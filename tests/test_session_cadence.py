@@ -116,6 +116,56 @@ class SessionCadenceTests(unittest.TestCase):
         ).fetchone())
         conn.close()
 
+    def test_backup_observes_capture_rows_after_cadence_purge(self):
+        """The backup call must see the same post-purge store transaction."""
+        import contextlib
+        import importlib.util
+        import io
+        from unittest.mock import patch
+
+        self.assertEqual(self._run("init").returncode, 0)
+        expired_id = str(uuid.uuid4())
+        conn = sqlite3.connect(self.store)
+        conn.execute(
+            "INSERT INTO training_capture("
+            "capture_id, host, created_at, updated_at, finalized_at, state, "
+            "redaction_status, governance_source) VALUES (?, 'test', "
+            "'2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z', "
+            "'2000-01-01T00:00:00Z', 'completed', 'metadata_only', 'test')",
+            (expired_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        spec = importlib.util.spec_from_file_location("_zmem_cadence_spy", str(STORE_PY))
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        mod = importlib.util.module_from_spec(spec)
+        backup_observations: list[bool] = []
+
+        def backup_spy(connection, *, retention, out_dir=None, if_due=False):
+            backup_observations.append(
+                connection.execute(
+                    "SELECT 1 FROM training_capture WHERE capture_id=?",
+                    (expired_id,),
+                ).fetchone() is not None
+            )
+            return 0
+
+        with patch.dict(os.environ, self.env, clear=False):
+            spec.loader.exec_module(mod)
+            old_argv = sys.argv
+            captured = io.StringIO()
+            sys.argv = ["store.py", "session-cadence", "--backup-retention", "7"]
+            try:
+                with patch.object(_cli_mod, "cmd_backup", side_effect=backup_spy):
+                    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
+                        mod.main()
+            finally:
+                sys.argv = old_argv
+
+        self.assertEqual(backup_observations, [False], captured.getvalue())
+
     def test_second_run_is_cadence_noop(self):
         """Hard assertion (critic-required; cubic#76 + Claude Code round 4):
         on a store WITH a live memory, run 1's organize does real work and its

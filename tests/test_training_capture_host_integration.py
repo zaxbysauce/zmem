@@ -80,6 +80,22 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _assert_raw_capture_secret_absent(self, sentinel: str) -> None:
+        """Check every local capture byte surface, including SQLite journals."""
+        candidates = [
+            self.store,
+            Path(str(self.store) + "-wal"),
+            Path(str(self.store) + "-shm"),
+            Path(str(self.store) + "-journal"),
+        ]
+        for directory in (self.data / "training-capture", self.store.parent / "training-capture"):
+            if directory.is_dir():
+                candidates.extend(path for path in directory.rglob("*") if path.is_file())
+        needle = sentinel.encode("utf-8")
+        for path in candidates:
+            if path.is_file():
+                self.assertNotIn(needle, path.read_bytes(), f"secret leaked to {path}")
+
     def _launcher_capture(
         self,
         payload: dict[str, object],
@@ -376,6 +392,45 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         self.assertFalse((self.store.parent / "training-capture").exists())
         for suffix in ("-wal", "-shm", "-journal"):
             self.assertFalse(Path(str(self.store) + suffix).exists())
+
+    def test_capture_never_leaks_secret_bytes_on_default_deny_surfaces(self) -> None:
+        for key in (
+            "ZMEM_CAPTURE",
+            "ZMEM_CAPTURE_CONSENT_SCOPE",
+            "ZMEM_CAPTURE_CONTENT_LICENSE",
+            "ZMEM_CAPTURE_REDACTION_POLICY_VERSION",
+        ):
+            self.env.pop(key, None)
+        cases = (
+            ("kill-switch", {"ZMEM_CAPTURE": "0"}),
+            ("governance-absent", {}),
+            (
+                "governance-field-empty",
+                {
+                    "ZMEM_CAPTURE_CONSENT_SCOPE": "",
+                    "ZMEM_CAPTURE_CONTENT_LICENSE": "CC-BY-4.0",
+                    "ZMEM_CAPTURE_REDACTION_POLICY_VERSION": "policy-v1",
+                },
+            ),
+        )
+        for label, extra_env in cases:
+            with self.subTest(label=label):
+                sentinel = f"Bearer b4-{label}-raw-secret-123456789"
+                payload = {
+                    "host": "codex",
+                    "session_id": f"session-{label}",
+                    "namespace": "project:integration",
+                    "capture_key": f"turn-{label}",
+                    "host_task_id": f"task-{label}",
+                    "prompt": sentinel,
+                    "assistant_response": f"assistant {sentinel}",
+                }
+                started = self._adapter("start", payload, extra_env=extra_env)
+                if extra_env.get("ZMEM_CAPTURE") == "0":
+                    self.assertEqual(started, {})
+                else:
+                    self.assertEqual(started["state"], "partial")
+                self._assert_raw_capture_secret_absent(sentinel)
 
     def test_malformed_delivery_id_leaves_no_orphan(self) -> None:
         initialized = self._cli("init")

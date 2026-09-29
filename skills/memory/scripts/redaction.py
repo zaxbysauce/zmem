@@ -38,3 +38,25 @@ def redact_secret_like_text(text: str) -> tuple[str, int]:
         redacted, changed = pattern.subn("[REDACTED_SECRET]", redacted)
         count += changed
     return redacted, count
+
+
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_WINDOWS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]+"
+)
+_POSIX_PATH_RE = re.compile(
+    r"(?<!:)(?<![A-Za-z0-9])/(?:Users|home|private|tmp|var|workspace|workspaces|mnt|opt|root)(?:/[^\s\"'<>]+)*"
+)
+
+
+def redact_training_text(value: str) -> tuple[str, int]:
+    """Apply secret, email, and filesystem path redaction for training data."""
+    redacted, count = redact_secret_like_text(value)
+    for pattern, replacement in (
+        (_EMAIL_RE, "[REDACTED_EMAIL]"),
+        (_WINDOWS_PATH_RE, "[REDACTED_PATH]"),
+        (_POSIX_PATH_RE, "[REDACTED_PATH]"),
+    ):
+        redacted, changed = pattern.subn(replacement, redacted)
+        count += changed
+    return redacted, count

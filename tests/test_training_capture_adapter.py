@@ -65,6 +65,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "host": "claude",
             "session_id": "session-1",
             "namespace": "project:hook-test",
+            "turn_id": "turn-default-deny",
             "prompt": "Bearer super-secret-token-value",
         }, env=self.env, api=self.api)
 
@@ -81,6 +82,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
         result = ADAPTER.run_action({
             "action": "start",
             "host": "claude",
+            "turn_id": "turn-metadata-only",
             "prompt": "host did not provide correlation metadata",
         }, env=self.env, api=self.api)
 
@@ -109,6 +111,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "namespace": "project:hook-test",
             "cwd": "C:/repo",
             "host_task_id": "native-task-7",
+            "turn_id": "turn-opt-in",
             "prompt": "bounded prompt",
         }, env=env, api=self.api)
 
@@ -239,6 +242,42 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "action": "snapshot", "host": "claude", "session_id": "same-session",
             "capture_id": first["capture_id"], "rendered": "must not attach",
         }, env=self.env, api=self.api), {})
+
+    def test_keyless_content_is_refused_before_store_or_sidecar(self):
+        def unexpected_connection():
+            raise AssertionError("content-bearing keyless start opened SQLite")
+
+        api = {**self.api, "connect": unexpected_connection}
+        result = ADAPTER.run_action({
+            "action": "start",
+            "host": "claude",
+            "session_id": "keyless-content",
+            "prompt": "Bearer keyless-secret-must-not-persist",
+            "assistant_response": "assistant bytes must not persist",
+        }, env=self.env, api=api)
+
+        self.assertEqual(result, {})
+        self.assertEqual(self.calls, [])
+        self.assertFalse((Path(self.tmp.name) / "training-capture").exists())
+        self.assertFalse(list(Path(self.tmp.name).glob("*.sqlite*")))
+
+    def test_standalone_content_uses_no_correlation_sidecar(self):
+        result = ADAPTER.run_action({
+            "action": "start_standalone",
+            "host": "hermes",
+            "session_id": "standalone-session",
+            "namespace": "project:hook-test",
+            "capture_key": "provider-fresh-key",
+            "prompt": "standalone prompt",
+            "assistant_response": "standalone response",
+        }, env=self.env, api=self.api)
+
+        self.assertEqual(result["state"], "partial")
+        self.assertEqual(self.calls[0][1]["prompt"], "standalone prompt")
+        self.assertEqual(
+            self.calls[0][1]["assistant_response"], "standalone response",
+        )
+        self.assertFalse((Path(self.tmp.name) / "training-capture").exists())
 
     def test_caller_capture_id_cannot_override_keyed_sidecar(self):
         base = {

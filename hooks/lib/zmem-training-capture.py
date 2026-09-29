@@ -259,8 +259,11 @@ def _correlated_capture_id(payload: Mapping[str, Any], env: Mapping[str, str]) -
 
 
 def _start(payload: Mapping[str, Any], env: Mapping[str, str],
-           api: Mapping[str, Any]) -> dict[str, Any]:
-    state_key = _state_key(payload)
+           api: Mapping[str, Any], *, persist_sidecar: bool = True) -> dict[str, Any]:
+    # Standalone provider callbacks deliberately skip the host-correlation
+    # sidecar.  Their fresh provider key identifies only the local partial;
+    # later delivery callbacks must never discover or attach to it.
+    state_key = _state_key(payload) if persist_sidecar else ""
     existing = _read_state_record(state_key, env) if state_key else {}
     if existing:
         return {
@@ -269,6 +272,14 @@ def _start(payload: Mapping[str, Any], env: Mapping[str, str],
             "redaction_status": "",
         }
     session_id = _session(payload)
+    # A keyless callback cannot be correlated by a later host event.  Refuse
+    # content-bearing starts before opening SQLite so an unresolvable turn can
+    # never leave prompt or assistant bytes behind as an orphaned partial.
+    if persist_sidecar and not state_key and (
+        _first_text(payload, "prompt", limit=16_000)
+        or _first_text(payload, "assistant_response", limit=16_000)
+    ):
+        return {}
     host = _first_text(payload, "host", limit=80).lower()
     namespace = _first_text(payload, "namespace", limit=512)
     if not host:
@@ -392,11 +403,14 @@ def run_action(payload: Mapping[str, Any], *, env: Mapping[str, str] | None = No
         if action == "clear":
             _clear_state(_state_key(payload), values)
             return {}
-        if action not in {"start", "observe", "snapshot"}:
+        if action not in {"start", "start_standalone", "observe", "snapshot"}:
             return {}
         loaded = api if api is not None else _load_api()
-        if action == "start":
-            return _start(payload, values, loaded)
+        if action in {"start", "start_standalone"}:
+            return _start(
+                payload, values, loaded,
+                persist_sidecar=action == "start",
+            )
         if action == "observe":
             return _observe(payload, values, loaded)
         return _snapshot(payload, values, loaded)

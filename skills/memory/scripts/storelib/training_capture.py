@@ -9,10 +9,10 @@ transaction when its caller did not already open one.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
 import sqlite3
-import sys
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -20,14 +20,24 @@ from typing import Any, Mapping, Sequence
 
 from storelib.schema import _commit, now_iso
 
-try:
-    from redaction import redact_secret_like_text
-except ImportError:  # pragma: no cover - installed scripts layout
-    # ``store.py`` normally adds its scripts directory to sys.path.  Keep the
-    # library importable in isolated callers without relying on storelib being
-    # a child package of that directory.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from redaction import redact_secret_like_text
+
+def _load_training_redactor():
+    """Load the sibling dependency-free training redactor without sys.path edits."""
+    path = Path(__file__).resolve().parent.parent / "redaction.py"
+    spec = importlib.util.spec_from_file_location(
+        f"_zmem_training_redaction_{uuid.uuid4().hex}", path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load training redactor from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    redact = getattr(module, "redact_training_text", None)
+    if not callable(redact):
+        raise ImportError(f"training redactor missing from {path}")
+    return redact
+
+
+redact_training_text = _load_training_redactor()
 
 
 MAX_CAPTURE_TEXT_BYTES = 16_000
@@ -136,25 +146,12 @@ def _uuid(value: object, field: str) -> str:
     return str(parsed)
 
 
-_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
-_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]+")
-_POSIX_PATH_RE = re.compile(
-    r"(?<!:)(?<![A-Za-z0-9])/(?:Users|home|private|tmp|var|workspace|workspaces|mnt|opt|root)(?:/[^\s\"'<>]+)*"
-)
 _SAFE_EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def _redact_training_text(value: str) -> tuple[str, int]:
-    """Apply the shared secret scanner plus conservative training PII rules."""
-    redacted, count = redact_secret_like_text(value)
-    for pattern, replacement in (
-        (_EMAIL_RE, "[REDACTED_EMAIL]"),
-        (_WINDOWS_PATH_RE, "[REDACTED_PATH]"),
-        (_POSIX_PATH_RE, "[REDACTED_PATH]"),
-    ):
-        redacted, changed = pattern.subn(replacement, redacted)
-        count += changed
-    return redacted, count
+    """Preserve the capture module API while using the canonical helper."""
+    return redact_training_text(value)
 
 
 def _opaque_identifier(value: str | None) -> str | None:
