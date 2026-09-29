@@ -136,7 +136,7 @@ jobs:
             # joins this loop when #180 lands (delete this branch then).
             if [ "$f" = "tests/test_q02_passive_secret_withhold.py" ]; then
               echo "=== $f (dependency-independent classes only; AC6 gated on #180) ==="
-              python "$f" PassiveSecretWithholdTest LedgerWithholdTest GitShaNotWithheldTest
+              python "$f" PassiveSecretWithholdTest LedgerWithholdTest GitShaNotWithheldTest WithholdBudgetAndNoSessionTest
               continue
             fi
             echo "=== $f ==="

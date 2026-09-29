@@ -21,7 +21,10 @@ README.
   match the row is replaced by an id+type-only `[WITHHELD: SECRET]` marker
   before rendering, telemetry, and the delivery ledger: no credential text
   reaches the hook payload, the model context, `surfaced_count`, or
-  `<data>/ops/*.ledger`. A `secret_withheld` count joins the JSON envelope
+  `<data>/ops/*.ledger`. Classification runs BEFORE the token budget — a
+  credential straddling the budget cut is withheld whole, never leaked as a
+  clipped fragment — and covers the no-session `--for-injection` lane as
+  well. A `secret_withheld` count joins the JSON envelope
   (only when a withhold happened — zero-withhold envelopes stay
   byte-identical). No new store writes; the prompt-injection re-scan and the
   #114 rendered-row law are untouched. Shapes issue #180 adds to the

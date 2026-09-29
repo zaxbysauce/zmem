@@ -326,5 +326,73 @@ class GitShaNotWithheldTest(_WithholdBase):
         self.assertEqual((rendered.count(FAKE), rendered.count(SHA)), (0, 1))
 
 
+class WithholdBudgetAndNoSessionTest(_WithholdBase):
+    """Review round 2 (F-267-1/F-267-2): the re-scan must classify BEFORE
+    the token budget (a credential straddling the cut is withheld whole,
+    never leaked as a clipped fragment) and must cover the no-session
+    `--for-injection` lane, not only the session selector."""
+
+    def test_credential_straddling_budget_cut_is_withheld_whole(self):
+        # Seed padded incident rows so some row's token straddles the
+        # budget cut at ZMEM_INJECT_TOKEN_BUDGET=250: under the old
+        # post-budget ordering the cut clipped the ghp_ token to a prefix
+        # the patterns no longer matched and the fragment shipped in the
+        # envelope and the ledger (probe-verified pre-fix). Under the
+        # pre-budget classification every admitted row is withheld whole.
+        pads = (30, 34, 38, 42, 46)
+        ids = []
+        for reps in pads:
+            ids.append(self._add_row(
+                NS_GLOBAL,
+                ("flange calibration deploy " * reps) + INCIDENT_CONTENT))
+        self.env["ZMEM_INJECT_TOKEN_BUDGET"] = "250"
+        r = self.hook_recall()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            r.stdout.count(FAKE), 0,
+            "no clipped credential fragment may reach the stdout envelope")
+        doc = self.env_json(r)
+        for entry in doc.get("results", []):
+            if entry.get("id") in ids:
+                self.assertNotIn(FAKE, json.dumps(entry))
+        withheld = [e for e in doc.get("results", [])
+                    if e.get("withheld_for_secret")]
+        self.assertGreaterEqual(
+            len(withheld), 1,
+            "precondition: at least one padded incident row must have been "
+            "selected and withheld")
+        ledger_files = glob.glob(
+            os.path.join(self.data_dir, "ops", "*.ledger*"))
+        for path in ledger_files:
+            self.assertNotIn(
+                FAKE, Path(path).read_text(encoding="utf-8"),
+                "no clipped credential fragment may reach the ledger")
+
+    def test_no_session_for_injection_withholds(self):
+        # F-267-2: recall --for-injection --json WITHOUT --session-id is the
+        # same passive gate+budget lane (MCP/eval callers omit session ids);
+        # it must withhold like the hook argv does.
+        row_id = self.seed_incident()
+        r = self._run_cli(
+            "recall", "--query", DEFAULT_QUERY,
+            "--namespace", NS, "--limit", "5", "--include-global",
+            "--global-limit", "3", "--no-bump", "--for-injection", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn(FAKE, r.stdout)
+        doc = json.loads(r.stdout)
+        entries = [e for e in doc.get("results", [])
+                   if e.get("id") == row_id]
+        self.assertTrue(entries, "the seeded row must still ride results")
+        for entry in entries:
+            self.assertTrue(entry.get("withheld_for_secret"))
+            self.assertEqual(entry.get("content"), "")
+        self.assertGreaterEqual(
+            sum(v for k, v in doc.items()
+                if "secret" in str(k).lower() and isinstance(v, int)
+                and not isinstance(v, bool)),
+            1,
+            "the no-session envelope must count the withhold")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

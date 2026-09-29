@@ -2205,6 +2205,25 @@ def _recall_injection_details(
         # returned order is unchanged this PR; see PASSIVE_PROMOTION_GATE).
         selected_rows = rerank_final_injection_set(query, selected_rows)
 
+    # Issue #256 (review F-267-1): classify credentials BEFORE the token
+    # budget. A credential straddling apply_token_budget's cut is clipped to
+    # a prefix the credential patterns no longer match, so a post-budget
+    # scan would leak the fragment into the payload and the ledger. The
+    # withheld row is reduced to the id+type metadata shape here — the fence
+    # renderer, the session-selector partition (which counts it into
+    # secret_withheld), and the JSON envelope all honor the flag. Runs with
+    # zero matching rows are untouched (byte-identical).
+    selected_rows = [
+        ({"id": r.get("id", ""), "type": r.get("type", ""),
+          "confidence": r.get("confidence", 0.0),
+          "signal": r.get("signal", "none"),
+          "namespace": r.get("namespace", ""),
+          "content": "", "withheld_for_secret": True}
+         if isinstance(r, dict) and not r.get("withheld_for_secret")
+         and _classify_credential(r)
+         else r)
+        for r in selected_rows]
+
     budget_emptied = False
     budget_dropped = 0
     budget_admission = 0
@@ -2271,6 +2290,13 @@ def _recall_injection_details(
         "budget_dropped_protected": budget_dropped_protected,
         "budget_note": injection_budget_note,
     }
+    # Issue #256 (F-267-2): the no-session --for-injection envelope reports
+    # the withhold too — keyed only when it happened, so every zero-withhold
+    # envelope stays byte-identical (C5 freeze).
+    withheld_count = sum(1 for r in selected_rows
+                         if r.get("withheld_for_secret"))
+    if withheld_count:
+        details["secret_withheld"] = withheld_count
     # Legacy --for-injection JSON exposes a numeric exclusion count only when
     # its caller supplied an exclusion list; preserve that byte/shape contract.
     if exclude_ids:
@@ -2281,6 +2307,8 @@ def _recall_injection_details(
 
     surfaced = (selected_rows if surfaced_ids is None else
                 [r for r in selected_rows if r["id"] in set(surfaced_ids)])
+    # Issue #256: a withheld row is not rendered content — never bumped.
+    surfaced = [r for r in surfaced if not r.get("withheld_for_secret")]
     return details, surfaced
 
 

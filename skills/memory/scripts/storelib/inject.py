@@ -1059,7 +1059,13 @@ def select_and_budget_for_injection(
         withheld_rows = []
         displayed_rows = []
         for row in rows:
-            if isinstance(row, dict) and recall_module._classify_credential(row):
+            if isinstance(row, dict) and (
+                    # F-267-1: rows classified pre-budget in recall.py arrive
+                    # already flagged (their clipped content no longer
+                    # matches the patterns, so the re-scan alone would miss
+                    # them) — trust the flag first.
+                    row.get("withheld_for_secret")
+                    or recall_module._classify_credential(row)):
                 withheld_rows.append(row)
                 displayed_rows.append({
                     "id": row.get("id", ""),

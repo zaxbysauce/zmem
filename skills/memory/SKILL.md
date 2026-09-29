@@ -1739,9 +1739,12 @@ ledger entry for it carries no credential text. The JSON envelope gains
 `secret_withheld` (a count) **only when a withhold happened** — clean runs
 stay byte-identical. Ordinary rows are untouched: rows carrying plain
 40-hex git SHAs render normally (the generic hex/base64 detectors are
-deliberately NOT used at read time). Explicit `recall`/`recent`/`get`
-without `--session-id` (the no-session variant) is an explicit call, not
-the passive lane, and is not filtered. Sibling envelopes the selector
+deliberately NOT used at read time). The re-scan runs BEFORE the token
+budget, so a credential straddling the budget cut is withheld whole — never
+leaked as a clipped fragment — and `--for-injection` applies it on the
+no-session lane too (explicit `recall`/`recent`/`get` WITHOUT
+`--for-injection` remain plain explicit calls and are not filtered).
+Sibling envelopes the selector
 builds for silent/kill-switch reasons never carry the key. Known residuals:
 a credential stored ONLY as an entity `canonical_name`/alias is not
 detected — it renders in the fence's entity line and rides into the
