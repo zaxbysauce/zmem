@@ -1618,9 +1618,19 @@ def _strict_ingest_staged(
                     (obj["episode_id"], obj["memory_id"], obj.get("added_at", "")),
                 )
 
+        # Issue #255: an evidence row whose only junctions point at a purged
+        # memory would otherwise re-insert the purged row's excerpt text (the
+        # excerpt frequently quotes tool-call input verbatim). Collect those
+        # ids first and skip them in the apply loop below.
+        purged_orphan_evidence = {
+            obj["evidence_id"] for table, obj in rows
+            if table == "memory_evidence" and obj["memory_id"] in purged_memory
+        }
         for table, obj in rows:
             if table != "evidence":
                 continue
+            if obj["id"] in purged_orphan_evidence:
+                continue  # issue #255: excerpt of a purged memory stays gone
             existing = conn.execute(
                 "SELECT session_id, lane, moment, kind, ts, hash, excerpt, "
                 "ref_path, ref_offset FROM evidence WHERE id=?", (obj["id"],)

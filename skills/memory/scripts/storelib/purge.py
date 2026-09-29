@@ -214,11 +214,28 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
             r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
             "", content, count=1)
         merged = [m for m in merged if _base_id(m) != pid]
-    # Residue test 1: any token that lived inside a removed block and still
-    # appears in the stripped content means the absorbed text was duplicated
-    # outside the block — the keeper keeps quoting the purged row. Tokens the
-    # keeper's own base content already had (never inside a block) are not
-    # residue, so a shared long word ("deployment") does not force a delete.
+    # Residue test 1 (removed-block tokens): any >=8-char token that lived
+    # inside a removed block and still appears verbatim in the stripped
+    # content means a phrase of the absorbed text was duplicated outside the
+    # block. Shared vocabulary that only exists in the keeper's own base text
+    # is unattributable after the merge and is handled by the byte-verify's
+    # surviving-row token suppression instead of a refusal (a real lexical
+    # consolidate cluster shares phrases between base and absorbed text, so a
+    # stricter test would refuse ordinary consolidations).
+    removed_tokens: set[str] = set()
+    for pid in keeper["purged"]:
+        base = re.escape(_base_id(pid))
+        block = re.search(
+            r"\n*--- merged from %s(?::truncated)? ---\n(?P<body>.*?)"
+            r"(?=\n*--- merged from |\Z)" % base,
+            content, flags=re.DOTALL)
+        if block is not None:
+            removed_tokens |= _tokens(block.group("body"))
+            content = content[:block.start()] + "\n" + content[block.end():]
+        content = re.sub(
+            r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
+            "", content, count=1)
+        merged = [m for m in merged if _base_id(m) != pid]
     if removed_tokens & _tokens(content):
         return None
     # Residue test 2 (PRR-002 follow-up): if the purged row's full current
@@ -618,7 +635,7 @@ def _verify_ledgers_clean(data_dir: Path, needles: list[str]) -> dict[str, int]:
 # --------------------------------------------------------------------------
 
 def _scrub_snapshot(path: Path, chain: list[str],
-                    needles: list[str]) -> str:
+                    needles: list[str]) -> dict[str, str]:
     """Apply the SAME remediation inside one snapshot file, in place.
 
     Old-schema snapshots skip tables they do not have. The scrub never
@@ -751,10 +768,10 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             try:
                 applied = _apply_purge_transaction(conn, res)
             except RuntimeError as e:
-                # AC6 refusal: a derived row (keeper/belief head/summary)
-                # still quotes the purged text and can neither be rewritten
-                # nor deleted autonomously. Nothing was modified; the named
-                # row needs operator action first.
+                # AC6 refusal: a keeper row still quotes the purged text
+                # and can neither be rewritten nor deleted autonomously.
+                # Nothing was modified; the named row needs operator action
+                # first.
                 print("[zmem] %s" % e, file=sys.stderr)
                 return 4
             needles = _needles(conn, applied)
@@ -812,6 +829,9 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         snapshots: list[dict[str, str]] = []
         if scrub_backups:
             bdir = Path(out_dir)
+            from storelib.schema import _host
+            if _host is not None:
+                _host.assert_local_fs(bdir)
             try:
                 for snap in sorted(list(bdir.glob("store-*.sqlite"))
                                    + list(bdir.glob("prerestore-*.sqlite"))):
@@ -877,7 +897,8 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                                    "y" if led["entries_dropped"] == 1 else "ies",
                                    led["files_scrubbed"]))
             for s in snapshots:
-                print("[zmem] purge: %s" % s)
+                print("[zmem] purge: %s %s (%s)" % (
+                    s["status"], s["snapshot"], s["detail"]))
             for w in warnings:
                 print("[zmem] purge: WARNING - surviving %s still quotes "
                       "purged-content tokens (kept by design; remove it too "

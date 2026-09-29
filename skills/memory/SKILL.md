@@ -1723,8 +1723,9 @@ the SessionStart hook fires, and refuses a destination that is not on a local
 filesystem (no UNC/network/OneDrive path). If any lock is held it exits **2**
 without touching the destination — a skipped restore must never look like a
 completed one. A live interactive session's own `add`/`recall` writes are
-blocked for the restore's duration by the live-writer refusal: still run
-`restore` when no session is actively writing.
+blocked for the restore's duration (writers wait on the maintenance gate and
+fail clearly after a short timeout): still run `restore` when no session is
+actively writing.
 
 ### purge — durably remove a memory's content (issue #255)
 ```
