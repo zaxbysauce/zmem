@@ -31,7 +31,9 @@ README.
   snapshots in place (never deleted/truncated) with the same removal and an
   `integrity_check` re-verify. Exit ladder: 0 clean, 2 usage, 3 unknown id,
   4 lock/live-writer refusal, 5 residue remains, 6 compaction or
-  backup-scrub failure. See the
+  backup-scrub failure; a retry of a deny-listed id resumes post-commit
+  cleanup, and vector erasure fails closed when sqlite-vec cannot be
+  loaded. See the
   `purge` section in the memory skill docs for operator caveats (never pass
   secret text on a command line; restore/`import-store --force` supersede a
   purge).

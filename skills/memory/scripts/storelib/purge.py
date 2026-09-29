@@ -44,6 +44,7 @@ from storelib.schema import (
     SCHEMA_LOCK_WAIT_SECONDS,
     _cleanup_stale_writer_leases,
     _normalize_content,
+    _load_vec,
     _release_named_lock,
     _strict_acquire_lock,
     now_iso,
@@ -91,6 +92,12 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
+def _denylisted_ids(conn: sqlite3.Connection) -> set[str]:
+    if not _table_exists(conn, "purged_id"):
+        return set()
+    return {r[0] for r in conn.execute("SELECT id FROM purged_id")}
+
+
 def _placeholders(ids: list[str]) -> str:
     return ",".join("?" * len(ids))
 
@@ -112,12 +119,29 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
     chain: list[str] = []
     seen: set[str] = set()
     for rid in requested:
+        root = conn.execute(
+            "SELECT namespace FROM memory WHERE id=?", (rid,)).fetchone()
+        root_namespace = root["namespace"] if root is not None else None
         cur = rid
-        while cur and cur not in seen:
+        while cur:
+            if cur in seen:
+                raise RuntimeError(
+                    "purge REFUSED: cyclic update_of chain at %s" % cur)
             row = conn.execute(
-                "SELECT id, update_of FROM memory WHERE id=?", (cur,)).fetchone()
+                "SELECT id, update_of, namespace, superseded_at "
+                "FROM memory WHERE id=?", (cur,)).fetchone()
             if row is None:
+                if cur != rid:
+                    raise RuntimeError(
+                        "purge REFUSED: update_of predecessor %s is missing"
+                        % cur)
                 break
+            if cur != rid and (
+                    row["namespace"] != root_namespace
+                    or not row["superseded_at"]):
+                raise RuntimeError(
+                    "purge REFUSED: update_of predecessor %s is not a "
+                    "superseded row in namespace %s" % (cur, root_namespace))
             seen.add(cur)
             chain.append(cur)
             cur = row["update_of"] or ""
@@ -141,14 +165,30 @@ def _resolve(conn: sqlite3.Connection, ids: list[str]) -> dict[str, Any]:
             chain)]
 
     keepers: list[dict[str, Any]] = []
+    all_keepers: list[dict[str, Any]] = []
     for r in conn.execute(
             "SELECT id, content, content_norm, merged_from FROM memory "
             "WHERE merged_from IS NOT NULL AND merged_from != ''"):
         mids = [m.strip() for m in (r["merged_from"] or "").split(",")
                 if m.strip()]
-        hit = [m for m in mids if _base_id(m) in seen]
-        if hit:
-            keepers.append({"row": dict(r), "purged": hit, "merged": mids})
+        all_keepers.append({"row": dict(r), "ids": mids})
+    absorbed = set(seen)
+    remaining = list(all_keepers)
+    while remaining:
+        next_remaining: list[dict[str, Any]] = []
+        progressed = False
+        for entry in remaining:
+            hit = [m for m in entry["ids"] if _base_id(m) in absorbed]
+            if not hit:
+                next_remaining.append(entry)
+                continue
+            keepers.append({"row": entry["row"], "purged": hit,
+                            "merged": entry["ids"]})
+            absorbed.add(entry["row"]["id"])
+            progressed = True
+        if not progressed:
+            break
+        remaining = next_remaining
 
     heads: list[dict[str, Any]] = []
     if chain and _table_exists(conn, "belief_head_source"):
@@ -211,9 +251,14 @@ def _plan_keeper(keeper: dict[str, Any], rows: dict[str, Any]):
             r"\n*--- merged from %s(?::truncated)? ---\n(?P<body>.*?)"
             r"(?=\n*--- merged from |\Z)" % base,
             content, flags=re.DOTALL)
-        if block is not None:
-            removed_tokens |= _tokens(block.group("body"))
-            content = content[:block.start()] + "\n" + content[block.end():]
+        if block is None:
+            # `merged_from` is provenance, so a missing block means the
+            # keeper's content was compressed or otherwise drifted. Refuse
+            # before deleting the target rather than silently clearing the
+            # provenance while leaving an unverified copy behind.
+            return None
+        removed_tokens |= _tokens(block.group("body"))
+        content = content[:block.start()] + "\n" + content[block.end():]
         content = re.sub(
             r"\n*--- merged from %s(?::truncated)? ---\n?" % base,
             "", content, count=1)
@@ -275,6 +320,16 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
     rows = res["rows"]
     ph = _placeholders(chain)
     chain_set = set(chain)
+
+    has_vec = _table_exists(conn, "memory_vec")
+    if has_vec:
+        try:
+            _load_vec(conn)
+        except Exception as exc:
+            raise RuntimeError(
+                "purge REFUSED: memory_vec exists but sqlite-vec could not "
+                "be loaded; refusing to claim vector erasure (%s)" % exc
+            ) from exc
 
     keeper_rewrites: list[tuple[str, str, str]] = []
     for k in res["keepers"]:
@@ -340,11 +395,22 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
         if summary_ids:
             conn.execute("DELETE FROM memory WHERE id IN (%s)"
                          % _placeholders(summary_ids), summary_ids)
-        try:
-            conn.execute("DELETE FROM memory_vec WHERE memory_id IN (%s)" % dph,
-                         dargs)
-        except sqlite3.OperationalError:
-            pass  # vec extension absent (model-absent degraded mode)
+        if has_vec:
+            try:
+                conn.execute(
+                    "DELETE FROM memory_vec WHERE memory_id IN (%s)" % dph,
+                    dargs)
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+            else:
+                remaining_vec = conn.execute(
+                    "SELECT COUNT(*) FROM memory_vec WHERE memory_id IN (%s)"
+                    % dph, dargs).fetchone()[0]
+                if remaining_vec:
+                    raise RuntimeError(
+                        "purge REFUSED: memory_vec still contains %d row(s) "
+                        "for the purged id(s)" % remaining_vec)
 
         for table, col in _ID_SIDE_TABLES:
             if _table_exists(conn, table):
@@ -357,6 +423,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                 "WHERE summary_memory_id IN (%s)" % dph, dargs)
 
         # Evidence orphans: only evidence that lost its LAST reference.
+        deleted_evidence: list[str] = []
         for ev in sorted(affected_evidence):
             if conn.execute(
                     "SELECT 1 FROM memory_evidence WHERE evidence_id=?",
@@ -374,6 +441,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                 conn.execute(
                     "DELETE FROM belief_head_evidence WHERE evidence_id=?",
                     (ev,))
+            deleted_evidence.append(ev)
 
         # Keepers: rewrite + relink FIRST (entity invariant, entity.py:11-14)
         # -- belief-head rebuilds below must read the keeper's POST-strip
@@ -414,7 +482,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
             # Every id deleted by this purge joins the deny-list, not just the
             # requested chain: derived-deleted rows (summaries, keepers) carry
             # the purged text too, and a pre-purge peer export still holds them.
-            for pid in all_deleted:
+            for pid in [*all_deleted, *deleted_evidence]:
                 conn.execute(
                     "INSERT OR IGNORE INTO purged_id (id, purged_at) "
                     "VALUES (?, ?)", (pid, now_iso()))
@@ -459,7 +527,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
         "head_deletes": head_deletes,
         "summary_deletes": res["summary_deletes"],
         "successor_updates": res["successor_updates"],
-        "deleted_evidence": sorted(affected_evidence),
+        "deleted_evidence": deleted_evidence,
         "gone_entities": gone_entities,
         "meta_scrubs": meta_scrubs,
     }
@@ -662,11 +730,16 @@ def _scrub_snapshot(path: Path, chain: list[str],
         if not res["chain"]:
             return {"snapshot": path.name, "status": "skipped",
                     "detail": "no purged id present"}
-        _apply_purge_transaction(conn, res)
+        applied = _apply_purge_transaction(conn, res)
+        # A retry may reach a snapshot after the live store no longer has the
+        # deleted row, so the caller cannot supply its plaintext needle. The
+        # snapshot still has the original row; derive its local fingerprints
+        # before closing it rather than accepting a false clean result.
+        local_needles = sorted(set(needles) | set(_needles(conn, applied)))
     finally:
         conn.close()
 
-    compact_and_verify(path, needles)
+    compact_and_verify(path, local_needles)
     conn = sqlite3.connect(str(path), timeout=30.0)
     try:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -676,11 +749,12 @@ def _scrub_snapshot(path: Path, chain: list[str],
         raise RuntimeError(
             "snapshot %s integrity_check=%s after scrub" % (path.name, integrity))
     data = path.read_bytes().lower()
-    residue = sum(data.count(n.encode("utf-8")) for n in needles)
+    residue = sum(data.count(n.encode("utf-8")) for n in local_needles)
     wal = Path(str(path) + "-wal")
     if wal.exists():
         wdata = wal.read_bytes().lower()
-        residue += sum(wdata.count(n.encode("utf-8")) for n in needles)
+        residue += sum(wdata.count(n.encode("utf-8"))
+                       for n in local_needles)
     if residue:
         raise RuntimeError(
             "snapshot %s holds %d needle byte(s) after scrub" % (
@@ -770,13 +844,8 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             # (only migrate does), and a silent deny-list no-op here would
             # lose the recording behind a success exit.
             schema_mod._ensure_purged_table(conn)
-            res = _resolve(conn, ids)
-            if res["missing"]:
-                print("[zmem] purge REFUSED: unknown id(s): %s"
-                      % ", ".join(res["missing"]), file=sys.stderr)
-                return 3
             try:
-                applied = _apply_purge_transaction(conn, res)
+                res = _resolve(conn, ids)
             except RuntimeError as e:
                 # AC6 refusal: a keeper row still quotes the purged text
                 # and can neither be rewritten nor deleted autonomously.
@@ -784,7 +853,37 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 # first.
                 print("[zmem] %s" % e, file=sys.stderr)
                 return 4
+            denylisted = _denylisted_ids(conn)
+            unknown = [i for i in res["missing"] if i not in denylisted]
+            if unknown:
+                print("[zmem] purge REFUSED: unknown id(s): %s"
+                      % ", ".join(unknown), file=sys.stderr)
+                return 3
+            retry_ids = [i for i in ids if i in denylisted]
+            if res["chain"]:
+                try:
+                    applied = _apply_purge_transaction(conn, res)
+                except RuntimeError as e:
+                    # AC6 refusal: a derived row (belief head/summary)
+                    # still quotes the purged text and can neither be
+                    # rewritten nor deleted autonomously. Nothing was
+                    # modified; the named row needs operator action first.
+                    print("[zmem] %s" % e, file=sys.stderr)
+                    return 4
+            else:
+                # A prior purge may have committed the row deletion before a
+                # later compaction, ledger, or snapshot step failed. Treat a
+                # deny-listed id as a scrub retry: there is no transaction to
+                # repeat, but the remaining cleanup phases still run.
+                applied = {
+                    "chain": [], "rows": {}, "keeper_rewrites": [],
+                    "head_rebuilds": [], "head_deletes": [],
+                    "summary_deletes": [], "successor_updates": [],
+                    "deleted_evidence": [], "gone_entities": [],
+                    "meta_scrubs": [], "retry_ids": retry_ids,
+                }
             needles = _needles(conn, applied)
+            applied["retry_ids"] = retry_ids
         finally:
             conn.close()
 
@@ -812,6 +911,8 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         data_dir = STORE_PATH.parent
         drop_ids = set(applied["chain"])
         drop_ids |= {sd["summary_id"] for sd in applied["summary_deletes"]}
+        drop_ids |= set(applied.get("retry_ids", []))
+        drop_ids |= denylisted
         try:
             # Round-3: the passive lane's ledger.record holds NO writer lease,
             # so it is invisible to the live-writer refusal -- but record()
@@ -840,10 +941,13 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         if scrub_backups:
             bdir = Path(out_dir)
             try:
+                snapshot_targets = list(dict.fromkeys(
+                    list(applied["chain"])
+                    + list(applied.get("retry_ids", []))))
                 for snap in sorted(list(bdir.glob("store-*.sqlite"))
                                    + list(bdir.glob("prerestore-*.sqlite"))):
                     snapshots.append(
-                        _scrub_snapshot(snap, applied["chain"], needles))
+                        _scrub_snapshot(snap, snapshot_targets, needles))
             except (sqlite3.Error, OSError, RuntimeError) as e:
                 print("[zmem] purge FAILED: backup scrub failed (%s)"
                       % e, file=sys.stderr)
@@ -919,4 +1023,3 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         if s_token is not None:
             _release_named_lock("schema", s_token)
         _release_named_lock("maintenance", m_token)
-

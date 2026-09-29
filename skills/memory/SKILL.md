@@ -1766,10 +1766,20 @@ What one purge does:
 - records the ids in the `purged_id` deny-list so `ingest-jsonl` will not
   re-insert them from a peer export (child records referencing a purged id
   are skipped or blanked, never fatal);
+- if a post-commit compaction, ledger scrub, or snapshot scrub fails, a later
+  `purge --id` for the deny-listed id resumes the cleanup phases. The retry
+  derives its scrub needles from each surviving snapshot row, so it does not
+  require the original plaintext as a command-line argument;
 - `--scrub-backups --out-dir DIR` applies the same removal inside every
   `store-*.sqlite` **and** `prerestore-*.sqlite` snapshot in DIR, rewriting
   files **in place** (never deleted, truncated, or renamed) and re-verifying
   each with `integrity_check`.
+
+Vector erasure is fail-closed: when a `memory_vec` table exists, purge must
+load sqlite-vec and verify that no vector rows remain for the deleted ids. If
+the extension cannot be loaded, the purge refuses rather than claiming the
+vectors were erased. `--scrub-backups --out-dir DIR` also requires DIR to be
+an existing local directory.
 
 Locking: the full `restore` posture (maintenance → schema → backup →
 consolidate locks, plus a live-writer refusal), so nothing can write between
@@ -1781,9 +1791,11 @@ writer); **5** residue remains in the store or ledgers — OR transient
 delivery-ledger lock contention (re-run; the message names which); **6**
 compaction/scrub step failed.
 
-Caveats: `import-store.py --force` and `restore` from a pre-purge snapshot are
-explicit whole-store replacements — they supersede both the removal and the
-deny-list, so **re-run purge after either** (a restore's `prerestore-*` safety
+Post-commit cleanup failures leave the deny-list entry in place by design;
+re-run purge for that id after fixing the named surface. `import-store.py
+--force` and `restore` from a pre-purge snapshot are explicit whole-store
+replacements — they supersede both the removal and the deny-list, so **re-run
+purge after either** (a restore's `prerestore-*` safety
 copy of the pre-restore store preserves the deny-list rows recorded between
 snapshot and restore, so the ids to re-purge are recoverable by SQL from that
 copy). Purge is also honest about a structural carve-out in the byte

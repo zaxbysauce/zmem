@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -45,6 +46,11 @@ _GIT_BASHES = (
 )
 _BASH = next((str(path) for path in _GIT_BASHES if path.is_file()),
              shutil.which("bash"))
+
+
+def _recent_sidecar_created() -> str:
+    """Return a timestamp that is safely inside the hook retention window."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
 
 
 def _write_transcript(records) -> str:
@@ -353,7 +359,7 @@ class TestReflectHookMessaging(unittest.TestCase):
             "tool_summary": "2=Bash",
             "details": ["  - Bash : boom"],
             "rejections": "User rejected 1 tool call(s). Stated reasons: leave the schema alone",
-            "created": "2026-09-15T00:00:00+00:00",
+            "created": _recent_sidecar_created(),
         }
         sidecar_path = ring / "deadbeef.json"
         sidecar_path.write_text(json.dumps(sidecar) + "\n", encoding="utf-8")
@@ -387,7 +393,7 @@ class TestReflectHookMessaging(unittest.TestCase):
             "tool_summary": "0 failure(s)",
             "details": [],
             "rejections": "User rejected 1 tool call(s). Stated reasons: not that file",
-            "created": "2026-09-15T00:00:00+00:00",
+            "created": _recent_sidecar_created(),
         }
         (ring / "rejonly.json").write_text(
             json.dumps(sidecar) + "\n", encoding="utf-8")
@@ -436,7 +442,7 @@ class TestReflectHookMessaging(unittest.TestCase):
             "tool_summary": "1=Bash",
             "details": [],
             "rejections": "",
-            "created": "2026-09-15T00:00:00+00:00",
+            "created": _recent_sidecar_created(),
         }
         other_path = ring / "other.json"
         other_path.write_text(json.dumps(other) + "\n", encoding="utf-8")
@@ -485,7 +491,7 @@ class TestReflectHookMessaging(unittest.TestCase):
             "tool_summary": "1=Read",
             "details": [],
             "rejections": "",
-            "created": "2026-09-15T00:00:00+00:00",
+            "created": _recent_sidecar_created(),
         }
         both_path = ring / "both.json"
         both_path.write_text(json.dumps(sidecar) + "\n", encoding="utf-8")

@@ -491,6 +491,20 @@ class PurgeDerivedCopiesTest(_PurgeBase):
                 "copy quoting the purged content (memory rows, belief heads, "
                 "merged_from provenance)")
 
+    def test_keeper_without_stored_block_refuses_before_delete(self):
+        target = self.add_row(TARGET_CONTENT)
+        keeper = self.add_row("compressed keeper summary without marker")
+        self._exec(
+            ("UPDATE memory SET merged_from=? WHERE id=?", (target, keeper)),
+        )
+
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn(keeper, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (target,)), 1,
+            "keeper residue refusal must happen before the purge transaction")
+
 
 # ---------------------------------------------------------------------------
 # AC7: per-session delivery ledgers under <ZMEM_DATA>/ops
@@ -557,6 +571,40 @@ class PurgeDenyListTest(_PurgeBase):
             "ingest must succeed (exit 0) yet skip the purged id — the deny "
             "list must outlive the row it names")
 
+    def test_ingest_does_not_resurrect_deleted_evidence_excerpt(self):
+        target = self.add_row(TARGET_CONTENT)
+        evidence_id = "00000000-0000-4000-8000-000000009999"
+        self._exec(
+            ("INSERT INTO evidence "
+             "(id, session_id, lane, moment, kind, ts, hash, excerpt, "
+             "ref_path, ref_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (evidence_id, "sess-purge", "zcode", "user_prompt", "tool_call",
+              "2026-09-29T00:00:00Z",
+              "0eb95917368d3681285c9136f01cd350a385e20026cdb746b3cbd6cdbef86926",
+              "evidence excerpt zebraquux",
+              "tests/test_q01_purge.py", 1)),
+            ("INSERT INTO memory_evidence (memory_id, evidence_id) "
+             "VALUES (?, ?)", (target, evidence_id)),
+        )
+        peer = os.path.join(self.tmp, "peer-evidence.jsonl")
+        r = self._run("export-jsonl", "--out", peer, "--namespace", NS)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(evidence_id, Path(peer).read_text(encoding="utf-8"))
+
+        r = self._purge(target)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM purged_id WHERE id=?",
+                      (evidence_id,)), 1)
+
+        r = self._run("ingest-jsonl", "--in", peer)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            self.qone("SELECT COUNT(*) FROM evidence WHERE id=?",
+                      (evidence_id,)), 0,
+            "a pre-purge export must not resurrect an orphaned evidence "
+            "excerpt after its memory is purged")
+
 
 # ---------------------------------------------------------------------------
 # AC9: --scrub-backups rewrites snapshots (incl. a prerestore-* copy)
@@ -603,6 +651,26 @@ class PurgeBackupScrubTest(_PurgeBase):
             (True, 1, "ok", 0),
             "--scrub-backups must rewrite the snapshot free of needle bytes "
             "while keeping it a valid database whose non-purged rows survive")
+
+    def test_scrub_retry_after_live_purge_is_idempotent(self):
+        target = self.add_row(TARGET_CONTENT)
+        backups = os.path.join(self.tmp, "retry-backups")
+        r = self._run("backup", "--out-dir", backups)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = sorted(glob.glob(os.path.join(backups, "store-*.sqlite")),
+                       key=os.path.getmtime)
+        self.assertTrue(snaps, "backup produced no store-*.sqlite snapshot")
+
+        first = self._purge(target)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        retry = self._purge(
+            target, extra=["--scrub-backups", "--out-dir", backups])
+        self.assertEqual(
+            retry.returncode, 0, retry.stderr +
+            "a post-commit cleanup retry must accept the deny-listed id")
+        self.assertEqual(
+            self._needle_count([snaps[-1], snaps[-1] + "-wal"]), 0,
+            "a retry must scrub the snapshot using its own copy of the row")
 
 
 if __name__ == "__main__":
