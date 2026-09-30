@@ -1053,6 +1053,30 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         "_links": validated_links,
     }
 
+def _purged_ids(conn: sqlite3.Connection) -> set:
+    """Ids removed by `purge` (issue #255). Empty when the additive
+    purged_id table does not exist yet (pre-#255 store / old snapshot)."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='purged_id'"
+        ).fetchone()
+        if row is None:
+            return set()
+        return {r[0] for r in conn.execute("SELECT id FROM purged_id")}
+    except sqlite3.Error:
+        return set()
+
+
+def _is_purged(conn: sqlite3.Connection, mid: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='purged_id'"
+    ).fetchone()
+    if row is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM purged_id WHERE id=?", (mid,)).fetchone() is not None
+
+
 def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                  capture_mode: str | None = None,
                  dedup_cache: dict | None = None,
@@ -1139,6 +1163,16 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             if started_tx and conn.in_transaction:
                 conn.rollback()
             return "skipped"
+
+        # Issue #255: the purge deny-list. An id that is absent because it was
+        # PURGED must not read as "genuinely new" -- a peer export that still
+        # holds it would silently resurrect the purged content. Skip (and
+        # count) instead of inserting; the tombstone branch above never runs
+        # for a purged id because the row is absent entirely.
+        if _is_purged(conn, mid):
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            return "purged_denied"
 
         # The id is genuinely new -- capture policy now applies. _apply_capture_policy
         # is pure (no DB, no I/O -- see lines 893-929). It runs inside the open
@@ -1480,28 +1514,42 @@ def _strict_ingest_staged(
     existing_memory = {r[0] for r in conn.execute("SELECT id FROM memory")}
     existing_episode = {r[0] for r in conn.execute("SELECT id FROM episode")}
     existing_evidence = {r[0] for r in conn.execute("SELECT id FROM evidence")}
+    # Issue #255: a deny-listed id is known-but-unrecreatable -- references to
+    # it pass pre-validation (the reference is not "unknown"), but the memory
+    # row itself is skipped by _ingest_row and the child-record loops below
+    # soft-fail those references instead of aborting the whole import.
+    # The deny-list covers ids from every purged object surface. Memory ids
+    # take the main path below; evidence ids are also skipped so an export
+    # captured before purge cannot resurrect an orphaned excerpt.
+    purged_ids = _purged_ids(conn)
     for table, obj in rows:
         if table == "episode" and obj.get("summary_memory_id"):
-            if obj["summary_memory_id"] not in memory_ids | existing_memory:
+            if obj["summary_memory_id"] not in (
+                    memory_ids | existing_memory | purged_ids):
                 raise ValueError("episode summary references an unknown memory")
         elif table == "memory":
             for entry in obj.get("_links", []):
-                if entry["dst"] not in memory_ids | existing_memory:
+                if entry["dst"] not in (
+                        memory_ids | existing_memory | purged_ids):
                     raise ValueError("memory link references an unknown memory")
         elif table == "episode_memory":
             if obj["episode_id"] not in episode_ids | existing_episode:
                 raise ValueError("episode_memory references an unknown episode")
-            if obj["memory_id"] not in memory_ids | existing_memory:
+            if obj["memory_id"] not in (
+                    memory_ids | existing_memory | purged_ids):
                 raise ValueError("episode_memory references an unknown memory")
         elif table == "episode_evidence":
             if obj["episode_id"] not in episode_ids | existing_episode:
                 raise ValueError("episode_evidence references an unknown episode")
-            if obj["evidence_id"] not in evidence_ids | existing_evidence:
+            if obj["evidence_id"] not in (
+                    evidence_ids | existing_evidence | purged_ids):
                 raise ValueError("episode_evidence references unknown evidence")
         elif table == "memory_evidence":
-            if obj["memory_id"] not in memory_ids | existing_memory:
+            if obj["memory_id"] not in (
+                    memory_ids | existing_memory | purged_ids):
                 raise ValueError("memory_evidence references an unknown memory")
-            if obj["evidence_id"] not in evidence_ids | existing_evidence:
+            if obj["evidence_id"] not in (
+                    evidence_ids | existing_evidence | purged_ids):
                 raise ValueError("memory_evidence references unknown evidence")
 
     savepoint = "zmem_strict_ingest"
@@ -1533,14 +1581,22 @@ def _strict_ingest_staged(
                 strict_diagnostics.append(diagnostic.getvalue())
             if outcome in ("tombstone_refused", "capture_refused"):
                 raise ValueError(f"strict import refused memory row {obj['id']}")
-            if obj.get("_links"):
+            # purged_denied rows are skipped, never fatal (issue #255): their
+            # links are dropped with them rather than added from a dead src.
+            if outcome != "purged_denied" and obj.get("_links"):
                 pending_links.append((obj["id"], obj["_links"]))
 
         for table, obj in rows:
             if table == "episode":
-                if obj["summary_memory_id"] and conn.execute(
+                summary_id = obj["summary_memory_id"]
+                if summary_id and summary_id in purged_ids:
+                    # Issue #255: the summary row was purged away -- import the
+                    # episode with the no-summary value instead of resurrecting
+                    # the pointer (the legacy path's F12 dangling-pointer fix).
+                    summary_id = ""
+                if summary_id and conn.execute(
                     "SELECT 1 FROM memory WHERE id=?",
-                    (obj["summary_memory_id"],),
+                    (summary_id,),
                 ).fetchone() is None:
                     raise ValueError("episode summary reference disappeared during import")
                 conn.execute(
@@ -1548,11 +1604,13 @@ def _strict_ingest_staged(
                     "(id, namespace, started_at, ended_at, summary_memory_id, token_count) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (obj["id"], obj["namespace"], obj["started_at"],
-                     obj["ended_at"], obj["summary_memory_id"], obj["token_count"]),
+                     obj["ended_at"], summary_id, obj["token_count"]),
                 )
 
         for table, obj in rows:
             if table == "episode_memory":
+                if obj["memory_id"] in purged_ids:
+                    continue  # issue #255: membership of a purged row is dropped
                 if conn.execute(
                     "SELECT 1 FROM episode WHERE id=?", (obj["episode_id"],)
                 ).fetchone() is None or conn.execute(
@@ -1565,9 +1623,19 @@ def _strict_ingest_staged(
                     (obj["episode_id"], obj["memory_id"], obj.get("added_at", "")),
                 )
 
+        # Issue #255: an evidence row whose only junctions point at a purged
+        # memory would otherwise re-insert the purged row's excerpt text (the
+        # excerpt frequently quotes tool-call input verbatim). Collect those
+        # ids first and skip them in the apply loop below.
+        purged_orphan_evidence = {
+            obj["evidence_id"] for table, obj in rows
+            if table == "memory_evidence" and obj["memory_id"] in purged_ids
+        }
         for table, obj in rows:
-            if table != "evidence":
+            if table != "evidence" or obj["id"] in purged_ids:
                 continue
+            if obj["id"] in purged_orphan_evidence:
+                continue  # issue #255: excerpt of a purged memory stays gone
             existing = conn.execute(
                 "SELECT session_id, lane, moment, kind, ts, hash, excerpt, "
                 "ref_path, ref_offset FROM evidence WHERE id=?", (obj["id"],)
@@ -1590,6 +1658,8 @@ def _strict_ingest_staged(
             from storelib.links import add_link
             for src, entries in pending_links:
                 for entry in entries:
+                    if entry["dst"] in purged_ids:
+                        continue  # issue #255: link to a purged row is dropped
                     add_link(
                         conn, src, entry["dst"], entry["relation"],
                         entry["score"], created_at=entry["created_at"] or None,
@@ -1597,6 +1667,9 @@ def _strict_ingest_staged(
 
         for table, obj in rows:
             if table == "episode_evidence":
+                if (obj["evidence_id"] in purged_orphan_evidence
+                        or obj["evidence_id"] in purged_ids):
+                    continue  # issue #255: junction for purged evidence is dropped
                 parent = conn.execute(
                     "SELECT 1 FROM episode WHERE id=?", (obj["episode_id"],)
                 ).fetchone()
@@ -1611,6 +1684,9 @@ def _strict_ingest_staged(
                     (obj["episode_id"], obj["evidence_id"]),
                 )
             elif table == "memory_evidence":
+                if (obj["memory_id"] in purged_ids
+                        or obj["evidence_id"] in purged_ids):
+                    continue  # issue #255/#256: evidence for a purged memory is dropped
                 parent = conn.execute(
                     "SELECT 1 FROM memory WHERE id=?", (obj["memory_id"],)
                 ).fetchone()

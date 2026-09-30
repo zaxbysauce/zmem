@@ -1716,14 +1716,144 @@ own `integrity_check` **before** touching the destination, then takes a
 deliberately outside the retention glob so rotation can never prune it), clears
 stale `-wal`/`-shm` sidecars, copies, and re-verifies the restored store.
 
-Takes **both** maintenance locks (`backup` and `consolidate`) for its whole
-duration, so it cannot race the automated background snapshot/consolidation the
-SessionStart hook fires, and refuses a destination that is not on a local
-filesystem (no UNC/network/OneDrive path). If either lock is held it exits **2**
+Takes the **full maintenance lock ladder** — `maintenance`, `schema`, `backup`,
+and `consolidate` — for its whole duration, and refuses when a live writer
+lease exists, so it cannot race the automated background snapshot/consolidation
+the SessionStart hook fires, and refuses a destination that is not on a local
+filesystem (no UNC/network/OneDrive path). If any lock is held it exits **2**
 without touching the destination — a skipped restore must never look like a
-completed one. This does *not* serialize against a live interactive session's
-own `add`/`recall` writes, which take no lock: still run `restore` when no
-session is actively writing.
+completed one. A live interactive session's own `add`/`recall` writes are
+blocked for the restore's duration (writers wait on the maintenance gate and
+fail clearly after a short timeout): still run `restore` when no session is
+actively writing.
+
+### Passive-lane credential withhold (issue #256)
+The hook-driven `recall --for-injection` path re-scans every selected row
+with the **credential** patterns from the write-time registry
+(`SECRET_CREDENTIAL_PATTERNS` — key=value shapes, PEM headers, `gh*_`
+tokens, AKIA keys; plus whatever shapes issue #180 adds). A matching row is
+delivered as an id+type-only bullet marked `[WITHHELD: SECRET]`: its
+content, source_ref, tags, and entity names never reach the hook payload or
+the model context, it is not counted in `surfaced_count`, and the delivery
+ledger entry for it carries no credential text. The JSON envelope gains
+`secret_withheld` (a count) **only when a withhold happened** — clean runs
+stay byte-identical. Ordinary rows are untouched: rows carrying plain
+40-hex git SHAs render normally (the generic hex/base64 detectors are
+deliberately NOT used at read time). The re-scan runs BEFORE the token
+budget, so a credential straddling the budget cut is withheld whole — never
+leaked as a clipped fragment — and `--for-injection` applies it on the
+no-session lane too (explicit `recall`/`recent`/`get` WITHOUT
+`--for-injection` remain plain explicit calls and are not filtered).
+Sibling envelopes the selector
+builds for silent/kill-switch reasons never carry the key. Known residuals:
+a credential stored ONLY as an entity `canonical_name`/alias is not
+detected — it renders in the fence's entity line and rides into the
+delivery ledger via the entry text (issue #180-adjacent; purge covers the
+store rows, not the entity tables, for those shapes); and the withheld
+bullet's metadata (id, type, namespace, confidence, signal) plus the
+`secret_withheld` counter still reveal to the model THAT a secret exists,
+by design. To remove a
+confirmed secret from the store entirely, use `purge` (#255); rotation of
+any credential that was ever passively delivered remains mandatory.
+
+### purge — durably remove a memory's content (issue #255)
+```
+python <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]
+```
+`update`/`invalidate` **tombstone** a row — the plaintext survives in the row,
+the FTS index, side tables, derived copies and ledger files. `purge` is the
+operator primitive that actually removes content, and it takes **ids ONLY**.
+**Never pass secret text on a command line in a hooked session**: the evidence
+writer records tool-call input into `evidence` rows and would re-insert the
+fragment.
+
+What one purge does:
+- resolves the id plus its verified `update_of` predecessor chain and deletes
+  those `memory` rows, their FTS entries, their `memory_vec` rows (by
+  `memory_id`) and every id-keyed side-table row (`memory_link`, both
+  endpoints; `memory_entity`, `episode_memory`, `memory_evidence`,
+  `belief_head_source`, `belief_head_evidence`);
+- deletes evidence rows and entity/alias rows the purge orphaned (evidence a
+  surviving row still references is kept);
+- **rewrites, deletes, or refuses** derived copies that carry the text:
+  consolidation keepers (the `\n\n--- merged from <id> ---\n` block
+  is stripped and entities re-linked), belief heads (rebuilt from surviving
+  sources, or deleted when sourceless), and extractive episode-summary rows
+  (episodes that contained a purged member lose their summary row — expect
+  deletion, not surgical editing). A keeper refuses the whole purge (exit 4,
+  naming the row, nothing deleted) when `merged_from` names a purged id but
+  its stored block header is missing (the content was compressed or drifted),
+  or when an 8+-character token of the absorbed block still appears in the
+  keeper's own text — the byte-verify suppresses needles that a surviving row
+  holds, so that residue could not otherwise be distinguished from a clean
+  rewrite;
+- compacts the store (FTS `'optimize'`, `VACUUM`, WAL checkpoint) and
+  **byte-verifies** the result: a case-insensitive scan of `store.sqlite` and
+  `-wal` must find no copy of the purged content. Exit **5** means the text
+  still lives somewhere outside the memory rows (the message names the
+  needle): typically an evidence row no memory references — the rescan that
+  owns those is issue #181;
+- scrubs the ids (and any needle-bearing entry) from the `<data>/ops/*.ledger`
+  delivery ledgers and removes orphaned `.ledger.tmp.*` partial writes. The
+  `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl` ops sidecars are NOT
+  scrubbed (outside the ledger contract) — treat them as residue surfaces;
+- records the ids in the `purged_id` deny-list so `ingest-jsonl` will not
+  re-insert them from a peer export (child records referencing a purged id
+  are skipped or blanked, never fatal);
+- if a post-commit compaction, ledger scrub, or snapshot scrub fails, a later
+  `purge --id` for the deny-listed id resumes the cleanup phases. The retry
+  derives its scrub needles from each surviving snapshot row, so it does not
+  require the original plaintext as a command-line argument. A scrub retry
+  never re-verifies the live store (the purged rows are absent, so no live
+  needles can be derived) and says so instead of claiming a clean verify;
+- `--scrub-backups --out-dir DIR` applies the same removal inside every
+  `store-*.sqlite` **and** `prerestore-*.sqlite` snapshot in DIR, rewriting
+  files **in place** (never deleted, truncated, or renamed) and re-verifying
+  each with `integrity_check`.
+
+Vector erasure is fail-closed: when a `memory_vec` table exists, purge must
+load sqlite-vec and verify that no vector rows remain for the deleted ids. If
+the extension cannot be loaded, the purge refuses rather than claiming the
+vectors were erased. `--scrub-backups --out-dir DIR` also requires DIR to be
+an existing local directory.
+
+Locking: the full `restore` posture (maintenance → schema → backup →
+consolidate locks, plus a live-writer refusal), so nothing can write between
+the deletes and the byte verification.
+
+Exit codes: **0** purged and verified clean; **2** bad usage; **3** unknown
+id (named); **4** refused (maintenance/schema/backup/consolidate lock or live
+writer); **5** residue remains in the store or ledgers — OR transient
+delivery-ledger lock contention (re-run; the message names which); **6**
+compaction/scrub step failed.
+
+Post-commit cleanup failures leave the deny-list entry in place by design;
+re-run purge for that id after fixing the named surface. `import-store.py
+--force` and `restore` from a pre-purge snapshot are explicit whole-store
+replacements — they supersede both the removal and the deny-list, so **re-run
+purge after either** (a restore's `prerestore-*` safety
+copy of the pre-restore store preserves the deny-list rows recorded between
+snapshot and restore, so the ids to re-purge are recoverable by SQL from that
+copy). Purge is also honest about a structural carve-out in the byte
+verification: memory content that is a substring of SQLite's own schema DDL
+text (contrived single-word contents like `namespace`) cannot be
+distinguished from schema bytes, so no needle is scanned for it. Surviving
+rows that still quote purged-content tokens (e.g. a mid-chain `update`
+successor, kept by design) are listed as WARNINGs in the summary. On exit **5**
+the deny-list rows are already recorded while content may remain: clean the
+named surface, then delete those rows from `purged_id` (or re-purge the
+surviving carrier) so peer imports stay denied only while content exists.
+Detection scope note: the read-time-style scan here covers the row's
+content, source_ref and tags; a credential stored ONLY as an entity
+name is not detected by purge's needle scan or by the passive lane's
+withhold (issue #180-adjacent residual). Keeper rewrite note: a
+consolidation keeper whose own base text shares words or short phrases
+with the absorbed text keeps those shared fragments after the strip —
+they are indistinguishable from the keeper's own vocabulary; the
+full purged text is always removed or the purge refuses, and the
+byte-verify's novel-token needles cover genuinely novel residue. Peer
+imports skip evidence rows that were junctioned to a purged memory
+(including their episode junctions), so purged excerpts stay gone.
 
 ### sweep — prune stale per-session cooldown sentinels
 ```

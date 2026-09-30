@@ -315,6 +315,7 @@ class EnvelopeContractTest(unittest.TestCase):
         }
         expected_optional = {
             "injection_risk", "candidate_lanes", "budget_note", "effective_ops",
+            "secret_withheld",
         }
         self.assertEqual(set(INJECTION_ENVELOPE_REQUIRED), expected_required)
         self.assertEqual(set(INJECTION_ENVELOPE_OPTIONAL), expected_optional)

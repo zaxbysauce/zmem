@@ -10,15 +10,72 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.71.0] - 2026-09-28
+## [0.74.0] - 2026-09-30
 
 ### Added
-- **Governed training capture and deterministic export (issue #135)**: existing
+- **Governed training capture and deterministic export (issue #135):** existing
   host hooks automatically retain bounded, redacted partial captures; only
   acknowledged captures with verified outcomes are exportable. Added local
   governance and revocation controls, independent reviewer acceptance,
   deterministic SFT and preference Parquet, bounded quarantine, and
   manifest-last publication.
+
+## [0.72.0] - 2026-09-28
+
+### Added
+- **Read-time credential withhold on the passive injection lane** (issue
+  #256). The injection lane (`recall --for-injection` as the hooks drive it)
+  now re-scans every selected row with `SECRET_CREDENTIAL_PATTERNS` — the
+  credential half of the write-time registry only, never the generic
+  hex/base64 half, so rows carrying plain 40-hex git SHAs still render. On a
+  match the row is replaced by an id+type-only `[WITHHELD: SECRET]` marker
+  before rendering, telemetry, and the delivery ledger: no credential text
+  reaches the hook payload, the model context, `surfaced_count`, or
+  `<data>/ops/*.ledger`. Classification runs BEFORE the token budget — a
+  credential straddling the budget cut is withheld whole, never leaked as a
+  clipped fragment — and covers the no-session `--for-injection` lane as
+  well. A `secret_withheld` count joins the JSON envelope
+  (only when a withhold happened — zero-withhold envelopes stay
+  byte-identical). No new store writes; the prompt-injection re-scan and the
+  #114 rendered-row law are untouched. Shapes issue #180 adds to the
+  registry are picked up automatically; until then the `sshpass -p` shape
+  stays unwithheld (CI runs the dependency-independent test classes; no
+  workflow executes the gated AC6 class — the trace gates that replay it
+  are human-run, not CI; see the ci.yml comment). Documented residuals: a
+  credential stored only as an entity name is not withheld (it renders in
+  the entity line and its text reaches the delivery ledger), and the
+  withheld bullet's metadata plus the `secret_withheld` counter reveal
+  that a secret exists. Removal of a confirmed secret is `purge`
+  (#255, 0.71.0).
+
+## [0.71.0] - 2026-09-28
+
+### Added
+- **`purge --id`: durable, byte-level removal of a memory's content** (issue
+  #255). `update`/`invalidate` tombstone; `purge` removes: the `memory` rows
+  (plus the verified `update_of` predecessor chain), FTS entries, `memory_vec`
+  rows by `memory_id`, and every id-keyed side-table row. Derived copies that
+  carry the text verbatim (consolidation keepers, belief heads, extractive
+  episode summaries) are rewritten — keepers re-link their entities — deleted,
+  or the purge refuses naming the row. The store is compacted (FTS `'optimize'`,
+  `VACUUM`, WAL checkpoint) under the full `restore` lock ladder and
+  **byte-verified**: a case-insensitive scan of `store.sqlite`/`-wal` (and the
+  `<data>/ops/*.ledger` delivery ledgers, which are scrubbed by id and by
+  needle) must find no copy of the purged content. Purged ids land in a
+  `purged_id` deny-list (additive, schema-version-independent) that
+  `ingest-jsonl` consults so a peer export cannot re-insert them; strict
+  imports skip child records referencing a purged id instead of aborting.
+  `purge --scrub-backups --out-dir DIR` rewrites `store-*` AND `prerestore-*`
+  snapshots in place (never deleted/truncated) with the same removal and an
+  `integrity_check` re-verify. Exit ladder: 0 clean, 2 usage, 3 unknown id,
+  4 lock/live-writer refusal, 5 residue remains, 6 compaction or
+  backup-scrub failure; a retry of a deny-listed id resumes post-commit
+  cleanup, vector erasure fails closed when sqlite-vec cannot be loaded,
+  and a keeper still quoting an absorbed token outside its merged block
+  refuses the purge rather than passing byte-verify. See the
+  `purge` section in the memory skill docs for operator caveats (never pass
+  secret text on a command line; restore/`import-store --force` supersede a
+  purge).
 
 ## [0.70.0] - 2026-09-27
 

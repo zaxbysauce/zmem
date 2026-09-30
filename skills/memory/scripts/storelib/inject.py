@@ -48,19 +48,23 @@ INJECTION_ENVELOPE_REQUIRED = frozenset({
     "budget_truncated", "budget_dropped_protected", "arms", "rendered",
 })
 INJECTION_ENVELOPE_OPTIONAL = frozenset({
-    "injection_risk", "candidate_lanes", "budget_note", "effective_ops",
+    "injection_risk", "candidate_lanes", "budget_note",
+    # Issue #256: present only when a credential withhold happened.
+    "secret_withheld",
+    # Issue #135: capture-only operation metadata, enabled by host adapters.
+    "effective_ops",
 })
 
 
 def _capture_envelope_enabled() -> bool:
     """Expose capture-only delivery metadata for host adapter subprocesses.
 
-    The launcher sets ``ZMEM_CAPTURE`` in its child environment.  Keeping the
-    field opt-in at this boundary preserves the established CLI wire shape for
-    direct store callers while letting automatic host capture receive the exact
-    operation tokens selected for this injection.
+    The launcher sets ``ZMEM_CAPTURE`` in its child environment. Keeping the
+    field opt-in preserves the established CLI wire shape for direct callers
+    while allowing automatic host capture to receive selected operation tokens.
     """
     return "ZMEM_CAPTURE" in os.environ and os.environ.get("ZMEM_CAPTURE", "").strip() != "0"
+
 
 # Best-effort single-source-of-truth for the protected type literals; the
 # fallbacks keep this module importable with no schema_meta on sys.path.
@@ -1059,6 +1063,36 @@ def select_and_budget_for_injection(
         if not candidate_ids:
             candidate_ids = [r.get("id") for r in rows
                              if isinstance(r, dict) and isinstance(r.get("id"), str)]
+        # Issue #256: read-time credential re-scan on the passive lane —
+        # the defense-in-depth twin of the prompt-injection re-scan. Every
+        # selected row matching SECRET_CREDENTIAL_PATTERNS (content /
+        # source_ref / tags) is replaced by an id+type-only withheld marker
+        # BEFORE rendering, the bump list, and the ledger. No new store
+        # writes: the row is never mutated, only its delivery is filtered.
+        withheld_rows = []
+        displayed_rows = []
+        for row in rows:
+            if isinstance(row, dict) and (
+                    # F-267-1: rows classified pre-budget in recall.py arrive
+                    # already flagged (their clipped content no longer
+                    # matches the patterns, so the re-scan alone would miss
+                    # them) — trust the flag first.
+                    row.get("withheld_for_secret")
+                    or recall_module._classify_credential(row)):
+                withheld_rows.append(row)
+                displayed_rows.append({
+                    "id": row.get("id", ""),
+                    "type": row.get("type", ""),
+                    "confidence": row.get("confidence", 0.0),
+                    "signal": row.get("signal", "none"),
+                    "namespace": row.get("namespace", ""),
+                    "content": "",
+                    "withheld_for_secret": True,
+                })
+            else:
+                displayed_rows.append(row)
+        rows = displayed_rows
+        secret_withheld_count = len(withheld_rows)
         excluded = [rid for rid in exclusions if rid in candidate_ids]
         if not rows and candidate_ids and excluded and set(candidate_ids) <= set(excluded):
             reason = "already-delivered"
@@ -1083,6 +1117,14 @@ def select_and_budget_for_injection(
         present = [row for row in present
                    if not row.get("link_relation")
                    and not row.get("_graph_arrival_only")]
+        # Issue #256: a withheld row is not rendered content (#114 rendered-row
+        # law) — never bumped, never ledgered. Shape-dependent backstop: today
+        # the [WITHHELD: SECRET] prefix already fails rows_present_in's
+        # marker whitelist, but that auto-drop depends on the fence shape; if
+        # the marker ever matched, this filter is the sole bump/ledger guard
+        # (proven by the c-iso mutation probe).
+        present = [row for row in present
+                   if not row.get("withheld_for_secret")]
         if present:
             try:
                 recall_module._bump_telemetry(
@@ -1103,10 +1145,11 @@ def select_and_budget_for_injection(
             budget_dropped=parsed.get("budget_dropped", 0),
             budget_admission=parsed.get("budget_admission", 0),
             budget_truncated=parsed.get("budget_truncated", 0),
-            budget_dropped_protected=parsed.get("budget_dropped_protected", 0),
-            arms=parsed.get("arms", {}), rendered=rendered,
-            effective_ops=list(effective_ops) if _capture_envelope_enabled() else None,
-            injection_risk=parsed.get("injection_risk"),
+             budget_dropped_protected=parsed.get("budget_dropped_protected", 0),
+             arms=parsed.get("arms", {}), rendered=rendered,
+             effective_ops=list(effective_ops) if _capture_envelope_enabled() else None,
+             injection_risk=parsed.get("injection_risk"),
+            secret_withheld=secret_withheld_count or None,
             candidate_lanes=parsed.get("candidate_lanes"),
             budget_note=parsed.get("budget_note") if rows else None,
         )

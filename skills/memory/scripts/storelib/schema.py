@@ -1263,6 +1263,19 @@ _BELIEF_SCHEMA_DDL = (
 )
 
 
+# v-independent additive table (issue #255): the purge deny-list. Rows are
+# written by `purge` and consulted by ingest-jsonl's absent-id branch so a
+# purged id cannot be re-inserted from a peer export.
+_PURGE_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS purged_id (
+      id        TEXT PRIMARY KEY,
+      purged_at TEXT NOT NULL
+    )
+    """,
+)
+
+
 # Issue #135: governed training capture is local-only side storage.  These
 # additive tables deliberately run independently of the numbered migration
 # sequence: clients that understand v14 continue to share the same schema
@@ -1404,6 +1417,32 @@ _TRAINING_CAPTURE_SCHEMA_OBJECTS = {
     "training_export_snapshot_binding",
     "training_capture_observation", "training_observation_capture_idx",
 }
+
+
+def _ensure_purged_table(conn: sqlite3.Connection) -> None:
+    """Create the additive purge deny-list table atomically (issue #255)."""
+    savepoint = "zmem_purge_ddl"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _PURGE_SCHEMA_DDL:
+            conn.execute(ddl)
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
 
 
 def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
@@ -1935,6 +1974,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     # so older clients keep their additive-window contract; the IF NOT EXISTS
     # block is idempotent and atomic (see _ensure_belief_tables).
     _ensure_belief_tables(conn)
+    _ensure_purged_table(conn)
     _ensure_training_capture_tables(conn)
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to

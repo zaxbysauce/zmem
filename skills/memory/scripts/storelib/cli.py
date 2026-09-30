@@ -1907,6 +1907,37 @@ def main():
                            help="where to put the pre-restore backup (default: same as "
                                 "`backup`)")
 
+    p_purge = _add_parser(
+        "purge", help="durably remove a memory's content (byte-level: rows, "
+                      "FTS terms, side tables, derived copies, ledger files)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Takes ids ONLY. Never pass secret text on a command line in a\n"
+            "hooked session: the evidence writer records tool input into\n"
+            "evidence rows and would re-insert the fragment.\n"
+            "\n"
+            "Exit codes:\n"
+            "  0  purged, compacted, byte-verified clean\n"
+            "  2  bad usage (missing --id / --scrub-backups without --out-dir)\n"
+            "  3  unknown id (names the ids; nothing was changed)\n"
+            "  4  refused: maintenance/schema/backup/consolidate lock or live writer\n"
+            "  5  residue detected after compaction (store or ledger)\n"
+            "  6  compaction or backup-scrub step failed\n"
+        ))
+    p_purge.add_argument("--id", dest="ids", action="append", required=True,
+                         metavar="ID",
+                         help="memory id to purge (repeatable). Ids ONLY — "
+                              "purge never accepts content text")
+    p_purge.add_argument("--scrub-backups", action="store_true",
+                         help="also rewrite matching backup snapshots "
+                              "(store-* AND prerestore-*) in --out-dir in "
+                              "place; files are never deleted or truncated")
+    p_purge.add_argument("--out-dir", default=None,
+                         help="backup directory for --scrub-backups")
+    p_purge.add_argument("--json", dest="as_json", action="store_true",
+                         help="print the purge summary as JSON")
+
+
     p_export_pack = _add_parser(
         "export-pack",
         help="render a Tier 1 markdown memory pack for a namespace (project + user:global)",
@@ -2555,6 +2586,16 @@ def main():
     if args.cmd == "restore":
         sys.exit(cmd_restore(from_path=args.from_path, force=args.force,
                              out_dir=args.out_dir))
+
+    # `purge` owns its full maintenance lock ladder (maintenance -> schema ->
+    # backup -> consolidate -> live-writer refusal, the cmd_restore posture)
+    # and its own open/close-per-step compaction work, so — like `restore`
+    # above — it is dispatched BEFORE connect()/init_db()/migrate() and the
+    # normal writer-lease flow.
+    if args.cmd == "purge":
+        from storelib.purge import cmd_purge
+        sys.exit(cmd_purge(ids=args.ids, scrub_backups=args.scrub_backups,
+                           out_dir=args.out_dir, as_json=args.as_json))
 
     # `sweep` is pure file maintenance (removes stale cooldown markers), never
     # touches the store itself, so — like `failures`/`restore` above — it is
