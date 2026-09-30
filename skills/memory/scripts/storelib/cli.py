@@ -1988,20 +1988,39 @@ def main():
 
     # Explicit trusted local adapters. Existing hooks call the state-machine
     # APIs directly and never manufacture an acknowledgement or completion.
-    p_capture_delivery = _add_parser("capture-training-delivery",
-                                     help="create a governed capture and delivery snapshot")
-    p_capture_delivery.add_argument("--input", required=True, help="JSON input file")
+    p_capture_delivery = _add_parser(
+        "capture-training-delivery",
+        help="create a local redacted capture and immutable delivery snapshot",
+    )
+    p_capture_delivery.add_argument(
+        "--input", required=True,
+        help="reviewed JSON delivery payload; host observations do not authorize export",
+    )
     p_capture_ack = _add_parser("capture-training-acknowledge",
-                                help="record a trusted delivery acknowledgement")
-    p_capture_ack.add_argument("--input", required=True, help="JSON input file")
+                                help="record a trusted local delivery acknowledgement")
+    p_capture_ack.add_argument(
+        "--input", required=True,
+        help="reviewed JSON acknowledgement payload for a delivery snapshot",
+    )
     p_capture_completion = _add_parser("capture-training-completion",
-                                       help="complete an acknowledged training capture")
-    p_capture_completion.add_argument("--input", required=True, help="JSON input file")
+                                       help="complete an acknowledged capture with verified evidence")
+    p_capture_completion.add_argument(
+        "--input", required=True,
+        help="reviewed JSON completion payload; verifier and outcome evidence are required",
+    )
     p_capture_review = _add_parser(
         "capture-training-review",
-        help="record an independent local review (protects against accidental self-review)",
+        help="record an independent local review; uses ZMEM_TRAINING_REVIEWER_IDS",
+        description=(
+            "Record an independent local review. Set "
+            "ZMEM_TRAINING_CALLER_ID for the local caller and "
+            "ZMEM_TRAINING_REVIEWER_IDS for the comma-separated reviewer allow-list."
+        ),
     )
-    p_capture_review.add_argument("--input", required=True, help="JSON input file")
+    p_capture_review.add_argument(
+        "--input", required=True,
+        help="reviewed JSON review payload; reviewer must differ from the verifier",
+    )
     p_capture_revoke = _add_parser(
         "capture-training-revoke",
         help="terminally revoke one local training capture by capture or delivery id",
@@ -2018,13 +2037,33 @@ def main():
         "--confirm", action="store_true", default=False,
         help="confirm permanent deletion of expired local capture records",
     )
-    p_training_export = _add_parser("export-training",
-                                    help="write reviewed governed training views")
-    p_training_export.add_argument("dir", help="output directory")
-    p_training_export.add_argument("--snapshot-id", dest="snapshot_id", default=None)
-    p_training_export.add_argument("--reviewer-confirmed", action="store_true", default=False)
-    p_training_export.add_argument("--namespace", default=None)
-    p_training_export.add_argument("--quarantine-raw", action="store_true", default=False)
+    p_training_export = _add_parser(
+        "export-training",
+        help="write reviewed, redacted SFT and preference Parquet views",
+        description=(
+            "Export only acknowledged, verifier-completed, governed captures. "
+            "SQLite remains authoritative; output is disposable operator-owned data."
+        ),
+    )
+    p_training_export.add_argument(
+        "dir", help="output directory; final manifest is written last"
+    )
+    p_training_export.add_argument(
+        "--snapshot-id", dest="snapshot_id", default=None,
+        help="immutable export snapshot binding to use as the source boundary",
+    )
+    p_training_export.add_argument(
+        "--reviewer-confirmed", action="store_true", default=False,
+        help="required local operator authorization after review and governance checks",
+    )
+    p_training_export.add_argument(
+        "--namespace", default=None,
+        help="optional project namespace filter; output uses an opaque project label",
+    )
+    p_training_export.add_argument(
+        "--quarantine-raw", action="store_true", default=False,
+        help="also write bounded redacted quarantine data under DIR/quarantine",
+    )
 
     _add_parser("stats", help="store statistics")
 
@@ -3549,6 +3588,9 @@ def main():
                 payload = training_capture_payload
                 assert payload is not None
                 capture_id = capture_id_for_delivery_snapshot(conn, payload.get("delivery_snapshot_id"))
+                assert_training_capture_replay_binding(
+                    conn, capture_id, _capture_replay_identity(payload)
+                )
                 caller = _trusted_training_caller()
                 capture = acknowledge_training_delivery(
                     conn, capture_id, attestation=_trusted_acknowledgement(payload, caller),

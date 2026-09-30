@@ -142,8 +142,9 @@ not unlimited streams. Point recall at the snapshot by running later commands wi
 Training views are a local, reviewed projection of completed task captures.
 They are separate from `export-dataset`: the training exporter never syncs
 capture rows, transcript text, embeddings, or event vectors, and it never
-publishes to a remote service. The four local capture tables are retained for
-the doctor and backup/restore paths, while ordinary sync remains unchanged.
+publishes to a remote service. The local capture, review, correlation, and
+snapshot-binding tables are retained for the doctor and backup/restore paths,
+while ordinary sync remains unchanged.
 
 Every automatic Claude, Codex, ZCode, and Hermes hook may create a partial
 capture, but capture governance defaults to deny. A denied or missing policy
@@ -202,6 +203,23 @@ through that snapshot id. Replaying identical trusted input is idempotent.
 No host callback may supply `source_memory_ids` as export authority or infer a
 verified outcome from observations.
 
+An independent local review is required for reviewer-acceptance corrections:
+
+```bash
+ZMEM_TRAINING_CALLER_ID=operator-a \
+ZMEM_TRAINING_REVIEWER_IDS=operator-b \
+python skills/memory/scripts/store.py capture-training-review \
+  --input review.json
+```
+
+`ZMEM_TRAINING_CALLER_ID` identifies the trusted local operator invoking the
+adapter. `ZMEM_TRAINING_REVIEWER_IDS` is a comma-separated allow-list, and the
+reviewer must differ from the verifier recorded in the completion. These
+environment variables establish a local workflow boundary; they do not claim
+that a hostile process on the same machine is an external reviewer. Correlation
+keys and host task ids are local metadata used to associate delivery and
+observations, never export authority.
+
 ### Exporting reviewed views
 
 Install the declared training dependency in the same Python environment that
@@ -212,13 +230,17 @@ python -m pip install --disable-pip-version-check \
   -r skills/memory/scripts/requirements-training.txt
 ```
 
-For Hermes, install the server requirements in the Hermes/store-host
-environment; that file includes the same PyArrow range:
+The Hermes server requirements contain only the MCP server dependencies. They do
+not install the optional training exporter, so installing them alone keeps
+PyArrow out of the shared host environment:
 
 ```bash
 python -m pip install --disable-pip-version-check \
   -r hermes-plugin/server/requirements.txt
 ```
+
+Install `requirements-training.txt` separately in the interpreter that runs
+`export-training` when Parquet output is needed.
 
 After installing or updating a plugin, reload the host so its cache uses the
 new release tree, then run the read-only doctor and confirm the training
@@ -279,16 +301,21 @@ Doctor does not inspect the writer lock and cannot prove that an export is
 inactive, so the confirmation flag is an operator assertion; consumers still
 reject any output missing its final manifest.
 
-The Hermes `sync_turn` callback always records a fresh partial. It establishes a
+The Hermes `sync_turn` callback automatically attempts to record a fresh partial. It establishes a
 reusable association before detached observations only when the host supplies
 an explicit `capture_key` or `turn_id`; otherwise the partial remains keyless.
-The capture subprocess is intentionally synchronous and has a 1.2-second bound,
-and it can still contend with the store's 5-second SQLite busy timeout.
-Capture failures remain fail-open to the host. The Claude, Codex, and ZCode
-launcher start path is also synchronous with the same 1.2-second subprocess
-bound and the same possible SQLite contention. The outer launcher watchdog is
-12 seconds (12000 ms); it protects the host hook process and does not turn a
-partial capture into an acknowledgement, outcome, or verified export.
+The Hermes capture subprocess is intentionally synchronous and has its own
+5-second per-operation bound. It can still contend with the store's 5-second
+SQLite busy timeout, and capture may add up to 5 seconds to `sync_turn` or the
+session-end maintenance path. There is no whole-callback wall-clock guarantee;
+capture failures remain fail-open to the host. The Claude, Codex, and ZCode
+launcher start path is also synchronous with a private 5-second capture cap,
+clamped to the remaining 12-second watchdog deadline with a 500 ms output
+reserve. A full 5-second capture leaves roughly 6.5–7 seconds for the rest of
+the path, so the watchdog can preempt recall even though the store recall
+budget is 8 seconds. The outer launcher watchdog protects the host hook process
+and does not turn a partial capture into an acknowledgement, outcome, or
+verified export.
 
 Capture retention is local SQLite retention. Purging expired rows does not
 remove earlier operator-owned training output folders or their published

@@ -1,7 +1,7 @@
 [
   {
     "task_id": "cap-pref",
-    "project_key": "fixture",
+    "project_key": "project-dc76d5d7535765135981ea8e",
     "session_id": "fixture-session",
     "episode_id": "fixture-episode",
     "prompt": "Review the corrected migration procedure.",
@@ -35,8 +35,8 @@
     "content_license": "fixture-license",
     "redaction_status": "redacted",
     "redaction_policy_version": "policy-v1",
-    "split_key": "7d68cc11d5ee2fa7bfa8d2e7933505a3080bd70a7f09caa9ba35b56fd067ce57",
+    "split_key": "train",
     "transform_version": "fixture-transform",
-    "row_checksum": "55fe6319af1387f636ee99f2e378c81ccdfa58ee969d2c49dcfb93fd09a96ed1"
+    "row_checksum": "7f2fd76e1ac19d34f7ca93fc0216150491830614f188c7202704a99b815da197"
   }
 ]

@@ -21,6 +21,17 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _isolated_env(overrides: dict[str, str]) -> dict[str, str]:
+    """Keep the host runtime while removing inherited zmem/store selectors."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("ZMEM_")
+        and key not in {"CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "PLUGIN_DATA"}
+    }
+    env.update(overrides)
+    return env
+
+
 @contextmanager
 def _plugin_context():
     plugins = types.ModuleType("plugins")
@@ -49,6 +60,44 @@ def _plugin_context():
 
 
 class HermesTrainingCaptureTests(unittest.TestCase):
+    def test_real_capture_subprocess_uses_the_private_five_second_cap(self):
+        with _plugin_context() as plugin:
+            completed = types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+            with mock.patch.dict(
+                os.environ, _isolated_env({"ZMEM_HOME": str(ROOT), "ZMEM_CAPTURE": "1"}),
+                clear=True,
+            ), \
+                 mock.patch.object(plugin, "_python_bin", return_value=sys.executable), \
+                 mock.patch.object(plugin.subprocess, "run", return_value=completed) as run:
+                self.assertEqual(plugin._run_training_capture("start", {"session_id": "timeout"}), {})
+            self.assertEqual(run.call_args.kwargs["timeout"], 5.0)
+
+    def test_explicit_preinit_prefetch_renders_without_lifecycle_mutation(self):
+        with _plugin_context() as plugin:
+            provider = plugin.ZmemMemoryProvider()
+            provider._transport = mock.Mock()
+            provider._transport.prefetch.return_value = {
+                "rendered": "preinit context", "effective_ops": [], "transform_version": "v1",
+            }
+            before = (provider._session_id, provider._namespace, provider._turn_epoch,
+                      list(provider._turn_tickets), provider._omitted_turn_callbacks_blocked)
+            with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "0", "ZMEM_INJECT": "1"}, clear=False), \
+                 mock.patch.object(plugin, "_run_training_capture") as capture:
+                self.assertEqual(
+                    provider.prefetch("preinit prompt", session_id="preinit-session"),
+                    "preinit context",
+                )
+            self.assertEqual(
+                (provider._session_id, provider._namespace, provider._turn_epoch,
+                 list(provider._turn_tickets), provider._omitted_turn_callbacks_blocked),
+                before,
+            )
+            provider._transport.prefetch.assert_called_once_with(
+                "preinit prompt", namespace="user:global", session_id="preinit-session",
+                moment="user_prompt", ops_tokens=[], lane="hermes-provider",
+            )
+            capture.assert_not_called()
+
     def test_sync_turn_starts_governed_partial_without_asserting_outcome(self):
         with _plugin_context() as plugin:
             provider = plugin.ZmemMemoryProvider()
@@ -130,7 +179,9 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                     plugin, "_run_training_capture",
                     return_value={"capture_id": "capture-hermes", "state": "partial"},
                 ) as start:
-                    provider.sync_turn("prompt", "response", session_id="session-hermes")
+                    provider.sync_turn(
+                        "prompt", "response", session_id="session-hermes", task_id="task-hermes",
+                    )
 
             self.assertEqual(len(calls), 1)
             action, payload = calls[0]
@@ -139,6 +190,8 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             self.assertEqual(payload["effective_ops"], envelope["effective_ops"])
             self.assertEqual(payload["transform_version"], "v2")
             self.assertEqual(payload["capture_key"], start.call_args.args[1]["capture_key"])
+            self.assertEqual(start.call_args.args[1]["host_task_id"], "task-hermes")
+            self.assertEqual(payload["host_task_id"], "task-hermes")
 
     def test_official_lifecycle_rejects_ambiguous_repeated_prompt(self):
         with _plugin_context() as plugin:
@@ -775,14 +828,24 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 "effective_ops": ["zmem_search"],
                 "transform_version": "v1",
             }
-            with mock.patch.dict(os.environ, env, clear=False):
+            observed_starts = []
+            original_capture = plugin._run_training_capture
+
+            def capture(action, payload):
+                result = original_capture(action, payload)
+                if action == "start":
+                    observed_starts.append(result)
+                return result
+
+            with mock.patch.dict(os.environ, _isolated_env(env), clear=True), \
+                 mock.patch.object(plugin, "_run_training_capture", side_effect=capture):
                 provider.on_turn_start(
                     1, "real adapter prompt", session_id="session-hermes-real",
                 )
                 provider.prefetch("real adapter prompt", session_id="session-hermes-real")
                 provider.sync_turn(
                     "real adapter prompt", "real adapter response",
-                    session_id="session-hermes-real",
+                    session_id="session-hermes-real", task_id="real-task",
                 )
                 deadline = time.monotonic() + 5.0
                 while time.monotonic() < deadline:
@@ -813,7 +876,69 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(len(rows), 1)
+            self.assertEqual(len(observed_starts), 1)
+            self.assertEqual(observed_starts[0]["state"], "partial")
+            self.assertEqual(observed_starts[0]["capture_id"], rows[0][0])
             self.assertEqual(rows[0][1], "real adapter context")
+
+    def test_standalone_turn_real_adapter_commits_without_a_sidecar(self):
+        with _plugin_context() as plugin, tempfile.TemporaryDirectory(
+            prefix="zmem-hermes-standalone-"
+        ) as temporary:
+            root = Path(temporary)
+            store = root / "store.sqlite"
+            env = {
+                "ZMEM_HOME": str(ROOT),
+                "ZMEM_STORE": str(store),
+                "ZMEM_DATA": str(root / "data"),
+                "ZMEM_CAPTURE": "1",
+                "ZMEM_EMBED_PROFILE": "fake",
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_MODELS_DIR": str(root / "models"),
+                "PYTHONUTF8": "1",
+                "ZMEM_CAPTURE_CONSENT_SCOPE": "local-training",
+                "ZMEM_CAPTURE_CONTENT_LICENSE": "CC-BY-4.0",
+                "ZMEM_CAPTURE_REDACTION_POLICY_VERSION": "policy-v1",
+            }
+            provider = plugin.ZmemMemoryProvider()
+            provider._session_id = "session-hermes-standalone"
+            # Content-bearing captures require a project scope.  This remains
+            # standalone because there is no claimed turn ticket; its namespace
+            # must still satisfy the shared store's governance contract.
+            provider._namespace = "project:hermes-standalone"
+            observed_starts = []
+            original_capture = plugin._run_training_capture
+
+            def capture(action, payload):
+                result = original_capture(action, payload)
+                if action == "start_standalone":
+                    observed_starts.append(result)
+                return result
+
+            with mock.patch.dict(os.environ, _isolated_env(env), clear=True), \
+                 mock.patch.object(plugin, "_run_training_capture", side_effect=capture):
+                provider.sync_turn(
+                    "standalone prompt", "standalone response",
+                    session_id="session-hermes-standalone",
+                )
+
+            self.assertTrue(store.is_file())
+            conn = sqlite3.connect(store)
+            try:
+                rows = conn.execute(
+                    "SELECT capture_id, state FROM training_capture"
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(len(observed_starts), 1)
+            self.assertEqual(observed_starts[0]["state"], "partial")
+            self.assertEqual(observed_starts[0]["capture_id"], rows[0][0])
+            self.assertTrue(rows[0][0])
+            self.assertIn(rows[0][1], {"partial", "emitted_to_host"})
+            self.assertEqual(
+                list((store.parent / "training-capture").glob("*.json")), []
+            )
 
     def test_capture_marker_is_scoped_to_the_store_child(self):
         with _plugin_context() as plugin:

@@ -414,7 +414,9 @@ class TrainingViewsContractTests(unittest.TestCase):
         self.assertEqual(row["source_event_ids"], ["evidence-selected"])
         self.assertEqual(row["evidence_ref"], "evidence-selected")
         self.assertNotIn("event-other", row["source_event_ids"])
-        self.assertEqual(self._manifest(output)["namespace"], "project:selected")
+        manifest = self._manifest(output)
+        self.assertRegex(manifest["namespace"], r"^project-[0-9a-f]{24}$")
+        self.assertNotIn("project:selected", json.dumps(manifest))
 
     def test_unknown_delivery_snapshot_fails_closed_without_forking_capture(self) -> None:
         self._init_store()

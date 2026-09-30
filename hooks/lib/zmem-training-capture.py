@@ -20,20 +20,25 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 _MAX_INPUT_BYTES = 64 * 1024
 _MAX_OBSERVATION_BYTES = 4_000
 _STATE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+_LOCK_TIMEOUT_SECONDS = 0.8
 _DEFAULT_GOVERNANCE_SOURCE = "configured_local_policy"
+_USE_PRIVATE_STANDALONE_BOOTSTRAP = False
 _OBSERVATION_KINDS = frozenset({
     "pre_tool", "post_tool", "post_tool_failure", "stop", "user_prompt",
     "post_tool_call", "turn",
@@ -52,6 +57,47 @@ def _first_text(mapping: Mapping[str, Any], *names: str, limit: int = 4096) -> s
         if value:
             return value
     return ""
+
+
+def _identity_text(mapping: Mapping[str, Any], *names: str, limit: int) -> str:
+    """Read an identity field without prefix truncation or fallback aliasing."""
+    for name in names:
+        value = mapping.get(name)
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if not candidate:
+            continue
+        if len(candidate.encode("utf-8")) > limit:
+            return ""
+        return candidate
+    return ""
+
+
+def _content_text(mapping: Mapping[str, Any], *names: str) -> tuple[bool, str | None]:
+    """Return complete input for the store redactor, never a clipped prefix."""
+    for name in names:
+        value = mapping.get(name)
+        if not isinstance(value, str):
+            continue
+        if len(value.encode("utf-8")) > _MAX_INPUT_BYTES:
+            return False, None
+        return True, value
+    return True, None
+
+
+def _has_oversized_identity(payload: Mapping[str, Any]) -> bool:
+    for names, limit in (
+        (("host",), 80),
+        (("session_id", "sessionId", "namespace"), 512),
+        (("task_id", "taskId", "host_task_id", "hostTaskId"), 512),
+        (("capture_key", "captureKey", "turn_id", "turnId"), 512),
+    ):
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, str) and value.strip() and len(value.strip().encode("utf-8")) > limit:
+                return True
+    return False
 
 
 def _bounded_json(value: object, limit: int = _MAX_OBSERVATION_BYTES) -> str | None:
@@ -94,8 +140,78 @@ def _data_dir(env: Mapping[str, str] | None = None) -> Path:
 
 
 def _state_path(session_id: str, env: Mapping[str, str] | None = None) -> Path:
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    # State keys are store-issued correlation digests, never host identifiers.
+    digest = _text(session_id, limit=128)
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        digest = hashlib.sha256(digest.encode("utf-8")).hexdigest()
     return _data_dir(env) / "training-capture" / f"{digest}.json"
+
+
+def _lock_path(session_key: str, env: Mapping[str, str] | None = None) -> Path:
+    return _data_dir(env) / "training-capture" / "locks" / f"{session_key}.lock"
+
+
+class _SessionLock:
+    """A stable, process-scoped lock file that is never removed on release."""
+
+    def __init__(self, session_key: str, env: Mapping[str, str]) -> None:
+        self.path = _lock_path(session_key, env)
+        self.handle: Any | None = None
+        self.locked = False
+
+    def __enter__(self) -> "_SessionLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+b")
+        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                self.handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if time.monotonic() >= deadline:
+                    try:
+                        self.handle.close()
+                    except OSError:
+                        pass
+                    self.handle = None
+                    raise TimeoutError("capture_lock_timeout")
+                time.sleep(0.01)
+                continue
+            self.locked = True
+            try:
+                # LK_NBLCK needs a byte at offset zero.  On Windows a held
+                # byte-range lock denies another handle's read, so initialize
+                # an empty stable file only after acquiring that byte.
+                if os.fstat(self.handle.fileno()).st_size == 0:
+                    self.handle.seek(0)
+                    self.handle.write(b"0")
+                    self.handle.flush()
+                return self
+            except BaseException:
+                self.__exit__(None, None, None)
+                raise
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        if self.handle is None:
+            return
+        try:
+            if self.locked:
+                self.handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+            self.locked = False
 
 
 def _valid_capture_id(value: object) -> str:
@@ -185,7 +301,84 @@ def _governance(env: Mapping[str, str] | None = None) -> dict[str, str | None]:
     }
 
 
+def _api_from_modules(schema: Any, capture: Any) -> dict[str, Any]:
+    """Expose the exact capture surface shared by normal and private imports."""
+    return {
+        "connect": schema.connect,
+        "prepare": schema._prepare_store,
+        "start": capture.start_training_capture,
+        "start_correlated": capture.start_correlated_training_capture,
+        "observe": capture.append_training_capture_observation,
+        "observe_correlated": capture.append_correlated_training_capture_observation,
+        "snapshot": capture.record_training_delivery_snapshot,
+        "snapshot_correlated": capture.record_correlated_training_delivery_snapshot,
+        "clear_correlated": capture.clear_correlated_training_session,
+        "identity_keys": capture.training_capture_identity_keys,
+    }
+
+
+def _private_storelib_child(name: str, path: Path, package: Any) -> Any:
+    """Load one real child module and give the private package normal attributes."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load {name}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    setattr(package, name.rpartition(".")[2], module)
+    return module
+
+
+def _load_private_standalone_api() -> dict[str, Any] | None:
+    """Load real capture modules without the unrelated compatibility package init.
+
+    This applies only to this executable helper's short-lived process.  Imported
+    adapters and every normal store client retain their ordinary package import.
+    On any failure the entire private package prefix is removed before normal
+    import fallback, preventing a compatibility-less shell from leaking there.
+    """
+    scripts = _scripts_dir()
+    if scripts is None:
+        return None
+    storelib = scripts / "storelib"
+    schema_path = storelib / "schema.py"
+    capture_path = storelib / "training_capture.py"
+    existing_prefix = tuple(name for name in sys.modules
+                            if name == "storelib" or name.startswith("storelib."))
+    # Never replace a parent or orphaned child from an embedding process.
+    if existing_prefix or not schema_path.is_file() or not capture_path.is_file():
+        return None
+    inserted_path = str(scripts)
+    if inserted_path not in sys.path:
+        sys.path.insert(0, inserted_path)
+    before = {name for name in sys.modules if name == "storelib" or name.startswith("storelib.")}
+    try:
+        package_spec = importlib.machinery.ModuleSpec("storelib", loader=None, is_package=True)
+        package_spec.submodule_search_locations = [str(storelib)]
+        package = importlib.util.module_from_spec(package_spec)
+        package.__path__ = list(package_spec.submodule_search_locations)
+        sys.modules["storelib"] = package
+        schema = _private_storelib_child("storelib.schema", schema_path, package)
+        capture = _private_storelib_child("storelib.training_capture", capture_path, package)
+        if (Path(schema.__file__).resolve() != schema_path.resolve()
+                or Path(capture.__file__).resolve() != capture_path.resolve()
+                or getattr(package, "schema", None) is not schema
+                or getattr(package, "training_capture", None) is not capture):
+            raise ImportError("private storelib identity check failed")
+        return _api_from_modules(schema, capture)
+    except Exception:
+        for name in tuple(sys.modules):
+            if ((name == "storelib" or name.startswith("storelib."))
+                    and name not in before):
+                sys.modules.pop(name, None)
+        return None
+
+
 def _load_api() -> dict[str, Any]:
+    if _USE_PRIVATE_STANDALONE_BOOTSTRAP:
+        private = _load_private_standalone_api()
+        if private is not None:
+            return private
     scripts = _scripts_dir()
     if scripts is None:
         raise RuntimeError("zmem scripts directory unavailable")
@@ -193,18 +386,8 @@ def _load_api() -> dict[str, Any]:
     if inserted not in sys.path:
         sys.path.insert(0, inserted)
     from storelib import schema  # type: ignore
-    from storelib.training_capture import (  # type: ignore
-        append_training_capture_observation,
-        record_training_delivery_snapshot,
-        start_training_capture,
-    )
-    return {
-        "connect": schema.connect,
-        "prepare": schema._prepare_store,
-        "start": start_training_capture,
-        "observe": append_training_capture_observation,
-        "snapshot": record_training_delivery_snapshot,
-    }
+    from storelib import training_capture  # type: ignore
+    return _api_from_modules(schema, training_capture)
 
 
 def _connection(api: Mapping[str, Any]):
@@ -215,106 +398,133 @@ def _connection(api: Mapping[str, Any]):
     return conn
 
 
+def _lock_timeout() -> dict[str, Any]:
+    """Emit a non-sensitive host diagnostic while preserving fail-open output."""
+    print("capture_lock_timeout", file=sys.stderr)
+    return {}
+
+
 def _session(payload: Mapping[str, Any]) -> str:
     return _first_text(payload, "session_id", "sessionId", limit=512)
 
 
-def _state_key(payload: Mapping[str, Any]) -> str:
-    """Choose an immutable per-turn sidecar key.
-
-    Session ids identify a conversation, not a turn.  A sidecar is therefore
-    written only when the host supplies an explicit turn identity.
-    Keyless starts still create a fresh partial, but later callbacks cannot
-    attach to it through a session or host fallback.
-    """
-    explicit = _first_text(
-        payload, "capture_key", "captureKey", "turn_id", "turnId",
-        limit=512,
-    )
-    if not explicit:
-        return ""
-    session_id = _session(payload)
-    return f"{session_id}:turn:{explicit}" if session_id else f"turn:{explicit}"
+def _identity_fields(payload: Mapping[str, Any], *, require_turn: bool) -> dict[str, str]:
+    fields = {
+        "host": _identity_text(payload, "host", limit=80).lower(),
+        "session_id": _identity_text(payload, "session_id", "sessionId", limit=512),
+        "namespace": _identity_text(payload, "namespace", limit=512),
+        "task_id": _identity_text(payload, "task_id", "taskId", "host_task_id", "hostTaskId", limit=512),
+        "turn_id": _identity_text(payload, "capture_key", "captureKey", "turn_id", "turnId", limit=512),
+    }
+    required = ("host", "session_id", "namespace") + (("task_id", "turn_id") if require_turn else ())
+    return fields if all(fields[name] for name in required) else {}
 
 
-def _correlated_capture_id(payload: Mapping[str, Any], env: Mapping[str, str]) -> str:
-    """Resolve only the store-issued id bound to an explicit sidecar key.
-
-    A callback supplied capture_id is a consistency check, never an authority.
-    A valid but mismatched id fails closed; malformed values are ignored so a
-    keyed host callback can still use its store-owned sidecar correlation.
-    """
-    state_key = _state_key(payload)
-    if not state_key:
-        return ""
-    stored = _read_state_record(state_key, env)
-    if not stored:
-        return ""
-    supplied = payload.get("capture_id")
-    supplied_text = _text(supplied, limit=80)
-    supplied_id = _valid_capture_id(supplied)
-    if supplied_text and supplied_id and supplied_id != stored["capture_id"]:
-        return ""
-    return stored["capture_id"]
+def _identity_keys(payload: Mapping[str, Any], api: Mapping[str, Any], *, require_turn: bool) -> tuple[str, str, dict[str, str]] | None:
+    fields = _identity_fields(payload, require_turn=require_turn)
+    helper = api.get("identity_keys")
+    if not fields or not callable(helper):
+        return None
+    try:
+        correlation_key, session_key = helper(
+            host=fields["host"], session_id=fields["session_id"],
+            namespace=fields["namespace"], task_id=fields["task_id"],
+            turn_id=fields["turn_id"], require_turn=require_turn,
+        )
+    except Exception:
+        return None
+    if not isinstance(session_key, str) or not re.fullmatch(r"[0-9a-f]{64}", session_key):
+        return None
+    if require_turn and (not isinstance(correlation_key, str) or not re.fullmatch(r"[0-9a-f]{64}", correlation_key)):
+        return None
+    return correlation_key, session_key, fields
 
 
 def _start(payload: Mapping[str, Any], env: Mapping[str, str],
            api: Mapping[str, Any], *, persist_sidecar: bool = True) -> dict[str, Any]:
-    # Standalone provider callbacks deliberately skip the host-correlation
-    # sidecar.  Their fresh provider key identifies only the local partial;
-    # later delivery callbacks must never discover or attach to it.
-    state_key = _state_key(payload) if persist_sidecar else ""
-    existing = _read_state_record(state_key, env) if state_key else {}
-    if existing:
-        return {
-            "capture_id": existing["capture_id"],
-            "state": "partial",
-            "redaction_status": "",
-        }
-    session_id = _session(payload)
-    # A keyless callback cannot be correlated by a later host event.  Refuse
-    # content-bearing starts before opening SQLite so an unresolvable turn can
-    # never leave prompt or assistant bytes behind as an orphaned partial.
-    if persist_sidecar and not state_key and (
-        _first_text(payload, "prompt", limit=16_000)
-        or _first_text(payload, "assistant_response", limit=16_000)
-    ):
+    # A correlated start has a complete durable tuple.  Standalone starts are
+    # intentionally unmapped but still require a complete scope for the closed
+    # session check in the store transaction.
+    if _has_oversized_identity(payload):
         return {}
-    host = _first_text(payload, "host", limit=80).lower()
-    namespace = _first_text(payload, "namespace", limit=512)
+    session_id = _identity_text(payload, "session_id", "sessionId", limit=512)
+    host = _identity_text(payload, "host", limit=80).lower()
+    namespace = _identity_text(payload, "namespace", limit=512)
     if not host:
         return {}
-    governance = _governance(env)
-    conn = _connection(api)
-    try:
-        row = api["start"](
-            conn,
-            host=host,
-            session_id=session_id or None,
-            namespace=namespace or None,
-            host_task_id=_first_text(payload, "host_task_id", "hostTaskId", limit=512) or None,
-            cwd=_first_text(payload, "cwd", limit=4096) or None,
-            prompt=_first_text(payload, "prompt", limit=16_000) or None,
-            assistant_response=_first_text(payload, "assistant_response", limit=16_000) or None,
-            **governance,
-        )
-    finally:
-        conn.close()
-    capture_id = _valid_capture_id(
-        row.get("capture_id") if isinstance(row, dict) else ""
-    )
-    if not capture_id:
+    prompt_ok, prompt = _content_text(payload, "prompt")
+    response_ok, response = _content_text(payload, "assistant_response")
+    if not prompt_ok or not response_ok:
         return {}
-    generation = str(uuid.uuid4())
-    if state_key:
-        _write_state(state_key, capture_id, env, generation=generation)
-    return {
-        "capture_id": capture_id,
-        "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
-        "redaction_status": _text(
-            row.get("redaction_status") if isinstance(row, dict) else "", limit=64
-        ),
+    governance = _governance(env)
+    kwargs = {
+        "host": host, "session_id": session_id or None, "namespace": namespace or None,
+        "host_task_id": _first_text(payload, "host_task_id", "hostTaskId", limit=512) or None,
+        "cwd": _first_text(payload, "cwd", limit=4096) or None,
+        "prompt": prompt,
+        "assistant_response": response,
+        **governance,
     }
+    identity = _identity_keys(payload, api, require_turn=persist_sidecar)
+    if identity is None:
+        # Preserve the automatic, metadata-only partial contract for hosts that
+        # did not provide enough identity to correlate a turn.  Content-bearing
+        # fields are dropped because no later callback can prove their
+        # association.  No sidecar or mapping is created on this path.
+        kwargs["prompt"] = None
+        kwargs["assistant_response"] = None
+        try:
+            conn = _connection(api)
+            try:
+                row = api["start"](conn, **kwargs)
+            finally:
+                conn.close()
+        except (OSError, ValueError):
+            return {}
+        capture_id = _valid_capture_id(row.get("capture_id") if isinstance(row, dict) else "")
+        if not capture_id:
+            return {}
+        return {
+            "capture_id": capture_id,
+            "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
+            "redaction_status": _text(row.get("redaction_status") if isinstance(row, dict) else "", limit=64),
+        }
+    correlation_key, session_key, fields = identity
+    try:
+        with _SessionLock(session_key, env):
+            conn = _connection(api)
+            try:
+                if persist_sidecar:
+                    row = api["start_correlated"](
+                        conn, task_id=fields["task_id"], turn_id=fields["turn_id"], **kwargs,
+                    )
+                else:
+                    row = api["start"](conn, **kwargs)
+            finally:
+                conn.close()
+            capture_id = _valid_capture_id(
+                row.get("capture_id") if isinstance(row, dict) else ""
+            )
+            if not capture_id:
+                return {}
+            if persist_sidecar:
+                previous = _read_state_record(correlation_key, env)
+                generation = (
+                    previous.get("generation")
+                    if previous.get("capture_id") == capture_id else str(uuid.uuid4())
+                )
+                _write_state(correlation_key, capture_id, env, generation=generation)
+            return {
+                "capture_id": capture_id,
+                "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
+                "redaction_status": _text(
+                    row.get("redaction_status") if isinstance(row, dict) else "", limit=64
+                ),
+            }
+    except TimeoutError:
+        return _lock_timeout()
+    except (OSError, ValueError):
+        return {}
 
 
 def _observation_kind(payload: Mapping[str, Any]) -> str:
@@ -323,33 +533,39 @@ def _observation_kind(payload: Mapping[str, Any]) -> str:
 
 
 def _observe(payload: Mapping[str, Any], env: Mapping[str, str],
-             api: Mapping[str, Any]) -> dict[str, Any]:
-    capture_id = _correlated_capture_id(payload, env)
-    if not capture_id:
+              api: Mapping[str, Any]) -> dict[str, Any]:
+    identity = _identity_keys(payload, api, require_turn=True)
+    if identity is None:
         return {}
+    _correlation_key, session_key, fields = identity
     observation = payload.get("observation")
     if observation is None:
         observation = payload.get("meta", payload)
     encoded = _bounded_json(observation)
-    conn = _connection(api)
     try:
-        return api["observe"](
-            conn,
-            capture_id,
-            observation_kind=_observation_kind(payload),
-            payload=encoded,
-        )
-    finally:
-        conn.close()
+        with _SessionLock(session_key, env):
+            conn = _connection(api)
+            try:
+                return api["observe_correlated"](
+                    conn, host=fields["host"], session_id=fields["session_id"],
+                    namespace=fields["namespace"], task_id=fields["task_id"],
+                    turn_id=fields["turn_id"], observation_kind=_observation_kind(payload),
+                    payload=encoded,
+                )
+            finally:
+                conn.close()
+    except TimeoutError:
+        return _lock_timeout()
+    except (OSError, ValueError):
+        return {}
 
 
 def _snapshot(payload: Mapping[str, Any], env: Mapping[str, str],
               api: Mapping[str, Any]) -> dict[str, Any]:
-    state_key = _state_key(payload)
-    before = _read_state_record(state_key, env)
-    capture_id = _correlated_capture_id(payload, env)
-    if not capture_id or not before:
+    identity = _identity_keys(payload, api, require_turn=True)
+    if identity is None:
         return {}
+    correlation_key, session_key, fields = identity
     rendered = payload.get("rendered")
     if not isinstance(rendered, str):
         return {}
@@ -358,38 +574,74 @@ def _snapshot(payload: Mapping[str, Any], env: Mapping[str, str],
         effective_ops = []
     if len(effective_ops) > 128 or not all(isinstance(item, str) for item in effective_ops):
         return {}
-    conn = _connection(api)
     try:
-        row = api["snapshot"](
-            conn,
-            capture_id,
-            rendered=rendered,
-            effective_ops=effective_ops,
-            transform_version=_first_text(payload, "transform_version", limit=512) or "v1",
-        )
-    finally:
-        conn.close()
-    delivery_snapshot_id = _valid_capture_id(
-        row.get("delivery_snapshot_id") if isinstance(row, dict) else ""
-    )
-    # A detached snapshot may finish after a newer start has replaced this
-    # sidecar.  Only preserve its immutable delivery identity when the state
-    # still names the same generation and store-issued capture id.
-    after = _read_state_record(state_key, env)
-    if (delivery_snapshot_id and after.get("capture_id") == before["capture_id"]
-            and after.get("generation") == before["generation"]):
-        _write_state(
-            state_key,
-            before["capture_id"],
-            env,
-            generation=before["generation"],
-            delivery_snapshot_id=delivery_snapshot_id,
-        )
-    return {
-        "capture_id": capture_id,
-        "delivery_snapshot_id": delivery_snapshot_id,
-        "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
-    }
+        with _SessionLock(session_key, env):
+            before = _read_state_record(correlation_key, env)
+            conn = _connection(api)
+            try:
+                row = api["snapshot_correlated"](
+                    conn, host=fields["host"], session_id=fields["session_id"],
+                    namespace=fields["namespace"], task_id=fields["task_id"],
+                    turn_id=fields["turn_id"], rendered=rendered,
+                    effective_ops=effective_ops,
+                    transform_version=_first_text(payload, "transform_version", limit=512) or "v1",
+                )
+            finally:
+                conn.close()
+            delivery_snapshot_id = _valid_capture_id(
+                row.get("delivery_snapshot_id") if isinstance(row, dict) else ""
+            )
+            capture_id = _valid_capture_id(row.get("capture_id") if isinstance(row, dict) else "")
+            # A detached snapshot may finish after a newer start has replaced
+            # this sidecar.  Preserve delivery identity only for the same
+            # durable correlation generation, while the session lock is held.
+            after = _read_state_record(correlation_key, env)
+            if (delivery_snapshot_id and before and after.get("capture_id") == before.get("capture_id")
+                    and after.get("generation") == before.get("generation")):
+                _write_state(
+                    correlation_key, before["capture_id"], env,
+                    generation=before["generation"], delivery_snapshot_id=delivery_snapshot_id,
+                )
+            return {
+                "capture_id": capture_id,
+                "delivery_snapshot_id": delivery_snapshot_id,
+                "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
+            }
+    except TimeoutError:
+        return _lock_timeout()
+    except (OSError, ValueError):
+        return {}
+
+
+def _clear_correlated(payload: Mapping[str, Any], env: Mapping[str, str],
+                      api: Mapping[str, Any]) -> dict[str, Any]:
+    identity = _identity_keys(payload, api, require_turn=False)
+    if identity is None:
+        return {}
+    _correlation_key, session_key, fields = identity
+
+    def remove_sidecars(keys: Sequence[str]) -> None:
+        for key in keys:
+            try:
+                _state_path(key, env).unlink(missing_ok=True)
+            except OSError as exc:
+                raise RuntimeError("capture_sidecar_clear_failed") from exc
+
+    try:
+        with _SessionLock(session_key, env):
+            conn = _connection(api)
+            try:
+                api["clear_correlated"](
+                    conn, host=fields["host"], session_id=fields["session_id"],
+                    namespace=fields["namespace"], remove_sidecars=remove_sidecars,
+                )
+            finally:
+                conn.close()
+        return {}
+    except TimeoutError:
+        return {"error": "capture_busy"}
+    except (OSError, ValueError):
+        return {}
 
 
 def run_action(payload: Mapping[str, Any], *, env: Mapping[str, str] | None = None,
@@ -400,12 +652,11 @@ def run_action(payload: Mapping[str, Any], *, env: Mapping[str, str] | None = No
         if _text(values.get("ZMEM_CAPTURE"), limit=32).strip() == "0":
             return {}
         action = _first_text(payload, "action", limit=32)
+        loaded = api if api is not None else _load_api()
         if action == "clear":
-            _clear_state(_state_key(payload), values)
-            return {}
+            return _clear_correlated(payload, values, loaded)
         if action not in {"start", "start_standalone", "observe", "snapshot"}:
             return {}
-        loaded = api if api is not None else _load_api()
         if action in {"start", "start_standalone"}:
             return _start(
                 payload, values, loaded,
@@ -438,4 +689,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    _USE_PRIVATE_STANDALONE_BOOTSTRAP = True
     raise SystemExit(main())

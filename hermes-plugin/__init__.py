@@ -77,7 +77,7 @@ _NATIVE_EVIDENCE_WORKERS = 2
 _NATIVE_EVIDENCE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=_NATIVE_EVIDENCE_QUEUE_MAX)
 _NATIVE_EVIDENCE_START_LOCK = threading.Lock()
 _NATIVE_EVIDENCE_STARTED = False
-_TRAINING_CAPTURE_TIMEOUT_S = 1.2
+_TRAINING_CAPTURE_TIMEOUT_S = 5.0
 _TRAINING_CAPTURE_INFLIGHT_MAX = 4
 _TRAINING_CAPTURE_INFLIGHT = threading.BoundedSemaphore(_TRAINING_CAPTURE_INFLIGHT_MAX)
 # Retain enough time for genuinely long-running agent turns while bounding
@@ -1756,7 +1756,11 @@ class ZmemMemoryProvider(MemoryProvider):
             active_session = self._session_id
             if explicit_session and active_session and explicit_session != active_session:
                 return ""
-            if not active_session:
+            # An explicit provider request may arrive before Hermes' session
+            # lifecycle initializes.  It is transport-only: do not allocate a
+            # ticket, mutate the epoch, mark an omitted callback, or attach a
+            # capture envelope until an active session exists.
+            if not active_session and not explicit_session:
                 return ""
             sid = explicit_session or active_session
             namespace = self._namespace
@@ -1786,7 +1790,7 @@ class ZmemMemoryProvider(MemoryProvider):
         # An omitted prefetch has no callback identity.  It may provide
         # ordinary passive context in the initial epoch, but it must never
         # attach an envelope to an explicit ticket.
-        if explicit_session:
+        if explicit_session and active_session:
             self._remember_turn_prefetch(sid, namespace, epoch, q, envelope)
         return envelope["rendered"]
 
@@ -2408,6 +2412,10 @@ class ZmemMemoryProvider(MemoryProvider):
         """
         try:
             ticket = self._claim_turn_ticket(session_id, user_content)
+            task_id = str(
+                kwargs.get("task_id") or kwargs.get("taskId")
+                or kwargs.get("host_task_id") or kwargs.get("hostTaskId") or ""
+            ).strip()
             if ticket is None:
                 if not isinstance(user_content, str) or not isinstance(assistant_content, str):
                     return None
@@ -2421,6 +2429,7 @@ class ZmemMemoryProvider(MemoryProvider):
                     "session_id": sid,
                     "namespace": namespace,
                     "capture_key": str(uuid.uuid4()),
+                    **({"host_task_id": task_id} if task_id else {}),
                     "cwd": os.getcwd(),
                     "prompt": user_content,
                     "assistant_response": assistant_content,
@@ -2439,6 +2448,7 @@ class ZmemMemoryProvider(MemoryProvider):
                     "session_id": sid,
                     "namespace": namespace,
                     "capture_key": capture_key,
+                    **({"host_task_id": task_id} if task_id else {}),
                     "cwd": os.getcwd(),
                     "prompt": user_content if isinstance(user_content, str) else "",
                     "assistant_response": (
@@ -2463,6 +2473,7 @@ class ZmemMemoryProvider(MemoryProvider):
                         "session_id": sid,
                         "namespace": namespace,
                         "capture_key": capture_key,
+                        **({"host_task_id": task_id} if task_id else {}),
                         "rendered": envelope["rendered"],
                         "effective_ops": envelope["effective_ops"],
                         "transform_version": envelope["transform_version"],

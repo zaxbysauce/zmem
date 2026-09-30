@@ -72,6 +72,22 @@ class RedactTextHelperTest(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(redacted, "before [REDACTED_SECRET], after")
 
+    def test_bearer_consumes_every_supported_terminal_character(self):
+        for terminal in "._+/~-":
+            with self.subTest(terminal=terminal):
+                token = "A" * 16 + terminal
+                redacted, count = redact_text(f"Bearer {token}, after")
+                self.assertEqual(count, 1)
+                self.assertEqual(redacted, "[REDACTED_SECRET], after")
+
+    def test_bearer_boundary_keeps_short_and_long_tokens_distinct(self):
+        for terminal in "._+/~-":
+            with self.subTest(terminal=terminal):
+                short = "Bearer " + ("A" * 14) + terminal
+                exact = "Bearer " + ("A" * 15) + terminal
+                self.assertEqual(redact_text(short), (short, 0))
+                self.assertEqual(redact_text(exact), ("[REDACTED_SECRET]", 1))
+
     def test_non_bearer_scheme_is_not_redacted_by_bearer_rule(self):
         text = "Basic " + "A" * 16
         redacted, count = redact_text(text)

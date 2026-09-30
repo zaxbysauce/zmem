@@ -25,17 +25,24 @@ from storelib.evidence import write_evidence  # noqa: E402
 from storelib.schema import SUPPORTED_SCHEMA_VERSION, init_db, migrate  # noqa: E402
 from storelib.training_capture import (  # noqa: E402
     MAX_EVENT_IDS,
+    MAX_OBSERVATION_BYTES,
     MAX_OBSERVATIONS_PER_CAPTURE,
     TrainingCaptureConflict,
+    TrainingCaptureInputRefusal,
     acknowledge_training_delivery,
+    append_correlated_training_capture_observation,
     append_training_capture_observation,
     assert_training_capture_replay_binding,
+    clear_correlated_training_session,
     complete_training_capture,
     purge_expired_training_captures,
     record_training_delivery_snapshot,
+    record_correlated_training_delivery_snapshot,
     review_training_capture,
     revoke_training_capture,
     start_training_capture,
+    start_correlated_training_capture,
+    training_capture_identity_keys,
 )
 from storelib.write import update_memory  # noqa: E402
 
@@ -46,6 +53,9 @@ class TrainingCaptureCoreTest(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         init_db(self.conn)
         migrate(self.conn)
+        self._path_fixture = tempfile.TemporaryDirectory(
+            prefix="zmem-training-core-path-")
+        self._path_root = Path(self._path_fixture.name)
         self.namespace = "project:capture-test"
         self.session_id = "capture-session"
         self.memory_one = self._memory("one")
@@ -54,6 +64,7 @@ class TrainingCaptureCoreTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.conn.close()
+        self._path_fixture.cleanup()
 
     def _memory(self, name: str) -> str:
         memory_id = str(uuid.uuid4())
@@ -502,11 +513,27 @@ class TrainingCaptureCoreTest(unittest.TestCase):
 
     def test_revocation_excludes_capture_and_retention_purges_after_30_days(self) -> None:
         capture_id, _ = self._acknowledged_capture()
+        raw_path = str(self._path_root / "private")
+        raw_reason = (
+            "Удаление пользователя — 用户请求撤回 — alice@example.com at "
+            f"{raw_path} with Bearer " + ("R" * 16) + "."
+        )
         revoked = revoke_training_capture(
-            self.conn, capture_id, reason="user requested removal",
+            self.conn, capture_id, reason=raw_reason,
             revoked_by="trusted-test", revoked_at="2026-01-01T00:00:00Z",
         )
-        self.assertEqual(revoked["revocation_reason"], "user requested removal")
+        persisted_reason = self.conn.execute(
+            "SELECT revocation_reason FROM training_capture WHERE capture_id=?",
+            (capture_id,),
+        ).fetchone()[0]
+        self.assertEqual(revoked["revocation_reason"], persisted_reason)
+        self.assertLessEqual(len(persisted_reason.encode("utf-8")), 512)
+        self.assertNotIn("alice@example.com", persisted_reason)
+        self.assertNotIn(raw_path, persisted_reason)
+        self.assertNotIn("Bearer " + ("R" * 16) + ".", persisted_reason)
+        self.assertIn("[REDACTED_EMAIL]", persisted_reason)
+        self.assertIn("[REDACTED_PATH]", persisted_reason)
+        self.assertIn("[REDACTED_SECRET]", persisted_reason)
         # Caller timestamps are ignored; age the durable store row directly to
         # exercise retention independently of the state-transition clock.
         self.conn.execute(
@@ -682,6 +709,61 @@ class TrainingCaptureCoreTest(unittest.TestCase):
         self.assertNotIn("abcdefghijklmnop", payload)
         self.assertNotIn(alice_home, payload)
 
+    def test_training_observation_redacts_nested_array_keys_and_values(self) -> None:
+        capture = start_training_capture(
+            self.conn, host="test", session_id=self.session_id,
+            namespace=self.namespace, consent_scope="local",
+            content_license="licensed", redaction_policy_version="v1",
+        )
+        raw_email = "nested@example.com"
+        raw_path = str(self._path_root / "nested" / "private-project")
+        raw_bearer = "Bearer " + ("N" * 16) + "."
+        raw_api_key = "api_key=" + ("K" * 20)
+        fixture = {
+            "events": [
+                {
+                    raw_email: raw_bearer,
+                    raw_path: [
+                        {raw_api_key: raw_email},
+                        [{raw_path: raw_bearer}],
+                    ],
+                },
+                [{"arbitrary": {raw_email: raw_path}}],
+            ],
+        }
+        append_training_capture_observation(
+            self.conn, capture["capture_id"], observation_kind="nested",
+            payload=json.dumps(fixture, ensure_ascii=False),
+        )
+        stored = self.conn.execute(
+            "SELECT payload FROM training_capture_observation WHERE capture_id=?",
+            (capture["capture_id"],),
+        ).fetchone()[0]
+        self.assertIsNotNone(stored)
+        self.assertLessEqual(len(stored.encode("utf-8")), MAX_OBSERVATION_BYTES)
+        for raw_value in (raw_email, raw_path, raw_bearer, raw_api_key):
+            self.assertNotIn(raw_value, stored)
+        self.assertIn("[REDACTED_EMAIL]", stored)
+        self.assertIn("[REDACTED_PATH]", stored)
+        self.assertIn("[REDACTED_SECRET]", stored)
+
+        def assert_clean(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    self.assertNotIn(raw_email, key)
+                    self.assertNotIn(raw_path, key)
+                    self.assertNotIn(raw_bearer, key)
+                    self.assertNotIn(raw_api_key, key)
+                    assert_clean(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_clean(child)
+            elif isinstance(value, str):
+                for raw_value in (raw_email, raw_path, raw_bearer, raw_api_key):
+                    self.assertNotIn(raw_value, value)
+
+        assert_clean(json.loads(stored))
+
     def test_training_observations_bound_count_and_event_ids(self) -> None:
         capture = start_training_capture(
             self.conn, host="test", session_id=self.session_id,
@@ -738,6 +820,65 @@ class TrainingCaptureCoreTest(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT count(*) FROM training_capture_observation WHERE capture_id=?", (capture_id,)
         ).fetchone()[0], 1)
+
+    def test_correlated_capture_clear_is_scoped_and_tombstones_late_callbacks(self) -> None:
+        fields = {
+            "host": "claude", "session_id": "session:scope", "namespace": self.namespace,
+            "host_task_id": "task:one",
+        }
+        first = start_correlated_training_capture(
+            self.conn, task_id="task:one", turn_id="turn:one", **fields,
+        )
+        repeated = start_correlated_training_capture(
+            self.conn, task_id="task:one", turn_id="turn:one", **fields,
+        )
+        self.assertEqual(first["capture_id"], repeated["capture_id"])
+        first_key, scope_key = training_capture_identity_keys(
+            host="claude", session_id="session:scope", namespace=self.namespace,
+            task_id="task:one", turn_id="turn:one",
+        )
+        second_key, _ = training_capture_identity_keys(
+            host="claude", session_id="session:scope", namespace=self.namespace,
+            task_id="task", turn_id="one:turn:one",
+        )
+        self.assertNotEqual(first_key, second_key)
+        removed: list[str] = []
+        self.assertEqual(
+            clear_correlated_training_session(
+                self.conn, host="claude", session_id="session:scope", namespace=self.namespace,
+                remove_sidecars=lambda keys: removed.extend(keys),
+            ),
+            [first_key],
+        )
+        self.assertEqual(removed, [first_key])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT count(*) FROM training_capture WHERE capture_id=?", (first["capture_id"],),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT count(*) FROM training_capture_correlation WHERE session_key=?", (scope_key,),
+            ).fetchone()[0],
+            0,
+        )
+        with self.assertRaisesRegex(TrainingCaptureInputRefusal, "session_closed"):
+            start_training_capture(self.conn, **fields)
+        with self.assertRaisesRegex(TrainingCaptureInputRefusal, "session_closed"):
+            append_correlated_training_capture_observation(
+                self.conn, host="claude", session_id="session:scope", namespace=self.namespace,
+                task_id="task:one", turn_id="turn:one", observation_kind="stop", payload="{}",
+            )
+        with self.assertRaisesRegex(TrainingCaptureInputRefusal, "session_closed"):
+            record_correlated_training_delivery_snapshot(
+                self.conn, host="claude", session_id="session:scope", namespace=self.namespace,
+                task_id="task:one", turn_id="turn:one", rendered="context", effective_ops=[],
+            )
+        other = start_training_capture(
+            self.conn, host="claude", session_id="session:scope", namespace="project:other",
+        )
+        self.assertEqual(other["state"], "partial")
 
     def test_update_reason_is_normalized_allowlisted_and_written_to_predecessor(self) -> None:
         with self.assertRaisesRegex(ValueError, "update reason"):

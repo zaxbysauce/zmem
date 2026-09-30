@@ -18,6 +18,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "skills" / "memory" / "scripts" / "store.py"
+# Keep import-time store resolution away from the operator store when this
+# module is run directly or loaded by unittest discovery.
+_IMPORT_TMP = tempfile.TemporaryDirectory(prefix="zmem-training-capture-cli-import-")
+_IMPORT_ROOT = Path(_IMPORT_TMP.name)
+os.environ["ZMEM_STORE"] = str(_IMPORT_ROOT / "store.sqlite")
+os.environ["ZMEM_DATA"] = str(_IMPORT_ROOT / "data")
 sys.path.insert(0, str(ROOT / "skills" / "memory" / "scripts"))
 from storelib import cli as store_cli  # noqa: E402
 from storelib.evidence import write_evidence  # noqa: E402
@@ -197,16 +203,30 @@ class TrainingCaptureCliTests(unittest.TestCase):
         delivery_id = str(uuid.uuid4())
         delivered = self._delivery(self._payload(delivery_id))
         self.assertEqual(delivered.returncode, 0, delivered.stderr)
+        raw_path = str(self.root / "private")
+        raw_reason = (
+            "Удаление пользователя — 用户请求撤回 — alice@example.com at "
+            f"{raw_path} with Bearer " + ("R" * 16) + "."
+        )
         revoked = self._run(
             "capture-training-revoke", "--delivery-snapshot-id", delivery_id,
-            "--reason", "operator removal",
+            "--reason", raw_reason,
         )
         replay = self._run(
             "capture-training-revoke", "--delivery-snapshot-id", delivery_id,
-            "--reason", "operator removal",
+            "--reason", raw_reason,
         )
         self.assertEqual(revoked.returncode, 0, revoked.stderr)
         self.assertEqual(json.loads(revoked.stdout), json.loads(replay.stdout))
+        output = json.loads(revoked.stdout)
+        persisted_reason = output["reason"]
+        self.assertLessEqual(len(persisted_reason.encode("utf-8")), 512)
+        self.assertNotIn("alice@example.com", persisted_reason)
+        self.assertNotIn(raw_path, persisted_reason)
+        self.assertNotIn("Bearer " + ("R" * 16) + ".", persisted_reason)
+        self.assertIn("[REDACTED_EMAIL]", persisted_reason)
+        self.assertIn("[REDACTED_PATH]", persisted_reason)
+        self.assertIn("[REDACTED_SECRET]", persisted_reason)
         conflict = self._run(
             "capture-training-revoke", "--delivery-snapshot-id", delivery_id,
             "--reason", "different reason",

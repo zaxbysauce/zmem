@@ -67,6 +67,10 @@ class TrainingExporterGoldenTests(unittest.TestCase):
                 )
 
             import pyarrow.parquet as pq
+            for filename in ("sft-000.parquet", "preferences-000.parquet"):
+                metadata = pq.read_schema(output / filename).metadata or {}
+                self.assertEqual(metadata.get(b"created_by"), b"zmem-training-v1")
+                self.assertEqual(metadata.get(b"pyarrow_version"), b"25.0.1")
             self.assertEqual(
                 _json_bytes(pq.read_table(output / "sft-000.parquet").to_pylist()),
                 (FIXTURE_DIR / "expected-sft.json").read_bytes(),

@@ -1973,6 +1973,21 @@ python <store.py> capture-training-acknowledge --input acknowledgement.json
 python <store.py> capture-training-completion --input completion.json
 ```
 
+Reviewer-acceptance corrections require a separate local review transition:
+
+```bash
+ZMEM_TRAINING_CALLER_ID=operator-a \
+ZMEM_TRAINING_REVIEWER_IDS=operator-b \
+python <store.py> capture-training-review --input review.json
+```
+
+`ZMEM_TRAINING_CALLER_ID` is the local caller identity and
+`ZMEM_TRAINING_REVIEWER_IDS` is the comma-separated reviewer allow-list. The
+reviewer must differ from the verifier. These values protect the local
+workflow against accidental self-review; they do not provide an external
+reviewer service or a boundary against a hostile local process. Capture ids,
+session keys, and optional host task ids are correlation metadata only.
+
 The delivery response contains the local `capture_id` and immutable
 `delivery_snapshot_id`; later adapters resolve the capture through the snapshot
 id. `host_task_id` is correlation metadata only when the host supplies it.
@@ -2000,12 +2015,17 @@ python -m pip install --disable-pip-version-check \
   -r skills/memory/scripts/requirements-training.txt
 ```
 
-The Hermes server environment can use its packaged requirements file instead:
+The Hermes server environment can install its packaged MCP requirements without
+installing the optional exporter:
 
 ```bash
 python -m pip install --disable-pip-version-check \
   -r hermes-plugin/server/requirements.txt
 ```
+
+Install `requirements-training.txt` separately in the interpreter that runs
+`export-training`; the training extra pins PyArrow `25.0.1` for deterministic
+Parquet bytes.
 
 The read-only doctor reports the exact requirements-file command when PyArrow
 is unavailable. Reload the host after updating a plugin cache and run doctor
@@ -2460,7 +2480,8 @@ one warning).
 | Stage | Value | Override env var | Notes |
 |---|---|---|---|
 | Launcher watchdog | 12000 ms | `ZMEM_LAUNCHER_WATCHDOG_MS` | Kills the child tree at the deadline, emits the retained Tier 0 sentinel, logs `outer_timeout=1 reason=omitted`, exits 0. |
-| Automatic capture start | 1200 ms | - | Synchronous only when the store-issued capture id is needed; observe/snapshot helpers are detached and fail open. This is inside the 12,000 ms launcher watchdog and never asserts acknowledgement or outcome. |
+| Automatic capture start | 5000 ms | - | Synchronous only when the store-issued capture id is needed; observe/snapshot helpers are detached and fail open. The translated launcher clamps this private allocation to the remaining 12,000 ms watchdog deadline minus a 500 ms output reserve, and never asserts acknowledgement or outcome. |
+| Hermes capture subprocess | 5000 ms | - | `sync_turn` and session-end capture use their own per-operation cap and may add up to 5 seconds to that callback or maintenance path. The launcher’s full 5-second start allocation can leave roughly 6.5–7 seconds inside the 12,000 ms watchdog, below the 8-second recall budget, so watchdog preemption is an expected degradation. No whole-callback wall-clock guarantee is made; capture remains fail open. |
 | Namespace resolution | 2000 ms | `ZMEM_NAMESPACE_RESOLVE_MS` | Per interpreter attempt; successful non-empty REMOTE namespaces are cached per process. |
 | Namespace cache TTL | 60000 ms | `ZMEM_NAMESPACE_CACHE_TTL_MS` | Entry expires at exactly TTL; path-key resolutions are never cached. |
 | Store recall | 8000 ms (8.0 s) | `ZMEM_STORE_RECALL_TIMEOUT_S` | SessionStart + the shared recall body. Finite positive float; values above 8.0 clamp to 8.0 (one warning); values below 8.0 are honored. ONE store attempt at SessionStart (no retry loop). |

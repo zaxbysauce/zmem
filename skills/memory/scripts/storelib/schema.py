@@ -1311,6 +1311,7 @@ _PURGE_SCHEMA_DDL = (
     )
     """,
 )
+_PURGE_SCHEMA_OBJECTS = {"purged_id"}
 
 
 # Issue #135: governed training capture is local-only side storage.  These
@@ -1419,6 +1420,22 @@ _TRAINING_CAPTURE_SCHEMA_DDL = (
     """,
     "CREATE INDEX IF NOT EXISTS training_observation_capture_idx "
     "ON training_capture_observation(capture_id, observed_at)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_correlation (
+      correlation_key TEXT PRIMARY KEY,
+      session_key TEXT NOT NULL,
+      capture_id TEXT NOT NULL UNIQUE REFERENCES training_capture(capture_id),
+      created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_capture_correlation_session_idx "
+    "ON training_capture_correlation(session_key)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_closed_session (
+      session_key TEXT PRIMARY KEY,
+      cleared_at TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -1453,11 +1470,15 @@ _TRAINING_CAPTURE_SCHEMA_OBJECTS = {
     "training_capture_review", "training_review_evidence_idx",
     "training_export_snapshot_binding",
     "training_capture_observation", "training_observation_capture_idx",
+    "training_capture_correlation", "training_capture_correlation_session_idx",
+    "training_capture_closed_session",
 }
 
 
 def _ensure_purged_table(conn: sqlite3.Connection) -> None:
     """Create the additive purge deny-list table atomically (issue #255)."""
+    if not _schema_objects_missing(conn, _PURGE_SCHEMA_OBJECTS):
+        return
     savepoint = "zmem_purge_ddl"
     own_transaction = not conn.in_transaction
     if own_transaction:
@@ -1515,7 +1536,7 @@ def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_training_capture_tables(conn: sqlite3.Connection) -> None:
-    """Install Issue #135's four local capture tables atomically.
+    """Install Issue #135's local capture tables atomically.
 
     This must stay version-independent: a numbered migration would violate the
     v14 compatibility contract for automatic partial capture.

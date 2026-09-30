@@ -25,9 +25,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 try:
-    from redaction import redact_secret_like_text
+    from redaction import redact_training_text
 except ImportError:  # pragma: no cover - installed scripts layout
-    from ..redaction import redact_secret_like_text  # type: ignore
+    from ..redaction import redact_training_text  # type: ignore
 
 try:
     from .training_capture import evidence_kind_compatible
@@ -96,10 +96,14 @@ def _text(value: object, *, max_bytes: int | None = None) -> str | None:
 
 
 def _redact(value: object, *, max_bytes: int | None = None) -> str | None:
-    text = _text(value, max_bytes=max_bytes)
+    # Redact before applying the byte budget.  Truncating first can shorten a
+    # Bearer token below the credential matcher floor and leave its prefix in
+    # the exported row.  The training policy also masks email addresses and
+    # filesystem paths, which are export PII even when they are not secrets.
+    text = _text(value)
     if text is None:
         return None
-    text, _ = redact_secret_like_text(text)
+    text, _ = redact_training_text(text)
     if max_bytes is not None:
         text = text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
     return text
@@ -490,6 +494,18 @@ def _episode_for_memories(conn: sqlite3.Connection, memory_ids: Sequence[str]) -
     return sorted(common)[0], None
 
 
+def _opaque_project_label(namespace: str) -> str:
+    """Return a stable label that cannot disclose the source namespace."""
+    payload = {
+        "kind": "training-project-label",
+        "namespace": str(namespace),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"project-{digest[:24]}"
+
+
 def _project_key(memory_rows: Sequence[sqlite3.Row]) -> tuple[str | None, str | None]:
     namespaces = {str(row["namespace"]) for row in memory_rows}
     if len(namespaces) != 1:
@@ -497,7 +513,7 @@ def _project_key(memory_rows: Sequence[sqlite3.Row]) -> tuple[str | None, str | 
     namespace = next(iter(namespaces))
     if not namespace.startswith("project:") or not namespace[8:].strip():
         return None, "invalid_namespace"
-    return namespace[8:], None
+    return _opaque_project_label(namespace), None
 
 
 class _UnionFind:
@@ -898,6 +914,10 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
             "task_id": capture_id,
             "namespace": str(row["namespace"]),
             "project_key": project_key,
+            # Keep the raw project identity only in the in-memory candidate so
+            # the historical split bucket can be reproduced.  It is excluded
+            # from every materialized row and manifest.
+            "_split_identity": str(memory_rows[0]["namespace"])[8:],
             "session_id": str(row["session_id"]),
             "episode_id": episode_id,
             "prompt": _redact(row["prompt"], max_bytes=MAX_CONTEXT_BYTES) or "",
@@ -934,10 +954,14 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
 
 
 def _assign_stable_splits(rows: Sequence[dict[str, Any]]) -> None:
-    """Assign one immutable project split after lineage deduplication."""
+    """Assign one immutable opaque split bucket after lineage deduplication."""
     for item in rows:
-        item["split_key"] = _split_key(str(item["project_key"]))
-        item["split_bucket"] = _split_bucket(str(item["split_key"]))
+        # The raw-derived digest remains internal so the bucket assignment is
+        # byte-for-byte compatible with training-v1.  Publishing that digest
+        # would make the namespace-derived split identity recoverable.
+        split_digest = _split_key(str(item["_split_identity"]))
+        item["_split_bucket"] = _split_bucket(split_digest)
+        item["split_key"] = item["_split_bucket"]
 
 
 def _materialize_sft(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -1129,6 +1153,10 @@ def _write_parquet(path: Path, rows: Sequence[Mapping[str, Any]], schema, pa, pq
     table = pa.table(columns, schema=schema)
     metadata = dict(table.schema.metadata or {})
     metadata[b"created_by"] = b"zmem-training-v1"
+    # Keep the exact writer version beside the byte-stable export marker.  The
+    # training dependency is pinned, and recording it makes regenerated
+    # Parquet goldens auditable when the writer changes.
+    metadata[b"pyarrow_version"] = str(pa.__version__).encode("ascii")
     table = table.replace_schema_metadata(metadata)
     pq.write_table(table, path, compression="zstd", use_dictionary=False,
                    row_group_size=max(1, len(rows)))
@@ -1350,14 +1378,20 @@ def _write_training_views_unlocked(conn: sqlite3.Connection, *, out_dir: str,
                 if verify_started:
                     conn.rollback()
                 raise
-            split_counts = Counter(_split_bucket(str(row["split_key"]))
-                                   for row in sft_rows)
+            split_counts = Counter(str(row["split_key"]) for row in sft_rows)
             manifest: dict[str, Any] = {
                 "schema_version": 1,
                 "format": "parquet",
                 "snapshot_id": snapshot_id,
                 "selection_sha256": source_fingerprint,
-                "namespace": namespace,
+                # A manifest may describe a namespace-filtered export, but it
+                # must not publish that raw path-shaped selector.  The row
+                # project label uses the same stable opaque domain.
+                "namespace": (
+                    _opaque_project_label(namespace)
+                    if isinstance(namespace, str) and namespace.startswith("project:")
+                    else None
+                ),
                 "transform_version": TRANSFORM_VERSION,
                 "embedding_model": embedding_model,
                 "embedding_revision": embedding_revision,

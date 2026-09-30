@@ -1,7 +1,7 @@
 [
   {
     "task_id": "cap-exact-a",
-    "project_key": "fixture",
+    "project_key": "project-dc76d5d7535765135981ea8e",
     "session_id": "fixture-session",
     "episode_id": "fixture-episode",
     "prompt": "Which command should I use for safe deploy?",
@@ -26,15 +26,15 @@
     "content_license": "fixture-license",
     "redaction_status": "redacted",
     "redaction_policy_version": "policy-v1",
-    "split_key": "7d68cc11d5ee2fa7bfa8d2e7933505a3080bd70a7f09caa9ba35b56fd067ce57",
+    "split_key": "train",
     "transform_version": "fixture-transform",
     "label_status": "candidate_positive",
     "exclusion_reason": null,
-    "row_checksum": "2700652795a871f872f8d34966a30562e399259a450e2b303d75821c2fb4ccc0"
+    "row_checksum": "6df462df4c4fec59d2354a7c6422e8cdbc94a68799f544fae65eee66331690a7"
   },
   {
     "task_id": "cap-pref",
-    "project_key": "fixture",
+    "project_key": "project-dc76d5d7535765135981ea8e",
     "session_id": "fixture-session",
     "episode_id": "fixture-episode",
     "prompt": "Review the corrected migration procedure.",
@@ -57,15 +57,15 @@
     "content_license": "fixture-license",
     "redaction_status": "redacted",
     "redaction_policy_version": "policy-v1",
-    "split_key": "7d68cc11d5ee2fa7bfa8d2e7933505a3080bd70a7f09caa9ba35b56fd067ce57",
+    "split_key": "train",
     "transform_version": "fixture-transform",
     "label_status": "candidate_positive",
     "exclusion_reason": null,
-    "row_checksum": "26aedc4476267b607c8f12683bd06e45905e317ff33055e1e3cf8f76f9542f8a"
+    "row_checksum": "f4b2fd02c02f488404a6783cc5c5154f44c323249c59029507f2271cce457eb2"
   },
   {
     "task_id": "cap-sem-a",
-    "project_key": "fixture",
+    "project_key": "project-dc76d5d7535765135981ea8e",
     "session_id": "fixture-session",
     "episode_id": "fixture-episode",
     "prompt": "How do I deploy this safely?",
@@ -90,10 +90,10 @@
     "content_license": "fixture-license",
     "redaction_status": "redacted",
     "redaction_policy_version": "policy-v1",
-    "split_key": "7d68cc11d5ee2fa7bfa8d2e7933505a3080bd70a7f09caa9ba35b56fd067ce57",
+    "split_key": "train",
     "transform_version": "fixture-transform",
     "label_status": "candidate_positive",
     "exclusion_reason": null,
-    "row_checksum": "72fb9092941a1e19d1db8c22aa2f4a10e45b1dee8c5ca54cc06ad7ff23583e8f"
+    "row_checksum": "11f1d3eb6bcd7201b110e5545312cefb25c98458eeaace89c34d7f153f30685b"
   }
 ]

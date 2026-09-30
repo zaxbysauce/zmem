@@ -60,6 +60,56 @@ _EVIDENCE_KINDS_BY_OUTCOME = {
 FINAL_STATES = frozenset({"completed"})
 
 
+def _capture_identity_keys(
+    host: object, session_id: object, namespace: object,
+    task_id: object | None = None, turn_id: object | None = None,
+    *, require_turn: bool,
+) -> tuple[str, str]:
+    """Return opaque correlation and session keys from named canonical JSON.
+
+    Every component is named before hashing.  Delimited concatenation would let
+    distinct identity tuples alias one another when a host emits the delimiter.
+    The session key intentionally omits task/turn so a clear invalidates every
+    correlated turn in precisely one host/session/namespace scope.
+    """
+    normalized_host = _required_text(host, "host", max_bytes=80).lower()
+    normalized_session = _required_text(session_id, "session_id", max_bytes=512)
+    normalized_namespace = _required_text(namespace, "namespace", max_bytes=512)
+    scope = {
+        "host": normalized_host,
+        "namespace": normalized_namespace,
+        "session": normalized_session,
+    }
+    scope_bytes = json.dumps(
+        scope, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    session_key = hashlib.sha256(scope_bytes).hexdigest()
+    if not require_turn:
+        return "", session_key
+    identity = {
+        "host": normalized_host,
+        "namespace": normalized_namespace,
+        "session": normalized_session,
+        "task": _required_text(task_id, "task_id", max_bytes=512),
+        "turn": _required_text(turn_id, "turn_id", max_bytes=512),
+    }
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), session_key
+
+
+def training_capture_identity_keys(
+    *, host: object, session_id: object, namespace: object,
+    task_id: object | None = None, turn_id: object | None = None,
+    require_turn: bool = True,
+) -> tuple[str, str]:
+    """Public canonical identity builder used by all host adapter actions."""
+    return _capture_identity_keys(
+        host, session_id, namespace, task_id, turn_id, require_turn=require_turn,
+    )
+
+
 class CaptureBusyError(RuntimeError):
     """A hook-safe signal that a SQLite writer could not acquire the lock."""
 
@@ -269,12 +319,15 @@ def _bounded_observation_json(value: str | None) -> str | None:
             if not isinstance(key, str):
                 continue
             key_lower = key.lower()
+            stored_key = _redact_training_text(key)[0]
+            if not stored_key:
+                continue
             if key_lower in {"host_task_id", "hosttaskid"}:
                 if isinstance(child, str):
-                    result[key] = _opaque_identifier(child)
+                    result[stored_key] = _opaque_identifier(child)
                 continue
             if key_lower == "cwd":
-                result[key] = "[REDACTED_PATH]" if isinstance(child, str) and child else None
+                result[stored_key] = "[REDACTED_PATH]" if isinstance(child, str) and child else None
                 continue
             if key_lower in {"event_id", "source_event_id", "source_event_ids"}:
                 if isinstance(child, list):
@@ -286,16 +339,16 @@ def _bounded_observation_json(value: str | None) -> str | None:
                         if normalized is not None:
                             bounded.append(normalized)
                             seen_ids += 1
-                    result[key] = bounded
+                    result[stored_key] = bounded
                 else:
                     if seen_ids >= MAX_EVENT_IDS:
                         continue
                     normalized = _bounded_event_id(child)
                     if normalized is not None:
-                        result[key] = normalized
+                        result[stored_key] = normalized
                         seen_ids += 1
                 continue
-            result[key] = visit(child)
+            result[stored_key] = visit(child)
         return result
 
     encoded = json.dumps(visit(decoded), ensure_ascii=False, sort_keys=True,
@@ -360,6 +413,111 @@ def _capture_row(conn: sqlite3.Connection, capture_id: str) -> sqlite3.Row:
     if row is None:
         raise ValueError("unknown training capture")
     return row
+
+
+def _expire_closed_training_sessions(conn: sqlite3.Connection, now_ts: str) -> None:
+    conn.execute(
+        "DELETE FROM training_capture_closed_session WHERE "
+        "datetime(cleared_at, '+30 days') <= datetime(?)",
+        (now_ts,),
+    )
+
+
+def _require_open_training_session(conn: sqlite3.Connection, session_key: str) -> None:
+    if conn.execute(
+        "SELECT 1 FROM training_capture_closed_session WHERE session_key=?",
+        (session_key,),
+    ).fetchone() is not None:
+        raise TrainingCaptureInputRefusal("session_closed")
+
+
+def _correlation_capture_id(
+    conn: sqlite3.Connection, correlation_key: str, session_key: str,
+) -> str | None:
+    row = conn.execute(
+        "SELECT capture_id FROM training_capture_correlation "
+        "WHERE correlation_key=? AND session_key=?",
+        (correlation_key, session_key),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def start_correlated_training_capture(
+    conn: sqlite3.Connection, *, task_id: object, turn_id: object,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Atomically create or retrieve one correlated partial capture.
+
+    The caller must already hold its stable per-session OS lock.  This helper
+    still owns the SQLite immediate transaction, which is the durable barrier
+    against a clear or a second process bypassing a stale sidecar.
+    """
+    host = kwargs.get("host")
+    session_id = kwargs.get("session_id")
+    namespace = kwargs.get("namespace")
+    correlation_key, session_key = training_capture_identity_keys(
+        host=host, session_id=session_id, namespace=namespace,
+        task_id=task_id, turn_id=turn_id,
+    )
+    owns_tx = _begin(conn)
+    try:
+        now = now_iso()
+        _expire_closed_training_sessions(conn, now)
+        _require_open_training_session(conn, session_key)
+        existing_id = _correlation_capture_id(conn, correlation_key, session_key)
+        if existing_id is not None:
+            row = _row_dict(_capture_row(conn, existing_id))
+            _finish(conn, owns_tx)
+            return row
+        capture = start_training_capture(conn, **kwargs)
+        conn.execute(
+            "INSERT INTO training_capture_correlation "
+            "(correlation_key, session_key, capture_id, created_at) VALUES (?, ?, ?, ?)",
+            (correlation_key, session_key, capture["capture_id"], now),
+        )
+        _finish(conn, owns_tx)
+        return capture
+    except Exception:
+        _rollback(conn, owns_tx)
+        raise
+
+
+def clear_correlated_training_session(
+    conn: sqlite3.Connection, *, host: object, session_id: object,
+    namespace: object, remove_sidecars: Any | None = None,
+) -> list[str]:
+    """Tombstone one identity scope and remove its durable correlations.
+
+    ``remove_sidecars`` runs while this immediate transaction is open.  It may
+    observe missing files as success; a raised error rolls back the durable
+    tombstone/mapping change so a retry can finish the clear coherently.
+    """
+    _, session_key = training_capture_identity_keys(
+        host=host, session_id=session_id, namespace=namespace, require_turn=False,
+    )
+    owns_tx = _begin(conn)
+    try:
+        now = now_iso()
+        _expire_closed_training_sessions(conn, now)
+        keys = [str(row[0]) for row in conn.execute(
+            "SELECT correlation_key FROM training_capture_correlation WHERE session_key=?",
+            (session_key,),
+        ).fetchall()]
+        if callable(remove_sidecars):
+            remove_sidecars(tuple(keys))
+        conn.execute(
+            "INSERT INTO training_capture_closed_session(session_key, cleared_at) VALUES (?, ?) "
+            "ON CONFLICT(session_key) DO UPDATE SET cleared_at=excluded.cleared_at",
+            (session_key, now),
+        )
+        conn.execute(
+            "DELETE FROM training_capture_correlation WHERE session_key=?", (session_key,),
+        )
+        _finish(conn, owns_tx)
+        return keys
+    except Exception:
+        _rollback(conn, owns_tx)
+        raise
 
 
 def assert_training_capture_replay_binding(
@@ -474,8 +632,19 @@ def start_training_capture(
     quarantine_reason = None if permitted else "capture_governance_denied"
     ts = now_iso()
     capture_id = str(uuid.uuid4())
+    # Direct and standalone starts have no durable turn mapping, but a complete
+    # session scope must still honor a prior clear.  Incomplete metadata-only
+    # callbacks retain their minimal audit marker without becoming correlatable.
+    session_key = ""
+    if isinstance(session_id, str) and session_id.strip() and isinstance(namespace, str) and namespace.strip():
+        _, session_key = training_capture_identity_keys(
+            host=host, session_id=session_id, namespace=namespace, require_turn=False,
+        )
     owns_tx = _begin(conn)
     try:
+        if session_key:
+            _expire_closed_training_sessions(conn, ts)
+            _require_open_training_session(conn, session_key)
         conn.execute(
             "INSERT INTO training_capture (capture_id, host, host_task_id, session_id, "
             "namespace, cwd, created_at, updated_at, state, prompt, assistant_response, "
@@ -531,6 +700,34 @@ def append_training_capture_observation(
         _rollback(conn, owns_tx)
         raise
     return {"observation_id": observation_id, "capture_id": capture_id}
+
+
+def append_correlated_training_capture_observation(
+    conn: sqlite3.Connection, *, host: object, session_id: object,
+    namespace: object, task_id: object, turn_id: object,
+    observation_kind: str, payload: str | None = None,
+) -> dict[str, Any]:
+    """Append only while the exact live correlation remains open."""
+    correlation_key, session_key = training_capture_identity_keys(
+        host=host, session_id=session_id, namespace=namespace,
+        task_id=task_id, turn_id=turn_id,
+    )
+    owns_tx = _begin(conn)
+    try:
+        now = now_iso()
+        _expire_closed_training_sessions(conn, now)
+        _require_open_training_session(conn, session_key)
+        capture_id = _correlation_capture_id(conn, correlation_key, session_key)
+        if capture_id is None:
+            raise ValueError("unknown training capture correlation")
+        row = append_training_capture_observation(
+            conn, capture_id, observation_kind=observation_kind, payload=payload,
+        )
+        _finish(conn, owns_tx)
+        return row
+    except Exception:
+        _rollback(conn, owns_tx)
+        raise
 
 
 def record_training_delivery_snapshot(
@@ -618,6 +815,36 @@ def record_training_delivery_snapshot(
     # capture's lifecycle state.
     result["state"] = "emitted_to_host"
     return result
+
+
+def record_correlated_training_delivery_snapshot(
+    conn: sqlite3.Connection, *, host: object, session_id: object,
+    namespace: object, task_id: object, turn_id: object,
+    rendered: str | None, effective_ops: Sequence[str] | None,
+    transform_version: str = "v1",
+) -> dict[str, Any]:
+    """Record a delivery only while its exact correlation is still live."""
+    correlation_key, session_key = training_capture_identity_keys(
+        host=host, session_id=session_id, namespace=namespace,
+        task_id=task_id, turn_id=turn_id,
+    )
+    owns_tx = _begin(conn)
+    try:
+        now = now_iso()
+        _expire_closed_training_sessions(conn, now)
+        _require_open_training_session(conn, session_key)
+        capture_id = _correlation_capture_id(conn, correlation_key, session_key)
+        if capture_id is None:
+            raise ValueError("unknown training capture correlation")
+        row = record_training_delivery_snapshot(
+            conn, capture_id, rendered=rendered, effective_ops=effective_ops,
+            transform_version=transform_version,
+        )
+        _finish(conn, owns_tx)
+        return row
+    except Exception:
+        _rollback(conn, owns_tx)
+        raise
 
 
 def acknowledge_training_delivery(
@@ -854,7 +1081,12 @@ def revoke_training_capture(
 ) -> dict[str, Any]:
     """Immediately exclude a capture while retaining its governed audit trail."""
     capture_id = _uuid(capture_id, "capture_id")
-    reason = _required_text(reason, "reason", max_bytes=4096)
+    reason = _redacted_bounded(
+        _required_text(reason, "reason", max_bytes=65_536),
+        "reason", 512,
+    )
+    if not reason:
+        raise ValueError("reason must be a non-empty string")
     revoked_by = _required_text(revoked_by, "revoked_by", max_bytes=512)
     ts = _timestamp(revoked_at, "revoked_at")
     owns_tx = _begin(conn)
@@ -899,11 +1131,13 @@ def purge_expired_training_captures(
         ids = [row[0] for row in rows]
         if ids:
             placeholders = ",".join("?" for _ in ids)
+            conn.execute("DELETE FROM training_capture_correlation WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_capture_observation WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_capture_review WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_capture_completion WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_delivery_snapshot WHERE capture_id IN (" + placeholders + ")", ids)
             conn.execute("DELETE FROM training_capture WHERE capture_id IN (" + placeholders + ")", ids)
+        _expire_closed_training_sessions(conn, now_ts)
         _finish(conn, owns_tx)
     except Exception:
         _rollback(conn, owns_tx)

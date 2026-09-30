@@ -13,6 +13,12 @@ from unittest.mock import patch
 
 import sys
 
+# Keep import-time store resolution away from the operator store when this
+# module is run directly or loaded by unittest discovery.
+_IMPORT_TMP = tempfile.TemporaryDirectory(prefix="zmem-training-exporter-import-")
+_IMPORT_ROOT = Path(_IMPORT_TMP.name)
+os.environ["ZMEM_STORE"] = str(_IMPORT_ROOT / "store.sqlite")
+os.environ["ZMEM_DATA"] = str(_IMPORT_ROOT / "data")
 sys.path.insert(0, str(Path(__file__).parents[1] / "skills" / "memory" / "scripts"))
 
 from storelib import schema
@@ -24,6 +30,8 @@ from storelib.training import (
     _bounded_quarantine_event,
     _load_snapshot_rows,
     _lineage_groups,
+    _opaque_project_label,
+    _redact,
     _split_bucket,
     _split_key,
     _training_output_lock,
@@ -39,6 +47,9 @@ class TrainingExporterTests(unittest.TestCase):
         self.conn.row_factory = sqlite3.Row
         schema.init_db(self.conn)
         schema.migrate(self.conn)
+        self._path_fixture = tempfile.TemporaryDirectory(
+            prefix="zmem-training-exporter-path-")
+        self._path_root = Path(self._path_fixture.name)
         self._old_profile = os.environ.get("ZMEM_EMBED_PROFILE")
         os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 
@@ -48,6 +59,7 @@ class TrainingExporterTests(unittest.TestCase):
         else:
             os.environ["ZMEM_EMBED_PROFILE"] = self._old_profile
         self.conn.close()
+        self._path_fixture.cleanup()
 
     def _seed_capture(self, *, capture_id: str = "cap-1", task_id: str = "task-1",
                       memory_id: str = "mem-1", evidence_id: str = "ev-1",
@@ -219,7 +231,8 @@ class TrainingExporterTests(unittest.TestCase):
                 "redaction_policy_version": "policy-v1",
             },
         )
-        self.assertRegex(row["split_key"], r"^[0-9a-f]{64}$")
+        self.assertIn(row["split_key"], {"train", "validation", "test"})
+        self.assertEqual(row["project_key"], _opaque_project_label("project:demo"))
         checksum_input = {key: row[key] for key in SFT_COLUMNS
                           if key != "row_checksum"}
         expected = hashlib.sha256(
@@ -904,6 +917,16 @@ class TrainingExporterTests(unittest.TestCase):
             ("explicit correction", "mem-predecessor"),
         )
         self.conn.execute(
+            "UPDATE memory SET content=? WHERE id=?",
+            (f"Use the new deploy command for alice@example.com at "
+             f"{self._path_root / 'alice' / 'new'}", "mem-1"),
+        )
+        self.conn.execute(
+            "UPDATE memory SET content=? WHERE id=?",
+            (f"Use the old deploy command for bob@example.com at "
+             f"{self._path_root / 'bob' / 'old'}", "mem-predecessor"),
+        )
+        self.conn.execute(
             "UPDATE training_capture_completion SET outcome_kind=?, outcome_value=?, "
             "reviewer_id=?, reviewer_confirmed=1, correction_closeout=1 WHERE capture_id=?",
             ("reviewer_acceptance", "accepted", "reviewer-1", "cap-1"),
@@ -926,6 +949,164 @@ class TrainingExporterTests(unittest.TestCase):
         self.assertEqual(row["rejected"]["memory_id"], "mem-predecessor")
         self.assertEqual(row["rejected"]["source_event_ids"], [])
         self.assertIsNone(row["rejected"]["evidence_ref"])
+        serialized = json.dumps(row, ensure_ascii=False)
+        new_path = str(self._path_root / "alice" / "new")
+        old_path = str(self._path_root / "bob" / "old")
+        self.assertNotIn("alice@example.com", serialized)
+        self.assertNotIn("bob@example.com", serialized)
+        self.assertNotIn(new_path, serialized)
+        self.assertNotIn(old_path, serialized)
+        self.assertGreaterEqual(serialized.count("[REDACTED_EMAIL]"), 2)
+        self.assertGreaterEqual(serialized.count("[REDACTED_PATH]"), 2)
+
+    def test_training_export_redacts_before_byte_bound_and_hides_project_namespace(self) -> None:
+        self._seed_capture()
+        raw_namespace = (
+            f"project:{self._path_root / 'alice' / 'private-project'}")
+        current_email = "alice@example.com"
+        current_path = str(self._path_root / "alice" / "private")
+        current_bearer = "Bearer " + ("A" * 16) + "."
+        predecessor_email = "bob@example.com"
+        predecessor_path = str(self._path_root / "bob" / "old")
+        predecessor_bearer = "Bearer " + ("B" * 16) + "."
+        self.conn.execute(
+            "UPDATE memory SET namespace=?, content=? WHERE id=?",
+            (raw_namespace, f"contact {current_email} at {current_path} plus {current_bearer}", "mem-1"),
+        )
+        self.conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, ingestion_ts, "
+            "trust_score, applied_count, violated_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("mem-predecessor", raw_namespace, "fact",
+             f"contact {predecessor_email} at {predecessor_path} plus {predecessor_bearer}",
+             "2026-01-01T00:00:00Z", 1.0, 0, 0),
+        )
+        self.conn.execute(
+            "INSERT INTO episode_memory (episode_id, memory_id) VALUES (?, ?)",
+            ("episode-1", "mem-predecessor"),
+        )
+        self.conn.execute(
+            "UPDATE memory SET update_of=? WHERE id=?",
+            ("mem-predecessor", "mem-1"),
+        )
+        self.conn.execute(
+            "UPDATE memory SET supersede_reason=? WHERE id=?",
+            ("explicit correction", "mem-predecessor"),
+        )
+        self.conn.execute(
+            "UPDATE episode SET namespace=? WHERE id=?", (raw_namespace, "episode-1")
+        )
+        self.conn.execute(
+            "UPDATE training_capture SET namespace=?, prompt=?, assistant_response=? "
+            "WHERE capture_id=?",
+            (raw_namespace, f"Deploy for {current_email} at {current_path}",
+             current_bearer + "é" * 400, "cap-1"),
+        )
+        self.conn.execute(
+            "UPDATE training_capture_completion SET outcome_value=? WHERE capture_id=?",
+            (f"passed for {current_email} at {current_path} with {current_bearer}", "cap-1"),
+        )
+        self.conn.commit()
+        self.assertIn("[REDACTED_SECRET]", _redact(current_bearer, max_bytes=24) or "")
+        rows = build_sft_rows(
+            self.conn, namespace=raw_namespace, snapshot_id="privacy-boundary",
+            reviewer_confirmed=True,
+        )
+        self.assertEqual(len(rows), 1)
+        row_text = json.dumps(rows[0], ensure_ascii=False)
+        self.assertTrue(row_text.startswith("{") and row_text.endswith("}"))
+        self.assertNotIn(raw_namespace, row_text)
+        self.assertNotIn(current_email, row_text)
+        self.assertNotIn(current_path, row_text)
+        self.assertNotIn(current_bearer, row_text)
+        self.assertIn("[REDACTED_EMAIL]", row_text)
+        self.assertIn("[REDACTED_PATH]", row_text)
+        self.assertIn("[REDACTED_SECRET]", row_text)
+        self.assertEqual(rows[0]["project_key"], _opaque_project_label(raw_namespace))
+
+        # Switch this same capture through the real correction/reviewer gate so
+        # the preference export contains both current and predecessor memory
+        # objects.  The outcome above deliberately carried the same raw values
+        # as the memory rows; its SFT readback proves it is redacted before the
+        # context byte bound is applied.  Reviewer completion requires the
+        # canonical accepted outcome, so the final materialized export uses the
+        # governed reviewer value while retaining the PII-bearing source rows.
+        self.conn.execute(
+            "INSERT INTO evidence (id, session_id, lane, moment, kind, ts, hash, excerpt, ref_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("ev-correction", "session-1", "test", "stop", "correction",
+             "2026-01-01T00:00:01Z", "correction-hash", "accepted correction", "fixture"),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence (memory_id, evidence_id) VALUES (?, ?)",
+            ("mem-1", "ev-correction"),
+        )
+        self.conn.execute(
+            "UPDATE training_capture_completion SET evidence_id=?, outcome_kind=?, outcome_value=?, "
+            "reviewer_id=?, reviewer_confirmed=1, correction_closeout=1 WHERE capture_id=?",
+            ("ev-correction", "reviewer_acceptance", "accepted", "reviewer-privacy", "cap-1"),
+        )
+        self.conn.execute(
+            "INSERT INTO training_capture_review "
+            "(capture_id, completion_evidence_id, reviewer_id, reviewed_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cap-1", "ev-correction", "reviewer-privacy", "2026-01-01T00:00:01Z"),
+        )
+        self.conn.commit()
+        preferences = build_preference_rows(
+            self.conn, namespace=raw_namespace, snapshot_id="privacy-preferences",
+            reviewer_confirmed=True,
+        )
+        self.assertGreaterEqual(len(preferences), 1)
+        preference_text = json.dumps(preferences[0], ensure_ascii=False)
+        self.assertNotIn(current_email, preference_text)
+        self.assertNotIn(current_path, preference_text)
+        self.assertNotIn(current_bearer, preference_text)
+        self.assertNotIn(predecessor_email, preference_text)
+        self.assertNotIn(predecessor_path, preference_text)
+        self.assertNotIn(predecessor_bearer, preference_text)
+        self.assertGreaterEqual(preference_text.count("[REDACTED_EMAIL]"), 2)
+        self.assertGreaterEqual(preference_text.count("[REDACTED_PATH]"), 2)
+        self.assertGreaterEqual(preference_text.count("[REDACTED_SECRET]"), 2)
+        with tempfile.TemporaryDirectory(prefix="training-privacy-artifacts-") as tmp:
+            output = Path(tmp) / "export"
+            result = write_training_views(
+                self.conn,
+                out_dir=str(output),
+                namespace=raw_namespace,
+                snapshot_id="privacy-artifacts",
+                reviewer_confirmed=True,
+            )
+            self.assertGreaterEqual(result["preference_count"], 1)
+            raw_split_digest = _split_key(raw_namespace[8:])
+            for artifact in output.rglob("*"):
+                if not artifact.is_file():
+                    continue
+                artifact_bytes = artifact.read_bytes()
+                for raw_value in (
+                    raw_namespace,
+                    current_email,
+                    current_path,
+                    current_bearer,
+                    predecessor_email,
+                    predecessor_path,
+                    predecessor_bearer,
+                    raw_split_digest,
+                ):
+                    self.assertNotIn(raw_value.encode("utf-8"), artifact_bytes, artifact)
+
+    def test_project_label_and_split_bucket_are_stable_for_same_namespace(self) -> None:
+        alice_namespace = (
+            f"project:{self._path_root / 'alice' / 'private-project'}")
+        bob_namespace = (
+            f"project:{self._path_root / 'bob' / 'private-project'}")
+        self.assertEqual(
+            _opaque_project_label(alice_namespace),
+            _opaque_project_label(alice_namespace),
+        )
+        self.assertNotEqual(
+            _opaque_project_label(alice_namespace),
+            _opaque_project_label(bob_namespace),
+        )
 
     def test_trust_floor_is_excluded_from_sft(self) -> None:
         self._seed_capture(trust=0.1, applied=3)

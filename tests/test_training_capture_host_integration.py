@@ -37,6 +37,9 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         })
         for key in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
             self.env.pop(key, None)
+        # The PATH lane must exercise production interpreter discovery rather
+        # than silently inheriting an explicit test-runner override.
+        self.env.pop("ZMEM_PYTHON", None)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -128,6 +131,14 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_production_launcher_wires_real_adapter_and_preserves_delivery_sidecar(self) -> None:
+        self._assert_production_launcher_capture()
+
+    def test_production_launcher_with_explicit_host_python_preserves_delivery_sidecar(self) -> None:
+        self._assert_production_launcher_capture({"ZMEM_PYTHON": sys.executable})
+
+    def _assert_production_launcher_capture(
+        self, extra_env: dict[str, str] | None = None,
+    ) -> None:
         task_id = "launcher-native-task-secret"
         started = self._launcher_capture({
             "session_id": "session-launcher",
@@ -135,25 +146,56 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
             "capture_key": "turn-launcher",
             "host_task_id": task_id,
             "prompt": "launcher prompt",
-        })
+        }, extra_env=extra_env)
         self.assertEqual(started["state"], "partial")
         self.assertTrue(started["capture_id"])
 
-        # The production launcher deliberately detaches observe/snapshot. Give
-        # the real Python adapter/store child enough scheduler slack to commit.
-        time.sleep(2.0)
-        conn = self._db()
-        try:
-            capture = conn.execute(
-                "SELECT state FROM training_capture WHERE capture_id=?",
-                (started["capture_id"],),
-            ).fetchone()
-            delivery = conn.execute(
-                "SELECT delivery_snapshot_id FROM training_delivery_snapshot "
-                "WHERE capture_id=?", (started["capture_id"],),
-            ).fetchone()
-        finally:
-            conn.close()
+        # The production launcher deliberately detaches observe/snapshot. Poll
+        # every persisted surface until the child commits, bounded by the same
+        # short host-integration wall time expected from this detached path.
+        deadline = time.monotonic() + 8.0
+        capture = delivery = sidecar = None
+        last_state = "store or sidecar not ready"
+        while time.monotonic() < deadline:
+            if self.store.is_file():
+                conn = self._db()
+                try:
+                    capture = conn.execute(
+                        "SELECT state FROM training_capture WHERE capture_id=?",
+                        (started["capture_id"],),
+                    ).fetchone()
+                    delivery = conn.execute(
+                        "SELECT delivery_snapshot_id FROM training_delivery_snapshot "
+                        "WHERE capture_id=?", (started["capture_id"],),
+                    ).fetchone()
+                finally:
+                    conn.close()
+            sidecars = list((self.store.parent / "training-capture").glob("*.json"))
+            if len(sidecars) == 1:
+                sidecar = None
+                try:
+                    candidate = json.loads(sidecars[0].read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    last_state = f"sidecar unreadable: {exc}"
+                else:
+                    sidecar = candidate
+            else:
+                sidecar = None
+                last_state = f"expected one sidecar, found {len(sidecars)}"
+            if (
+                capture is not None
+                and capture[0] == "emitted_to_host"
+                and delivery is not None
+                and sidecar is not None
+                and sidecar.get("capture_id") == started["capture_id"]
+                and sidecar.get("delivery_snapshot_id") == delivery[0]
+            ):
+                break
+            if capture is not None:
+                last_state = f"capture={capture[0]!r}, delivery={delivery!r}, sidecar={sidecar!r}"
+            time.sleep(0.05)
+        else:
+            self.fail(f"detached capture did not become ready before deadline: {last_state}")
         self.assertEqual(capture[0], "emitted_to_host")
         self.assertIsNotNone(delivery)
         # With an explicit ZMEM_STORE, the adapter co-locates its hashed
@@ -327,6 +369,16 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         }), encoding="utf-8")
         delivery = self._cli("capture-training-delivery", "--input", str(delivery_input))
         self.assertEqual(delivery.returncode, 0, delivery.stderr)
+
+        conflicting_ack = self.root / "ack-conflicting.json"
+        conflicting_ack.write_text(json.dumps({
+            "delivery_snapshot_id": delivery_id,
+            "host": "different-host",
+            "attestation": {"attested_by": "local-cli"},
+        }), encoding="utf-8")
+        refused = self._cli("capture-training-acknowledge", "--input", str(conflicting_ack))
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("conflicting", refused.stderr.lower())
 
         ack_input = self.root / "ack.json"
         ack_input.write_text(json.dumps({

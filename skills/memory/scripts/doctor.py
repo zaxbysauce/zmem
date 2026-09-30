@@ -463,12 +463,17 @@ def _check_training_capture_health(store_path: Path) -> dict:
         "training_capture",
         "training_delivery_snapshot",
         "training_capture_completion",
+        "training_capture_review",
+        "training_export_snapshot_binding",
         "training_capture_observation",
+        "training_capture_correlation",
+        "training_capture_closed_session",
     }
     try:
+        placeholders = ", ".join("?" for _ in required)
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN (?, ?, ?, ?)",
+            f"AND name IN ({placeholders})",
             tuple(sorted(required)),
         ).fetchall()
         present = {str(row[0]) for row in rows}
@@ -539,8 +544,9 @@ def _check_training_capture_health(store_path: Path) -> dict:
         )
         count(
             "expired_retention",
-            "SELECT count(*) FROM training_capture WHERE finalized_at IS NOT NULL "
-            "AND datetime(finalized_at, '+30 days') <= datetime('now')",
+            "SELECT count(*) FROM training_capture WHERE "
+            "datetime(COALESCE(finalized_at, updated_at), '+30 days') "
+            "<= datetime('now')",
         )
 
         # The completion payload is a cache of the authoritative
@@ -582,20 +588,32 @@ def _check_training_capture_health(store_path: Path) -> dict:
         conn.close()
 
     revoked_records = counts.get("revoked_records", 0)
-    # Revocation is a normal governed terminal outcome. Keep its count in the
-    # report for operator visibility, but do not classify it as corruption.
+    expired_retention = counts.get("expired_retention", 0)
+    # Revocation and expiry are normal governed maintenance states. Keep their
+    # counts visible, but do not classify them as integrity corruption.
     problems = {
         name: value
         for name, value in counts.items()
-        if value and name != "revoked_records"
+        if value and name not in {"revoked_records", "expired_retention"}
     }
+    retention = {"expired_retention": expired_retention}
     if problems:
         labels = ", ".join(f"{name}={value}" for name, value in sorted(problems.items()))
+        retention_note = (
+            f" {expired_retention} capture record(s), including inactive partials, "
+            "exceeded the 30-day local retention window."
+            if expired_retention
+            else ""
+        )
         return _check(
             "training-capture",
             "warn",
-            f"Training capture health needs review ({labels}).",
+            f"Training capture integrity needs review ({labels}).{retention_note}",
             issues=problems,
+            retention=retention,
+            classification=(
+                "integrity_and_retention" if expired_retention else "integrity"
+            ),
             revoked_records=revoked_records,
         )
     revoked_note = (
@@ -603,12 +621,27 @@ def _check_training_capture_health(store_path: Path) -> dict:
         if revoked_records
         else ""
     )
+    if expired_retention:
+        return _check(
+            "training-capture",
+            "warn",
+            f"Training capture retention maintenance needed: {expired_retention} "
+            "capture record(s), including inactive partials, exceeded the 30-day "
+            "local retention window. Tables and local associations are consistent."
+            + revoked_note,
+            issues={},
+            retention=retention,
+            classification="retention_maintenance",
+            revoked_records=revoked_records,
+        )
     return _check(
         "training-capture",
         "pass",
         "Training capture tables and local associations are consistent."
         + revoked_note,
         issues={},
+        retention=retention,
+        classification="healthy",
         revoked_records=revoked_records,
     )
 
@@ -3686,8 +3719,11 @@ def _recommendations(checks: list[dict]) -> list[str]:
     capture = by_id.get("training-capture", {})
     if capture.get("status") == "warn":
         missing = capture.get("details", {}).get("missing_tables") or []
-        expired = capture.get("details", {}).get("issues", {}).get(
-            "expired_retention", 0
+        details = capture.get("details", {})
+        issues = details.get("issues", {}) or {}
+        retention = details.get("retention", {}) or {}
+        expired = retention.get(
+            "expired_retention", issues.get("expired_retention", 0)
         )
         if missing:
             notes.append(
@@ -3695,20 +3731,30 @@ def _recommendations(checks: list[dict]) -> list[str]:
                 f"({', '.join(missing)}); run a writable zmem command to let "
                 "the additive initializer install them, then rerun doctor."
             )
-        elif expired:
-            notes.append(
-                f"{expired} finalized training capture record(s) exceeded the "
-                "30-day local retention window. Run `python <store.py> "
-                "purge-training-captures --confirm`; doctor remains read-only, "
-                "and session-cadence also sweeps expired capture rows before "
-                "backup."
-            )
         else:
-            notes.append(
-                "Training capture state needs review before export; inspect the "
-                "training-capture check and repair the source workflow, then "
-                "rerun doctor. Doctor never repairs capture rows."
-            )
+            if issues:
+                labels = ", ".join(
+                    f"{name}={value}" for name, value in sorted(issues.items())
+                )
+                notes.append(
+                    "Training capture integrity needs review "
+                    f"({labels}); inspect the training-capture check and repair "
+                    "the source workflow."
+                )
+            if expired:
+                notes.append(
+                    f"{expired} training capture record(s), including inactive "
+                    "partials, exceeded the 30-day local retention window. Run "
+                    "`python <store.py> purge-training-captures --confirm`; "
+                    "doctor remains read-only, and session-cadence also sweeps "
+                    "expired capture rows before backup."
+                )
+            elif not issues:
+                notes.append(
+                    "Training capture state needs review before export; inspect "
+                    "the training-capture check and repair the source workflow, "
+                    "then rerun doctor. Doctor never repairs capture rows."
+                )
     staging = by_id.get("training-staging", {})
     if staging.get("status") == "warn":
         paths = staging.get("details", {}).get("paths") or []

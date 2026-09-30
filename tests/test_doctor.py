@@ -23,6 +23,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCTOR_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "doctor.py"
+STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
 PYTHON = sys.executable
 REAL_GIT = shutil.which("git")
 
@@ -1455,9 +1456,43 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             "training_capture",
             "training_delivery_snapshot",
             "training_capture_completion",
+            "training_capture_review",
+            "training_export_snapshot_binding",
             "training_capture_observation",
+            "training_capture_correlation",
+            "training_capture_closed_session",
         })
         self.assertEqual(path.read_bytes(), before)
+
+    def test_each_required_capture_table_is_checked_individually(self):
+        """Every additive capture table has a distinct doctor missing case."""
+        import doctor  # noqa: E402
+
+        required = {
+            "training_capture",
+            "training_delivery_snapshot",
+            "training_capture_completion",
+            "training_capture_review",
+            "training_export_snapshot_binding",
+            "training_capture_observation",
+            "training_capture_correlation",
+            "training_capture_closed_session",
+        }
+        for missing in sorted(required):
+            with self.subTest(missing=missing):
+                tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-missing-"))
+                self.addCleanup(shutil.rmtree, tmp, True)
+                path = tmp / "store.sqlite"
+                conn = sqlite3.connect(str(path))
+                for table in sorted(required - {missing}):
+                    conn.execute(f'CREATE TABLE "{table}"(id TEXT)')
+                conn.commit()
+                conn.close()
+
+                check = doctor._check_training_capture_health(path)
+
+                self.assertEqual(check["status"], "warn", check)
+                self.assertEqual(check["details"]["missing_tables"], [missing])
 
     def test_healthy_capture_tables_pass(self):
         import doctor  # noqa: E402
@@ -1471,7 +1506,8 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT,
+                updated_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1483,6 +1519,10 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture_observation(
                 observation_id TEXT PRIMARY KEY, capture_id TEXT
             );
+            CREATE TABLE training_capture_review(id TEXT);
+            CREATE TABLE training_export_snapshot_binding(id TEXT);
+            CREATE TABLE training_capture_correlation(id TEXT);
+            CREATE TABLE training_capture_closed_session(id TEXT);
             CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
             """
         )
@@ -1507,7 +1547,8 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT,
+                updated_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1519,6 +1560,10 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture_observation(
                 observation_id TEXT PRIMARY KEY, capture_id TEXT
             );
+            CREATE TABLE training_capture_review(id TEXT);
+            CREATE TABLE training_export_snapshot_binding(id TEXT);
+            CREATE TABLE training_capture_correlation(id TEXT);
+            CREATE TABLE training_capture_closed_session(id TEXT);
             CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
             INSERT INTO training_capture(
                 capture_id, state, redaction_status, redaction_policy_version
@@ -1546,7 +1591,8 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT,
+                updated_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1558,6 +1604,10 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture_observation(
                 observation_id TEXT PRIMARY KEY, capture_id TEXT
             );
+            CREATE TABLE training_capture_review(id TEXT);
+            CREATE TABLE training_export_snapshot_binding(id TEXT);
+            CREATE TABLE training_capture_correlation(id TEXT);
+            CREATE TABLE training_capture_closed_session(id TEXT);
             CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
             INSERT INTO training_capture(
                 capture_id, state, redaction_status, redaction_policy_version,
@@ -1588,7 +1638,8 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture(
                 capture_id TEXT PRIMARY KEY, state TEXT,
                 redaction_status TEXT, redaction_policy_version TEXT,
-                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT
+                acknowledged_at TEXT, revoked_at TEXT, finalized_at TEXT,
+                updated_at TEXT
             );
             CREATE TABLE training_delivery_snapshot(
                 delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
@@ -1600,12 +1651,22 @@ class TrainingDependencyCheckTest(unittest.TestCase):
             CREATE TABLE training_capture_observation(
                 observation_id TEXT PRIMARY KEY, capture_id TEXT
             );
+            CREATE TABLE training_capture_review(id TEXT);
+            CREATE TABLE training_export_snapshot_binding(id TEXT);
+            CREATE TABLE training_capture_correlation(id TEXT);
+            CREATE TABLE training_capture_closed_session(id TEXT);
             CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
             INSERT INTO training_capture(
                 capture_id, state, redaction_status, redaction_policy_version,
-                revoked_at, finalized_at
+                revoked_at, finalized_at, updated_at
             ) VALUES ('capture-expired', 'partial', 'redacted', 'v1',
-                      '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z');
+                      '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z',
+                      '2000-01-01T00:00:00Z');
+            INSERT INTO training_capture(
+                capture_id, state, redaction_status, redaction_policy_version,
+                updated_at
+            ) VALUES ('capture-expired-partial', 'partial', 'redacted', 'v1',
+                      '2000-01-01T00:00:00Z');
             """
         )
         conn.commit()
@@ -1615,10 +1676,34 @@ class TrainingDependencyCheckTest(unittest.TestCase):
         check = doctor._check_training_capture_health(path)
 
         self.assertEqual(check["status"], "warn", check)
-        self.assertEqual(check["details"]["issues"], {"expired_retention": 1})
+        self.assertEqual(check["details"]["issues"], {})
+        self.assertEqual(check["details"]["retention"], {"expired_retention": 2})
+        self.assertEqual(check["details"]["classification"], "retention_maintenance")
+        self.assertIn("retention maintenance", check["summary"])
+        self.assertIn("inactive partials", check["summary"])
         self.assertEqual(path.read_bytes(), before)
-        self.assertTrue(any("purge-training-captures --confirm" in note
-                            for note in doctor._recommendations([check])))
+        notes = doctor._recommendations([check])
+        self.assertTrue(any("purge-training-captures --confirm" in note for note in notes))
+        self.assertTrue(any("inactive partials" in note for note in notes))
+
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "UPDATE training_capture SET state='invalid' "
+            "WHERE capture_id='capture-expired-partial'"
+        )
+        conn.commit()
+        conn.close()
+
+        mixed = doctor._check_training_capture_health(path)
+
+        self.assertEqual(mixed["status"], "warn", mixed)
+        self.assertEqual(mixed["details"]["issues"], {"illegal_state": 1})
+        self.assertEqual(mixed["details"]["retention"], {"expired_retention": 2})
+        self.assertEqual(mixed["details"]["classification"], "integrity_and_retention")
+        self.assertIn("integrity needs review", mixed["summary"])
+        mixed_notes = doctor._recommendations([mixed])
+        self.assertTrue(any("integrity needs review" in note for note in mixed_notes))
+        self.assertTrue(any("inactive partials" in note for note in mixed_notes))
 
     def test_abandoned_staging_directory_is_reported(self):
         import doctor  # noqa: E402
@@ -1723,6 +1808,44 @@ class TrainingDependencyCheckTest(unittest.TestCase):
 
         self.assertEqual(check["status"], "warn", check)
         self.assertTrue(staging.is_dir())
+
+
+class TrainingOperatorDocsTest(unittest.TestCase):
+    """Issue #135: operators can discover review and export controls."""
+
+    def test_export_and_review_help_expose_governance_controls(self):
+        export = subprocess.run(
+            [PYTHON, str(STORE_PY), "export-training", "--help"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, check=False,
+        )
+        review = subprocess.run(
+            [PYTHON, str(STORE_PY), "capture-training-review", "--help"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(export.returncode, 0, export.stderr)
+        self.assertEqual(review.returncode, 0, review.stderr)
+        export_help = export.stdout
+        review_help = review.stdout
+        for token in (
+            "--snapshot-id", "--reviewer-confirmed", "--namespace",
+            "--quarantine-raw", "redacted", "manifest",
+        ):
+            self.assertIn(token, export_help)
+        self.assertIn("ZMEM_TRAINING_CALLER_ID", review_help)
+        self.assertIn("ZMEM_TRAINING_REVIEWER_IDS", review_help)
+
+    def test_docs_state_local_privacy_and_optional_dependency_boundary(self):
+        docs = (REPO_ROOT / "docs" / "CLOUD.md").read_text(encoding="utf-8")
+        skill = (REPO_ROOT / "skills" / "memory" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        for text in (docs, skill):
+            for token in (
+                "capture-training-review", "ZMEM_TRAINING_CALLER_ID",
+                "ZMEM_TRAINING_REVIEWER_IDS", "requirements-training.txt",
+                "operator-owned", "quarantine-raw",
+            ):
+                self.assertIn(token, text)
 
 
 class EmbeddingsHealthCheckTest(unittest.TestCase):

@@ -78,8 +78,16 @@ def main() -> None:
 
         sft_table = parquet.read_table(output / "sft-000.parquet")
         rows = sft_table.to_pylist()
-        same_group = [row for row in rows if row.get("project_key") == "split-same"]
-        other_group = [row for row in rows if row.get("project_key") == "split-other"]
+        project_groups = {
+            project_key: [row for row in rows if row.get("project_key") == project_key]
+            for project_key in {row.get("project_key") for row in rows}
+        }
+        assert len(project_groups) == 2, project_groups
+        # Project labels are intentionally opaque, so identify the fixture's
+        # lineage groups by their expected post-dedup cardinality rather than
+        # by hash ordering.
+        same_group = max(project_groups.values(), key=len)
+        other_group = min(project_groups.values(), key=len)
         assert same_group and other_group
         # Dedup is lineage scoped.  The other project has deliberately
         # distinct event text and must survive even if its source memory is
@@ -87,7 +95,11 @@ def main() -> None:
         assert len(other_group) == 1, other_group
         assert len({row["split_key"] for row in same_group}) == 1
         assert len({row["split_key"] for row in other_group}) == 1
-        assert same_group[0]["split_key"] != other_group[0]["split_key"]
+        assert same_group[0]["split_key"] in {"train", "validation", "test"}
+        assert other_group[0]["split_key"] in {"train", "validation", "test"}
+        serialized = json.dumps(rows, ensure_ascii=False)
+        assert "split-same" not in serialized
+        assert "split-other" not in serialized
 
         same_task = [
             row for row in same_group

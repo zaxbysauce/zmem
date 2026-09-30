@@ -662,7 +662,9 @@ let evidenceWritersInFlight = 0;
 // correlation id; observations and snapshots use a detached writer and never
 // hold up the host callback.  The adapter owns redaction and governance.
 const TRAINING_CAPTURE_HOSTS = new Set(["claude", "codex", "zcode"]);
-const TRAINING_CAPTURE_TIMEOUT_MS = 1200;
+const TRAINING_CAPTURE_TIMEOUT_MS = 5000;
+const TRAINING_CAPTURE_PROBE_TIMEOUT_MS = 250;
+const TRAINING_CAPTURE_OUTPUT_RESERVE_MS = 500;
 const EDIT_TOOL_NAMES = new Set([
     "edit", "edit_file", "write", "write_file", "writefile", "notebookedit",
     "notebook_edit", "multiedit", "multi_edit", "applypatch", "apply_patch",
@@ -765,16 +767,27 @@ function _sanitizeRefPath(value) {
 }
 
 function resolvePython(env = process.env, platform = process.platform,
-                       probe = execFileSync) {
+                       probe = execFileSync, timeoutMs = TRAINING_CAPTURE_PROBE_TIMEOUT_MS,
+                       now = elapsedProcessMs) {
     const explicit = env && typeof env.ZMEM_PYTHON === "string" ? env.ZMEM_PYTHON.trim() : "";
     if (explicit) return explicit;
     const candidates = platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    const clock = typeof now === "function" ? now : elapsedProcessMs;
+    const deadline = Number(clock()) + Math.max(1, timeoutMs);
     for (const candidate of candidates) {
+        const remaining = Math.floor(deadline - Number(clock()));
+        if (remaining <= 0) break;
         try {
             // `where` is Windows-only.  Probing the interpreter itself works
             // on both POSIX and Windows and does not select a missing POSIX
             // command merely because the lookup utility is absent.
-            probe(candidate, ["--version"], { stdio: "ignore" });
+            // The adapter is called from host hooks.  A PATH entry can point
+            // at a stalled shim, so probing it must share the capture budget
+            // instead of becoming an unbounded synchronous wait.
+            probe(candidate, ["--version"], {
+                stdio: "ignore",
+                timeout: remaining,
+            });
             return candidate;
         } catch {
             // Try the next interpreter name; the caller remains fail-open.
@@ -1114,6 +1127,7 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
             env: childEnv,
             stdio: ["pipe", "ignore", "ignore"],
             detached: true,
+            windowsHide: true,
         });
         if (!child) return false;
         evidenceWritersInFlight += 1;
@@ -1197,6 +1211,11 @@ function _trainingCaptureInput(host, hookName, meta, env, action, extra = {}) {
         callback.capture_key, callback.captureKey,
         callback.turn_id, callback.turnId,
     );
+    const taskId = _firstNonEmptyString(
+        callback.task_id, callback.taskId,
+        callback.host_task_id, callback.hostTaskId,
+    );
+    if (taskId) input.task_id = taskId;
     if (captureKey) input.capture_key = captureKey;
     if (action === "observe") {
         input.observation_kind = extra.observation_kind || "post_tool";
@@ -1211,11 +1230,12 @@ function _captureDisabled(env = process.env) {
 }
 
 function _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
-                                     spawnFn = spawn) {
+                                     spawnFn = spawn, python = "") {
     try {
         const script = _trainingCaptureScript(env);
-        const child = spawnFn(resolvePython(env), [script, "--action", action], {
+        const child = spawnFn(python || resolvePython(env), [script, "--action", action], {
             detached: true,
+            windowsHide: true,
             stdio: ["pipe", "ignore", "ignore"],
             env: { ...(env || {}), ZMEM_HOST: host },
         });
@@ -1245,9 +1265,19 @@ function _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, e
     }
 }
 
+function _trainingCaptureNow(options = {}) {
+    const clock = options && typeof options.now === "function" ? options.now : elapsedProcessMs;
+    try {
+        const value = Number(clock());
+        return Number.isFinite(value) ? value : Number(elapsedProcessMs());
+    } catch {
+        return Number(elapsedProcessMs());
+    }
+}
+
 function runTrainingCapture(host, hookName, meta, env = process.env,
                             action = "observe", extra = {}, execFn = execFileSync,
-                            spawnFn = spawn) {
+                            spawnFn = spawn, options = {}) {
     try {
         if (!TRAINING_CAPTURE_HOSTS.has(host)) return {};
         if (_captureDisabled(env)) return {};
@@ -1256,15 +1286,37 @@ function runTrainingCapture(host, hookName, meta, env = process.env,
         const input = _trainingCaptureInput(host, hookName, meta, env, action, extra);
         const encoded = safeJsonStringify(input, EVIDENCE_RAW_MAX_BYTES);
         if (!encoded) return {};
+        const captureStartedAt = _trainingCaptureNow(options);
+        const configuredDeadline = options && options.deadline;
+        const deadline = typeof configuredDeadline === "number"
+            && Number.isFinite(configuredDeadline) ? configuredDeadline : null;
+        const allocationMs = deadline === null
+            ? TRAINING_CAPTURE_TIMEOUT_MS
+            : Math.max(0, Math.min(
+                TRAINING_CAPTURE_TIMEOUT_MS,
+                deadline - captureStartedAt - TRAINING_CAPTURE_OUTPUT_RESERVE_MS,
+            ));
+        if (allocationMs <= 0) return {};
+        const probeMs = Math.min(TRAINING_CAPTURE_PROBE_TIMEOUT_MS, allocationMs);
+        const clock = options && typeof options.now === "function"
+            ? options.now : elapsedProcessMs;
+        const probe = options && typeof options.probe === "function"
+            ? options.probe : execFileSync;
+        const python = resolvePython(env, process.platform, probe,
+            probeMs, clock);
         if (execFn === execFileSync && action !== "start") {
             _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
-                spawnFn);
+                spawnFn, python);
             return {};
         }
-        const output = execFn(resolvePython(env), [script, "--action", action], {
+        const remainingMs = Math.floor(
+            allocationMs - (_trainingCaptureNow(options) - captureStartedAt)
+        );
+        if (remainingMs <= 0) return {};
+        const output = execFn(python, [script, "--action", action], {
             input: encoded + "\n",
             encoding: "utf8",
-            timeout: TRAINING_CAPTURE_TIMEOUT_MS,
+            timeout: remainingMs,
             env: { ...(env || {}), ZMEM_HOST: host },
             stdio: ["pipe", "pipe", "ignore"],
         });
@@ -1809,11 +1861,13 @@ async function main() {
     const translated = TRANSLATED_HOOKS.has(hookName);
     const outChunks = [];
     const fireState = { child: null, host: "", budget: 0, env: null,
-        meta: null };
+        meta: null, trainingCaptureDeadline: null };
     let watchdog = null;
     if (translated) {
         const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
             budgetDefault("launcher_watchdog_ms", DEFAULT_LAUNCHER_WATCHDOG_MS));
+        const watchdogStartedAt = elapsedProcessMs();
+        fireState.trainingCaptureDeadline = watchdogStartedAt + watchdogMs;
         watchdog = startWatchdog(() => fireState.child, watchdogMs, PRODUCTION_CLOCK, () => {
             const raw = Buffer.concat(outChunks).toString("utf8");
             let envelope;
@@ -1929,12 +1983,18 @@ async function main() {
     // $ZMEM_CTX_BUDGET directly.
     env.ZMEM_CTX_BUDGET = String(budget);
 
-    // Issue #135: create a store-owned partial before the child runs, then
-    // append observations on later callbacks. This is bounded and fail-open.
+    // Issue #135: the start allocates the correlation before a delivery can
+    // occur.  Every later observation is detached only after the hook child
+    // has finished, so a cold Python import or SQLite writer cannot consume
+    // the delivery watchdog's budget.
+    const captureAction = _trainingCaptureAction(hookName);
     try {
-        const captureAction = _trainingCaptureAction(hookName);
-        if (captureAction) {
-            runTrainingCapture(host, hookName, prepared.meta, env, captureAction);
+        if (captureAction === "start") {
+            runTrainingCapture(host, hookName, prepared.meta, env, captureAction, {},
+                execFileSync, spawn, {
+                    deadline: fireState.trainingCaptureDeadline,
+                    now: elapsedProcessMs,
+                });
         }
     } catch { /* automatic capture never blocks the host */ }
 
@@ -2037,17 +2097,25 @@ async function main() {
             } catch {
                 envelope = {};
             }
+            process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             try {
+                if (captureAction && captureAction !== "start") {
+                    runTrainingCapture(host, hookName, prepared.meta, env, captureAction);
+                }
                 snapshotTrainingDelivery(host, hookName, prepared.meta, env,
                     extractPayload(raw));
             } catch { /* capture is fail-open */ }
-            process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             // Translated hooks are always fail-open: exit 0 regardless of child.
             process.exit(0);
         });
     } else {
         // Pass-through: preserve the child's exit code (today's behavior).
         child.on("close", (code) => {
+            try {
+                if (captureAction && captureAction !== "start") {
+                    runTrainingCapture(host, hookName, prepared.meta, env, captureAction);
+                }
+            } catch { /* capture is fail-open */ }
             process.exit(code || 0);
         });
     }

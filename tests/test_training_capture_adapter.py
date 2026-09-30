@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+from contextlib import redirect_stderr
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,12 +32,18 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
         self.env = {"ZMEM_DATA": self.tmp.name}
         self.calls: list[tuple[str, dict]] = []
         self.capture_id = "11111111-1111-4111-8111-111111111111"
+        self.correlations: dict[str, str] = {}
         self.api = {
             "connect": lambda: _Conn(),
             "prepare": None,
             "start": self._start,
+            "start_correlated": self._start_correlated,
             "observe": self._observe,
+            "observe_correlated": self._observe_correlated,
             "snapshot": self._snapshot,
+            "snapshot_correlated": self._snapshot_correlated,
+            "clear_correlated": self._clear_correlated,
+            "identity_keys": self._identity_keys,
         }
 
     def tearDown(self) -> None:
@@ -46,6 +56,48 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "state": "partial",
             "redaction_status": "metadata_only" if not kwargs["consent_scope"] else "redacted",
         }
+
+    def _identity_keys(self, *, host, session_id, namespace, task_id=None,
+                       turn_id=None, require_turn=True):
+        scope = json.dumps({"host": host, "namespace": namespace, "session": session_id},
+                           sort_keys=True, separators=(",", ":")).encode()
+        session_key = hashlib.sha256(scope).hexdigest()
+        if not require_turn:
+            return "", session_key
+        identity = json.dumps({"host": host, "namespace": namespace,
+                               "session": session_id, "task": task_id, "turn": turn_id},
+                              sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(identity).hexdigest(), session_key
+
+    def _start_correlated(self, conn, *, task_id, turn_id, **kwargs):
+        key, _ = self._identity_keys(host=kwargs["host"], session_id=kwargs["session_id"],
+                                     namespace=kwargs["namespace"], task_id=task_id, turn_id=turn_id)
+        row = self._start(conn, **kwargs)
+        self.correlations[key] = row["capture_id"]
+        return row
+
+    def _observe_correlated(self, conn, *, host, session_id, namespace, task_id, turn_id, **kwargs):
+        key, _ = self._identity_keys(host=host, session_id=session_id, namespace=namespace,
+                                     task_id=task_id, turn_id=turn_id)
+        capture_id = self.correlations.get(key)
+        if not capture_id:
+            raise ValueError("unknown correlation")
+        return self._observe(conn, capture_id, **kwargs)
+
+    def _snapshot_correlated(self, conn, *, host, session_id, namespace, task_id, turn_id, **kwargs):
+        key, _ = self._identity_keys(host=host, session_id=session_id, namespace=namespace,
+                                     task_id=task_id, turn_id=turn_id)
+        capture_id = self.correlations.get(key)
+        if not capture_id:
+            raise ValueError("unknown correlation")
+        return self._snapshot(conn, capture_id, **kwargs)
+
+    def _clear_correlated(self, conn, *, host, session_id, namespace, remove_sidecars):
+        _unused, session_key = self._identity_keys(host=host, session_id=session_id,
+                                                    namespace=namespace, require_turn=False)
+        keys = [key for key in self.correlations if key]
+        remove_sidecars(keys)
+        self.correlations.clear()
 
     def _observe(self, conn, capture_id, **kwargs):
         self.calls.append(("observe", {"capture_id": capture_id, **kwargs}))
@@ -74,7 +126,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
         self.assertIsNone(call["consent_scope"])
         self.assertIsNone(call["content_license"])
         self.assertIsNone(call["redaction_policy_version"])
-        self.assertEqual(call["prompt"], "Bearer super-secret-token-value")
+        self.assertIsNone(call["prompt"])
         self.assertNotIn("acknowledge", " ".join(name for name, _ in self.calls))
         self.assertNotIn("complete", " ".join(name for name, _ in self.calls))
 
@@ -126,6 +178,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "host": "zcode",
             "session_id": "session-3",
             "namespace": "project:hook-test",
+            "host_task_id": "task-3",
             "turn_id": "turn-3",
         }
         ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
@@ -165,6 +218,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "host": "claude",
             "session_id": "session-4",
             "namespace": "project:hook-test",
+            "host_task_id": "task-4",
             "turn_id": "turn-4",
             "prompt": "private prompt",
         }, env=self.env, api=self.api)
@@ -178,7 +232,8 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
     def test_snapshot_delivery_identity_is_preserved_in_the_sidecar(self):
         base = {
             "host": "claude", "session_id": "session-delivery",
-            "namespace": "project:hook-test", "turn_id": "turn-delivery",
+            "namespace": "project:hook-test", "host_task_id": "task-delivery",
+            "turn_id": "turn-delivery",
         }
         ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
         result = ADAPTER.run_action({
@@ -196,10 +251,13 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
     def test_delayed_snapshot_cannot_publish_against_a_newer_generation(self):
         base = {
             "host": "claude", "session_id": "session-generation",
-            "namespace": "project:hook-test", "turn_id": "turn-generation",
+            "namespace": "project:hook-test", "host_task_id": "task-generation",
+            "turn_id": "turn-generation",
         }
         ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
-        state_key = ADAPTER._state_key(base)
+        state_key, _session_key, _fields = ADAPTER._identity_keys(
+            base, self.api, require_turn=True,
+        )
         replacement_capture = "33333333-3333-4333-8333-333333333333"
         replacement_generation = "44444444-4444-4444-8444-444444444444"
 
@@ -214,7 +272,10 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
                 "state": "emitted_to_host",
             }
 
-        self.api["snapshot"] = delayed_snapshot
+        def delayed_snapshot_correlated(conn, **kwargs):
+            return delayed_snapshot(conn, self.capture_id, **kwargs)
+
+        self.api["snapshot_correlated"] = delayed_snapshot_correlated
         result = ADAPTER.run_action({
             "action": "snapshot", **base, "rendered": "old context",
         }, env=self.env, api=self.api)
@@ -243,23 +304,72 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "capture_id": first["capture_id"], "rendered": "must not attach",
         }, env=self.env, api=self.api), {})
 
-    def test_keyless_content_is_refused_before_store_or_sidecar(self):
-        def unexpected_connection():
-            raise AssertionError("content-bearing keyless start opened SQLite")
-
-        api = {**self.api, "connect": unexpected_connection}
+    def test_keyless_content_becomes_metadata_only_without_a_sidecar(self):
         result = ADAPTER.run_action({
             "action": "start",
             "host": "claude",
             "session_id": "keyless-content",
             "prompt": "Bearer keyless-secret-must-not-persist",
             "assistant_response": "assistant bytes must not persist",
-        }, env=self.env, api=api)
+        }, env=self.env, api=self.api)
 
-        self.assertEqual(result, {})
-        self.assertEqual(self.calls, [])
+        self.assertEqual(result["state"], "partial")
+        self.assertIsNone(self.calls[0][1]["prompt"])
+        self.assertIsNone(self.calls[0][1]["assistant_response"])
         self.assertFalse((Path(self.tmp.name) / "training-capture").exists())
-        self.assertFalse(list(Path(self.tmp.name).glob("*.sqlite*")))
+
+    def test_oversized_identity_does_not_alias_its_prefix(self):
+        base = {
+            "action": "start", "host": "claude", "session_id": "session-prefix",
+            "namespace": "project:hook-test", "host_task_id": "task-prefix",
+            "turn_id": "turn-prefix",
+        }
+        oversized = {**base, "host_task_id": "task-prefix" + ("x" * 513)}
+        self.assertEqual(ADAPTER.run_action(oversized, env=self.env, api=self.api), {})
+        self.assertEqual(self.calls, [])
+        normal = ADAPTER.run_action(base, env=self.env, api=self.api)
+        self.assertEqual(normal["capture_id"], self.capture_id)
+
+    def test_content_reaches_core_without_prefix_clipping(self):
+        prompt = ("x" * 16_000) + " Bearer full-secret-value"
+        result = ADAPTER.run_action({
+            "action": "start", "host": "claude", "session_id": "content-boundary",
+            "namespace": "project:hook-test", "host_task_id": "task-boundary",
+            "turn_id": "turn-boundary", "prompt": prompt,
+        }, env={
+            **self.env, "ZMEM_CAPTURE_CONSENT_SCOPE": "local-training",
+            "ZMEM_CAPTURE_CONTENT_LICENSE": "CC-BY-4.0",
+            "ZMEM_CAPTURE_REDACTION_POLICY_VERSION": "v1",
+        }, api=self.api)
+        self.assertEqual(result["capture_id"], self.capture_id)
+        self.assertEqual(self.calls[0][1]["prompt"], prompt)
+
+    def test_lock_timeout_never_falls_back_to_an_unlocked_capture(self):
+        class BusyLock:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                raise TimeoutError("capture_lock_timeout")
+
+            def __exit__(self, *_args):
+                return None
+
+        payload = {
+            "action": "start", "host": "claude", "session_id": "locked-session",
+            "namespace": "project:hook-test", "host_task_id": "locked-task",
+            "turn_id": "locked-turn",
+        }
+        with mock.patch.object(ADAPTER, "_SessionLock", BusyLock):
+            diagnostic = io.StringIO()
+            with redirect_stderr(diagnostic):
+                self.assertEqual(ADAPTER.run_action(payload, env=self.env, api=self.api), {})
+            self.assertEqual(ADAPTER.run_action(
+                {**payload, "action": "clear"}, env=self.env, api=self.api,
+            ), {"error": "capture_busy"})
+        self.assertEqual(diagnostic.getvalue(), "capture_lock_timeout\n")
+        self.assertNotIn("locked-session", diagnostic.getvalue())
+        self.assertEqual(self.calls, [])
 
     def test_standalone_content_uses_no_correlation_sidecar(self):
         result = ADAPTER.run_action({
@@ -277,7 +387,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
         self.assertEqual(
             self.calls[0][1]["assistant_response"], "standalone response",
         )
-        self.assertFalse((Path(self.tmp.name) / "training-capture").exists())
+        self.assertFalse(list((Path(self.tmp.name) / "training-capture").glob("*.json")))
 
     def test_caller_capture_id_cannot_override_keyed_sidecar(self):
         base = {
