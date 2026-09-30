@@ -105,7 +105,13 @@ recall and recent skip the unfiltered candidate scan. The legacy
 `[tier=unknown]` and the legacy `tier=cross` marker keeps its suffix form.
 Ordinary plain-text recall/recent output includes the unknown marker too. Passive
 injection retains its established tierless wire bytes. Explicit `--namespace`,
-search, hook, and injection calls retain their legacy routing and limits.
+search, hook, and injection calls retain their legacy routing and limits — with
+one addition (issue #235): on the gated passive moments (`pretool`/`subagent`)
+a `user:global` injection candidate whose best measured relevance lane is
+below `ZMEM_INJECT_FLOOR_USER_GLOBAL` (default 0.5, `0` disables) is withheld
+and its slot returns empty rather than being backfilled; the injection envelope
+reports the count as `global_withheld`. Query-less pulls (no measured lanes)
+keep the not-measured exemption.
 Hermes `namespace="*"` searches and namespace-less unscoped MCP reads retain the
 full-store legacy path through an internal dispatch marker.
 On implicit ordinary recall and recent, `--include-global` opts into the

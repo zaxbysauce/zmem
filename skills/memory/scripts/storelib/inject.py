@@ -51,6 +51,8 @@ INJECTION_ENVELOPE_OPTIONAL = frozenset({
     "injection_risk", "candidate_lanes", "budget_note",
     # Issue #256: present only when a credential withhold happened.
     "secret_withheld",
+    # Issue #235: present only when the user:global tier floor withheld.
+    "global_withheld",
 })
 
 # Best-effort single-source-of-truth for the protected type literals; the
@@ -581,6 +583,28 @@ def _trust_floor() -> float:
     ))
 
 
+def _user_global_floor() -> float:
+    """The user:global tier floor (issue #235), single-sourced from
+    schema_meta.
+
+    On gated passive moments (pretool/subagent) a global-tier injection
+    candidate whose MAX measured relevance lane sits below this floor is
+    withheld and its reserved slot returns empty rather than being
+    backfilled (enforcement lives in recall.py's global-tier seam; a global
+    candidate with NO measured lane keeps the not-measured exemption).
+    Literals mirror the schema_meta defaults so a partially-deployed tree
+    keeps the documented floor. A negative value is operator error and
+    clamps to 0.0; at 0.0 the floor is fully DISABLED (relevance values are
+    >= 0, so nothing is ever below it) — the same honest-disable semantics
+    as the trust floor.
+    """
+    return max(0.0, _env_float(
+        getattr(_schema_meta, "INJECT_FLOOR_USER_GLOBAL_ENV",
+                "ZMEM_INJECT_FLOOR_USER_GLOBAL"),
+        getattr(_schema_meta, "INJECT_FLOOR_USER_GLOBAL_DEFAULT", 0.5),
+    ))
+
+
 def _row_trust(row: Any) -> float:
     """The row's trust_score, normalized for ranking/gate use (issue #115).
 
@@ -858,6 +882,7 @@ def select_and_budget_for_injection(
     data_dir: str | None = None,
     min_confidence: float | None = None,
     pretool_input: dict | None = None,
+    user_global_floor: float | None = None,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -865,6 +890,17 @@ def select_and_budget_for_injection(
     distinguishes omitted (``None``: derive the pretool ring in storelib) from
     explicitly empty (``[]``: do not read the ring).  The caller owns ``conn``;
     this function never opens or closes SQLite.
+
+    ``user_global_floor`` (issue #235) overrides the env-derived
+    user:global tier floor; ``None`` resolves it from the environment on
+    gated moments (``pretool``/``subagent`` — hooks' posttoolbatch maps to
+    ``pretool`` store-side) and leaves it unset on every other moment.  The
+    resolved value is threaded through the shared kwargs dict into BOTH
+    ``recall_memory`` and ``recent_memory`` (``_user_global_floor``);
+    enforcement lives at recall.py's global-tier seam, where a below-floor
+    candidate is withheld and its slot returns empty rather than being
+    backfilled.  A global candidate with no measured lane (query-less
+    recent pulls) keeps the relevance gate's not-measured exemption.
     """
     if moment not in INJECTION_MOMENTS:
         raise ValueError("invalid injection moment: {!r}".format(moment))
@@ -981,6 +1017,20 @@ def select_and_budget_for_injection(
     if not effective_query.strip() and effective_min_confidence is None:
         effective_min_confidence = inject_recent_floor()
 
+    # Issue #235: the user:global tier floor is store-side (the hook argv
+    # surface is frozen).  An explicit caller argument wins; otherwise the
+    # env-derived floor arms only on gated moments — pretool and subagent
+    # (hooks' posttoolbatch maps to pretool store-side, so the post-tool
+    # batch class is covered).  session_start/user_prompt/precompact keep
+    # their current global composition; a resolved 0.0 disables (clamped in
+    # _user_global_floor, threaded as 0.0 so recall.py's `> 0` guard skips).
+    if user_global_floor is not None:
+        effective_user_global_floor = max(0.0, float(user_global_floor))
+    elif moment in ("pretool", "subagent"):
+        effective_user_global_floor = _user_global_floor()
+    else:
+        effective_user_global_floor = None
+
     # Validation above intentionally precedes this first ledger call.
     try:
         delivered_ids = list(ledger.delivered_ids(resolved_data, session_id))
@@ -1025,6 +1075,11 @@ def select_and_budget_for_injection(
             # Issue #137: the fence identity is the session id plus the
             # runtime moment — represented-row suppression never crosses it.
             _fence_id="%s:%s" % (session_id, moment),
+            # Issue #235: the user:global tier floor rides the SAME dict on
+            # both dispatch branches (query -> recall_memory, query-less ->
+            # recent_memory); an asymmetric kwarg here is the PR #225
+            # fail-open class, pinned by tests/test_user_global_floor.py.
+            _user_global_floor=effective_user_global_floor,
         )
         if effective_query.strip():
             kwargs["query"] = effective_query
@@ -1136,6 +1191,11 @@ def select_and_budget_for_injection(
             arms=parsed.get("arms", {}), rendered=rendered,
             injection_risk=parsed.get("injection_risk"),
             secret_withheld=secret_withheld_count or None,
+            # Issue #235: recall.py's global-tier seam counts floor-withheld
+            # user:global candidates into the captured details; forward it
+            # so the envelope names the withheld slot (keyed only when a
+            # withhold happened, mirroring secret_withheld).
+            global_withheld=parsed.get("global_withheld"),
             candidate_lanes=parsed.get("candidate_lanes"),
             budget_note=parsed.get("budget_note") if rows else None,
         )
