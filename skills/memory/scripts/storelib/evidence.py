@@ -17,6 +17,7 @@ import re
 import sqlite3
 import sys
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 from storelib.write import redact_text
@@ -29,6 +30,20 @@ EVIDENCE_MAX_EXCERPT_CHARS = 400
 EVIDENCE_INPUT_MAX_EXCERPT_CHARS = 4096
 EVIDENCE_DEFAULT_RETENTION_DAYS = 30
 EVIDENCE_DEFAULT_CAP = 50_000
+# Keep one memory write's association list bounded at every local trust
+# boundary. The CLI, writer, and direct association helper all use the
+# canonical normalizer below so their count and ordering rules cannot drift.
+MAX_EVIDENCE_IDS_PER_WRITE = 256
+# Association reads can otherwise turn a single memory or evidence identifier
+# into an unbounded response.  This is a read/output limit only: imports and
+# persistence remain lossless, and callers can retrieve the next page.
+EVIDENCE_ASSOCIATION_PAGE_MAX = 256
+# Keep untrusted ``IN`` query inputs below SQLite's common host-parameter
+# ceilings (999 in legacy builds, 32766 in newer builds).  These are
+# conservative per-query limits; custom builds with a lower compiled cap may
+# require smaller values.
+EVIDENCE_LOOKUP_CHUNK_SIZE = 400
+EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE = 900
 EVIDENCE_LANES = (
     "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
 )
@@ -42,6 +57,46 @@ EVIDENCE_KINDS = (
 _UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _UUID_SHAPED_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 _SQLITE_INT_MAX = 2**63 - 1
+
+
+def normalize_evidence_ids(
+    evidence_ids: Iterable[object] | None,
+    *,
+    error_type: type[Exception] = ValueError,
+) -> list[str]:
+    """Canonicalize and bound evidence IDs for one memory write.
+
+    ``error_type`` lets the CLI retain its ``ArgumentTypeError`` contract while
+    writer and direct association callers continue to raise ``ValueError``.
+    Endpoint existence is checked separately at each write trust boundary.
+    """
+    if evidence_ids is None:
+        raw_ids: list[object] = []
+    elif isinstance(evidence_ids, (list, tuple)):
+        # Reject before string coercion, sorting, or duplicate scans.
+        if len(evidence_ids) > MAX_EVIDENCE_IDS_PER_WRITE:
+            raise error_type(
+                "at most 256 evidence ids may be attached to one memory write"
+            )
+        raw_ids = list(evidence_ids)
+    else:
+        raw_ids = []
+        for value in evidence_ids:
+            raw_ids.append(value)
+            if len(raw_ids) > MAX_EVIDENCE_IDS_PER_WRITE:
+                raise error_type(
+                    "at most 256 evidence ids may be attached to one memory write"
+                )
+    ids = [str(value).strip() for value in raw_ids]
+    for evidence_id in ids:
+        if not evidence_id:
+            raise error_type("evidence id is empty")
+    seen: set[str] = set()
+    for evidence_id in ids:
+        if evidence_id in seen:
+            raise error_type(f"duplicate evidence id: {evidence_id}")
+        seen.add(evidence_id)
+    return sorted(ids)
 
 
 def _validate_ts(value: str, field: str = "ts") -> str:
@@ -275,14 +330,192 @@ def sweep_evidence(
         return zero
 
 
-def evidence_ids_for_memory(conn, memory_id: str) -> list:
+def attach_memory_evidence(
+    conn: sqlite3.Connection, *, memory_id: str, evidence_ids: list[str] | tuple[str, ...]
+) -> int:
+    """Attach evidence rows to one memory atomically and idempotently.
+
+    Writer callers normally already own a transaction.  The standalone form is
+    useful to administrative callers, while the savepoint keeps a failed
+    association from partially changing a caller-owned transaction. Returns
+    the number of newly inserted pairs; existing pairs contribute zero.
+    """
+    ids = normalize_evidence_ids(evidence_ids)
+    if not ids:
+        return 0
+
+    own_transaction = not conn.in_transaction
+    savepoint = "zmem_attach_memory_evidence"
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        if conn.execute("SELECT 1 FROM memory WHERE id=?", (memory_id,)).fetchone() is None:
+            raise ValueError(f"memory id not found: {memory_id}")
+        missing = _missing_evidence_ids(conn, ids)
+        if missing:
+            raise ValueError(f"evidence id not found: {missing[0]}")
+        inserted = 0
+        for evidence_id in ids:
+            inserted += conn.execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id, evidence_id) VALUES (?, ?)",
+                (memory_id, evidence_id),
+            ).rowcount
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return inserted
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def evidence_ids_for_memory(conn, memory_id: str) -> list[str]:
     """Issue #124: association read for the operation-feedback loop — the
     evidence ids linked to one memory via the schema-14 memory_evidence
     table. Read-only; the association WRITE API and the MCP surfaces remain
     issue #171's scope. Sorted for deterministic membership checks."""
-    rows = conn.execute(
-        "SELECT evidence_id FROM memory_evidence WHERE memory_id = ? "
-        "ORDER BY evidence_id",
-        (memory_id,),
-    ).fetchall()
-    return [r[0] for r in rows]
+    return evidence_ids_for_memories(conn, [memory_id]).get(memory_id, [])
+
+
+def _missing_evidence_ids(
+    conn: sqlite3.Connection, evidence_ids: list[str] | tuple[str, ...]
+) -> list[str]:
+    """Return missing evidence IDs in caller-supplied deterministic order.
+
+    The writer validates association endpoints at its own trust boundary and
+    the association helper validates them again inside its transaction. Keep
+    those checks, but use bounded ``IN`` queries so large imports do not hold
+    the write lock across one query per untrusted ID.
+    """
+    missing: list[str] = []
+    for offset in range(0, len(evidence_ids), EVIDENCE_LOOKUP_CHUNK_SIZE):
+        chunk = list(evidence_ids[offset:offset + EVIDENCE_LOOKUP_CHUNK_SIZE])
+        placeholders = ",".join("?" for _ in chunk)
+        found = {
+            row[0] for row in conn.execute(
+                f"SELECT id FROM evidence WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+        }
+        missing.extend(evidence_id for evidence_id in chunk if evidence_id not in found)
+    return missing
+
+
+def evidence_ids_for_memories(
+    conn: sqlite3.Connection, memory_ids: list[str] | tuple[str, ...]
+) -> dict[str, list[str]]:
+    """Fetch associations for many memories with bounded queries.
+
+    Pre-v14 stores have no association table. Probe the schema marker once per
+    call when that table is absent, preserving the single-memory helper's
+    fail-open legacy behavior while still surfacing damaged v14 stores.
+    """
+    result = {memory_id: [] for memory_id in memory_ids}
+    if not memory_ids:
+        return result
+    unique_ids = list(dict.fromkeys(memory_ids))
+    try:
+        for offset in range(0, len(unique_ids), EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE):
+            chunk = unique_ids[offset:offset + EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT memory_id, evidence_id FROM memory_evidence "
+                f"WHERE memory_id IN ({placeholders}) "
+                "ORDER BY memory_id, evidence_id",
+                chunk,
+            ).fetchall()
+            for memory_id, evidence_id in rows:
+                result[memory_id].append(evidence_id)
+    except sqlite3.OperationalError as exc:
+        # Older, schema-initialized stores can legitimately lack this v14
+        # side table. Do not hide a damaged v14 schema or unrelated SQL error.
+        if "no such table: memory_evidence" not in str(exc):
+            raise
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            pre_v14 = version is not None and int(version[0]) < 14
+        except (TypeError, ValueError):
+            pre_v14 = False
+        if not pre_v14:
+            raise
+        return result
+    return result
+
+
+def evidence_ids_for_memories_bounded(
+    conn: sqlite3.Connection,
+    memory_ids: list[str] | tuple[str, ...],
+    *,
+    limit: int = EVIDENCE_ASSOCIATION_PAGE_MAX,
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Return a bounded, deterministic evidence-id prefix for each memory.
+
+    This is deliberately separate from :func:`evidence_ids_for_memories`:
+    maintenance and feedback callers retain their complete, lossless view,
+    while recall/recent/explain can safely expose provenance on large stores.
+    ``truncated`` identifies memories for which one look-ahead id was found.
+
+    A window-function filter looks concise but still materializes every link in
+    an oversized partition.  The nested UNION form instead performs an indexed
+    ``LIMIT limit + 1`` lookup for each requested memory in one SQL round trip
+    per bounded chunk.
+    """
+    if limit < 1 or limit > EVIDENCE_ASSOCIATION_PAGE_MAX:
+        raise ValueError("evidence association page limit is out of range")
+    result = {memory_id: [] for memory_id in memory_ids}
+    truncated: set[str] = set()
+    unique_ids = list(dict.fromkeys(memory_ids))
+    if not unique_ids:
+        return result, truncated
+    # Each UNION arm has one id and one limit parameter.  Keep under both the
+    # common SQLite variable limit and SQLITE_MAX_COMPOUND_SELECT.
+    chunk_size = min(400, EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE)
+    try:
+        for offset in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[offset:offset + chunk_size]
+            arms = [
+                "SELECT memory_id, evidence_id FROM ("
+                "SELECT memory_id, evidence_id FROM memory_evidence "
+                "WHERE memory_id=? ORDER BY evidence_id LIMIT ?"
+                ")"
+                for _ in chunk
+            ]
+            params: list[object] = []
+            for memory_id in chunk:
+                params.extend((memory_id, limit + 1))
+            rows = conn.execute(
+                "SELECT memory_id, evidence_id FROM ("
+                + " UNION ALL ".join(arms)
+                + ") ORDER BY memory_id, evidence_id",
+                params,
+            ).fetchall()
+            counts: dict[str, int] = {memory_id: 0 for memory_id in chunk}
+            for memory_id, evidence_id in rows:
+                counts[memory_id] += 1
+                if counts[memory_id] <= limit:
+                    result[memory_id].append(evidence_id)
+                else:
+                    truncated.add(memory_id)
+    except sqlite3.OperationalError as exc:
+        if "no such table: memory_evidence" not in str(exc):
+            raise
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()
+        try:
+            pre_v14 = version is not None and int(version[0]) < 14
+        except (TypeError, ValueError):
+            pre_v14 = False
+        if not pre_v14:
+            raise
+    return result, truncated

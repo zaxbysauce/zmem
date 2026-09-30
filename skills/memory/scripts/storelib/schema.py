@@ -1220,7 +1220,44 @@ _EVIDENCE_SCHEMA_DDL = (
         PRIMARY KEY (memory_id, evidence_id)
     )
     """,
+    "CREATE INDEX IF NOT EXISTS memory_evidence_evidence_memory_idx "
+    "ON memory_evidence(evidence_id, memory_id)",
 )
+
+_EVIDENCE_LOOKUP_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS memory_evidence_evidence_memory_idx "
+    "ON memory_evidence(evidence_id, memory_id)"
+)
+
+
+def _ensure_evidence_lookup_index(conn: sqlite3.Connection) -> None:
+    """Add the evidence-first association index to existing v14 stores.
+
+    The index is part of the atomic v14 DDL for new stores, and this
+    version-independent ensure covers stores that already recorded v14 before
+    the index was introduced. No data or schema-version change is required.
+    """
+    savepoint = "zmem_evidence_lookup_index"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        conn.execute(_EVIDENCE_LOOKUP_INDEX_DDL)
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
 
 # Issue #137: additive belief-head side tables.  Like the v14 evidence
 # tables, this DDL is version-independent — it runs on every open from
@@ -1968,6 +2005,10 @@ def migrate(conn: sqlite3.Connection) -> None:
         # Keep its DDL out of init_db(): opening an existing v13 store must not
         # pre-create any v14 table before this atomic versioned transaction.
         _migrate_v14(conn)
+
+    # Version-independent evidence-first lookup index: this repairs existing
+    # v14 stores without a version bump and is idempotent on every open.
+    _ensure_evidence_lookup_index(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.
     # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,

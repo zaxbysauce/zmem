@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          out="$(python -m unittest -v tests/test_session_tools.py tests/test_mcp_server.py 2>&1)" || {
+          out="$(python -m unittest -v tests/test_session_tools.py tests/test_mcp_server.py tests/test_evidence_association.py 2>&1)" || {
             printf '%s\n' "$out"
             exit 1
           }

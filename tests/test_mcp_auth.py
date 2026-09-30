@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -121,6 +123,58 @@ class TokenConfigParsingTest(unittest.TestCase):
         cfg.check_namespace(None)
         cfg.check_namespace("project:anything")
 
+    def test_bearer_token_utf8_bound_applies_to_config_and_presented_value(self):
+        import asyncio
+
+        at_limit = "t" * 4096
+        os.environ["ZMEM_MCP_TOKEN"] = at_limit
+        self.assertEqual(self.auth.load_token_config().token, at_limit)
+
+        verifier = self.auth.StaticTokenVerifier(at_limit)
+        self.assertIsNotNone(asyncio.run(verifier.verify_token(at_limit)))
+        self.assertIsNone(asyncio.run(verifier.verify_token("t" * 4097)))
+
+        oversized = "s" * 4097
+        os.environ["ZMEM_MCP_TOKEN"] = oversized
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as cm:
+                self.auth.load_token_config()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("maximum of 4096 UTF-8 bytes", output.getvalue())
+        self.assertNotIn(oversized, output.getvalue())
+
+    def test_bearer_token_utf8_encoding_handles_multibyte_and_surrogates(self):
+        import asyncio
+
+        at_limit = "é" * 2048
+        os.environ["ZMEM_MCP_TOKEN"] = at_limit
+        self.assertEqual(self.auth.load_token_config().token, at_limit)
+        verifier = self.auth.StaticTokenVerifier(at_limit)
+        self.assertIsNotNone(asyncio.run(verifier.verify_token(at_limit)))
+        self.assertIsNone(asyncio.run(verifier.verify_token(chr(0xD800))))
+
+        oversized = "é" * 2049
+        os.environ["ZMEM_MCP_TOKEN"] = oversized
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as cm:
+                self.auth.load_token_config()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("maximum of 4096 UTF-8 bytes", output.getvalue())
+        self.assertNotIn(oversized, output.getvalue())
+
+        os.environ.pop("ZMEM_MCP_TOKEN", None)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(
+            json.dumps({"token": chr(0xD800)})
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as cm:
+                self.auth.load_token_config()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("token must be valid UTF-8 text", output.getvalue())
+
     def test_bare_file_token_is_unscoped(self):
         os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file("  file-bare-secret \n")
         cfg = self.auth.load_token_config()
@@ -173,6 +227,58 @@ class TokenConfigParsingTest(unittest.TestCase):
     def test_empty_namespaces_list_exits_2(self):
         os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(
             json.dumps({"token": "x", "namespaces": []}))
+        with self.assertRaises(SystemExit) as cm:
+            self.auth.load_token_config()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_scoped_namespace_count_and_utf8_bounds(self):
+        at_count = [f"project:scope-{index}" for index in range(128)]
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(json.dumps({
+            "token": "x", "namespaces": at_count,
+        }))
+        self.assertEqual(len(self.auth.load_token_config().namespaces), 128)
+
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(json.dumps({
+            "token": "x", "namespaces": at_count + ["project:overflow"],
+        }))
+        with self.assertRaises(SystemExit) as cm:
+            self.auth.load_token_config()
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_scoped_namespace_aggregate_utf8_bound(self):
+        # Count and per-entry limits alone can still fill Windows' 32K process
+        # command line once each `--namespace` flag is added. Keep total scope
+        # text safely below that limit.
+        at_aggregate = [
+            f"project:{index:02d}" + ("x" * 246) for index in range(32)
+        ]
+        self.assertEqual(sum(len(value.encode("utf-8")) for value in at_aggregate), 8192)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(json.dumps({
+            "token": "x", "namespaces": at_aggregate,
+        }))
+        self.assertEqual(len(self.auth.load_token_config().namespaces), 32)
+
+        output = io.StringIO()
+        over_aggregate = at_aggregate + ["project:overflow"]
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(json.dumps({
+            "token": "x", "namespaces": over_aggregate,
+        }))
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as cm:
+                self.auth.load_token_config()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("maximum aggregate of 8192 UTF-8 bytes", output.getvalue())
+
+        # `project:` is 8 bytes, so this entry lands exactly on the per-scope
+        # UTF-8 boundary.  One extra byte must be refused before validation.
+        at_bytes = "project:" + ("x" * 248)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(json.dumps({
+            "token": "x", "namespaces": [at_bytes],
+        }))
+        self.assertTrue(self.auth.load_token_config().scoped)
+        os.environ["ZMEM_MCP_TOKEN_FILE"] = self._token_file(json.dumps({
+            "token": "x", "namespaces": [at_bytes + "x"],
+        }))
         with self.assertRaises(SystemExit) as cm:
             self.auth.load_token_config()
         self.assertEqual(cm.exception.code, 2)
