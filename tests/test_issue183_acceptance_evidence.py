@@ -113,7 +113,8 @@ class Issue183AcceptanceEvidenceTest(unittest.TestCase):
             )
             self.assertEqual(shown.returncode, 0, shown.stderr)
             row = json.loads(shown.stdout)
-            self.assertEqual(row["excerpt"], "[REDACTED_SECRET]")
+            # Issue #180 value-span redaction (key name survives).
+            self.assertEqual(row["excerpt"], "token=[REDACTED_SECRET]")
             self.assertNotIn("hash", row)
             secret_conn = sqlite3.connect(env["ZMEM_STORE"])
             with secret_conn:

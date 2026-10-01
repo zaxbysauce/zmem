@@ -280,8 +280,10 @@ class TestSecrets(unittest.TestCase):
         it = _make_item(message="the api_key=0123456789abcdef is bad, use X",
                         capture_mode="auto")
         self.assertTrue(it["secret_warning"])
-        self.assertNotIn("api_key", it["message"])
-        self.assertIn("REDACTED", it["message"])
+        # Issue #180 value-span redaction: the KEY name survives, the VALUE
+        # must not (the pre-#180 whole-match mask removed both).
+        self.assertNotIn("0123456789abcdef", it["message"])
+        self.assertIn("api_key=[REDACTED_SECRET]", it["message"])
 
     def test_manual_keeps_original_with_warning(self):
         it = _make_item(message="the api_key=0123456789abcdef is bad, use X",
