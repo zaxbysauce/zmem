@@ -2042,14 +2042,22 @@ def _classify_credential(item: dict) -> bool:
     tags) but re-runs the CREDENTIAL half of the write-time registry only —
     never ``SECRET_GENERIC_PATTERNS``/``SECRET_PATTERNS``: their 32+ hex /
     40+ base64 shapes match every full git SHA and would withhold ordinary
-    rows. Pure string/regex; no model, no store writes. The shapes issue
-    #180 adds to ``SECRET_CREDENTIAL_PATTERNS`` are picked up here
-    automatically (the registry is consumed verbatim).
+    rows. Pure string/regex; no model, no store writes. Issue #180: the
+    command/URL credential shapes and the refusal-only detector live in
+    sibling lists of the same single registry and are consumed here
+    explicitly, so a ``sshpass -p ...`` / ``sudo -S`` row is withheld on the
+    passive lane exactly like a token-shaped one (the field-leak vector).
     """
-    from redaction import SECRET_CREDENTIAL_PATTERNS
+    from redaction import (
+        SECRET_COMMAND_PATTERNS,
+        SECRET_CREDENTIAL_PATTERNS,
+        SECRET_REFUSAL_PATTERNS,
+    )
     blob = " \n".join(
         str(item.get(k) or "") for k in ("content", "source_ref", "tags"))
-    return any(pat.search(blob) for pat in SECRET_CREDENTIAL_PATTERNS)
+    return any(pat.search(blob) for pat in (
+        SECRET_CREDENTIAL_PATTERNS + SECRET_COMMAND_PATTERNS
+        + SECRET_REFUSAL_PATTERNS))
 
 
 def _classify_injection(item: dict) -> bool:

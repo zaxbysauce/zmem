@@ -24,12 +24,24 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
+SECRETS_DIR = REPO_ROOT / "tests" / "fixtures" / "secrets"
 sys.path.insert(0, str(SCRIPTS))
 
 from storelib.write import redact_text  # noqa: E402
 from redaction import redact_training_text  # noqa: E402
 
 SECRET = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+
+
+def _ensure_scripts_path() -> None:
+    """Re-assert SCRIPTS on sys.path before an in-process storelib import.
+
+    A sibling module's cleanup (test_storelib_exports drains SCRIPTS_DIR
+    from sys.path) can remove the module-level insert made at import time;
+    co-run order must never decide whether storelib resolves.
+    """
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
 
 
 def _run(args, env=None):
@@ -127,6 +139,117 @@ class RedactTextHelperTest(unittest.TestCase):
                     self.assertNotIn("secret.txt", redacted)
 
 
+class CapturePatternMatrixTest(unittest.TestCase):
+    """Issue #180: the frozen 12-positive / 12-negative pattern matrix.
+
+    In-process against the PUBLIC policy (`storelib.write.apply_capture_policy`)
+    with the env pinned to a scratch store BEFORE the storelib import (the
+    module-level `redact_text` import at the top of this file already cached
+    storelib against the ambient env, so the cache is purged and re-imported
+    under this class's pinned env — repo convention).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="zmem-matrix-")
+        cls._saved = {k: os.environ.get(k) for k in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_CAPTURE_MODE",
+        )}
+        os.environ["ZMEM_STORE"] = os.path.join(cls._tmp, "store.sqlite")
+        os.environ["ZMEM_DATA"] = cls._tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls._tmp, "missing-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_CAPTURE_MODE", None)
+        # Pin env FIRST, then purge the cached storelib, then import: the
+        # package freezes STORE_PATH at import time and must never bind to the
+        # ambient (operator) store.
+        for mod_name in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+            del sys.modules[mod_name]
+        _ensure_scripts_path()
+        import storelib.write as write_mod  # noqa: E402
+        cls.write_mod = write_mod
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+        # Drop the scratch-bound storelib so a later in-process import
+        # re-resolves against the caller's env, not the deleted scratch.
+        for mod_name in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+            del sys.modules[mod_name]
+        for k, v in cls._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _matrix(self) -> dict:
+        return json.loads(
+            (SECRETS_DIR / "patterns.json").read_text(encoding="utf-8"))
+
+    def _expected_matrix(self) -> dict:
+        return json.loads(
+            (SECRETS_DIR / "patterns.expected.json").read_text(encoding="utf-8"))
+
+    def _apply(self, content: str):
+        return self.write_mod.apply_capture_policy(
+            content=content, source_ref="", tags="", capture_mode="auto")
+
+    def test_all_positive_cases_have_exact_outcomes(self):
+        matrix = self._matrix()
+        expected = self._expected_matrix()
+        positives = matrix["positive"]
+        self.assertEqual(len(positives), 12, "the matrix freezes exactly 12 positives")
+        self.assertEqual(len(matrix["negative"]), 12,
+                         "the matrix freezes exactly 12 negatives")
+        exp_by_id = {case["id"]: case for case in expected["positive"]}
+        quarantined = []
+        for case in positives:
+            if case["outcome"] != "redacted":
+                quarantined.append(case)
+                continue
+            content, _ref, _tags, _warnings = self._apply(case["input"])
+            self.assertEqual(content, exp_by_id[case["id"]]["expected"],
+                             f"{case['id']} must match the frozen expected output")
+            self.assertIn("[REDACTED_SECRET]", content, case["id"])
+        # Exactly one positive is the whole-row refusal (sudo -S).
+        self.assertEqual([c["id"] for c in quarantined], ["p03"], quarantined)
+        with self.assertRaises(self.write_mod.CapturePolicyRefusal) as ctx:
+            self._apply(quarantined[0]["input"])
+        self.assertEqual(ctx.exception.reason, "unredactable_secret")
+
+    def test_all_negative_cases_are_byte_identical(self):
+        negatives = self._matrix()["negative"]
+        self.assertEqual(len(negatives), 12)
+        for case in negatives:
+            content, _ref, _tags, _warnings = self._apply(case["input"])
+            self.assertEqual(content, case["input"],
+                             f"{case['id']} must pass through byte-identical")
+        # The issue's named trap: `passwd entry` is a WORD, not a key=value
+        # credential, and must never match.
+        content, _ref, _tags, _warnings = self._apply("passwd entry")
+        self.assertEqual(content, "passwd entry")
+
+    def test_compound_key_names_still_redact(self):
+        # Non-fixture breadth pin: the keyword prefix is deliberately
+        # unanchored, so COMPOUND key names keep matching and only the VALUE
+        # span is replaced.
+        cases = (
+            ("DB_PASSWORD=supersecretpw", "DB_PASSWORD=[REDACTED_SECRET]"),
+            ("my_api_key=abcdefgh1234", "my_api_key=[REDACTED_SECRET]"),
+            ("stripe_token=abcdefgh1234", "stripe_token=[REDACTED_SECRET]"),
+            ("export DB_PASSWORD=hunter2long",
+             "export DB_PASSWORD=[REDACTED_SECRET]"),
+        )
+        for raw, expected in cases:
+            content, _ref, _tags, _warnings = self._apply(raw)
+            self.assertEqual(content, expected,
+                             "the key must survive; only the value is replaced")
+
+
 class WritePathRedactionTest(unittest.TestCase):
     """CLI add/update in auto mode redact; manual mode warns advisories."""
 
@@ -207,12 +330,195 @@ class WritePathRedactionTest(unittest.TestCase):
         self.assertGreaterEqual(len(redactions), 1, out)
 
     def test_secret_like_source_ref_refused_fail_closed(self):
+        # Issue #180: an auto-mode whole-row refusal now QUARANTINES (exit 0,
+        # result "quarantined", original row in <data>/quarantine/) instead
+        # of the pre-#180 exit-2 drop. The secret itself still never reaches
+        # stdout or stderr.
         r = _run(["add", "--namespace", "project:redact", "--type", "fact",
                   "--content", "benign",
                   "--source-ref", f"ref {SECRET}",
                   "--capture-mode", "auto", "--json"])
-        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out.get("result"), "quarantined")
+        self.assertEqual(out.get("id"), None)
+        warnings = out.get("warnings") or []
+        self.assertTrue(any(w.get("type") == "quarantined"
+                            and w.get("reason") == "source_ref_secret_like"
+                            for w in warnings), warnings)
         self.assertNotIn(SECRET, r.stdout + r.stderr)
+
+    def test_public_policy_is_the_only_capture_entry_point(self):
+        """Issue #180 AC1 guardrail: the PUBLIC policy name is the only capture
+        entry point. The pre-#180 private spelling must be gone from the module
+        AND from every file under skills/memory/scripts/ and tests/ — the name
+        is CONSTRUCTED here so this test file itself carries no literal."""
+        private_name = "_" + "apply_capture_policy"
+        _ensure_scripts_path()
+        import storelib.write as storelib_write  # noqa: E402 — env pinned by setUpClass
+        self.assertTrue(hasattr(storelib_write, "apply_capture_policy"))
+        self.assertFalse(hasattr(storelib_write, private_name),
+                         "the private policy symbol must not survive")
+        # Plain substring scan — byte-identical in strength to the frozen
+        # acceptance check (no exclusions; even test-method names must not
+        # embed the private spelling).
+        hits = []
+        for root_dir in (SCRIPTS, REPO_ROOT / "tests"):
+            for path in sorted(root_dir.rglob("*")):
+                if not path.is_file() or "__pycache__" in path.parts:
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if private_name in text:
+                    hits.append(str(path))
+        self.assertEqual(hits, [],
+                         "private capture-policy symbol still referenced in: "
+                         + ", ".join(hits))
+
+
+class QuarantinePolicyTest(unittest.TestCase):
+    """Issue #180: the CLI add-path quarantine contract (stdout bytes, the
+    durable quarantine record, and f(f(x))==f(x) policy idempotence)."""
+
+    # The SAFE matrix subset for the full f(f(x))==f(x) pin (warnings
+    # included): the value-span shapes whose first-pass placeholder output is
+    # re-detected by exactly the patterns that produced it. p04/p05
+    # (--password=) additionally trip the key=value detector on the 8+-char
+    # placeholder (detection count 1 -> 2) and p11/p12 collapse to a bare
+    # marker that no pattern re-detects (the redacted warning disappears) —
+    # for those, content/source_ref/tags are still fixed points, which this
+    # test asserts for EVERY redacted positive below.
+    SAFE_POSITIVE_IDS = ("p01", "p02", "p06", "p07", "p08", "p09", "p10")
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="zmem-quar-")
+        cls.store = os.path.join(cls._tmp, "store.sqlite")
+        cls._saved = {k: os.environ.get(k) for k in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_CAPTURE_MODE",
+        )}
+        os.environ["ZMEM_STORE"] = cls.store
+        os.environ["ZMEM_DATA"] = cls._tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls._tmp, "missing-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_CAPTURE_MODE", None)
+        _run(["init"])
+        # In-process policy access for the idempotence leg: env is pinned
+        # above, so purge the cached storelib and re-import against the
+        # scratch before any call (repo convention).
+        for mod_name in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+            del sys.modules[mod_name]
+        _ensure_scripts_path()
+        import storelib.write as write_mod  # noqa: E402
+        cls.write_mod = write_mod
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+        for mod_name in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+            del sys.modules[mod_name]
+        for k, v in cls._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_source_refusal_quarantines_once(self):
+        import hashlib
+        import shutil
+        import sqlite3
+        import time
+
+        row = json.loads(
+            (SECRETS_DIR / "quarantine_row.jsonl").read_text(
+                encoding="utf-8").splitlines()[0])
+        date_before = time.strftime("%Y-%m-%d", time.gmtime())
+        r = _run(["add", "--namespace", "user:global", "--type", "fact",
+                  "--content", row["content"],
+                  "--source-ref", row["source_ref"],
+                  "--tags", "fixture", "--signal", "test",
+                  "--capture-mode", "auto", "--json"])
+        date_after = time.strftime("%Y-%m-%d", time.gmtime())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            r.stdout.rstrip("\n"),
+            '{"id": null, "result": "quarantined", "warnings": '
+            '[{"type": "quarantined", "reason": "source_ref_secret_like"}]}')
+        # The refused secret never crosses either stdio lane.
+        self.assertNotIn("pw180B", r.stdout)
+        self.assertNotIn("pw180B", r.stderr)
+
+        # No row was stored (the store was freshly initialized).
+        conn = sqlite3.connect(self.store)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+        # Exactly one quarantine record for TODAY, canonical key order.
+        qdir = os.path.join(self._tmp, "quarantine")
+        qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")]
+        self.assertEqual(len(qfiles), 1, qfiles)
+        self.assertIn(qfiles[0],
+                      {date_before + ".jsonl", date_after + ".jsonl"})
+        with open(os.path.join(qdir, qfiles[0]), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(len(lines), 1, "one quarantined add appends one line")
+        record = json.loads(lines[0])
+        self.assertEqual(list(record.keys()),
+                         ["quarantined_at", "reason", "source_ref", "row"])
+        self.assertEqual(record["source_ref"], "sshpass -p pw180B")
+        self.assertEqual(record["reason"], "source_ref_secret_like")
+
+        # The in-process helper reproduces the frozen expected record byte
+        # for byte at the fixed timestamp (CRLF-normalized on both sides).
+        scratch2 = tempfile.mkdtemp(prefix="zmem-quar2-")
+        self.addCleanup(shutil.rmtree, scratch2, True)
+        target = self.write_mod.quarantine_import_row(
+            scratch2, row, reason="source_ref_secret_like",
+            now="2026-09-10T12:00:00Z")
+        produced = Path(target).read_bytes().replace(b"\r\n", b"\n")
+        expected = (SECRETS_DIR / "quarantine_row.expected.jsonl").read_bytes(
+            ).replace(b"\r\n", b"\n")
+        self.assertEqual(produced, expected)
+        self.assertEqual(hashlib.sha256(produced).hexdigest(),
+                         hashlib.sha256(expected).hexdigest())
+
+    def test_policy_is_idempotent_on_own_output(self):
+        matrix = json.loads(
+            (SECRETS_DIR / "patterns.json").read_text(encoding="utf-8"))
+        redacted = [c for c in matrix["positive"] if c["outcome"] == "redacted"]
+        self.assertEqual(len(redacted), 11)
+        apply = self.write_mod.apply_capture_policy
+        for case in redacted:
+            c1, r1, t1, w1 = apply(content=case["input"],
+                                   source_ref="file:fixture-safe",
+                                   tags="", capture_mode="auto")
+            self.assertIn("[REDACTED_SECRET]", c1, case["id"])
+            c2, r2, t2, w2 = apply(content=c1, source_ref=r1, tags=t1,
+                                   capture_mode="auto")
+            self.assertEqual((c2, r2, t2), (c1, r1, t1),
+                             f"{case['id']}: content/source_ref/tags must be "
+                             f"a fixed point of auto mode")
+            if case["id"] in self.SAFE_POSITIVE_IDS:
+                self.assertEqual(json.dumps(w2, sort_keys=True),
+                                 json.dumps(w1, sort_keys=True),
+                                 f"{case['id']}: warnings must be byte-"
+                                 f"identical on the policy's own output")
+        self.assertEqual(
+            len([c for c in redacted if c["id"] in self.SAFE_POSITIVE_IDS]),
+            len(self.SAFE_POSITIVE_IDS),
+            "every SAFE id must still be a redacted matrix positive")
 
 
 class ReadEnvelopeOmitCountsTest(unittest.TestCase):

@@ -25,7 +25,7 @@ import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
-from storelib.write import CapturePolicyRefusal, _GLOBAL_NEAR_MISS_STEMS, _apply_capture_policy, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
+from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
     EVIDENCE_KINDS,
@@ -1096,7 +1096,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
     local store.
 
     Returns 'added', 'tombstoned', 'tombstone_refused', 'deduped',
-    'capture_refused', or 'skipped' -- the caller tallies these into the
+    'capture_refused', 'quarantined', 'quarantine_failed', or 'skipped' -- the caller tallies these into the
     ingest-jsonl summary line. Malformed-row handling lives in the caller, so
     a bad row never reaches this function; the caller also catches anything
     raised here (a row that blows up must not abort the rest of the file).
@@ -1185,8 +1185,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 conn.rollback()
             return "purged_denied"
 
-        # The id is genuinely new -- capture policy now applies. _apply_capture_policy
-        # is pure (no DB, no I/O -- see lines 893-929). It runs inside the open
+        # The id is genuinely new -- capture policy now applies. apply_capture_policy
+        # is pure (no DB, no I/O -- see its own docstring). It runs inside the open
         # transaction, so a CapturePolicyRefusal rolls it back before returning
         # (nothing was written yet: the only DB work so far is the read-only
         # existence SELECT above). This closes the prompt-injection-via-memory
@@ -1212,7 +1212,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # dispatch only sees its own --source-ref override); same bytes as
             # storelib.write.warn_reserved_source_ref via the shared printer.
             warn_reserved_source_ref(source_ref)
-            content, source_ref, tags, cap_warns = _apply_capture_policy(
+            content, source_ref, tags, cap_warns = apply_capture_policy(
                 content=content,
                 source_ref=source_ref,
                 tags=tags,
@@ -1221,6 +1221,23 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         except CapturePolicyRefusal as exc:
             if started_tx and conn.in_transaction:
                 conn.rollback()
+            # Issue #180: an auto-mode quarantineable refusal records the
+            # ORIGINAL validated row in the quarantine JSONL instead of a
+            # silent drop; every other refusal keeps the capture_refused
+            # contract. A quarantine write failure rolls back to a
+            # quarantine_failed count (the caller exits nonzero).
+            if (exc.reason in QUARANTINE_REASONS
+                    and _normalize_capture_mode(capture_mode) == "auto"):
+                try:
+                    quarantine_import_row(
+                        os.path.dirname(STORE_PATH), obj, reason=exc.reason)
+                except OSError as q_exc:
+                    print(f"[zmem] ingest-jsonl: quarantine write failed for "
+                          f"row {mid}: {q_exc}", file=sys.stderr)
+                    return "quarantine_failed"
+                print(f"[zmem] ingest-jsonl: quarantined row {mid}: "
+                      f"{exc.message}", file=sys.stderr)
+                return "quarantined"
             print(f"[zmem] ingest-jsonl: refused row {mid}: {exc}", file=sys.stderr)
             return "capture_refused"
         for w in cap_warns:
@@ -1232,7 +1249,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # dedup-on-write or recall -- it must not resurface, and it must not
             # silently absorb a live row into its (dead) dedup slot either.
             # Secret/injection handling is applied just above via
-            # _apply_capture_policy (issue #35); no separate advisory scan here.
+            # apply_capture_policy (issue #35); no separate advisory scan here.
             shash = ""
             conn.execute(
                 """INSERT INTO memory
@@ -1262,7 +1279,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             return "added"
 
         # Secret/injection handling is applied once above (for new rows) via
-        # _apply_capture_policy (issue #35); no separate advisory scan here.
+        # apply_capture_policy (issue #35); no separate advisory scan here.
         # Issue #63 review round: ingest is a WRITE surface; a forgotten
         # fake-profile export must announce itself here too.
         import embeddings as _emb_sync
@@ -1594,7 +1611,7 @@ def _strict_ingest_staged(
                 )
             if diagnostic.getvalue():
                 strict_diagnostics.append(diagnostic.getvalue())
-            if outcome in ("tombstone_refused", "capture_refused"):
+            if outcome in ("tombstone_refused", "capture_refused", "quarantined", "quarantine_failed"):
                 raise ValueError(f"strict import refused memory row {obj['id']}")
             # purged_denied rows are skipped, never fatal (issue #255): their
             # links are dropped with them rather than added from a dead src.
@@ -1843,6 +1860,8 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
     capture_refused = 0
+    quarantined = 0
+    quarantine_failed = 0
     links_added = links_skipped = 0
     first_refused_id = None
     saw_line = False
@@ -2021,6 +2040,10 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     first_refused_id = obj["id"]
             elif outcome == "capture_refused":
                 capture_refused += 1
+            elif outcome == "quarantined":
+                quarantined += 1
+            elif outcome == "quarantine_failed":
+                quarantine_failed += 1
             elif outcome == "deduped":
                 deduped += 1
             else:
@@ -2061,13 +2084,27 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
               f"own store's export, not a remote/cloud outbox.", file=sys.stderr)
 
     if capture_refused:
-        # Rows refused by the capture policy (auto mode: source_ref looked like a
-        # secret). NOT written. One summary note, not per-row, for the same
-        # noise-suppression reason as tombstones_refused.
+        # Rows refused by the capture policy (reviewed mode, or non-quarantine
+        # refusal shapes). NOT written. One summary note, not per-row, for the
+        # same noise-suppression reason as tombstones_refused.
         print(f"[zmem] ingest-jsonl: refused {capture_refused} row(s) under the "
-              f"capture policy (secret-like source_ref in 'auto' mode); those rows are "
-              f"NOT stored. Re-ingest with --capture-mode reviewed/manual only "
+              f"capture policy (secret-like source_ref in 'reviewed' mode); those rows are "
+              f"NOT stored. Re-ingest with --capture-mode manual only "
               f"if you have verified the source_ref is safe.", file=sys.stderr)
+
+    if quarantined:
+        # Issue #180: whole-row auto-mode refusals recorded in the quarantine
+        # JSONL (one line per row under <data>/quarantine/) — durable, not a
+        # silent drop. One summary note, same noise policy as above.
+        print(f"[zmem] ingest-jsonl: quarantined {quarantined} row(s) under the "
+              f"capture policy (auto mode); the original rows are recorded under "
+              f"the store's quarantine/ directory for operator review.", file=sys.stderr)
+
+    if quarantine_failed:
+        print(f"[zmem] ingest-jsonl: quarantine write FAILED for "
+              f"{quarantine_failed} row(s); the summary above still counts them, "
+              f"no store row was written for them, and this run exits nonzero.",
+              file=sys.stderr)
 
     # v11 (issue #61, sync): apply collected link edges AFTER every row has
     # landed (endpoints may appear anywhere in the file). Each edge is
@@ -2158,7 +2195,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
 
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "
+          f"quarantined={quarantined} quarantine_failed={quarantine_failed} "
           f"deduped={deduped} skipped={skipped} malformed={malformed} "
           f"links_added={links_added} links_skipped={links_skipped} "
           f"episodes_added={episodes_added} episodes_skipped={episodes_skipped}")
-    return 2 if decode_error is not None else 0
+    if decode_error is not None:
+        return 2
+    # Issue #180: a quarantine write failure is a fail-closed outcome — the
+    # summary has printed, but the run must not report success.
+    return 1 if quarantine_failed else 0

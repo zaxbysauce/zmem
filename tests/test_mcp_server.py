@@ -1028,18 +1028,25 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                          str(warnings))
 
     def test_add_secret_source_ref_returns_structured_error(self):
-        """When source_ref itself carries secret-like text, auto mode refuses
-        (CapturePolicyRefusal → store.py exit 2). The MCP server surfaces a
-        structured error, not a crash (#36 M4)."""
+        """When source_ref itself carries secret-like text, auto mode now
+        QUARANTINES (issue #180: store.py exit 0 with the shared quarantine
+        envelope). The MCP server forwards that envelope — result
+        "quarantined", id null — never a crash and never a stored row (#36
+        M4 parity with the new contract)."""
         ns = self._ns()
         result = self._call(
             "add", type="fact",
             content="benign content with no secrets",
             namespace=ns, signal="test",
             source_ref="creds ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789")
-        # Refusal → error path (not "stored").
-        self.assertIn("error", result)
-        self.assertNotEqual(result.get("result"), "stored")
+        # Quarantine envelope forwarded — success path, not an error path.
+        self.assertEqual(result.get("result"), "quarantined")
+        self.assertIsNone(result.get("id"))
+        warnings = result.get("warnings") or []
+        self.assertTrue(any(w.get("type") == "quarantined"
+                            and w.get("reason") == "source_ref_secret_like"
+                            for w in warnings), warnings)
+        self.assertNotIn("ghp_", json.dumps(result))
 
     def test_add_clean_content_no_warnings(self):
         """A clean add surfaces no SECRET-related warnings. (The test env has no
@@ -1305,6 +1312,89 @@ class McpDefaultNamespaceTest(unittest.TestCase):
                              {"user:test-explicit"})
         finally:
             os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
+
+
+@unittest.skipUnless(MCP_AVAILABLE,
+                     "mcp package not installed (MCP server tests need it)")
+class McpCapturePolicyTest(unittest.TestCase):
+    """Issue #180: the MCP `add` tool forwards the CLI's quarantine result
+    shape verbatim and stays remote-safe — no local path, no credential, no
+    quarantine file location ever crosses the network boundary."""
+
+    QUARANTINE_STDOUT = json.dumps({
+        "id": None,
+        "result": "quarantined",
+        "warnings": [{"type": "quarantined",
+                      "reason": "source_ref_secret_like"}],
+    })
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="zmem-mcp-quar-")
+        cls._saved_env = {
+            k: os.environ.get(k) for k in (
+                "ZMEM_HOME", "ZMEM_STORE", "ZMEM_MCP_TOKEN",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_DATA",
+            )
+        }
+        os.environ["ZMEM_HOME"] = str(REPO_ROOT)
+        os.environ["ZMEM_STORE"] = os.path.join(cls.tmp, "store.sqlite")
+        os.environ["ZMEM_MCP_TOKEN"] = "test-token-for-quarantine-suite"
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls.tmp, "no-such-models")
+        os.environ.pop("ZMEM_DATA", None)
+        import mcp_server  # noqa: E402 — imported lazily after env is set
+        cls.mcp_server = mcp_server
+        cls.server = mcp_server.build_server(host="127.0.0.1", port=0,
+                                             use_tls=False)
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        for k, v in cls._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _call(self, name: str, **args):
+        return asyncio.run(
+            self.server._tool_manager.call_tool(name, args, context=None))
+
+    def test_add_quarantine_result_is_remote_safe(self):
+        argv_batches = []
+        original = self.mcp_server._run_store
+
+        def quarantining_run_store(args, input_text=None):
+            argv_batches.append(list(args))
+            return {"ok": True, "stdout": self.QUARANTINE_STDOUT,
+                    "stderr": "", "returncode": 0}
+
+        self.mcp_server._run_store = quarantining_run_store
+        try:
+            response = self._call(
+                "add", type="fact", content="sshpass -p pw180A ssh host",
+                namespace="user:global", source_ref="file:fixture-safe")
+        finally:
+            self.mcp_server._run_store = original
+
+        # The write crossed the subprocess boundary in auto mode with a JSON
+        # contract — the capture bar is the store's, never the adapter's.
+        self.assertEqual(len(argv_batches), 1, argv_batches)
+        argv = argv_batches[0]
+        for token in ("--capture-mode", "auto", "--json"):
+            self.assertIn(token, argv, argv)
+
+        self.assertEqual(response.get("result"), "quarantined", response)
+        self.assertIsNone(response.get("id"), response)
+        self.assertEqual(response.get("warnings"),
+                         [{"type": "quarantined",
+                           "reason": "source_ref_secret_like"}], response)
+        # Remote-safe: no credential, no quarantine path, no local detail.
+        text = json.dumps(response)
+        self.assertNotIn("pw180A", text)
+        self.assertNotIn("quarantine/", text)
 
 
 if __name__ == "__main__":

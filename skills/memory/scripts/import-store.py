@@ -1,37 +1,57 @@
 #!/usr/bin/env python
-"""ZMem legacy-store import — Phase 1 (box-wide unified memory, PLAN.md P1).
+"""ZMem legacy-store import — staged, sanitized, atomic (issue #180).
 
-Copies the existing per-plugin ZCode store into the new box-neutral location
-(~/.zmem by default) WITHOUT ever opening the source read-write. The legacy
-store may be live (an active ZCode session writing to it) so this script:
+Imports an existing (legacy) zmem store into a destination directory WITHOUT
+ever opening the source read-write, and WITHOUT transferring rows that the
+capture policy refuses: the destination is only replaced after every safe row
+is redacted, every refused row is quarantined, and integrity + count checks
+pass on a STAGING database.
 
-  1. Transfers store.sqlite with SQLite's ONLINE BACKUP API, from a source
-     connection opened STRICTLY read-only (`mode=ro` URI) into a fresh
-     destination connection. A raw file copy of a live WAL-mode database can
-     capture a torn snapshot — recent commits live in `-wal`, so the main
-     file's bytes can be byte-identical while the copy is missing committed
-     data, and a main-file-only fingerprint check would still report success.
-     The backup API copies pages under SQLite's own locking and yields a
-     consistent snapshot regardless of concurrent WAL activity. `core.md` is
-     not a database and is still a plain file copy.
-  2. Verifies the destination copy is intact (`PRAGMA integrity_check`) and
-     reports its live/total row counts. Only the destination is ever opened
-     writable.
-  3. Hashes the source store.sqlite (sha256+size+mtime) before AND after the
-     whole run and asserts they are IDENTICAL — belt-and-suspenders proof the
-     source was never touched. If they differ (e.g. a live session wrote
-     mid-run), the script reports the mismatch loudly; that is a "re-run when
-     quiescent" signal, not a bug in this script, and the assertion must never
-     be weakened.
+Flow (issue #180, Workstream L PR 1):
 
-The destination directory is checked with host.assert_local_fs() (no UNC, no
-network drive, no OneDrive-synced dir) before anything is created in it, and
-`--force` clears any pre-existing destination `-wal`/`-shm`/`-journal` sidecar
-BEFORE the transfer, so a leftover journal from a previous store can never be
-replayed onto the freshly imported one.
+  1. Guards from the pre-#180 script are kept: the destination directory is
+     checked with host.assert_local_fs() (no UNC/network/OneDrive paths) and a
+     non-empty destination store.sqlite without --force is a FileExistsError
+     BEFORE anything is staged.
+  2. The source is opened STRICTLY read-only (`mode=ro` URI plus
+     PRAGMA query_only=1). Its sha256/size/mtime fingerprint is taken before
+     any work and asserted IDENTICAL after the whole run — the source is never
+     touched, and a live writer changing it mid-run is a loud "re-run when
+     quiescent" signal, never a corrupted import.
+  3. A staging database is created with tempfile.mkstemp inside dest_dir
+     (prefix ".store-180-", suffix ".sqlite.tmp") and populated by SQLite's
+     ONLINE BACKUP API from the read-only source (a raw file copy of a live
+     WAL database can capture a torn snapshot; the backup API cannot).
+  4. Every source memory row, in deterministic `id` order, is run through the
+     shared capture policy (apply_capture_policy, capture_mode="auto"; NULL
+     content/source_ref/tags are normalized to "" first). Safe rows keep their
+     id and relationships and are UPDATEd in place with the redacted
+     content/tags (the store's own FTS triggers keep memory_fts in sync;
+     memory_vec rows for changed rows are dropped — vec0 has no trigger and a
+     stale embedding of pre-redaction text is a leak vector). Refused rows are
+     DELETEd from the staging database together with their related rows
+     (memory_vec, memory_link both directions, memory_entity, episode_memory,
+     memory_evidence, belief_head_source/belief_head_evidence when present),
+     episode.summary_memory_id pointers to them are reset to '' (the empty-TEXT
+     idiom), and the ORIGINAL row is appended to
+     <dest_dir>/quarantine/<UTC-date>.jsonl via quarantine_import_row — a
+     durable record, not a silent drop.
+  5. The staging transaction commits only after every row is dispositioned and
+     every quarantine append succeeded. A quarantine write failure (or any
+     other failure) rolls the staging transaction back and removes ONLY the
+     staging file: the prior destination — store.sqlite, its sidecars, and
+     core.md — is left byte-identical.
+  6. Acceptance: the staged database is switched to journal_mode=DELETE (so
+     os.replace can never race a WAL sidecar replay), PRAGMA integrity_check
+     must report ok, and staged_count = source_count - quarantined_count must
+     equal the staged memory row count. Only then are stale destination
+     sidecars cleared, the staging file os.replace()d onto the destination,
+     core.md copied, and owner-only permissions applied.
 
-Refuses to overwrite a non-empty existing destination store.sqlite unless
---force is passed.
+Importing storelib here is safe even though storelib resolves STORE_PATH from
+the environment at import time: this script uses only the pure policy helpers
+(apply_capture_policy, quarantine_import_row) and the purge side-table list,
+never a storelib connection or STORE_PATH itself.
 
 Usage:
   python import-store.py --source "C:\\path\\to\\store.sqlite" --dest-dir "C:\\Users\\<user>\\.zmem" [--force]
@@ -41,9 +61,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -52,11 +74,18 @@ try:
 except ImportError:
     _host = None
 
+from storelib.write import QUARANTINE_REASONS, apply_capture_policy, quarantine_import_row  # noqa: E402
+from storelib.purge import _ID_SIDE_TABLES  # noqa: E402
+
 
 # Sidecars a sqlite database can leave beside its main file. Duplicated here
-# rather than imported from store.py on purpose: importing store.py resolves
-# STORE_PATH from the environment at import time, which this script must not do.
+# rather than imported from store.py on purpose: the store's connection
+# machinery is not used by this script (see the module docstring for what IS
+# imported).
 SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+# Related-row tables keyed by memory id (mirrors storelib.purge's cleanup set;
+# imported from there — this list must never drift from the purge contract).
 
 
 def _file_fingerprint(path: Path) -> dict | None:
@@ -80,53 +109,115 @@ def _existing_store_is_nonempty(dest_store: Path) -> bool:
         return True  # be conservative
 
 
-def _backup_source_to_dest(source_store: Path, dest_store: Path) -> None:
-    """Online-backup `source_store` -> `dest_store`.
-
-    The source connection is opened STRICTLY read-only via a `mode=ro` URI, so
-    this script's "never open the source read-write" invariant holds; the backup
-    API then gives a transactionally consistent page copy even if a live writer
-    is appending WAL frames underneath us.
-
-    A read-only open of a WAL database can MATERIALIZE `-shm`/`-wal` beside the
-    source, and a read-only connection cannot checkpoint them away on close.
-    We deliberately do NOT clean those up.
-
-    An earlier version snapshotted which sidecars existed before opening and
-    deleted any that appeared afterwards, on the theory that those were ours.
-    That snapshot is a TOCTOU: a legacy session that begins writing between the
-    snapshot and the cleanup creates a `-wal` holding REAL COMMITTED FRAMES,
-    which is indistinguishable from one we materialized — and deleting it makes
-    that session's committed data unavailable to later connections. This script
-    reads a store another process may own, so it leaves the source directory
-    exactly as it found it. A stray `-shm`/`-wal` is harmless: SQLite recreates
-    and checkpoints them on the next normal open.
-
-    Path -> URI goes through Path.resolve().as_uri(); an f-string
-    `file:{path}` does not survive a Windows `C:\\...` path.
-    """
-    src_uri = source_store.resolve().as_uri() + "?mode=ro"
-    src_conn = sqlite3.connect(src_uri, uri=True)
-    try:
-        dst_conn = sqlite3.connect(str(dest_store))
-        try:
-            src_conn.backup(dst_conn)
-        finally:
-            dst_conn.close()
-    finally:
-        src_conn.close()
-
-
 def _clear_dest_sidecars(dest_store: Path) -> None:
     """Delete any `-wal`/`-shm`/`-journal` left beside the destination by a
     PREVIOUS store. They belong to the file we are about to replace; left in
     place, SQLite would happily replay a stale rollback journal onto the newly
-    imported database. Must run BEFORE the transfer, not after."""
+    imported database. Runs just BEFORE the atomic replace (issue #180: an
+    aborted import must leave the prior destination — sidecars included —
+    untouched), not before staging."""
     for s in SIDECAR_SUFFIXES:
         sib = Path(str(dest_store) + s)
         if sib.exists():
             sib.unlink()
             print(f"[import] removed stale destination {sib.name}")
+
+
+def _open_source_readonly(source_store: Path) -> sqlite3.Connection:
+    """Open the source STRICTLY read-only (mode=ro URI + query_only=1)."""
+    src_uri = source_store.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(src_uri, uri=True)
+    conn.execute("PRAGMA query_only=1")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()
+    return row is not None
+
+
+def _sanitize_staged_store(staged: sqlite3.Connection,
+                           source: sqlite3.Connection,
+                           dest_dir: Path) -> dict:
+    """Apply the shared capture policy to every staged memory row.
+
+    Runs inside the caller's open transaction on the staging database. Safe
+    rows keep their id and are UPDATEd with redacted content/tags; refused
+    rows are deleted with their related rows and quarantined. Returns the
+    {added, redacted, quarantined, quarantine_failed} counters; a quarantine
+    write failure raises OSError after incrementing quarantine_failed (the
+    caller rolls back and aborts — the counter is for the error path).
+    """
+    source_count = source.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+    counters = {"added": 0, "redacted": 0, "quarantined": 0,
+                "quarantine_failed": 0}
+    has_vec = _table_exists(staged, "memory_vec")
+    rows = source.execute("SELECT * FROM memory ORDER BY id").fetchall()
+    for row in rows:
+        mid = row["id"]
+        # NULL fields are legal in a real legacy store; the policy joins
+        # strings and must never see None.
+        content = row["content"] or ""
+        source_ref = row["source_ref"] or ""
+        tags = row["tags"] or ""
+        try:
+            new_content, new_source_ref, new_tags, _warnings = (
+                apply_capture_policy(content=content, source_ref=source_ref,
+                                     tags=tags, capture_mode="auto"))
+        except Exception as exc:
+            # CapturePolicyRefusal with a quarantineable reason (the only
+            # refusals the policy raises today). Defensive default: any
+            # refusal quarantines, so staged_count arithmetic stays true.
+            reason = getattr(exc, "reason", "source_ref_secret_like")
+            if reason not in QUARANTINE_REASONS:
+                reason = "source_ref_secret_like"
+            quarantine_row = {
+                "id": mid,
+                "namespace": row["namespace"],
+                "type": row["type"],
+                "content": content,
+                "tags": tags,
+                "source_ref": source_ref,
+                "signal": row["signal"],
+            }
+            try:
+                quarantine_import_row(dest_dir, quarantine_row, reason=reason)
+            except OSError:
+                counters["quarantine_failed"] += 1
+                raise
+            # Delete the staged memory row and every related row. The FTS
+            # triggers (memory_ad) keep memory_fts consistent; memory_vec has
+            # no trigger, so it is deleted explicitly.
+            staged.execute("DELETE FROM memory WHERE id=?", (mid,))
+            if has_vec:
+                staged.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
+            for table, col in _ID_SIDE_TABLES:
+                if _table_exists(staged, table):
+                    staged.execute(f"DELETE FROM {table} WHERE {col}=?", (mid,))
+            if _table_exists(staged, "episode"):
+                staged.execute(
+                    "UPDATE episode SET summary_memory_id='' "
+                    "WHERE summary_memory_id=?", (mid,))
+            counters["quarantined"] += 1
+            print(f"[import] quarantined {mid} ({reason})")
+            continue
+        if new_content != content or new_tags != tags:
+            staged.execute(
+                "UPDATE memory SET content=?, tags=? WHERE id=?",
+                (new_content, new_tags, mid))
+            # The stored embedding was computed over the PRE-redaction text —
+            # drop it rather than keep a vector of secret content (the FTS
+            # triggers handle the text index; `reembed` can backfill).
+            if has_vec:
+                staged.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
+            counters["redacted"] += 1
+        counters["added"] += 1
+    staged_count = source_count - counters["quarantined"]
+    return {"source_count": source_count, "staged_count": staged_count,
+            **counters}
 
 
 def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
@@ -155,63 +246,102 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
     print(f"[import] source: {source_store}")
     print(f"[import] dest:   {dest_store}")
 
-    # --- Fingerprint the source BEFORE any copy work. Source is read-only
-    # (opened for hashing only) from here to the end of the run. ---
+    # --- Fingerprint the source BEFORE any copy work. The source is only ever
+    # opened read-only from here to the end of the run. ---
     before = _file_fingerprint(source_store)
     if before is None:
         raise FileNotFoundError(f"source store vanished before fingerprinting: {source_store}")
     print(f"[import] source sha256 (before) = {before['sha256']}")
 
-    # --- Clear the destination's stale sidecars, THEN transfer. The main file
-    # itself is replaced wholesale by the backup API (it truncates/overwrites
-    # the destination database), but a leftover journal from the store that
-    # used to live here would outlive it. ---
-    _clear_dest_sidecars(dest_store)
-
-    _backup_source_to_dest(source_store, dest_store)
-    print(f"[import] online-backup {source_store.name} -> {dest_store} "
-          f"(source opened read-only)")
-
-    if source_core_md.exists():
-        shutil.copy2(source_core_md, dest_core_md)
-        print(f"[import] copied {source_core_md.name} -> {dest_core_md}")
-    else:
-        print(f"[import] WARNING: no core.md at source ({source_core_md}); skipped")
-
-    # --- Fingerprint the source AFTER copying. Must match `before`. ---
-    after = _file_fingerprint(source_store)
-    source_unchanged = after is not None and after == before
-    print(f"[import] source sha256 (after)  = {after['sha256'] if after else 'MISSING'}")
-    if not source_unchanged:
-        raise RuntimeError(
-            "SOURCE STORE CHANGED DURING IMPORT — a session likely wrote to it "
-            "mid-copy. The import did not corrupt the source, but the "
-            "before/after proof failed; re-run this import when the source "
-            "is quiescent (no active ZCode/zmem session). "
-            f"before={before} after={after}"
-        )
-
-    # --- Checkpoint + integrity-check ONLY the destination copy. The source
-    # is never opened again past this point (and was only ever opened mode=ro).
-    # The backup API leaves no WAL sidecar of its own; the checkpoint is kept
-    # so the destination is left in the WAL mode store.py expects, with a
-    # truncated log. ---
-    conn = sqlite3.connect(str(dest_store))
+    # --- Stage: build a sanitized copy in dest_dir, replace only on success
+    # (issue #180). ---
+    fd, staged_path_str = tempfile.mkstemp(prefix=".store-180-",
+                                           suffix=".sqlite.tmp", dir=dest_dir)
+    os.close(fd)
+    staged_path = Path(staged_path_str)
+    staged_path.unlink()  # mkstemp created an empty file; the backup API
+    # wants to initialize the database itself.
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        total = conn.execute("SELECT count(*) FROM memory").fetchone()[0]
-        live = conn.execute("SELECT count(*) FROM memory WHERE superseded_at IS NULL").fetchone()[0]
-    finally:
-        conn.close()
+        source_conn = _open_source_readonly(source_store)
+        try:
+            staged_conn = sqlite3.connect(str(staged_path))
+            try:
+                staged_conn.row_factory = sqlite3.Row
+                print(f"[import] online-backup {source_store.name} -> staging "
+                      f"{staged_path.name} (source opened read-only)")
+                source_conn.backup(staged_conn)
+                staged_conn.execute("BEGIN IMMEDIATE")
+                counts = _sanitize_staged_store(staged_conn, source_conn,
+                                                dest_dir)
+                staged_conn.commit()
+                print(f"[import] staged rows: added={counts['added']} "
+                      f"redacted={counts['redacted']} "
+                      f"quarantined={counts['quarantined']} "
+                      f"quarantine_failed={counts['quarantine_failed']}")
 
-    print(f"[import] destination integrity_check = {integrity}")
-    print(f"[import] destination rows: total={total} live={live}")
-    if integrity != "ok":
-        raise RuntimeError(f"destination copy failed integrity_check: {integrity}")
+                # --- Verify the staged database, then close it before the
+                # atomic replace (issue #180: journal_mode=DELETE so no WAL
+                # sidecar of the staging file can race os.replace). ---
+                staged_conn.execute("PRAGMA journal_mode=DELETE")
+                integrity = staged_conn.execute(
+                    "PRAGMA integrity_check").fetchone()[0]
+                total = staged_conn.execute(
+                    "SELECT COUNT(*) FROM memory").fetchone()[0]
+                live = staged_conn.execute(
+                    "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL"
+                ).fetchone()[0]
+            finally:
+                staged_conn.close()
+        finally:
+            source_conn.close()
 
-    print("[import] source fingerprint unchanged before vs after — source untouched, confirmed.")
+        print(f"[import] destination integrity_check = {integrity}")
+        print(f"[import] destination rows: total={total} live={live}")
+        if integrity != "ok":
+            raise RuntimeError(
+                f"staged copy failed integrity_check: {integrity}")
+        if counts["staged_count"] != total:
+            raise RuntimeError(
+                f"staged count mismatch: source_count="
+                f"{counts['source_count']} - quarantined="
+                f"{counts['quarantined']} = {counts['staged_count']} but the "
+                f"staged memory table holds {total} row(s)")
+
+        # --- Fingerprint the source AFTER all copy work. Must match before. ---
+        after = _file_fingerprint(source_store)
+        source_unchanged = after is not None and after == before
+        print(f"[import] source sha256 (after)  = {after['sha256'] if after else 'MISSING'}")
+        if not source_unchanged:
+            raise RuntimeError(
+                "SOURCE STORE CHANGED DURING IMPORT — a session likely wrote to it "
+                "mid-copy. The import did not corrupt the source, but the "
+                "before/after proof failed; re-run this import when the source "
+                "is quiescent (no active ZCode/zmem session). "
+                f"before={before} after={after}"
+            )
+        print("[import] source fingerprint unchanged before vs after — source untouched, confirmed.")
+
+        # --- Accept: clear stale destination sidecars (a leftover journal from
+        # the store that used to live here must never replay onto the new
+        # file), then atomically replace the destination. ---
+        _clear_dest_sidecars(dest_store)
+        os.replace(staged_path, dest_store)
+        if source_core_md.exists():
+            shutil.copy2(source_core_md, dest_core_md)
+            print(f"[import] copied {source_core_md.name} -> {dest_core_md}")
+        else:
+            print(f"[import] WARNING: no core.md at source ({source_core_md}); skipped")
+    except BaseException:
+        # Remove ONLY the staging file: the prior destination — store.sqlite,
+        # its sidecars, and core.md — stays byte-identical on every failure
+        # path (quarantine write failure, integrity mismatch, count mismatch,
+        # source fingerprint mismatch).
+        try:
+            if staged_path.exists():
+                staged_path.unlink()
+        except OSError:
+            pass
+        raise
 
     # Harden perms on the freshly-populated box-wide store (owner-only ACL,
     # best-effort). connect()'s first-creation gate never fires for this dir
@@ -233,6 +363,10 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
         "dest_integrity_check": integrity,
         "dest_total_rows": total,
         "dest_live_rows": live,
+        "added": counts["added"],
+        "redacted": counts["redacted"],
+        "quarantined": counts["quarantined"],
+        "quarantine_failed": counts["quarantine_failed"],
     }
 
 

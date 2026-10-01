@@ -28,10 +28,10 @@ Design rules (zmem invariants):
     a single stderr line rather than raising.
 
 This module is named `correction_queue` (NOT `queue`) specifically to avoid
-shadowing Python's stdlib `queue` module. `SECRET_PATTERNS` lives here as the
-single source of truth; store.py aliases it (`from correction_queue import
-SECRET_PATTERNS`) so its existing capture-policy helpers never drift from the
-queue's redaction.
+shadowing Python's stdlib `queue` module. The secret pattern registry lives
+in `redaction.py` (the single source of truth since the registry moved out of
+this file); this module re-imports it so the queue's redaction can never
+drift from the capture policy's.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def _env(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Capture-mode helpers (mirror store.py's, reading the SAME SECRET_PATTERNS)
+# Capture-mode helpers (reading the SAME registry via redaction.py)
 # ---------------------------------------------------------------------------
 def normalize_capture_mode() -> str:
     """Resolve the effective capture mode: ZMEM_CAPTURE_MODE env, else "manual".

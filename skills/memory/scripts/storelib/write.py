@@ -113,14 +113,18 @@ except ImportError:
 try:
     from redaction import (  # noqa: F401
         SECRET_CREDENTIAL_PATTERNS,
+        SECRET_COMMAND_PATTERNS,
         SECRET_PATTERNS,
+        SECRET_REFUSAL_PATTERNS,
         redact_secret_like_text as _shared_redact_secret_like_text,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from redaction import (  # type: ignore # noqa: F401
         SECRET_CREDENTIAL_PATTERNS,
+        SECRET_COMMAND_PATTERNS,
         SECRET_PATTERNS,
+        SECRET_REFUSAL_PATTERNS,
         redact_secret_like_text as _shared_redact_secret_like_text,
     )
 
@@ -148,7 +152,38 @@ class AutoCaptureRuntimeError(RuntimeError):
 
 
 class CapturePolicyRefusal(ValueError):
-    """Automatic capture could not safely preserve the record contract."""
+    """Automatic capture could not safely preserve the record contract.
+
+    Issue #180: carries a stable machine reason (``.reason``) plus the exact
+    human message (``.message``, passed to ValueError) — callers branch on
+    ``reason`` without parsing prose. Capture-policy refusals are constructed
+    with the canonical message ``capture refused: <reason>``; namespace
+    validation refusals ride the same type with their own prose message and
+    a ``namespace_*`` reason label.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        self.reason = reason
+        self.message = message
+        super().__init__(message)
+
+
+# Stable refusal-reason labels (issue #180). Auto-mode refusals with these
+# reasons are QUARANTINEABLE: the importer that caught them appends the
+# original row to the quarantine JSONL instead of silently dropping it.
+REASON_SOURCE_REF_SECRET_LIKE = "source_ref_secret_like"
+REASON_UNREDACTABLE_SECRET = "unredactable_secret"
+REASON_SOURCE_REF_UNSAFE_PATH = "source_ref_unsafe_path"
+QUARANTINE_REASONS = frozenset({
+    REASON_SOURCE_REF_SECRET_LIKE,
+    REASON_UNREDACTABLE_SECRET,
+    REASON_SOURCE_REF_UNSAFE_PATH,
+})
+
+
+def _capture_refusal(reason: str) -> CapturePolicyRefusal:
+    """Build a capture-policy refusal with the canonical message form."""
+    return CapturePolicyRefusal(reason, f"capture refused: {reason}")
 
 class ContentTooLarge(ValueError):
     """Content exceeds MAX_CONTENT_CHARS. A dedicated subclass (rather than a
@@ -161,9 +196,11 @@ def redact_text(text: str) -> tuple[str, int]:
     """THE single secret-redaction helper (issue #65, 10.8).
 
     Every write path that must sanitize text — CLI/MCP/Hermes ``add``/``update``
-    (via ``_apply_capture_policy``), ``mine-history`` sample/message redaction,
+    (via ``apply_capture_policy``), ``mine-history`` sample/message redaction,
     and episode/organize summary writes (they route through ``add_memory``) —
-    calls THIS function, never a private copy. Returns ``(redacted, count)``.
+    calls THIS function, never a private copy. Returns ``(redacted, count)``;
+    count is a DETECTION count (issue #180 idempotence: a value already equal
+    to the marker is detected but not rewritten).
     """
     return _redact_secret_like_text(text)
 
@@ -283,7 +320,7 @@ def _source_ref_allowlisted(source_ref: str) -> tuple[bool, str | None]:
     allowlisted only when the remainder is RELATIVE and traversal-free
     (no drive letter, no leading slash/UNC, no ``~``, no ``..`` segment);
     anything else falls through to the refusal rules in
-    ``_apply_capture_policy``.
+    ``apply_capture_policy``.
     """
     ref = source_ref or ""
     for scheme in _ALLOWED_SOURCE_SCHEMES:
@@ -296,16 +333,18 @@ def _source_ref_allowlisted(source_ref: str) -> tuple[bool, str | None]:
 
 def _check_credential_shapes(source_ref: str) -> list[str]:
     """Credential-shape scan for allowlisted source_refs (defense in depth):
-    only the EXPLICIT credential patterns, never the generic hex/base64 ones
-    that hash-shaped provenance legitimately trips."""
+    only the EXPLICIT credential patterns — plus the #180 command/URL shapes
+    and refusal-only detectors — never the generic hex/base64 ones that
+    hash-shaped provenance legitimately trips."""
     hits = []
-    for pat in SECRET_CREDENTIAL_PATTERNS:
+    for pat in (SECRET_CREDENTIAL_PATTERNS + SECRET_COMMAND_PATTERNS
+                + SECRET_REFUSAL_PATTERNS):
         m = pat.search(source_ref or "")
         if m:
             hits.append(f"possible secret-like text matched pattern {pat.pattern[:40]!r}...")
     return hits
 
-def _apply_capture_policy(
+def apply_capture_policy(
     *,
     content: str,
     source_ref: str,
@@ -313,6 +352,11 @@ def _apply_capture_policy(
     capture_mode: str,
 ) -> tuple[str, str, str, list[dict]]:
     """Apply capture-time redaction/labeling while preserving provenance.
+
+    THE single capture-policy entry point (issue #180): every importer —
+    CLI/MCP/Hermes ``add``/``update`` (via ``add_memory``/``update_memory``),
+    JSONL sync, legacy store import, and harvest ingestion — routes through
+    this function; nothing else re-implements capture policy.
 
     Returns structured warnings (issue #65, 10.8): each is a dict with
     ``type`` ("advisory" | "redacted"), ``message`` (the same human text the
@@ -322,6 +366,25 @@ def _apply_capture_policy(
     characters of the matched text (C03/B-01: state the real contract).
     Remote surfaces force capture-mode auto, so only count-only messages
     ever cross a network boundary.
+
+    Mode contract (issue #180): ``manual`` is advisory-only and stores; the
+    CLI exits 0. ``reviewed`` RAISES on capture refusals (the issue's Design
+    step 1 — an explicit review claim cannot carry a secret-shaped
+    source_ref or an unredactable shape) with exit 2 and never quarantines.
+    ``auto`` redacts value spans, tags ``auto-redacted``, and raises
+    quarantineable refusals (``QUARANTINE_REASONS``): an unsafe source_ref
+    (``source_ref_secret_like``), an unsafe ``file:`` shape
+    (``source_ref_unsafe_path``), or a detector hit with no safe value span
+    (``unredactable_secret``, e.g. ``sudo -S`` — the password arrives on
+    stdin, so there is nothing in the row to redact). Importers that catch
+    a quarantineable refusal append the original row via
+    ``quarantine_import_row`` instead of silently dropping it.
+
+    Idempotence (issue #180 AC8): redaction detects but never rewrites a
+    value already equal to ``[REDACTED_SECRET]``, and warnings count
+    detections — so applying auto mode to a row this policy already
+    produced returns byte-identical content, source_ref, tags, and
+    warnings.
     """
     mode = _normalize_capture_mode(capture_mode)
     allowlisted, allow_scheme = _source_ref_allowlisted(source_ref)
@@ -340,50 +403,44 @@ def _apply_capture_policy(
     out_tags = tags
     source_warnings = _check_secrets("", source_ref)
     allowlist_warning: dict | None = None
-    if mode == "auto":
+    if mode in ("auto", "reviewed"):
         if allowlisted:
             if _check_credential_shapes(source_ref):
-                raise CapturePolicyRefusal(
-                    "refusing automatic capture because source_ref contains secret-like "
-                    "text; review it manually so provenance and staleness tracking are "
-                    "not silently destroyed"
-                )
-            allowlist_warning = {
-                "type": "source_ref_allowlisted",
-                "scheme": allow_scheme,
-                "message": (
-                    f"source_ref uses allowlisted provenance scheme "
-                    f"{allow_scheme!r}; hash-like shapes in it are not treated "
-                    "as secrets (content scanning unchanged)"
-                ),
-            }
+                raise _capture_refusal(REASON_SOURCE_REF_SECRET_LIKE)
+            if mode == "auto":
+                allowlist_warning = {
+                    "type": "source_ref_allowlisted",
+                    "scheme": allow_scheme,
+                    "message": (
+                        f"source_ref uses allowlisted provenance scheme "
+                        f"{allow_scheme!r}; hash-like shapes in it are not treated "
+                        "as secrets (content scanning unchanged)"
+                    ),
+                }
         elif _check_credential_shapes(source_ref):
-            # Credential shape on a NON-allowlisted ref: legacy refusal (same
-            # message; the credential is the more specific danger, checked
-            # before the file-absolute shape rule below).
-            raise CapturePolicyRefusal(
-                "refusing automatic capture because source_ref contains secret-like "
-                "text; review it manually so provenance and staleness tracking are "
-                "not silently destroyed"
-            )
+            # Credential shape on a NON-allowlisted ref: the credential is
+            # the more specific danger, checked before the file-absolute
+            # shape rule below.
+            raise _capture_refusal(REASON_SOURCE_REF_SECRET_LIKE)
         elif _file_ref_absolute(source_ref):
-            raise CapturePolicyRefusal(
-                "refusing automatic capture: file: source_ref is an absolute "
-                "path; use a relative path or a well-known stem "
-                "(e.g. file:codex-MEMORY.md) so provenance never carries a "
-                "home-absolute location"
-            )
+            raise _capture_refusal(REASON_SOURCE_REF_UNSAFE_PATH)
         elif source_warnings:
-            raise CapturePolicyRefusal(
-                "refusing automatic capture because source_ref contains secret-like "
-                "text; review it manually so provenance and staleness tracking are "
-                "not silently destroyed"
-            )
+            raise _capture_refusal(REASON_SOURCE_REF_SECRET_LIKE)
+        # Issue #180: refusal-only detectors (sudo -S) — no safe value span
+        # exists anywhere in the row, so auto/reviewed capture refuses it
+        # whole rather than storing a redaction that removes nothing.
+        combined_scan = " ".join((content, tags))
+        if any(p.search(combined_scan) for p in SECRET_REFUSAL_PATTERNS):
+            raise _capture_refusal(REASON_UNREDACTABLE_SECRET)
     if mode == "auto" and secret_hits:
         out_content, content_redactions = _redact_secret_like_text(content)
         out_tags, tag_redactions = _redact_secret_like_text(tags)
         total = content_redactions + tag_redactions
         if total <= 0:
+            # Dead-man switch (PRR-001 kept AutoCaptureRuntimeError as the
+            # type so organize's skip-and-log handler still catches it):
+            # unreachable while detections are counted, but a regression in
+            # the counting must never store secret-like text silently.
             raise AutoCaptureRuntimeError(
                 "zmem: refusing automatic capture with likely secrets that could "
                 "not be safely redacted"
@@ -410,6 +467,51 @@ def _apply_capture_policy(
     if allowlist_warning is not None:
         warnings.append(allowlist_warning)
     return out_content, out_source_ref, out_tags, warnings
+
+QUARANTINE_DIR_NAME = "quarantine"
+
+
+def quarantine_import_row(data_dir: str | Path, row: dict, *, reason: str,
+                           now: str | None = None) -> Path:
+    """Append one refused import row to the deterministic quarantine JSONL.
+
+    Issue #180: importers that catch a quarantineable ``CapturePolicyRefusal``
+    (``QUARANTINE_REASONS``) record the ORIGINAL row here instead of silently
+    dropping it, so an operator can review and re-ingest it. The record is a
+    single UTF-8 JSON object with keys in this order: ``quarantined_at``,
+    ``reason``, ``source_ref``, ``row`` — serialized compact
+    (``ensure_ascii=False``, ``separators=(",", ":")``) with one terminating
+    LF — appended to ``<data_dir>/quarantine/<UTC-date>.jsonl``.
+
+    ``now`` is an ISO-8601 UTC ``YYYY-MM-DDTHH:MM:SSZ`` value; ``None`` calls
+    ``schema.now_iso()``. The quarantine directory is created with mode
+    ``0o700`` and the file with ``0o600``; an ``os.chmod`` failure raises
+    ``OSError``, and any write failure raises the original ``OSError`` —
+    callers roll back their current row, count ``quarantine_failed``, and
+    return a nonzero result. This helper never writes SQLite. Single-writer
+    assumption: store writes are serialized by the store's writer lease; the
+    quarantine append happens after the caller's row rollback.
+    """
+    stamp = now if now is not None else now_iso()
+    date_part = stamp[:10] if len(stamp) >= 10 else stamp
+    quarantine_dir = Path(data_dir) / QUARANTINE_DIR_NAME
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(quarantine_dir, 0o700)
+    target = quarantine_dir / f"{date_part}.jsonl"
+    record = {
+        "quarantined_at": stamp,
+        "reason": reason,
+        "source_ref": row.get("source_ref", ""),
+        "row": row,
+    }
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    existed = target.exists()
+    with open(target, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(line)
+    if not existed:
+        os.chmod(target, 0o600)
+    return target
+
 
 def _to_win_path(p: str) -> str:
     """Normalize a Cygwin path (/c/..., /tmp/..., /home/...) to Windows form so
@@ -642,6 +744,7 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
     """
     if namespace is None or not namespace.strip():
         raise CapturePolicyRefusal(
+            "namespace_empty",
             "refusing write: namespace is empty; use 'user:global' for "
             "cross-project knowledge or 'project:<name>' for project-scoped"
         )
@@ -652,6 +755,7 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
     # refusal because they cannot safely pass through subprocess argv.
     if has_namespace_control(trimmed):
         raise CapturePolicyRefusal(
+            "namespace_control_chars",
             f"refusing write: namespace {trimmed!r} contains a control character"
         )
 
@@ -696,9 +800,10 @@ def _validate_namespace(conn: sqlite3.Connection, namespace: str) -> str:
                 "any current client opens the store (issue #71 C), or rekey them "
                 "right now with `rekey-namespace --near-miss-global --confirm`.)"
             )
-        raise CapturePolicyRefusal(msg)
+        raise CapturePolicyRefusal("namespace_global_near_miss", msg)
     if not is_valid_namespace(trimmed):
         raise CapturePolicyRefusal(
+            "namespace_invalid",
             f"refusing write: namespace {trimmed!r} is invalid; use "
             "project:<name>, user:<name>, fleet:<name>, host:<name>, "
             "agent:<name>, domain:<name>, or the canonical user:global"
@@ -892,7 +997,7 @@ def add_memory(
     link_attr_propagate: bool = True,
     evidence_ids: list[str] | tuple[str, ...] | None = None,
 ) -> WriteResult:
-    content, source_ref, tags, warns = _apply_capture_policy(
+    content, source_ref, tags, warns = apply_capture_policy(
         content=content,
         source_ref=source_ref,
         tags=tags,
@@ -1380,7 +1485,7 @@ def update_memory(
     # and, as in add_memory, BEFORE the size check (PR-review PRR-C): in auto
     # mode redaction can shrink secret-laden oversized content under the cap,
     # and update must not reject content the add path would accept.
-    content_eff, source_ref_eff, tags_eff, warns = _apply_capture_policy(
+    content_eff, source_ref_eff, tags_eff, warns = apply_capture_policy(
         content=content,
         source_ref=source_ref_eff,
         tags=tags_eff,

@@ -7,19 +7,23 @@ row's shape and enum values, and calls `store.py add` via subprocess for
 each valid row.
 
 This script does ONLY mechanical shape validation (required keys present,
-enum values in range). It does NOT apply the capture bar and does NOT dedup
-against the store — that judgment call belongs to the agent running
-`commands/ingest-harvest.md`, which is expected to hand this script an
-already-trimmed, already-recall-checked set of surviving rows. Feeding it a
-raw, un-reviewed harvest will happily ingest everything that is well-formed.
+enum values in range) and implements NO pattern matching of its own — the
+capture bar is applied by the store's shared capture policy, which every
+`store.py add --capture-mode auto --json` child subprocess runs (issue #180:
+value spans are redacted, whole-row refusals are quarantined, and this
+adapter reports stored/deduped/quarantined/failed counts). It does NOT dedup
+against the store beyond the writer's own dedup-on-write — the judgment call
+belongs to the agent running `commands/ingest-harvest.md`, which is expected
+to hand this script an already-trimmed, already-recall-checked set of
+surviving rows.
 
 Python 3.11, stdlib only, ASCII-only stdout/stderr.
 
 Usage:
   python ingest_harvest.py <harvest.json> [--source-ref REF] [--store PATH]
 
-Exit code: 0 if every row in the file was valid and ingested cleanly;
-1 if any row was rejected (bad shape/enum) or failed to ingest.
+Exit code: 0 if every row in the file was stored, deduped, or quarantined
+cleanly; 1 if any row was rejected (bad shape/enum) or failed to ingest.
 """
 
 from __future__ import annotations
@@ -112,13 +116,23 @@ def validate_row(row: object, index: int) -> tuple[dict | None, str | None]:
     return row, None
 
 
-def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
-    """Call `store.py add` for one row. Returns (ok, message).
+def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[str, str]:
+    """Call `store.py add --capture-mode auto --json` for one row.
+
+    Issue #180: the harvest lane runs the SAME capture policy as every other
+    importer — auto mode redacts value spans and quarantines whole-row
+    refusals (the child's quarantine record lands under the child store's
+    data dir). Returns a structured status: the first value is exactly one of
+    ``stored``, ``deduped``, ``quarantined``, or ``failed``; the second is the
+    exact public message. A row carrying its own ``source_ref`` forwards it
+    (the caller-supplied uniform ref is the fallback); a child failure,
+    timeout, or malformed JSON is ``failed``.
 
     Deliberately does NOT pass --confidence: the signal-derived default in
     store.py's add_memory() is intentional, and hand-setting it here would
     let a harvest silently override the honesty check signal is supposed
-    to encode.
+    to encode. This adapter implements NO pattern matching of its own — the
+    policy lives in storelib, reached only through the subprocess boundary.
 
     Encoding, both directions, because a harvest carries arbitrary non-ASCII:
       - PYTHONIOENCODING=utf-8 in the CHILD's env, so store.py's own success
@@ -129,6 +143,7 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
       - encoding/errors on the PARENT's pipe decode, so a child byte sequence
         this console cannot represent is replaced rather than raising here.
     """
+    row_ref = row.get("source_ref") or source_ref
     cmd = [
         sys.executable, str(store_py), "add",
         "--namespace", row["namespace"],
@@ -136,7 +151,9 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
         "--content", row["content"],
         "--tags", row["tags"],
         "--signal", row["signal"],
-        "--source-ref", source_ref,
+        "--source-ref", row_ref,
+        "--capture-mode", "auto",
+        "--json",
     ]
     child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     try:
@@ -146,11 +163,26 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[bool, str]:
             timeout=120,
         )
     except subprocess.TimeoutExpired:
-        return False, "store.py add timed out after 120s"
+        return "failed", "store.py add timed out after 120s"
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        return False, detail or f"store.py add exited {result.returncode}"
-    return True, (result.stdout or "").strip()
+        return "failed", detail or f"store.py add exited {result.returncode}"
+    stdout = (result.stdout or "").strip()
+    try:
+        envelope = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        return "failed", stdout or "store.py add produced no JSON result"
+    if not isinstance(envelope, dict):
+        return "failed", stdout or "store.py add produced a non-object JSON result"
+    status = envelope.get("result")
+    if status not in ("stored", "deduped", "quarantined"):
+        return "failed", f"store.py add reported unknown result {status!r}"
+    if status == "quarantined":
+        warnings = envelope.get("warnings") or []
+        reason = next((w.get("reason") for w in warnings
+                       if isinstance(w, dict) and w.get("reason")), "unknown")
+        return "quarantined", f"quarantined by the capture policy ({reason})"
+    return status, stdout
 
 
 def main() -> int:
@@ -212,7 +244,9 @@ def main() -> int:
     source_ref = args.source_ref or f"session:harvest-{harvest_path.stem}"
 
     total = len(data)
-    added = 0
+    stored = 0
+    deduped = 0
+    quarantined = 0
     failed = 0
 
     for i, raw_row in enumerate(data, start=1):
@@ -222,16 +256,25 @@ def main() -> int:
             failed += 1
             continue
 
-        ok, message = ingest_row(store_py, row, source_ref)
-        if ok:
-            added += 1
+        status, message = ingest_row(store_py, row, source_ref)
+        if status == "stored":
+            stored += 1
             preview = row["content"][:80]
             _print(f"[ingest-harvest] added row {i}: [{row['namespace']}] {row['type']}: {preview}")
+        elif status == "deduped":
+            deduped += 1
+            preview = row["content"][:80]
+            _print(f"[ingest-harvest] deduped row {i}: [{row['namespace']}] {row['type']}: {preview}")
+        elif status == "quarantined":
+            quarantined += 1
+            _print(f"[ingest-harvest] QUARANTINED row {i}: {message}", err=True)
         else:
             failed += 1
             _print(f"[ingest-harvest] FAILED row {i}: {message}", err=True)
 
-    _print(f"[ingest-harvest] summary: {total} row(s) in file, {added} added, {failed} failed/rejected")
+    _print(f"[ingest-harvest] summary: {total} row(s) in file, "
+           f"{stored} stored, {deduped} deduped, "
+           f"{quarantined} quarantined, {failed} failed/rejected")
 
     return 1 if failed else 0
 
