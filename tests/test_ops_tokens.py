@@ -1103,12 +1103,15 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             sys.modules["zmem_hermes_ops_prefetch"] = mod
             spec.loader.exec_module(mod)
             provider = mod.ZmemMemoryProvider()
-            provider.initialize("sess-pf-provider")
+            provider.initialize("sess-pf")
 
             provider._namespace = "project:prefetch-compose"
             out = provider.prefetch("keep finalizing this work",
                                     session_id="sess-pf")
             self.assertIn("prefetchcanary", out)
+            out_mismatch = provider.prefetch(
+                "keep finalizing this work", session_id="sess-pf-provider")
+            self.assertEqual(out_mismatch, "")
             out_nosid = provider.prefetch("keep finalizing this work")
             self.assertNotIn("prefetchcanary", out_nosid)
 
