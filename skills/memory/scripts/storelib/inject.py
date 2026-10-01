@@ -900,7 +900,10 @@ def select_and_budget_for_injection(
     enforcement lives at recall.py's global-tier seam, where a below-floor
     candidate is withheld and its slot returns empty rather than being
     backfilled.  A global candidate with no measured lane (query-less
-    recent pulls) keeps the relevance gate's not-measured exemption.
+    recent pulls) keeps the relevance gate's not-measured exemption.  An
+    explicit argument that is not a finite number is treated as unset
+    (the env/default resolution applies); a negative value clamps to 0.0
+    (floor disabled) — the passive lane never raises on a bad floor value.
     """
     if moment not in INJECTION_MOMENTS:
         raise ValueError("invalid injection moment: {!r}".format(moment))
@@ -1024,8 +1027,26 @@ def select_and_budget_for_injection(
     # batch class is covered).  session_start/user_prompt/precompact keep
     # their current global composition; a resolved 0.0 disables (clamped in
     # _user_global_floor, threaded as 0.0 so recall.py's `> 0` guard skips).
+    # An explicit argument that is not a finite number (PR #268 review) is
+    # treated as UNSET — the passive lane never raises, so garbage falls
+    # through to the env/default resolution exactly like a garbage env
+    # value does, instead of escaping as ValueError/TypeError; a negative
+    # explicit value is a deliberate operator request and clamps to 0.0
+    # (floor disabled).
+    normalized_floor = None
     if user_global_floor is not None:
-        effective_user_global_floor = max(0.0, float(user_global_floor))
+        try:
+            parsed_floor = float(user_global_floor)
+        except (TypeError, ValueError, OverflowError):
+            parsed_floor = None
+        if parsed_floor is not None and (
+                parsed_floor != parsed_floor
+                or parsed_floor in (float("inf"), float("-inf"))):
+            parsed_floor = None
+        if parsed_floor is not None:
+            normalized_floor = max(0.0, parsed_floor)
+    if normalized_floor is not None:
+        effective_user_global_floor = normalized_floor
     elif moment in ("pretool", "subagent"):
         effective_user_global_floor = _user_global_floor()
     else:
