@@ -1416,6 +1416,102 @@ class TrainingDependencyCheckTest(unittest.TestCase):
         cls.scripts = REPO_ROOT / "skills" / "memory" / "scripts"
         sys.path.insert(0, str(cls.scripts))
 
+    def _training_health_store(self) -> Path:
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-integrity-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "store.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            """
+            CREATE TABLE training_capture(
+                capture_id TEXT PRIMARY KEY, state TEXT, redaction_status TEXT,
+                redaction_policy_version TEXT, acknowledged_at TEXT, revoked_at TEXT,
+                finalized_at TEXT, updated_at TEXT
+            );
+            CREATE TABLE training_delivery_snapshot(
+                delivery_snapshot_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE training_capture_completion(
+                capture_id TEXT PRIMARY KEY, evidence_id TEXT,
+                associated_memory_ids_json TEXT
+            );
+            CREATE TABLE training_capture_observation(
+                observation_id TEXT PRIMARY KEY, capture_id TEXT
+            );
+            CREATE TABLE training_capture_review(id TEXT);
+            CREATE TABLE training_export_snapshot_binding(id TEXT);
+            CREATE TABLE training_capture_correlation(id TEXT);
+            CREATE TABLE training_capture_closed_session(id TEXT);
+            CREATE TABLE memory_evidence(memory_id TEXT, evidence_id TEXT);
+            """
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_null_capture_state_is_an_illegal_transition(self):
+        import doctor  # noqa: E402
+
+        path = self._training_health_store()
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "INSERT INTO training_capture(capture_id, state, redaction_status) VALUES (?, ?, ?)",
+            ("capture-null-state", None, "metadata_only"),
+        )
+        conn.commit()
+        conn.close()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["issues"].get("illegal_state"), 1)
+        self.assertEqual(check["details"]["issues"].get("illegal_state_transition"), 1)
+
+    def test_non_list_completion_associations_are_reported(self):
+        import doctor  # noqa: E402
+
+        path = self._training_health_store()
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "INSERT INTO training_capture(capture_id, state, redaction_status, acknowledged_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("capture-bad-association", "completed", "metadata_only", "2026-01-01T00:00:00Z"),
+        )
+        conn.execute(
+            "INSERT INTO training_delivery_snapshot(delivery_snapshot_id, capture_id) VALUES (?, ?)",
+            ("delivery-bad-association", "capture-bad-association"),
+        )
+        conn.execute(
+            "INSERT INTO training_capture_completion(capture_id, evidence_id, associated_memory_ids_json) "
+            "VALUES (?, ?, ?)",
+            ("capture-bad-association", "evidence-bad-association", "{}"),
+        )
+        conn.commit()
+        conn.close()
+
+        check = doctor._check_training_capture_health(path)
+
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["issues"], {"source_memory_mismatch": 1})
+
+    def test_staging_parent_resolves_output_symlink_when_supported(self):
+        import doctor  # noqa: E402
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor135-staging-link-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        real_parent = tmp / "real-parent"
+        real_parent.mkdir()
+        linked_parent = tmp / "linked-parent"
+        try:
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+        except OSError:
+            self.skipTest("symlink creation is unavailable on this host")
+
+        self.assertEqual(
+            doctor._training_staging_parent(tmp, linked_parent / "training-output"),
+            real_parent.resolve(),
+        )
+
     def test_missing_pyarrow_names_declared_install_command(self):
         import doctor  # noqa: E402
         from unittest import mock  # noqa: E402

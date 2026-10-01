@@ -275,6 +275,30 @@ def main() -> None:
         )
         assert result.returncode == 0, combined(result)
 
+        temporal_review_path = write_payload(
+            temp_root,
+            "temporal-review.json",
+            {
+                "delivery_snapshot_id": temporal["delivery_snapshot_id"],
+                "evidence_id": temporal_source["evidence_id"],
+                "reviewer_id": "reviewer-135-temporal",
+            },
+        )
+        temporal_review = run_store(
+            temp_root,
+            "capture-training-review",
+            "--input",
+            str(temporal_review_path),
+            env_overrides={
+                "ZMEM_TRAINING_CALLER_ID": "reviewer-135-temporal",
+                "ZMEM_TRAINING_REVIEWER_IDS": "reviewer-135-temporal",
+            },
+        )
+        stop_at_missing_surface(
+            temporal_review, "capture-training-review", "AC3_MISSING_REVIEWER_EXPORT"
+        )
+        assert temporal_review.returncode == 0, combined(temporal_review)
+
         temporal_output = temp_root / "training-temporal"
         result = run_store(
             temp_root,

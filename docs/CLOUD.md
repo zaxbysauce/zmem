@@ -260,11 +260,11 @@ python skills/memory/scripts/store.py export-training ./training \
 
 `DIR` is the training output directory itself. It contains
 `sft-000.parquet`, `preferences-000.parquet`, `manifest.json`, and
-`deletion-map.json` directly. `deletion-map.json` is derived deduplication and
-exclusion metadata for the export; it does not delete canonical SQLite rows or
-prior output directories. With `--quarantine-raw`, a bounded redacted
-derived dump is written under `DIR/quarantine/` with its own
-`quarantine-manifest.json`. It uses the same verified, acknowledged
+`deletion-map.json` directly. With `--quarantine-raw`, the top-level
+`quarantine-manifest.json` is also written directly under `DIR`; its bounded
+redacted dump is written under `DIR/quarantine/`. `deletion-map.json` is derived
+deduplication and exclusion metadata for the export; it does not delete canonical
+SQLite rows or prior output directories. It uses the same verified, acknowledged
 completion gate as SFT and preference output; partial, refused, revoked,
 incomplete, or capture-quarantined records never reach any derived artifact.
 The main manifest records row counts and the export snapshot identity. A

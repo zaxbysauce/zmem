@@ -372,7 +372,7 @@ test("recall start enforces the carried deadline when a helper runs long", () =>
         ...process.env,
         ZMEM_ROOT: root,
         ZMEM_SESSION: "timeout",
-        ZMEM_PYTHON: "python",
+        ZMEM_PYTHON: process.platform === "win32" ? "python" : "python3",
     };
     const started = Date.now();
     try {
@@ -417,6 +417,25 @@ test("convention capture observations remain detached", () => {
     assert.strictEqual(spawnCall.options.windowsHide, true);
     assert.strictEqual(launch._trainingCaptureAction("recall"), "start");
     assert.strictEqual(launch._trainingCaptureAction("convention-capture"), "observe");
+});
+
+test("session-end uses the same canonical namespace as capture start", () => {
+    const priorProject = process.env.CODEX_PROJECT_DIR;
+    try {
+        process.env.CODEX_PROJECT_DIR = REPO;
+        launch.clearNamespaceCache();
+        const meta = { session_id: "session-end-namespace", cwd: REPO };
+        const started = launch.buildCanonicalEnv("codex", meta, "session-start");
+        const cleared = launch.buildCanonicalEnv("codex", meta, "session-end", {
+            requireResolvedNamespace: true,
+        });
+        assert(started.ZMEM_NAMESPACE);
+        assert.strictEqual(cleared.ZMEM_NAMESPACE, started.ZMEM_NAMESPACE);
+    } finally {
+        if (priorProject === undefined) delete process.env.CODEX_PROJECT_DIR;
+        else process.env.CODEX_PROJECT_DIR = priorProject;
+        launch.clearNamespaceCache();
+    }
 });
 
 test("detached observations start only after the translated hook has produced its payload", () => {

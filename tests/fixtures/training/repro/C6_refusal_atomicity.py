@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -25,7 +26,10 @@ def main() -> None:
         temp_root = Path(raw)
         probe = run_store(temp_root, "capture-training-completion", "-h")
         surface_exists_or_exit(
-            probe, "capture-training-completion", "AC6_MISSING_CAPTURE_REFUSAL"
+            probe,
+            "capture-training-completion",
+            "AC6_MISSING_CAPTURE_REFUSAL",
+            strict=True,
         )
         if probe.returncode == 0:
             # Head path: all prerequisites are valid except the one governance field.
@@ -42,9 +46,10 @@ def main() -> None:
             payload["source_event_id"] = "event-135-missing-license"
             payload["project_key"] = "refusal"
             payload["content_license"] = "internal-review"
-            capture_delivery_and_ack(
+            receipt = capture_delivery_and_ack(
                 temp_root, payload, sentinel="AC6_MISSING_CAPTURE_REFUSAL"
             )
+            capture_id = str(receipt["capture_id"])
             incomplete = dict(payload)
             incomplete.pop("content_license")
             result = complete_payload(
@@ -56,6 +61,21 @@ def main() -> None:
             assert result.stderr == "missing governance field: content_license\n", (
                 "missing exact governance refusal stderr: " + combined(result)
             )
+
+            conn = sqlite3.connect(temp_root / "store.sqlite")
+            try:
+                completion = conn.execute(
+                    "SELECT 1 FROM training_capture_completion WHERE capture_id=?",
+                    (capture_id,),
+                ).fetchone()
+                associations = conn.execute(
+                    "SELECT memory_id FROM memory_evidence WHERE evidence_id=?",
+                    (source["evidence_id"],),
+                ).fetchall()
+            finally:
+                conn.close()
+            assert completion is None, "refusal committed a completion row"
+            assert not associations, "refusal committed a memory/evidence association"
 
             # An emitted/acknowledged orphan may remain, but no complete event
             # or memory/evidence export binding may be committed.

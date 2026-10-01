@@ -19,14 +19,30 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "skills" / "memory" / "scripts" / "store.py"
 # Keep import-time store resolution away from the operator store when this
-# module is run directly or loaded by unittest discovery.
+# module is run directly or loaded by unittest discovery. Restore the ambient
+# values immediately after imports; cached STORE_PATH then points only at a
+# cleaned temporary location.
+_IMPORT_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_EMBED_PROFILE", "ZMEM_MODEL_AUTODOWNLOAD")
+_IMPORT_ENV = {key: os.environ.get(key) for key in _IMPORT_KEYS}
 _IMPORT_TMP = tempfile.TemporaryDirectory(prefix="zmem-training-capture-cli-import-")
 _IMPORT_ROOT = Path(_IMPORT_TMP.name)
-os.environ["ZMEM_STORE"] = str(_IMPORT_ROOT / "store.sqlite")
-os.environ["ZMEM_DATA"] = str(_IMPORT_ROOT / "data")
+os.environ.update({
+    "ZMEM_STORE": str(_IMPORT_ROOT / "store.sqlite"),
+    "ZMEM_DATA": str(_IMPORT_ROOT / "data"),
+    "ZMEM_EMBED_PROFILE": "fake",
+    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+})
 sys.path.insert(0, str(ROOT / "skills" / "memory" / "scripts"))
-from storelib import cli as store_cli  # noqa: E402
-from storelib.evidence import write_evidence  # noqa: E402
+try:
+    from storelib import cli as store_cli  # noqa: E402
+    from storelib.evidence import write_evidence  # noqa: E402
+finally:
+    for _key, _value in _IMPORT_ENV.items():
+        if _value is None:
+            os.environ.pop(_key, None)
+        else:
+            os.environ[_key] = _value
+    _IMPORT_TMP.cleanup()
 
 
 class TrainingCaptureCliTests(unittest.TestCase):
@@ -134,6 +150,50 @@ class TrainingCaptureCliTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_explicit_delivery_replay_deduplicates_canonical_source_event_ids(self) -> None:
+        cases = (
+            ("/home/" + "alice/secret-project/notes.txt", 3, True),
+            ("alice@example.com", 2, True),
+            ("safe-event-123", 2, False),
+        )
+        conn = sqlite3.connect(self.store)
+        try:
+            for source_event_id, repeats, is_opaque in cases:
+                payload = self._payload(str(uuid.uuid4()))
+                payload["source_event_id"] = source_event_id
+                results = [self._delivery(payload) for _ in range(repeats)]
+                self.assertTrue(all(result.returncode == 0 for result in results), results[-1].stderr)
+                capture_id = json.loads(results[0].stdout)["capture_id"]
+                rows = conn.execute(
+                    "SELECT payload FROM training_capture_observation "
+                    "WHERE capture_id=? AND observation_kind='source_event_id'",
+                    (capture_id,),
+                ).fetchall()
+                self.assertEqual(len(rows), 1)
+                if is_opaque:
+                    self.assertNotIn(source_event_id, rows[0][0])
+                else:
+                    self.assertEqual(json.loads(rows[0][0]), {"source_event_id": source_event_id})
+
+            distinct = self._payload(str(uuid.uuid4()))
+            distinct["source_event_id"] = "safe-event-123"
+            first = self._delivery(distinct)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            distinct["source_event_id"] = "safe-event-456"
+            second = self._delivery(distinct)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            capture_id = json.loads(first.stdout)["capture_id"]
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM training_capture_observation "
+                    "WHERE capture_id=? AND observation_kind='source_event_id'",
+                    (capture_id,),
+                ).fetchone()[0],
+                2,
+            )
+        finally:
+            conn.close()
+
     def test_conflicting_explicit_delivery_replay_is_rejected(self) -> None:
         delivery_id = str(uuid.uuid4())
         payload = self._payload(delivery_id)
@@ -176,6 +236,40 @@ class TrainingCaptureCliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1, stderr.getvalue())
         self.assertIn("optional training exporter unavailable", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_export_lease_precedes_connect_and_releases_on_setup_base_exception(self) -> None:
+        """The restore barrier is held even when setup raises outside expected errors."""
+        calls: list[str] = []
+        lease = object()
+        old_argv = sys.argv
+        sys.argv = [
+            str(STORE), "export-training", str(self.root / "training"),
+            "--snapshot-id", str(uuid.uuid4()), "--reviewer-confirmed",
+            "--namespace", "project:training-cli",
+        ]
+
+        def acquire(_command: str) -> object:
+            calls.append("acquire")
+            return lease
+
+        def fail_connect() -> sqlite3.Connection:
+            calls.append("connect")
+            raise KeyError("unanticipated setup fault")
+
+        def release(token: object | None) -> None:
+            self.assertIs(token, lease)
+            calls.append("release")
+
+        try:
+            with patch.object(store_cli, "_wait_for_maintenance_clear"), \
+                 patch.object(store_cli, "_acquire_writer_lease", side_effect=acquire), \
+                 patch.object(store_cli, "_release_writer_lease", side_effect=release), \
+                 patch.object(store_cli, "connect", side_effect=fail_connect):
+                with self.assertRaisesRegex(KeyError, "unanticipated setup fault"):
+                    store_cli.main()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(calls, ["acquire", "connect", "release"])
 
     def test_partial_governance_is_accepted_as_metadata_only_and_timestamps_refused(self) -> None:
         delivery_id = str(uuid.uuid4())

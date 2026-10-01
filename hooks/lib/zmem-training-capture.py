@@ -19,6 +19,7 @@ callback.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -36,6 +37,7 @@ from typing import Any, Mapping, Sequence
 _MAX_INPUT_BYTES = 64 * 1024
 _MAX_OBSERVATION_BYTES = 4_000
 _STATE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+_SESSION_SCOPE_MAX_NAMESPACES = 8
 _LOCK_TIMEOUT_SECONDS = 0.8
 _DEFAULT_GOVERNANCE_SOURCE = "configured_local_policy"
 _USE_PRIVATE_STANDALONE_BOOTSTRAP = False
@@ -154,15 +156,17 @@ def _lock_path(session_key: str, env: Mapping[str, str] | None = None) -> Path:
 class _SessionLock:
     """A stable, process-scoped lock file that is never removed on release."""
 
-    def __init__(self, session_key: str, env: Mapping[str, str]) -> None:
+    def __init__(self, session_key: str, env: Mapping[str, str],
+                 deadline: float | None = None) -> None:
         self.path = _lock_path(session_key, env)
+        self.deadline = deadline
         self.handle: Any | None = None
         self.locked = False
 
     def __enter__(self) -> "_SessionLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = self.path.open("a+b")
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        deadline = self.deadline if self.deadline is not None else time.monotonic() + _LOCK_TIMEOUT_SECONDS
         while True:
             try:
                 self.handle.seek(0)
@@ -275,6 +279,64 @@ def _write_state(state_key: str, capture_id: str, env: Mapping[str, str] | None 
             pass
 
 
+def _session_scope_key(fields: Mapping[str, str]) -> str:
+    """A hashed index for the start namespace of one host session."""
+    canonical = json.dumps({"host": fields["host"], "session_id": fields["session_id"]},
+                           sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _read_session_scope_keys(fields: Mapping[str, str], env: Mapping[str, str]) -> list[str]:
+    path = _state_path(_session_scope_key(fields), env)
+    try:
+        if time.time() - path.stat().st_mtime > _STATE_MAX_AGE_SECONDS:
+            path.unlink(missing_ok=True)
+            return []
+        value = json.loads(path.read_text(encoding="utf-8"))
+        values = value.get("session_keys") if isinstance(value, dict) else []
+        if not isinstance(values, list):
+            return []
+        session_keys = []
+        for candidate in values[:_SESSION_SCOPE_MAX_NAMESPACES]:
+            session_key = _text(candidate, limit=64).strip()
+            if re.fullmatch(r"[0-9a-f]{64}", session_key) and session_key not in session_keys:
+                session_keys.append(session_key)
+        return session_keys
+    except (OSError, ValueError, TypeError, OverflowError):
+        return []
+
+
+def _write_session_scope(fields: Mapping[str, str], session_key: str,
+                         env: Mapping[str, str]) -> None:
+    path = _state_path(_session_scope_key(fields), env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            session_keys = _read_session_scope_keys(fields, env)
+            if session_key not in session_keys:
+                session_keys.append(session_key)
+            if len(session_keys) > _SESSION_SCOPE_MAX_NAMESPACES:
+                raise ValueError("capture_scope_limit")
+            json.dump({"session_keys": session_keys}, handle, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _clear_session_scope(fields: Mapping[str, str], env: Mapping[str, str]) -> None:
+    try:
+        _state_path(_session_scope_key(fields), env).unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError("capture_scope_clear_failed") from exc
+
+
 def _clear_state(session_id: str, env: Mapping[str, str] | None = None) -> None:
     if not session_id:
         return
@@ -313,6 +375,7 @@ def _api_from_modules(schema: Any, capture: Any) -> dict[str, Any]:
         "snapshot": capture.record_training_delivery_snapshot,
         "snapshot_correlated": capture.record_correlated_training_delivery_snapshot,
         "clear_correlated": capture.clear_correlated_training_session,
+        "clear_session_keys": capture._clear_training_capture_session_keys,
         "identity_keys": capture.training_capture_identity_keys,
     }
 
@@ -491,36 +554,43 @@ def _start(payload: Mapping[str, Any], env: Mapping[str, str],
         }
     correlation_key, session_key, fields = identity
     try:
-        with _SessionLock(session_key, env):
-            conn = _connection(api)
-            try:
-                if persist_sidecar:
-                    row = api["start_correlated"](
-                        conn, task_id=fields["task_id"], turn_id=fields["turn_id"], **kwargs,
-                    )
-                else:
-                    row = api["start"](conn, **kwargs)
-            finally:
-                conn.close()
-            capture_id = _valid_capture_id(
-                row.get("capture_id") if isinstance(row, dict) else ""
-            )
-            if not capture_id:
-                return {}
+        lock_deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        with _SessionLock(_session_scope_key(fields), env, lock_deadline):
+            # Record the opaque scope before its database transaction.  A
+            # crash may leave an empty scope to clear, but cannot strand a
+            # successfully committed correlation outside session-end cleanup.
             if persist_sidecar:
-                previous = _read_state_record(correlation_key, env)
-                generation = (
-                    previous.get("generation")
-                    if previous.get("capture_id") == capture_id else str(uuid.uuid4())
+                _write_session_scope(fields, session_key, env)
+            with _SessionLock(session_key, env, lock_deadline):
+                conn = _connection(api)
+                try:
+                    if persist_sidecar:
+                        row = api["start_correlated"](
+                            conn, task_id=fields["task_id"], turn_id=fields["turn_id"], **kwargs,
+                        )
+                    else:
+                        row = api["start"](conn, **kwargs)
+                finally:
+                    conn.close()
+                capture_id = _valid_capture_id(
+                    row.get("capture_id") if isinstance(row, dict) else ""
                 )
-                _write_state(correlation_key, capture_id, env, generation=generation)
-            return {
-                "capture_id": capture_id,
-                "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
-                "redaction_status": _text(
-                    row.get("redaction_status") if isinstance(row, dict) else "", limit=64
-                ),
-            }
+                if not capture_id:
+                    return {}
+                if persist_sidecar:
+                    previous = _read_state_record(correlation_key, env)
+                    generation = (
+                        previous.get("generation")
+                        if previous.get("capture_id") == capture_id else str(uuid.uuid4())
+                    )
+                    _write_state(correlation_key, capture_id, env, generation=generation)
+                return {
+                    "capture_id": capture_id,
+                    "state": _text(row.get("state") if isinstance(row, dict) else "", limit=64),
+                    "redaction_status": _text(
+                        row.get("redaction_status") if isinstance(row, dict) else "", limit=64
+                    ),
+                }
     except TimeoutError:
         return _lock_timeout()
     except (OSError, ValueError):
@@ -628,15 +698,35 @@ def _clear_correlated(payload: Mapping[str, Any], env: Mapping[str, str],
                 raise RuntimeError("capture_sidecar_clear_failed") from exc
 
     try:
-        with _SessionLock(session_key, env):
-            conn = _connection(api)
-            try:
-                api["clear_correlated"](
-                    conn, host=fields["host"], session_id=fields["session_id"],
-                    namespace=fields["namespace"], remove_sidecars=remove_sidecars,
-                )
-            finally:
-                conn.close()
+        lock_deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+        with _SessionLock(_session_scope_key(fields), env, lock_deadline):
+            trusted_session_keys = _read_session_scope_keys(fields, env)
+            if trusted_session_keys:
+                # Scope locks are acquired in digest order after the stable
+                # host/session index lock, matching correlated-start order.
+                with ExitStack() as locks:
+                    for trusted_key in sorted(trusted_session_keys):
+                        locks.enter_context(_SessionLock(trusted_key, env, lock_deadline))
+                    conn = _connection(api)
+                    try:
+                        api["clear_session_keys"](
+                            conn, session_keys=trusted_session_keys,
+                            remove_sidecars=remove_sidecars,
+                        )
+                    finally:
+                        conn.close()
+                _clear_session_scope(fields, env)
+                return {}
+            with _SessionLock(session_key, env, lock_deadline):
+                conn = _connection(api)
+                try:
+                    api["clear_correlated"](
+                        conn, host=fields["host"], session_id=fields["session_id"],
+                        namespace=fields["namespace"], remove_sidecars=remove_sidecars,
+                    )
+                finally:
+                    conn.close()
+            _clear_session_scope(fields, env)
         return {}
     except TimeoutError:
         return {"error": "capture_busy"}

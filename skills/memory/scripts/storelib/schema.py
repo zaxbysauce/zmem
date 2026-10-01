@@ -1569,6 +1569,15 @@ def _ensure_training_capture_tables(conn: sqlite3.Connection) -> None:
     try:
         for ddl in _TRAINING_CAPTURE_SCHEMA_DDL:
             conn.execute(ddl)
+        # Recheck after acquiring the SQLite write barrier.  Direct callers of
+        # this additive helper can otherwise both observe the missing column
+        # and one loses the race on ALTER TABLE.
+        current_columns = {
+            str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(training_capture_observation)"
+            ).fetchall()
+        }
+        observation_digest_missing = "payload_sha256" not in current_columns
         if observation_digest_missing:
             conn.execute(
                 "ALTER TABLE training_capture_observation ADD COLUMN payload_sha256 TEXT"

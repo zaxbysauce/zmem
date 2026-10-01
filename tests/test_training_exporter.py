@@ -14,31 +14,48 @@ from unittest.mock import patch
 import sys
 
 # Keep import-time store resolution away from the operator store when this
-# module is run directly or loaded by unittest discovery.
+# module is run directly or loaded by unittest discovery. Storelib caches this
+# temporary location, then the ambient process environment is restored before
+# discovery can import another module.
+_IMPORT_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_EMBED_PROFILE", "ZMEM_MODEL_AUTODOWNLOAD")
+_IMPORT_ENV = {key: os.environ.get(key) for key in _IMPORT_KEYS}
 _IMPORT_TMP = tempfile.TemporaryDirectory(prefix="zmem-training-exporter-import-")
 _IMPORT_ROOT = Path(_IMPORT_TMP.name)
-os.environ["ZMEM_STORE"] = str(_IMPORT_ROOT / "store.sqlite")
-os.environ["ZMEM_DATA"] = str(_IMPORT_ROOT / "data")
+os.environ.update({
+    "ZMEM_STORE": str(_IMPORT_ROOT / "store.sqlite"),
+    "ZMEM_DATA": str(_IMPORT_ROOT / "data"),
+    "ZMEM_EMBED_PROFILE": "fake",
+    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+})
 sys.path.insert(0, str(Path(__file__).parents[1] / "skills" / "memory" / "scripts"))
 
-from storelib import schema
-from storelib import training as training_module
-from storelib.training import (
-    PREFERENCE_COLUMNS,
-    SFT_COLUMNS,
-    TrainingExportError,
-    _bounded_quarantine_event,
-    _load_snapshot_rows,
-    _lineage_groups,
-    _opaque_project_label,
-    _redact,
-    _split_bucket,
-    _split_key,
-    _training_output_lock,
-    build_preference_rows,
-    build_sft_rows,
-    write_training_views,
-)
+try:
+    from storelib import schema
+    from storelib import training as training_module
+    from storelib.training import (
+        PREFERENCE_COLUMNS,
+        QUARANTINE_EVENT_MAX_BYTES,
+        SFT_COLUMNS,
+        TrainingExportError,
+        _bounded_quarantine_event,
+        _load_snapshot_rows,
+        _lineage_groups,
+        _opaque_project_label,
+        _redact,
+        _split_bucket,
+        _split_key,
+        _training_output_lock,
+        build_preference_rows,
+        build_sft_rows,
+        write_training_views,
+    )
+finally:
+    for _key, _value in _IMPORT_ENV.items():
+        if _value is None:
+            os.environ.pop(_key, None)
+        else:
+            os.environ[_key] = _value
+    _IMPORT_TMP.cleanup()
 
 
 class TrainingExporterTests(unittest.TestCase):
@@ -112,7 +129,9 @@ class TrainingExporterTests(unittest.TestCase):
             "INSERT INTO training_delivery_snapshot (delivery_snapshot_id, capture_id, rendered, "
             "effective_ops_json, rendered_hash, transform_version, emitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("delivery-1", capture_id, "<context>safe</context>",
-             json.dumps(["deploy --safe"]), "hash", "transform-v1", "2026-01-01T00:00:00Z"),
+             json.dumps(["deploy --safe"]),
+             hashlib.sha256(b"<context>safe</context>").hexdigest(),
+             "transform-v1", "2026-01-01T00:00:00Z"),
         )
         self.conn.execute(
             "INSERT INTO training_capture_completion (capture_id, evidence_id, verifier_id, verified_at, "
@@ -203,6 +222,23 @@ class TrainingExporterTests(unittest.TestCase):
             self.assertEqual(row["label_status"], "candidate_positive")
             self.assertEqual(len(row["row_checksum"]), 64)
             self.assertEqual(before, self.conn.execute("SELECT count(*) FROM memory").fetchone()[0])
+
+    def test_rendered_hash_corruption_is_excluded_before_materialization(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "UPDATE training_delivery_snapshot SET rendered=? WHERE capture_id=?",
+            ("tampered rendered context", "cap-1"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="corrupt-rendered", reviewer_confirmed=True,
+                quarantine_raw=True,
+            )
+            self.assertEqual(result["sft_count"], 0)
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["excluded_counts"], {"snapshot_integrity": 1})
 
     def test_completed_row_binds_export_governance_and_full_projection(self) -> None:
         self._seed_capture()
@@ -382,6 +418,31 @@ class TrainingExporterTests(unittest.TestCase):
             )
             manifest = json.loads((Path(tmp) / "manifest.json").read_text())
         self.assertEqual(manifest["excluded_counts"].get("revoked"), 1)
+
+    def test_foreign_associated_memory_is_excluded_by_namespace(self) -> None:
+        self._seed_capture()
+        self.conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, ingestion_ts, trust_score, applied_count, violated_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("mem-foreign", "project:other", "fact", "Foreign source", "2026-01-01T00:00:00Z", 1.0, 3, 0),
+        )
+        self.conn.execute(
+            "INSERT INTO memory_evidence (memory_id, evidence_id) VALUES (?, ?)",
+            ("mem-foreign", "ev-1"),
+        )
+        self.conn.execute(
+            "UPDATE training_capture_completion SET associated_memory_ids_json=? WHERE capture_id=?",
+            (json.dumps(["mem-1", "mem-foreign"]), "cap-1"),
+        )
+        self.conn.commit()
+        with tempfile.TemporaryDirectory() as tmp:
+            result = write_training_views(
+                self.conn, out_dir=tmp, namespace="project:demo",
+                snapshot_id="foreign-associated-memory", reviewer_confirmed=True,
+            )
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text())
+        self.assertEqual(result["sft_count"], 0)
+        self.assertEqual(manifest["excluded_counts"], {"association_namespace_mismatch": 1})
 
     def test_snapshot_id_cannot_be_reused_for_a_second_destination(self) -> None:
         self._seed_capture()
@@ -576,7 +637,8 @@ class TrainingExporterTests(unittest.TestCase):
             "INSERT INTO training_delivery_snapshot (delivery_snapshot_id, capture_id, "
             "rendered, effective_ops_json, rendered_hash, transform_version, emitted_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("delivery-growth", "partial-growth", "partial context", "[]", "hash",
+            ("delivery-growth", "partial-growth", "partial context", "[]",
+             hashlib.sha256(b"partial context").hexdigest(),
              "transform-v1", "2026-01-01T00:00:00Z"),
         )
         self.conn.commit()
@@ -612,7 +674,8 @@ class TrainingExporterTests(unittest.TestCase):
             "INSERT INTO training_delivery_snapshot (delivery_snapshot_id, capture_id, "
             "rendered, effective_ops_json, rendered_hash, transform_version, emitted_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("delivery-partial", "partial", "partial context", "[]", "hash",
+            ("delivery-partial", "partial", "partial context", "[]",
+             hashlib.sha256(b"partial context").hexdigest(),
              "transform-v1", "2026-01-01T00:00:00Z"),
         )
         partial_payload = json.dumps({"source_event_id": "partial-event"})
@@ -671,6 +734,8 @@ class TrainingExporterTests(unittest.TestCase):
                 (Path(tmp) / "quarantine-manifest.json").read_text()
             )
             self.assertEqual(manifest["event_ids"], [])
+            export_manifest = json.loads((Path(tmp) / "manifest.json").read_text())
+            self.assertEqual(export_manifest["excluded_counts"], {"quarantine": 1})
 
     def test_quarantine_excludes_governance_invalid_capture(self) -> None:
         self._seed_capture()
@@ -747,6 +812,23 @@ class TrainingExporterTests(unittest.TestCase):
             TrainingExportError, "invalid persisted operations for capture cap-1"
         ):
             _bounded_quarantine_event(item, "event-1")
+
+    def test_valid_many_ops_quarantine_event_is_byte_bounded(self) -> None:
+        item = {
+            "capture": {
+                "capture_id": "capture-bounded",
+                "prompt": "p" * 300,
+                "assistant_response": "a" * 300,
+                "rendered": "r" * 300,
+                "effective_ops_json": json.dumps(["x"] * 80),
+            },
+        }
+        event = _bounded_quarantine_event(item, "event-bounded")
+        payload = json.loads(event)
+        self.assertLessEqual(len(event), QUARANTINE_EVENT_MAX_BYTES)
+        self.assertEqual(payload["capture_id"], "capture-bounded")
+        self.assertEqual(payload["event_id"], "event-bounded")
+        self.assertLess(len(payload["ops_tokens"]), 80)
 
     def test_training_output_lock_persists_and_ignores_legacy_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

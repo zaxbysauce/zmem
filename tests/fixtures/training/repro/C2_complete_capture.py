@@ -64,13 +64,14 @@ def main() -> None:
         raw_bearer = "Bearer sk-training-135-redaction-token"
         raw_entropy = "f" * 48
         payload = bind_payload(dict(payload_obj), source)
+        oversized_prompt = ("training prompt " * 2_000)[:16_050]
         payload.update(
             {
                 "context_fence": (
-                    f"<zmem>\\nsecret={raw_bearer}\\n{raw_entropy}\\n"
-                    f"- {source['memory_id']}\\n</zmem>\\n"
+                    f"<zmem>\nsecret={raw_bearer}\n{raw_entropy}\n"
+                    f"- {source['memory_id']}\n</zmem>\n"
                 ),
-                "prompt": f"Verify the export with {raw_bearer} and {raw_entropy}.",
+                "prompt": oversized_prompt,
                 "assistant_response": f"The token {raw_bearer} is not retained.",
                 "ops_tokens": ["pytest", raw_bearer],
             }
@@ -124,6 +125,8 @@ def main() -> None:
         )
         assert row is not None, "complete task was not exported"
         assert row["task_id"] == capture_id
+        assert len(row["prompt"].encode("utf-8")) == 16_000
+        assert row["prompt"] == oversized_prompt[:16_000]
         assert row["source_memory_ids"] == [source["memory_id"]]
         assert payload["source_event_id"] in row["source_event_ids"]
         assert len(row["prompt"].encode("utf-8")) <= 16000

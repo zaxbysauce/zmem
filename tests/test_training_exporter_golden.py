@@ -51,45 +51,48 @@ class TrainingExporterGoldenTests(unittest.TestCase):
                 snapshot_id=cases["snapshot_id"],
                 reviewer_confirmed=True,
             )
-
             self.assertEqual(result["sft_count"], 3)
             self.assertEqual(result["preference_count"], 1)
             self.assertEqual(result["deletion_count"], 2)
-            for generated, expected in (
-                ("sft-000.parquet", "expected-sft.parquet"),
-                ("preferences-000.parquet", "expected-preferences.parquet"),
-                ("deletion-map.json", "expected-deletion-map.json"),
-            ):
-                self.assertEqual(
-                    (output / generated).read_bytes(),
-                    (FIXTURE_DIR / expected).read_bytes(),
-                    generated,
-                )
+            self._assert_export_matches_goldens(output)
 
-            import pyarrow.parquet as pq
-            for filename in ("sft-000.parquet", "preferences-000.parquet"):
-                metadata = pq.read_schema(output / filename).metadata or {}
-                self.assertEqual(metadata.get(b"created_by"), b"zmem-training-v1")
-                self.assertEqual(metadata.get(b"pyarrow_version"), b"25.0.1")
+    def _assert_export_matches_goldens(self, output: Path) -> None:
+        """Compare the on-disk export through the same oracle used by CI."""
+        for generated, expected in (
+            ("sft-000.parquet", "expected-sft.parquet"),
+            ("preferences-000.parquet", "expected-preferences.parquet"),
+            ("deletion-map.json", "expected-deletion-map.json"),
+        ):
             self.assertEqual(
-                _json_bytes(pq.read_table(output / "sft-000.parquet").to_pylist()),
-                (FIXTURE_DIR / "expected-sft.json").read_bytes(),
-            )
-            self.assertEqual(
-                _json_bytes(pq.read_table(output / "preferences-000.parquet").to_pylist()),
-                (FIXTURE_DIR / "expected-preferences.json").read_bytes(),
+                (output / generated).read_bytes(),
+                (FIXTURE_DIR / expected).read_bytes(),
+                generated,
             )
 
-            deletion_map = json.loads((output / "deletion-map.json").read_text())
-            self.assertEqual(
-                {row["reason"] for row in deletion_map},
-                {"exact_duplicate", "semantic_duplicate"},
-            )
-            preferences = pq.read_table(output / "preferences-000.parquet").to_pylist()
-            self.assertEqual(preferences[0]["chosen"]["memory_id"], "mem-new")
-            self.assertEqual(preferences[0]["rejected"]["memory_id"], "mem-old")
+        import pyarrow.parquet as pq
+        for filename in ("sft-000.parquet", "preferences-000.parquet"):
+            metadata = pq.read_schema(output / filename).metadata or {}
+            self.assertEqual(metadata.get(b"created_by"), b"zmem-training-v1")
+            self.assertEqual(metadata.get(b"pyarrow_version"), b"25.0.1")
+        self.assertEqual(
+            _json_bytes(pq.read_table(output / "sft-000.parquet").to_pylist()),
+            (FIXTURE_DIR / "expected-sft.json").read_bytes(),
+        )
+        self.assertEqual(
+            _json_bytes(pq.read_table(output / "preferences-000.parquet").to_pylist()),
+            (FIXTURE_DIR / "expected-preferences.json").read_bytes(),
+        )
 
-    def test_golden_detects_a_mutated_export_projection(self) -> None:
+        deletion_map = json.loads((output / "deletion-map.json").read_text())
+        self.assertEqual(
+            {row["reason"] for row in deletion_map},
+            {"exact_duplicate", "semantic_duplicate"},
+        )
+        preferences = pq.read_table(output / "preferences-000.parquet").to_pylist()
+        self.assertEqual(preferences[0]["chosen"]["memory_id"], "mem-new")
+        self.assertEqual(preferences[0]["rejected"]["memory_id"], "mem-old")
+
+    def test_golden_detects_mutated_export_bytes(self) -> None:
         cases = build_fixtures.load_cases()
         with tempfile.TemporaryDirectory(prefix="training-golden-mutation-") as tmp:
             output = Path(tmp)
@@ -100,13 +103,14 @@ class TrainingExporterGoldenTests(unittest.TestCase):
                 snapshot_id=cases["snapshot_id"],
                 reviewer_confirmed=True,
             )
-            import pyarrow.parquet as pq
-            rows = pq.read_table(output / "sft-000.parquet").to_pylist()
-            rows[0]["assistant_response"] = "mutated exporter output"
-            self.assertNotEqual(
-                _json_bytes(rows),
-                (FIXTURE_DIR / "expected-sft.json").read_bytes(),
-            )
+            self._assert_export_matches_goldens(output)
+            generated_path = output / "sft-000.parquet"
+            generated = bytearray(generated_path.read_bytes())
+            self.assertGreater(len(generated), 1)
+            generated[len(generated) // 2] ^= 1
+            generated_path.write_bytes(generated)
+            with self.assertRaises(AssertionError):
+                self._assert_export_matches_goldens(output)
 
 
 if __name__ == "__main__":

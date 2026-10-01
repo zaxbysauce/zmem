@@ -40,7 +40,7 @@
     {"capture_id": "cap-exact-a", "host_task_id": "task-exact-a", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "Which command should I use for safe deploy?", "assistant_response": "Run deploy --safe."},
     {"capture_id": "cap-exact-b", "host_task_id": "task-exact-b", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "Which command should I use for safe deploy?", "assistant_response": "Run deploy --safe."},
     {"capture_id": "cap-sem-a", "host_task_id": "task-sem-a", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "How do I deploy this safely?", "assistant_response": "Run deploy --safe."},
-    {"capture_id": "cap-sem-b", "host_task_id": "task-sem-b", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "How do I deploy this safely? ", "assistant_response": "Run deploy --safe."},
+    {"capture_id": "cap-sem-b", "host_task_id": "task-sem-b", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "How should I deploy this safely?", "assistant_response": "Run deploy --safe."},
     {"capture_id": "cap-pref", "host_task_id": "task-preference", "session_id": "fixture-session", "namespace": "project:fixture", "prompt": "Review the corrected migration procedure.", "assistant_response": "The corrected procedure is deploy --safe."}
   ],
   "deliveries": [

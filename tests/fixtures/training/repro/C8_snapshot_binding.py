@@ -25,7 +25,10 @@ def main() -> None:
         temp_root = Path(raw)
         probe = run_store(temp_root, "capture-training-completion", "-h")
         surface_exists_or_exit(
-            probe, "capture-training-completion", "AC8_MISSING_CAPTURE_COMPLETION"
+            probe,
+            "capture-training-completion",
+            "AC8_MISSING_CAPTURE_COMPLETION",
+            strict=True,
         )
         if probe.returncode == 0:
             source = seed_memory_evidence_episode(

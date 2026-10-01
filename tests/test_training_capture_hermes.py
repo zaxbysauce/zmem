@@ -193,6 +193,35 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             self.assertEqual(start.call_args.args[1]["host_task_id"], "task-hermes")
             self.assertEqual(payload["host_task_id"], "task-hermes")
 
+    def test_claimed_ticket_without_task_identity_starts_standalone_without_snapshot(self):
+        with _plugin_context() as plugin:
+            provider = plugin.ZmemMemoryProvider()
+            provider._session_id = "session-hermes"
+            provider._namespace = "project:hermes-hook"
+            provider._transport = mock.Mock()
+            provider._transport.prefetch.return_value = {
+                "rendered": "context", "effective_ops": [], "transform_version": "v1",
+            }
+            starts = []
+            snapshots = []
+            with mock.patch.object(
+                plugin, "_run_training_capture",
+                side_effect=lambda action, payload: starts.append((action, payload))
+                or {"capture_id": "capture-hermes", "state": "partial"},
+            ), mock.patch.object(
+                plugin, "_background_training_capture",
+                side_effect=lambda action, payload: snapshots.append((action, payload)),
+            ):
+                provider.on_turn_start(1, "taskless prompt", session_id="session-hermes")
+                provider.prefetch("taskless prompt", session_id="session-hermes")
+                provider.sync_turn("taskless prompt", "taskless response", session_id="session-hermes")
+
+            self.assertEqual([action for action, _ in starts], ["start_standalone"])
+            self.assertEqual(starts[0][1]["prompt"], "taskless prompt")
+            self.assertEqual(starts[0][1]["assistant_response"], "taskless response")
+            self.assertNotIn("host_task_id", starts[0][1])
+            self.assertEqual(snapshots, [])
+
     def test_official_lifecycle_rejects_ambiguous_repeated_prompt(self):
         with _plugin_context() as plugin:
             provider = plugin.ZmemMemoryProvider()
@@ -237,8 +266,10 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 provider.on_turn_start(2, "second", session_id="session-hermes")
                 provider.prefetch("first", session_id="session-hermes")
                 provider.prefetch("second", session_id="session-hermes")
-                provider.sync_turn("second", "response-2", session_id="session-hermes")
-                provider.sync_turn("first", "response-1", session_id="session-hermes")
+                provider.sync_turn("second", "response-2", session_id="session-hermes",
+                                   task_id="task-out-of-order")
+                provider.sync_turn("first", "response-1", session_id="session-hermes",
+                                   task_id="task-out-of-order")
 
             self.assertEqual([action for action, _ in calls], ["snapshot", "snapshot"])
             self.assertNotEqual(calls[0][1]["capture_key"], calls[1][1]["capture_key"])
@@ -261,7 +292,8 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                                    side_effect=lambda action, payload: calls.append((action, payload))):
                 provider.on_turn_start(1, "right prompt", session_id="session-hermes")
                 provider.prefetch("wrong prompt", session_id="session-hermes")
-                provider.sync_turn("right prompt", "response", session_id="session-hermes")
+                provider.sync_turn("right prompt", "response", session_id="session-hermes",
+                                   task_id="task-mismatch")
                 provider.on_turn_start(2, "expired prompt", session_id="session-hermes")
                 provider._turn_tickets[0]["expires_at"] = 0
                 provider.sync_turn("expired prompt", "response", session_id="session-hermes")
@@ -459,6 +491,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 provider.prefetch("prompt", session_id="session-first")
                 provider.sync_turn(
                     "prompt", "explicit response", session_id="session-first",
+                    task_id="task-first-epoch",
                 )
 
             self.assertEqual([action for action, _ in starts], [
@@ -499,6 +532,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 provider.prefetch("same prompt", session_id="session-new")
                 provider.sync_turn(
                     "same prompt", "current response", session_id="session-new",
+                    task_id="task-rotation",
                 )
 
             self.assertEqual([action for action, _ in starts], ["start"])
@@ -571,14 +605,14 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 )
                 provider.sync_turn(
                     "sequential prompt", "first response",
-                    session_id="session-sequential",
+                    session_id="session-sequential", task_id="task-sequential",
                 )
                 provider.on_turn_start(
                     2, "sequential prompt", session_id="session-sequential",
                 )
                 provider.sync_turn(
                     "sequential prompt", "second response",
-                    session_id="session-sequential",
+                    session_id="session-sequential", task_id="task-sequential",
                 )
 
             self.assertEqual([action for action, _ in starts], ["start", "start"])
@@ -641,7 +675,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 clock[0] += 31.0
                 provider.sync_turn(
                     "long-turn prompt", "long-turn response",
-                    session_id="session-hermes-long",
+                    session_id="session-hermes-long", task_id="task-long-turn",
                 )
 
             self.assertEqual([action for action, _ in calls], ["snapshot"])
@@ -685,13 +719,15 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                 self.assertNotIn(prompt, repr(provider._turn_tickets))
                 provider.prefetch(prompt, session_id="session-hermes")
                 retained = provider._turn_tickets[0]["envelope"]
-                provider.sync_turn(prompt, "response", session_id="session-hermes")
+                provider.sync_turn(prompt, "response", session_id="session-hermes",
+                                   task_id="task-redacted-envelope")
 
             self.assertNotIn("sk-test-12345678901234567890", str(retained))
             self.assertNotIn("user@example.com", str(retained))
             self.assertEqual(calls[0][1]["rendered"], "[REDACTED_SECRET] [REDACTED_EMAIL]")
             self.assertEqual(calls[0][1]["effective_ops"],
                              ["[REDACTED_SECRET] [REDACTED_EMAIL]"])
+            self.assertEqual(calls[0][1]["host_task_id"], "task-redacted-envelope")
 
     def test_redactor_uses_resolved_home_without_sys_path_pollution(self):
         with _plugin_context() as plugin, tempfile.TemporaryDirectory(
@@ -943,13 +979,43 @@ class HermesTrainingCaptureTests(unittest.TestCase):
     def test_capture_marker_is_scoped_to_the_store_child(self):
         with _plugin_context() as plugin:
             completed = types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
-            with mock.patch.object(plugin, "_resolve_store_py", return_value=Path("store.py")), \
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(plugin, "_resolve_store_py", return_value=Path("store.py")), \
                  mock.patch.object(plugin, "_python_bin", return_value="python"), \
                  mock.patch.object(plugin.subprocess, "run", return_value=completed) as run:
                 plugin._run_passive_store(["recent"], capture=True)
                 child_env = run.call_args.kwargs["env"]
                 self.assertEqual(child_env["ZMEM_CAPTURE"], "1")
                 self.assertNotIn("ZMEM_CAPTURE", os.environ)
+
+    def test_local_transport_defaults_capture_marker_but_preserves_explicit_zero(self):
+        transport_spec = importlib.util.spec_from_file_location(
+            f"training_capture_transport_{uuid.uuid4().hex}",
+            ROOT / "hermes-plugin" / "transport.py",
+        )
+        assert transport_spec is not None and transport_spec.loader is not None
+        transport = importlib.util.module_from_spec(transport_spec)
+        transport_spec.loader.exec_module(transport)
+
+        class InlineExecutor:
+            def run(self, operation, _deadline):
+                return operation()
+
+        completed = mock.Mock()
+        completed.communicate.return_value = (
+            json.dumps({"rendered": "", "effective_ops": [], "transform_version": "v1"}), "",
+        )
+        with mock.patch.object(transport.subprocess, "Popen", return_value=completed) as popen:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                local = transport.LocalSubprocess(store_py="store.py", executor=InlineExecutor())
+                local.prefetch("prompt", namespace="project:hermes", session_id="session",
+                               moment="user_prompt", ops_tokens=[])
+                self.assertEqual(popen.call_args.kwargs["env"]["ZMEM_CAPTURE"], "1")
+            with mock.patch.dict(os.environ, {"ZMEM_CAPTURE": "0"}, clear=True):
+                local = transport.LocalSubprocess(store_py="store.py", executor=InlineExecutor())
+                local.prefetch("prompt", namespace="project:hermes", session_id="session",
+                               moment="user_prompt", ops_tokens=[])
+                self.assertEqual(popen.call_args.kwargs["env"]["ZMEM_CAPTURE"], "0")
 
     def test_sync_and_background_capture_fail_open_without_worker_traceback(self):
         with _plugin_context() as plugin:

@@ -211,6 +211,19 @@ def _opaque_identifier(value: str | None) -> str | None:
     return "opaque:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
+_OPAQUE_OBSERVATION_IDENTIFIER_RE = re.compile(r"opaque:[0-9a-f]{32}\Z")
+_OPAQUE_OBSERVATION_IDENTITY_KEYS = frozenset({
+    "host_task_id", "hosttaskid", "task_id", "taskid", "turn_id", "turnid",
+})
+
+
+def _opaque_observation_identifier(value: str) -> str:
+    """Canonicalize an already-sanitized callback identity without re-hashing it."""
+    if _OPAQUE_OBSERVATION_IDENTIFIER_RE.fullmatch(value):
+        return value
+    return _opaque_identifier(value) or ""
+
+
 def _redacted_bounded(value: object, field: str, limit: int) -> str | None:
     if value is None:
         return None
@@ -223,6 +236,27 @@ def _redacted_bounded(value: object, field: str, limit: int) -> str | None:
     redacted, _ = _redact_training_text(value)
     raw = redacted.encode("utf-8")[:limit]
     return raw.decode("utf-8", errors="ignore")
+
+
+def _redacted_delivery_text(value: object) -> str | None:
+    """Redact an emitted payload without changing what the host received."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("rendered must be a string or null")
+    if len(value.encode("utf-8")) > 65_536:
+        raise TrainingCaptureInputRefusal("rendered_over_limit")
+    redacted, _ = _redact_training_text(value)
+    if len(redacted.encode("utf-8")) > MAX_CAPTURE_TEXT_BYTES:
+        raise TrainingCaptureInputRefusal("rendered_over_limit")
+    return redacted
+
+
+def _redacted_observation_kind(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("observation_kind must be a non-empty string")
+    redacted, _ = _redact_training_text(value.strip())
+    return _required_text(redacted, "observation_kind", max_bytes=128)
 
 
 def _redacted_cwd(value: object) -> str | None:
@@ -322,9 +356,9 @@ def _bounded_observation_json(value: str | None) -> str | None:
             stored_key = _redact_training_text(key)[0]
             if not stored_key:
                 continue
-            if key_lower in {"host_task_id", "hosttaskid"}:
+            if key_lower in _OPAQUE_OBSERVATION_IDENTITY_KEYS:
                 if isinstance(child, str):
-                    result[stored_key] = _opaque_identifier(child)
+                    result[stored_key] = _opaque_observation_identifier(child)
                 continue
             if key_lower == "cwd":
                 result[stored_key] = "[REDACTED_PATH]" if isinstance(child, str) and child else None
@@ -466,6 +500,9 @@ def start_correlated_training_capture(
         _require_open_training_session(conn, session_key)
         existing_id = _correlation_capture_id(conn, correlation_key, session_key)
         if existing_id is not None:
+            assert_training_capture_replay_binding(
+                conn, existing_id, _correlated_start_replay_identity(kwargs),
+            )
             row = _row_dict(_capture_row(conn, existing_id))
             _finish(conn, owns_tx)
             return row
@@ -482,42 +519,66 @@ def start_correlated_training_capture(
         raise
 
 
-def clear_correlated_training_session(
-    conn: sqlite3.Connection, *, host: object, session_id: object,
-    namespace: object, remove_sidecars: Any | None = None,
+def _clear_training_capture_session_keys(
+    conn: sqlite3.Connection, *, session_keys: Sequence[object],
+    remove_sidecars: Any | None = None,
 ) -> list[str]:
-    """Tombstone one identity scope and remove its durable correlations.
+    """Clear a bounded, already-opaque set of session-key digests.
 
-    ``remove_sidecars`` runs while this immediate transaction is open.  It may
-    observe missing files as success; a raised error rolls back the durable
-    tombstone/mapping change so a retry can finish the clear coherently.
+    This internal host-adapter seam deliberately accepts only the 64-hex
+    digests produced by :func:`training_capture_identity_keys`; it never
+    accepts raw host, session, or namespace identifiers. ``remove_sidecars``
+    runs inside the durable transaction. A failure leaves both the mappings
+    and closed-session tombstones untouched so the caller can retry.
     """
-    _, session_key = training_capture_identity_keys(
-        host=host, session_id=session_id, namespace=namespace, require_turn=False,
-    )
+    if isinstance(session_keys, (str, bytes)):
+        raise ValueError("session_keys must be a bounded sequence")
+    normalized: list[str] = []
+    for value in session_keys:
+        key = _required_text(value, "session_key", max_bytes=64)
+        if re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            raise ValueError("session_key must be a 64-character lowercase SHA-256 digest")
+        if key not in normalized:
+            normalized.append(key)
+    if not normalized or len(normalized) > 8:
+        raise ValueError("session_keys must contain between 1 and 8 opaque digests")
     owns_tx = _begin(conn)
     try:
         now = now_iso()
         _expire_closed_training_sessions(conn, now)
+        placeholders = ",".join("?" for _ in normalized)
         keys = [str(row[0]) for row in conn.execute(
-            "SELECT correlation_key FROM training_capture_correlation WHERE session_key=?",
-            (session_key,),
+            "SELECT correlation_key FROM training_capture_correlation "
+            f"WHERE session_key IN ({placeholders})", normalized,
         ).fetchall()]
         if callable(remove_sidecars):
             remove_sidecars(tuple(keys))
-        conn.execute(
+        conn.executemany(
             "INSERT INTO training_capture_closed_session(session_key, cleared_at) VALUES (?, ?) "
             "ON CONFLICT(session_key) DO UPDATE SET cleared_at=excluded.cleared_at",
-            (session_key, now),
+            ((key, now) for key in normalized),
         )
         conn.execute(
-            "DELETE FROM training_capture_correlation WHERE session_key=?", (session_key,),
+            f"DELETE FROM training_capture_correlation WHERE session_key IN ({placeholders})", normalized,
         )
         _finish(conn, owns_tx)
         return keys
     except Exception:
         _rollback(conn, owns_tx)
         raise
+
+
+def clear_correlated_training_session(
+    conn: sqlite3.Connection, *, host: object, session_id: object,
+    namespace: object, remove_sidecars: Any | None = None,
+) -> list[str]:
+    """Tombstone one identity scope and remove its durable correlations."""
+    _, session_key = training_capture_identity_keys(
+        host=host, session_id=session_id, namespace=namespace, require_turn=False,
+    )
+    return _clear_training_capture_session_keys(
+        conn, session_keys=(session_key,), remove_sidecars=remove_sidecars,
+    )
 
 
 def assert_training_capture_replay_binding(
@@ -537,18 +598,22 @@ def assert_training_capture_replay_binding(
         # The compatibility column is always NULL.  Host task IDs are never a
         # persisted capture identity, including in hashed form.
         "host_task_id": lambda value: None,
-        "session_id": lambda value: _required_text(value, "session_id", max_bytes=512),
-        "namespace": lambda value: _required_text(value, "namespace", max_bytes=512),
+        "session_id": lambda value: (_required_text(value, "session_id", max_bytes=512)
+                                    if value is not None else None),
+        "namespace": lambda value: (_required_text(value, "namespace", max_bytes=512)
+                                    if value is not None else None),
         "cwd": _redacted_cwd,
         "prompt": lambda value: _redacted_bounded(value, "prompt", MAX_CAPTURE_TEXT_BYTES),
         "assistant_response": lambda value: _redacted_bounded(
             value, "assistant_response", MAX_CAPTURE_TEXT_BYTES
         ),
-        "consent_scope": lambda value: _required_text(value, "consent_scope", max_bytes=512),
-        "content_license": lambda value: _required_text(value, "content_license", max_bytes=512),
-        "redaction_policy_version": lambda value: _required_text(
+        "consent_scope": lambda value: (_required_text(value, "consent_scope", max_bytes=512)
+                                         if value is not None else None),
+        "content_license": lambda value: (_required_text(value, "content_license", max_bytes=512)
+                                           if value is not None else None),
+        "redaction_policy_version": lambda value: (_required_text(
             value, "redaction_policy_version", max_bytes=512
-        ),
+        ) if value is not None else None),
     }
     for field, normalize in normalizers.items():
         if field in identity and normalize(identity[field]) != capture[field]:
@@ -661,13 +726,36 @@ def start_training_capture(
     return _row_dict(_capture_row(conn, capture_id))
 
 
+def _correlated_start_replay_identity(kwargs: Mapping[str, object]) -> dict[str, object]:
+    """Normalize a correlated start exactly as ``start_training_capture`` does."""
+    scope, license_, policy, permitted = _content_governance(
+        kwargs.get("consent_scope"), kwargs.get("content_license"),
+        kwargs.get("redaction_policy_version"),
+    )
+    identity: dict[str, object] = {
+        "host": kwargs.get("host"), "host_task_id": None,
+        "redaction_status": "redacted" if permitted else "metadata_only",
+        "consent_scope": scope, "content_license": license_,
+        "redaction_policy_version": policy,
+    }
+    if permitted:
+        identity.update({key: kwargs.get(key) for key in (
+            "session_id", "namespace", "cwd", "prompt", "assistant_response",
+        )})
+    else:
+        identity.update({key: None for key in (
+            "session_id", "namespace", "cwd", "prompt", "assistant_response",
+        )})
+    return identity
+
+
 def append_training_capture_observation(
     conn: sqlite3.Connection, capture_id: str, *, observation_kind: str,
     payload: str | None = None, observed_at: str | None = None,
 ) -> dict[str, Any]:
     """Append a bounded redacted observation without changing capture state."""
     capture_id = _uuid(capture_id, "capture_id")
-    observation_kind = _required_text(observation_kind, "observation_kind", max_bytes=128)
+    observation_kind = _redacted_observation_kind(observation_kind)
     observed_at = _timestamp(observed_at, "observed_at")
     owns_tx = _begin(conn)
     try:
@@ -745,37 +833,24 @@ def record_training_delivery_snapshot(
         capture = _capture_row(conn, capture_id)
         if capture["revoked_at"] is not None:
             raise ValueError("training capture cannot receive a delivery snapshot in its current state")
-        try:
-            if capture["redaction_status"] == "redacted":
-                stored_rendered = _redacted_bounded(rendered, "rendered", MAX_CAPTURE_TEXT_BYTES)
-                stored_ops = _redacted_ops(effective_ops)
-                rendered_hash = hashlib.sha256((stored_rendered or "").encode("utf-8")).hexdigest()
-            else:
-                # Default-deny captures can record that a delivery occurred, but
-                # cannot retain any emitted content, token list, or content hash.
-                stored_rendered = stored_ops = rendered_hash = None
-        except TrainingCaptureInputRefusal as exc:
-            # Preserve the partial capture and commit a durable, non-exportable
-            # refusal marker.  The caller still receives the refusal so a hook can
-            # fail open without silently prefix-truncating the delivered ops.
-            ts = now_iso()
-            conn.execute(
-                "UPDATE training_capture SET quarantine_reason=?, updated_at=? "
-                "WHERE capture_id=? AND state='partial'",
-                (exc.reason, ts, capture_id),
-            )
-            _finish(conn, owns_tx)
-            raise
+        if capture["redaction_status"] == "redacted":
+            stored_rendered = _redacted_delivery_text(rendered)
+            stored_ops = _redacted_ops(effective_ops)
+            rendered_hash = hashlib.sha256((stored_rendered or "").encode("utf-8")).hexdigest()
+        else:
+            # Default-deny captures can record that a delivery occurred, but
+            # cannot retain any emitted content, token list, or content hash.
+            stored_rendered = stored_ops = rendered_hash = None
+        if delivery_snapshot_id is not None:
+            identified = conn.execute(
+                "SELECT capture_id FROM training_delivery_snapshot WHERE delivery_snapshot_id=?",
+                (delivery_snapshot_id,),
+            ).fetchone()
+            if identified is not None and identified["capture_id"] != capture_id:
+                raise TrainingCaptureConflict("delivery_snapshot_id belongs to another capture")
         existing = conn.execute(
             "SELECT * FROM training_delivery_snapshot WHERE capture_id=?", (capture_id,)
         ).fetchone()
-        if existing is None and delivery_snapshot_id is not None:
-            existing = conn.execute(
-                "SELECT * FROM training_delivery_snapshot WHERE delivery_snapshot_id=?",
-                (delivery_snapshot_id,),
-            ).fetchone()
-            if existing is not None and existing["capture_id"] != capture_id:
-                raise TrainingCaptureConflict("delivery_snapshot_id belongs to another capture")
         if existing is not None:
             expected = (stored_rendered, stored_ops, rendered_hash, transform_version)
             actual = (existing["rendered"], existing["effective_ops_json"],
@@ -804,6 +879,11 @@ def record_training_delivery_snapshot(
         if changed.rowcount != 1:
             raise TrainingCaptureConflict("training capture state changed during delivery")
         _finish(conn, owns_tx)
+    except TrainingCaptureInputRefusal as exc:
+        _rollback(conn, owns_tx)
+        if owns_tx:
+            mark_training_delivery_refusal(conn, capture_id, exc.reason)
+        raise
     except Exception:
         _rollback(conn, owns_tx)
         raise
@@ -817,6 +897,27 @@ def record_training_delivery_snapshot(
     return result
 
 
+def mark_training_delivery_refusal(
+    conn: sqlite3.Connection, capture_id: str, reason: str,
+) -> None:
+    """Durably mark a rejected delivery after its caller rolled back."""
+    capture_id = _uuid(capture_id, "capture_id")
+    reason = _required_text(reason, "reason", max_bytes=128)
+    owns_tx = _begin(conn)
+    try:
+        changed = conn.execute(
+            "UPDATE training_capture SET quarantine_reason=?, updated_at=? "
+            "WHERE capture_id=? AND state='partial'",
+            (reason, now_iso(), capture_id),
+        )
+        if changed.rowcount != 1:
+            raise TrainingCaptureConflict("training capture cannot be marked refused")
+        _finish(conn, owns_tx)
+    except Exception:
+        _rollback(conn, owns_tx)
+        raise
+
+
 def record_correlated_training_delivery_snapshot(
     conn: sqlite3.Connection, *, host: object, session_id: object,
     namespace: object, task_id: object, turn_id: object,
@@ -828,6 +929,7 @@ def record_correlated_training_delivery_snapshot(
         host=host, session_id=session_id, namespace=namespace,
         task_id=task_id, turn_id=turn_id,
     )
+    capture_id: str | None = None
     owns_tx = _begin(conn)
     try:
         now = now_iso()
@@ -842,6 +944,11 @@ def record_correlated_training_delivery_snapshot(
         )
         _finish(conn, owns_tx)
         return row
+    except TrainingCaptureInputRefusal as exc:
+        _rollback(conn, owns_tx)
+        if capture_id is not None:
+            mark_training_delivery_refusal(conn, capture_id, exc.reason)
+        raise
     except Exception:
         _rollback(conn, owns_tx)
         raise

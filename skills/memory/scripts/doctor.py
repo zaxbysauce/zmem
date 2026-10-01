@@ -495,7 +495,7 @@ def _check_training_capture_health(store_path: Path) -> dict:
 
         count(
             "illegal_state",
-            "SELECT count(*) FROM training_capture WHERE state NOT IN "
+            "SELECT count(*) FROM training_capture WHERE state IS NULL OR state NOT IN "
             "('partial', 'emitted_to_host', 'acknowledged', 'completed')",
         )
         count(
@@ -528,7 +528,7 @@ def _check_training_capture_health(store_path: Path) -> dict:
         count(
             "illegal_state_transition",
             "SELECT count(*) FROM training_capture c WHERE "
-            "(c.state IN ('emitted_to_host', 'acknowledged', 'completed') "
+            "c.state IS NULL OR (c.state IN ('emitted_to_host', 'acknowledged', 'completed') "
             "AND NOT EXISTS (SELECT 1 FROM training_delivery_snapshot s "
             "WHERE s.capture_id=c.capture_id)) "
             "OR (c.state IN ('acknowledged', 'completed') "
@@ -561,6 +561,8 @@ def _check_training_capture_health(store_path: Path) -> dict:
             for completion in completions:
                 try:
                     supplied = json.loads(completion["associated_memory_ids_json"])
+                    if not isinstance(supplied, list):
+                        raise ValueError("associated_memory_ids_json must be a list")
                     supplied_ids = sorted({str(value) for value in supplied})
                 except (TypeError, ValueError):
                     association_mismatch += 1
@@ -650,7 +652,7 @@ def _training_output_path(training_output: str | Path) -> Path:
     output = Path(training_output).expanduser()
     if not output.is_absolute():
         output = Path.cwd() / output
-    return Path(os.path.abspath(str(output)))
+    return Path(os.path.abspath(str(output))).resolve()
 
 
 def _training_staging_parent(

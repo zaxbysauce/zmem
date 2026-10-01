@@ -186,7 +186,7 @@ def bind_payload(
     bound["memory_ids"] = [source["memory_id"]]
     bound["session_id"] = source["session_id"]
     if include_context:
-        bound["context_fence"] = f"<zmem>\\n- {source['memory_id']}\\n</zmem>\\n"
+        bound["context_fence"] = f"<zmem>\n- {source['memory_id']}\n</zmem>\n"
     return bound
 
 
@@ -315,17 +315,25 @@ def assert_redacted_storage(temp_root: Path, raw_values: list[str]) -> None:
 def stop_at_missing_surface(
     result: subprocess.CompletedProcess[str], command: str, sentinel: str
 ) -> None:
-    surface_exists_or_exit(result, command, sentinel)
+    surface_exists_or_exit(result, command, sentinel, strict=True)
     assert result.returncode == 0, f"{command}: command failed\n{combined(result)}"
 
 
 def surface_exists_or_exit(
-    result: subprocess.CompletedProcess[str], command: str, sentinel: str
+    result: subprocess.CompletedProcess[str],
+    command: str,
+    sentinel: str,
+    *,
+    strict: bool = False,
 ) -> None:
     text = combined(result)
     if result.returncode == 2 and "invalid choice" in text and command in text:
         print(sentinel)
         raise SystemExit(1)
+    if strict and result.returncode != 0:
+        raise AssertionError(
+            f"{command} help probe failed unexpectedly (rc={result.returncode})\n{text}"
+        )
 
 
 def load_fixture(name: str) -> dict[str, Any] | list[dict[str, Any]]:

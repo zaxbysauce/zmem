@@ -102,6 +102,7 @@ const NEEDS_NAMESPACE = new Set([
     "convention-capture",
     "capture-correction",
     "precompact",
+    "session-end",
 ]);
 
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
@@ -293,11 +294,17 @@ function resolveNamespace(projectDir, opts = {}) {
         "print(json.dumps({'ns': _ns, 'remote': bool(_fb is None or _ns != _fb)}))";
     const candidates =
         process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    // The caller may be a time-bounded host hook.  The interpreter fallback
+    // must share one resolver allocation rather than consuming it once per
+    // candidate.
+    const resolveStarted = clock();
     for (const py of candidates) {
+        const remainingResolveMs = resolveMs - (clock() - resolveStarted);
+        if (remainingResolveMs <= 0) break;
         try {
             const out = execFileSync(py, ["-c", code, scriptsDir, projectDir], {
                 encoding: "utf8",
-                timeout: resolveMs,
+                timeout: Math.max(1, remainingResolveMs),
                 stdio: ["ignore", "pipe", "ignore"],
             }).trim();
             if (out) {
@@ -330,7 +337,7 @@ function resolveNamespace(projectDir, opts = {}) {
     }
     warnOnce(warn, "namespace_resolution_error",
         "zmem: namespace_resolution_error=1 (falling back to user:global)\n");
-    return "user:global";
+    return opts.requireResolved ? "" : "user:global";
 }
 
 // --- Launcher watchdog (issue #121) -------------------------------------------
@@ -794,6 +801,12 @@ function resolvePython(env = process.env, platform = process.platform,
         }
     }
     return candidates[0];
+}
+
+function resolveDetachedPython(env = process.env, platform = process.platform) {
+    const explicit = env && typeof env.ZMEM_PYTHON === "string" ? env.ZMEM_PYTHON.trim() : "";
+    if (explicit) return explicit;
+    return platform === "win32" ? "python" : "python3";
 }
 
 // --- Codex SessionEnd fast path (issue #189) -------------------------------
@@ -1302,13 +1315,16 @@ function runTrainingCapture(host, hookName, meta, env = process.env,
             ? options.now : elapsedProcessMs;
         const probe = options && typeof options.probe === "function"
             ? options.probe : execFileSync;
-        const python = resolvePython(env, process.platform, probe,
-            probeMs, clock);
         if (execFn === execFileSync && action !== "start") {
+            // Detached work is optional and must not synchronously probe an
+            // interpreter before the host receives its hook envelope.
+            const python = resolveDetachedPython(env);
             _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
                 spawnFn, python);
             return {};
         }
+        const python = resolvePython(env, process.platform, probe,
+            probeMs, clock);
         const remainingMs = Math.floor(
             allocationMs - (_trainingCaptureNow(options) - captureStartedAt)
         );
@@ -1360,7 +1376,7 @@ function snapshotTrainingDelivery(host, hookName, meta, env, payload,
 // hookName is optional (back-compat for direct callers/tests that don't care
 // about the namespace-skip): omitted/unrecognized names get the namespace
 // resolved (safe default — never SILENTLY skip for a hook that needs it).
-function buildCanonicalEnv(host, meta, hookName) {
+function buildCanonicalEnv(host, meta, hookName, options = {}) {
     const env = { ...process.env };
 
     const project =
@@ -1455,8 +1471,11 @@ function buildCanonicalEnv(host, meta, hookName) {
     // ~100ms cold-start) for hooks that actually consume ZMEM_NAMESPACE. An
     // unrecognized/omitted hookName resolves anyway (fail safe toward
     // correctness, not silently toward speed).
-    env.ZMEM_NAMESPACE =
-        !hookName || NEEDS_NAMESPACE.has(hookName) ? resolveNamespace(project) : "";
+    env.ZMEM_NAMESPACE = !hookName || NEEDS_NAMESPACE.has(hookName)
+        ? resolveNamespace(project, {
+            resolveMs: options.namespaceResolveMs,
+            requireResolved: options.requireResolvedNamespace === true,
+        }) : "";
     env.ZMEM_SKILLS_DIRS = skillsDirs;
     env.ZMEM_TIER0 = tier0;
     env.ZMEM_CTX_BUDGET = ctxBudget;
@@ -1878,13 +1897,13 @@ async function main() {
             } catch {
                 envelope = {};
             }
+            process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             try {
                 snapshotTrainingDelivery(
                     fireState.host || detectHost(), hookName,
                     fireState.meta || {}, fireState.env || process.env,
                     extractPayload(raw));
             } catch { /* capture is fail-open */ }
-            process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
             appendOuterTimeoutDecision(fireState.env || process.env, hookName, "launcher", {
                 tier0_emitted: hookName === "session-start" && extractPayload(raw) !== null,
                 timeout_ms: watchdogMs,
@@ -1946,6 +1965,26 @@ async function main() {
             outputEmitted = true;
             emitCodexSessionEndResult();
         };
+        // Capture clear uses the same namespace resolver as an ordinary
+        // session-end. If it cannot resolve within the remaining host budget,
+        // skip it rather than clearing an unrelated fallback namespace.
+        const beforeNamespace = elapsedProcessMs();
+        const namespaceBudget = Number.isFinite(beforeNamespace)
+            ? Math.max(0, CODEX_SESSION_END_TARGET_MS - beforeNamespace
+                - CODEX_SESSION_END_OUTPUT_MARGIN_MS) : 0;
+        let captureEnv = null;
+        if (namespaceBudget > 0) {
+            const candidate = buildCanonicalEnv(host, meta, hookName, {
+                namespaceResolveMs: Math.min(DEFAULT_NAMESPACE_RESOLVE_MS, namespaceBudget),
+                requireResolvedNamespace: true,
+            });
+            if (candidate.ZMEM_NAMESPACE) captureEnv = candidate;
+        }
+        if (captureEnv) {
+            runTrainingCapture(host, hookName, meta, captureEnv, "clear", {},
+                execFileSync, spawn, { deadline: CODEX_SESSION_END_TARGET_MS,
+                    now: elapsedProcessMs });
+        }
         const fastPath = await runCodexSessionEndFastPath(meta, { onTimeout: emit });
         if (fastPath.reason === "no-budget") {
             process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
@@ -2149,6 +2188,7 @@ module.exports = {
     failureSignals,
     safeJsonStringify,
     resolvePython,
+    resolveDetachedPython,
     codexSessionEndId,
     codexSessionEndEnv,
     runCodexSessionEndFastPath,

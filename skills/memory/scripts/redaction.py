@@ -47,16 +47,25 @@ def redact_secret_like_text(text: str) -> tuple[str, int]:
 
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _WINDOWS_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/]|\\\\)[^\s\"'<>]+"
+    r'''(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/][^\s"'<>]+|\\\\[^\s\\"'<>]+\\[^\s\\"'<>]+(?:\\[^\s"'<>]+)*)'''
 )
+_POSIX_ROOTS = r"Users|home|private|tmp|var|workspaces|workspace|mnt|opt|root"
 _POSIX_PATH_RE = re.compile(
-    r"(?<!:)(?<![A-Za-z0-9])/(?:Users|home|private|tmp|var|workspace|workspaces|mnt|opt|root)(?:/[^\s\"'<>]+)*"
+    rf'''(?<![A-Za-z0-9/:])/(?:{_POSIX_ROOTS})(?=/|\s|"|'|<|>|$)(?:/[^\s"'<>]+)*'''
+)
+_QUOTED_PATH_RE = re.compile(
+    rf'''(?P<quote>["'])(?P<path>(?:[A-Za-z]:[\\/][^\r\n"']+|\\\\[^\s\\"']+\\[^\\\r\n"']+(?:\\[^\r\n"']+)*|/(?:{_POSIX_ROOTS})(?=/|\s|"|'|<|>|$)[^\r\n"']*))(?P=quote)'''
 )
 
 
 def redact_training_text(value: str) -> tuple[str, int]:
     """Apply secret, email, and filesystem path redaction for training data."""
     redacted, count = redact_secret_like_text(value)
+    def replace_quoted(match: re.Match[str]) -> str:
+        return f"{match.group('quote')}[REDACTED_PATH]{match.group('quote')}"
+
+    redacted, changed = _QUOTED_PATH_RE.subn(replace_quoted, redacted)
+    count += changed
     for pattern, replacement in (
         (_EMAIL_RE, "[REDACTED_EMAIL]"),
         (_WINDOWS_PATH_RE, "[REDACTED_PATH]"),

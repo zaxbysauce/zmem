@@ -43,7 +43,7 @@ def main() -> None:
                 "project_key": "quarantine",
                 "prompt": f"Use {secret} only for this verified action.",
                 "assistant_response": f"Verified; secret={secret}",
-                "context_fence": f"<zmem>\\n- {source['memory_id']}\\nsecret={secret}\\n</zmem>\\n",
+                "context_fence": f"<zmem>\n- {source['memory_id']}\nsecret={secret}\n</zmem>\n",
                 "ops_tokens": ["pytest", secret],
             }
         )
@@ -90,9 +90,10 @@ def main() -> None:
         event_paths = [
             path
             for path in quarantine.rglob("*")
-            if path.is_file() and path.name != "quarantine-manifest.json"
+            if path.is_file()
         ]
         assert event_paths
+        assert len(event_paths) == len(event_ids), (len(event_paths), len(event_ids))
         for path in event_paths:
             assert len(path.read_bytes()) <= 400
             text = path.read_text(encoding="utf-8")

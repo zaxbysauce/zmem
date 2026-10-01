@@ -105,7 +105,10 @@ def _insert_fixture(conn: sqlite3.Connection, cases: dict[str, Any]) -> None:
             (
                 delivery["delivery_snapshot_id"], delivery["capture_id"],
                 delivery["rendered"], json.dumps(delivery["ops"], separators=(",", ":")),
-                delivery.get("rendered_hash", delivery["delivery_snapshot_id"]),
+                delivery.get(
+                    "rendered_hash",
+                    hashlib.sha256(delivery["rendered"].encode("utf-8")).hexdigest(),
+                ),
                 delivery.get("transform_version", "fixture-transform"),
                 delivery.get("emitted_at", "2026-01-01T00:00:00Z"),
             ),
@@ -182,8 +185,14 @@ def load_cases() -> dict[str, Any]:
 def generate(output: Path) -> None:
     cases = load_cases()
     output.mkdir(parents=True, exist_ok=True)
-    old_profile = os.environ.get("ZMEM_EMBED_PROFILE")
-    os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+    pinned_env = {
+        "ZMEM_EMBED_PROFILE": "fake",
+        "ZMEM_INJECT_FLOOR_TRUST": "0.2",
+        "ZMEM_DEDUP_THRESHOLD": "0.85",
+        "ZMEM_TRAINING_MAX_ROWS": "10000",
+    }
+    old_env = {key: os.environ.get(key) for key in pinned_env}
+    os.environ.update(pinned_env)
     try:
         with tempfile.TemporaryDirectory(prefix="training-fixture-") as tmp:
             conn = sqlite3.connect(":memory:")
@@ -212,10 +221,11 @@ def generate(output: Path) -> None:
             finally:
                 conn.close()
     finally:
-        if old_profile is None:
-            os.environ.pop("ZMEM_EMBED_PROFILE", None)
-        else:
-            os.environ["ZMEM_EMBED_PROFILE"] = old_profile
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def main() -> int:

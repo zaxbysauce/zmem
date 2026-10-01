@@ -15,6 +15,7 @@ const path = require("path");
 const [repo, projectDir, expectedNamespace, mode] = process.argv.slice(2);
 const HELPER_DEADLINE_MS = 32000;
 const CLEANUP_RESERVE_MS = 12000;
+const ORGANIZER_MAX_WAIT_MS = HELPER_DEADLINE_MS + CLEANUP_RESERVE_MS + 1000;
 const START_WAIT_MS = 12000;
 const CLOSE_WAIT_MS = 10000;
 const MUTANT_OBSERVE_MS = 1200;
@@ -64,6 +65,8 @@ const summary = {
     launcher_exit_code: null,
     launcher_close_signal: null,
     cleanup_worker_survived: false,
+    organizer_timed_out: false,
+    real_python_path: "",
     schema_before: "",
     schema_after: "",
     mutant_falsified: false,
@@ -221,13 +224,19 @@ except ValueError:
     _at = -1
 if _at >= 0 and _at + 1 < len(_argv) and _argv[_at + 1] == _target:
     with open(os.environ["ZMEM_TEST_ORGANIZER_PID"], "w", encoding="utf-8") as _f:
-        _f.write(str(os.getpid()) + "\\n")
+        _f.write(str(os.getpid()))
     with open(os.environ["ZMEM_TEST_ORGANIZER_STARTED"], "w", encoding="utf-8") as _f:
-        _f.write("organizer-started\\n")
-    while not os.path.exists(os.environ["ZMEM_TEST_ORGANIZER_RELEASE"]):
+        _f.write("organizer-started")
+    _deadline = time.monotonic() + (float(os.environ["ZMEM_TEST_ORGANIZER_MAX_WAIT_MS"]) / 1000.0)
+    while (not os.path.exists(os.environ["ZMEM_TEST_ORGANIZER_RELEASE"])
+           and time.monotonic() < _deadline):
         time.sleep(0.025)
+    if not os.path.exists(os.environ["ZMEM_TEST_ORGANIZER_RELEASE"]):
+        with open(os.environ["ZMEM_TEST_ORGANIZER_TIMEOUT"], "w", encoding="utf-8") as _f:
+            _f.write("organizer-timeout")
+        raise SystemExit(0)
     with open(os.environ["ZMEM_TEST_ORGANIZER_FINISHED"], "w", encoding="utf-8") as _f:
-        _f.write("organizer-finished\\n")
+        _f.write("organizer-finished")
     time.sleep = lambda _seconds: None
     subprocess.call = lambda *_args, **_kwargs: 0
 `;
@@ -259,6 +268,10 @@ function readDelivery() {
 
 async function main() {
     realPython = findPython();
+    summary.real_python_path = realPython;
+    if (!path.isAbsolute(realPython)) {
+        throw new Error("resolved interpreter is not absolute: " + realPython);
+    }
     work = fs.mkdtempSync(path.join(os.tmpdir(), "zmem-maintenance-" + mode + "-"));
     const fixtureRoot = path.join(work, "plugin");
     const shimDir = path.join(work, "python-shim");
@@ -268,6 +281,7 @@ async function main() {
     releasePath = path.join(work, "organizer-release");
     finishedPath = path.join(work, "organizer-finished");
     pidPath = path.join(work, "organizer-pid");
+    const timeoutPath = path.join(work, "organizer-timeout");
     summary.data_dir = dataDir;
     summary.store_path = storePath;
 
@@ -314,6 +328,8 @@ async function main() {
         ZMEM_TEST_ORGANIZER_STARTED: startedPath,
         ZMEM_TEST_ORGANIZER_RELEASE: releasePath,
         ZMEM_TEST_ORGANIZER_FINISHED: finishedPath,
+        ZMEM_TEST_ORGANIZER_MAX_WAIT_MS: String(ORGANIZER_MAX_WAIT_MS),
+        ZMEM_TEST_ORGANIZER_TIMEOUT: timeoutPath,
     });
     summary.seed_namespace = resolveFixtureNamespace(fixtureRoot, baseEnv);
     summary.seed_namespace_matches_project = summary.seed_namespace === expectedNamespace;
@@ -391,16 +407,19 @@ async function main() {
         summary.seeded_context_present && !summary.outer_timeout;
     const workerPid = ownedWorkerPid();
     summary.organizer_exited = !!workerPid && await waitForOwnedExit(workerPid, Math.min(2000, remainingMs(2000)));
+    summary.organizer_timed_out = fs.existsSync(timeoutPath);
     summary.schema_after = schemaVersion(storePath, baseEnv);
 
     if (mode === "real") {
         if (!summary.organizer_started || !summary.delivery_before_release || !summary.organizer_finished ||
+            summary.organizer_timed_out ||
             !summary.organizer_exited || summary.launcher_exit_code !== 0 ||
             summary.schema_before !== summary.schema_after) {
             throw new Error("real fixture did not prove detached maintenance before valid delivery");
         }
     } else {
-        summary.mutant_falsified = summary.organizer_started && summary.mutant_changed_one_ampersand &&
+        summary.mutant_falsified = summary.organizer_started && !summary.organizer_timed_out &&
+            summary.mutant_changed_one_ampersand &&
             !summary.launcher_closed_before_release && !summary.delivery_before_release &&
             summary.organizer_finished && summary.organizer_exited && summary.delivery_after_release;
         if (!summary.mutant_falsified) throw new Error("foreground mutant did not block valid delivery until the owned release");

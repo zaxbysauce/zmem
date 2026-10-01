@@ -2442,6 +2442,20 @@ class ZmemMemoryProvider(MemoryProvider):
                 prompt_digest = ticket.get("prompt_digest")
                 capture_key = str(ticket.get("capture_key") or "")
                 envelope = ticket.get("envelope")
+                if not task_id:
+                    _run_training_capture("start_standalone", {
+                        "host": "hermes",
+                        "hook_name": "sync_turn",
+                        "session_id": sid,
+                        "namespace": namespace,
+                        "capture_key": str(uuid.uuid4()),
+                        "cwd": os.getcwd(),
+                        "prompt": user_content if isinstance(user_content, str) else "",
+                        "assistant_response": (
+                            assistant_content if isinstance(assistant_content, str) else ""
+                        ),
+                    })
+                    return None
                 started = _run_training_capture("start", {
                     "host": "hermes",
                     "hook_name": "sync_turn",

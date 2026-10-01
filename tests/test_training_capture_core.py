@@ -15,36 +15,54 @@ from unittest.mock import patch
 
 
 # Keep all package resolution and any accidental schema path lookup isolated
-# before importing storelib.  These tests use in-memory connections, but the
+# before importing storelib. These tests use in-memory connections, but the
 # import itself binds STORE_PATH for the process.
 _SCRIPT_DIR = Path(__file__).resolve().parents[1] / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(_SCRIPT_DIR))
-os.environ["ZMEM_STORE"] = str(Path(__file__).resolve().parent / ".training-capture-test.sqlite")
+_IMPORT_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_EMBED_PROFILE", "ZMEM_MODEL_AUTODOWNLOAD")
+_IMPORT_ENV = {key: os.environ.get(key) for key in _IMPORT_KEYS}
+_IMPORT_TMP = tempfile.TemporaryDirectory(prefix="zmem-training-core-import-")
+_IMPORT_ROOT = Path(_IMPORT_TMP.name)
+os.environ.update({
+    "ZMEM_STORE": str(_IMPORT_ROOT / "store.sqlite"),
+    "ZMEM_DATA": str(_IMPORT_ROOT / "data"),
+    "ZMEM_EMBED_PROFILE": "fake",
+    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+})
 
-from storelib.evidence import write_evidence  # noqa: E402
-from storelib.schema import SUPPORTED_SCHEMA_VERSION, init_db, migrate  # noqa: E402
-from storelib.training_capture import (  # noqa: E402
-    MAX_EVENT_IDS,
-    MAX_OBSERVATION_BYTES,
-    MAX_OBSERVATIONS_PER_CAPTURE,
-    TrainingCaptureConflict,
-    TrainingCaptureInputRefusal,
-    acknowledge_training_delivery,
-    append_correlated_training_capture_observation,
-    append_training_capture_observation,
-    assert_training_capture_replay_binding,
-    clear_correlated_training_session,
-    complete_training_capture,
-    purge_expired_training_captures,
-    record_training_delivery_snapshot,
-    record_correlated_training_delivery_snapshot,
-    review_training_capture,
-    revoke_training_capture,
-    start_training_capture,
-    start_correlated_training_capture,
-    training_capture_identity_keys,
-)
-from storelib.write import update_memory  # noqa: E402
+try:
+    from storelib.evidence import write_evidence  # noqa: E402
+    from storelib.schema import SUPPORTED_SCHEMA_VERSION, init_db, migrate  # noqa: E402
+    from storelib.training_capture import (  # noqa: E402
+        MAX_EVENT_IDS,
+        MAX_OBSERVATION_BYTES,
+        MAX_OBSERVATIONS_PER_CAPTURE,
+        TrainingCaptureConflict,
+        TrainingCaptureInputRefusal,
+        acknowledge_training_delivery,
+        append_correlated_training_capture_observation,
+        append_training_capture_observation,
+        assert_training_capture_replay_binding,
+        _clear_training_capture_session_keys,
+        clear_correlated_training_session,
+        complete_training_capture,
+        purge_expired_training_captures,
+        record_training_delivery_snapshot,
+        record_correlated_training_delivery_snapshot,
+        review_training_capture,
+        revoke_training_capture,
+        start_training_capture,
+        start_correlated_training_capture,
+        training_capture_identity_keys,
+    )
+    from storelib.write import update_memory  # noqa: E402
+finally:
+    for _key, _value in _IMPORT_ENV.items():
+        if _value is None:
+            os.environ.pop(_key, None)
+        else:
+            os.environ[_key] = _value
+    _IMPORT_TMP.cleanup()
 
 
 class TrainingCaptureCoreTest(unittest.TestCase):
@@ -176,6 +194,9 @@ class TrainingCaptureCoreTest(unittest.TestCase):
 
     def test_correction_closeout_requires_reviewer_correction_evidence(self) -> None:
         capture_id, _ = self._acknowledged_capture()
+        # Inline reviewer fields are rejected before the correction-evidence
+        # contract, so prove that the correction branch itself admits only
+        # correction evidence and remains separately review-gated.
         with self.assertRaisesRegex(ValueError, "separate local review"):
             complete_training_capture(
                 self.conn, capture_id, evidence_id=self._evidence(),
@@ -185,13 +206,62 @@ class TrainingCaptureCoreTest(unittest.TestCase):
                 reviewer_id="reviewer", reviewer_confirmed=True,
                 correction_closeout=True,
             )
+        with self.assertRaisesRegex(ValueError, "evidence kind"):
+            complete_training_capture(
+                self.conn, capture_id, evidence_id=self._evidence(kind="test_result"),
+                memory_ids=[self.memory_one], verifier_id="trusted-test",
+                outcome_kind="reviewer_acceptance", outcome_value="accepted",
+                export_consent_scope="export-local", export_content_license="licensed",
+                correction_closeout=True,
+            )
+        completion = complete_training_capture(
+            self.conn, capture_id, evidence_id=self._evidence(kind="correction"),
+            memory_ids=[self.memory_one], verifier_id="trusted-test",
+            outcome_kind="reviewer_acceptance", outcome_value="accepted",
+            export_consent_scope="export-local", export_content_license="licensed",
+            correction_closeout=True,
+        )
+        self.assertEqual(completion["correction_closeout"], 1)
         self.assertEqual(
             self.conn.execute(
                 "SELECT state FROM training_capture WHERE capture_id=?",
                 (capture_id,),
             ).fetchone()[0],
-            "acknowledged",
+            "completed",
         )
+
+    def test_internal_opaque_session_clear_tombstones_each_validated_key(self) -> None:
+        first = start_correlated_training_capture(
+            self.conn, host="test", session_id=self.session_id, namespace=self.namespace,
+            task_id="task-one", turn_id="turn-one", prompt="prompt", assistant_response="response",
+            consent_scope="local", content_license="licensed", redaction_policy_version="v1",
+        )
+        second_namespace = "project:second"
+        second = start_correlated_training_capture(
+            self.conn, host="test", session_id=self.session_id, namespace=second_namespace,
+            task_id="task-two", turn_id="turn-two", prompt="prompt", assistant_response="response",
+            consent_scope="local", content_license="licensed", redaction_policy_version="v1",
+        )
+        _, first_key = training_capture_identity_keys(
+            host="test", session_id=self.session_id, namespace=self.namespace, require_turn=False,
+        )
+        _, second_key = training_capture_identity_keys(
+            host="test", session_id=self.session_id, namespace=second_namespace, require_turn=False,
+        )
+        removed = _clear_training_capture_session_keys(
+            self.conn, session_keys=(first_key, second_key),
+        )
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM training_capture_correlation"
+        ).fetchone()[0], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM training_capture_closed_session"
+        ).fetchone()[0], 2)
+        for capture in (first, second):
+            self.assertIsNotNone(capture["capture_id"])
+        with self.assertRaisesRegex(ValueError, "64-character lowercase"):
+            _clear_training_capture_session_keys(self.conn, session_keys=("project:raw",))
 
     def test_reviewer_acceptance_requires_distinct_allowlisted_review_transition(self) -> None:
         capture_id, _ = self._acknowledged_capture()
@@ -416,6 +486,87 @@ class TrainingCaptureCoreTest(unittest.TestCase):
                 self.conn, capture_id, rendered="changed", effective_ops=[],
                 delivery_snapshot_id=snapshot_id,
             )
+
+    def test_correlated_start_replay_requires_canonical_immutable_fields(self) -> None:
+        fields = {
+            "host": "test", "session_id": self.session_id, "namespace": self.namespace,
+            "task_id": "task-replay", "turn_id": "turn-replay", "prompt": "first prompt",
+            "assistant_response": "first response", "consent_scope": "local",
+            "content_license": "licensed", "redaction_policy_version": "v1",
+        }
+        first = start_correlated_training_capture(self.conn, **fields)
+        self.assertEqual(
+            start_correlated_training_capture(self.conn, **fields)["capture_id"],
+            first["capture_id"],
+        )
+        changed = dict(fields)
+        changed["prompt"] = "changed prompt"
+        with self.assertRaisesRegex(TrainingCaptureConflict, "conflicting training capture replay"):
+            start_correlated_training_capture(self.conn, **changed)
+        changed = dict(fields)
+        changed["consent_scope"] = "changed-governance"
+        with self.assertRaisesRegex(TrainingCaptureConflict, "conflicting training capture replay"):
+            start_correlated_training_capture(self.conn, **changed)
+
+    def test_supplied_snapshot_id_cannot_cross_capture_after_a_snapshot_exists(self) -> None:
+        first = start_training_capture(
+            self.conn, host="test", session_id=self.session_id, namespace=self.namespace,
+            prompt="first", assistant_response="response", consent_scope="local",
+            content_license="licensed", redaction_policy_version="v1",
+        )
+        second = start_training_capture(
+            self.conn, host="test", session_id=self.session_id, namespace=self.namespace,
+            prompt="second", assistant_response="response", consent_scope="local",
+            content_license="licensed", redaction_policy_version="v1",
+        )
+        snapshot_id = str(uuid.uuid4())
+        record_training_delivery_snapshot(
+            self.conn, first["capture_id"], rendered="first rendered", effective_ops=[],
+            delivery_snapshot_id=snapshot_id,
+        )
+        with self.assertRaisesRegex(TrainingCaptureConflict, "belongs to another capture"):
+            record_training_delivery_snapshot(
+                self.conn, second["capture_id"], rendered="second rendered", effective_ops=[],
+                delivery_snapshot_id=snapshot_id,
+            )
+
+    def test_rendered_delivery_limits_refuse_without_prefix_persistence(self) -> None:
+        for size in (16_001, 65_537):
+            with self.subTest(size=size):
+                rendered = ("bounded rendered " * ((size // 17) + 1))[:size]
+                capture = start_training_capture(
+                    self.conn, host="test", session_id=self.session_id, namespace=self.namespace,
+                    prompt="prompt", assistant_response="response", consent_scope="local",
+                    content_license="licensed", redaction_policy_version="v1",
+                )
+                with self.assertRaisesRegex(TrainingCaptureInputRefusal, "rendered_over_limit"):
+                    record_training_delivery_snapshot(
+                        self.conn, capture["capture_id"], rendered=rendered, effective_ops=[],
+                    )
+                self.assertIsNone(self.conn.execute(
+                    "SELECT 1 FROM training_delivery_snapshot WHERE capture_id=?", (capture["capture_id"],),
+                ).fetchone())
+                self.assertEqual(self.conn.execute(
+                    "SELECT quarantine_reason FROM training_capture WHERE capture_id=?", (capture["capture_id"],),
+                ).fetchone()[0], "rendered_over_limit")
+
+    def test_observation_label_is_redacted_before_persistence(self) -> None:
+        capture = start_training_capture(
+            self.conn, host="test", session_id=self.session_id, namespace=self.namespace,
+            prompt="prompt", assistant_response="response", consent_scope="local",
+            content_license="licensed", redaction_policy_version="v1",
+        )
+        observation = append_training_capture_observation(
+            self.conn, capture["capture_id"],
+            observation_kind="email alice@example.com at /home/" + "alice/private.txt",
+            payload="{}",
+        )
+        stored_kind = self.conn.execute(
+            "SELECT observation_kind FROM training_capture_observation WHERE observation_id=?",
+            (observation["observation_id"],),
+        ).fetchone()[0]
+        self.assertNotIn("alice@example.com", stored_kind)
+        self.assertNotIn("private.txt", stored_kind)
 
     def test_conflicting_capture_replay_binding_is_rejected_without_mutation(self) -> None:
         capture_id, _ = self._acknowledged_capture()
@@ -763,6 +914,51 @@ class TrainingCaptureCoreTest(unittest.TestCase):
                     self.assertNotIn(raw_value, value)
 
         assert_clean(json.loads(stored))
+
+    def test_training_observation_canonicalizes_task_turn_aliases_without_rehashing(self) -> None:
+        capture = start_training_capture(
+            self.conn, host="test", session_id=self.session_id,
+            namespace=self.namespace, consent_scope="local",
+            content_license="licensed", redaction_policy_version="v1",
+        )
+        raw_values = {
+            "task_id": "task-snake-secret",
+            "taskId": "task-camel-secret",
+            "turn_id": "turn-snake-secret",
+            "turnId": "turn-camel-secret",
+        }
+        fixture = {
+            **raw_values,
+            "nested": {"task_id": raw_values["task_id"], "turnId": raw_values["turnId"]},
+            "nonstrings": {"task_id": 7, "taskId": None, "turn_id": {"raw": "value"}},
+        }
+        first = append_training_capture_observation(
+            self.conn, capture["capture_id"], observation_kind="identity",
+            payload=json.dumps(fixture),
+        )
+        stored = self.conn.execute(
+            "SELECT payload FROM training_capture_observation WHERE observation_id=?",
+            (first["observation_id"],),
+        ).fetchone()[0]
+        canonical = json.loads(stored)
+        for key, raw in raw_values.items():
+            self.assertNotIn(raw, stored)
+            self.assertEqual(
+                canonical[key],
+                "opaque:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32],
+            )
+        self.assertNotIn("task_id", canonical["nonstrings"])
+        self.assertNotIn("taskId", canonical["nonstrings"])
+        self.assertNotIn("turn_id", canonical["nonstrings"])
+
+        replay = append_training_capture_observation(
+            self.conn, capture["capture_id"], observation_kind="identity", payload=stored,
+        )
+        replayed = self.conn.execute(
+            "SELECT payload FROM training_capture_observation WHERE observation_id=?",
+            (replay["observation_id"],),
+        ).fetchone()[0]
+        self.assertEqual(json.loads(replayed), canonical)
 
     def test_training_observations_bound_count_and_event_ids(self) -> None:
         capture = start_training_capture(

@@ -27,6 +27,7 @@ SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from storelib.write import redact_text  # noqa: E402
+from redaction import redact_training_text  # noqa: E402
 
 SECRET = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
 
@@ -93,6 +94,37 @@ class RedactTextHelperTest(unittest.TestCase):
         redacted, count = redact_text(text)
         self.assertEqual(redacted, text)
         self.assertEqual(count, 0)
+
+    def test_training_redaction_consumes_quoted_path_corpus(self):
+        cases = (
+            r"\\server\share\alice\secret.txt",
+            r'"\\server\share name\alice folder\secret.txt"',
+            r'"C:\Users' + r'\Alice Smith\secret.txt"',
+            r"'/home/" + r"alice/private project/secret.txt'",
+            r'"\\server\share\multiple\segments\secret.txt"',
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                redacted, count = redact_training_text(value)
+                self.assertNotIn("secret.txt", redacted)
+                self.assertIn("[REDACTED_PATH]", redacted)
+                self.assertEqual(count, 1)
+
+    def test_training_path_corpus_preserves_urls_and_non_paths(self):
+        cases = (
+            (r'"/Users/' + r'alice/private work/secret.txt"', True),
+            (r'/workspaces/alice/secret.txt', True),
+            (r'https://home.example.com/path', False),
+            (r'https://example.test/' + r'Users/alice', False),
+            (r'\\n ordinary escape text', False),
+            (r'print("\\n")', False),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                redacted, count = redact_training_text(value)
+                self.assertEqual(count > 0, expected)
+                if expected:
+                    self.assertNotIn("secret.txt", redacted)
 
 
 class WritePathRedactionTest(unittest.TestCase):

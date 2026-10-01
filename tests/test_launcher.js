@@ -832,8 +832,8 @@ console.log("\n[7] Phase 5: reflect (Stop) + capture-failure (PostToolUseFailure
 }
 
 // Issue #242: the causal fixture owns the asynchronous worker lifecycle.  This
-// runner keeps the ordinary launcher suite synchronous and executes its green
-// proof only; the foreground mutant is invoked directly during review.
+// runner keeps the ordinary launcher suite synchronous and executes both the
+// green proof and the foreground mutant falsification in CI.
 function runMaintenanceCausalFixture(mode, projectDir, namespace) {
     const helperPath = path.join(REPO, "tests", "fixtures", "launcher", "maintenance-causal.js");
     const result = spawnSync(process.execPath,
@@ -863,6 +863,9 @@ console.log("\n[8] SessionStart maintenance is detached before Tier-2 delivery")
         JSON.stringify(report));
     ok("maintenance causal fixture: seed namespace matches the real project resolver",
         !!(report && report.seed_namespace_matches_project), JSON.stringify(report));
+    ok("maintenance causal fixture: resolves an absolute interpreter before shim creation",
+        !!(report && report.real_python_path && path.isAbsolute(report.real_python_path)),
+        JSON.stringify(report));
     ok("maintenance causal fixture: maintenance started before release",
         !!(report && report.organizer_started), JSON.stringify(report));
     ok("maintenance causal fixture: valid seeded delivery closes before release",
@@ -873,6 +876,16 @@ console.log("\n[8] SessionStart maintenance is detached before Tier-2 delivery")
         !!(report && report.organizer_finished && report.schema_before &&
             report.organizer_exited && report.launcher_exit_code === 0 &&
             report.schema_before === report.schema_after), JSON.stringify(report));
+}
+
+{
+    const { result, report } = runMaintenanceCausalFixture("mutant", PROJ, NS);
+    ok("maintenance causal mutant: helper completed", result.status === 0,
+        (result.error && result.error.message) || String(result.stderr || "").slice(-400));
+    ok("maintenance causal mutant: changed exactly the background ampersand",
+        !!(report && report.mutant_changed_one_ampersand), JSON.stringify(report));
+    ok("maintenance causal mutant: foreground worker falsified detached proof",
+        !!(report && report.mutant_falsified), JSON.stringify(report));
 }
 
 console.log("\n[9] Phase 7: subagent-recall (SubagentStart) + subagent-reflect (SubagentStop)");

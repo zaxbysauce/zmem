@@ -266,6 +266,18 @@ INJECT_FLOOR_ENT_DEFAULT = 0.5
 # edges clear it by construction; a curated sub-threshold edge measures below.
 INJECT_FLOOR_GRAPH_DEFAULT = 0.75
 
+# user:global tier floor (issue #235): on gated passive moments (pretool and
+# subagent — hooks' posttoolbatch maps to pretool store-side) a global-tier
+# injection candidate whose MAX measured lane sits below this floor is
+# withheld and its slot returns empty rather than being backfilled. The
+# generic per-lane floors above judge EVERY tier; a generic-token-overlap
+# global row can clear the 0.30 lex floor while being irrelevant to the
+# operation, so the reserved global slot gets its own, higher bar. A global
+# candidate with NO measured lane (query-less recent pulls) keeps the
+# relevance gate's not-measured exemption — never withheld by this floor.
+# 0.0 disables (relevance values are >= 0, so nothing is ever below it).
+INJECT_FLOOR_USER_GLOBAL_DEFAULT = 0.5
+
 # Trust floor (issue #115, Workstream C-4): the v11 contradiction ledger
 # (links.py adjust_trust: one distinct `contradicts` event = -0.10, clamped
 # to [0.0, 1.0]) was invisible at recall — a row contradicted ten times kept
@@ -304,6 +316,7 @@ INJECT_FLOOR_COS_ENV = "ZMEM_INJECT_FLOOR_COS"
 INJECT_FLOOR_ENT_ENV = "ZMEM_INJECT_FLOOR_ENT"
 INJECT_FLOOR_GRAPH_ENV = "ZMEM_INJECT_FLOOR_GRAPH"
 INJECT_FLOOR_TRUST_ENV = "ZMEM_INJECT_FLOOR_TRUST"
+INJECT_FLOOR_USER_GLOBAL_ENV = "ZMEM_INJECT_FLOOR_USER_GLOBAL"
 
 # Closed reason set for silent inject decisions (issue #87 / #85 direction 1).
 # When a passive surface (--no-bump) injects nothing, it names WHICH gate fired

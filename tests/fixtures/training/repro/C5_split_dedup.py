@@ -41,7 +41,9 @@ def main() -> None:
             )
             payload = bind_payload(dict(raw_payload), source)
             # The first two are exact duplicates. The third shares the same
-            # lineage group but has distinct redacted event text.
+            # lineage group but has distinct redacted event text. The other
+            # project is deliberately given the same event text as the first
+            # row so global deduplication would incorrectly delete it.
             if index < 3:
                 payload["task_id"] = "task-135-split-group"
                 payload["project_key"] = "split-same"
@@ -50,6 +52,10 @@ def main() -> None:
             else:
                 payload["task_id"] = "task-135-split-other"
                 payload["project_key"] = "split-other"
+                payload["prompt"] = payloads[0]["prompt"]
+                payload["assistant_response"] = payloads[0]["assistant_response"]
+                payload["outcome_kind"] = payloads[0]["outcome_kind"]
+                payload["outcome_value"] = payloads[0]["outcome_value"]
             payload["delivery_snapshot_id"] = f"00000000-0000-4000-8000-00000000052{index}"
             payload["ops_tokens"] = ["pytest"]
             sources.append(source)
@@ -89,10 +95,20 @@ def main() -> None:
         same_group = max(project_groups.values(), key=len)
         other_group = min(project_groups.values(), key=len)
         assert same_group and other_group
-        # Dedup is lineage scoped.  The other project has deliberately
-        # distinct event text and must survive even if its source memory is
-        # otherwise similar.
+        # Dedup is lineage scoped.  The other project has identical event text
+        # but must survive because its source lineage is independent.
         assert len(other_group) == 1, other_group
+        assert (
+            other_group[0]["prompt"],
+            other_group[0]["assistant_response"],
+            other_group[0]["outcome_kind"],
+            other_group[0]["outcome_value"],
+        ) == (
+            payloads[0]["prompt"],
+            payloads[0]["assistant_response"],
+            payloads[0]["outcome_kind"],
+            payloads[0]["outcome_value"],
+        )
         assert len({row["split_key"] for row in same_group}) == 1
         assert len({row["split_key"] for row in other_group}) == 1
         assert same_group[0]["split_key"] in {"train", "validation", "test"}

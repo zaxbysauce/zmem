@@ -273,6 +273,7 @@ constants live in `schema_meta.py`.
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
 | `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
 | `INJECT_FLOOR_TRUST_DEFAULT` | 0.2 | `ZMEM_INJECT_FLOOR_TRUST` | Selective-inject gate (issue #115). Hard floor on `trust_score`: a row the contradiction ledger has driven below 0.2 (nine or more distinct `contradict` events) can no longer ride the passive lane; `compute_score` also multiplies every composite by `trust_score` (identity at the default 1.0, so uncontradicted rankings do not move — explicit recall/search keep retrieving the row, just ranked lower). When E-5 (#124) starts recording violations automatically, they must feed THIS ledger via trust deltas — `violated_count` never becomes a second independent gate input. |
+| `INJECT_FLOOR_USER_GLOBAL_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_USER_GLOBAL` | user:global tier floor on the passive injection lane (issue #235). On gated moments (`pretool`/`subagent` — the hooks' posttoolbatch maps to `pretool` store-side) a global-tier injection candidate whose MAX measured relevance lane sits below 0.5 is withheld and its reserved slot returns empty rather than being backfilled; the envelope reports the count as `global_withheld` (present only when a withhold happened). A global candidate with NO measured lane (query-less recent pulls) keeps the not-measured exemption — never withheld by this floor; when issue #253 restores task-keyed SubagentStart recall, the floor becomes effective on that surface naturally. `session_start`/`user_prompt`/`precompact` keep their current global composition. `0` disables (relevance values are >= 0, so nothing is ever below it). |
 
 The floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a passive-lane filter; the trust floor
@@ -691,7 +692,10 @@ and a tierless generic row is explicitly prefixed `[tier=unknown]`. Ordinary
 plain-text recall/recent output includes that marker too. Legacy passive
 injection retains its established tierless wire bytes. The legacy
 `tier=cross` renderer marker remains a suffix. Explicit `--namespace`, search,
-hook, and injection calls retain their legacy route and limit arguments.
+hook, and injection calls retain their legacy route and limit arguments
+(issue #235 adds only the gated-moment `user_global` relevance floor on top:
+below-floor global candidates are withheld before the merge, the slot stays
+empty, and the envelope reports the count as `global_withheld`).
 On implicit ordinary recall and recent, `--include-global` opts into the
 scoped `user_global` reservation and preserves tier labels. Explicit
 `--namespace` calls retain their legacy union behavior; `--include-cross-project`
@@ -1973,7 +1977,9 @@ python <store.py> capture-training-acknowledge --input acknowledgement.json
 python <store.py> capture-training-completion --input completion.json
 ```
 
-Reviewer-acceptance corrections require a separate local review transition:
+Every reviewer-acceptance outcome requires a separate local review transition,
+including turn evidence. Reviewer-acceptance corrections additionally require
+correction evidence:
 
 ```bash
 ZMEM_TRAINING_CALLER_ID=operator-a \
@@ -2472,10 +2478,11 @@ zmem fixture ever contains that wrapper.
 ## Timeout budget
 
 Issue #121: the hook path runs inside the host's hook timeout (the host
-configs give SessionStart 15 s) with an internal budget. Canonical integer
-values live in `hooks/timeout-budget.json`; runtime overrides read env vars
-and fall back to those defaults (an invalid value falls back with exactly
-one warning).
+configs give SessionStart 15 s) with an internal budget. Canonical shared
+integer values live in `hooks/timeout-budget.json`; the private
+training-capture allocations below are implemented in `hooks/zmem-launch.js`.
+Runtime overrides read env vars and fall back to those defaults (an invalid
+value falls back with exactly one warning).
 
 | Stage | Value | Override env var | Notes |
 |---|---|---|---|

@@ -49,6 +49,14 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def _capture_state_records(self) -> list[dict]:
+        directory = Path(self.tmp.name) / "training-capture"
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in directory.glob("*.json")
+            if "capture_id" in json.loads(path.read_text(encoding="utf-8"))
+        ]
+
     def _start(self, conn, **kwargs):
         self.calls.append(("start", kwargs))
         return {
@@ -117,6 +125,7 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "host": "claude",
             "session_id": "session-1",
             "namespace": "project:hook-test",
+            "host_task_id": "task-default-deny",
             "turn_id": "turn-default-deny",
             "prompt": "Bearer super-secret-token-value",
         }, env=self.env, api=self.api)
@@ -126,7 +135,10 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
         self.assertIsNone(call["consent_scope"])
         self.assertIsNone(call["content_license"])
         self.assertIsNone(call["redaction_policy_version"])
-        self.assertIsNone(call["prompt"])
+        # The adapter forwards content to the storage API; default-deny
+        # redaction is enforced by the production capture writer when these
+        # governance values are absent.
+        self.assertEqual(call["prompt"], "Bearer super-secret-token-value")
         self.assertNotIn("acknowledge", " ".join(name for name, _ in self.calls))
         self.assertNotIn("complete", " ".join(name for name, _ in self.calls))
 
@@ -222,9 +234,9 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "turn_id": "turn-4",
             "prompt": "private prompt",
         }, env=self.env, api=self.api)
-        state_files = list((Path(self.tmp.name) / "training-capture").glob("*.json"))
-        self.assertEqual(len(state_files), 1)
-        state = json.loads(state_files[0].read_text())
+        state_records = self._capture_state_records()
+        self.assertEqual(len(state_records), 1)
+        state = state_records[0]
         self.assertEqual(state["capture_id"], self.capture_id)
         self.assertIsInstance(state["generation"], str)
         self.assertEqual(set(state), {"capture_id", "generation"})
@@ -243,8 +255,9 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             result["delivery_snapshot_id"],
             "22222222-2222-4222-8222-222222222222",
         )
-        state_file = next((Path(self.tmp.name) / "training-capture").glob("*.json"))
-        state = json.loads(state_file.read_text())
+        state_records = self._capture_state_records()
+        self.assertEqual(len(state_records), 1)
+        state = state_records[0]
         self.assertEqual(state["capture_id"], self.capture_id)
         self.assertEqual(state["delivery_snapshot_id"], result["delivery_snapshot_id"])
 
@@ -280,8 +293,9 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
             "action": "snapshot", **base, "rendered": "old context",
         }, env=self.env, api=self.api)
         self.assertEqual(result["capture_id"], self.capture_id)
-        state_file = next((Path(self.tmp.name) / "training-capture").glob("*.json"))
-        state = json.loads(state_file.read_text())
+        state_records = self._capture_state_records()
+        self.assertEqual(len(state_records), 1)
+        state = state_records[0]
         self.assertEqual(state, {
             "capture_id": replacement_capture,
             "generation": replacement_generation,
@@ -391,15 +405,18 @@ class TrainingCaptureAdapterTests(unittest.TestCase):
 
     def test_caller_capture_id_cannot_override_keyed_sidecar(self):
         base = {
-            "host": "claude", "session_id": "keyed", "turn_id": "turn-a",
+            "host": "claude", "session_id": "keyed",
+            "namespace": "project:hook-test", "host_task_id": "task-keyed",
+            "turn_id": "turn-a",
         }
         ADAPTER.run_action({"action": "start", **base}, env=self.env, api=self.api)
-        self.assertEqual(ADAPTER.run_action({
+        observed = ADAPTER.run_action({
             "action": "observe", **base,
             "capture_id": "22222222-2222-4222-8222-222222222222",
             "observation": {"status": "wrong-target"},
-        }, env=self.env, api=self.api), {})
-        self.assertEqual(len(self.calls), 1)
+        }, env=self.env, api=self.api)
+        self.assertEqual(observed["capture_id"], self.capture_id)
+        self.assertEqual(self.calls[-1][1]["capture_id"], self.capture_id)
 
     def test_kill_switch_is_authoritative_and_does_not_create_state(self):
         env = {**self.env, "ZMEM_CAPTURE": "0"}

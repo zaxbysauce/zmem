@@ -213,6 +213,10 @@ class SkillDocDriftTest(unittest.TestCase):
         # too — the doc-drift guard must cover it like the other three.
         self.assertIn("INJECT_FLOOR_TRUST_DEFAULT", text,
                       "SKILL.md must document INJECT_FLOOR_TRUST_DEFAULT")
+        # Issue #235: the user:global tier floor is a documented surface the
+        # same way (gated-moment global-tier relevance on the passive lane).
+        self.assertIn("INJECT_FLOOR_USER_GLOBAL_DEFAULT", text,
+                      "SKILL.md must document INJECT_FLOOR_USER_GLOBAL_DEFAULT")
 
     # -- issue #59, 4.x: the append-only revision surface is documented -------
 

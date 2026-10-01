@@ -272,6 +272,7 @@ def build_injection_envelope(
     rendered: str,
     injection_risk: int | None = None,
     secret_withheld: int | None = None,
+    global_withheld: int | None = None,
     candidate_lanes: dict | None = None,
     budget_note: str | None = None,
     effective_ops: list[str] | None = None,
@@ -301,6 +302,10 @@ def build_injection_envelope(
     # are untouched).
     if secret_withheld is not None:
         envelope["secret_withheld"] = secret_withheld
+    # Issue #235: same keyed-only-when-present contract for the user:global
+    # tier floor withhold — zero-withhold envelopes stay byte-identical.
+    if global_withheld is not None:
+        envelope["global_withheld"] = global_withheld
     if candidate_lanes is not None:
         envelope["candidate_lanes"] = candidate_lanes
     if budget_note is not None:
@@ -2179,6 +2184,7 @@ def _recall_injection_details(
     fence_id: str | None = None,
     query: str = "",
     cross_rerank: bool = False,
+    global_withheld: int = 0,
 ) -> tuple[dict, list[dict]]:
     """Apply the one passive post-retrieval decision pipeline.
 
@@ -2317,6 +2323,12 @@ def _recall_injection_details(
                          if r.get("withheld_for_secret"))
     if withheld_count:
         details["secret_withheld"] = withheld_count
+    # Issue #235: the user:global tier floor's withhold count arrives from
+    # the caller (the floor is applied at the global-tier seam BEFORE this
+    # pipeline); keyed only when a withhold happened so zero-withhold
+    # envelopes stay byte-identical.
+    if global_withheld:
+        details["global_withheld"] = global_withheld
     # Legacy --for-injection JSON exposes a numeric exclusion count only when
     # its caller supplied an exclusion list; preserve that byte/shape contract.
     if exclude_ids:
@@ -2364,6 +2376,7 @@ def _recall_memory_impl(
     _fence_id: str | None = None,
     moment: str | None = None,
     lane: str | None = None,
+    _user_global_floor: float | None = None,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -2539,6 +2552,39 @@ def _recall_memory_impl(
             as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
             moment=effective_moment, lane=lane,
         )
+
+    # Issue #235: the user:global tier floor.  The selector threads the
+    # resolved floor only on gated passive moments; here a below-floor
+    # global candidate is withheld BEFORE the merge, so `_merge_tiers`
+    # returns its reserved slot EMPTY rather than backfilling it (the merge
+    # is a project hard floor — project rows never extend past `limit` to
+    # fill a withheld global slot).  A candidate is judged by its MAX
+    # measured `_rel_*` lane, mirroring the selective-inject gate's
+    # any-lane-passes disjunction; a candidate with NO measured lane keeps
+    # the gate's not-measured exemption (query-less pulls can arrive here
+    # only via the recent lane, whose impl performs no enforcement, so in
+    # practice every candidate reaching this filter has measured lanes —
+    # the exemption branch is the defensive shape, not a reachable one).
+    # explain_recall never passes this kwarg: its own `_merge_tiers` site
+    # stays byte-identical.
+    global_floor_withheld = 0
+    if (_user_global_floor is not None and _user_global_floor > 0
+            and global_scored):
+        kept_global: list[tuple[float, dict]] = []
+        for _score, item in global_scored:
+            lane_values = [
+                item[key] for key in ("_rel_lex", "_rel_cos", "_rel_ent",
+                                      "_rel_graph")
+                if item.get(key) is not None
+            ]
+            if not lane_values:
+                kept_global.append((_score, item))
+                continue
+            if max(lane_values) >= _user_global_floor:
+                kept_global.append((_score, item))
+            else:
+                global_floor_withheld += 1
+        global_scored = kept_global
 
     # Issue #58, 3.4: at emit time, re-classify each row for
     # `prompt-injection-risk` so a paraphrase that slipped the
@@ -2760,6 +2806,7 @@ def _recall_memory_impl(
             surfaced_ids=bump_ids,
             namespace=namespace, fence_id=fence_id,
             query=query, cross_rerank=cross_rerank,
+            global_withheld=global_floor_withheld,
         )
         results = injection_details["results"]
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
@@ -3935,6 +3982,7 @@ def _recent_memory_impl(
     _fence_id: str | None = None,
     moment: str | None = None,
     lane: str | None = None,
+    _user_global_floor: float | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -4164,6 +4212,7 @@ def _collect_injection_candidates(
     _fence_id: str | None = None,
     moment: str | None = None,
     lane: str | None = None,
+    _user_global_floor: float | None = None,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -4193,6 +4242,7 @@ def _collect_injection_candidates(
         _fence_id=_fence_id,
         moment=moment,
         lane=lane,
+        _user_global_floor=_user_global_floor,
     )
     if query is None:
         _recent_memory_impl(
@@ -4250,6 +4300,7 @@ def recall_memory(
     _fence_id: str | None = None,
     moment: str | None = None,
     lane: str | None = None,
+    _user_global_floor: float | None = None,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
@@ -4296,6 +4347,7 @@ def recall_memory(
             _fence_id=_fence_id,
             moment=moment,
             lane=lane,
+            _user_global_floor=_user_global_floor,
         )
 
     if scopes is not None:
@@ -4329,6 +4381,7 @@ def recall_memory(
         _fence_id=_fence_id,
         moment=moment,
         lane=lane,
+        _user_global_floor=_user_global_floor,
     )
     if _capture is not None:
         _capture.clear()
@@ -4377,6 +4430,7 @@ def recent_memory(
     _fence_id: str | None = None,
     moment: str | None = None,
     lane: str | None = None,
+    _user_global_floor: float | None = None,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -4402,6 +4456,7 @@ def recent_memory(
             _fence_id=_fence_id,
             moment=moment,
             lane=lane,
+            _user_global_floor=_user_global_floor,
         )
 
     if scopes is not None:
@@ -4435,6 +4490,7 @@ def recent_memory(
         _fence_id=_fence_id,
         moment=moment,
         lane=lane,
+        _user_global_floor=_user_global_floor,
     )
     if _capture is not None:
         _capture.clear()

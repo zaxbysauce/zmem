@@ -8,7 +8,6 @@ than duplicating the row-building implementation.
 
 from __future__ import annotations
 
-import atexit
 import hashlib
 import json
 import os
@@ -22,22 +21,38 @@ from pathlib import Path
 from unittest import mock
 
 
-# Pin the store before any package import.  The storelib modules resolve their
-# SQLite path at import time, and an ambient ZMEM_STORE must never point these
-# tests at the operator's canonical database.
-_BOOTSTRAP_ROOT = Path(tempfile.mkdtemp(prefix="zmem-training-views-import-"))
-os.environ["ZMEM_STORE"] = str(_BOOTSTRAP_ROOT / "store.sqlite")
-os.environ["ZMEM_DATA"] = str(_BOOTSTRAP_ROOT / "data")
-for _key in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
-    os.environ.pop(_key, None)
-os.environ["ZMEM_EMBED_PROFILE"] = "fake"
-os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-os.environ["PYTHONUTF8"] = "1"
-atexit.register(shutil.rmtree, _BOOTSTRAP_ROOT, True)
-
-
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "skills" / "memory" / "scripts" / "store.py"
+
+# Pin imports to a disposable store, then immediately restore the process
+# environment. The cached store path points to a cleaned temporary location,
+# so accidental direct storelib calls cannot use an operator store.
+_IMPORT_KEYS = (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_EMBED_PROFILE", "ZMEM_MODEL_AUTODOWNLOAD",
+    "PYTHONUTF8", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+)
+_IMPORT_ENV = {key: os.environ.get(key) for key in _IMPORT_KEYS}
+_IMPORT_TMP = tempfile.TemporaryDirectory(prefix="zmem-training-views-import-")
+_IMPORT_ROOT = Path(_IMPORT_TMP.name)
+os.environ.update({
+    "ZMEM_STORE": str(_IMPORT_ROOT / "store.sqlite"),
+    "ZMEM_DATA": str(_IMPORT_ROOT / "data"),
+    "ZMEM_EMBED_PROFILE": "fake",
+    "ZMEM_MODEL_AUTODOWNLOAD": "0",
+    "PYTHONUTF8": "1",
+})
+for _key in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+    os.environ.pop(_key, None)
+sys.path.insert(0, str(ROOT / "skills" / "memory" / "scripts"))
+try:
+    from storelib import training as _training_import_safety  # noqa: E402,F401
+finally:
+    for _key, _value in _IMPORT_ENV.items():
+        if _value is None:
+            os.environ.pop(_key, None)
+        else:
+            os.environ[_key] = _value
+    _IMPORT_TMP.cleanup()
 
 
 class TrainingViewsContractTests(unittest.TestCase):
@@ -243,7 +258,9 @@ class TrainingViewsContractTests(unittest.TestCase):
                     capture_id,
                     f"<context>{memory_id}</context>",
                     json.dumps([f"deploy --safe --task {task_id}"]),
-                    f"rendered-hash-{capture_id}",
+                    hashlib.sha256(
+                        f"<context>{memory_id}</context>".encode("utf-8")
+                    ).hexdigest(),
                     "transform-v1",
                     "2026-01-01T00:00:00Z",
                 ),
@@ -521,7 +538,10 @@ class TrainingViewsContractTests(unittest.TestCase):
                         raise OSError("fixture manifest install failure")
                     original_replace(source, destination)
 
-                with mock.patch("storelib.training.os.replace", side_effect=fail_manifest):
+                with (
+                    mock.patch.dict(os.environ, self.env, clear=True),
+                    mock.patch("storelib.training.os.replace", side_effect=fail_manifest),
+                ):
                     with self.assertRaisesRegex(OSError, "manifest install failure"):
                         write_training_views(
                             conn,

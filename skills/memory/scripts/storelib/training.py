@@ -824,15 +824,11 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
         # The independent snapshot query above deliberately includes captures
         # that are incomplete or excluded; this join only builds eligible rows.
         reason: str | None = None
-        if not _completion_is_exportable(
+        if row["quarantine_reason"]:
+            reason = "quarantine"
+        elif not _completion_is_exportable(
                 conn, {"capture": row, "completion": completion, "review": review}):
             reason = "missing_governance_or_outcome"
-        elif row["revoked_at"] is not None:
-            reason = "revoked"
-        elif row["quarantine_reason"]:
-            reason = "quarantine"
-        elif row["redaction_status"] != "redacted":
-            reason = "redaction_status"
         elif not all(row[key] for key in (
             "namespace", "session_id", "prompt", "assistant_response", "rendered", "effective_ops_json",
             "rendered_hash", "transform_version", "emitted_at",
@@ -844,9 +840,13 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
             reason = "missing_governance_or_outcome"
         elif str(row["outcome_kind"]) not in _OUTCOME_KINDS:
             reason = "invalid_outcome_kind"
-        ops_tokens = _parse_ops(
-            row["effective_ops_json"], capture_id=capture_id
-        )
+        ops_tokens: list[str] = []
+        if reason is None:
+            actual_hash = hashlib.sha256(str(row["rendered"] or "").encode("utf-8")).hexdigest()
+            if actual_hash != row["rendered_hash"]:
+                reason = "snapshot_integrity"
+        if reason is None:
+            ops_tokens = _parse_ops(row["effective_ops_json"], capture_id=capture_id)
         evidence = None
         if reason is None:
             evidence = conn.execute("SELECT * FROM evidence WHERE id=?", (row["evidence_id"],)).fetchone()
@@ -865,6 +865,9 @@ def _candidate_rows(conn: sqlite3.Connection, *, namespace: str | None,
                 memory_rows = _memory_rows(conn, source_memory_ids)
                 if len(memory_rows) != len(source_memory_ids):
                     reason = "missing_association"
+                elif any(str(memory["namespace"]) != str(row["namespace"])
+                         for memory in memory_rows):
+                    reason = "association_namespace_mismatch"
                 else:
                     _validate_update_lineage(conn, memory_rows)
                 associated_json = row["associated_memory_ids_json"] if "associated_memory_ids_json" in row.keys() else None
@@ -1182,6 +1185,13 @@ def _bounded_quarantine_event(item: Mapping[str, Any], event_id: str) -> bytes:
     # content fields in a deterministic order, then shrinking the remainder.
     for key in ("assistant_response", "context_fence", "prompt", "task_id"):
         payload[key] = ""
+        raw = _json_bytes(payload)
+        if len(raw) <= QUARANTINE_EVENT_MAX_BYTES:
+            return raw
+    # Operations are data too.  Reduce the list before shortening identifiers
+    # so a hostile operations envelope cannot make quarantine output unbounded.
+    while payload["ops_tokens"]:
+        payload["ops_tokens"].pop()
         raw = _json_bytes(payload)
         if len(raw) <= QUARANTINE_EVENT_MAX_BYTES:
             return raw

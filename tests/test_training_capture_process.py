@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -18,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "skills" / "memory" / "scripts" / "store.py"
 SCRIPTS = STORE.parent
 ADAPTER = ROOT / "hooks" / "lib" / "zmem-training-capture.py"
+_LOCK_TIMEOUT_MATCH = re.search(
+    r"^_LOCK_TIMEOUT_SECONDS\s*=\s*([0-9.]+)", ADAPTER.read_text(encoding="utf-8"), re.MULTILINE)
+assert _LOCK_TIMEOUT_MATCH is not None
+LOCK_CONTENTION_CEILING_S = float(_LOCK_TIMEOUT_MATCH.group(1)) + 0.4
 
 ADAPTER_CHILD = r'''
 import importlib.util
@@ -269,6 +274,30 @@ with module._SessionLock(key, os.environ):
     time.sleep(30)
 '''
 
+NESTED_LOCK_HOLDER = r'''
+import importlib.util
+import json
+import os
+import time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("capture_adapter", os.environ["ZMEM_ADAPTER"])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+payload = json.loads(os.environ["LOCK_PAYLOAD"])
+if os.environ["LOCK_KIND"] == "index":
+    fields = module._identity_fields(payload, require_turn=True)
+    key = module._session_scope_key(fields)
+else:
+    identity = module._identity_keys(payload, module._load_api(), require_turn=True)
+    if identity is None:
+        raise RuntimeError("missing session lock identity")
+    key = identity[1]
+with module._SessionLock(key, os.environ):
+    Path(os.environ["READY"]).write_text("ready", encoding="utf-8")
+    time.sleep(float(os.environ["HOLD_SECONDS"]))
+'''
+
 
 class ProcessCaptureTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -285,6 +314,7 @@ class ProcessCaptureTests(unittest.TestCase):
             "ZMEM_EMBED_PROFILE": "fake",
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
             "ZMEM_MODELS_DIR": str(self.root / "models"),
+            "ZMEM_CAPTURE": "1",
             "ZMEM_CAPTURE_CONSENT_SCOPE": "local",
             "ZMEM_CAPTURE_CONTENT_LICENSE": "CC-BY-4.0",
             "ZMEM_CAPTURE_REDACTION_POLICY_VERSION": "v1",
@@ -403,7 +433,7 @@ class ProcessCaptureTests(unittest.TestCase):
 
     def test_private_bootstrap_preserves_identity_and_existing_prefixes(self) -> None:
         expected_keys = [
-            "clear_correlated", "connect", "identity_keys", "observe",
+            "clear_correlated", "clear_session_keys", "connect", "identity_keys", "observe",
             "observe_correlated", "prepare", "snapshot", "snapshot_correlated",
             "start", "start_correlated",
         ]
@@ -549,7 +579,7 @@ class ProcessCaptureTests(unittest.TestCase):
                 busy_clear["result"],
                 {"error": "capture_busy"},
             )
-            self.assertLess(float(busy_clear["elapsed"]), 1.2)
+            self.assertLess(float(busy_clear["elapsed"]), LOCK_CONTENTION_CEILING_S)
             self.assertEqual(self.mapped_count("serialized", "project:process"), 1)
             start_release.write_text("release", encoding="utf-8")
             self.assertTrue(json.loads(self.collect(delayed_start)).get("capture_id"))
@@ -598,7 +628,7 @@ class ProcessCaptureTests(unittest.TestCase):
             snapshot_clear_go.write_text("go", encoding="utf-8")
             busy_snapshot_clear = json.loads(self.collect(warm_snapshot_clear))
             self.assertEqual(busy_snapshot_clear["result"], {"error": "capture_busy"})
-            self.assertLess(float(busy_snapshot_clear["elapsed"]), 1.2)
+            self.assertLess(float(busy_snapshot_clear["elapsed"]), LOCK_CONTENTION_CEILING_S)
             snapshot_release.write_text("release", encoding="utf-8")
             self.assertTrue(json.loads(self.collect(delayed_snapshot)).get("delivery_snapshot_id"))
         finally:
@@ -635,7 +665,7 @@ class ProcessCaptureTests(unittest.TestCase):
             contender_go.write_text("go", encoding="utf-8")
             contention = json.loads(self.collect(contender))
             self.assertEqual(contention["result"], {})
-            self.assertLess(float(contention["elapsed"]), 1.2)
+            self.assertLess(float(contention["elapsed"]), LOCK_CONTENTION_CEILING_S)
             self.assertEqual(self.mapped_count("dead-lock", "project:process"), 0)
             holder.terminate()
             holder.wait(timeout=10)
@@ -682,6 +712,71 @@ class ProcessCaptureTests(unittest.TestCase):
         self.assertTrue(self.adapter(expired).get("capture_id"))
         self.assertEqual(self.adapter(current), {})
         self.assertEqual(self.scalar("SELECT count(*) FROM training_capture_closed_session"), 1)
+
+    def test_long_same_prefix_sessions_have_distinct_opaque_scope_indexes(self) -> None:
+        prefix = "s" * 128
+        first = prefix + "-first"
+        second = prefix + "-second"
+        self.assertTrue(self.adapter(self.payload(first)).get("capture_id"))
+        self.assertTrue(self.adapter(self.payload(second)).get("capture_id"))
+        self.assertEqual(self.mapped_count(first, "project:process"), 1)
+        self.assertEqual(self.mapped_count(second, "project:process"), 1)
+
+        def scope_digest(session: str) -> str:
+            canonical = json.dumps(
+                {"host": "claude", "session_id": session},
+                sort_keys=True, separators=(",", ":"),
+            )
+            return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+        first_index = self.store.parent / "training-capture" / f"{scope_digest(first)}.json"
+        second_index = self.store.parent / "training-capture" / f"{scope_digest(second)}.json"
+        self.assertNotEqual(first_index, second_index)
+        self.assertTrue(first_index.is_file())
+        self.assertTrue(second_index.is_file())
+        self.assertRegex(first_index.name, r"^[0-9a-f]{64}\.json$")
+        self.assertRegex(second_index.name, r"^[0-9a-f]{64}\.json$")
+        persisted = b"".join(path.read_bytes() for path in (first_index, second_index))
+        self.assertNotIn(first.encode("utf-8"), persisted)
+        self.assertNotIn(second.encode("utf-8"), persisted)
+
+        self.assertEqual(self.adapter({**self.payload(first), "action": "clear"}), {})
+        self.assertEqual(self.mapped_count(first, "project:process"), 0)
+        self.assertEqual(self.mapped_count(second, "project:process"), 1)
+        self.assertEqual(self.adapter({**self.payload(second), "action": "clear"}), {})
+
+    def test_nested_scope_locks_share_one_absolute_deadline(self) -> None:
+        payload = self.payload("nested-deadline")
+        index_ready = self.root / "index-ready"
+        session_ready = self.root / "session-ready"
+        holder_env = {**self.env, "LOCK_PAYLOAD": json.dumps(payload)}
+        index_holder = self.popen(
+            NESTED_LOCK_HOLDER,
+            {**holder_env, "LOCK_KIND": "index", "READY": str(index_ready), "HOLD_SECONDS": "0.50"},
+        )
+        session_holder = self.popen(
+            NESTED_LOCK_HOLDER,
+            {**holder_env, "LOCK_KIND": "session", "READY": str(session_ready), "HOLD_SECONDS": "2.0"},
+        )
+        try:
+            self.wait_for(index_ready)
+            self.wait_for(session_ready)
+            started = time.monotonic()
+            self.assertEqual(self.adapter(payload), {})
+            elapsed = time.monotonic() - started
+            # The scope index consumes about 0.5 seconds. A fresh nested 0.8
+            # second allowance would take about 1.3 seconds; the shared
+            # absolute deadline returns within the one-lock ceiling.
+            self.assertLess(elapsed, LOCK_CONTENTION_CEILING_S)
+            self.assertEqual(self.mapped_count("nested-deadline", "project:process"), 0)
+        finally:
+            for holder in (index_holder, session_holder):
+                if holder.poll() is None:
+                    holder.kill()
+                holder.wait(timeout=10)
+                for stream in (holder.stdin, holder.stdout, holder.stderr):
+                    if stream is not None and not stream.closed:
+                        stream.close()
 
 
 if __name__ == "__main__":

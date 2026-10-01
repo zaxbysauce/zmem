@@ -37,6 +37,10 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         })
         for key in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
             self.env.pop(key, None)
+        for key in ("ZMEM_CAPTURE", "ZMEM_CAPTURE_CONSENT_SCOPE",
+                    "ZMEM_CAPTURE_CONTENT_LICENSE",
+                    "ZMEM_CAPTURE_REDACTION_POLICY_VERSION"):
+            self.env.pop(key, None)
         # The PATH lane must exercise production interpreter discovery rather
         # than silently inheriting an explicit test-runner override.
         self.env.pop("ZMEM_PYTHON", None)
@@ -171,17 +175,18 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
                 finally:
                     conn.close()
             sidecars = list((self.store.parent / "training-capture").glob("*.json"))
-            if len(sidecars) == 1:
-                sidecar = None
+            sidecar = None
+            for path in sidecars:
                 try:
-                    candidate = json.loads(sidecars[0].read_text(encoding="utf-8"))
+                    candidate = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
                     last_state = f"sidecar unreadable: {exc}"
-                else:
+                    continue
+                if candidate.get("capture_id") == started["capture_id"]:
                     sidecar = candidate
-            else:
-                sidecar = None
-                last_state = f"expected one sidecar, found {len(sidecars)}"
+                    break
+            if sidecar is None and sidecars:
+                last_state = "capture sidecar not ready"
             if (
                 capture is not None
                 and capture[0] == "emitted_to_host"
@@ -201,10 +206,13 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         # With an explicit ZMEM_STORE, the adapter co-locates its hashed
         # correlation sidecar beside that store.
         sidecars = list((self.store.parent / "training-capture").glob("*.json"))
-        self.assertEqual(len(sidecars), 1)
-        self.assertNotIn(task_id, sidecars[0].name)
-        self.assertNotIn(task_id.encode("utf-8"), sidecars[0].read_bytes())
-        sidecar = json.loads(sidecars[0].read_text(encoding="utf-8"))
+        for path in sidecars:
+            self.assertNotIn(task_id, path.name)
+            self.assertNotIn(task_id.encode("utf-8"), path.read_bytes())
+        sidecar = next(
+            json.loads(path.read_text(encoding="utf-8")) for path in sidecars
+            if json.loads(path.read_text(encoding="utf-8")).get("capture_id") == started["capture_id"]
+        )
         self.assertEqual(sidecar["capture_id"], started["capture_id"])
         self.assertEqual(sidecar["delivery_snapshot_id"], delivery[0])
         self.assertNotIn(task_id.encode("utf-8"), self.store.read_bytes())
@@ -309,6 +317,103 @@ class TrainingCaptureHostIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(exported.returncode, 0, exported.stderr)
         self.assertEqual(json.loads(exported.stdout)["sft_count"], 0)
+
+    def test_session_end_clear_uses_the_namespace_persisted_at_capture_start(self) -> None:
+        payload = self._capture_payload(
+            session_id="session-clear-roundtrip", namespace="project:start-scope",
+            capture_key="turn-clear-roundtrip", task_id="clear-roundtrip-task",
+        )
+        started = self._adapter("start", payload)
+        self.assertTrue(started["capture_id"])
+        second_payload = {
+            **payload,
+            "namespace": "project:changed-scope",
+            "capture_key": "turn-clear-roundtrip-second",
+            "host_task_id": "clear-roundtrip-task-second",
+        }
+        second = self._adapter("start", second_payload)
+        self.assertTrue(second["capture_id"])
+        scope_files = list((self.store.parent / "training-capture").glob("*.json"))
+        self.assertEqual(len(scope_files), 3)
+        for path in scope_files:
+            raw = path.read_bytes()
+            self.assertNotIn(str(payload["session_id"]).encode("utf-8"), raw)
+            self.assertNotIn(b"project:start-scope", raw)
+            self.assertNotIn(b"project:changed-scope", raw)
+        self.assertTrue(any(
+            "session_keys" in json.loads(path.read_text(encoding="utf-8"))
+            for path in scope_files
+        ))
+        self.assertEqual(self._adapter("clear", {
+            "host": "codex", "session_id": "other-session",
+            "namespace": "project:changed-scope",
+        }), {})
+        conn = self._db()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM training_capture_correlation").fetchone()[0], 2,
+            )
+        finally:
+            conn.close()
+        # This represents a remote/resolver change before the host's SessionEnd
+        # callback.  Clear must tombstone every scope trusted for this session.
+        self.assertEqual(self._adapter("clear", {
+            "host": "codex",
+            "session_id": payload["session_id"],
+            "namespace": "project:changed-scope",
+        }), {})
+
+        conn = self._db()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM training_capture_correlation").fetchone()[0], 0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM training_capture_closed_session").fetchone()[0], 3,
+            )
+        finally:
+            conn.close()
+        sidecars = list((self.store.parent / "training-capture").glob("*.json"))
+        self.assertEqual(sidecars, [])
+        self.assertEqual(self._adapter("start", payload), {})
+
+    def test_governed_correlated_observe_fallback_redacts_task_turn_aliases(self) -> None:
+        governance = {
+            "ZMEM_CAPTURE_CONSENT_SCOPE": "local-training",
+            "ZMEM_CAPTURE_CONTENT_LICENSE": "CC-BY-4.0",
+            "ZMEM_CAPTURE_REDACTION_POLICY_VERSION": "policy-v1",
+        }
+        raw_values = {
+            "task_id": "adapter-task-snake-secret",
+            "taskId": "adapter-task-camel-secret",
+            "turn_id": "adapter-turn-snake-secret",
+            "turnId": "adapter-turn-camel-secret",
+        }
+        payload = {
+            "host": "codex",
+            "session_id": "session-observe-fallback",
+            "namespace": "project:integration",
+            "prompt": "governed prompt",
+            "assistant_response": "governed response",
+            **raw_values,
+        }
+        started = self._adapter("start", payload, extra_env=governance)
+        observed = self._adapter("observe", {
+            **payload,
+            "observation_kind": "post_tool",
+        }, extra_env=governance)
+        self.assertEqual(observed["capture_id"], started["capture_id"])
+        conn = self._db()
+        try:
+            stored = conn.execute(
+                "SELECT payload FROM training_capture_observation WHERE capture_id=?",
+                (started["capture_id"],),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertIsNotNone(stored)
+        for raw in raw_values.values():
+            self.assertNotIn(raw, stored)
 
     def test_verified_completion_exports_and_redacts_task_id(self) -> None:
         session_id = "session-verified"

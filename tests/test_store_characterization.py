@@ -34,10 +34,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
@@ -338,6 +341,54 @@ class CharacterizationTests(unittest.TestCase):
             "The storelib split must be behavior-identical. If this change is "
             "intentional, rebase via ZMEM_CHAR_RECORD=1.\n",
         )
+
+    def test_direct_additive_migration_race_rechecks_after_write_barrier(self):
+        """Two old-schema direct openers both succeed without a duplicate ALTER."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib import schema  # noqa: E402
+
+        with tempfile.TemporaryDirectory(prefix="zmem-capture-ddl-race-") as tmp:
+            path = Path(tmp) / "store.sqlite"
+            seed = sqlite3.connect(path, isolation_level=None)
+            try:
+                schema._ensure_training_capture_tables(seed)
+                seed.execute(
+                    "ALTER TABLE training_capture_observation DROP COLUMN payload_sha256"
+                )
+            finally:
+                seed.close()
+
+            barrier = threading.Barrier(2)
+
+            class GatedConnection(sqlite3.Connection):
+                def execute(self, sql, *args, **kwargs):
+                    if sql == "BEGIN IMMEDIATE":
+                        barrier.wait(timeout=10)
+                    return super().execute(sql, *args, **kwargs)
+
+            def upgrade() -> Exception | None:
+                conn = sqlite3.connect(
+                    path, isolation_level=None, timeout=10, factory=GatedConnection,
+                )
+                try:
+                    schema._ensure_training_capture_tables(conn)
+                    return None
+                except Exception as exc:  # Test reports the precise unexpected DDL failure.
+                    return exc
+                finally:
+                    conn.close()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = list(pool.map(lambda _unused: upgrade(), range(2)))
+            self.assertEqual(outcomes, [None, None])
+            verify = sqlite3.connect(path)
+            try:
+                columns = [row[1] for row in verify.execute(
+                    "PRAGMA table_info(training_capture_observation)"
+                )]
+            finally:
+                verify.close()
+            self.assertEqual(columns.count("payload_sha256"), 1)
 
     def test_root_help_surface(self):
         r = _run_cli({}, "--help")

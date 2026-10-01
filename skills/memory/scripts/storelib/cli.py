@@ -63,10 +63,12 @@ from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTarget
 from storelib.delivery_ledger import FeedbackSidecarError
 from storelib.feedback import apply_operation_feedback
 from storelib.training_capture import (
-    CaptureBusyError, TrainingCaptureConflict, acknowledge_training_delivery,
-    append_training_capture_observation, assert_training_capture_replay_binding,
+    CaptureBusyError, TrainingCaptureConflict, TrainingCaptureInputRefusal,
+    acknowledge_training_delivery,
+    _bounded_observation_json, append_training_capture_observation,
+    assert_training_capture_replay_binding,
     capture_id_for_delivery_snapshot,
-    complete_training_capture,
+    complete_training_capture, mark_training_delivery_refusal,
     purge_expired_training_captures, record_training_delivery_snapshot,
     review_training_capture, revoke_training_capture,
     start_training_capture,
@@ -3318,14 +3320,28 @@ def main():
     } and bool(args.after_namespace) != bool(args.after_memory_id)):
         ap.error("association cursor requires both --after-namespace and --after-memory-id")
 
+    writer_lease = None
+    conn = None
     try:
         _wait_for_maintenance_clear(args.cmd)
+        # Export snapshots must not open an old database between a restore and
+        # taking its writer lease.  Acquisition itself is connection-free.
+        if args.cmd == "export-training":
+            writer_lease = _acquire_writer_lease(args.cmd)
         conn = _connect_existing_store() if existing_only_evidence_write else connect()
         if not existing_only_evidence_write:
             _prepare_store(conn)
-    except RuntimeError as e:
+    except (RuntimeError, sqlite3.Error, OSError) as e:
+        if conn is not None:
+            conn.close()
+        _release_writer_lease(writer_lease)
         print(f"[zmem] {e}", file=sys.stderr)
         sys.exit(2)
+    except BaseException:
+        if conn is not None:
+            conn.close()
+        _release_writer_lease(writer_lease)
+        raise
 
     # Issue #71 C: after the store is open and migrated, remediate any rows
     # stranded under a global-near-miss namespace so they become reachable
@@ -3370,7 +3386,6 @@ def main():
             print(f"[zmem] {e}", file=sys.stderr)
             sys.exit(2)
 
-    writer_lease = None
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl",
                      "capture-training-delivery", "capture-training-acknowledge",
@@ -3422,7 +3437,8 @@ def main():
         # cannot interleave between cadence steps.
         or args.cmd == "session-cadence"
     ):
-        writer_lease = _acquire_writer_lease(args.cmd)
+        if writer_lease is None:
+            writer_lease = _acquire_writer_lease(args.cmd)
 
     try:
         if args.cmd == "init":
@@ -3498,6 +3514,7 @@ def main():
                 assert payload is not None
                 delivery_id = payload.get("delivery_snapshot_id")
                 capture_id = None
+                capture_started = False
                 if delivery_id is not None:
                     # Explicit identities are accepted for a first delivery by
                     # trusted local services.  Look up an existing row only to
@@ -3538,6 +3555,7 @@ def main():
                         governance_source="trusted_local_cli",
                     )
                     capture_id = capture["capture_id"]
+                    capture_started = True
                 else:
                     assert_training_capture_replay_binding(
                         conn, capture_id, _capture_replay_identity(payload)
@@ -3549,20 +3567,22 @@ def main():
                     source_event_id = source_event_id.strip()
                     if len(source_event_id.encode("utf-8")) > 1024:
                         raise ValueError("source_event_id is too large")
-                    observation_payload = json.dumps(
+                    raw_observation_payload = json.dumps(
                         {"source_event_id": source_event_id},
                         ensure_ascii=False, separators=(",", ":"),
                     )
-                    existing = conn.execute(
-                        "SELECT 1 FROM training_capture_observation "
-                        "WHERE capture_id=? AND observation_kind=? AND payload=? LIMIT 1",
-                        (capture_id, "source_event_id", observation_payload),
-                    ).fetchone()
-                    if existing is None:
-                        append_training_capture_observation(
-                            conn, capture_id, observation_kind="source_event_id",
-                            payload=observation_payload,
-                        )
+                    canonical_observation_payload = _bounded_observation_json(raw_observation_payload)
+                    if canonical_observation_payload is not None:
+                        existing = conn.execute(
+                            "SELECT 1 FROM training_capture_observation "
+                            "WHERE capture_id=? AND observation_kind=? AND payload=? LIMIT 1",
+                            (capture_id, "source_event_id", canonical_observation_payload),
+                        ).fetchone()
+                        if existing is None:
+                            append_training_capture_observation(
+                                conn, capture_id, observation_kind="source_event_id",
+                                payload=raw_observation_payload,
+                            )
                 snapshot = record_training_delivery_snapshot(
                     conn, capture_id,
                     rendered=(payload.get("rendered")
@@ -3578,6 +3598,15 @@ def main():
                 print(json.dumps({"capture_id": capture_id,
                                    "delivery_snapshot_id": snapshot["delivery_snapshot_id"],
                                    "state": snapshot["state"]}, sort_keys=True))
+            except TrainingCaptureInputRefusal as exc:
+                conn.rollback()
+                # A new capture belonged to the rolled-back outer command and
+                # no durable row remains to mark. Replays bind an already
+                # committed partial and receive the narrow refusal marker.
+                if capture_id is not None and not capture_started:
+                    mark_training_delivery_refusal(conn, capture_id, exc.reason)
+                print(str(exc), file=sys.stderr)
+                sys.exit(1)
             except (ValueError, TrainingCaptureConflict, CaptureBusyError, OSError,
                     json.JSONDecodeError, sqlite3.Error) as exc:
                 conn.rollback()
