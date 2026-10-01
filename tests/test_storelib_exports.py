@@ -199,6 +199,15 @@ class StorelibExportsTest(unittest.TestCase):
         # store/storelib evicted) and restore it after the class.
         cls.tmp = tempfile.mkdtemp(prefix="zmem-export-capture-")
         cls.addClassCleanup(shutil.rmtree, cls.tmp, True)
+        # Snapshot the process-global import state FIRST and restore exactly
+        # it — a co-run sibling (e.g. tests.test_dataset) may lazily import
+        # storelib.* later in THIS process, so the cleanup must evict only
+        # what this class imported, never drain sys.path or purge modules
+        # that existed before it (review round-2 co-run regression).
+        cls._saved_path = list(sys.path)
+        cls._saved_store_mods = {m: sys.modules[m] for m in list(sys.modules)
+                                 if m == "store" or m == "storelib"
+                                 or m.startswith("storelib.")}
         cls.addClassCleanup(cls._restore_import_state)
         env = {**os.environ,
                "ZMEM_STORE": os.path.join(cls.tmp, "store.sqlite"),
@@ -213,15 +222,14 @@ class StorelibExportsTest(unittest.TestCase):
 
     @classmethod
     def _restore_import_state(cls):
-        while True:
-            try:
-                sys.path.remove(str(SCRIPTS_DIR))
-            except ValueError:
-                break
+        # Evict everything this class left behind (store/storelib under the
+        # scratch env), then reinstate the pre-existing entries verbatim.
         for mod_name in [m for m in list(sys.modules)
                          if m == "store" or m == "storelib"
                          or m.startswith("storelib.")]:
             sys.modules.pop(mod_name, None)
+        sys.modules.update(cls._saved_store_mods)
+        sys.path[:] = cls._saved_path
 
     def test_public_policy_is_exported(self):
         # Issue #180 mandates an export-pin method whose name embeds the
