@@ -381,10 +381,16 @@ def apply_capture_policy(
     ``quarantine_import_row`` instead of silently dropping it.
 
     Idempotence (issue #180 AC8): redaction detects but never rewrites a
-    value already equal to ``[REDACTED_SECRET]``, and warnings count
-    detections — so applying auto mode to a row this policy already
-    produced returns byte-identical content, source_ref, tags, and
-    warnings.
+    value already equal to ``[REDACTED_SECRET]``, so applying auto mode to
+    a row this policy already produced returns byte-identical content,
+    source_ref, and tags. Warnings are identical for inputs whose
+    detection set is stable across a re-scan (every issue fixture row,
+    e.g. ``sshpass -p <value>`` — one placeholder-valued detection on
+    both passes); two documented drifts exist beyond that: a placeholder
+    value long enough to trip a second pattern re-counts (``--password=``
+    + key=value), and an output that no longer matches any pattern emits
+    no redaction warning at all. Counts are detections, never byte
+    changes.
     """
     mode = _normalize_capture_mode(capture_mode)
     allowlisted, allow_scheme = _source_ref_allowlisted(source_ref)
@@ -488,9 +494,11 @@ def quarantine_import_row(data_dir: str | Path, row: dict, *, reason: str,
     ``0o700`` and the file with ``0o600``; an ``os.chmod`` failure raises
     ``OSError``, and any write failure raises the original ``OSError`` —
     callers roll back their current row, count ``quarantine_failed``, and
-    return a nonzero result. This helper never writes SQLite. Single-writer
-    assumption: store writes are serialized by the store's writer lease; the
-    quarantine append happens after the caller's row rollback.
+    return a nonzero result. This helper never writes SQLite. Each record
+    is one small append (a single write of one LF-terminated line); the
+    store's writer lease does NOT cover this file — concurrent processes
+    quarantining into the same data dir rely on append-mode single-write
+    line atomicity, which is why every record is exactly one line.
     """
     stamp = now if now is not None else now_iso()
     date_part = stamp[:10] if len(stamp) >= 10 else stamp

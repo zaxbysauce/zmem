@@ -3787,7 +3787,11 @@ def main():
                         "signal": args.signal,
                         "source_ref": args.source_ref or "",
                     }
-                    data_dir = os.environ.get("ZMEM_DATA") or os.path.dirname(STORE_PATH)
+                    # Same sink resolution as every other importer writer
+                    # (sync/_ingest_row): the quarantine dir belongs to the
+                    # STORE, never to a divergent ZMEM_DATA — one store, one
+                    # quarantine directory.
+                    data_dir = os.path.dirname(STORE_PATH)
                     try:
                         quarantine_import_row(data_dir, quarantine_row,
                                                reason=exc.reason)

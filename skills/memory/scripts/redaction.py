@@ -87,15 +87,10 @@ SECRET_PATTERNS = (
     + SECRET_REFUSAL_PATTERNS
 )
 
-# Stable labels for the #180 shapes (documentation + diagnostics; the capture
-# policy maps pattern classes to its own stable refusal reasons).
-SECRET_PATTERN_LABELS = {
-    "sshpass_standalone_p": SECRET_COMMAND_PATTERNS[0],
-    "password_flag_attached": SECRET_COMMAND_PATTERNS[1],
-    "client_p_attached": SECRET_COMMAND_PATTERNS[2],
-    "url_userinfo_password": SECRET_COMMAND_PATTERNS[3],
-    "sudo_stdin_password": SECRET_REFUSAL_PATTERNS[0],
-}
+# The stable labels for the #180 shapes are the capture policy's refusal
+# reasons (write.py: source_ref_secret_like / unredactable_secret /
+# source_ref_unsafe_path) plus the shape names documented in SKILL.md's
+# capture-policy table; no parallel label mapping is kept here.
 
 # Identity membership: exactly the value-capturing patterns. A frozenset of
 # pattern objects (re.Pattern hashes by identity) — never a "has group 1"

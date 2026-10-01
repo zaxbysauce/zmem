@@ -74,7 +74,7 @@ try:
 except ImportError:
     _host = None
 
-from storelib.write import QUARANTINE_REASONS, apply_capture_policy, quarantine_import_row  # noqa: E402
+from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, apply_capture_policy, quarantine_import_row  # noqa: E402
 from storelib.purge import _ID_SIDE_TABLES  # noqa: E402
 
 
@@ -167,11 +167,13 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
             new_content, new_source_ref, new_tags, _warnings = (
                 apply_capture_policy(content=content, source_ref=source_ref,
                                      tags=tags, capture_mode="auto"))
-        except Exception as exc:
-            # CapturePolicyRefusal with a quarantineable reason (the only
-            # refusals the policy raises today). Defensive default: any
-            # refusal quarantines, so staged_count arithmetic stays true.
-            reason = getattr(exc, "reason", "source_ref_secret_like")
+        except CapturePolicyRefusal as exc:
+            # A genuine capture refusal: quarantine with its stable reason.
+            # Only CapturePolicyRefusal is handled here — any other exception
+            # (AutoCaptureRuntimeError, a future bug) propagates so the staged
+            # transaction rolls back and the import aborts instead of
+            # silently quarantining a row the policy never judged.
+            reason = exc.reason
             if reason not in QUARANTINE_REASONS:
                 reason = "source_ref_secret_like"
             quarantine_row = {

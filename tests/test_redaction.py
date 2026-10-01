@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -592,6 +593,53 @@ class CloseoutFeedbackDocTest(unittest.TestCase):
         line = ("zmem: redacted 1 secret-like value(s) from the captured "
                 "memory (value not shown).")
         self.assertNotIn(SECRET, line)
+
+    def test_quarantine_sink_follows_the_store_not_divergent_zmem_data(self):
+        """Implementation-review finding 1 guard: every importer writer must
+        resolve the quarantine sink from the STORE (dirname(STORE_PATH)),
+        never from a divergent ZMEM_DATA — one store, one quarantine dir.
+        Drives `add` and `ingest-jsonl` under ZMEM_STORE=<A>/store.sqlite
+        with ZMEM_DATA=<B> and asserts both records land under A, not B."""
+        dir_a = tempfile.mkdtemp(prefix="zmem-qsink-a-")
+        dir_b = tempfile.mkdtemp(prefix="zmem-qsink-b-")
+        self.addCleanup(shutil.rmtree, dir_a, True)
+        self.addCleanup(shutil.rmtree, dir_b, True)
+        env = {**os.environ,
+               "ZMEM_STORE": os.path.join(dir_a, "store.sqlite"),
+               "ZMEM_DATA": dir_b,
+               "ZMEM_MODELS_DIR": os.path.join(dir_b, "missing-models"),
+               "ZMEM_MODEL_AUTODOWNLOAD": "0"}
+        env.pop("ZMEM_CAPTURE_MODE", None)
+        _run(["init"], env=env)
+        row = json.loads(SECRETS_DIR.joinpath("quarantine_row.jsonl")
+                         .read_text(encoding="utf-8").splitlines()[0])
+        # Lane 1: CLI add.
+        r = _run(["add", "--namespace", "user:global", "--type", "fact",
+                  "--content", row["content"], "--tags", row["tags"],
+                  "--signal", row["signal"],
+                  "--source-ref", row["source_ref"],
+                  "--capture-mode", "auto", "--json"], env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout).get("result"), "quarantined")
+        # Lane 2: ingest-jsonl.
+        jl = os.path.join(dir_b, "row.jsonl")
+        with open(jl, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(SECRETS_DIR.joinpath("quarantine_row.jsonl")
+                     .read_text(encoding="utf-8"))
+        r2 = _run(["ingest-jsonl", "--in", jl, "--capture-mode", "auto"],
+                  env=env)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("quarantined=1", r2.stdout)
+        # Both records landed under the STORE's dir (A); B stays clean.
+        qdir_a = os.path.join(dir_a, "quarantine")
+        self.assertTrue(os.path.isdir(qdir_a), "store-dir quarantine missing")
+        lines = []
+        for name in sorted(os.listdir(qdir_a)):
+            with open(os.path.join(qdir_a, name), encoding="utf-8") as fh:
+                lines.extend(l for l in fh.read().splitlines() if l.strip())
+        self.assertEqual(len(lines), 2, lines)
+        self.assertFalse(os.path.exists(os.path.join(dir_b, "quarantine")),
+                         "quarantine wrongly created under divergent ZMEM_DATA")
 
 
 if __name__ == "__main__":

@@ -2180,28 +2180,39 @@ Command names and URL syntax match case-insensitively; option letters are
 case-SENSITIVE (`-S` vs `-s`, `-p` vs `-P`). `[REDACTED_SECRET]` is
 idempotent: a value already equal to the marker is detected but never
 rewritten, so re-running auto mode on a redacted row is a fixed point for
-content, source_ref, and tags. Known safe-direction caveat: a URL of the
-shape `scheme://host:port/a@b` over-redacts the `port/a` span, and an
-attached `ssh -p<port>` is treated as a password (both are the price of the
-issue's exact matrix).
+content, source_ref, and tags (warnings are identical for inputs whose
+detection set is stable across a re-scan — every issue fixture row; a
+placeholder value long enough to trip a second pattern re-counts, and an
+output matching no pattern emits no redaction warning). Known safe-direction
+caveat: a URL of the shape `scheme://host:port/a@b` over-redacts the
+`port/a` span, and an attached `ssh -p<port>` is treated as a password
+(both are the price of the issue's exact matrix) — and because the
+read-time credential classifier consumes the same shapes, such a stored
+row is ALSO withheld from passive injection (issue #256's read-time
+defense), not merely masked at write time.
 
 Quarantine contract: an auto-mode refusal with reason
 `source_ref_secret_like`, `source_ref_unsafe_path`, or
 `unredactable_secret` is quarantineable. The importer that caught it
-appends the ORIGINAL row to `<data-dir>/quarantine/<UTC-date>.jsonl`
-(directory 0o700, file 0o600) — one compact JSON object per line, keys in
-order `quarantined_at`, `reason`, `source_ref`, `row` — via
-`quarantine_import_row` (write failures raise `OSError`: the row is rolled
-back, counted `quarantine_failed`, and the run exits nonzero). Quarantine
-appends are single-writer (the store's writer lease serializes writers);
-review quarantine files with restricted filesystem access.
+appends the ORIGINAL row to `<store-data-dir>/quarantine/<UTC-date>.jsonl`
+(the directory of the resolved STORE — every importer writer resolves the
+same sink, never a divergent `ZMEM_DATA`; directory 0o700, file 0o600) —
+one compact JSON object per line, keys in order `quarantined_at`,
+`reason`, `source_ref`, `row` — via `quarantine_import_row` (write
+failures raise `OSError`: the row is rolled back, counted
+`quarantine_failed`, and the run exits nonzero). The store's writer lease
+does NOT cover the quarantine file; each record is one small append (a
+single write of one LF-terminated line), which is what keeps concurrent
+quarantining processes line-coherent. Review quarantine files with
+restricted filesystem access.
 
 Importer results and counters:
 - `store.py add --capture-mode auto --json` prints
   `{"id": null, "result": "quarantined", "warnings": [{"type": "quarantined", "reason": "<reason>"}]}`
-  and exits 0 on a successful quarantine; manual/reviewed/namespace
+  and exits 0 on a successful quarantine; reviewed-mode and namespace
   refusals exit 2 with `[zmem] capture policy refused: <reason>` (namespace
-  refusals keep their prose guidance).
+  refusals keep their prose guidance; `manual` never raises on capture
+  grounds — namespace validation can refuse in any mode).
 - `ingest-jsonl` summary carries `quarantined=` and `quarantine_failed=`
   after `capture_refused=`; `quarantine_failed>0` exits 1.
   `ingest-jsonl --strict` treats a quarantined row as a rejection

@@ -34,7 +34,9 @@ README.
   case-insensitive and option letters case-sensitive (`sudo -s` and
   `ssh -P<port>` never match); `[REDACTED_SECRET]` is idempotent (detected,
   never rewritten, so re-running auto mode on a redacted row is a fixed
-  point), and counts are detection counts. The read-time credential
+  point for content, source_ref, and tags — warnings are identical for
+  inputs whose detection set is stable across a re-scan, including every
+  issue fixture row), and counts are detection counts. The read-time credential
   withhold on the passive injection lane (issue #256) picks the new shapes
   up through the same registry, and evidence/hook redaction inherits every
   detector via `redact_text`.
