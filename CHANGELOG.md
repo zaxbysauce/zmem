@@ -10,6 +10,35 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.74.0] - 2026-09-30
+
+### Added
+- **user:global relevance floor on the passive injection lane** (issue
+  #235). On gated moments (`pretool` and `subagent` — the hooks'
+  posttoolbatch maps to `pretool` store-side) a `user:global` injection
+  candidate whose best measured relevance lane (`_rel_lex`/`_rel_cos`/
+  `_rel_ent`/`_rel_graph`) sits below the new tier floor is withheld
+  BEFORE the project/global merge and its reserved slot returns empty
+  rather than being backfilled — the generic per-lane floors already judge
+  every tier, but a generic-token-overlap global row could clear the 0.30
+  lex floor while being irrelevant to the operation, which field
+  measurement called the passive surface's single largest quality cost.
+  The selector resolves the floor store-side (`user_global_floor=` argument
+  > `ZMEM_INJECT_FLOOR_USER_GLOBAL` env > `INJECT_FLOOR_USER_GLOBAL_DEFAULT`
+  0.5; `0` disables) and threads it through the one kwargs dict BOTH
+  `recall_memory` and `recent_memory` consume — an asymmetric kwarg there
+  is the silent-empty-envelope hazard class, pinned by a symmetry test. A
+  `global_withheld` count joins the JSON envelope only when a withhold
+  happened (zero-withhold envelopes stay byte-identical, mirroring
+  `secret_withheld`). Explicit query-less rule (issue #235's comment): a
+  global candidate with NO measured lane keeps the relevance gate's
+  not-measured exemption — Claude Code SubagentStart is query-less until
+  issue #253 restores task-keyed recall, and the floor must not empty that
+  surface's global tier. `session_start`/`user_prompt`/`precompact` keep
+  their current global composition; `explain_recall` output is untouched.
+  No `hooks/` script and no CLI flag changed — the hook argv surface is
+  frozen and the floor is store-internal.
+
 ## [0.73.0] - 2026-09-30
 
 ### Added

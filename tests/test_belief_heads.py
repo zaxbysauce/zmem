@@ -44,8 +44,9 @@ _ROUTE_ENV_KEYS = (
     "ZMEM_MODELS_DIR", _ZMEM_MODEL_AUTO_DL, "ZMEM_MODEL_URL",
     "ZMEM_EMBED_PROFILE", "ZMEM_CROSS_ENCODER_MODEL", "HOME", "USERPROFILE",
     "APPDATA", "LOCALAPPDATA",
-    # Trust floor must sit at its default (0.2) for the below-bar check.
-    "ZMEM_INJECT_FLOOR_TRUST",
+    # Trust floor must sit at its default (0.2) for the below-bar check;
+    # issue #235's user:global tier floor rides the same injection lane.
+    "ZMEM_INJECT_FLOOR_TRUST", "ZMEM_INJECT_FLOOR_USER_GLOBAL",
 )
 _IMPORT_SANDBOX = Path(tempfile.mkdtemp(prefix="zmem-belief-import-"))
 atexit.register(shutil.rmtree, _IMPORT_SANDBOX, ignore_errors=True)

@@ -64,6 +64,8 @@ _STRIP_ENV = (
     # ambient operator value (e.g. ZMEM_INJECT_FLOOR_LEX=0.0) flips the
     # below-relevance / happy-path assertions non-hermetically.
     "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS", "ZMEM_INJECT_FLOOR_ENT",
+    # issue #235: the user:global tier floor rides the same lane.
+    "ZMEM_INJECT_FLOOR_USER_GLOBAL",
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
     # #93 A1 residue: eval-runner pollution vars — a single-process
     # multi-file runner must not leak the fake embedder or pinned clock in.

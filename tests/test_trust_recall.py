@@ -94,7 +94,7 @@ class _FloorEnvHermetic:
     FLOOR_ENVS = ("ZMEM_INJECT_FLOOR_TRUST", "ZMEM_INJECT_FLOOR_PROMPT",
                   "ZMEM_INJECT_FLOOR_RECENT", "ZMEM_INJECT_FLOOR_GATE_NONE",
                   "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
-                  "ZMEM_INJECT_FLOOR_ENT")
+                  "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_USER_GLOBAL")
 
     def setUp(self):
         self._saved_floors = {k: os.environ.get(k) for k in self.FLOOR_ENVS}
@@ -185,7 +185,7 @@ class TrustRecallCliBase(unittest.TestCase):
         for _k in ("ZMEM_INJECT_FLOOR_TRUST", "ZMEM_INJECT_FLOOR_PROMPT",
                    "ZMEM_INJECT_FLOOR_RECENT", "ZMEM_INJECT_FLOOR_GATE_NONE",
                    "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
-                   "ZMEM_INJECT_FLOOR_ENT"):
+                   "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_USER_GLOBAL"):
             self.env.pop(_k, None)
         # Fixture rows must not semantic-dedup into each other (write-path
         # cosine merge returns the PRE-EXISTING id), so every content is
