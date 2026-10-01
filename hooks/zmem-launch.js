@@ -102,6 +102,7 @@ const NEEDS_NAMESPACE = new Set([
     "convention-capture",
     "capture-correction",
     "precompact",
+    "session-end",
 ]);
 
 // Hook-name → Claude Code hookEventName (for the {hookSpecificOutput} rewrap).
@@ -293,11 +294,17 @@ function resolveNamespace(projectDir, opts = {}) {
         "print(json.dumps({'ns': _ns, 'remote': bool(_fb is None or _ns != _fb)}))";
     const candidates =
         process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    // The caller may be a time-bounded host hook.  The interpreter fallback
+    // must share one resolver allocation rather than consuming it once per
+    // candidate.
+    const resolveStarted = clock();
     for (const py of candidates) {
+        const remainingResolveMs = resolveMs - (clock() - resolveStarted);
+        if (remainingResolveMs <= 0) break;
         try {
             const out = execFileSync(py, ["-c", code, scriptsDir, projectDir], {
                 encoding: "utf8",
-                timeout: resolveMs,
+                timeout: Math.max(1, remainingResolveMs),
                 stdio: ["ignore", "pipe", "ignore"],
             }).trim();
             if (out) {
@@ -330,7 +337,7 @@ function resolveNamespace(projectDir, opts = {}) {
     }
     warnOnce(warn, "namespace_resolution_error",
         "zmem: namespace_resolution_error=1 (falling back to user:global)\n");
-    return "user:global";
+    return opts.requireResolved ? "" : "user:global";
 }
 
 // --- Launcher watchdog (issue #121) -------------------------------------------
@@ -657,6 +664,14 @@ const EVIDENCE_RAW_MAX_BYTES = 64 * 1024;
 const EVIDENCE_WRITER_MAX_INFLIGHT = 8;
 const EVIDENCE_WRITER_TIMEOUT_MS = 15000;
 let evidenceWritersInFlight = 0;
+// Issue #135: automatic training capture is a bounded, fail-open adapter.  The
+// start action remains synchronous so the store can allocate the per-turn
+// correlation id; observations and snapshots use a detached writer and never
+// hold up the host callback.  The adapter owns redaction and governance.
+const TRAINING_CAPTURE_HOSTS = new Set(["claude", "codex", "zcode"]);
+const TRAINING_CAPTURE_TIMEOUT_MS = 5000;
+const TRAINING_CAPTURE_PROBE_TIMEOUT_MS = 250;
+const TRAINING_CAPTURE_OUTPUT_RESERVE_MS = 500;
 const EDIT_TOOL_NAMES = new Set([
     "edit", "edit_file", "write", "write_file", "writefile", "notebookedit",
     "notebook_edit", "multiedit", "multi_edit", "applypatch", "apply_patch",
@@ -758,19 +773,40 @@ function _sanitizeRefPath(value) {
     return clean.slice(0, 4096);
 }
 
-function resolvePython(env = process.env) {
+function resolvePython(env = process.env, platform = process.platform,
+                       probe = execFileSync, timeoutMs = TRAINING_CAPTURE_PROBE_TIMEOUT_MS,
+                       now = elapsedProcessMs) {
     const explicit = env && typeof env.ZMEM_PYTHON === "string" ? env.ZMEM_PYTHON.trim() : "";
     if (explicit) return explicit;
-    const candidates = process.platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    const candidates = platform === "win32" ? ["python", "python3"] : ["python3", "python"];
+    const clock = typeof now === "function" ? now : elapsedProcessMs;
+    const deadline = Number(clock()) + Math.max(1, timeoutMs);
     for (const candidate of candidates) {
+        const remaining = Math.floor(deadline - Number(clock()));
+        if (remaining <= 0) break;
         try {
-            execFileSync("where", [candidate], { stdio: "ignore" });
+            // `where` is Windows-only.  Probing the interpreter itself works
+            // on both POSIX and Windows and does not select a missing POSIX
+            // command merely because the lookup utility is absent.
+            // The adapter is called from host hooks.  A PATH entry can point
+            // at a stalled shim, so probing it must share the capture budget
+            // instead of becoming an unbounded synchronous wait.
+            probe(candidate, ["--version"], {
+                stdio: "ignore",
+                timeout: remaining,
+            });
             return candidate;
         } catch {
             // Try the next interpreter name; the caller remains fail-open.
         }
     }
     return candidates[0];
+}
+
+function resolveDetachedPython(env = process.env, platform = process.platform) {
+    const explicit = env && typeof env.ZMEM_PYTHON === "string" ? env.ZMEM_PYTHON.trim() : "";
+    if (explicit) return explicit;
+    return platform === "win32" ? "python" : "python3";
 }
 
 // --- Codex SessionEnd fast path (issue #189) -------------------------------
@@ -1104,6 +1140,7 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
             env: childEnv,
             stdio: ["pipe", "ignore", "ignore"],
             detached: true,
+            windowsHide: true,
         });
         if (!child) return false;
         evidenceWritersInFlight += 1;
@@ -1137,11 +1174,209 @@ function recordEvidence(host, hookName, payload, meta, env = process.env,
     }
 }
 
+function _trainingCaptureScript(env = process.env) {
+    const root = (env && (env.ZMEM_ROOT || env.PLUGIN_ROOT ||
+        env.CLAUDE_PLUGIN_ROOT || env.ZCODE_PLUGIN_ROOT)) || getPluginRoot();
+    const script = join(root, "hooks", "lib", "zmem-training-capture.py");
+    return existsSync(script) ? script : "";
+}
+
+function _trainingCaptureSession(meta, env) {
+    return _firstNonEmptyString(
+        meta && meta.session_id, meta && meta.sessionId,
+        env && env.ZMEM_SESSION, env && env.CLAUDE_SESSION_ID,
+    );
+}
+
+function _trainingCaptureObservation(meta, hookName) {
+    const raw = _compactJson({ hook_name: hookName, callback: meta || {} });
+    if (!raw) return { hook_name: hookName };
+    try { return JSON.parse(raw); } catch { return { hook_name: hookName }; }
+}
+
+function _trainingCaptureInput(host, hookName, meta, env, action, extra = {}) {
+    const callback = meta && typeof meta === "object" && !Array.isArray(meta) ? meta : {};
+    const sessionId = _trainingCaptureSession(callback, env);
+    const input = {
+        action,
+        host,
+        hook_name: hookName,
+        session_id: sessionId,
+        namespace: _firstNonEmptyString(callback.namespace, env && env.ZMEM_NAMESPACE),
+        cwd: _firstNonEmptyString(
+            callback.cwd, env && env.CLAUDE_PROJECT_DIR,
+            env && env.CODEX_PROJECT_DIR, env && env.ZCODE_PROJECT_DIR,
+        ),
+        host_task_id: _firstNonEmptyString(
+            callback.host_task_id, callback.hostTaskId,
+            callback.task_id, callback.taskId,
+        ),
+        prompt: _firstNonEmptyString(
+            callback.prompt, callback.user_prompt, callback.userPrompt,
+            callback.user_message, callback.userMessage,
+        ),
+        assistant_response: _firstNonEmptyString(
+            callback.assistant_response, callback.assistantResponse,
+        ),
+        ...extra,
+    };
+    const captureKey = _firstNonEmptyString(
+        callback.capture_key, callback.captureKey,
+        callback.turn_id, callback.turnId,
+    );
+    const taskId = _firstNonEmptyString(
+        callback.task_id, callback.taskId,
+        callback.host_task_id, callback.hostTaskId,
+    );
+    if (taskId) input.task_id = taskId;
+    if (captureKey) input.capture_key = captureKey;
+    if (action === "observe") {
+        input.observation_kind = extra.observation_kind || "post_tool";
+        input.observation = _trainingCaptureObservation(callback, hookName);
+    }
+    return input;
+}
+
+function _captureDisabled(env = process.env) {
+    return Boolean(env && typeof env.ZMEM_CAPTURE === "string" &&
+        env.ZMEM_CAPTURE.trim() === "0");
+}
+
+function _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
+                                     spawnFn = spawn, python = "") {
+    try {
+        const script = _trainingCaptureScript(env);
+        const child = spawnFn(python || resolvePython(env), [script, "--action", action], {
+            detached: true,
+            windowsHide: true,
+            stdio: ["pipe", "ignore", "ignore"],
+            env: { ...(env || {}), ZMEM_HOST: host },
+        });
+        let finished = false;
+        let reaper = null;
+        const clearReaper = () => {
+            if (finished) return;
+            finished = true;
+            if (reaper !== null) clearTimeout(reaper);
+        };
+        child.on("error", clearReaper);
+        child.on("close", clearReaper);
+        reaper = setTimeout(() => {
+            try { if (typeof child.kill === "function") child.kill(); } catch { /* fail open */ }
+            clearReaper();
+        }, TRAINING_CAPTURE_TIMEOUT_MS);
+        if (finished) clearTimeout(reaper);
+        if (typeof reaper.unref === "function") reaper.unref();
+        if (child.stdin) {
+            child.stdin.on("error", () => {});
+            child.stdin.end(encoded + "\n");
+        }
+        child.unref();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function _trainingCaptureNow(options = {}) {
+    const clock = options && typeof options.now === "function" ? options.now : elapsedProcessMs;
+    try {
+        const value = Number(clock());
+        return Number.isFinite(value) ? value : Number(elapsedProcessMs());
+    } catch {
+        return Number(elapsedProcessMs());
+    }
+}
+
+function runTrainingCapture(host, hookName, meta, env = process.env,
+                            action = "observe", extra = {}, execFn = execFileSync,
+                            spawnFn = spawn, options = {}) {
+    try {
+        if (!TRAINING_CAPTURE_HOSTS.has(host)) return {};
+        if (_captureDisabled(env)) return {};
+        const script = _trainingCaptureScript(env);
+        if (!script || typeof execFn !== "function") return {};
+        const input = _trainingCaptureInput(host, hookName, meta, env, action, extra);
+        const encoded = safeJsonStringify(input, EVIDENCE_RAW_MAX_BYTES);
+        if (!encoded) return {};
+        const captureStartedAt = _trainingCaptureNow(options);
+        const configuredDeadline = options && options.deadline;
+        const deadline = typeof configuredDeadline === "number"
+            && Number.isFinite(configuredDeadline) ? configuredDeadline : null;
+        const allocationMs = deadline === null
+            ? TRAINING_CAPTURE_TIMEOUT_MS
+            : Math.max(0, Math.min(
+                TRAINING_CAPTURE_TIMEOUT_MS,
+                deadline - captureStartedAt - TRAINING_CAPTURE_OUTPUT_RESERVE_MS,
+            ));
+        if (allocationMs <= 0) return {};
+        const probeMs = Math.min(TRAINING_CAPTURE_PROBE_TIMEOUT_MS, allocationMs);
+        const clock = options && typeof options.now === "function"
+            ? options.now : elapsedProcessMs;
+        const probe = options && typeof options.probe === "function"
+            ? options.probe : execFileSync;
+        if (execFn === execFileSync && action !== "start") {
+            // Detached work is optional and must not synchronously probe an
+            // interpreter before the host receives its hook envelope.
+            const python = resolveDetachedPython(env);
+            _runTrainingCaptureDetached(host, hookName, meta, env, action, extra, encoded,
+                spawnFn, python);
+            return {};
+        }
+        const python = resolvePython(env, process.platform, probe,
+            probeMs, clock);
+        const remainingMs = Math.floor(
+            allocationMs - (_trainingCaptureNow(options) - captureStartedAt)
+        );
+        if (remainingMs <= 0) return {};
+        const output = execFn(python, [script, "--action", action], {
+            input: encoded + "\n",
+            encoding: "utf8",
+            timeout: remainingMs,
+            env: { ...(env || {}), ZMEM_HOST: host },
+            stdio: ["pipe", "pipe", "ignore"],
+        });
+        const parsed = JSON.parse(String(output || "{}"));
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+function _trainingCaptureAction(hookName) {
+    // SessionStart runs before a user prompt can establish a capture.  Avoid a
+    // needless Python subprocess on that hot path; the first UserPromptSubmit
+    // callback creates the partial and later hooks attach observations.
+    if (hookName === "session-start") return null;
+    if (hookName === "recall") return "start";
+    if (hookName === "session-end") return "clear";
+    return "observe";
+}
+
+function snapshotTrainingDelivery(host, hookName, meta, env, payload,
+                                  execFn = execFileSync) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return {};
+    const hasContext = Object.prototype.hasOwnProperty.call(payload, "rendered")
+        || Object.prototype.hasOwnProperty.call(payload, "additionalContext");
+    if (!hasContext) return {};
+    const rendered = typeof payload.rendered === "string" ? payload.rendered
+        : typeof payload.additionalContext === "string" ? payload.additionalContext : "";
+    const effectiveOps = Array.isArray(payload.effective_ops)
+        ? payload.effective_ops : Array.isArray(payload.effectiveOps)
+            ? payload.effectiveOps : [];
+    return runTrainingCapture(host, hookName, meta, env, "snapshot", {
+        rendered,
+        effective_ops: effectiveOps,
+        transform_version: typeof payload.transform_version === "string"
+            ? payload.transform_version : "v1",
+    }, execFn);
+}
+
 // --- Build the canonical ZMEM_* env for the child ---------------------------
 // hookName is optional (back-compat for direct callers/tests that don't care
 // about the namespace-skip): omitted/unrecognized names get the namespace
 // resolved (safe default — never SILENTLY skip for a hook that needs it).
-function buildCanonicalEnv(host, meta, hookName) {
+function buildCanonicalEnv(host, meta, hookName, options = {}) {
     const env = { ...process.env };
 
     const project =
@@ -1236,8 +1471,11 @@ function buildCanonicalEnv(host, meta, hookName) {
     // ~100ms cold-start) for hooks that actually consume ZMEM_NAMESPACE. An
     // unrecognized/omitted hookName resolves anyway (fail safe toward
     // correctness, not silently toward speed).
-    env.ZMEM_NAMESPACE =
-        !hookName || NEEDS_NAMESPACE.has(hookName) ? resolveNamespace(project) : "";
+    env.ZMEM_NAMESPACE = !hookName || NEEDS_NAMESPACE.has(hookName)
+        ? resolveNamespace(project, {
+            resolveMs: options.namespaceResolveMs,
+            requireResolved: options.requireResolvedNamespace === true,
+        }) : "";
     env.ZMEM_SKILLS_DIRS = skillsDirs;
     env.ZMEM_TIER0 = tier0;
     env.ZMEM_CTX_BUDGET = ctxBudget;
@@ -1641,11 +1879,14 @@ async function main() {
     // exit 0. Pass-through hooks stay unwatched (documented residual).
     const translated = TRANSLATED_HOOKS.has(hookName);
     const outChunks = [];
-    const fireState = { child: null, host: "", budget: 0, env: null };
+    const fireState = { child: null, host: "", budget: 0, env: null,
+        meta: null, trainingCaptureDeadline: null };
     let watchdog = null;
     if (translated) {
         const watchdogMs = readPositiveIntMs(process.env, "ZMEM_LAUNCHER_WATCHDOG_MS",
             budgetDefault("launcher_watchdog_ms", DEFAULT_LAUNCHER_WATCHDOG_MS));
+        const watchdogStartedAt = elapsedProcessMs();
+        fireState.trainingCaptureDeadline = watchdogStartedAt + watchdogMs;
         watchdog = startWatchdog(() => fireState.child, watchdogMs, PRODUCTION_CLOCK, () => {
             const raw = Buffer.concat(outChunks).toString("utf8");
             let envelope;
@@ -1657,6 +1898,12 @@ async function main() {
                 envelope = {};
             }
             process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
+            try {
+                snapshotTrainingDelivery(
+                    fireState.host || detectHost(), hookName,
+                    fireState.meta || {}, fireState.env || process.env,
+                    extractPayload(raw));
+            } catch { /* capture is fail-open */ }
             appendOuterTimeoutDecision(fireState.env || process.env, hookName, "launcher", {
                 tier0_emitted: hookName === "session-start" && extractPayload(raw) !== null,
                 timeout_ms: watchdogMs,
@@ -1718,6 +1965,26 @@ async function main() {
             outputEmitted = true;
             emitCodexSessionEndResult();
         };
+        // Capture clear uses the same namespace resolver as an ordinary
+        // session-end. If it cannot resolve within the remaining host budget,
+        // skip it rather than clearing an unrelated fallback namespace.
+        const beforeNamespace = elapsedProcessMs();
+        const namespaceBudget = Number.isFinite(beforeNamespace)
+            ? Math.max(0, CODEX_SESSION_END_TARGET_MS - beforeNamespace
+                - CODEX_SESSION_END_OUTPUT_MARGIN_MS) : 0;
+        let captureEnv = null;
+        if (namespaceBudget > 0) {
+            const candidate = buildCanonicalEnv(host, meta, hookName, {
+                namespaceResolveMs: Math.min(DEFAULT_NAMESPACE_RESOLVE_MS, namespaceBudget),
+                requireResolvedNamespace: true,
+            });
+            if (candidate.ZMEM_NAMESPACE) captureEnv = candidate;
+        }
+        if (captureEnv) {
+            runTrainingCapture(host, hookName, meta, captureEnv, "clear", {},
+                execFileSync, spawn, { deadline: CODEX_SESSION_END_TARGET_MS,
+                    now: elapsedProcessMs });
+        }
         const fastPath = await runCodexSessionEndFastPath(meta, { onTimeout: emit });
         if (fastPath.reason === "no-budget") {
             process.stderr.write("zmem: Codex SessionEnd fast path skipped: no remaining budget\n");
@@ -1733,6 +2000,9 @@ async function main() {
     }
 
     const env = buildCanonicalEnv(host, prepared.meta, hookName);
+    fireState.host = host;
+    fireState.env = env;
+    fireState.meta = prepared.meta;
     let budget = resolveBudget(env);
     if (host === "codex" && budget > CODEX_ENVELOPE_CAP_BYTES) {
         // PRR-002 (#95): an explicitly-set operator budget above the codex
@@ -1751,6 +2021,21 @@ async function main() {
     // fitEnvelope but propagated unclamped to child shell scripts that read
     // $ZMEM_CTX_BUDGET directly.
     env.ZMEM_CTX_BUDGET = String(budget);
+
+    // Issue #135: the start allocates the correlation before a delivery can
+    // occur.  Every later observation is detached only after the hook child
+    // has finished, so a cold Python import or SQLite writer cannot consume
+    // the delivery watchdog's budget.
+    const captureAction = _trainingCaptureAction(hookName);
+    try {
+        if (captureAction === "start") {
+            runTrainingCapture(host, hookName, prepared.meta, env, captureAction, {},
+                execFileSync, spawn, {
+                    deadline: fireState.trainingCaptureDeadline,
+                    now: elapsedProcessMs,
+                });
+        }
+    } catch { /* automatic capture never blocks the host */ }
 
     // Evidence is captured exactly once, after payload normalization and
     // before the delivery child is spawned.  The detached writer never awaits
@@ -1852,12 +2137,24 @@ async function main() {
                 envelope = {};
             }
             process.stdout.write((safeJsonStringify(envelope) || "{}") + "\n");
+            try {
+                if (captureAction && captureAction !== "start") {
+                    runTrainingCapture(host, hookName, prepared.meta, env, captureAction);
+                }
+                snapshotTrainingDelivery(host, hookName, prepared.meta, env,
+                    extractPayload(raw));
+            } catch { /* capture is fail-open */ }
             // Translated hooks are always fail-open: exit 0 regardless of child.
             process.exit(0);
         });
     } else {
         // Pass-through: preserve the child's exit code (today's behavior).
         child.on("close", (code) => {
+            try {
+                if (captureAction && captureAction !== "start") {
+                    runTrainingCapture(host, hookName, prepared.meta, env, captureAction);
+                }
+            } catch { /* capture is fail-open */ }
             process.exit(code || 0);
         });
     }
@@ -1891,6 +2188,7 @@ module.exports = {
     failureSignals,
     safeJsonStringify,
     resolvePython,
+    resolveDetachedPython,
     codexSessionEndId,
     codexSessionEndEnv,
     runCodexSessionEndFastPath,
@@ -1899,6 +2197,9 @@ module.exports = {
     CODEX_SESSION_END_TARGET_MS,
     canonicalUtcNow,
     recordEvidence,
+    runTrainingCapture,
+    snapshotTrainingDelivery,
+    _trainingCaptureAction,
     extractPayload,
     makeEnvelope,
     encodedSize,

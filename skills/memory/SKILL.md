@@ -1951,6 +1951,141 @@ Entity links are deliberately NOT carried in the JSONL (they are store-local
 derived data, like embeddings and content_norm): the receiving store rebuilds
 them by re-running the deterministic extractor on ingest — see below.
 
+### Governed training capture and export (issue #135)
+
+Automatic Claude, Codex, ZCode, and Hermes hooks may create a partial training
+capture. Capture governance defaults to deny and a denied or missing policy
+stores metadata only; local capture consent permits redacted partial storage
+but does not authorize export. A capture is exportable only after the actual
+injection result has been snapshotted, a trusted workflow has acknowledged the
+delivery, and a verifier has completed the capture with a supported outcome,
+evidence id, scoped memory ids, current export governance, and any required
+reviewer correction fields. Hook observations, Stop, tool success/failure,
+and displayed text never complete a capture.
+
+Completion evidence must match the outcome: test, compile, and lint require
+test_result evidence; user_acceptance requires turn evidence; reviewer_acceptance
+accepts turn or correction evidence. correction_closeout requires
+reviewer_acceptance with correction evidence.
+
+The explicit trusted local adapters accept reviewed JSON input and keep the
+state transitions separate:
+
+```bash
+python <store.py> capture-training-delivery --input delivery.json
+python <store.py> capture-training-acknowledge --input acknowledgement.json
+python <store.py> capture-training-completion --input completion.json
+```
+
+Every reviewer-acceptance outcome requires a separate local review transition,
+including turn evidence. Reviewer-acceptance corrections additionally require
+correction evidence:
+
+```bash
+ZMEM_TRAINING_CALLER_ID=operator-a \
+ZMEM_TRAINING_REVIEWER_IDS=operator-b \
+python <store.py> capture-training-review --input review.json
+```
+
+`ZMEM_TRAINING_CALLER_ID` is the local caller identity and
+`ZMEM_TRAINING_REVIEWER_IDS` is the comma-separated reviewer allow-list. The
+reviewer must differ from the verifier. These values protect the local
+workflow against accidental self-review; they do not provide an external
+reviewer service or a boundary against a hostile local process. Capture ids,
+session keys, and optional host task ids are correlation metadata only.
+
+The delivery response contains the local `capture_id` and immutable
+`delivery_snapshot_id`; later adapters resolve the capture through the snapshot
+id. `host_task_id` is correlation metadata only when the host supplies it.
+Replayed compatible inputs are idempotent, while conflicting snapshots or
+completion data are refused. The current redaction masks credential-like,
+email, and filesystem-path classes; it is not comprehensive PII anonymization.
+Reviewer trust on this local completion path means a local operator's
+attestation; no external reviewer registry is implied.
+
+Finalized and revoked capture records, their local delivery/completion/
+observation rows, remain for 30 days. The detached `session-cadence` task
+attempts the purge before its backup step; a successful purge keeps expired
+records out of new backups. Doctor reports an intentional expired-retention
+warning with output status `warn` and stays read-only; an operator can run the
+explicit cleanup instead:
+
+```bash
+python <store.py> purge-training-captures --confirm
+```
+
+Before enabling export, install PyArrow in the store-host interpreter:
+
+```bash
+python -m pip install --disable-pip-version-check \
+  -r skills/memory/scripts/requirements-training.txt
+```
+
+The Hermes server environment can install its packaged MCP requirements without
+installing the optional exporter:
+
+```bash
+python -m pip install --disable-pip-version-check \
+  -r hermes-plugin/server/requirements.txt
+```
+
+Install `requirements-training.txt` separately in the interpreter that runs
+`export-training`; the training extra pins PyArrow `25.0.1` for deterministic
+Parquet bytes.
+
+The read-only doctor reports the exact requirements-file command when PyArrow
+is unavailable. Reload the host after updating a plugin cache and run doctor
+before exporting.
+
+### export-training — write reviewed SFT and preference views
+
+```bash
+python <store.py> export-training DIR --snapshot-id ID \
+  --reviewer-confirmed [--namespace NS] [--quarantine-raw]
+```
+
+`--snapshot-id` selects the immutable source export snapshot and
+`--reviewer-confirmed` is a required export authorization. Both are checked
+before SQLite opens or output is created. `DIR` is the training output
+directory itself and contains the fixed `sft-000.parquet`,
+`preferences-000.parquet`, `manifest.json`, and `deletion-map.json` artifacts
+directly. `deletion-map.json` is derived deduplication and exclusion metadata;
+it does not delete canonical SQLite rows or prior operator-owned output
+folders. Empty eligible selections still produce schema-only Parquet files. A
+missing PyArrow dependency or unavailable local model for a nonempty semantic
+export fails closed before publish.
+
+`--quarantine-raw` writes a separate bounded, redacted derived dump under
+`DIR/quarantine/` with `DIR/quarantine-manifest.json`. It uses the same
+verified, acknowledged completion gate as the Parquet views; partial, denied,
+revoked, incomplete, or capture-quarantined records never reach any derived
+artifact. Training vectors are in-memory only and never sync or back up.
+Output is published from a validated same-volume staging directory, with one
+advisory per-output lock and the final manifest written last; consumers must
+reject output without a valid manifest. Parquet, quarantine, deletion-map, and
+staging files are operator-owned disposable artifacts outside canonical-row
+retention; purging SQLite capture rows does not delete prior published output
+folders. Doctor reports abandoned staging directories but is read-only by
+default. After confirming no export is running, an operator can
+explicitly remove only stale direct, non-symlink `.training-staging-*` siblings
+of `DIR`:
+
+```bash
+python <doctor.py> --project . --training-output ./training \
+  --cleanup-training-staging --confirm-no-training-export
+```
+
+The cleanup skips candidates newer than 24 hours and rechecks mtimes before
+removal. For `./training`, a candidate is `./.training-staging-*`. The remedy
+for an expired-retention warning is `python <store.py>
+purge-training-captures --confirm`, followed by another doctor run. The
+exporter bounds work at 10,000 source captures by default. Set
+ZMEM_TRAINING_MAX_ROWS to a lower positive limit when needed; exceeding the
+limit fails before publication and leaves no new manifest. The exporter has no
+cross-process lock that doctor could use to prove an export is
+inactive, so the confirmation flag is an operator assertion. Revoked captures
+are reported as an informational count and remain ineligible for export.
+
 v13 (issue #65, 10.7): every row carries a `kind` discriminator (`"memory"`);
 episodes round-trip as additional `"episode"` and `"episode_memory"`
 records when any exist (memberships are emitted only when both endpoints are
@@ -2343,14 +2478,17 @@ zmem fixture ever contains that wrapper.
 ## Timeout budget
 
 Issue #121: the hook path runs inside the host's hook timeout (the host
-configs give SessionStart 15 s) with an internal budget. Canonical integer
-values live in `hooks/timeout-budget.json`; runtime overrides read env vars
-and fall back to those defaults (an invalid value falls back with exactly
-one warning).
+configs give SessionStart 15 s) with an internal budget. Canonical shared
+integer values live in `hooks/timeout-budget.json`; the private
+training-capture allocations below are implemented in `hooks/zmem-launch.js`.
+Runtime overrides read env vars and fall back to those defaults (an invalid
+value falls back with exactly one warning).
 
 | Stage | Value | Override env var | Notes |
 |---|---|---|---|
 | Launcher watchdog | 12000 ms | `ZMEM_LAUNCHER_WATCHDOG_MS` | Kills the child tree at the deadline, emits the retained Tier 0 sentinel, logs `outer_timeout=1 reason=omitted`, exits 0. |
+| Automatic capture start | 5000 ms | - | Synchronous only when the store-issued capture id is needed; observe/snapshot helpers are detached and fail open. The translated launcher clamps this private allocation to the remaining 12,000 ms watchdog deadline minus a 500 ms output reserve, and never asserts acknowledgement or outcome. |
+| Hermes capture subprocess | 5000 ms | - | `sync_turn` and session-end capture use their own per-operation cap and may add up to 5 seconds to that callback or maintenance path. The launcher’s full 5-second start allocation can leave roughly 6.5–7 seconds inside the 12,000 ms watchdog, below the 8-second recall budget, so watchdog preemption is an expected degradation. No whole-callback wall-clock guarantee is made; capture remains fail open. |
 | Namespace resolution | 2000 ms | `ZMEM_NAMESPACE_RESOLVE_MS` | Per interpreter attempt; successful non-empty REMOTE namespaces are cached per process. |
 | Namespace cache TTL | 60000 ms | `ZMEM_NAMESPACE_CACHE_TTL_MS` | Entry expires at exactly TTL; path-key resolutions are never cached. |
 | Store recall | 8000 ms (8.0 s) | `ZMEM_STORE_RECALL_TIMEOUT_S` | SessionStart + the shared recall body. Finite positive float; values above 8.0 clamp to 8.0 (one warning); values below 8.0 are honored. ONE store attempt at SessionStart (no retry loop). |

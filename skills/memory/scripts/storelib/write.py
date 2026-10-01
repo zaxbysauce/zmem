@@ -1302,6 +1302,7 @@ def update_memory(
     capture_mode: str = "manual",
     link_attr_propagate: bool = True,
     expected_old_namespace: str | None = None,
+    supersede_reason: str = "updated",
     evidence_ids: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
@@ -1311,7 +1312,8 @@ def update_memory(
     ``mid`` must exist and be LIVE — an unknown or already-superseded id is
     refused (raises ValueError; CLI exit 2, nothing written). The old row is
     NEVER content-mutated: ``superseded_at=now, valid_until=now,
-    supersede_reason='updated'``; the new row carries ``valid_from=now,
+    supersede_reason`` set to normalized ``updated`` or ``explicit correction``;
+    the new row carries ``valid_from=now,
     valid_until='', update_of=mid``. Namespace/type/tags/source_ref are copied
     from the old row unless overridden; confidence/signal/taint are
     caller-supplied or inherited.
@@ -1336,6 +1338,14 @@ def update_memory(
     content (CLI exit 1, mirroring ``add``), CapturePolicyRefusal for a
     capture-policy refusal, ValueError for unknown / already-superseded ids.
     """
+    # #135 correction lineage is a closed export signal.  Validate before the
+    # first read or transaction so an invalid request cannot partially update.
+    if not isinstance(supersede_reason, str):
+        raise ValueError("update reason must be 'updated' or 'explicit correction'")
+    normalized_reason = " ".join(supersede_reason.split()).casefold()
+    if normalized_reason not in {"updated", "explicit correction"}:
+        raise ValueError("update reason must be 'updated' or 'explicit correction'")
+
     # Resolve the old row first — everything else refuses against it.
     old = conn.execute("SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
     if old is None:
@@ -1420,7 +1430,7 @@ def update_memory(
             cur = conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
                 "WHERE id=? AND namespace=?",
-                (ts, ts, "updated", mid, expected_old_namespace),
+                (ts, ts, normalized_reason, mid, expected_old_namespace),
             )
             if cur.rowcount == 0:
                 if started_tx and conn.in_transaction:
@@ -1435,7 +1445,7 @@ def update_memory(
             conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
                 "WHERE id=?",
-                (ts, ts, "updated", mid),
+                (ts, ts, normalized_reason, mid),
             )
         try:
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))

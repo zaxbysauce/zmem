@@ -6,6 +6,15 @@ import re
 
 
 SECRET_CREDENTIAL_PATTERNS = [
+    # Authorization headers occur in prompts, rendered fences, and operation
+    # transcripts.  Keep this ahead of the generic token patterns so the whole
+    # credential (rather than an arbitrary suffix) is replaced consistently.
+    # The token alphabet contains several non-word characters.  A trailing
+    # ``\b`` therefore backtracks before a terminal ``.``, ``_``, ``+``, ``/``,
+    # ``~`` or ``-`` and leaks that character.  Require the next character to
+    # be outside the credential alphabet so the greedy match consumes the
+    # complete token while still respecting ordinary delimiters.
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])"),
     re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*\S{8,}"),
     re.compile(r"-----BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY-----"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
@@ -32,5 +41,36 @@ def redact_secret_like_text(text: str) -> tuple[str, int]:
     count = 0
     for pattern in SECRET_PATTERNS:
         redacted, changed = pattern.subn("[REDACTED_SECRET]", redacted)
+        count += changed
+    return redacted, count
+
+
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_WINDOWS_PATH_RE = re.compile(
+    r'''(?<![A-Za-z0-9])(?:[A-Za-z]:[\\/][^\s"'<>]+|\\\\[^\s\\"'<>]+\\[^\s\\"'<>]+(?:\\[^\s"'<>]+)*)'''
+)
+_POSIX_ROOTS = r"Users|home|private|tmp|var|workspaces|workspace|mnt|opt|root"
+_POSIX_PATH_RE = re.compile(
+    rf'''(?<![A-Za-z0-9/:])/(?:{_POSIX_ROOTS})(?=/|\s|"|'|<|>|$)(?:/[^\s"'<>]+)*'''
+)
+_QUOTED_PATH_RE = re.compile(
+    rf'''(?P<quote>["'])(?P<path>(?:[A-Za-z]:[\\/][^\r\n"']+|\\\\[^\s\\"']+\\[^\\\r\n"']+(?:\\[^\r\n"']+)*|/(?:{_POSIX_ROOTS})(?=/|\s|"|'|<|>|$)[^\r\n"']*))(?P=quote)'''
+)
+
+
+def redact_training_text(value: str) -> tuple[str, int]:
+    """Apply secret, email, and filesystem path redaction for training data."""
+    redacted, count = redact_secret_like_text(value)
+    def replace_quoted(match: re.Match[str]) -> str:
+        return f"{match.group('quote')}[REDACTED_PATH]{match.group('quote')}"
+
+    redacted, changed = _QUOTED_PATH_RE.subn(replace_quoted, redacted)
+    count += changed
+    for pattern, replacement in (
+        (_EMAIL_RE, "[REDACTED_EMAIL]"),
+        (_WINDOWS_PATH_RE, "[REDACTED_PATH]"),
+        (_POSIX_PATH_RE, "[REDACTED_PATH]"),
+    ):
+        redacted, changed = pattern.subn(replacement, redacted)
         count += changed
     return redacted, count

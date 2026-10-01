@@ -1,0 +1,99 @@
+[
+  {
+    "task_id": "cap-exact-a",
+    "project_key": "project-dc76d5d7535765135981ea8e",
+    "session_id": "fixture-session",
+    "episode_id": "fixture-episode",
+    "prompt": "Which command should I use for safe deploy?",
+    "context_fence": "<context>safe</context>",
+    "ops_tokens": [
+      "deploy --safe"
+    ],
+    "assistant_response": "Run deploy --safe.",
+    "outcome_kind": "test",
+    "outcome_value": "passed",
+    "evidence_ref": "ev-exact-a",
+    "source_memory_ids": [
+      "mem-exact-a"
+    ],
+    "source_event_ids": [
+      "ev-exact-a",
+      "ev-exact-b",
+      "event-exact-a",
+      "event-exact-b"
+    ],
+    "consent_scope": "fixture-export",
+    "content_license": "fixture-license",
+    "redaction_status": "redacted",
+    "redaction_policy_version": "policy-v1",
+    "split_key": "train",
+    "transform_version": "fixture-transform",
+    "label_status": "candidate_positive",
+    "exclusion_reason": null,
+    "row_checksum": "6df462df4c4fec59d2354a7c6422e8cdbc94a68799f544fae65eee66331690a7"
+  },
+  {
+    "task_id": "cap-pref",
+    "project_key": "project-dc76d5d7535765135981ea8e",
+    "session_id": "fixture-session",
+    "episode_id": "fixture-episode",
+    "prompt": "Review the corrected migration procedure.",
+    "context_fence": "<context>correction</context>",
+    "ops_tokens": [
+      "deploy --safe"
+    ],
+    "assistant_response": "The corrected procedure is deploy --safe.",
+    "outcome_kind": "reviewer_acceptance",
+    "outcome_value": "accepted",
+    "evidence_ref": "ev-pref",
+    "source_memory_ids": [
+      "mem-new"
+    ],
+    "source_event_ids": [
+      "ev-pref",
+      "event-pref"
+    ],
+    "consent_scope": "fixture-export",
+    "content_license": "fixture-license",
+    "redaction_status": "redacted",
+    "redaction_policy_version": "policy-v1",
+    "split_key": "train",
+    "transform_version": "fixture-transform",
+    "label_status": "candidate_positive",
+    "exclusion_reason": null,
+    "row_checksum": "f4b2fd02c02f488404a6783cc5c5154f44c323249c59029507f2271cce457eb2"
+  },
+  {
+    "task_id": "cap-sem-a",
+    "project_key": "project-dc76d5d7535765135981ea8e",
+    "session_id": "fixture-session",
+    "episode_id": "fixture-episode",
+    "prompt": "How do I deploy this safely?",
+    "context_fence": "<context>safe</context>",
+    "ops_tokens": [
+      "deploy --safe"
+    ],
+    "assistant_response": "Run deploy --safe.",
+    "outcome_kind": "test",
+    "outcome_value": "passed",
+    "evidence_ref": "ev-sem-a",
+    "source_memory_ids": [
+      "mem-sem-a"
+    ],
+    "source_event_ids": [
+      "ev-sem-a",
+      "ev-sem-b",
+      "event-sem-a",
+      "event-sem-b"
+    ],
+    "consent_scope": "fixture-export",
+    "content_license": "fixture-license",
+    "redaction_status": "redacted",
+    "redaction_policy_version": "policy-v1",
+    "split_key": "train",
+    "transform_version": "fixture-transform",
+    "label_status": "candidate_positive",
+    "exclusion_reason": null,
+    "row_checksum": "11f1d3eb6bcd7201b110e5545312cefb25c98458eeaace89c34d7f153f30685b"
+  }
+]

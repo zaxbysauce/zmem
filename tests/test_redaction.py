@@ -27,6 +27,7 @@ SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from storelib.write import redact_text  # noqa: E402
+from redaction import redact_training_text  # noqa: E402
 
 SECRET = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
 
@@ -57,6 +58,73 @@ class RedactTextHelperTest(unittest.TestCase):
         redacted, n = redact_text(text)
         self.assertEqual(redacted, text)
         self.assertEqual(n, 0)
+
+    def test_bearer_boundary_is_16_characters(self):
+        short = "Bearer " + "A" * 15
+        exact = "Bearer " + "A" * 16
+        self.assertEqual(redact_text(short), (short, 0))
+        redacted, count = redact_text(exact)
+        self.assertEqual((redacted, count), ("[REDACTED_SECRET]", 1))
+
+    def test_bearer_accepts_supported_delimiters_and_mixed_case(self):
+        token = "A._+/~-" + "B" * 16
+        text = f"before bEaReR {token}, after"
+        redacted, count = redact_text(text)
+        self.assertEqual(count, 1)
+        self.assertEqual(redacted, "before [REDACTED_SECRET], after")
+
+    def test_bearer_consumes_every_supported_terminal_character(self):
+        for terminal in "._+/~-":
+            with self.subTest(terminal=terminal):
+                token = "A" * 16 + terminal
+                redacted, count = redact_text(f"Bearer {token}, after")
+                self.assertEqual(count, 1)
+                self.assertEqual(redacted, "[REDACTED_SECRET], after")
+
+    def test_bearer_boundary_keeps_short_and_long_tokens_distinct(self):
+        for terminal in "._+/~-":
+            with self.subTest(terminal=terminal):
+                short = "Bearer " + ("A" * 14) + terminal
+                exact = "Bearer " + ("A" * 15) + terminal
+                self.assertEqual(redact_text(short), (short, 0))
+                self.assertEqual(redact_text(exact), ("[REDACTED_SECRET]", 1))
+
+    def test_non_bearer_scheme_is_not_redacted_by_bearer_rule(self):
+        text = "Basic " + "A" * 16
+        redacted, count = redact_text(text)
+        self.assertEqual(redacted, text)
+        self.assertEqual(count, 0)
+
+    def test_training_redaction_consumes_quoted_path_corpus(self):
+        cases = (
+            r"\\server\share\alice\secret.txt",
+            r'"\\server\share name\alice folder\secret.txt"',
+            r'"C:\Users' + r'\Alice Smith\secret.txt"',
+            r"'/home/" + r"alice/private project/secret.txt'",
+            r'"\\server\share\multiple\segments\secret.txt"',
+        )
+        for value in cases:
+            with self.subTest(value=value):
+                redacted, count = redact_training_text(value)
+                self.assertNotIn("secret.txt", redacted)
+                self.assertIn("[REDACTED_PATH]", redacted)
+                self.assertEqual(count, 1)
+
+    def test_training_path_corpus_preserves_urls_and_non_paths(self):
+        cases = (
+            (r'"/Users/' + r'alice/private work/secret.txt"', True),
+            (r'/workspaces/alice/secret.txt', True),
+            (r'https://home.example.com/path', False),
+            (r'https://example.test/' + r'Users/alice', False),
+            (r'\\n ordinary escape text', False),
+            (r'print("\\n")', False),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                redacted, count = redact_training_text(value)
+                self.assertEqual(count > 0, expected)
+                if expected:
+                    self.assertNotIn("secret.txt", redacted)
 
 
 class WritePathRedactionTest(unittest.TestCase):

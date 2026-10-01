@@ -1103,14 +1103,33 @@ class HermesPrefetchComposeTest(unittest.TestCase):
             sys.modules["zmem_hermes_ops_prefetch"] = mod
             spec.loader.exec_module(mod)
             provider = mod.ZmemMemoryProvider()
-            provider.initialize("sess-pf-provider")
+            provider.initialize("sess-pf")
 
             provider._namespace = "project:prefetch-compose"
             out = provider.prefetch("keep finalizing this work",
                                     session_id="sess-pf")
             self.assertIn("prefetchcanary", out)
-            out_nosid = provider.prefetch("keep finalizing this work")
-            self.assertNotIn("prefetchcanary", out_nosid)
+            out_mismatch = provider.prefetch(
+                "keep finalizing this work", session_id="sess-pf-provider")
+            self.assertEqual(out_mismatch, "")
+
+            # A later epoch makes an omitted callback uncorrelatable.  Assert
+            # at the transport boundary so ledger de-duplication cannot make a
+            # content-only assertion pass vacuously.
+            class RecordingTransport:
+                def __init__(self):
+                    self.calls = []
+
+                def prefetch(self, *args, **kwargs):
+                    self.calls.append((args, kwargs))
+                    return {"rendered": "unexpected context", "effective_ops": [],
+                            "transform_version": "v1"}
+
+            recorder = RecordingTransport()
+            provider._transport = recorder
+            provider.initialize("sess-pf-later")
+            self.assertEqual(provider.prefetch("later epoch query"), "")
+            self.assertEqual(recorder.calls, [])
 
             # The kill switch still silences Hermes passive prefetch.
             os.environ["ZMEM_QUERY_CONTEXT"] = "0"

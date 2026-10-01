@@ -275,6 +275,7 @@ def build_injection_envelope(
     global_withheld: int | None = None,
     candidate_lanes: dict | None = None,
     budget_note: str | None = None,
+    effective_ops: list[str] | None = None,
 ) -> dict:
     """Build the closed passive-injection envelope shared by adapters."""
     envelope = {
@@ -309,6 +310,9 @@ def build_injection_envelope(
         envelope["candidate_lanes"] = candidate_lanes
     if budget_note is not None:
         envelope["budget_note"] = budget_note
+    if (isinstance(effective_ops, list)
+            and all(isinstance(item, str) for item in effective_ops)):
+        envelope["effective_ops"] = list(effective_ops)
     return envelope
 
 

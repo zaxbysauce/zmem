@@ -10,6 +10,16 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.75.0] - 2026-10-01
+
+### Added
+- **Governed training capture and deterministic export (issue #135):** existing
+  host hooks automatically retain bounded, redacted partial captures; only
+  acknowledged captures with verified outcomes are exportable. Added local
+  governance and revocation controls, independent reviewer acceptance,
+  deterministic SFT and preference Parquet, bounded quarantine, and
+  manifest-last publication.
+
 ## [0.74.0] - 2026-09-30
 
 ### Added

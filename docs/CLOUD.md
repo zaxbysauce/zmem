@@ -137,6 +137,192 @@ store's content cap) — datasets are sized for personal-memory corpora,
 not unlimited streams. Point recall at the snapshot by running later commands with
 `ZMEM_STORE=<dest>/snapshot.sqlite`.
 
+## Governed training views (issue #135)
+
+Training views are a local, reviewed projection of completed task captures.
+They are separate from `export-dataset`: the training exporter never syncs
+capture rows, transcript text, embeddings, or event vectors, and it never
+publishes to a remote service. The local capture, review, correlation, and
+snapshot-binding tables are retained for the doctor and backup/restore paths,
+while ordinary sync remains unchanged.
+
+Every automatic Claude, Codex, ZCode, and Hermes hook may create a partial
+capture, but capture governance defaults to deny. A denied or missing policy
+stores only capture metadata and a reason; it does not store prompt,
+response, fence, ops-token text, hashes, or embeddings. Capture consent allows
+local redacted partial storage, but does not grant export consent.
+
+The Claude, Codex, and ZCode launcher callbacks are keyless unless their
+payload explicitly supplies the supported stable `capture_key` or `turn_id`.
+Keyless callbacks create fresh partials without a reusable sidecar; under
+default-deny they contain metadata only, while configured capture consent
+permits bounded redacted content. Later observations or delivery snapshots
+cannot bind to those partials automatically. The current masking covers
+credential-like values,
+email addresses, and filesystem paths. It is not comprehensive PII
+anonymization; hostnames, usernames, and other identifying values may remain
+and must not be treated as masked by default.
+
+The state machine is deliberately staged:
+
+1. The hook stores a `capture_id` and, when the actual injection result is
+   emitted, an immutable delivery snapshot. `capture_id` is local store
+   correlation; `host_task_id` is used only when the host supplied one.
+2. A trusted local workflow acknowledges the delivery snapshot. This is a
+   local-operator attestation, not an external reviewer or display receipt.
+   Host observations, Stop, tool success/failure, and displayed text do not
+   count as acknowledgement or an outcome.
+3. A trusted verifier completes the capture with a supported outcome, evidence
+   id, and scoped memory ids. Completion validates the current export
+   governance and associates the exact evidence/memory pairs in one
+   transaction. Reviewer accepted correction pairs also require the configured
+   reviewer fields and correction closeout. Reviewer trust is local-operator
+   trust for this workflow; no external reviewer registry is implied.
+
+Completion evidence is type checked against the outcome: test, compile, and
+lint outcomes require test_result evidence; user_acceptance requires turn
+evidence; reviewer_acceptance accepts turn or correction evidence. When
+correction_closeout is true, the outcome must be reviewer_acceptance and the
+evidence must be correction evidence.
+
+The explicit local adapters use JSON input files so the attestation and
+completion fields can be reviewed before the write:
+
+```bash
+python skills/memory/scripts/store.py capture-training-delivery \
+  --input delivery.json
+python skills/memory/scripts/store.py capture-training-acknowledge \
+  --input acknowledgement.json
+python skills/memory/scripts/store.py capture-training-completion \
+  --input completion.json
+```
+
+The delivery command returns the store `capture_id` and an immutable
+`delivery_snapshot_id`; acknowledgement and completion resolve the capture
+through that snapshot id. Replaying identical trusted input is idempotent.
+No host callback may supply `source_memory_ids` as export authority or infer a
+verified outcome from observations.
+
+An independent local review is required for reviewer-acceptance corrections:
+
+```bash
+ZMEM_TRAINING_CALLER_ID=operator-a \
+ZMEM_TRAINING_REVIEWER_IDS=operator-b \
+python skills/memory/scripts/store.py capture-training-review \
+  --input review.json
+```
+
+`ZMEM_TRAINING_CALLER_ID` identifies the trusted local operator invoking the
+adapter. `ZMEM_TRAINING_REVIEWER_IDS` is a comma-separated allow-list, and the
+reviewer must differ from the verifier recorded in the completion. These
+environment variables establish a local workflow boundary; they do not claim
+that a hostile process on the same machine is an external reviewer. Correlation
+keys and host task ids are local metadata used to associate delivery and
+observations, never export authority.
+
+### Exporting reviewed views
+
+Install the declared training dependency in the same Python environment that
+runs the store host before enabling export:
+
+```bash
+python -m pip install --disable-pip-version-check \
+  -r skills/memory/scripts/requirements-training.txt
+```
+
+The Hermes server requirements contain only the MCP server dependencies. They do
+not install the optional training exporter, so installing them alone keeps
+PyArrow out of the shared host environment:
+
+```bash
+python -m pip install --disable-pip-version-check \
+  -r hermes-plugin/server/requirements.txt
+```
+
+Install `requirements-training.txt` separately in the interpreter that runs
+`export-training` when Parquet output is needed.
+
+After installing or updating a plugin, reload the host so its cache uses the
+new release tree, then run the read-only doctor and confirm the training
+dependency check. Doctor reports the exact requirements-file command when
+PyArrow is unavailable; it never installs packages or edits host state.
+
+Export requires an immutable source snapshot and an explicit reviewer
+confirmation before opening the store:
+
+```bash
+python skills/memory/scripts/store.py export-training ./training \
+  --snapshot-id <snapshot-id> \
+  --reviewer-confirmed \
+  [--namespace project:github.com/you/your-repo] \
+  [--quarantine-raw]
+```
+
+`DIR` is the training output directory itself. It contains
+`sft-000.parquet`, `preferences-000.parquet`, `manifest.json`, and
+`deletion-map.json` directly. With `--quarantine-raw`, the top-level
+`quarantine-manifest.json` is also written directly under `DIR`; its bounded
+redacted dump is written under `DIR/quarantine/`. `deletion-map.json` is derived
+deduplication and exclusion metadata for the export; it does not delete canonical
+SQLite rows or prior output directories. It uses the same verified, acknowledged
+completion gate as SFT and preference output; partial, refused, revoked,
+incomplete, or capture-quarantined records never reach any derived artifact.
+The main manifest records row counts and the export snapshot identity. A
+missing PyArrow dependency or failed nonempty semantic dedup closes the export
+before output is published.
+
+Training output is staged on the same volume and validated before publish; a
+persistent sibling advisory lock serializes writers on supported local
+filesystems. NFS and SMB support is not promised. Data files are replaced
+first and the manifest is written last as the completion marker. Parquet,
+quarantine, deletion-map, and staging files are operator-owned disposable
+artifacts; canonical SQLite rows remain the retention authority. SQLite capture
+purge does not delete operator-owned published export folders. Consumers must
+reject a directory without a valid final manifest.
+The exporter bounds work at 10,000 source captures by default; operators can
+set ZMEM_TRAINING_MAX_ROWS to a lower positive limit. Exceeding the limit
+fails before publication and leaves no new manifest.
+Doctor reports incomplete staging output, illegal capture states, missing
+redaction metadata, and stale local capture records for cleanup. Revoked rows
+are counted informationally and remain excluded from export.
+Doctor remains read-only by default. After confirming no export is active, an
+operator can explicitly remove only stale direct, non-symlink
+`.training-staging-*` siblings of `DIR` with:
+
+```bash
+python skills/memory/scripts/doctor.py \
+  --project . --training-output ./training \
+  --cleanup-training-staging --confirm-no-training-export
+```
+
+The cleanup skips candidates newer than 24 hours and rechecks their mtimes
+before removal. For `./training`, a candidate is `./.training-staging-*`.
+Doctor does not inspect the writer lock and cannot prove that an export is
+inactive, so the confirmation flag is an operator assertion; consumers still
+reject any output missing its final manifest.
+
+The Hermes `sync_turn` callback automatically attempts to record a fresh partial. It establishes a
+reusable association before detached observations only when the host supplies
+an explicit `capture_key` or `turn_id`; otherwise the partial remains keyless.
+The Hermes capture subprocess is intentionally synchronous and has its own
+5-second per-operation bound. It can still contend with the store's 5-second
+SQLite busy timeout, and capture may add up to 5 seconds to `sync_turn` or the
+session-end maintenance path. There is no whole-callback wall-clock guarantee;
+capture failures remain fail-open to the host. The Claude, Codex, and ZCode
+launcher start path is also synchronous with a private 5-second capture cap,
+clamped to the remaining 12-second watchdog deadline with a 500 ms output
+reserve. A full 5-second capture leaves roughly 6.5–7 seconds for the rest of
+the path, so the watchdog can preempt recall even though the store recall
+budget is 8 seconds. The outer launcher watchdog protects the host hook process
+and does not turn a partial capture into an acknowledgement, outcome, or
+verified export.
+
+Capture retention is local SQLite retention. Purging expired rows does not
+remove earlier operator-owned training output folders or their published
+copies. Doctor reports an intentional expired-retention warning with
+`status: "warn"`; after checking that no export is active, run
+`python <store.py> purge-training-captures --confirm` and rerun doctor.
+
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)
 
 The simplest option: periodically export the store's most relevant memories

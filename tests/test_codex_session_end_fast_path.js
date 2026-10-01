@@ -452,7 +452,10 @@ function testDivergentStoreAndDataRoots() {
             result.status === 0 && result.stdout === "{}\n" && result.stderr === ""
             && storeGone && storePreserved && defaultPreserved);
     } finally {
-        fs.rmSync(tree, { recursive: true, force: true });
+        // SessionEnd capture may still briefly hold store.sqlite in its detached
+        // child. Node retries transient busy operations after 100 + ... + 1000 ms
+        // (5.5 s for one operation), covering the capture child's 5 s watchdog.
+        fs.rmSync(tree, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
 }
 
@@ -485,4 +488,7 @@ function testNonCodexNegative() {
     console.log("\n[4] Divergent store/data roots");
     testDivergentStoreAndDataRoots();
     console.log(`\n${passed} passed, 0 failed`);
-})().catch(() => process.exitCode = 1);
+})().catch((error) => {
+    console.error(error && error.stack ? error.stack : String(error));
+    process.exitCode = 1;
+});

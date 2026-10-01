@@ -18,6 +18,8 @@ so ``ZMEM_HOME`` is optional for a standalone install.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import importlib.util
 import json
 import logging
@@ -75,6 +77,123 @@ _NATIVE_EVIDENCE_WORKERS = 2
 _NATIVE_EVIDENCE_QUEUE: "queue.Queue[str]" = queue.Queue(maxsize=_NATIVE_EVIDENCE_QUEUE_MAX)
 _NATIVE_EVIDENCE_START_LOCK = threading.Lock()
 _NATIVE_EVIDENCE_STARTED = False
+_TRAINING_CAPTURE_TIMEOUT_S = 5.0
+_TRAINING_CAPTURE_INFLIGHT_MAX = 4
+_TRAINING_CAPTURE_INFLIGHT = threading.BoundedSemaphore(_TRAINING_CAPTURE_INFLIGHT_MAX)
+# Retain enough time for genuinely long-running agent turns while bounding
+# stale provider memory. Session/reinitialize cleanup and the 32-ticket cap are
+# the primary retention controls; this TTL handles a missing completion.
+_HERMES_TURN_TICKET_TTL_S = 86_400.0
+_HERMES_TURN_TICKET_MAX = 32
+_HERMES_TURN_TOMBSTONE_MAX = 32
+_HERMES_TICKET_RENDERED_MAX_BYTES = 16_000
+_HERMES_TICKET_OPS_MAX_BYTES = 400
+_HERMES_TICKET_VERSION_MAX_BYTES = 512
+_CAPTURE_STORE_ENV: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "zmem_capture_store_env", default=False,
+)
+
+def _capture_disabled() -> bool:
+    """The operator kill switch is authoritative across Hermes wrappers."""
+    return os.environ.get("ZMEM_CAPTURE", "").strip() == "0"
+
+
+def _hermes_prompt_digest(value: object) -> str | None:
+    """Return a non-reversible digest for the canonical Hermes prompt."""
+    if not isinstance(value, str):
+        return None
+    prompt = value.strip()
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        return None
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def _hermes_capture_redactor():
+    """Load the approved dependency-free redactor without importing storelib.
+
+    ``storelib.training_capture`` imports the full SQLite schema and historically
+    made its own ``sys.path`` edit for ``redaction``.  Hermes only needs the
+    dependency-free training scanner here, so load the resolved-home source by
+    filename under a unique, non-registered module name.
+    """
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    scripts = home / "skills" / "memory" / "scripts"
+    redaction_path = scripts / "redaction.py"
+    if not redaction_path.is_file():
+        return None
+    try:
+        module_name = f"_zmem_hermes_redaction_{uuid.uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(module_name, redaction_path)
+        if spec is None or spec.loader is None:
+            return None
+        redaction = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(redaction)
+        redact_training_text = redaction.redact_training_text
+        if not callable(redact_training_text):
+            return None
+        return redact_training_text
+    except Exception:
+        return None
+
+
+def _hermes_redacted_ticket_text(value: object, *, max_bytes: int) -> str | None:
+    """Redact and bound a ticket value before retaining it in provider memory."""
+    if not isinstance(value, str):
+        return None
+    if len(value.encode("utf-8")) > 65_536:
+        return None
+    redact = _hermes_capture_redactor()
+    if redact is None:
+        return None
+    try:
+        redacted, _ = redact(value)
+        raw = redacted.encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if len(raw) > max_bytes:
+        return None
+    return raw.decode("utf-8")
+
+
+def _hermes_ticket_envelope(envelope: object) -> dict[str, object] | None:
+    """Build the bounded, redacted snapshot envelope retained for one turn."""
+    if not isinstance(envelope, dict) or not isinstance(envelope.get("rendered"), str):
+        return None
+    rendered = _hermes_redacted_ticket_text(
+        envelope["rendered"], max_bytes=_HERMES_TICKET_RENDERED_MAX_BYTES,
+    )
+    if rendered is None:
+        return None
+    operations = envelope.get("effective_ops", [])
+    if not isinstance(operations, list) or len(operations) > 128:
+        return None
+    redacted_ops: list[str] = []
+    for operation in operations:
+        item = _hermes_redacted_ticket_text(
+            operation, max_bytes=_HERMES_TICKET_VERSION_MAX_BYTES,
+        )
+        if item is None:
+            return None
+        redacted_ops.append(item)
+    try:
+        encoded_ops = json.dumps(redacted_ops, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if len(encoded_ops.encode("utf-8")) > _HERMES_TICKET_OPS_MAX_BYTES:
+        return None
+    transform_version = _hermes_redacted_ticket_text(
+        envelope.get("transform_version", "v1"),
+        max_bytes=_HERMES_TICKET_VERSION_MAX_BYTES,
+    )
+    if transform_version is None:
+        return None
+    return {
+        "rendered": rendered,
+        "effective_ops": redacted_ops,
+        "transform_version": transform_version or "v1",
+    }
 
 
 def _resolve_zmem_home() -> Optional[Path]:
@@ -460,6 +579,7 @@ def _passive_store_args(
 
 def _run_passive_store(
     args: List[str], timing: Optional[Dict[str, int]] = None,
+    *, capture: bool = False,
 ) -> Dict[str, Any]:
     """Run a passive command without allowing adapter failures to escape.
 
@@ -467,7 +587,15 @@ def _run_passive_store(
     store attempt behind a decision line can carry its measured ``t_ms``.
     """
     try:
-        result = _run_store(args, timing=timing)
+        marker = _CAPTURE_STORE_ENV.set(capture)
+        try:
+            # Preserve the historical call shape for provider/test adapters
+            # that replace _run_store with a narrow fail-open seam.  The real
+            # subprocess helper reads the context marker below and adds the
+            # capture envelope flag only to that child process.
+            result = _run_store(args, timing=timing)
+        finally:
+            _CAPTURE_STORE_ENV.reset(marker)
     except Exception as exc:  # pragma: no cover - defensive seam for hosts
         logger.debug("zmem passive store call failed (%s)", exc)
         return {"ok": False, "stdout": "", "stderr": "", "returncode": 1}
@@ -506,6 +634,7 @@ def _sanitize_store_error(r: Dict[str, Any], limit: int = 200) -> str:
 def _run_store(
     args: List[str], input_text: str | None = None,
     timing: Optional[Dict[str, int]] = None,
+    env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Run ``store.py <args>`` and return ``{ok, stdout, stderr, returncode}``.
 
@@ -523,6 +652,11 @@ def _run_store(
             "returncode": 127,
         }
     cmd = [_python_bin(), str(store_py), *args]
+    if env is None and _CAPTURE_STORE_ENV.get():
+        env = os.environ.copy()
+        # Capture mode is parent-owned.  Preserve an explicit disabled value;
+        # the wrapper must never turn the global kill switch back on.
+        env["ZMEM_CAPTURE"] = os.environ.get("ZMEM_CAPTURE", "1")
     # Start at the exact subprocess boundary.  Path resolution is outside this
     # interval, matching the MCP server's attributed timing contract.
     started = time.perf_counter()
@@ -544,6 +678,7 @@ def _run_store(
             encoding="utf-8",
             errors="replace",
             timeout=command_timeout,
+            env=env,
         )
         _record_timing()
         return {
@@ -568,6 +703,69 @@ def _run_store(
             "stderr": f"store.py failed: {exc}",
             "returncode": 1,
         }
+
+
+def _training_capture_script() -> Optional[Path]:
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    script = home / "hooks" / "lib" / "zmem-training-capture.py"
+    return script if script.is_file() else None
+
+
+def _run_training_capture(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Invoke the shared partial-capture adapter without exposing failures."""
+    if _capture_disabled():
+        return {}
+    script = _training_capture_script()
+    if script is None or action not in {
+        "start", "start_standalone", "observe", "snapshot", "clear",
+    }:
+        return {}
+    request = dict(payload)
+    request["action"] = action
+    encoded = _safe_json_dumps(request, max_bytes=64 * 1024)
+    if encoded is None:
+        return {}
+    try:
+        proc = subprocess.run(
+            [_python_bin(), str(script), "--action", action],
+            input=encoded + "\n", capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_TRAINING_CAPTURE_TIMEOUT_S,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        decoded = json.loads((proc.stdout or "{}").strip())
+        return decoded if isinstance(decoded, dict) else {}
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError,
+            json.JSONDecodeError):
+        return {}
+
+
+def _background_training_capture(action: str, payload: Dict[str, Any]) -> None:
+    """Bound post-tool capture work so the Hermes callback stays fail-open."""
+    if _capture_disabled():
+        return
+    if not _TRAINING_CAPTURE_INFLIGHT.acquire(blocking=False):
+        return
+
+    def _worker() -> None:
+        try:
+            _run_training_capture(action, payload)
+        except Exception as exc:
+            # Background capture is observational.  Keep unexpected adapter
+            # failures out of the host's thread exception hook and preserve the
+            # callback's fail-open contract.
+            logger.debug("zmem background training capture failed: %s", exc)
+        finally:
+            _TRAINING_CAPTURE_INFLIGHT.release()
+
+    try:
+        threading.Thread(target=_worker, name="zmem-training-capture",
+                         daemon=True).start()
+    except Exception:
+        _TRAINING_CAPTURE_INFLIGHT.release()
 
 
 def _native_edit_path(args: Any) -> str:
@@ -1231,6 +1429,12 @@ class ZmemMemoryProvider(MemoryProvider):
         self._session_id: str = ""
         self._namespace: str = "user:global"
         self._initialized: bool = False
+        self._turn_tickets: list[dict[str, Any]] = []
+        self._turn_ticket_lock = threading.RLock()
+        self._turn_epoch: int = 0
+        self._turn_tombstones: set[str] = set()
+        self._turn_correlation_blocked: bool = False
+        self._omitted_turn_callbacks_blocked: bool = False
         # Issue #160: select the transport at construction, from
         # configuration only.  A provider with no usable mode stays
         # unavailable (is_available False) and fails open everywhere.
@@ -1282,9 +1486,197 @@ class ZmemMemoryProvider(MemoryProvider):
         """The exact transport-resolution reason for an unavailable provider."""
         return self._mode_reason
 
+    def _clear_turn_tickets(self) -> None:
+        with self._turn_ticket_lock:
+            self._turn_tickets.clear()
+
+    def _rotate_turn_epoch_locked(self, session_id: str, namespace: str) -> int:
+        """Replace the active correlation scope as one lock-protected action."""
+        # After the provider's first epoch there is no identity on an omitted
+        # session callback that can distinguish a delayed old event from the
+        # current session.  Keep this fail-closed for the provider lifetime;
+        # only constructing a fresh provider resets it.
+        if self._turn_epoch > 0:
+            self._omitted_turn_callbacks_blocked = True
+        self._turn_epoch += 1
+        self._session_id = session_id
+        self._namespace = namespace
+        self._turn_tickets.clear()
+        self._turn_tombstones.clear()
+        self._turn_correlation_blocked = False
+        return self._turn_epoch
+
+    def _purge_turn_tickets(self, now: float | None = None) -> None:
+        cutoff = time.monotonic() if now is None else now
+        self._turn_tickets[:] = [
+            ticket for ticket in self._turn_tickets
+            if ticket.get("expires_at", 0.0) > cutoff
+        ]
+
+    def _tombstoned_locked(self, prompt_digest: str) -> bool:
+        return self._turn_correlation_blocked or prompt_digest in self._turn_tombstones
+
+    def _tombstone_bucket_locked(self, session_id: str, prompt_digest: str) -> None:
+        """Disable one prompt bucket for this epoch, fail-closed on overflow."""
+        self._turn_tickets[:] = [
+            ticket for ticket in self._turn_tickets
+            if not (
+                ticket.get("epoch") == self._turn_epoch
+                and ticket.get("session_id") == session_id
+                and ticket.get("prompt_digest") == prompt_digest
+            )
+        ]
+        if prompt_digest in self._turn_tombstones or self._turn_correlation_blocked:
+            return
+        if len(self._turn_tombstones) >= _HERMES_TURN_TOMBSTONE_MAX:
+            # Tombstones are never evicted.  Once the bounded set is full,
+            # correlation is disabled for this epoch rather than risking a
+            # later prompt binding to an old callback.
+            self._turn_correlation_blocked = True
+            self._turn_tickets.clear()
+            return
+        self._turn_tombstones.add(prompt_digest)
+
+    def on_turn_start(self, turn_number: object, message: object, **kwargs: Any) -> None:
+        """Arm one bounded ticket for the official Hermes turn lifecycle.
+
+        ``turn_number`` is deliberately ignored.  It is a host identity, not
+        a safe persistence key.  The ticket keeps only an opaque local key and
+        a digest of the prompt until the matching ``sync_turn`` callback.
+        """
+        del turn_number
+        explicit_session = str(kwargs.get("session_id") or "").strip()
+        prompt_digest = _hermes_prompt_digest(message)
+        if prompt_digest is None:
+            return None
+        with self._turn_ticket_lock:
+            # An omitted host identity can never safely arm a ticket.  In the
+            # initial epoch it remains a harmless no-op for compatibility;
+            # after rotation it is rejected by the sticky lifetime block.
+            if not explicit_session:
+                return None
+            active_session = self._session_id
+            if not active_session or explicit_session != active_session:
+                return None
+            session_id = active_session
+            if not session_id or self._tombstoned_locked(prompt_digest):
+                return None
+            self._purge_turn_tickets()
+            matches = [
+                ticket for ticket in self._turn_tickets
+                if ticket.get("epoch") == self._turn_epoch
+                and ticket.get("session_id") == session_id
+                and ticket.get("prompt_digest") == prompt_digest
+            ]
+            if matches:
+                self._tombstone_bucket_locked(session_id, prompt_digest)
+                return None
+            self._turn_tickets.append({
+                "epoch": self._turn_epoch,
+                "session_id": session_id,
+                "namespace": self._namespace,
+                "prompt_digest": prompt_digest,
+                "capture_key": str(uuid.uuid4()),
+                "expires_at": time.monotonic() + _HERMES_TURN_TICKET_TTL_S,
+                "envelope": None,
+                "invalid": False,
+            })
+            overflow = len(self._turn_tickets) - _HERMES_TURN_TICKET_MAX
+            if overflow > 0:
+                del self._turn_tickets[:overflow]
+        return None
+
+    def _remember_turn_prefetch(self, session_id: str, namespace: str,
+                                epoch: int, query: str, envelope: object) -> None:
+        prompt_digest = _hermes_prompt_digest(query)
+        retained = _hermes_ticket_envelope(envelope)
+        if not session_id or prompt_digest is None or retained is None:
+            return
+        with self._turn_ticket_lock:
+            if (epoch != self._turn_epoch or session_id != self._session_id
+                    or namespace != self._namespace
+                    or self._tombstoned_locked(prompt_digest)):
+                return
+            self._purge_turn_tickets()
+            matches = [
+                ticket for ticket in self._turn_tickets
+                if ticket.get("epoch") == epoch
+                and ticket.get("session_id") == session_id
+                and ticket.get("prompt_digest") == prompt_digest
+                and not ticket.get("claimed")
+            ]
+            if len(matches) != 1:
+                return
+            ticket = matches[0]
+            existing = ticket.get("envelope")
+            if existing is None and not ticket.get("invalid"):
+                ticket["envelope"] = retained
+            elif existing != retained:
+                # A second, divergent envelope cannot be safely bound to the
+                # one-capture schema.  Tombstone the whole bucket.
+                self._tombstone_bucket_locked(session_id, prompt_digest)
+
+    def _claim_turn_ticket(self, session_id: str, user_content: object) -> dict[str, Any] | None:
+        prompt_digest = _hermes_prompt_digest(user_content)
+        explicit_session = str(session_id or "").strip()
+        # Omitted sync callbacks may only create a standalone partial; they
+        # can never claim a provider ticket or attach a delivery snapshot.
+        if not explicit_session or prompt_digest is None:
+            return None
+        with self._turn_ticket_lock:
+            active_session = self._session_id
+            if not active_session or explicit_session != active_session:
+                return None
+            if self._tombstoned_locked(prompt_digest):
+                return None
+            self._purge_turn_tickets()
+            matches = [
+                ticket for ticket in self._turn_tickets
+                if ticket.get("epoch") == self._turn_epoch
+                and ticket.get("session_id") == active_session
+                and ticket.get("prompt_digest") == prompt_digest
+                and not ticket.get("claimed")
+            ]
+            if len(matches) != 1:
+                return None
+            ticket = matches[0]
+            ticket["claimed"] = True
+            return ticket
+
+    def _standalone_turn_identity(self, session_id: str) -> tuple[str, str, int] | None:
+        """Return only the current identity for an uncorrelated partial.
+
+        A standalone callback carries no delivery association.  An explicit
+        stale session is rejected; an omitted session may use the currently
+        active session only in the provider's first epoch.  Once rotation has
+        occurred, the lifetime block rejects omitted callbacks because their
+        provenance is unknowable.  With no active session there is no safe
+        destination.
+        """
+        explicit_session = str(session_id or "").strip()
+        with self._turn_ticket_lock:
+            active_session = self._session_id
+            if not active_session:
+                return None
+            if explicit_session and explicit_session != active_session:
+                return None
+            if not explicit_session and self._omitted_turn_callbacks_blocked:
+                return None
+            return active_session, self._namespace, self._turn_epoch
+
+    def _release_claimed_turn_ticket(self, ticket: dict[str, Any]) -> None:
+        with self._turn_ticket_lock:
+            self._turn_tickets[:] = [
+                candidate for candidate in self._turn_tickets
+                if candidate is not ticket
+            ]
+
     def initialize(self, session_id: str, **kwargs) -> None:
-        self._session_id = session_id or ""
-        self._namespace = self._resolve_namespace(**kwargs)
+        resolved_session = str(session_id or "").strip()
+        resolved_namespace = self._resolve_namespace(**kwargs)
+        with self._turn_ticket_lock:
+            self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
+            self._initialized = True
 
         # First-run safety: ensure the store exists — LOCAL mode only (issue
         # #160).  MCP mode opens no socket and creates no store.  store.py
@@ -1297,8 +1689,6 @@ class ZmemMemoryProvider(MemoryProvider):
                 r = _run_store(["init"])
                 if not r["ok"]:
                     logger.warning("zmem: store.py init failed: %s", r["stderr"])
-        self._initialized = True
-
     def _resolve_namespace(self, **kwargs) -> str:
         """Namespace precedence: ZMEM_NAMESPACE env → user:<user_id> → user:global.
 
@@ -1360,16 +1750,49 @@ class ZmemMemoryProvider(MemoryProvider):
             return ""
         raw_query = query if isinstance(query, str) else ""
         q = raw_query.strip()[:_MAX_PROMPT_CHARS]
-        sid = (session_id or self._session_id or "").strip()
+        prompt_digest = _hermes_prompt_digest(q)
+        explicit_session = str(session_id or "").strip()
+        with self._turn_ticket_lock:
+            active_session = self._session_id
+            if explicit_session and active_session and explicit_session != active_session:
+                return ""
+            # An explicit provider request may arrive before Hermes' session
+            # lifecycle initializes.  It is transport-only: do not allocate a
+            # ticket, mutate the epoch, mark an omitted callback, or attach a
+            # capture envelope until an active session exists.
+            if not active_session and not explicit_session:
+                return ""
+            sid = explicit_session or active_session
+            namespace = self._namespace
+            epoch = self._turn_epoch
+            omitted_blocked = (
+                not explicit_session and self._omitted_turn_callbacks_blocked
+            )
+            if prompt_digest is not None and self._tombstoned_locked(prompt_digest):
+                return ""
+            if omitted_blocked:
+                return ""
         envelope = transport.prefetch(
             q,
-            namespace=self._namespace,
+            namespace=namespace,
             session_id=sid,
             moment="user_prompt",
             ops_tokens=[],
             lane="hermes-provider",
         )
-        return envelope.get("rendered", "")
+        if not isinstance(envelope, dict) or not isinstance(envelope.get("rendered"), str):
+            logger.debug("zmem prefetch: missing or malformed rendered envelope")
+            return ""
+        # The official Hermes lifecycle gives us no safe capture key at
+        # prefetch time.  Retain a bounded, redacted envelope in the matching
+        # provider-owned turn ticket; sync_turn starts the capture first and
+        # enqueues its one snapshot after the store returns a capture id.
+        # An omitted prefetch has no callback identity.  It may provide
+        # ordinary passive context in the initial epoch, but it must never
+        # attach an envelope to an explicit ticket.
+        if explicit_session and active_session:
+            self._remember_turn_prefetch(sid, namespace, epoch, q, envelope)
+        return envelope["rendered"]
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """No-op — the manager already background-caches external prefetch."""
@@ -1385,6 +1808,20 @@ class ZmemMemoryProvider(MemoryProvider):
         uses the existing ``_run_store`` CLI seam and drops on overflow.
         """
         try:
+            session_id = str(kwargs.get("session_id") or self._session_id or "").strip()
+            _background_training_capture("observe", {
+                "host": "hermes",
+                "hook_name": "post_tool_call",
+                "session_id": session_id,
+                "namespace": self._namespace,
+                "capture_key": (
+                    kwargs.get("capture_key") or kwargs.get("captureKey")
+                    or kwargs.get("turn_id") or kwargs.get("turnId")
+                ),
+                "host_task_id": kwargs.get("task_id") or kwargs.get("taskId"),
+                "observation_kind": "post_tool_call",
+                "observation": dict(kwargs),
+            })
             _enqueue_native_evidence(dict(kwargs))
         except Exception:
             pass
@@ -1890,9 +2327,11 @@ class ZmemMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **kwargs,
     ) -> None:
-        self._session_id = new_session_id or ""
+        resolved_session = str(new_session_id or "").strip()
         # Namespace may change if the new session is a different gateway user.
-        self._namespace = self._resolve_namespace(**kwargs)
+        resolved_namespace = self._resolve_namespace(**kwargs)
+        with self._turn_ticket_lock:
+            self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Detached housekeeping — organize + backup if due.
@@ -1915,6 +2354,16 @@ class ZmemMemoryProvider(MemoryProvider):
         ``_STORE_TIMEOUT_S`` (20s) subprocess cap.
         """
         try:
+            with self._turn_ticket_lock:
+                previous_session = self._session_id
+                previous_namespace = self._namespace
+                self._rotate_turn_epoch_locked("", "user:global")
+            _run_training_capture("clear", {
+                "host": "hermes",
+                "hook_name": "session-end",
+                "session_id": previous_session,
+                "namespace": previous_namespace,
+            })
             _run_store(["organize"])
             _run_store(["backup", "--if-due"])
         except Exception as exc:  # pragma: no cover — defensive
@@ -1952,11 +2401,101 @@ class ZmemMemoryProvider(MemoryProvider):
         *,
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
+        **kwargs: Any,
     ) -> None:
-        """No-op. zmem captures lessons via explicit agent action (zmem_add),
-        not passive turn ingestion — unlike mem0/honcho which do server-side
-        extraction. Turning here would duplicate the reflection loop's job.
+        """Start a governed partial for an actually supplied Hermes turn.
+
+        The turn callback supplies content but does not prove display receipt,
+        acknowledgement, or a verified outcome. A unique current ticket may
+        correlate a later delivery snapshot; an absent or ambiguous ticket
+        still records a fresh-key standalone partial without a snapshot.
         """
+        try:
+            ticket = self._claim_turn_ticket(session_id, user_content)
+            task_id = str(
+                kwargs.get("task_id") or kwargs.get("taskId")
+                or kwargs.get("host_task_id") or kwargs.get("hostTaskId") or ""
+            ).strip()
+            if ticket is None:
+                if not isinstance(user_content, str) or not isinstance(assistant_content, str):
+                    return None
+                identity = self._standalone_turn_identity(session_id)
+                if identity is None:
+                    return None
+                sid, namespace, _epoch = identity
+                _run_training_capture("start_standalone", {
+                    "host": "hermes",
+                    "hook_name": "sync_turn",
+                    "session_id": sid,
+                    "namespace": namespace,
+                    "capture_key": str(uuid.uuid4()),
+                    **({"host_task_id": task_id} if task_id else {}),
+                    "cwd": os.getcwd(),
+                    "prompt": user_content,
+                    "assistant_response": assistant_content,
+                })
+                return None
+            try:
+                sid = str(ticket.get("session_id") or "")
+                namespace = str(ticket.get("namespace") or "")
+                epoch = ticket.get("epoch")
+                prompt_digest = ticket.get("prompt_digest")
+                capture_key = str(ticket.get("capture_key") or "")
+                envelope = ticket.get("envelope")
+                if not task_id:
+                    _run_training_capture("start_standalone", {
+                        "host": "hermes",
+                        "hook_name": "sync_turn",
+                        "session_id": sid,
+                        "namespace": namespace,
+                        "capture_key": str(uuid.uuid4()),
+                        "cwd": os.getcwd(),
+                        "prompt": user_content if isinstance(user_content, str) else "",
+                        "assistant_response": (
+                            assistant_content if isinstance(assistant_content, str) else ""
+                        ),
+                    })
+                    return None
+                started = _run_training_capture("start", {
+                    "host": "hermes",
+                    "hook_name": "sync_turn",
+                    "session_id": sid,
+                    "namespace": namespace,
+                    "capture_key": capture_key,
+                    **({"host_task_id": task_id} if task_id else {}),
+                    "cwd": os.getcwd(),
+                    "prompt": user_content if isinstance(user_content, str) else "",
+                    "assistant_response": (
+                        assistant_content if isinstance(assistant_content, str) else ""
+                    ),
+                })
+                capture_id = started.get("capture_id") if isinstance(started, dict) else None
+                if (isinstance(capture_id, str) and capture_id.strip()
+                        and isinstance(envelope, dict)):
+                    with self._turn_ticket_lock:
+                        current = (
+                            epoch == self._turn_epoch
+                            and sid == self._session_id
+                            and isinstance(prompt_digest, str)
+                            and not self._tombstoned_locked(prompt_digest)
+                        )
+                    if not current:
+                        return None
+                    _background_training_capture("snapshot", {
+                        "host": "hermes",
+                        "hook_name": "prefetch",
+                        "session_id": sid,
+                        "namespace": namespace,
+                        "capture_key": capture_key,
+                        **({"host_task_id": task_id} if task_id else {}),
+                        "rendered": envelope["rendered"],
+                        "effective_ops": envelope["effective_ops"],
+                        "transform_version": envelope["transform_version"],
+                    })
+            finally:
+                self._release_claimed_turn_ticket(ticket)
+        except Exception:
+            pass
         return None
 
     def get_config_schema(self) -> List[Dict[str, Any]]:

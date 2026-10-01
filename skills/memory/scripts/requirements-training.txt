@@ -1,0 +1,4 @@
+# Disposable SFT/preference export support for issue #135.
+# Parquet goldens are byte-exact; keep the writer version fixed across local
+# exports and CI.
+pyarrow==25.0.1

@@ -192,15 +192,16 @@ def _query_args(query: str) -> list[str]:
 class _LocalOperation:
     """A cancellable ``store.py`` subprocess run (the deadline kill hook)."""
 
-    def __init__(self, cmd: list[str]):
+    def __init__(self, cmd: list[str], env: Optional[dict[str, str]] = None):
         self._cmd = cmd
+        self._env = env
         self._proc: Optional[subprocess.Popen] = None
 
     def __call__(self) -> str:
         self._proc = subprocess.Popen(
             self._cmd, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace")
+            text=True, encoding="utf-8", errors="replace", env=self._env)
         out, _err = self._proc.communicate()
         return out or ""
 
@@ -393,8 +394,10 @@ class LocalSubprocess:
             argv.extend(["--ops-token", token])
         argv.append("--json")
         try:
+            child_env = os.environ.copy()
+            child_env.setdefault("ZMEM_CAPTURE", "1")
             stdout = self._executor.run(
-                _LocalOperation(argv), self._deadline_s)
+                _LocalOperation(argv, child_env), self._deadline_s)
         except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - every failure class fails open
             logger.debug("zmem transport: local prefetch failed open: %s", exc)
             return _empty_envelope()

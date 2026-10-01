@@ -1299,12 +1299,10 @@ _BELIEF_SCHEMA_DDL = (
     "ON belief_head_evidence(evidence_id)",
 )
 
+
 # v-independent additive table (issue #255): the purge deny-list. Rows are
 # written by `purge` and consulted by ingest-jsonl's absent-id branch so a
-# purged id cannot be re-inserted from a peer export. Version-independent on
-# purpose (the `_ensure_belief_tables` additive-window contract): an older
-# client that lacks this table simply never consults it and degrades to
-# pre-purge re-insert behavior; a newer client creates it idempotently.
+# purged id cannot be re-inserted from a peer export.
 _PURGE_SCHEMA_DDL = (
     """
     CREATE TABLE IF NOT EXISTS purged_id (
@@ -1313,14 +1311,174 @@ _PURGE_SCHEMA_DDL = (
     )
     """,
 )
+_PURGE_SCHEMA_OBJECTS = {"purged_id"}
+
+
+# Issue #135: governed training capture is local-only side storage.  These
+# additive tables deliberately run independently of the numbered migration
+# sequence: clients that understand v14 continue to share the same schema
+# version while each capable client installs this idempotent set atomically.
+_TRAINING_CAPTURE_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS training_capture (
+      capture_id TEXT PRIMARY KEY,
+      host TEXT NOT NULL,
+      host_task_id TEXT,
+      session_id TEXT,
+      namespace TEXT,
+      cwd TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      finalized_at TEXT,
+      acknowledged_at TEXT,
+      acknowledgement_attestation TEXT,
+      state TEXT NOT NULL CHECK (state IN
+        ('partial', 'emitted_to_host', 'acknowledged', 'completed')),
+      prompt TEXT,
+      assistant_response TEXT,
+      consent_scope TEXT,
+      content_license TEXT,
+      redaction_status TEXT NOT NULL CHECK (redaction_status IN
+        ('redacted', 'metadata_only')),
+      redaction_policy_version TEXT,
+      governance_source TEXT NOT NULL,
+      quarantine_reason TEXT,
+      revoked_at TEXT,
+      revoked_by TEXT,
+      revocation_reason TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_capture_state_idx "
+    "ON training_capture(state, updated_at)",
+    "CREATE INDEX IF NOT EXISTS training_capture_session_idx "
+    "ON training_capture(namespace, session_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_delivery_snapshot (
+      delivery_snapshot_id TEXT PRIMARY KEY,
+      capture_id TEXT NOT NULL UNIQUE REFERENCES training_capture(capture_id),
+      rendered TEXT,
+      effective_ops_json TEXT,
+      rendered_hash TEXT,
+      transform_version TEXT,
+      emitted_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_delivery_capture_idx "
+    "ON training_delivery_snapshot(capture_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_completion (
+      capture_id TEXT PRIMARY KEY REFERENCES training_capture(capture_id),
+      evidence_id TEXT NOT NULL REFERENCES evidence(id),
+      associated_memory_ids_json TEXT NOT NULL,
+      verifier_id TEXT NOT NULL,
+      verified_at TEXT NOT NULL,
+      outcome_kind TEXT NOT NULL CHECK (outcome_kind IN
+        ('test', 'compile', 'lint', 'user_acceptance', 'reviewer_acceptance')),
+      outcome_value TEXT NOT NULL,
+      acknowledgement_attestation TEXT NOT NULL,
+      export_consent_scope TEXT NOT NULL,
+      export_content_license TEXT NOT NULL,
+      reviewer_id TEXT,
+      reviewer_confirmed INTEGER NOT NULL DEFAULT 0 CHECK
+        (reviewer_confirmed IN (0, 1)),
+      correction_closeout INTEGER NOT NULL DEFAULT 0 CHECK
+        (correction_closeout IN (0, 1)),
+      correction_chain_id TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_completion_evidence_idx "
+    "ON training_capture_completion(evidence_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_review (
+      capture_id TEXT PRIMARY KEY REFERENCES training_capture(capture_id),
+      completion_evidence_id TEXT NOT NULL REFERENCES evidence(id),
+      reviewer_id TEXT NOT NULL,
+      reviewed_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_review_evidence_idx "
+    "ON training_capture_review(completion_evidence_id)",
+    """
+    CREATE TABLE IF NOT EXISTS training_export_snapshot_binding (
+      snapshot_id TEXT PRIMARY KEY,
+      binding_sha256 TEXT NOT NULL CHECK (
+        length(binding_sha256)=64 AND
+        binding_sha256 NOT GLOB '*[^0-9A-Fa-f]*'
+      ),
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_observation (
+      observation_id TEXT PRIMARY KEY,
+      capture_id TEXT NOT NULL REFERENCES training_capture(capture_id),
+      observation_kind TEXT NOT NULL,
+      payload TEXT,
+      payload_sha256 TEXT,
+      observed_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_observation_capture_idx "
+    "ON training_capture_observation(capture_id, observed_at)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_correlation (
+      correlation_key TEXT PRIMARY KEY,
+      session_key TEXT NOT NULL,
+      capture_id TEXT NOT NULL UNIQUE REFERENCES training_capture(capture_id),
+      created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS training_capture_correlation_session_idx "
+    "ON training_capture_correlation(session_key)",
+    """
+    CREATE TABLE IF NOT EXISTS training_capture_closed_session (
+      session_key TEXT PRIMARY KEY,
+      cleared_at TEXT NOT NULL
+    )
+    """,
+)
+
+
+def _schema_objects_missing(conn: sqlite3.Connection, expected: set[str]) -> set[str]:
+    """Return absent additive schema objects without acquiring a writer lock.
+
+    Additive side tables deliberately keep schema version 14.  Their hot path
+    must therefore be a read-only sqlite_master probe: ``CREATE ... IF NOT
+    EXISTS`` still needs schema/write coordination on some SQLite builds.
+    """
+    if not expected:
+        return set()
+    placeholders = ",".join("?" for _ in expected)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name IN (" + placeholders + ")",
+        tuple(expected),
+    ).fetchall()
+    return expected - {str(row[0]) for row in rows}
+
+
+_BELIEF_SCHEMA_OBJECTS = {
+    "belief_head", "belief_head_source", "belief_head_evidence",
+    "belief_head_namespace_idx", "belief_head_source_source_idx",
+    "belief_head_evidence_evidence_idx",
+}
+
+
+_TRAINING_CAPTURE_SCHEMA_OBJECTS = {
+    "training_capture", "training_capture_state_idx", "training_capture_session_idx",
+    "training_delivery_snapshot", "training_delivery_capture_idx",
+    "training_capture_completion", "training_completion_evidence_idx",
+    "training_capture_review", "training_review_evidence_idx",
+    "training_export_snapshot_binding",
+    "training_capture_observation", "training_observation_capture_idx",
+    "training_capture_correlation", "training_capture_correlation_session_idx",
+    "training_capture_closed_session",
+}
 
 
 def _ensure_purged_table(conn: sqlite3.Connection) -> None:
-    """Create the additive purge deny-list table atomically (issue #255).
-
-    Same contract as `_ensure_belief_tables`: one transaction (or savepoint
-    when a caller transaction is open); a failure leaves the table set
-    unchanged."""
+    """Create the additive purge deny-list table atomically (issue #255)."""
+    if not _schema_objects_missing(conn, _PURGE_SCHEMA_OBJECTS):
+        return
     savepoint = "zmem_purge_ddl"
     own_transaction = not conn.in_transaction
     if own_transaction:
@@ -1351,6 +1509,8 @@ def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
     A failure at any DDL boundary must leave both the table set and the
     version marker byte-for-byte unchanged, so the whole block runs inside
     one transaction (or savepoint, when a caller transaction is open)."""
+    if not _schema_objects_missing(conn, _BELIEF_SCHEMA_OBJECTS):
+        return
     savepoint = "zmem_belief_ddl"
     own_transaction = not conn.in_transaction
     if own_transaction:
@@ -1360,6 +1520,86 @@ def _ensure_belief_tables(conn: sqlite3.Connection) -> None:
     try:
         for ddl in _BELIEF_SCHEMA_DDL:
             conn.execute(ddl)
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+def _ensure_training_capture_tables(conn: sqlite3.Connection) -> None:
+    """Install Issue #135's local capture tables atomically.
+
+    This must stay version-independent: a numbered migration would violate the
+    v14 compatibility contract for automatic partial capture.
+    """
+    missing = _schema_objects_missing(conn, _TRAINING_CAPTURE_SCHEMA_OBJECTS)
+    observation_columns: set[str] = set()
+    if "training_capture_observation" not in missing:
+        observation_columns = {
+            str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(training_capture_observation)"
+            ).fetchall()
+        }
+    observation_digest_missing = (
+        "training_capture_observation" not in missing
+        and "payload_sha256" not in observation_columns
+    )
+    if not missing and not observation_digest_missing:
+        return
+    # A v14 store created before independent reviews has all the original
+    # capture objects but lacks this table.  Its old in-row reviewer flag did
+    # not prove an independent transition, so it is intentionally not
+    # grandfathered.  This runs only during that one additive upgrade.
+    review_table_missing = "training_capture_review" in missing
+    savepoint = "zmem_training_capture_ddl"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _TRAINING_CAPTURE_SCHEMA_DDL:
+            conn.execute(ddl)
+        # Recheck after acquiring the SQLite write barrier.  Direct callers of
+        # this additive helper can otherwise both observe the missing column
+        # and one loses the race on ALTER TABLE.
+        current_columns = {
+            str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(training_capture_observation)"
+            ).fetchall()
+        }
+        observation_digest_missing = "payload_sha256" not in current_columns
+        if observation_digest_missing:
+            conn.execute(
+                "ALTER TABLE training_capture_observation ADD COLUMN payload_sha256 TEXT"
+            )
+        # SQLite has no built-in SHA-256 scalar.  Backfill only this additive
+        # integrity field while the one-time upgrade transaction owns the
+        # schema, hashing the exact UTF-8 bytes retained in SQLite.
+        rows = conn.execute(
+            "SELECT observation_id, payload FROM training_capture_observation "
+            "WHERE payload IS NOT NULL AND payload_sha256 IS NULL"
+        ).fetchall()
+        for row in rows:
+            digest = hashlib.sha256(str(row[1]).encode("utf-8")).hexdigest()
+            conn.execute(
+                "UPDATE training_capture_observation SET payload_sha256=? WHERE observation_id=?",
+                (digest, row[0]),
+            )
+        if review_table_missing:
+            conn.execute(
+                "UPDATE training_capture_completion SET reviewer_confirmed=0 "
+                "WHERE reviewer_confirmed<>0"
+            )
         if own_transaction:
             conn.commit()
         else:
@@ -1806,6 +2046,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     # block is idempotent and atomic (see _ensure_belief_tables).
     _ensure_belief_tables(conn)
     _ensure_purged_table(conn)
+    _ensure_training_capture_tables(conn)
 
     # Version-INDEPENDENT: retry any old-style namespace the v5 pass had to
     # skip. See _retry_pending_ns_migration for why this cannot live behind the
