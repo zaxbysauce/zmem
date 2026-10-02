@@ -901,7 +901,10 @@ The optional `--llm-local` path is a recorded local adapter for deterministic
 maintenance tests and offline operation. Set `ZMEM_PAGE_ADAPTER_ACTIONS` to a
 local JSON action file. The adapter receives at most 20 bounded candidates;
 each content field is capped at 400 UTF-8 bytes, and each Markdown operation
-at 4000 UTF-8 bytes. Only `replace_section`, `append_bullet`, and
+at 4000 UTF-8 bytes. Each action set permits at most 20 operations, with at
+most 20 distinct citations per operation. Serialized definition, pointer,
+and version JSON are each limited to 262144 UTF-8 bytes before publication.
+Only `replace_section`, `append_bullet`, and
 `retract_bullet` operations with in-scope citations are accepted. The file is
 data only: no shell commands, dynamic imports, network calls, filesystem paths,
 raw page queries, or executable instruction fields are interpreted. Missing

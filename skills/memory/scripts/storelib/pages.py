@@ -25,6 +25,8 @@ _FENCE_MARKERS = ("<<<ZMEM_UNTRUSTED_FENCE>>>", "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 _MAX_ADAPTER_CONTENT = 400
 _MAX_MARKDOWN = 4000
 _MAX_ARTIFACT_BYTES = 262144
+_MAX_ADAPTER_OPERATIONS = 20
+_MAX_OPERATION_CITATIONS = 20
 
 
 class PageError(ValueError):
@@ -32,8 +34,19 @@ class PageError(ValueError):
 
 
 def _json_bytes(value: object) -> bytes:
-    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            + "\n").encode("utf-8")
+    try:
+        return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise PageError("invalid page artifact") from exc
+
+
+def _bounded_json(value: object) -> bytes:
+    """Serialize an artifact exactly as readers will see it, before publishing."""
+    raw = _json_bytes(value)
+    if len(raw) > _MAX_ARTIFACT_BYTES:
+        raise PageError("page artifact exceeds bound")
+    return raw
 
 
 def _validate_id(page_id: str) -> str:
@@ -282,7 +295,14 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
         raise PageError("page source is missing evidence")
     live = [r for r in live if not page_path_ref(r.get("source_ref"))]
     for row in live:
-        row["evidence_ids"] = list(evidence.get(row["id"], []))
+        row_id = str(row["id"])
+        row["evidence_ids"] = list(evidence.get(row_id, []))
+        # Keep the canonical joined associations private to this publication
+        # snapshot.  A row's source and evidence lists alone cannot express
+        # which evidence belongs to which represented source.
+        row["_source_evidence_pairs"] = [
+            (row_id, evidence_id) for evidence_id in row["evidence_ids"]
+        ]
     live, _status, _stats = selective_inject_filter(live, with_stats=True)
     valid_head_rows: list[dict] = []
     for head in heads:
@@ -293,11 +313,24 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
             item = dict(head)
             placeholders = ",".join("?" for _ in (ids + [item["id"]]))
             head_evidence = conn.execute(
-                "SELECT evidence_id FROM belief_head_evidence WHERE head_id=? AND source_id IN (" + placeholders + ")",
+                "SELECT bhe.source_id,bhe.evidence_id FROM belief_head_evidence bhe "
+                "JOIN evidence e ON e.id=bhe.evidence_id WHERE bhe.head_id=? AND bhe.source_id IN (" + placeholders + ")",
                 [item["head_id"]] + ids + [item["id"]],
             ).fetchall()
             item["evidence_ids"] = sorted({eid for sid in ids for eid in evidence.get(sid, [])}
-                                            | {str(row[0]) for row in head_evidence})
+                                            | {str(row[1]) for row in head_evidence})
+            # Member associations stay exact: never infer a member/evidence
+            # edge from the virtual head's union.  The virtual head itself may
+            # represent its already-validated evidence union.
+            member_pairs = {
+                (source_id, evidence_id)
+                for source_id in ids for evidence_id in evidence.get(source_id, [])
+            }
+            member_pairs.update((str(source_id), str(evidence_id))
+                                for source_id, evidence_id in head_evidence)
+            item["_source_evidence_pairs"] = sorted(
+                member_pairs | {(str(item["id"]), evidence_id)
+                                for evidence_id in item["evidence_ids"]})
             selected, _status, _stats = selective_inject_filter([item], with_stats=True)
             valid_head_rows.extend(selected)
     rows = valid_head_rows + live
@@ -328,7 +361,13 @@ def _sections(text: str) -> dict[str, tuple[int, int, str]]:
 
 
 def _safe_text(value: str, maximum: int) -> str:
-    if not isinstance(value, str) or len(value.encode("utf-8")) > maximum:
+    if not isinstance(value, str):
+        raise PageError("page text exceeds bound")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PageError("invalid page text") from exc
+    if len(encoded) > maximum:
         raise PageError("page text exceeds bound")
     if any(marker in value for marker in _FENCE_MARKERS):
         raise PageError("page text contains fence marker")
@@ -341,6 +380,11 @@ def _utf8_cap(value: object, maximum: int) -> str:
     return raw.decode("utf-8", "ignore")
 
 
+def _bullet_record(source_ids: list[str], evidence_ids: list[str]) -> dict[str, list[str]]:
+    """Canonical provenance derived from selected rows or operation citations."""
+    return {"source_ids": sorted(set(source_ids)), "evidence_ids": sorted(set(evidence_ids))}
+
+
 def _bullet(row: dict, evidence: list[str]) -> str:
     source_ids = sorted(set((row.get("source_ids") or []) + [str(row["id"])]))
     evidence_ids = sorted(set(evidence or row.get("evidence_ids") or []))
@@ -350,10 +394,10 @@ def _bullet(row: dict, evidence: list[str]) -> str:
                 ", ".join(source_ids), ", ".join(evidence_ids), digest))
 
 
-def _render_refresh(rows: list[dict]) -> tuple[str, list[str], list[str], dict[str, list[str]]]:
+def _render_refresh(rows: list[dict]) -> tuple[str, list[str], list[str], dict[str, dict[str, list[str]]]]:
     source_ids: set[str] = set()
     evidence_ids: set[str] = set()
-    bullets: dict[str, list[str]] = {}
+    bullets: dict[str, dict[str, list[str]]] = {}
     rendered: list[str] = []
     for row in rows:
         ids = sorted(set((row.get("source_ids") or []) + [str(row["id"])]))
@@ -369,8 +413,85 @@ def _render_refresh(rows: list[dict]) -> tuple[str, list[str], list[str], dict[s
         source_ids.update(ids)
         evidence_ids.update(eids)
         rendered.append(_bullet(row, eids))
-        bullets[digest] = ids
+        bullets[digest] = _bullet_record(ids, eids)
     return "\n\n".join(rendered) + "\n", sorted(source_ids), sorted(evidence_ids), bullets
+
+
+def _trusted_bullet_sources(value: object) -> dict[str, dict[str, list[str]]]:
+    """Validate provenance written by a previous page publication.
+
+    Page text is derived from untrusted source and adapter input.  It is never
+    parsed to reconstruct grounding: only this separately-written manifest is
+    carried across an adapter delta.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PageError("invalid page provenance")
+    result: dict[str, dict[str, list[str]]] = {}
+    for ident, record in value.items():
+        if not isinstance(ident, str) or not _PAGE_ID.fullmatch(ident):
+            raise PageError("invalid page provenance")
+        if not isinstance(record, dict) or set(record) != {"source_ids", "evidence_ids"}:
+            raise PageError("invalid page provenance")
+        sources = record.get("source_ids")
+        evidence = record.get("evidence_ids")
+        if (not isinstance(sources, list) or not isinstance(evidence, list)
+                or not sources or not evidence
+                or any(not isinstance(item, str) or not item for item in sources + evidence)
+                or sources != sorted(set(sources)) or evidence != sorted(set(evidence))):
+            raise PageError("invalid page provenance")
+        result[ident] = _bullet_record(sources, evidence)
+    return result
+
+
+def _require_authoritative_bullets(content: str,
+                                   bullet_sources: dict[str, dict[str, list[str]]]) -> None:
+    """Reject structural bullet text that has no source/citation authority."""
+    bullet_ids: list[str] = []
+    open_id: str | None = None
+    for match in re.finditer(r"<!-- (end-)?bullet:([A-Za-z0-9._-]+) -->", content):
+        is_end, ident = match.groups()
+        if not is_end:
+            if open_id is not None:
+                raise PageError("malformed page bullet")
+            open_id = ident
+            bullet_ids.append(ident)
+        elif open_id != ident:
+            raise PageError("malformed page bullet")
+        else:
+            open_id = None
+    if open_id is not None:
+        raise PageError("malformed page bullet")
+    if len(bullet_ids) != len(set(bullet_ids)) or set(bullet_ids) != set(bullet_sources):
+        raise PageError("untracked page bullet")
+
+
+def _require_live_bullet_authority(rows: list[dict],
+                                   bullet_sources: dict[str, dict[str, list[str]]]) -> None:
+    """Revalidate every retained source/evidence record against publication rows."""
+    valid_pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        pairs = row.get("_source_evidence_pairs")
+        if not isinstance(pairs, (list, tuple)):
+            raise PageError("page provenance changed during publication")
+        for pair in pairs:
+            if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                    or not all(isinstance(value, str) and value for value in pair)):
+                raise PageError("page provenance changed during publication")
+            valid_pairs.add((pair[0], pair[1]))
+    valid_sources = {source for source, _evidence_id in valid_pairs}
+    valid_evidence = {evidence_id for _source, evidence_id in valid_pairs}
+    for record in bullet_sources.values():
+        sources = record["source_ids"]
+        evidence = record["evidence_ids"]
+        if (any(source not in valid_sources for source in sources)
+                or any(evidence_id not in valid_evidence for evidence_id in evidence)
+                or any(not any((source, evidence_id) in valid_pairs for source in sources)
+                       for evidence_id in evidence)
+                or any(not any((source, evidence_id) in valid_pairs for evidence_id in evidence)
+                       for source in sources)):
+            raise PageError("page provenance changed during publication")
 
 
 def _snapshot_bytes(rows: list[dict]) -> bytes:
@@ -378,32 +499,24 @@ def _snapshot_bytes(rows: list[dict]) -> bytes:
     return _json_bytes([{
         "id": r.get("id"), "source_ids": sorted(r.get("source_ids") or []),
         "evidence_ids": sorted(r.get("evidence_ids") or []), "content": r.get("content"),
+        "source_evidence_pairs": sorted([list(pair) for pair in r.get("_source_evidence_pairs", [])]),
         "ingestion_ts": r.get("ingestion_ts"), "trust_score": r.get("trust_score"),
         "confidence": r.get("confidence"), "signal": r.get("signal"), "taint": r.get("taint"),
     } for r in rows])
 
 
-def _content_bullet_sources(content: str) -> dict[str, dict[str, list[str]]]:
-    """Persist only provenance that is visible in the committed bullet text."""
-    result: dict[str, dict[str, list[str]]] = {}
-    for match in re.finditer(r"<!-- bullet:([A-Za-z0-9._-]+) -->(.*?)<!-- end-bullet:\1 -->", content, re.S):
-        body = match.group(2)
-        def values(label: str) -> list[str]:
-            found = re.search(r"(?m)^\s*" + re.escape(label) + r":\s*(.*)$", body)
-            return [x.strip() for x in found.group(1).split(",") if x.strip()] if found else []
-        result[match.group(1)] = {
-            "source_ids": values("source_ids"),
-            "evidence_ids": values("evidence_ids"),
-        }
-    return result
-
-
 def _apply_operations(text: str, operations: Any,
-                      citation_map: dict[str, tuple[list[str], list[str]]]) -> str:
-    if not isinstance(operations, list) or not operations:
+                      citation_map: dict[str, tuple[list[str], list[str]]],
+                      bullet_sources: dict[str, dict[str, list[str]]]) -> tuple[str, dict[str, dict[str, list[str]]]]:
+    if (not isinstance(operations, list) or not operations
+            or len(operations) > _MAX_ADAPTER_OPERATIONS):
         raise PageError("empty page adapter result")
     sections = _sections(text)
     result = text
+    authoritative = {
+        ident: _bullet_record(record.get("source_ids", []), record.get("evidence_ids", []))
+        for ident, record in bullet_sources.items()
+    }
     # Every operation can target only an existing marked section. Recompute
     # offsets after each replacement, preserving untouched byte slices exactly.
     for operation in operations:
@@ -412,14 +525,19 @@ def _apply_operations(text: str, operations: Any,
         op = operation.get("op")
         section_id = operation.get("section_id")
         citations = operation.get("citations")
-        if op not in {"replace_section", "append_bullet", "retract_bullet"} or section_id not in sections:
+        if (not isinstance(op, str) or not isinstance(section_id, str)
+                or op not in {"replace_section", "append_bullet", "retract_bullet"}
+                or section_id not in sections):
             raise PageError("invalid page adapter target")
         expected = ({"op", "section_id", "markdown", "citations"}
                     if op in {"replace_section", "append_bullet"}
                     else {"op", "section_id", "bullet_id", "citations"})
         if set(operation) != expected:
             raise PageError("invalid page adapter operation")
-        if (not isinstance(citations, list) or not citations or any(not isinstance(c, str) or c not in citation_map for c in citations)):
+        if (not isinstance(citations, list) or not citations
+                or len(citations) > _MAX_OPERATION_CITATIONS
+                or any(not isinstance(c, str) or c not in citation_map for c in citations)
+                or len(set(citations)) != len(citations)):
             raise PageError("unresolved page citation")
         sections = _sections(result)
         start, end, body = sections[section_id]
@@ -428,8 +546,11 @@ def _apply_operations(text: str, operations: Any,
             digest = hashlib.sha256(_json_bytes({"markdown": markdown, "citations": sorted(citations)})).hexdigest()[:16]
             source_ids = sorted({sid for citation in citations for sid in citation_map[citation][0]})
             evidence_ids = sorted({eid for citation in citations for eid in citation_map[citation][1]})
+            for old_id in re.findall(r"<!-- bullet:([A-Za-z0-9._-]+) -->", body):
+                authoritative.pop(old_id, None)
             grounded = "<!-- bullet:%s -->\n%s\n  source_ids: %s\n  evidence_ids: %s\n<!-- end-bullet:%s -->\n" % (digest, markdown, ", ".join(source_ids), ", ".join(evidence_ids), digest)
             result = result[:start] + grounded + result[end:]
+            authoritative[digest] = _bullet_record(source_ids, evidence_ids)
         elif op == "append_bullet":
             markdown = _safe_text(operation.get("markdown"), _MAX_MARKDOWN)
             suffix = "" if body.endswith("\n") else "\n"
@@ -438,6 +559,7 @@ def _apply_operations(text: str, operations: Any,
             evidence_ids = sorted({eid for citation in citations for eid in citation_map[citation][1]})
             grounded = "<!-- bullet:%s -->\n%s\n  source_ids: %s\n  evidence_ids: %s\n<!-- end-bullet:%s -->\n" % (digest, markdown, ", ".join(source_ids), ", ".join(evidence_ids), digest)
             result = result[:end] + suffix + grounded + result[end:]
+            authoritative[digest] = _bullet_record(source_ids, evidence_ids)
         else:
             bullet_id = operation.get("bullet_id")
             if not isinstance(bullet_id, str):
@@ -447,11 +569,10 @@ def _apply_operations(text: str, operations: Any,
             if count != 1:
                 raise PageError("unknown page bullet")
             result = result[:start] + updated + result[end:]
+            authoritative.pop(bullet_id, None)
     _sections(result)
-    bullet_ids = re.findall(r"<!-- bullet:([A-Za-z0-9._-]+) -->", result)
-    if len(bullet_ids) != len(set(bullet_ids)):
-        raise PageError("duplicate page bullet")
-    return result
+    _require_authoritative_bullets(result, authoritative)
+    return result, authoritative
 
 
 def _acquire_actual_maintenance(conn: sqlite3.Connection) -> tuple[Path, str]:
@@ -522,6 +643,13 @@ def _next_version(directory: Path) -> str:
 
 def _publish(directory: Path, definition: dict, current: dict, version: dict, content: bytes,
              *, definition_was_missing: bool) -> None:
+    # These are the exact bytes that readers later cap in _load_json.  Check
+    # every serialized artifact before creating a staging directory or replacing
+    # an existing projection/pointer, so an oversized candidate preserves the
+    # entire prior committed tree.
+    definition_bytes = _bounded_json(definition)
+    current_bytes = _bounded_json(current)
+    version_bytes = _bounded_json(version)
     versions = directory / "versions"
     versions.mkdir(parents=True, exist_ok=True)
     stage = directory / (".staging-" + uuid.uuid4().hex)
@@ -531,10 +659,10 @@ def _publish(directory: Path, definition: dict, current: dict, version: dict, co
     installed_version: Path | None = None
     committed = False
     try:
-        version_temp = _atomic_write(stage / (version["version_id"] + ".json"), _json_bytes(version))
+        version_temp = _atomic_write(stage / (version["version_id"] + ".json"), version_bytes)
         page_temp = _atomic_write(stage / "page.md", content)
-        current_temp = _atomic_write(stage / "current.json", _json_bytes(current))
-        definition_temp = _atomic_write(stage / "definition.json", _json_bytes(definition))
+        current_temp = _atomic_write(stage / "current.json", current_bytes)
+        definition_temp = _atomic_write(stage / "definition.json", definition_bytes)
         final_version = versions / (version["version_id"] + ".json")
         if final_version.exists():
             raise PageError("page version already exists")
@@ -605,8 +733,9 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
                     or tuple(definition.get("tags") or []) != normalized_tags):
                 raise PageError("conflicting page definition")
         projection_path = directory / "page.md"
+        old_version: dict | None = None
         if not definition_was_missing:
-            _definition, old, raw = _read_committed(directory)
+            _definition, old_version, raw = _read_committed(directory)
             base = raw.decode("utf-8")
         elif projection_path.exists():
             _regular(projection_path)
@@ -640,13 +769,23 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         finally:
             if conn.in_transaction:
                 conn.rollback()
-        fresh_rendered, source_ids, evidence_ids, bullets = _render_refresh(fresh_rows)
+        fresh_rendered, source_ids, evidence_ids, fresh_bullets = _render_refresh(fresh_rows)
         if not source_ids:
             raise PageError("page sources changed during refresh")
         if "refresh" not in sections:
             raise PageError("missing refresh section")
-        start, end, _body = sections["refresh"]
+        start, end, refresh_body = sections["refresh"]
         content = base[:start] + fresh_rendered + base[end:]
+        prior_bullets = _trusted_bullet_sources(
+            old_version.get("bullet_sources") if old_version is not None else None)
+        # An ordinary refresh rewrites only the refresh section.  Keep the
+        # separately-authenticated provenance for every untouched section,
+        # then replace authority for the old refresh bullets with the current
+        # canonical snapshot's records.
+        actual_bullets = dict(prior_bullets)
+        for old_id in re.findall(r"<!-- bullet:([A-Za-z0-9._-]+) -->", refresh_body):
+            actual_bullets.pop(old_id, None)
+        actual_bullets.update(fresh_bullets)
         if llm_local:
             offered = fresh_rows[:20]
             payload = {
@@ -657,12 +796,22 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
                                 "content": _utf8_cap(r.get("content", ""), _MAX_ADAPTER_CONTENT)}
                                for r in offered],
             }
-            citation_map: dict[str, tuple[list[str], list[str]]] = {}
+            citation_pairs: dict[str, set[tuple[tuple[str, ...], tuple[str, ...]]]] = {}
             for row in offered:
                 row_sources = sorted({str(x) for x in (list(row.get("source_ids") or []) + [row.get("id")]) if isinstance(x, str)})
                 row_evidence = sorted({str(x) for x in (row.get("evidence_ids") or []) if isinstance(x, str)})
                 for citation in row_sources + row_evidence:
-                    citation_map[citation] = (row_sources, row_evidence)
+                    citation_pairs.setdefault(citation, set()).add((tuple(row_sources), tuple(row_evidence)))
+            # A shared citation deliberately represents every offered row that
+            # is grounded by it.  Union those exact row authorities rather than
+            # letting insertion order choose one unrelated pair.
+            citation_map = {
+                citation: (
+                    sorted({source_id for sources, _evidence in pairs for source_id in sources}),
+                    sorted({evidence_id for _sources, evidence in pairs for evidence_id in evidence}),
+                )
+                for citation, pairs in citation_pairs.items()
+            }
             try:
                 output = adapter(payload)
             except Exception as exc:
@@ -671,7 +820,8 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
                 raise PageError("invalid page adapter result")
             # Adapter deltas retain every original untouched section slice.
             # The extractive refresh body is the non-adapter publication path.
-            content = _apply_operations(base, output.get("operations"), citation_map)
+            content, actual_bullets = _apply_operations(
+                base, output.get("operations"), citation_map, prior_bullets)
         # Do not publish adapter output against a superseded/changed snapshot.
         conn.execute("BEGIN")
         try:
@@ -684,7 +834,8 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         if _snapshot_bytes(publish_rows) != _snapshot_bytes(fresh_rows):
             raise PageError("page sources changed during publication")
         _sections(content)
-        actual_bullets = _content_bullet_sources(content)
+        _require_authoritative_bullets(content, actual_bullets)
+        _require_live_bullet_authority(publish_rows, actual_bullets)
         represented_sources = sorted({sid for item in actual_bullets.values() for sid in item["source_ids"]})
         represented_evidence = sorted({eid for item in actual_bullets.values() for eid in item["evidence_ids"]})
         if not represented_sources or not represented_evidence:
