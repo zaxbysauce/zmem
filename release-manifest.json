@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "893d8f126544c7850af932ec5980326c40f4213564743a3c66bd6a8b651c7ef7",
+  "digest": "abde281bb1ec2e1855802f9b4ff532a7e88e51d07aed67e8ed025f9d75ab8848",
   "files": {
     "hermes-plugin/__init__.py": "f3a35ebbf9ddda986e3e643f956b34c1f298fac74555540e63086954b11b811b",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -56,7 +56,7 @@
     "scripts/release_gate.py": "0fee2823312e51cdd7b0a4827509aa806907e06ae95b87b2a90f532997c76ecb",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "2c395a4c770035c53db83ad8f3b06fa9be79b4a929d3c44ecde4cbc856f5f653",
-    "skills/memory/SKILL.md": "43ebbc6258945acaad37881be6cacc0e4c6b776294feefb664021874488179b8",
+    "skills/memory/SKILL.md": "4a3bb7e2bd5640b5178d676aa28f29ace54234fdcef068844e42d0474076f5a9",
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
@@ -67,7 +67,7 @@
     "skills/memory/scripts/embeddings.py": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a",
     "skills/memory/scripts/history_mining.py": "83cf4930a502fb581818ef174a17753bc525e28e7295cf7d3d48292ca42f6672",
     "skills/memory/scripts/host.py": "4716b0992960b57a109be5d8004658e069770ce14ac98c9d72e912b4b92d6b27",
-    "skills/memory/scripts/import-store.py": "6705641f64b79273582a7eec7dc81132a52afbe9e50ae696d93236c1ba863bb8",
+    "skills/memory/scripts/import-store.py": "b798a65f92e588900b87c43776f648192691fde57592eeab9de75ea6ba3565a8",
     "skills/memory/scripts/redaction.py": "0eb0b529e9b9223e1d74c23b4ddb6d116bd9f32ae89e07bb67a7a9afe75ad16f",
     "skills/memory/scripts/requirements-training.txt": "87e2a26eba83329b6be02d566fea3feab9e887296d67b7bae4b34a4b60445c88",
     "skills/memory/scripts/schema_meta.py": "bf06b4f26b520de381725aa284ea1aea7fe3bd2c02222945c14f842b3963a1a3",
@@ -101,12 +101,12 @@
     "skills/memory/scripts/storelib/recall.py": "895dad8c4b076e5dbdf3384e15aaec7fffdf87acada4c377ac1e9fe185d21e87",
     "skills/memory/scripts/storelib/rekey.py": "ed7e38f9660c2aa3aa6b2251e133f06d574bd87f3bd23c714fd585472ec6dfb3",
     "skills/memory/scripts/storelib/schema.py": "a020e81c322474b94edb63e82b230876608049fd50ac0a3599b27a4d3bc8ac0a",
-    "skills/memory/scripts/storelib/sync.py": "3ece3ddeec4e0bc51eac97d34d14c3864be4dd7d8cdc8c619f4cd7dbafeccac6",
+    "skills/memory/scripts/storelib/sync.py": "b77d7ea51e7b20246d8baf164f285a1e6b328e81ce4704bf49a9202e9f13497f",
     "skills/memory/scripts/storelib/training.py": "a308dcc6289e4c16efb0286a14c65dc8de0b400334d99cda80e24ae101cea4d6",
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "438e9db5ab4f3532b0bfd616c5026698cc07b2a96af59d2fadd08f75571d806e"
+    "skills/memory/scripts/storelib/write.py": "2f38ab2c57de195222e4b5886862e8ee918fbcef6b8c990c4e4bc317794961c0"
   },
   "version": "0.76.0"
 }

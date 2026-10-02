@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -591,6 +592,45 @@ class QuarantinePolicyTest(unittest.TestCase):
         self.assertEqual(len(lines), 2, lines)
         self.assertFalse(os.path.exists(os.path.join(dir_b, "quarantine")),
                          "quarantine wrongly created under divergent ZMEM_DATA")
+
+    def test_concurrent_writers_do_not_lose_or_tear_records(self):
+        """Review-round guard: bare O_APPEND measured lost and torn records
+        under concurrent Win32 quarantine writers; the exclusive writer lock
+        is what keeps the ledger line-coherent. Three processes x 40 records
+        must all land whole in the single date file."""
+        worker = (
+            "import os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from storelib.write import quarantine_import_row\n"
+            "for i in range(40):\n"
+            "    quarantine_import_row(\n"
+            "        os.environ['ZMEM_DATA'],\n"
+            "        {'source_ref': 'probe:concurrent',\n"
+            "         'seq': sys.argv[2] + ':' + str(i)},\n"
+            "        reason='unredactable_secret',\n"
+            "        now='2031-01-05T00:00:00Z')\n"
+        )
+        # Own scratch dir: the class tmp holds the other tests' ledgers, and
+        # the once-only assertions count files in their quarantine dir.
+        scratch = tempfile.mkdtemp(prefix="zmem-quar-conc-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        env = {**os.environ, "ZMEM_DATA": scratch}
+        procs = [subprocess.Popen(
+            [sys.executable, "-c", worker, str(SCRIPTS), str(w)],
+            cwd=str(REPO_ROOT), env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE) for w in range(3)]
+        for p in procs:
+            _out, err = p.communicate(timeout=180)
+            self.assertEqual(p.returncode, 0, err.decode("utf-8", "replace"))
+        ledger = os.path.join(scratch, "quarantine", "2031-01-05.jsonl")
+        with open(ledger, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(len(lines), 120, "lost records under concurrency")
+        seqs = set()
+        for line in lines:
+            # A torn/interleaved line raises here.
+            seqs.add(json.loads(line)["row"]["seq"])
+        self.assertEqual(len(seqs), 120, "duplicate or missing seqs")
 
 
 class ReadEnvelopeOmitCountsTest(unittest.TestCase):

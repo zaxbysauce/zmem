@@ -314,6 +314,49 @@ def generate_legacy_sqlite() -> None:
                 " VALUES (?, ?, ?, ?, ?)",
                 ("00000000-0000-4000-8000-000000000be9", RECORD_180["id"],
                  "primary", FIXED_TS, "fixture"))
+            # Two more heads exercise the refusal branch's head scrub
+            # (review round: refusing a row deleted its junction rows but
+            # left the head itself serving that row's text through recall).
+            # Head ...bea is sourced ONLY by the refused row 181, so the
+            # import must DELETE it; head ...beb quotes row 180's secret in
+            # its content, names the to-be-refused row 181 as its
+            # head_source_id, and is sourced by BOTH rows, so the import
+            # must REBUILD it from the surviving source (content AND
+            # head_source_id AND support_count).
+            conn.execute(
+                "INSERT INTO belief_head (id, namespace, topic_identity,"
+                " content, head_state, head_source_id, support_count,"
+                " refresh_watermark, generator_revision, confidence, signal,"
+                " taint, trust_score)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("00000000-0000-4000-8000-000000000bea", "user:global",
+                 "fixture-bea", RECORD_181["content"], "active",
+                 RECORD_181["id"], 1, FIXED_TS, "fixture", 0.5, "test",
+                 "untrusted_tool", 1.0))
+            conn.execute(
+                "INSERT INTO belief_head_source (head_id, source_id, role,"
+                " source_ingestion_ts, source_checksum)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("00000000-0000-4000-8000-000000000bea", RECORD_181["id"],
+                 "primary", FIXED_TS, "fixture"))
+            conn.execute(
+                "INSERT INTO belief_head (id, namespace, topic_identity,"
+                " content, head_state, head_source_id, support_count,"
+                " refresh_watermark, generator_revision, confidence, signal,"
+                " taint, trust_score)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("00000000-0000-4000-8000-000000000beb", "user:global",
+                 "fixture-beb", RECORD_180["content"], "active",
+                 RECORD_181["id"], 2, FIXED_TS, "fixture", 0.5, "test",
+                 "untrusted_tool", 1.0))
+            for sid, role in ((RECORD_180["id"], "primary"),
+                              (RECORD_181["id"], "support")):
+                conn.execute(
+                    "INSERT INTO belief_head_source (head_id, source_id,"
+                    " role, source_ingestion_ts, source_checksum)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    ("00000000-0000-4000-8000-000000000beb", sid, role,
+                     FIXED_TS, "fixture"))
             conn.commit()
             # init_db stamps meta.created_at with the wall clock; pin it so
             # the fixture bytes are reproducible (digest-stable regeneration).

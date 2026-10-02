@@ -477,6 +477,110 @@ def apply_capture_policy(
 QUARANTINE_DIR_NAME = "quarantine"
 
 
+def _lock_quarantine_exclusive(fd: int) -> None:
+    """Exclusive advisory lock on an open quarantine fd, cross-platform
+    (``fcntl.flock`` on POSIX, ``msvcrt.locking`` byte 0 on Windows). Waits
+    up to ~5s for the previous writer, then raises ``OSError`` (fail-closed:
+    callers count ``quarantine_failed`` rather than writing unserialized)."""
+    if os.name == "nt":
+        import msvcrt
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+
+def _unlock_quarantine(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass  # close() releases the lock regardless
+
+
+def _append_locked(target: Path, payload: bytes, *,
+                   rollback: bool = False) -> None:
+    """Append ``payload`` to ``target`` under the exclusive writer lock.
+
+    One ``os.open(O_APPEND|O_CREAT, 0o600)`` + ``os.write`` of the whole
+    payload with the lock held, so concurrent quarantining processes can
+    neither interleave nor overwrite each other's bytes (O_APPEND alone did
+    not suffice on Windows: two handles can seek to the same end offset
+    before either write lands — the review-round probe measured lost and
+    torn lines). With ``rollback=True`` a failure mid-write truncates back
+    to the pre-write size first, so a batch lands whole or not at all."""
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        _lock_quarantine_exclusive(fd)
+        try:
+            pre_size = os.lseek(fd, 0, os.SEEK_END) if rollback else None
+            try:
+                written = 0
+                while written < len(payload):
+                    written += os.write(fd, payload[written:])
+            except BaseException:
+                if pre_size is not None:
+                    try:
+                        os.ftruncate(fd, pre_size)
+                    except OSError:
+                        pass
+                raise
+        finally:
+            _unlock_quarantine(fd)
+    finally:
+        os.close(fd)
+
+
+def _harden_quarantine_file(quarantine_dir: Path, target: Path) -> None:
+    """Owner-only perms on the quarantine dir and ledger file (the file on
+    EVERY append, so a pre-existing loose-perm file is tightened)."""
+    os.chmod(quarantine_dir, 0o700)
+    os.chmod(target, 0o600)
+    # Windows: os.chmod only toggles the read-only bit there; tighten the
+    # real ACL best-effort when the host helper is importable (review round).
+    if os.name == "nt":
+        try:
+            import host as _host_acl
+        except ImportError:
+            _host_acl = None
+        if _host_acl is not None:
+            try:
+                _host_acl.set_owner_only_perms(quarantine_dir)
+                _host_acl.set_owner_only_perms(target)
+            except Exception:
+                pass
+
+
+def _quarantine_line(row: dict, reason: str, stamp: str) -> bytes:
+    record = {
+        "quarantined_at": stamp,
+        "reason": reason,
+        "source_ref": row.get("source_ref", ""),
+        "row": row,
+    }
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            + "\n").encode("utf-8")
+
+
+def _quarantine_target(data_dir: str | Path, stamp: str) -> tuple[Path, Path]:
+    date_part = stamp[:10] if len(stamp) >= 10 else stamp
+    quarantine_dir = Path(data_dir) / QUARANTINE_DIR_NAME
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    return quarantine_dir, quarantine_dir / f"{date_part}.jsonl"
+
+
 def quarantine_import_row(data_dir: str | Path, row: dict, *, reason: str,
                            now: str | None = None) -> Path:
     """Append one refused import row to the deterministic quarantine JSONL.
@@ -497,56 +601,65 @@ def quarantine_import_row(data_dir: str | Path, row: dict, *, reason: str,
     original ``OSError`` — callers roll back their current row, count
     ``quarantine_failed``, and return a nonzero result. This helper never
     writes SQLite. Concurrency: the store's writer lease does NOT cover this
-    file. Each record is appended through one low-level
-    ``os.open(..., O_APPEND | O_CREAT)`` + ``os.write`` of the whole encoded
-    line — a single append syscall per record, which POSIX O_APPEND and the
-    Windows CRT both honor per call (the buffered text-mode ``open("a")``
-    this replaced empirically DROPPED bytes under concurrent writers on
-    Windows). Cross-process interleaving of whole records remains possible
-    where a platform does not honor per-call append atomicity; run one
-    quarantine writer per store when that matters.
+    file. Writers serialize on an exclusive advisory byte-range lock held
+    across the append (``_append_locked``), which is what keeps concurrent
+    quarantining processes line-coherent — O_APPEND alone measured lost and
+    torn records under concurrent Win32 writers (review-round probe), and
+    the buffered text-mode ``open("a")`` this whole design replaced was
+    worse still.
     """
     stamp = now if now is not None else now_iso()
-    date_part = stamp[:10] if len(stamp) >= 10 else stamp
-    quarantine_dir = Path(data_dir) / QUARANTINE_DIR_NAME
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(quarantine_dir, 0o700)
-    target = quarantine_dir / f"{date_part}.jsonl"
-    record = {
-        "quarantined_at": stamp,
-        "reason": reason,
-        "source_ref": row.get("source_ref", ""),
-        "row": row,
-    }
-    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-            + "\n").encode("utf-8")
-    # Low-level single-syscall append: the buffered text-mode writer this
-    # replaced empirically DROPPED bytes under concurrent Win32 writers
-    # (review-round probe); O_APPEND + one os.write of the whole encoded line
-    # is the portable per-record-atomic idiom.
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        written = 0
-        while written < len(line):
-            written += os.write(fd, line[written:])
-    finally:
-        os.close(fd)
-    # Harden on EVERY append (not only creation): a pre-existing quarantine
-    # file with looser perms must never keep holding unredacted rows.
-    os.chmod(target, 0o600)
-    # Windows: os.chmod only toggles the read-only bit there; tighten the
-    # real ACL best-effort when the host helper is importable (review round).
-    if os.name == "nt":
-        try:
-            import host as _host_acl
-        except ImportError:
-            _host_acl = None
-        if _host_acl is not None:
-            try:
-                _host_acl.set_owner_only_perms(quarantine_dir)
-                _host_acl.set_owner_only_perms(target)
-            except Exception:
-                pass
+    quarantine_dir, target = _quarantine_target(data_dir, stamp)
+    _append_locked(target, _quarantine_line(row, reason, stamp))
+    _harden_quarantine_file(quarantine_dir, target)
+    return target
+
+
+def quarantine_import_rows(data_dir: str | Path,
+                           records: list[tuple[str, dict]],
+                           *, now: str | None = None) -> Path | None:
+    """Append a BATCH of refused rows as one locked, all-or-nothing write.
+
+    ``records`` are ``(reason, row)`` pairs shaped exactly like successive
+    ``quarantine_import_row`` calls; the encoded lines are concatenated and
+    written under a single lock acquisition, so a crash or write failure
+    cannot tear the batch mid-records (partial bytes are rolled back via
+    ``os.ftruncate`` before the error propagates). Records whose payload —
+    reason, source_ref, and row, EXCLUDING the per-call ``quarantined_at``
+    stamp — is already in the ledger are skipped, so a re-run after a failed
+    import re-flushes instead of duplicating (review round: import-store
+    flushes before the destination is touched, and a rare failure after a
+    successful flush must not double-record on the successful re-run).
+    Perms are hardened exactly like ``quarantine_import_row``. Returns the
+    ledger path, or None when every record was already present."""
+    stamp = now if now is not None else now_iso()
+    quarantine_dir, target = _quarantine_target(data_dir, stamp)
+    existing = set()
+    if target.exists():
+        with open(target, "rb") as fh:
+            for line in fh.read().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue  # a torn historical line matches nothing
+                rec.pop("quarantined_at", None)
+                existing.add(json.dumps(
+                    rec, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")))
+    fresh: list[bytes] = []
+    for reason, row in records:
+        key_rec = {"reason": reason, "source_ref": row.get("source_ref", ""),
+                   "row": row}
+        if json.dumps(key_rec, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")) in existing:
+            continue
+        fresh.append(_quarantine_line(row, reason, stamp))
+    if not fresh:
+        return None
+    _append_locked(target, b"".join(fresh), rollback=True)
+    _harden_quarantine_file(quarantine_dir, target)
     return target
 
 

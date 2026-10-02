@@ -65,6 +65,8 @@ NS = "project:jsonlsync"
 SECRETS_DIR = REPO_ROOT / "tests" / "fixtures" / "secrets"
 FIXTURE_ROW_180 = "00000000-0000-4000-8000-000000000180"
 FIXTURE_ROW_181 = "00000000-0000-4000-8000-000000000181"
+FIXTURE_HEAD_REFUSED_ONLY = "00000000-0000-4000-8000-000000000bea"
+FIXTURE_HEAD_SHARED = "00000000-0000-4000-8000-000000000beb"
 
 
 def _base_env(tmp: str) -> dict:
@@ -1833,6 +1835,16 @@ class LegacyImportCaptureTest(_TwoStoreCase):
             bh = conn.execute(
                 "SELECT content FROM belief_head WHERE head_source_id=?",
                 (FIXTURE_ROW_180,)).fetchone()
+            head_del = conn.execute(
+                "SELECT 1 FROM belief_head WHERE id=?",
+                (FIXTURE_HEAD_REFUSED_ONLY,)).fetchone()
+            head_mix = conn.execute(
+                "SELECT content, head_source_id, support_count FROM"
+                " belief_head WHERE id=?",
+                (FIXTURE_HEAD_SHARED,)).fetchone()
+            needle_heads = conn.execute(
+                "SELECT COUNT(*) FROM belief_head"
+                " WHERE content LIKE '%pw180%'").fetchone()[0]
         finally:
             conn.close()
         self.assertEqual((total, live), (1, 1))
@@ -1847,6 +1859,22 @@ class LegacyImportCaptureTest(_TwoStoreCase):
         self.assertEqual(bh[0], self.REDACTED_180,
                          "belief_head content must be rebuilt post-redaction")
         self.assertNotIn("pw180", bh[0])
+        # Refusal-branch head scrub (review round): the head sourced ONLY by
+        # the refused row 181 is deleted with it, and the shared head is
+        # rebuilt from its SURVIVING source — content, head_source_id, and
+        # support_count together — so no belief_head serves refused text.
+        self.assertIsNone(head_del,
+                          "a head with no surviving source must be deleted")
+        self.assertIsNotNone(head_mix, "the shared head must survive")
+        self.assertEqual(head_mix[0], self.REDACTED_180,
+                         "shared head content must rebuild from the survivor")
+        self.assertEqual(head_mix[1], FIXTURE_ROW_180,
+                         "shared head_source_id must move to the survivor")
+        self.assertEqual(head_mix[2], 1,
+                         "shared head support_count must drop with the"
+                         " refused source")
+        self.assertEqual(needle_heads, 0,
+                         "no belief_head may keep a pre-redaction needle")
 
         qdir = os.path.join(dst_a, "quarantine")
         qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")]

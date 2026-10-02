@@ -2136,7 +2136,7 @@ additionally redacts secret-like VALUES in content/tags (value-span
 replacement, tagged `auto-redacted`) and QUARANTINES rows whose `source_ref`
 looks like a secret (issue #180: counted as `quarantined` in the summary —
 after `capture_refused` — with the original row appended to
-`<data>/quarantine/<UTC-date>.jsonl`, NOT stored; the run still exits 0).
+`<store-dir>/quarantine/<UTC-date>.jsonl`, NOT stored; the run still exits 0).
 `reviewed` RAISES on those refusals (counted as `capture_refused`, never
 quarantined — plain `ingest-jsonl` still exits 0 with the count since the
 file keeps going; exit 2 applies via `--strict` or the `add`/`update` CLI
@@ -2209,9 +2209,11 @@ one compact JSON object per line, keys in order `quarantined_at`,
 `reason`, `source_ref`, `row` — via `quarantine_import_row` (write
 failures raise `OSError`: the row is rolled back, counted
 `quarantine_failed`, and the run exits nonzero). The store's writer lease
-does NOT cover the quarantine file; each record is one small append (a
-single write of one LF-terminated line), which is what keeps concurrent
-quarantining processes line-coherent. Review quarantine files with
+does NOT cover the quarantine file; writers serialize on an exclusive
+advisory file lock (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows)
+held across each append — bare `O_APPEND` and the buffered text-mode
+`open("a")` idiom both measurably dropped or tore records under concurrent
+Win32 writers (review-round probe). Review quarantine files with
 restricted filesystem access.
 
 Importer results and counters:
@@ -2227,13 +2229,19 @@ Importer results and counters:
   (all-or-nothing stays fail-closed).
 - `import-store.py` stages a sanitized copy (source read-only
   `mode=ro`+`query_only=1`; every memory row through the policy in id
-  order; refused rows deleted with their related rows and quarantined;
-  redacted rows keep ids with FTS maintained by trigger and stale
-  `memory_vec` embeddings dropped), verifies `PRAGMA integrity_check` and
-  `staged_count = source_count - quarantined_count`, and only then
-  atomically replaces the destination (`os.replace`); the source's
-  sha256/size/row-count are proven unchanged before and after. Its report
-  carries `added`, `redacted`, `quarantined`, `quarantine_failed`.
+  order; refused rows deleted with their related rows — belief heads
+  sourced only by a refused row are deleted with it, shared heads rebuild
+  from a surviving source — and quarantined; redacted rows keep ids with
+  FTS maintained by trigger and stale `memory_vec` embeddings dropped),
+  verifies `PRAGMA integrity_check` and
+  `staged_count = source_count - quarantined_count`, flushes its refusal
+  records (one locked, all-or-nothing batch; records the ledger already
+  holds — compared without the per-call timestamp — are skipped, so
+  re-imports never duplicate them) BEFORE the destination is touched, and
+  only then atomically replaces the destination (`os.replace`); the
+  source's sha256/size/row-count are proven unchanged before and after.
+  Its report carries `added`, `redacted`, `quarantined`,
+  `quarantine_failed`.
 - `scripts/ingest_harvest.py` subprocesses
   `store.py add --capture-mode auto --json` per row (a record may carry its
   own `source_ref`; the CLI `--source-ref` is the fallback), classifies

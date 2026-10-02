@@ -42,12 +42,15 @@ Flow (issue #180, Workstream L PR 1):
      (the empty-TEXT idiom), and the ORIGINAL full row is recorded for the
      post-acceptance quarantine flush.
   5. Refused-row records are BUFFERED during the sanitize transaction and
-     appended to <dest_dir>/quarantine/<UTC-date>.jsonl only AFTER every
-     validation gate has passed — a failed import (integrity mismatch, count
-     mismatch, source-fingerprint mismatch, core.md failure, replace failure)
-     therefore leaves NO quarantine ledger entries for an import that never
-     completed, and a successful re-run never duplicates them. A quarantine
-     append failure at flush time still aborts the import (fail-closed).
+     appended to <dest_dir>/quarantine/<UTC-date>.jsonl after every
+     validation gate has passed but BEFORE the destination is touched — a
+     flush failure therefore aborts fail-closed with the prior destination
+     byte-identical. The flush itself is one locked, all-or-nothing batch
+     append (a partial failure truncates back to the pre-write size), and
+     records the ledger already holds (compared WITHOUT the per-call
+     quarantined_at stamp) are skipped — so the only failures that can
+     follow a successful flush (core.md swap, store replace) never
+     duplicate entries on a successful re-run.
   6. Acceptance: the staged database is switched to journal_mode=DELETE (so
      os.replace can never race a WAL sidecar replay), its FTS index is
      optimized and the file VACUUMed (clearing FTS tombstone segments that
@@ -60,9 +63,9 @@ Flow (issue #180, Workstream L PR 1):
 
 Importing storelib here is safe even though storelib resolves STORE_PATH from
 the environment at import time: this script uses only the pure policy helpers
-(apply_capture_policy, quarantine_import_row), the purge side-table list, the
-entity relink helper, and schema's vec loader / content normalizer — never a
-storelib connection or STORE_PATH itself.
+(apply_capture_policy, quarantine_import_rows), the purge side-table list and
+head-survivor helper, the entity relink helper, and schema's vec loader /
+content normalizer — never a storelib connection or STORE_PATH itself.
 
 Usage:
   python import-store.py --source "C:\\path\\to\\store.sqlite" --dest-dir "C:\\Users\\<user>\\.zmem" [--force]
@@ -88,14 +91,14 @@ except ImportError:
 
 from storelib.entity import relink_memory  # noqa: E402
 from storelib.schema import _load_vec, _normalize_content  # noqa: E402
-from storelib.purge import _ID_SIDE_TABLES  # noqa: E402
+from storelib.purge import _ID_SIDE_TABLES, _head_surviving_source  # noqa: E402
 from storelib.write import (  # noqa: E402
     MAX_CONTENT_CHARS,
     CapturePolicyRefusal,
     REASON_UNREDACTABLE_SECRET,
     QUARANTINE_REASONS,
     apply_capture_policy,
-    quarantine_import_row,
+    quarantine_import_rows,
 )
 
 
@@ -151,14 +154,25 @@ def _stash_dest_sidecars(dest_store: Path) -> list[tuple[Path, Path]]:
     """RENAME stale destination sidecars aside instead of deleting them, so a
     failed os.replace can restore them and the prior destination stays truly
     byte-identical (review round: sidecar clear used to precede the replace
-    unguarded). Returns the (stash_path, original_path) pairs to clean up."""
-    stashed = []
-    for s in SIDECAR_SUFFIXES:
-        sib = Path(str(dest_store) + s)
-        if sib.exists():
-            stash = sib.with_name(sib.name + ".store-180-stash")
-            os.replace(sib, stash)
-            stashed.append((stash, sib))
+    unguarded). Returns the (stash_path, original_path) pairs to clean up.
+    A rename that fails mid-loop restores the sidecars already stashed before
+    re-raising (review round: a partial stash otherwise stranded the first
+    sidecar under its stash name, losing the old store's WAL)."""
+    stashed: list[tuple[Path, Path]] = []
+    try:
+        for s in SIDECAR_SUFFIXES:
+            sib = Path(str(dest_store) + s)
+            if sib.exists():
+                stash = sib.with_name(sib.name + ".store-180-stash")
+                os.replace(sib, stash)
+                stashed.append((stash, sib))
+    except OSError:
+        for stash, orig in stashed:
+            try:
+                os.replace(stash, orig)
+            except OSError:
+                pass
+        raise
     return stashed
 
 
@@ -211,6 +225,32 @@ def _rebuild_belief_heads(staged: sqlite3.Connection, mid: str,
             "UPDATE belief_head SET content=? WHERE id=?", (new_content, hid))
 
 
+def _scrub_belief_heads_after_refusal(
+        staged: sqlite3.Connection, mid: str) -> None:
+    """A refused row's text never becomes storable, so no belief_head may
+    keep a content copy of it (review round: the refusal branch deleted the
+    junction rows but left the head itself serving the refused text through
+    recall). Mirrors storelib.purge: heads with a surviving source are
+    rebuilt from that source's newest live row (content, head_source_id,
+    support_count); heads with none are deleted. No-op when the legacy store
+    predates the belief tables."""
+    if not _table_exists(staged, "belief_head") or not _table_exists(
+            staged, "belief_head_source"):
+        return
+    head_ids = [r["head_id"] for r in staged.execute(
+        "SELECT DISTINCT head_id FROM belief_head_source WHERE source_id=?",
+        (mid,)).fetchall()]
+    for hid in head_ids:
+        src = _head_surviving_source(staged, hid, [mid])
+        if src is None:
+            staged.execute("DELETE FROM belief_head WHERE id=?", (hid,))
+        else:
+            staged.execute(
+                "UPDATE belief_head SET content=?, head_source_id=?, "
+                "support_count=MAX(support_count-1, 0) WHERE id=?",
+                (src["content"], src["id"], hid))
+
+
 def _sanitize_staged_store(staged: sqlite3.Connection,
                            source: sqlite3.Connection) -> tuple[dict, list]:
     """Apply the shared capture policy to every staged memory row.
@@ -220,7 +260,7 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
     derived carrier recomputed or dropped; refused rows are deleted with
     their related rows. Quarantine records are BUFFERED and returned as a
     list of (reason, payload) — the caller flushes them through
-    quarantine_import_row only after every acceptance gate has passed, so a
+    quarantine_import_rows only after every acceptance gate has passed, so a
     failed import leaves no ledger entries behind (review round: the appends
     used to happen mid-transaction and outlived their aborted run).
 
@@ -269,6 +309,12 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
             staged.execute("DELETE FROM memory WHERE id=?", (mid,))
             if has_vec:
                 staged.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
+            # belief_head rows themselves carry a content COPY of their
+            # source rows — scrub them BEFORE the junction deletes below,
+            # which is how the scrub finds this row's heads (the survivor
+            # query excludes `mid` via the chain and the already-deleted
+            # memory row alike).
+            _scrub_belief_heads_after_refusal(staged, mid)
             for table, col in _ID_SIDE_TABLES:
                 if _table_exists(staged, table):
                     staged.execute(f"DELETE FROM {table} WHERE {col}=?", (mid,))
@@ -316,11 +362,15 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
 
 
 def _flush_quarantine(dest_dir: Path, pending: list) -> None:
-    """Append every buffered refusal record. Called only after ALL acceptance
-    gates passed, so the ledger never holds entries for an import that failed
-    validation. An OSError here still aborts the import (fail-closed)."""
-    for reason, payload in pending:
-        quarantine_import_row(dest_dir, payload, reason=reason)
+    """Append every buffered refusal record as ONE locked, all-or-nothing
+    batch write (quarantine_import_rows) that SKIPS records the ledger
+    already holds, so a re-run after a failed import never duplicates
+    entries. Called only after ALL acceptance gates passed and BEFORE the
+    destination is touched, so a flush failure aborts fail-closed with the
+    prior destination byte-identical. An OSError here still aborts the
+    import (fail-closed) — and leaves no partial batch behind."""
+    if pending:
+        quarantine_import_rows(dest_dir, pending)
 
 
 def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
@@ -364,24 +414,30 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
     staged_path = Path(staged_path_str)
     staged_path.unlink()  # mkstemp created an empty file; the backup API
     # wants to initialize the database itself.
+    staged_core: Path | None = None  # bound before the guarded block so the
+    # failure handler below can always clean the staged core.md temp up.
     try:
         source_conn = _open_source_readonly(source_store)
         try:
             staged_conn = sqlite3.connect(str(staged_path))
             try:
                 staged_conn.row_factory = sqlite3.Row
-                # Load sqlite-vec on the staging connection when available so
-                # DELETE FROM memory_vec works on vec-bearing sources; a
-                # source without the table skips the vec deletes entirely
-                # (review round: a bare connect crashed the whole import with
-                # `no such module: vec0` on modern stores).
-                try:
-                    _load_vec(staged_conn)
-                except Exception:
-                    pass
                 print(f"[import] online-backup {source_store.name} -> staging "
                       f"{staged_path.name} (source opened read-only)")
                 source_conn.backup(staged_conn)
+                # Load sqlite-vec AFTER the backup, now that the staged copy
+                # carries the source's tables: a vec-bearing source needs the
+                # extension for the DELETE FROM memory_vec in sanitize; a
+                # vec-less source sanitizes fine without it (review round: a
+                # bare connect used to crash the whole import with `no such
+                # module: vec0`). If the loader is unavailable for a
+                # vec-BEARING source, re-raise the loader's real error instead
+                # of a confusing vec0 failure at the first DELETE.
+                try:
+                    _load_vec(staged_conn)
+                except Exception:
+                    if _table_exists(staged_conn, "memory_vec"):
+                        raise
                 staged_conn.execute("BEGIN IMMEDIATE")
                 counts, pending = _sanitize_staged_store(staged_conn,
                                                          source_conn)
@@ -442,15 +498,19 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
 
         # --- Flush the buffered quarantine ledger HERE: every validation gate
         # has passed, and the flush must succeed BEFORE the destination is
-        # touched (review round: appends after the replace let a failed flush
-        # report exit 1 with the new store already in place). A flush failure
-        # aborts fail-closed with the prior destination untouched. ---
+        # touched (fail-closed: a flush failure leaves the prior destination
+        # byte-identical). The batch append is all-or-nothing under the
+        # writer lock, and records the ledger already holds are skipped, so
+        # the only failures that can follow a successful flush (core.md
+        # swap, store replace) never duplicate entries on a re-run. ---
         _flush_quarantine(dest_dir, pending)
 
-        # --- Accept. Order matters: stage core.md BEFORE the store replace
-        # (a copy failure must abort BEFORE the destination is touched), stash
-        # stale destination sidecars (restored on failure), then atomically
-        # replace. ---
+        # --- Accept. Order matters (review round): stage core.md BEFORE the
+        # store replace (a copy failure must abort BEFORE the destination is
+        # touched), stash stale destination sidecars INSIDE the guarded block
+        # (a partial stash rolls itself back), replace the store, swap
+        # core.md. Once the store replace has succeeded the old sidecars are
+        # never restored beside the NEW store (mixed generations). ---
         staged_core = None
         if source_core_md.exists():
             fd_core, staged_core_str = tempfile.mkstemp(
@@ -458,21 +518,36 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
             os.close(fd_core)
             staged_core = Path(staged_core_str)
             shutil.copy2(source_core_md, staged_core)
-        stashed = _stash_dest_sidecars(dest_store)
+        store_replaced = False
+        stashed: list[tuple[Path, Path]] = []
         try:
+            stashed = _stash_dest_sidecars(dest_store)
             os.replace(staged_path, dest_store)
+            store_replaced = True
             if staged_core is not None:
                 os.replace(staged_core, dest_core_md)
                 staged_core = None
                 print(f"[import] copied {source_core_md.name} -> {dest_core_md}")
-            elif source_core_md.exists():
-                # Unreachable in practice (staged above); kept for clarity.
-                pass
             else:
                 print(f"[import] WARNING: no core.md at source ({source_core_md}); skipped")
         except OSError as exc:
-            # Restore the prior destination exactly: sidecars back, staged
-            # files removed.
+            if store_replaced:
+                # Only the core.md swap failed; the store itself landed. The
+                # stashed sidecars belong to the replaced-away store — drop
+                # them, never re-home them beside the NEW store (review
+                # round: that left mixed generations and broke the re-run).
+                for stash, _orig in stashed:
+                    try:
+                        stash.unlink()
+                    except OSError:
+                        pass
+                raise OSError(
+                    f"{exc}; the destination store WAS updated but copying "
+                    f"{dest_core_md.name} failed — close any zmem session "
+                    f"holding it open, then re-run this import (the store "
+                    f"re-import is idempotent) or copy the file manually"
+                ) from exc
+            # Store not yet replaced: put the prior destination back exactly.
             for stash, orig in stashed:
                 try:
                     os.replace(stash, orig)
@@ -488,13 +563,20 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
             except OSError:
                 pass
     except BaseException:
-        # Remove ONLY the staging file: the prior destination — store.sqlite,
-        # its sidecars, and core.md — stays byte-identical on every failure
-        # path (quarantine write failure, integrity mismatch, count mismatch,
-        # source fingerprint mismatch).
+        # Remove ONLY the staging files: on every failure path up to and
+        # including the store replace, the prior destination — store.sqlite,
+        # its sidecars, and core.md — stays byte-identical (quarantine write
+        # failure, integrity mismatch, count mismatch, source fingerprint
+        # mismatch). After the store replace, the store IS the accepted new
+        # one and only the staged core.md temp still needs removing.
         try:
             if staged_path.exists():
                 staged_path.unlink()
+        except OSError:
+            pass
+        try:
+            if staged_core is not None and staged_core.exists():
+                staged_core.unlink()
         except OSError:
             pass
         raise

@@ -25,7 +25,7 @@ import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
-from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
+from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
     EVIDENCE_KINDS,
@@ -1091,7 +1091,8 @@ def _is_purged(conn: sqlite3.Connection, mid: str) -> bool:
 def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                  capture_mode: str | None = None,
                  dedup_cache: dict | None = None,
-                 preserve_ids: bool = False) -> str:
+                 preserve_ids: bool = False,
+                 quarantine_ledger: bool = True) -> str:
     """Apply one VALIDATED JSONL sync row (a _validate_sync_row result) to the
     local store.
 
@@ -1218,6 +1219,16 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 tags=tags,
                 capture_mode=capture_mode,
             )
+            if len(content) > INGEST_MAX_CONTENT_CHARS:
+                # Value-span markers grew the redacted text past the storage
+                # cap the ORIGINAL fit (row validation above is pre-policy):
+                # there is no safe storable form, so apply the same refusal
+                # contract write.add_memory uses for this exact situation
+                # (auto -> quarantine, strict -> refused) instead of silently
+                # storing an oversized row (review round).
+                raise CapturePolicyRefusal(
+                    REASON_UNREDACTABLE_SECRET,
+                    "capture refused: unredactable_secret")
         except CapturePolicyRefusal as exc:
             if started_tx and conn.in_transaction:
                 conn.rollback()
@@ -1228,6 +1239,15 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # quarantine_failed count (the caller exits nonzero).
             if (exc.reason in QUARANTINE_REASONS
                     and _normalize_capture_mode(capture_mode) == "auto"):
+                if not quarantine_ledger:
+                    # Strict lane: this row is about to fail the whole run
+                    # (_strict_ingest_staged raises on 'quarantined'), and a
+                    # ledger entry written for a run that then failed would be
+                    # appended AGAIN by every re-run (review round). The row
+                    # stays in the source JSONL for the operator to resolve.
+                    print(f"[zmem] ingest-jsonl: refused row {mid}: {exc}",
+                          file=sys.stderr)
+                    return "quarantined"
                 try:
                     quarantine_import_row(
                         os.path.dirname(STORE_PATH), obj, reason=exc.reason)
@@ -1608,6 +1628,9 @@ def _strict_ingest_staged(
                 outcome = _ingest_row(
                     conn, obj, allow_tombstones=allow_tombstones,
                     capture_mode=capture_mode, preserve_ids=True,
+                    # Strict never persists a ledger entry: the run raises on
+                    # this row below, and a re-run would duplicate the entry.
+                    quarantine_ledger=False,
                 )
             if diagnostic.getvalue():
                 strict_diagnostics.append(diagnostic.getvalue())
