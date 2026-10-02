@@ -10,8 +10,9 @@ source_ref is STRUCTURED provenance. This pins the allowlist contract:
 - CREDENTIAL shapes (key=value, PEM headers, gh*_ tokens, AKIA) still refuse
   on allowlisted refs — defense in depth;
 - `file:` absolute remainders (drive letter, POSIX-absolute, UNC, ~) refuse;
-- content/tags scanning is UNCHANGED: secrets in content still redact in auto
-  mode, and reviewed/manual modes behave exactly as before;
+- content/tags scanning is UNCHANGED in auto mode; since issue #180 the
+  `reviewed` mode RAISES on credential-shaped source_refs (exit 2) while
+  `manual` stays advisory-only — see test_reviewed_mode_never_refuses;
 - the write result surfaces a structured `source_ref_allowlisted` warning so
   the redacted/refused/warnings triad stays honest.
 
@@ -38,7 +39,7 @@ sys.path.insert(0, str(SCRIPTS_DIR / "storelib"))
 STORE_PY = SCRIPTS_DIR / "store.py"
 PYTHON = sys.executable
 
-from storelib.write import CapturePolicyRefusal, _apply_capture_policy  # noqa: E402
+from storelib.write import CapturePolicyRefusal, apply_capture_policy  # noqa: E402
 
 
 def _base_env(tmp: str) -> dict:
@@ -113,7 +114,7 @@ class CredentialShapeStillRefusedTest(unittest.TestCase):
     def _refused(self, source_ref, mode="auto"):
         tmp = tempfile.mkdtemp(prefix="zmem-allow-cred-")
         self.addCleanup(shutil.rmtree, tmp, True)
-        content, _, _, warnings = _apply_capture_policy(
+        content, _, _, warnings = apply_capture_policy(
             content="probe", source_ref=source_ref, tags="",
             capture_mode=mode)
         return content, warnings
@@ -158,16 +159,27 @@ class CredentialShapeStillRefusedTest(unittest.TestCase):
             self._refused("db:jwt:eyJ" + "A1b2C3d4" * 8 + ".eyJ" + "x9Y8z7W6" * 4)
 
     def test_reviewed_mode_never_refuses(self):
-        # Manual/reviewed semantics unchanged: advisory only.
-        _, warnings = self._refused("db:tokens:ghp_" + "a" * 36, mode="reviewed")
-        self.assertTrue(any(w["type"] == "advisory" for w in warnings))
+        # Issue #180 retarget (the method name is historical — the DoD forbids
+        # renames): the issue's Design step 1 governs — `reviewed` RAISES on a
+        # credential-shaped ref where `manual` stays advisory-only, so an
+        # explicit review claim can never carry a secret-shaped source_ref.
+        with self.assertRaises(CapturePolicyRefusal) as ctx:
+            self._refused("db:tokens:ghp_" + "a" * 36, mode="reviewed")
+        self.assertEqual(ctx.exception.reason, "source_ref_secret_like")
+        # Manual keeps the original advisory contract.
+        content, _, _, warnings = apply_capture_policy(
+            content="probe", source_ref="db:tokens:ghp_" + "a" * 36,
+            tags="", capture_mode="manual")
+        self.assertEqual(content, "probe")
+        self.assertTrue(any(w["type"] == "advisory" for w in warnings),
+                        warnings)
 
 
 class FileAbsoluteRefusedTest(unittest.TestCase):
     """`file:` is the one scheme with a shape rule: relative only."""
 
     def _refused(self, source_ref):
-        _apply_capture_policy(content="probe", source_ref=source_ref,
+        apply_capture_policy(content="probe", source_ref=source_ref,
                               tags="", capture_mode="auto")
 
     def test_windows_drive_absolute_refuses(self):
@@ -196,7 +208,7 @@ class ContentScanningUnchangedTest(unittest.TestCase):
     still redacts in auto mode even when the source_ref is allowlisted."""
 
     def test_content_secret_redacted_with_allowlisted_ref(self):
-        content, _, _, warnings = _apply_capture_policy(
+        content, _, _, warnings = apply_capture_policy(
             content="the token is ghp_" + "a" * 36,
             source_ref="db:memory:0123456789abcdef0123456789abcdef",
             tags="", capture_mode="auto")
@@ -205,7 +217,7 @@ class ContentScanningUnchangedTest(unittest.TestCase):
         self.assertTrue(any(w["type"] == "redacted" for w in warnings))
 
     def test_allowlist_warning_surfaced(self):
-        _, _, _, warnings = _apply_capture_policy(
+        _, _, _, warnings = apply_capture_policy(
             content="clean content", tags="",
             source_ref="db:memory:0123456789abcdef0123456789abcdef",
             capture_mode="auto")
@@ -218,7 +230,7 @@ class ContentScanningUnchangedTest(unittest.TestCase):
         # The 32-hex shape OUTSIDE an allowlisted scheme refuses as before —
         # the relaxation is scoped to the provenance schemes only.
         with self.assertRaises(CapturePolicyRefusal):
-            _apply_capture_policy(content="probe", tags="",
+            apply_capture_policy(content="probe", tags="",
                                   source_ref="build 0123456789abcdef0123456789abcdef",
                                   capture_mode="auto")
 
@@ -242,7 +254,7 @@ class FileTraversalRefusedTest(unittest.TestCase):
     bytes, so traversal would hash files outside the project."""
 
     def _refused(self, source_ref):
-        _apply_capture_policy(content="probe", source_ref=source_ref,
+        apply_capture_policy(content="probe", source_ref=source_ref,
                               tags="", capture_mode="auto")
 
     def test_posix_traversal_refuses(self):
@@ -259,11 +271,30 @@ class FileTraversalRefusedTest(unittest.TestCase):
 
     def test_inner_stays_allowed(self):
         # A directory merely NAMED with dots is not traversal.
-        _, _, _, warnings = _apply_capture_policy(
+        _, _, _, warnings = apply_capture_policy(
             content="probe", tags="", source_ref="file:docs/v1.2/notes.md",
             capture_mode="auto")
         self.assertTrue(any(w["type"] == "source_ref_allowlisted"
                             for w in warnings))
+
+
+class CaptureAllowlistTest(unittest.TestCase):
+    """Issue #180: the capture policy is importable ONLY under its public
+    name — the pre-#180 private spelling is gone from the package surface.
+    The private name is CONSTRUCTED so this file carries no literal."""
+
+    def test_only_public_policy_is_imported(self):
+        private_name = "_" + "apply_capture_policy"
+        import storelib
+        import storelib.write
+        self.assertTrue(hasattr(storelib, "apply_capture_policy"))
+        self.assertTrue(hasattr(storelib.write, "apply_capture_policy"))
+        self.assertFalse(hasattr(storelib, private_name),
+                         "the private policy symbol must not survive on the "
+                         "storelib package surface")
+        self.assertFalse(hasattr(storelib.write, private_name),
+                         "the private policy symbol must not survive on the "
+                         "storelib.write module surface")
 
 
 if __name__ == "__main__":

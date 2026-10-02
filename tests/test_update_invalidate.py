@@ -281,7 +281,9 @@ class UpdateBasicFlowTest(_StoreCase):
                            "--source-ref", "creds ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
                            "--capture-mode", "auto")
         self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn("refusing automatic capture", r.stderr)
+        # Issue #180: capture-policy refusals print the stable reason label
+        # (the old prose form is gone); update never quarantines.
+        self.assertIn("capture policy refused: source_ref_secret_like", r.stderr)
         self.assertIsNone(self.store.row(mid)["superseded_at"],
                           "a capture-refused update must not tombstone the target")
 

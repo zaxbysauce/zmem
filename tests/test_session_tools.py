@@ -695,6 +695,95 @@ class HermesSessionToolsTest(unittest.TestCase):
         self.assertNotIn("Unknown tool", raw)
 
 
+class HermesCapturePolicyTest(unittest.TestCase):
+    """Issue #180: zmem_add returns the SAME normalized quarantine envelope
+    as the MCP add tool (envelope-forwarding parity against a stubbed store;
+    end-to-end remote-safety runs in the store itself), and the subprocess
+    boundary holds — the provider never imports storelib in-process."""
+
+    QUARANTINE_STDOUT = json.dumps({
+        "id": None,
+        "result": "quarantined",
+        "warnings": [{"type": "quarantined",
+                      "reason": "source_ref_secret_like"}],
+    })
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="zmem-hermes-quar-")
+        cls._saved = {k: os.environ.get(k) for k in (
+            "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD",
+        )}
+        os.environ["ZMEM_HOME"] = str(REPO_ROOT)
+        os.environ["ZMEM_STORE"] = os.path.join(cls._tmp, "store.sqlite")
+        os.environ["ZMEM_DATA"] = cls._tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(cls._tmp, "no-such-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        # Stub the Hermes host ABC (provided by the gateway at runtime),
+        # matching HermesSessionToolsTest above.
+        agent = types.ModuleType("agent")
+        mp = types.ModuleType("agent.memory_provider")
+
+        class MemoryProvider:  # minimal stand-in
+            pass
+
+        mp.MemoryProvider = MemoryProvider
+        agent.memory_provider = mp
+        sys.modules.setdefault("agent", agent)
+        sys.modules.setdefault("agent.memory_provider", mp)
+
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "zmem_hermes_capture_policy", REPO_ROOT / "hermes-plugin" / "__init__.py")
+        cls.mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_hermes_capture_policy"] = cls.mod
+        spec.loader.exec_module(cls.mod)
+        cls.provider = cls.mod.ZmemMemoryProvider()
+        cls.provider.initialize("sess-hermes-quarantine")
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+        for k, v in cls._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        sys.modules.pop("zmem_hermes_capture_policy", None)
+
+    def test_zmem_add_matches_mcp_quarantine_result(self):
+        # Purge first so the post-call assertion measures THIS call, not a
+        # storelib module some earlier test in the process may have imported.
+        for mod_name in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+            del sys.modules[mod_name]
+
+        def quarantining_run_store(args, input_text=None):
+            return {"ok": True, "stdout": self.QUARANTINE_STDOUT,
+                    "stderr": "", "returncode": 0}
+
+        with mock.patch.object(self.mod, "_run_store",
+                               side_effect=quarantining_run_store):
+            raw = self.provider.handle_tool_call(
+                "zmem_add", {"type": "fact",
+                             "content": "sshpass -p pw180A ssh host",
+                             "signal": "test", "namespace": "user:global",
+                             "source_ref": "file:fixture-safe"})
+        result = json.loads(raw)
+        self.assertEqual(result.get("result"), "quarantined", result)
+        self.assertIsNone(result.get("id"), result)
+        self.assertEqual(result.get("warnings"),
+                         [{"type": "quarantined",
+                           "reason": "source_ref_secret_like"}], result)
+        # The subprocess boundary held: no in-process storelib import.
+        leaked = [m for m in list(sys.modules)
+                  if m == "storelib" or m.startswith("storelib.")]
+        self.assertEqual(leaked, [],
+                         "zmem_add must reach the policy only via store.py")
+
+
 class HermesMcpClientTest(unittest.TestCase):
     def test_client_forwards_optional_lane(self):
         import importlib.util

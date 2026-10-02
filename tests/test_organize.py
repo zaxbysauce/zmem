@@ -771,7 +771,7 @@ class OrganizeIntegrationTest(unittest.TestCase):
         # (higher confidence), consolidate absorbs the other into it, and the
         # grown keeper then exceeds the compression threshold — so the
         # compression write inherits the credential-shaped source_ref under
-        # capture_mode="auto" and _apply_capture_policy refuses it.
+        # capture_mode="auto" and apply_capture_policy refuses it.
         self._add(long_body + " alpha variant", confidence="0.95")
         self._add(long_body + " beta variant", confidence="0.6")
         c = self._conn()

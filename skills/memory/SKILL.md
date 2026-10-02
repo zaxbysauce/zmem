@@ -2132,10 +2132,17 @@ concealment ("do not mention this"), instruction-override paraphrases
 ordinary coding lessons like "update the lockfile" never tag; the read path
 re-classifies EVERY row at emit time regardless of store age).
 Use `--capture-mode auto` when ingesting an untrusted/remote sync file: it
-additionally redacts secret-like content/tags (tagged `auto-redacted`) and
-refuses rows whose `source_ref` looks like a secret (counted as
-`capture_refused` in the summary, NOT stored). `reviewed`/`manual` keep the
-original text with an advisory notice.
+additionally redacts secret-like VALUES in content/tags (value-span
+replacement, tagged `auto-redacted`) and QUARANTINES rows whose `source_ref`
+looks like a secret (issue #180: counted as `quarantined` in the summary —
+after `capture_refused` — with the original row appended to
+`<store-dir>/quarantine/<UTC-date>.jsonl`, NOT stored; the run still exits 0).
+`reviewed` RAISES on those refusals (counted as `capture_refused`, never
+quarantined — plain `ingest-jsonl` still exits 0 with the count since the
+file keeps going; exit 2 applies via `--strict` or the `add`/`update` CLI
+paths); `manual` keeps the original text with an advisory notice.
+A quarantine write failure counts `quarantine_failed`, stores nothing for
+that row, and exits 1.
 
 Issue #71 F: in `auto` mode, `source_ref`s with a structured provenance
 scheme — `db:`, `hindsight:`, `session:`, `zmem-queue:`, and `file:` with a
@@ -2145,6 +2152,115 @@ Credential shapes (key=value pairs, PEM headers, `gh*_`/AKIA tokens) still
 refuse on allowlisted refs, `file:` absolute remainders still refuse, and
 content/tags scanning is unchanged. The write result carries a structured
 `source_ref_allowlisted` warning so the relaxation is visible.
+
+### Capture policy and quarantine (issue #180)
+
+`apply_capture_policy` (storelib.write) is THE single capture-policy entry
+point. Every importer routes through it: CLI `add`/`update` (via
+`add_memory`/`update_memory`), `ingest-jsonl` and `ingest-jsonl --strict`,
+`import-store.py`, `scripts/ingest_harvest.py`, MCP `add`, Hermes `zmem_add`
+(the last three via the `store.py` subprocess boundary — no adapter
+re-implements pattern matching). The pattern registry lives in
+`redaction.py` as the only source; `redact_text` and the read-time
+credential withhold (`recall`'s classifier) iterate the same lists.
+
+Detectors and span semantics — value-span patterns replace ONLY the secret
+value and keep the surrounding syntax; everything else whole-match-replaces:
+
+| shape | matches | does NOT match |
+|---|---|---|
+| `sshpass -p <value>` (any whitespace, incl. tabs) | value replaced | dangling `sshpass -p` |
+| `sudo -S` | whole-row refusal (`unredactable_secret`) | `sudo -s` (flag case matters) |
+| `--password=<value>` (attached) | value replaced | `--password <value>` spaced; bare `--password` |
+| `ssh`/`mysql`/`psql` `-p<value>` (attached) | value replaced | `-P<token>`; other commands' `-p`; spaced `-p <value>` |
+| `scheme://user:password@host` | password replaced | URLs without userinfo |
+| key=value (`password=`, `api_key=`, … compound names like `DB_PASSWORD=` included) | value replaced (8+ chars) | bare keywords with no `[:=]` |
+| PEM block (BEGIN…END) | whole block replaced | — |
+| token prefixes (`gh*_`, `sk-`, `AKIA`, JWT, …) | whole token replaced | — |
+
+Known accepted over-redaction (issue-mandated matrix, fail-safe direction):
+for `ssh` and `psql` the lowercase `-p` is actually the PORT flag, so
+`ssh -p2222 user@host` IS redacted as if the port were a secret; the matrix
+positives (`ssh -ppw180F`) require it. Do not "fix" this without changing the
+issue contract.
+
+Command names and URL syntax match case-insensitively; option letters are
+case-SENSITIVE (`-S` vs `-s`, `-p` vs `-P`). `[REDACTED_SECRET]` is
+idempotent: a value already equal to the marker is detected but never
+rewritten, so re-running auto mode on a redacted row is a fixed point for
+content, source_ref, and tags (warnings are identical for inputs whose
+detection set is stable across a re-scan — every issue fixture row; a
+placeholder value long enough to trip a second pattern re-counts, and an
+output matching no pattern emits no redaction warning). Known safe-direction
+caveat: a URL of the shape `scheme://host:port/a@b` over-redacts the
+`port/a` span, and an attached `ssh -p<port>` is treated as a password
+(both are the price of the issue's exact matrix) — and because the
+read-time credential classifier consumes the same shapes, such a stored
+row is ALSO withheld from passive injection (issue #256's read-time
+defense), not merely masked at write time.
+
+Quarantine contract: an auto-mode refusal with reason
+`source_ref_secret_like`, `source_ref_unsafe_path`, or
+`unredactable_secret` is quarantineable. The importer that caught it
+appends the ORIGINAL row to `<store-data-dir>/quarantine/<UTC-date>.jsonl`
+(the directory of the resolved STORE — every importer writer resolves the
+same sink, never a divergent `ZMEM_DATA`; directory 0o700, file 0o600) —
+one compact JSON object per line, keys in order `quarantined_at`,
+`reason`, `source_ref`, `row` — via `quarantine_import_row` (write
+failures raise `OSError`: the row is rolled back, counted
+`quarantine_failed`, and the run exits nonzero). The store's writer lease
+does NOT cover the quarantine file; writers serialize on an exclusive
+advisory file lock (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows)
+held across each append — bare `O_APPEND` and the buffered text-mode
+`open("a")` idiom both measurably dropped or tore records under concurrent
+Win32 writers (review-round probe). Review quarantine files with
+restricted filesystem access.
+
+Importer results and counters:
+- `store.py add --capture-mode auto --json` prints
+  `{"id": null, "result": "quarantined", "warnings": [{"type": "quarantined", "reason": "<reason>"}]}`
+  and exits 0 on a successful quarantine; reviewed-mode and namespace
+  refusals exit 2 with `[zmem] capture policy refused: <reason>` (namespace
+  refusals keep their prose guidance; `manual` never raises on capture
+  grounds — namespace validation can refuse in any mode).
+- `ingest-jsonl` summary carries `quarantined=` and `quarantine_failed=`
+  after `capture_refused=`; `quarantine_failed>0` exits 1.
+  `ingest-jsonl --strict` treats a quarantined row as a rejection
+  (all-or-nothing stays fail-closed).
+- `import-store.py` stages a sanitized copy (source read-only
+  `mode=ro`+`query_only=1`; every memory row through the policy in id
+  order; refused rows deleted with their related rows — belief heads
+  sourced only by a refused row are deleted with it, shared heads rebuild
+  from a surviving source — and quarantined; redacted rows keep ids with
+  FTS maintained by trigger and stale `memory_vec` embeddings dropped),
+  verifies `PRAGMA integrity_check` and
+  `staged_count = source_count - quarantined_count`, flushes its refusal
+  records (one locked, all-or-nothing batch; records the ledger already
+  holds — compared without the per-call timestamp — are skipped, so
+  re-imports never duplicate them) BEFORE the destination is touched, and
+  only then atomically replaces the destination (`os.replace`); the
+  source's sha256/size/row-count are proven unchanged before and after.
+  Its report carries `added`, `redacted`, `quarantined`,
+  `quarantine_failed`.
+- `scripts/ingest_harvest.py` subprocesses
+  `store.py add --capture-mode auto --json` per row (a record may carry its
+  own `source_ref`; the CLI `--source-ref` is the fallback), classifies
+  each child result as `stored`/`deduped`/`quarantined`/`failed`, and
+  reports all four counts; any `failed` exits 1.
+- MCP `add` and Hermes `zmem_add` forward the store envelope verbatim —
+  `result: "quarantined"`, `id: null`, one structured warning — and never
+  expose the local quarantine path, the source row, the credential value,
+  or any filesystem detail.
+
+Operator runbook (a stored credential is captured — the field trigger was
+row `b513b21c`): invalidate the row with reason `credential leak`; rotate
+the affected SSH password AND every credential that shared it; search
+backups, exports, quarantine files, and logs for copies; verify the row is
+tombstoned and absent from live recall; never print the credential; review
+future whole-row quarantine records with restricted filesystem access.
+Invalidate tombstones rather than purges (durable purge is #255); read-time
+credential withhold on the passive lane is #256. This runbook is
+operator-only and never targets a test store.
 
 Every ingested row ALSO runs the deterministic entity extractor (the same
 one `add` uses), so entity identity is rebuilt locally instead of carried
