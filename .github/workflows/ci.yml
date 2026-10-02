@@ -85,6 +85,17 @@ jobs:
       - name: Install huggingface_hub
         shell: bash
         run: python -m pip install --disable-pip-version-check "huggingface_hub>=0.30"
+
+      # Issue #180: the legacy-import capture fixture carries a memory_vec
+      # carrier, and import-store refuses (fail-closed) to sanitize a
+      # vec-bearing store without the sqlite-vec extension — stale
+      # pre-redaction vectors are exactly the leak the carrier exists to
+      # catch. Install the small extension in BOTH matrix legs so the
+      # import suite RUNS its vec path instead of erroring; the heavier
+      # embedding model runtime stays reserved for the test-embeddings job.
+      - name: Install sqlite-vec
+        shell: bash
+        run: python -m pip install --disable-pip-version-check "sqlite-vec>=0.1.6,<1.0"
       - name: MCP tool suites (skipped=0 gate)
         shell: bash
         run: |
@@ -126,19 +137,9 @@ jobs:
               echo "=== $f (skipped here: dependency-enforcing smoke test runs in test-embeddings) ==="
               continue
             fi
-            # Issue #256: SshpassShapeWithholdTest is RED until issue #180
-            # lands its `sshpass -p` credential shape (this issue's own
-            # Dependencies section) — running the full file here would redden
-            # every push on another workstream's timeline. Run the
-            # dependency-independent classes. NOTE: no workflow executes the
-            # gated AC6 class — the issue-trace gates that replay it are
-            # human-run over git-excluded trace dirs, NOT CI; the full file
-            # joins this loop when #180 lands (delete this branch then).
-            if [ "$f" = "tests/test_q02_passive_secret_withhold.py" ]; then
-              echo "=== $f (dependency-independent classes only; AC6 gated on #180) ==="
-              python "$f" PassiveSecretWithholdTest LedgerWithholdTest GitShaNotWithheldTest WithholdBudgetAndNoSessionTest
-              continue
-            fi
+            # (Issue #256 gate removed: #180 landed, so the full
+            # test_q02_passive_secret_withhold.py file — AC6 class included —
+            # runs in this loop.)
             echo "=== $f ==="
             python "$f"
           done
