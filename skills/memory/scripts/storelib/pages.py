@@ -369,9 +369,14 @@ def _safe_text(value: str, maximum: int) -> str:
         raise PageError("invalid page text") from exc
     if len(encoded) > maximum:
         raise PageError("page text exceeds bound")
-    if any(marker in value for marker in _FENCE_MARKERS):
-        raise PageError("page text contains fence marker")
+    _require_no_fence_markers(value)
     return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _require_no_fence_markers(content: str) -> None:
+    """Refuse reserved host-control literals without rewriting page bytes."""
+    if any(marker in content for marker in _FENCE_MARKERS):
+        raise PageError("page text contains fence marker")
 
 
 def _utf8_cap(value: object, maximum: int) -> str:
@@ -834,6 +839,10 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         if _snapshot_bytes(publish_rows) != _snapshot_bytes(fresh_rows):
             raise PageError("page sources changed during publication")
         _sections(content)
+        # Canonical content and retained sections bypass adapter field caps.
+        # Scan the composed page once, without normalizing it, before building
+        # a version or entering publication staging.
+        _require_no_fence_markers(content)
         _require_authoritative_bullets(content, actual_bullets)
         _require_live_bullet_authority(publish_rows, actual_bullets)
         represented_sources = sorted({sid for item in actual_bullets.values() for sid in item["source_ids"]})

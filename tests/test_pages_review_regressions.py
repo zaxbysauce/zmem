@@ -6,6 +6,7 @@ module through a package path.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -78,6 +79,23 @@ def _json_file_sizes(root: Path) -> dict[str, int]:
         str(path.relative_to(_page_dir(root))).replace("\\", "/"): len(path.read_bytes())
         for path in sorted(_page_dir(root).rglob("*.json"))
     }
+
+
+def _install_legacy_retained_marker(root: Path, marker: str) -> None:
+    """Make a checksum-valid legacy committed page with a retained literal."""
+    directory = _page_dir(root)
+    current = _current(root)
+    version_path = directory / "versions" / f"{current['version_id']}.json"
+    version = json.loads(version_path.read_text(encoding="utf-8"))
+    content = version["content"].replace("Stable bytes: cafe", "Stable bytes: cafe " + marker)
+    raw = content.encode("utf-8")
+    checksum = hashlib.sha256(raw).hexdigest()
+    current["page_checksum"] = checksum
+    version["page_checksum"] = checksum
+    version["content"] = content
+    (directory / "page.md").write_bytes(raw)
+    (directory / "current.json").write_bytes(_contract_json_bytes(current))
+    version_path.write_bytes(_contract_json_bytes(version))
 
 
 def _adapter_append(markdown: str):
@@ -485,6 +503,71 @@ class PagesReviewRegressions(unittest.TestCase):
                         "grounded stable café section",
                         (_page_dir(root) / "page.md").read_text(encoding="utf-8"),
                     )
+                finally:
+                    db.close()
+
+    def test_final_page_fence_scan_refuses_canonical_and_retained_literals(self):
+        markers = (
+            "<<<ZMEM_UNTRUSTED_FENCE>>>",
+            "<<<END_ZMEM_UNTRUSTED_FENCE>>>",
+        )
+        source_id = "00000000-0000-4000-8000-000000000502"
+        for marker in markers:
+            with self.subTest(input="canonical", marker=marker):
+                with tempfile.TemporaryDirectory(prefix="zmem-pages-review-fence-source-") as tmp:
+                    root = Path(tmp)
+                    with _isolated_env(root):
+                        db, pages = _seed_store(root)
+                        try:
+                            _copy_base_page(root)
+                            _refresh(pages, db, root)
+                            before = _tree_bytes(_page_dir(root))
+                            db.execute("UPDATE memory SET content=? WHERE id=?", (
+                                "Fixture topic source alpha " + marker, source_id,
+                            ))
+                            db.commit()
+                            with self.assertRaisesRegex(pages.PageError, "fence marker"):
+                                _refresh(pages, db, root)
+                            self.assertEqual(before, _tree_bytes(_page_dir(root)))
+                        finally:
+                            db.close()
+            with self.subTest(input="retained", marker=marker):
+                with tempfile.TemporaryDirectory(prefix="zmem-pages-review-fence-retained-") as tmp:
+                    root = Path(tmp)
+                    with _isolated_env(root):
+                        db, pages = _seed_store(root)
+                        try:
+                            _copy_base_page(root)
+                            _refresh(pages, db, root)
+                            _install_legacy_retained_marker(root, marker)
+                            before = _tree_bytes(_page_dir(root))
+                            with self.assertRaisesRegex(pages.PageError, "fence marker"):
+                                _refresh(pages, db, root)
+                            self.assertEqual(before, _tree_bytes(_page_dir(root)))
+                        finally:
+                            db.close()
+
+    def test_final_page_fence_scan_covers_adapter_composed_result(self):
+        """The final scan sees a literal composed after per-field adapter caps."""
+        marker = "<<<ZMEM_UNTRUSTED_" + "FENCE>>>"
+        with tempfile.TemporaryDirectory(prefix="zmem-pages-review-fence-adapter-") as tmp:
+            root = Path(tmp)
+            with _isolated_env(root):
+                db, pages = _seed_store(root)
+                try:
+                    _copy_base_page(root)
+                    _refresh(pages, db, root)
+                    before = _tree_bytes(_page_dir(root))
+                    real_apply = pages._apply_operations
+
+                    def composed_with_marker(*args, **kwargs):
+                        content, authority = real_apply(*args, **kwargs)
+                        return content.replace("valid adapter page", marker), authority
+
+                    with patch.object(pages, "_apply_operations", side_effect=composed_with_marker):
+                        with self.assertRaisesRegex(pages.PageError, "fence marker"):
+                            _refresh(pages, db, root, adapter=_adapter_append("valid adapter page"))
+                    self.assertEqual(before, _tree_bytes(_page_dir(root)))
                 finally:
                     db.close()
 
