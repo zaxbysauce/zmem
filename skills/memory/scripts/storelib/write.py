@@ -502,6 +502,12 @@ def _unlock_quarantine(fd: int) -> None:
     try:
         if os.name == "nt":
             import msvcrt
+            # The locked range was taken at offset 0; writes with O_APPEND
+            # advance the fd position, and msvcrt.locking UNLCK addresses the
+            # range at the CURRENT position — seek back or the unlock always
+            # misses (close() releases the lock regardless, but an explicit
+            # unlock that works lets the retry loop actually proceed).
+            os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
@@ -635,19 +641,29 @@ def quarantine_import_rows(data_dir: str | Path,
     stamp = now if now is not None else now_iso()
     quarantine_dir, target = _quarantine_target(data_dir, stamp)
     existing = set()
-    if target.exists():
-        with open(target, "rb") as fh:
-            for line in fh.read().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    rec = json.loads(line.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    continue  # a torn historical line matches nothing
-                rec.pop("quarantined_at", None)
-                existing.add(json.dumps(
-                    rec, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":")))
+    # Scan EVERY ledger file, not just today's: a failed-after-flush import
+    # re-run that straddles a UTC midnight would otherwise re-append its
+    # records into the new date file (review round 3) — the no-duplicates
+    # contract is unconditional. Quarantine ledgers are small (records are
+    # rare refusals), so the full scan is cheap. A torn historical line
+    # matches nothing.
+    for ledger in sorted(quarantine_dir.glob("*.jsonl")):
+        try:
+            with open(ledger, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            rec.pop("quarantined_at", None)
+            existing.add(json.dumps(
+                rec, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")))
     fresh: list[bytes] = []
     for reason, row in records:
         key_rec = {"reason": reason, "source_ref": row.get("source_ref", ""),

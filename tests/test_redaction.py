@@ -29,7 +29,7 @@ SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 SECRETS_DIR = REPO_ROOT / "tests" / "fixtures" / "secrets"
 sys.path.insert(0, str(SCRIPTS))
 
-from storelib.write import redact_text  # noqa: E402
+from storelib.write import quarantine_import_rows, redact_text  # noqa: E402
 from redaction import redact_training_text  # noqa: E402
 
 SECRET = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
@@ -631,6 +631,29 @@ class QuarantinePolicyTest(unittest.TestCase):
             # A torn/interleaved line raises here.
             seqs.add(json.loads(line)["row"]["seq"])
         self.assertEqual(len(seqs), 120, "duplicate or missing seqs")
+
+    def test_batch_flush_dedupes_across_utc_dates(self):
+        """Review-round guard: the ledger dedupe must scan EVERY quarantine
+        file, not just the flush date's — a failed-after-flush import re-run
+        across a UTC midnight otherwise re-appends the same records into the
+        new date file, violating the never-duplicate contract."""
+        scratch = tempfile.mkdtemp(prefix="zmem-quar-xdate-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        record = ("unredactable_secret",
+                  {"source_ref": "probe:xdate", "content": "k=v"})
+        first = quarantine_import_rows(scratch, [record],
+                                       now="2031-03-04T23:59:00Z")
+        self.assertEqual(os.path.basename(str(first)), "2031-03-04.jsonl")
+        second = quarantine_import_rows(scratch, [record],
+                                        now="2031-03-05T00:01:00Z")
+        self.assertIsNone(second, "identical records must be deduped")
+        self.assertFalse(
+            os.path.exists(os.path.join(scratch, "quarantine",
+                                        "2031-03-05.jsonl")),
+            "the re-run must not open a new date file for the same record")
+        with open(os.path.join(scratch, "quarantine", "2031-03-04.jsonl"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(len(fh.read().splitlines()), 1)
 
 
 class ReadEnvelopeOmitCountsTest(unittest.TestCase):
