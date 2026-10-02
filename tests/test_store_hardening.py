@@ -437,8 +437,11 @@ class TestAutomaticCaptureSecurity(HardeningStoreCase):
             "--capture-mode",
             "auto",
         )
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("provenance and staleness", r.stderr)
+        # Issue #180: an auto-mode secret-shaped source_ref QUARANTINES
+        # (exit 0, durable record) instead of the pre-#180 exit-2 drop — the
+        # "without writing" property is unchanged: zero memory rows.
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("quarantined this row (source_ref_secret_like)", r.stderr)
         row = self.query_one("SELECT count(*) FROM memory")
         self.assertEqual(row[0], 0)
 

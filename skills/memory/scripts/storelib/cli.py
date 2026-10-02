@@ -59,7 +59,7 @@ from storelib.dataset import (
     cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
     export_dataset, import_dataset, publish_dataset,
 )
-from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, add_memory, feedback_memory, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, QUARANTINE_REASONS, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, _normalize_capture_mode, add_memory, feedback_memory, quarantine_import_row, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
 from storelib.delivery_ledger import FeedbackSidecarError
 from storelib.feedback import apply_operation_feedback
 from storelib.training_capture import (
@@ -3772,7 +3772,60 @@ def main():
                         "warnings": res.warnings,
                     }))
             except CapturePolicyRefusal as exc:
-                print(f"[zmem] {exc}", file=sys.stderr)
+                # Issue #180: in auto mode a quarantineable refusal records the
+                # ORIGINAL input row in the quarantine JSONL and reports
+                # success-with-quarantine (exit 0) — the durable record replaces
+                # the silent drop. Every other refusal (reviewed-mode raise,
+                # namespace validation) keeps exit 2.
+                if (exc.reason in QUARANTINE_REASONS
+                        and _normalize_capture_mode(args.capture_mode) == "auto"):
+                    quarantine_row = {
+                        "namespace": args.namespace,
+                        "type": args.type,
+                        "content": args.content,
+                        "tags": args.tags,
+                        "signal": args.signal,
+                        "source_ref": args.source_ref or "",
+                        # Preserve explicitly-supplied add metadata so a
+                        # re-ingestion reconstructs the same row (cubic
+                        # round); None means the flag was not supplied and
+                        # add_memory's defaults would have applied.
+                        "confidence": args.confidence,
+                        "taint": args.taint,
+                    }
+                    # Same sink resolution as every other importer writer
+                    # (sync/_ingest_row): the quarantine dir belongs to the
+                    # STORE, never to a divergent ZMEM_DATA — one store, one
+                    # quarantine directory.
+                    data_dir = os.path.dirname(STORE_PATH)
+                    try:
+                        quarantine_import_row(data_dir, quarantine_row,
+                                               reason=exc.reason)
+                    except OSError:
+                        print("[zmem] capture quarantine failed: quarantine_write_failed",
+                              file=sys.stderr)
+                        sys.exit(1)
+                    if args.json:
+                        print(json.dumps({
+                            "id": None,
+                            "result": "quarantined",
+                            "warnings": [{
+                                "type": "quarantined",
+                                "reason": exc.reason,
+                            }],
+                        }))
+                    else:
+                        print(f"[zmem] capture policy quarantined this row "
+                              f"({exc.reason}); recorded under the store's "
+                              f"quarantine/ directory", file=sys.stderr)
+                    sys.exit(0)
+                if exc.reason.startswith("namespace_"):
+                    # Namespace validation keeps its prose guidance (same form
+                    # as the episode handler) — the operator needs the fix hint.
+                    print(f"[zmem] {exc}", file=sys.stderr)
+                else:
+                    print(f"[zmem] capture policy refused: {exc.reason}",
+                          file=sys.stderr)
                 sys.exit(2)
             except ContentTooLarge as exc:
                 # Content-size cap — caught SPECIFICALLY (not as a bare
@@ -3841,7 +3894,16 @@ def main():
                         "warnings": res.warnings,
                     }))
             except CapturePolicyRefusal as exc:
-                print(f"[zmem] {exc}", file=sys.stderr)
+                # Issue #180 wording contract: capture-policy refusals print
+                # the stable reason label; namespace validation keeps its
+                # prose guidance. An update mutates an existing row — the
+                # refusal prevents the mutation, so there is nothing new to
+                # quarantine (unlike the add path); exit stays 2.
+                if exc.reason.startswith("namespace_"):
+                    print(f"[zmem] {exc}", file=sys.stderr)
+                else:
+                    print(f"[zmem] capture policy refused: {exc.reason}",
+                          file=sys.stderr)
                 sys.exit(2)
             except ContentTooLarge as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)

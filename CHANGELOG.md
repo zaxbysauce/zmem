@@ -10,6 +10,119 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.76.0] - 2026-10-01
+
+### Added
+- **One capture policy for every importer, new credential shapes, quarantine**
+  (issue #180, Workstream L PR 1 of 2). `apply_capture_policy`
+  (`storelib.write`) is now the single public capture-policy entry point —
+  the private spelling is gone from the codebase — and every importer routes
+  through it: CLI `add`/`update`, `ingest-jsonl` (both the default and
+  `--strict` variants), legacy `import-store.py`, harvest ingestion
+  (`scripts/ingest_harvest.py`), MCP `add`, and Hermes `zmem_add` (the last
+  three via the `store.py` subprocess boundary; no adapter implements
+  pattern matching). The shared pattern registry (`redaction.py`, the only
+  source) gains labeled detectors for the command/URL credential shapes the
+  field leak rode in on: `sshpass -p <value>` (standalone, any whitespace),
+  `sudo -S` (whole-row refusal — the password arrives on stdin, no safe
+  span exists), attached `--password=<value>`, attached
+  `ssh`/`mysql`/`psql` `-p<value>`, URL userinfo
+  (`scheme://user:password@host` — scheme/user/host preserved), a full-block
+  PEM match, and compound key=value names (`DB_PASSWORD=…`, `my_api_key=…`).
+  Value-span patterns replace ONLY the secret value —
+  `sshpass -p [REDACTED_SECRET] ssh host` — with command names/URL syntax
+  case-insensitive and option letters case-sensitive (`sudo -s` and
+  `ssh -P<port>` never match); `[REDACTED_SECRET]` is idempotent (detected,
+  never rewritten, so re-running auto mode on a redacted row is a fixed
+  point for content, source_ref, and tags — warnings are identical for
+  inputs whose detection set is stable across a re-scan, including every
+  issue fixture row), and counts are detection counts. The read-time credential
+  withhold on the passive injection lane (issue #256) picks the new shapes
+  up through the same registry, and evidence/hook redaction inherits every
+  detector via `redact_text`.
+- **Quarantine** (issue #180): an auto-mode refusal with reason
+  `source_ref_secret_like`, `source_ref_unsafe_path`, or
+  `unredactable_secret` is no longer a silent drop. The catching importer
+  appends the ORIGINAL row to `<data-dir>/quarantine/<UTC-date>.jsonl`
+  (0o700/0o600, one compact JSON object per line — `quarantined_at`,
+  `reason`, `source_ref`, `row`). `store.py add --capture-mode auto --json`
+  prints `{"id": null, "result": "quarantined", "warnings": [{"type":
+  "quarantined", "reason": ...}]}` and exits 0; a quarantine write failure
+  prints `[zmem] capture quarantine failed: quarantine_write_failed` and
+  exits 1 with no store row. `ingest-jsonl` gains `quarantined=` and
+  `quarantine_failed=` summary counters (`quarantine_failed>0` exits 1).
+  Deterministic fixtures and generators live under
+  `tests/fixtures/secrets/` (12-positive/12-negative pattern matrix,
+  two-row five-importer input, legacy SQLite source, harvest array, and
+  expected outputs with recorded SHA-256 digests).
+- **Structured refusal reasons** (issue #180): `CapturePolicyRefusal` now
+  carries `.reason`/`.message` (canonical message `capture refused:
+  <reason>`), so callers and tests branch on stable labels instead of
+  prose. Non-quarantine refusals print `[zmem] capture policy refused:
+  <reason>` (namespace validation keeps its operator guidance prose).
+
+### Fixed
+- **PR-review round (swarm review, 4 lanes + 11 micro-families + independent
+  validation):** legacy-import redaction now recomputes or drops EVERY
+  derived carrier — `content_norm` is recomputed from the post-redaction
+  text (it previously retained the verbatim secret and fed dedup/recall),
+  the `embedding`/`embedding_model`/`embedded_at` columns are cleared (the
+  stale blob survived and `reembed` re-propagated it), entity links are
+  re-derived from the redacted text, belief_head content copies are rebuilt,
+  and the staging FTS index is optimized + the file VACUUMed before
+  acceptance (tombstone segments could retain pre-redaction bytes). The
+  staging connection now loads sqlite-vec, fixing a crash (`no such module:
+  vec0`) that made sanitized import fail on every vec-bearing source store.
+  Quarantine appends are buffered until every acceptance gate passes (a
+  failed import no longer leaves ledger entries for an import that never
+  completed) and are written through one `O_APPEND` `os.write` per record
+  with `0o600` enforced on every append (the buffered text-mode writer
+  silently dropped bytes under concurrent writers on Windows; loose
+  pre-existing files are now tightened). Quarantine records carry the FULL
+  original source row. `core.md` is staged before the atomic store replace
+  (a copy failure no longer reports FAILED with the new store already in
+  place), stale destination sidecars are stashed and restored on failure,
+  and a replace failure while a session holds the store open now carries a
+  "close zmem sessions and retry" advisory. Redacted-and-grown content over
+  the storage cap is refused as `unredactable_secret` (auto: quarantine)
+  instead of being durably lost to `ContentTooLarge` after validation.
+
+### Changed
+- **Legacy store import is staged, sanitized, and atomic** (issue #180):
+  `import-store.py` builds a staging database in the destination directory
+  (online-backup from a `mode=ro` + `query_only=1` source), runs EVERY
+  memory row through the capture policy in deterministic `id` order
+  (NULL fields normalized), UPDATEs safe rows with redacted content/tags
+  (FTS maintained by the store's own triggers; stale `memory_vec`
+  embeddings of pre-redaction text dropped), DELETEs refused rows with
+  their related rows (side tables + `episode.summary_memory_id` reset),
+  quarantines each refusal, verifies `PRAGMA integrity_check` and
+  `staged_count = source_count - quarantined_count`, and only then
+  atomically replaces the destination (`os.replace` after clearing stale
+  sidecars). The source's SHA-256/size/row-count are proven unchanged
+  before and after; every failure path leaves the prior destination —
+  store, sidecars, and core.md — byte-identical. The report adds
+  `added`/`redacted`/`quarantined`/`quarantine_failed` counters.
+- **Harvest ingestion applies the capture bar** (issue #180):
+  `ingest_row` subprocesses `store.py add --capture-mode auto --json`
+  (a record may carry its own `source_ref`; the CLI `--source-ref` is the
+  fallback), returns a structured `stored`/`deduped`/`quarantined`/`failed`
+  status, and the summary reports all four counts (any `failed` exits 1).
+- **`reviewed` mode now raises** on capture refusals (exit 2, never
+  quarantined) per the issue's contract — an explicit review claim cannot
+  carry a secret-shaped source_ref; `manual` stays advisory-only and
+  remains the operator escape hatch. The one existing pin of the old
+  advisory behavior (`test_reviewed_mode_never_refuses`) is retargeted
+  with its historical name kept.
+- **Refusal stderr format** for capture-policy refusals is the stable label
+  line above; three existing pins are retargeted
+  (`test_secret_like_source_ref_refused_fail_closed` now asserts the
+  quarantine envelope at exit 0, `test_update_capture_refusal_exits_2`
+  and `test_add_secret_source_ref_returns_structured_error` assert the new
+  label/quarantine shapes), and `ingest-jsonl`'s auto-mode secret-source_ref
+  tally moved from `capture_refused` to `quarantined` (fourth retarget:
+  `test_ingest_auto_mode_refuses_secret_source_ref_and_keeps_going`).
+
 ## [0.75.0] - 2026-10-01
 
 ### Added

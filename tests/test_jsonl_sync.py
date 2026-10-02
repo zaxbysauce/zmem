@@ -62,6 +62,11 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
 PYTHON = sys.executable
 NS = "project:jsonlsync"
+SECRETS_DIR = REPO_ROOT / "tests" / "fixtures" / "secrets"
+FIXTURE_ROW_180 = "00000000-0000-4000-8000-000000000180"
+FIXTURE_ROW_181 = "00000000-0000-4000-8000-000000000181"
+FIXTURE_HEAD_REFUSED_ONLY = "00000000-0000-4000-8000-000000000bea"
+FIXTURE_HEAD_SHARED = "00000000-0000-4000-8000-000000000beb"
 
 
 def _base_env(tmp: str) -> dict:
@@ -162,11 +167,13 @@ class _TwoStoreCase(unittest.TestCase):
     def _summary_counts(stdout: str) -> dict:
         m = re.search(
             r"added=(\d+) tombstoned=(\d+) tombstones_refused=(\d+) "
-            r"capture_refused=(\d+) deduped=(\d+) skipped=(\d+) malformed=(\d+)",
+            r"capture_refused=(\d+) quarantined=(\d+) quarantine_failed=(\d+) "
+            r"deduped=(\d+) skipped=(\d+) malformed=(\d+)",
             stdout,
         )
         assert m, f"summary line not found in: {stdout!r}"
         keys = ("added", "tombstoned", "tombstones_refused", "capture_refused",
+                "quarantined", "quarantine_failed",
                 "deduped", "skipped", "malformed")
         return dict(zip(keys, (int(g) for g in m.groups())))
 
@@ -1165,7 +1172,7 @@ class IngestValidationTest(_TwoStoreCase):
         """A tombstoned row's content is still written to disk and still
         readable via `get` / `list --include-superseded`, so 'it arrived dead'
         is not a reason to skip the capture-policy scan. The row now flows
-        through _apply_capture_policy (issue #35): the secret-like content is
+        through apply_capture_policy (issue #35): the secret-like content is
         surfaced as a capture-policy notice (manual mode is advisory, like
         `add`), and the row is still written."""
         path = self._write_jsonl(self.b, "deadsecret.jsonl", [
@@ -1478,7 +1485,7 @@ class IngestHarvestChildEncodingTest(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # capture policy (issue #35): ingest-jsonl now routes every inserted row
-# through _apply_capture_policy, the same defense `add` uses. Prompt-injection
+# through apply_capture_policy, the same defense `add` uses. Prompt-injection
 # tagging is applied in ALL modes; secret redaction/refusal only in 'auto'.
 # ---------------------------------------------------------------------------
 class CapturePolicyIngestTest(_TwoStoreCase):
@@ -1517,7 +1524,7 @@ class CapturePolicyIngestTest(_TwoStoreCase):
         field (clean content/source_ref) must still be tagged
         prompt-injection-risk. Tags are FTS-indexed and surfaced verbatim into
         model context via recall, so injection text confined to tags is the same
-        vector the PR's capture policy exists to close. _apply_capture_policy
+        vector the PR's capture policy exists to close. apply_capture_policy
         scans content, source_ref, AND tags."""
         path = self._write_jsonl(self.b, "tags-injection.jsonl", [
             _sync_row(id="12121212-0000-0000-0000-0000000000aa",
@@ -1568,10 +1575,12 @@ class CapturePolicyIngestTest(_TwoStoreCase):
         self.assertIn("auto-redacted", stored[1])
 
     def test_ingest_auto_mode_refuses_secret_source_ref_and_keeps_going(self):
-        """--capture-mode auto REFUSES a row whose source_ref looks like a
-        secret (CapturePolicyRefusal, like `add`): the row is NOT stored, it is
-        tallied as capture_refused, and the file keeps going (per-row
-        resilience contract)."""
+        """--capture-mode auto QUARANTINES a row whose source_ref looks like a
+        secret (issue #180): the row is NOT stored, the ORIGINAL row is
+        appended to <data>/quarantine/<date>.jsonl, it is tallied as
+        quarantined (capture_refused stays 0 — that counter now belongs to
+        reviewed-mode raises), and the file keeps going (per-row resilience
+        contract)."""
         path = self._write_jsonl(self.b, "mixed.jsonl", [
             _sync_row(id="44444444-0000-0000-0000-000000000004",
                       content="clean row before the refused one"),
@@ -1585,8 +1594,10 @@ class CapturePolicyIngestTest(_TwoStoreCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         counts = self._summary_counts(r.stdout)
         self.assertEqual(counts["added"], 2)        # the two clean rows
-        self.assertEqual(counts["capture_refused"], 1)
-        # the refused row is NOT stored
+        self.assertEqual(counts["quarantined"], 1)
+        self.assertEqual(counts["capture_refused"], 0)
+        self.assertEqual(counts["quarantine_failed"], 0)
+        # the quarantined row is NOT stored
         self.assertIsNone(self.b.query_one(
             "SELECT id FROM memory WHERE id=?",
             ("55555555-0000-0000-0000-000000000005",)))
@@ -1597,8 +1608,114 @@ class CapturePolicyIngestTest(_TwoStoreCase):
         self.assertIsNotNone(self.b.query_one(
             "SELECT id FROM memory WHERE id=?",
             ("66666666-0000-0000-0000-000000000006",)))
-        # capture_refused note surfaced
-        self.assertIn("refused 1 row(s) under the capture policy", r.stderr)
+        # quarantined note surfaced
+        self.assertIn("quarantined 1 row(s) under the capture policy", r.stderr)
+        # the quarantine record holds the original row with its id
+        qdir = os.path.join(self.b.tmp, "quarantine")
+        qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")] \
+            if os.path.isdir(qdir) else []
+        self.assertEqual(len(qfiles), 1, qfiles)
+        with open(os.path.join(qdir, qfiles[0]), encoding="utf-8") as fh:
+            record = json.loads(fh.read().splitlines()[0])
+        self.assertEqual(record["reason"], "source_ref_secret_like")
+        self.assertEqual(record["row"]["id"],
+                         "55555555-0000-0000-0000-000000000005")
+
+    def test_safe_sshpass_row_is_redacted(self):
+        """Issue #180 fixture lane: the SAFE fixture row (row 180, allowlisted
+        file: ref, sshpass secret in content) redacts its value span and
+        stores; the unsafe-source_ref twin (row 181) is quarantined — same
+        ingest, two dispositions, both counted."""
+        fixture = str(SECRETS_DIR / "sshpass.jsonl")
+        r = self.b.run("ingest-jsonl", "--in", fixture, "--capture-mode", "auto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1)
+        self.assertEqual(counts["quarantined"], 1)
+        self.assertEqual(counts["quarantine_failed"], 0)
+        self.assertEqual(counts["capture_refused"], 0)
+        stored = self.b.query_one(
+            "SELECT content, tags FROM memory WHERE id=?", (FIXTURE_ROW_180,))
+        self.assertIsNotNone(stored, "the safe fixture row must be stored")
+        self.assertEqual(stored[0], "sshpass -p [REDACTED_SECRET] ssh host")
+        tags = {t.strip() for t in stored[1].split(",") if t.strip()}
+        self.assertIn("auto-redacted", tags)
+        self.assertIn("fixture", tags)
+        # The quarantined twin is absent from memory.
+        self.assertIsNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?", (FIXTURE_ROW_181,)))
+        # ...and is the run's single durable quarantine record.
+        qdir = os.path.join(self.b.tmp, "quarantine")
+        qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")] \
+            if os.path.isdir(qdir) else []
+        self.assertEqual(len(qfiles), 1, qfiles)
+        with open(os.path.join(qdir, qfiles[0]), encoding="utf-8") as fh:
+            record = json.loads(fh.read().splitlines()[0])
+        self.assertEqual(record["reason"], "source_ref_secret_like")
+        self.assertEqual(record["row"]["id"], FIXTURE_ROW_181)
+        # Byte-compare the actual per-row outcomes against the committed
+        # expected fixture (issue contract: "the tests compare each generated
+        # file byte-for-byte after LF normalization"). The expected records
+        # freeze the policy-level outcome per row: row 180 stored (redacted
+        # content + merged tags), row 181 the quarantined envelope.
+        expected_lines = [
+            json.dumps({"id": FIXTURE_ROW_180, "result": "stored",
+                        "content": stored[0], "tags": stored[1]},
+                       ensure_ascii=False, separators=(",", ":")),
+            json.dumps({"id": None, "result": "quarantined",
+                        "warnings": [{"type": "quarantined",
+                                      "reason": "source_ref_secret_like"}]},
+                       ensure_ascii=False, separators=(",", ":")),
+        ]
+        expected_file = (SECRETS_DIR / "sshpass.expected.jsonl").read_bytes()
+        self.assertEqual(
+            "\n".join(expected_lines) + "\n",
+            expected_file.replace(b"\r\n", b"\n").decode("utf-8"),
+            "actual ingest outcomes must match sshpass.expected.jsonl")
+
+    def test_auto_source_refusal_quarantines_and_counts(self):
+        """A clean row plus the fixture quarantine row in ONE auto-mode file:
+        the clean row stores, the unsafe-source_ref row quarantines, and the
+        summary counts both dispositions exactly."""
+        import uuid
+
+        clean = _sync_row(id=str(uuid.uuid4()), content="clean")
+        refused = json.loads(
+            (SECRETS_DIR / "quarantine_row.jsonl").read_text(
+                encoding="utf-8").splitlines()[0])
+        path = self._write_jsonl(self.b, "mixed-fixture.jsonl",
+                                 [clean, refused])
+        r = self.b.run("ingest-jsonl", "--in", path, "--capture-mode", "auto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1)
+        self.assertEqual(counts["quarantined"], 1)
+        self.assertEqual(counts["quarantine_failed"], 0)
+        self.assertEqual(counts["capture_refused"], 0)
+        self.assertIsNotNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?", (clean["id"],)))
+        self.assertEqual(
+            self.b.query_one("SELECT content FROM memory WHERE id=?",
+                             (clean["id"],))[0], "clean")
+
+    def test_quarantine_failure_returns_nonzero_without_row(self):
+        """A quarantine dir that cannot be written (a plain FILE sits at
+        <data>/quarantine) is FAIL-CLOSED: exit 1, quarantine_failed=1, and no
+        memory row for the refused id. The case tears down its own stores, so
+        the planted file needs no restore."""
+        refused = json.loads(
+            (SECRETS_DIR / "quarantine_row.jsonl").read_text(
+                encoding="utf-8").splitlines()[0])
+        path = self._write_jsonl(self.b, "qfail.jsonl", [refused])
+        with open(os.path.join(self.b.tmp, "quarantine"), "w") as fh:
+            fh.write("")
+        r = self.b.run("ingest-jsonl", "--in", path, "--capture-mode", "auto")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["quarantine_failed"], 1)
+        self.assertEqual(counts["quarantined"], 0)
+        self.assertIsNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?", (refused["id"],)))
 
     def test_existing_local_row_path_not_affected_by_capture_policy(self):
         """An id already present locally is NEVER content-overwritten by a sync
@@ -1635,6 +1752,216 @@ class CapturePolicyIngestTest(_TwoStoreCase):
         self.assertIn("original local content", self.b.query_one(
             "SELECT content FROM memory WHERE id=?",
             ("77777777-0000-0000-0000-000000000007",))[0])
+
+
+class LegacyImportCaptureTest(unittest.TestCase):
+    """Issue #180: import-store.py stages, sanitizes, and quarantines.
+
+    Leg 1 (success): the legacy fixture source (two rows — a redactable
+    sshpass row and an unsafe-source_ref row) imports into a fresh
+    destination with the source provably untouched (sha/size/row-count),
+    exactly one redacted live row, and exactly one quarantine record.
+
+    Leg 2 (fail-closed): a pre-existing non-empty destination plus a planted
+    plain FILE at <dest>/quarantine makes the quarantine append raise — the
+    import exits nonzero and leaves the prior destination byte-identical.
+    """
+
+    SOURCE_REL = str(Path("tests") / "fixtures" / "secrets" / "legacy-source.sqlite")
+    REDACTED_180 = "sshpass -p [REDACTED_SECRET] ssh host"
+
+    def _dest_env(self, dest_dir: str) -> dict:
+        env = _base_env(dest_dir)
+        env["ZMEM_DATA"] = dest_dir
+        env.pop("ZMEM_CAPTURE_MODE", None)
+        return env
+
+    def _source_fingerprint(self) -> dict:
+        import hashlib
+        source = REPO_ROOT / "tests" / "fixtures" / "secrets" / "legacy-source.sqlite"
+        conn = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            rows = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+        finally:
+            conn.close()
+        data = source.read_bytes()
+        return {"sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data), "rows": rows}
+
+    def _run_import(self, dest_dir: str):
+        env = self._dest_env(dest_dir)
+        return subprocess.run(
+            [PYTHON, "skills/memory/scripts/import-store.py",
+             "--source", self.SOURCE_REL, "--dest-dir", dest_dir, "--force"],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), env=env,
+            timeout=300,
+        )
+
+    def test_staged_import_preserves_source_and_rejects_destination_on_quarantine_failure(self):
+        import hashlib
+
+        # ---- Leg 1: success into a fresh destination.
+        dst_a = tempfile.mkdtemp(prefix="zmem-import-a-")
+        self.addCleanup(shutil.rmtree, dst_a, True)
+        before = self._source_fingerprint()
+        r = self._run_import(dst_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = self._source_fingerprint()
+        self.assertEqual(after, before, "the legacy source must be untouched")
+
+        conn = sqlite3.connect(os.path.join(dst_a, "store.sqlite"))
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            total = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+            live = conn.execute(
+                "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL"
+            ).fetchone()[0]
+            content = conn.execute(
+                "SELECT content FROM memory WHERE id=?",
+                (FIXTURE_ROW_180,)).fetchone()
+            # Derived carriers must be recomputed or dropped with the content
+            # (review round: a naive content/tags UPDATE left the secret in
+            # content_norm, the embedding columns, memory_vec, and
+            # belief_head).
+            norm_row = conn.execute(
+                "SELECT content_norm, embedding, embedding_model,"
+                " embedded_at FROM memory WHERE id=?",
+                (FIXTURE_ROW_180,)).fetchone()
+            bh = conn.execute(
+                "SELECT content FROM belief_head WHERE head_source_id=?",
+                (FIXTURE_ROW_180,)).fetchone()
+            head_del = conn.execute(
+                "SELECT 1 FROM belief_head WHERE id=?",
+                (FIXTURE_HEAD_REFUSED_ONLY,)).fetchone()
+            head_mix = conn.execute(
+                "SELECT content, head_source_id, support_count FROM"
+                " belief_head WHERE id=?",
+                (FIXTURE_HEAD_SHARED,)).fetchone()
+            needle_heads = conn.execute(
+                "SELECT COUNT(*) FROM belief_head"
+                " WHERE content LIKE '%pw180%'").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual((total, live), (1, 1))
+        self.assertEqual(content[0], self.REDACTED_180)
+        self.assertIsNotNone(norm_row[0])
+        self.assertNotIn("pw180a", (norm_row[0] or "").lower())
+        self.assertIn("redacted", (norm_row[0] or "").lower())
+        self.assertIsNone(norm_row[1],
+                          "pre-redaction embedding blob must be dropped")
+        self.assertEqual(norm_row[2] or "", "")
+        self.assertIsNotNone(bh, "belief_head row must survive the import")
+        self.assertEqual(bh[0], self.REDACTED_180,
+                         "belief_head content must be rebuilt post-redaction")
+        self.assertNotIn("pw180", bh[0])
+        # Refusal-branch head scrub (review round): the head sourced ONLY by
+        # the refused row 181 is deleted with it, and the shared head is
+        # rebuilt from its SURVIVING source — content, head_source_id, and
+        # support_count together — so no belief_head serves refused text.
+        self.assertIsNone(head_del,
+                          "a head with no surviving source must be deleted")
+        self.assertIsNotNone(head_mix, "the shared head must survive")
+        self.assertEqual(head_mix[0], self.REDACTED_180,
+                         "shared head content must rebuild from the survivor")
+        self.assertEqual(head_mix[1], FIXTURE_ROW_180,
+                         "shared head_source_id must move to the survivor")
+        self.assertEqual(head_mix[2], 1,
+                         "shared head support_count must drop with the"
+                         " refused source")
+        self.assertEqual(needle_heads, 0,
+                         "no belief_head may keep a pre-redaction needle")
+
+        qdir = os.path.join(dst_a, "quarantine")
+        qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")]
+        self.assertEqual(len(qfiles), 1, qfiles)
+        with open(os.path.join(qdir, qfiles[0]), encoding="utf-8") as fh:
+            record = json.loads(fh.read().splitlines()[0])
+        self.assertEqual(record["reason"], "source_ref_secret_like")
+        self.assertEqual(record["row"]["id"], FIXTURE_ROW_181)
+
+        # ---- Leg 2: fail-closed on a blocked quarantine path.
+        dst_b = tempfile.mkdtemp(prefix="zmem-import-b-")
+        self.addCleanup(shutil.rmtree, dst_b, True)
+        env_b = self._dest_env(dst_b)
+        for args in (("init",), ("add", "--namespace", "user:global",
+                                 "--type", "fact", "--content",
+                                 "benign pre-existing destination row",
+                                 "--signal", "test")):
+            pre = subprocess.run(
+                [PYTHON, str(STORE_PY), *args], capture_output=True,
+                text=True, env=env_b, timeout=120)
+            self.assertEqual(pre.returncode, 0, pre.stderr)
+        dest_store = os.path.join(dst_b, "store.sqlite")
+        sha_before = hashlib.sha256(
+            Path(dest_store).read_bytes()).hexdigest()
+        # Plant a plain FILE where the quarantine directory must go.
+        with open(os.path.join(dst_b, "quarantine"), "w") as fh:
+            fh.write("")
+        r2 = self._run_import(dst_b)
+        self.assertNotEqual(r2.returncode, 0,
+                            "a failed quarantine append must fail the import")
+        self.assertEqual(
+            hashlib.sha256(Path(dest_store).read_bytes()).hexdigest(),
+            sha_before,
+            "the prior destination store must be byte-identical")
+
+
+class HarvestCaptureTest(_TwoStoreCase):
+    """Issue #180: scripts/ingest_harvest.py counts quarantined rows
+    separately from stored/failed and forwards each row's own source_ref so
+    the capture policy discriminates exactly like the other importers."""
+
+    def test_harvest_counts_quarantined_separately(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-harv-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = _base_env(tmp)
+        env["ZMEM_DATA"] = tmp
+        env.pop("ZMEM_CAPTURE_MODE", None)
+        init = subprocess.run(
+            [PYTHON, str(STORE_PY), "init"], capture_output=True, text=True,
+            env=env, timeout=120)
+        self.assertEqual(init.returncode, 0, init.stderr)
+        r = subprocess.run(
+            [PYTHON, "scripts/ingest_harvest.py",
+             "tests/fixtures/secrets/harvest.json",
+             "--store", "skills/memory/scripts/store.py"],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), env=env,
+            timeout=300,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(
+            r"summary: (\d+) row\(s\) in file, (\d+) stored, (\d+) deduped, "
+            r"(\d+) quarantined, (\d+) failed/rejected", r.stdout)
+        self.assertIsNotNone(m, f"summary line not found in: {r.stdout!r}")
+        total, stored, _deduped, quarantined, failed = (
+            int(g) for g in m.groups())
+        self.assertEqual((total, stored, quarantined, failed), (2, 1, 1, 0))
+        conn = sqlite3.connect(os.path.join(tmp, "store.sqlite"))
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            rows = conn.execute("SELECT content FROM memory").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [("sshpass -p [REDACTED_SECRET] ssh host",)])
+        # The quarantine count must be backed by a durable record on disk
+        # (review round: a child claiming "quarantined" without appending the
+        # record used to pass this test).
+        qdir = os.path.join(tmp, "quarantine")
+        qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")] \
+            if os.path.isdir(qdir) else []
+        self.assertEqual(len(qfiles), 1, qfiles)
+        with open(os.path.join(qdir, qfiles[0]), encoding="utf-8") as fh:
+            record = json.loads(fh.read().splitlines()[0])
+        self.assertEqual(record["reason"], "source_ref_secret_like")
+        self.assertEqual(record["row"]["content"],
+                         "safe text")
 
 
 # ---------------------------------------------------------------------------

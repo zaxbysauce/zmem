@@ -620,7 +620,9 @@ class EvidenceWriterTest(_StoreCase):
         )
         self.conn.commit()
         row = self.conn.execute("SELECT * FROM evidence").fetchone()
-        self.assertEqual(row["excerpt"], "[REDACTED_SECRET]")
+        # Issue #180 value-span redaction: the key name survives, the value
+        # is masked (the pre-#180 whole-match mask removed both).
+        self.assertEqual(row["excerpt"], "token=[REDACTED_SECRET]")
         self.assertEqual(
             row["hash"],
             hashlib.sha256(

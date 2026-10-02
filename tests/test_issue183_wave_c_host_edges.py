@@ -213,7 +213,7 @@ process.stdout.write(JSON.stringify({
                 row = data_lines[0]
                 self.assertEqual(len(row.splitlines()), 1)
                 self.assertEqual(row.count("\t"), 8)
-                self.assertIn(r"line one\nline two\t[REDACTED_SECRET]", row)
+                self.assertIn(r"line one\nline two\ttoken=[REDACTED_SECRET]", row)  # issue #180 value-span mask
                 self.assertIn(r"src/\r\nactual.py", row)
                 self.assertNotIn("token=sk-test", row)
 
