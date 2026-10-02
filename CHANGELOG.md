@@ -10,6 +10,28 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.77.0] - 2026-10-02
+
+### Fixed
+- **Maintenance-lock false positives no longer block writes for up to 30
+  minutes** (issue #262). Every `store.py` command — and `restore`/`purge` at
+  their own maintenance gates — now classifies the `.zmem-maintenance.lock`
+  probe by the holder recorded in the lock token instead of by file age alone.
+  A lock whose holder process is dead (killed mid-hold, e.g. by a hook
+  runner's subprocess timeout) or an empty lock file older than a short grace
+  period is recognized as a phantom, removed with the same identity-checked
+  rename-and-confirm dance the stale-lock path uses, and the command proceeds
+  instead of failing with "maintenance is active" until the 1800 s stale
+  window elapsed. A genuinely live maintenance holder is refused exactly as
+  before. The grace window defaults to 10 s and is configurable via
+  `ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS` (values below 1 s or above the stale
+  window are clamped; non-finite or non-positive values fall back to the
+  default). Two disclosed residuals: a lock held by a process in a different
+  PID namespace (containers sharing a store volume) reads as dead and its
+  lock is broken — single-box usage is unaffected — and a lock file whose
+  content is non-empty but unparseable (a foreign/manual artifact zmem's own
+  primitives do not produce) keeps today's full 1800 s staleness window.
+
 ## [0.76.0] - 2026-10-01
 
 ### Added
