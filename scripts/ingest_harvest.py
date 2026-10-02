@@ -144,9 +144,15 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[str, str]:
         this console cannot represent is replaced rather than raising here.
     """
     raw_ref = row.get("source_ref")
-    # A malformed non-string ref must fail THIS row (child rc!=0 -> failed
-    # count), never crash the whole importer before the subprocess runs.
-    row_ref = raw_ref if isinstance(raw_ref, str) and raw_ref else source_ref
+    # A MISSING or empty ref falls back to the batch reference (the designed
+    # provenance default); a NON-STRING ref is a shape error and fails THIS
+    # row (failed count, nonzero exit) — silently substituting provenance
+    # and reporting the row stored would be a quiet integrity loss.
+    if raw_ref is not None and not isinstance(raw_ref, str):
+        return ("failed",
+                f"row source_ref must be a string, got "
+                f"{type(raw_ref).__name__}")
+    row_ref = raw_ref if raw_ref else source_ref
     cmd = [
         sys.executable, str(store_py), "add",
         "--namespace", row["namespace"],

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "553a21f80882e08465d80332443a81392d6d12498062c23f8b9aeeab2a244c33",
+  "digest": "de8f28aa9e118c8cc7f51f7cccedcc12e0e868aef4e9f89868591e10fb79c547",
   "files": {
     "hermes-plugin/__init__.py": "f3a35ebbf9ddda986e3e643f956b34c1f298fac74555540e63086954b11b811b",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -49,7 +49,7 @@
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
     "scripts/host_canary.py": "0c8ccc8ff1cb585f5951121a5704464a364d5ef94ca579be460625e8ab9262c1",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
-    "scripts/ingest_harvest.py": "435282434d476cd553096d8097ecde8dba0e4f6932d151ed1d72b3540e99d2fd",
+    "scripts/ingest_harvest.py": "b8bc5cd4fbc42ff5b364a3090439dcf4f19c4196586cb9df8cdf69767972a1ea",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
     "scripts/refresh-report-schema.json": "a2105db8ca57a6e860c35bf25a6e8f943b70c0f3abaf65fcf2803d9d99b01bea",
     "scripts/refresh_hosts.py": "6c85a1a2cc0e2264348e9427311958388dc807beeb4b9780ab0ab2b50770d2cf",
@@ -106,7 +106,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "9fd8bef3ea15a2ad4afe3d767723e20df44c9054dafd51d9a0d130f8b6a21c21"
+    "skills/memory/scripts/storelib/write.py": "90b2992c6ff1bcfc9a92661533965bd0468f5c1bc280bab169d291983075725e"
   },
   "version": "0.76.0"
 }

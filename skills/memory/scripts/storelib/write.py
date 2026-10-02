@@ -651,8 +651,12 @@ def quarantine_import_rows(data_dir: str | Path,
         try:
             with open(ledger, "rb") as fh:
                 raw = fh.read()
-        except OSError:
-            continue
+        except FileNotFoundError:
+            continue  # vanished between glob and open: matches nothing
+        # Any other OSError — a concurrent writer holding the mandatory
+        # Win32 byte-range lock, an ACL denial — propagates: the flush
+        # aborts fail-closed rather than dedupe against an incomplete set
+        # and append duplicates (review round 5).
         for line in raw.splitlines():
             if not line.strip():
                 continue
