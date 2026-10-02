@@ -10,6 +10,16 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.82.0] - 2026-10-05
+
+### Fixed
+- **Host refresh no-op handling:** ignore Claude Code's root-level `.in_use`
+  liveness markers only in Claude caches, report errors while scanning parents
+  for stale staged temporaries, and sweep stale report temporaries alongside
+  cache and registry staging files. Document the complete mirror exclusions
+  (`.git`, `graphify-out`, `__pycache__`, `.pyc`, and `.pyo`) and cover them in
+  no-op regression tests.
+
 ## [0.81.0] - 2026-10-04
 
 ### Added
