@@ -10,6 +10,32 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.75.1] - 2026-10-02
+
+### Fixed
+- **`refresh_hosts.py` no longer rename-swaps an already-current host cache.**
+  The transaction used to rename the live cache directory on every run, even
+  when nothing had changed; on Windows that rename fails (WinError 32/5) while
+  any process holds a handle inside the cache, so the scheduled updater failed
+  on every run with nothing to update. After staging and verifying, a cache is
+  now skipped only when it matches the staged mirror exactly (same regular-file
+  set, raw-byte-equal contents, no links or reparse points, with the same
+  `.git`/`__pycache__`/`.pyc` exclusions as the mirror), and a registry or
+  marketplace file only when its bytes already equal the staged bytes. A host
+  with nothing to change is reported with the new per-host status `unchanged`
+  (the report schema's `status` is an open string, so the contract is
+  unchanged; external callers that test for `refreshed` should also accept
+  `unchanged`). Relative paths are compared case-sensitively, and Claude Code's
+  host-owned root-level `.in_use/` liveness markers are ignored (a link inside
+  them, or an `.orphaned_at` marker, still counts as a difference). Any other
+  difference, including one outside the runtime surface, an extra stale file or
+  a CRLF-only change, still takes the full backup/replace/rollback path, which
+  can still hit the Windows handle error. A version bump installs into a new
+  `<version>` directory and does not rename the old one. A staged temporary
+  that cannot be removed on a no-op run is a stderr warning, not a failure, and
+  leftover staged temporaries from earlier runs are swept at the start of the
+  next real run (retained `-backup-` preimages are never touched).
+
 ## [0.75.0] - 2026-10-01
 
 ### Added
