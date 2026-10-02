@@ -2137,8 +2137,10 @@ replacement, tagged `auto-redacted`) and QUARANTINES rows whose `source_ref`
 looks like a secret (issue #180: counted as `quarantined` in the summary —
 after `capture_refused` — with the original row appended to
 `<data>/quarantine/<UTC-date>.jsonl`, NOT stored; the run still exits 0).
-`reviewed` RAISES on those refusals (counted as `capture_refused`, exit 2,
-never quarantined); `manual` keeps the original text with an advisory notice.
+`reviewed` RAISES on those refusals (counted as `capture_refused`, never
+quarantined — plain `ingest-jsonl` still exits 0 with the count since the
+file keeps going; exit 2 applies via `--strict` or the `add`/`update` CLI
+paths); `manual` keeps the original text with an advisory notice.
 A quarantine write failure counts `quarantine_failed`, stores nothing for
 that row, and exits 1.
 
@@ -2170,11 +2172,17 @@ value and keep the surrounding syntax; everything else whole-match-replaces:
 | `sshpass -p <value>` (any whitespace, incl. tabs) | value replaced | dangling `sshpass -p` |
 | `sudo -S` | whole-row refusal (`unredactable_secret`) | `sudo -s` (flag case matters) |
 | `--password=<value>` (attached) | value replaced | `--password <value>` spaced; bare `--password` |
-| `ssh`/`mysql`/`psql` `-p<value>` (attached) | value replaced | `-P<port>`; other commands' `-p`; spaced `-p <value>` |
+| `ssh`/`mysql`/`psql` `-p<value>` (attached) | value replaced | `-P<token>`; other commands' `-p`; spaced `-p <value>` |
 | `scheme://user:password@host` | password replaced | URLs without userinfo |
 | key=value (`password=`, `api_key=`, … compound names like `DB_PASSWORD=` included) | value replaced (8+ chars) | bare keywords with no `[:=]` |
 | PEM block (BEGIN…END) | whole block replaced | — |
 | token prefixes (`gh*_`, `sk-`, `AKIA`, JWT, …) | whole token replaced | — |
+
+Known accepted over-redaction (issue-mandated matrix, fail-safe direction):
+for `ssh` and `psql` the lowercase `-p` is actually the PORT flag, so
+`ssh -p2222 user@host` IS redacted as if the port were a secret; the matrix
+positives (`ssh -ppw180F`) require it. Do not "fix" this without changing the
+issue contract.
 
 Command names and URL syntax match case-insensitively; option letters are
 case-SENSITIVE (`-S` vs `-s`, `-p` vs `-P`). `[REDACTED_SECRET]` is

@@ -234,6 +234,25 @@ class CapturePatternMatrixTest(unittest.TestCase):
         content, _ref, _tags, _warnings = self._apply("passwd entry")
         self.assertEqual(content, "passwd entry")
 
+    def test_hand_written_spec_matches_generated_golden(self):
+        """Cubic round: patterns.json's hand-written `expected` values (the
+        issue's literal spec) and patterns.expected.json's generated golden
+        must AGREE for every case — drift between the two files otherwise
+        passes silently because the matrix test reads only the golden."""
+        spec = json.loads((SECRETS_DIR / "patterns.json").read_text(
+            encoding="utf-8"))
+        golden = json.loads((SECRETS_DIR / "patterns.expected.json").read_text(
+            encoding="utf-8"))
+        golden_by_id = {c["id"]: c for c in golden["positive"] + golden["negative"]}
+        for case in spec["positive"] + spec["negative"]:
+            g = golden_by_id[case["id"]]
+            if case["outcome"] == "quarantine":
+                self.assertIsNone(case.get("expected"))
+                continue
+            self.assertEqual(
+                case["expected"], g["expected"],
+                f"spec/golden drift for {case['id']}")
+
     def test_compound_key_names_still_redact(self):
         # Non-fixture breadth pin: the keyword prefix is deliberately
         # unanchored, so COMPOUND key names keep matching and only the VALUE
@@ -362,17 +381,21 @@ class WritePathRedactionTest(unittest.TestCase):
                          "the private policy symbol must not survive")
         # Plain substring scan — byte-identical in strength to the frozen
         # acceptance check (no exclusions; even test-method names must not
-        # embed the private spelling).
+        # embed the private spelling). Raw-BYTES scan for the utf-8 AND
+        # utf-16-le encodings so a non-UTF-8 file cannot hide the name behind
+        # an errors="replace" decode (cubic round).
+        needles = (private_name.encode("utf-8"),
+                   private_name.encode("utf-16-le"))
         hits = []
         for root_dir in (SCRIPTS, REPO_ROOT / "tests"):
             for path in sorted(root_dir.rglob("*")):
                 if not path.is_file() or "__pycache__" in path.parts:
                     continue
                 try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
+                    raw = path.read_bytes()
                 except OSError:
                     continue
-                if private_name in text:
+                if any(n in raw for n in needles):
                     hits.append(str(path))
         self.assertEqual(hits, [],
                          "private capture-policy symbol still referenced in: "

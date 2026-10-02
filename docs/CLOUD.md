@@ -534,16 +534,20 @@ compromise of the store, and rebuild rather than "clean up" — see the
 
   **Exit code** — `ingest-jsonl` exits `2` when `--in` is missing or otherwise
   inaccessible (permission denied, is a directory, etc.) or contains no data
-  lines whatsoever (empty or whitespace-only). It exits `0` for every other
-  outcome, including a file full of malformed rows: a bad row is never fatal
+  lines whatsoever (empty or whitespace-only). It exits `1` when a quarantine
+  write failed for any row (`quarantine_failed` non-zero), and `0` for every
+  other outcome, including a file full of malformed rows: a bad row is never fatal
   to the run, it is counted and reported by line number on stderr, and the
   summary line (`added=… tombstoned=… tombstones_refused=… capture_refused=…
-  deduped=… skipped=… malformed=…`) always prints on stdout so "the run finished" and
+  quarantined=… quarantine_failed=… deduped=… skipped=… malformed=…`) always prints on stdout so "the run finished" and
   "every row landed" are never confused for each other. Check
-  `malformed`/`tombstones_refused`/`capture_refused` in that summary, not just the exit code, to
-  know whether the file was clean. `capture_refused` is non-zero only under
-  `--capture-mode auto` when a row's `source_ref` looked like a secret and was
-  refused (not stored) — see the ingest-jsonl capture policy. (A file that is present and readable but
+  `malformed`/`tombstones_refused`/`capture_refused`/`quarantined` in that summary, not just the exit code, to
+  know whether the file was clean. Under issue #180, `quarantined` is non-zero
+  under `--capture-mode auto` when a row looked secret-like (source_ref,
+  unredactable content, or unsafe path) and was NOT stored — the original row
+  is appended to the store's `quarantine/` directory for operator review;
+  `capture_refused` is non-zero under `--capture-mode reviewed` for the same
+  shapes (refused, no quarantine record) — see the ingest-jsonl capture policy. (A file that is present and readable but
   not valid UTF-8 is a separate, unhandled failure mode outside this: it
   raises past `ingest-jsonl`'s own guard and exits `1` with a traceback.)
 
@@ -593,9 +597,11 @@ compromise of the store, and rebuild rather than "clean up" — see the
   empty/whitespace-only outbox file, `0` otherwise (malformed rows never fail
   the run). A cloud outbox is remote-authored data: ingest always tags
   `prompt-injection-risk` on rows matching injection patterns (in every mode),
-  and `--capture-mode auto` additionally redacts secret-like content and
-  refuses rows whose `source_ref` looks like a secret (counted as
-  `capture_refused`). Prefer `auto` for an outbox you do not fully control.
+  and `--capture-mode auto` additionally redacts secret-like values and
+  quarantines rows that look secret-like (source_ref, unredactable content,
+  or unsafe path — counted as `quarantined`, original row recorded under the
+  store's `quarantine/` directory). Prefer `auto` for an outbox you do not
+  fully control.
 
 - **Re-embed after ingesting an outbox.** Ingest only computes an embedding
   when the embedding runtime is available on the ingesting box; rows that

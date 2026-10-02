@@ -491,14 +491,20 @@ def quarantine_import_row(data_dir: str | Path, row: dict, *, reason: str,
 
     ``now`` is an ISO-8601 UTC ``YYYY-MM-DDTHH:MM:SSZ`` value; ``None`` calls
     ``schema.now_iso()``. The quarantine directory is created with mode
-    ``0o700`` and the file with ``0o600``; an ``os.chmod`` failure raises
-    ``OSError``, and any write failure raises the original ``OSError`` —
-    callers roll back their current row, count ``quarantine_failed``, and
-    return a nonzero result. This helper never writes SQLite. Each record
-    is one small append (a single write of one LF-terminated line); the
-    store's writer lease does NOT cover this file — concurrent processes
-    quarantining into the same data dir rely on append-mode single-write
-    line atomicity, which is why every record is exactly one line.
+    ``0o700`` and the file hardened to ``0o600`` on EVERY append (not only
+    file creation, so a pre-existing loose-perm file is tightened); an
+    ``os.chmod`` failure raises ``OSError``, and any write failure raises the
+    original ``OSError`` — callers roll back their current row, count
+    ``quarantine_failed``, and return a nonzero result. This helper never
+    writes SQLite. Concurrency: the store's writer lease does NOT cover this
+    file. Each record is appended through one low-level
+    ``os.open(..., O_APPEND | O_CREAT)`` + ``os.write`` of the whole encoded
+    line — a single append syscall per record, which POSIX O_APPEND and the
+    Windows CRT both honor per call (the buffered text-mode ``open("a")``
+    this replaced empirically DROPPED bytes under concurrent writers on
+    Windows). Cross-process interleaving of whole records remains possible
+    where a platform does not honor per-call append atomicity; run one
+    quarantine writer per store when that matters.
     """
     stamp = now if now is not None else now_iso()
     date_part = stamp[:10] if len(stamp) >= 10 else stamp
@@ -512,12 +518,35 @@ def quarantine_import_row(data_dir: str | Path, row: dict, *, reason: str,
         "source_ref": row.get("source_ref", ""),
         "row": row,
     }
-    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-    existed = target.exists()
-    with open(target, "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(line)
-    if not existed:
-        os.chmod(target, 0o600)
+    line = (json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            + "\n").encode("utf-8")
+    # Low-level single-syscall append: the buffered text-mode writer this
+    # replaced empirically DROPPED bytes under concurrent Win32 writers
+    # (review-round probe); O_APPEND + one os.write of the whole encoded line
+    # is the portable per-record-atomic idiom.
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        written = 0
+        while written < len(line):
+            written += os.write(fd, line[written:])
+    finally:
+        os.close(fd)
+    # Harden on EVERY append (not only creation): a pre-existing quarantine
+    # file with looser perms must never keep holding unredacted rows.
+    os.chmod(target, 0o600)
+    # Windows: os.chmod only toggles the read-only bit there; tighten the
+    # real ACL best-effort when the host helper is importable (review round).
+    if os.name == "nt":
+        try:
+            import host as _host_acl
+        except ImportError:
+            _host_acl = None
+        if _host_acl is not None:
+            try:
+                _host_acl.set_owner_only_perms(quarantine_dir)
+                _host_acl.set_owner_only_perms(target)
+            except Exception:
+                pass
     return target
 
 
@@ -1005,6 +1034,13 @@ def add_memory(
     link_attr_propagate: bool = True,
     evidence_ids: list[str] | tuple[str, ...] | None = None,
 ) -> WriteResult:
+    # Capture the pre-policy length: value-span redaction GROWS text
+    # ([REDACTED_SECRET] is longer than a short value), so an input that fit
+    # the cap can overflow it after redaction. That row has no safe storable
+    # form — refuse it (reason unredactable_secret) so the auto-mode CLI
+    # caller quarantines it instead of losing it to a ContentTooLarge error
+    # (review round: a harvest row at exactly MAX was durably lost this way).
+    pre_policy_len = len(content)
     content, source_ref, tags, warns = apply_capture_policy(
         content=content,
         source_ref=source_ref,
@@ -1033,6 +1069,10 @@ def add_memory(
     # previously only ingest-jsonl rejected oversize content, so a >65k row
     # written here broke Tier-3 sync import on another box (#36 M17).
     if len(content) > MAX_CONTENT_CHARS:
+        if pre_policy_len <= MAX_CONTENT_CHARS:
+            # The ORIGINAL input fit; only redaction growth overflowed the
+            # cap. There is no safe storable form of this row.
+            raise _capture_refusal(REASON_UNREDACTABLE_SECRET)
         raise ContentTooLarge(
             f"content is {len(content)} chars, over the {MAX_CONTENT_CHARS} limit"
         )

@@ -1651,6 +1651,25 @@ class CapturePolicyIngestTest(_TwoStoreCase):
             record = json.loads(fh.read().splitlines()[0])
         self.assertEqual(record["reason"], "source_ref_secret_like")
         self.assertEqual(record["row"]["id"], FIXTURE_ROW_181)
+        # Byte-compare the actual per-row outcomes against the committed
+        # expected fixture (issue contract: "the tests compare each generated
+        # file byte-for-byte after LF normalization"). The expected records
+        # freeze the policy-level outcome per row: row 180 stored (redacted
+        # content + merged tags), row 181 the quarantined envelope.
+        expected_lines = [
+            json.dumps({"id": FIXTURE_ROW_180, "result": "stored",
+                        "content": stored[0], "tags": stored[1]},
+                       ensure_ascii=False, separators=(",", ":")),
+            json.dumps({"id": None, "result": "quarantined",
+                        "warnings": [{"type": "quarantined",
+                                      "reason": "source_ref_secret_like"}]},
+                       ensure_ascii=False, separators=(",", ":")),
+        ]
+        expected_file = (SECRETS_DIR / "sshpass.expected.jsonl").read_bytes()
+        self.assertEqual(
+            "\n".join(expected_lines) + "\n",
+            expected_file.replace(b"\r\n", b"\n").decode("utf-8"),
+            "actual ingest outcomes must match sshpass.expected.jsonl")
 
     def test_auto_source_refusal_quarantines_and_counts(self):
         """A clean row plus the fixture quarantine row in ONE auto-mode file:
@@ -1803,10 +1822,31 @@ class LegacyImportCaptureTest(_TwoStoreCase):
             content = conn.execute(
                 "SELECT content FROM memory WHERE id=?",
                 (FIXTURE_ROW_180,)).fetchone()
+            # Derived carriers must be recomputed or dropped with the content
+            # (review round: a naive content/tags UPDATE left the secret in
+            # content_norm, the embedding columns, memory_vec, and
+            # belief_head).
+            norm_row = conn.execute(
+                "SELECT content_norm, embedding, embedding_model,"
+                " embedded_at FROM memory WHERE id=?",
+                (FIXTURE_ROW_180,)).fetchone()
+            bh = conn.execute(
+                "SELECT content FROM belief_head WHERE head_source_id=?",
+                (FIXTURE_ROW_180,)).fetchone()
         finally:
             conn.close()
         self.assertEqual((total, live), (1, 1))
         self.assertEqual(content[0], self.REDACTED_180)
+        self.assertIsNotNone(norm_row[0])
+        self.assertNotIn("pw180a", (norm_row[0] or "").lower())
+        self.assertIn("redacted", (norm_row[0] or "").lower())
+        self.assertIsNone(norm_row[1],
+                          "pre-redaction embedding blob must be dropped")
+        self.assertEqual(norm_row[2] or "", "")
+        self.assertIsNotNone(bh, "belief_head row must survive the import")
+        self.assertEqual(bh[0], self.REDACTED_180,
+                         "belief_head content must be rebuilt post-redaction")
+        self.assertNotIn("pw180", bh[0])
 
         qdir = os.path.join(dst_a, "quarantine")
         qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")]
@@ -1882,6 +1922,18 @@ class HarvestCaptureTest(_TwoStoreCase):
         finally:
             conn.close()
         self.assertEqual(rows, [("sshpass -p [REDACTED_SECRET] ssh host",)])
+        # The quarantine count must be backed by a durable record on disk
+        # (review round: a child claiming "quarantined" without appending the
+        # record used to pass this test).
+        qdir = os.path.join(tmp, "quarantine")
+        qfiles = [f for f in os.listdir(qdir) if f.endswith(".jsonl")] \
+            if os.path.isdir(qdir) else []
+        self.assertEqual(len(qfiles), 1, qfiles)
+        with open(os.path.join(qdir, qfiles[0]), encoding="utf-8") as fh:
+            record = json.loads(fh.read().splitlines()[0])
+        self.assertEqual(record["reason"], "source_ref_secret_like")
+        self.assertEqual(record["row"]["content"],
+                         "safe text")
 
 
 # ---------------------------------------------------------------------------

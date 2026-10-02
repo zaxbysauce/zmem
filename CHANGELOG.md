@@ -61,6 +61,32 @@ README.
   prose. Non-quarantine refusals print `[zmem] capture policy refused:
   <reason>` (namespace validation keeps its operator guidance prose).
 
+### Fixed
+- **PR-review round (swarm review, 4 lanes + 11 micro-families + independent
+  validation):** legacy-import redaction now recomputes or drops EVERY
+  derived carrier — `content_norm` is recomputed from the post-redaction
+  text (it previously retained the verbatim secret and fed dedup/recall),
+  the `embedding`/`embedding_model`/`embedded_at` columns are cleared (the
+  stale blob survived and `reembed` re-propagated it), entity links are
+  re-derived from the redacted text, belief_head content copies are rebuilt,
+  and the staging FTS index is optimized + the file VACUUMed before
+  acceptance (tombstone segments could retain pre-redaction bytes). The
+  staging connection now loads sqlite-vec, fixing a crash (`no such module:
+  vec0`) that made sanitized import fail on every vec-bearing source store.
+  Quarantine appends are buffered until every acceptance gate passes (a
+  failed import no longer leaves ledger entries for an import that never
+  completed) and are written through one `O_APPEND` `os.write` per record
+  with `0o600` enforced on every append (the buffered text-mode writer
+  silently dropped bytes under concurrent writers on Windows; loose
+  pre-existing files are now tightened). Quarantine records carry the FULL
+  original source row. `core.md` is staged before the atomic store replace
+  (a copy failure no longer reports FAILED with the new store already in
+  place), stale destination sidecars are stashed and restored on failure,
+  and a replace failure while a session holds the store open now carries a
+  "close zmem sessions and retry" advisory. Redacted-and-grown content over
+  the storage cap is refused as `unredactable_secret` (auto: quarantine)
+  instead of being durably lost to `ContentTooLarge` after validation.
+
 ### Changed
 - **Legacy store import is staged, sanitized, and atomic** (issue #180):
   `import-store.py` builds a staging database in the destination directory

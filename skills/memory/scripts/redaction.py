@@ -58,15 +58,20 @@ SECRET_GENERIC_PATTERNS = [
 
 # Issue #180 command and URL credential shapes. Case-insensitivity is scoped
 # with inline groups to the COMMAND NAME / URL SYNTAX only — option letters
-# stay case-sensitive so ``sudo -s`` (shell) and ``ssh -P<port>`` (port flag)
-# are never mistaken for ``sudo -S`` / ``ssh -p<password>``. Group 1 captures
+# stay case-sensitive so ``sudo -s`` (shell) never matches ``sudo -S``.
+# NOTE (cubic round, stated honestly): for ssh and psql the lowercase ``-p``
+# IS the port flag, so ``ssh -p2222`` IS over-redacted here — that is the
+# issue #180 matrix's explicit contract (positive p06 ``ssh -ppw180F``),
+# accepted as fail-safe over-redaction and disclosed in SKILL.md; the case
+# scoping only guarantees ``-P``-shaped tokens never match. Group 1 captures
 # the value span in every entry.
 SECRET_COMMAND_PATTERNS = [
     # sshpass -p <value> (standalone -p; any whitespace, incl. tabs)
     re.compile(r"(?i:\bsshpass\b)\s+-p\s+(\S+)"),
     # --password=<value> (attached form only; spaced/dangling are not matches)
     re.compile(r"(?i:--password=)(\S+)"),
-    # ssh/mysql/psql -p<value> (attached form only, exactly these commands)
+    # ssh/mysql/psql -p<value> (attached form only, exactly these commands;
+    # over-redacts ports for ssh/psql per the issue matrix)
     re.compile(r"(?i:\b(?:ssh|mysql|psql)\b)[ \t]+-p(\S+)"),
     # scheme://user:password@host — replace only the password
     re.compile(r"(?i:\b[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@"),
@@ -92,10 +97,19 @@ SECRET_PATTERNS = (
 # source_ref_unsafe_path) plus the shape names documented in SKILL.md's
 # capture-policy table; no parallel label mapping is kept here.
 
+# The key=value pattern is the ONE credential pattern with a captured VALUE
+# span (group 1). Reference it by this named constant, never by list position:
+# a positional slice like ``SECRET_CREDENTIAL_PATTERNS[:1]`` would silently
+# change span semantics if the list were reordered (cubic review round).
+KEYVALUE_VALUE_SPAN_PATTERN = SECRET_CREDENTIAL_PATTERNS[0]
+
 # Identity membership: exactly the value-capturing patterns. A frozenset of
 # pattern objects (re.Pattern hashes by identity) — never a "has group 1"
-# heuristic, which would misfire on unrelated grouped patterns.
-_VALUE_SPAN_PATTERNS = frozenset(SECRET_CREDENTIAL_PATTERNS[:1] + SECRET_COMMAND_PATTERNS)
+# heuristic, which would misfire on unrelated grouped patterns, and never a
+# positional slice, which would silently flip span semantics when the
+# credential list is reordered.
+_VALUE_SPAN_PATTERNS = frozenset(
+    (KEYVALUE_VALUE_SPAN_PATTERN,) + tuple(SECRET_COMMAND_PATTERNS))
 
 
 def _value_span_replacement(match: "re.Match[str]") -> str:

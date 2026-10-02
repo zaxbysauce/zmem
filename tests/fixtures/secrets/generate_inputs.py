@@ -13,8 +13,11 @@ Writes, under tests/fixtures/secrets/:
   - quarantine_row.jsonl     row 181 alone (the source-ref refusal input)
 
 Every file is written LF-pinned; one sha256 digest per file is printed.
-Fixture content is FIXED (no clock, no uuid4): re-running this script must
-reproduce byte-identical files.
+Fixture content is FIXED (no clock, no uuid4): re-running this script
+reproduces the text files byte-identically; legacy-source.sqlite is
+byte-stable per sqlite build (the committed binary is the canonical
+artifact — a differently-built sqlite may embed a different version
+header while remaining logically identical).
 """
 
 from __future__ import annotations
@@ -106,6 +109,13 @@ NEGATIVE = [
 ]
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone()
+    return row is not None
+
+
 def sha256_of(path: Path) -> str:
     h = hashlib.sha256()
     h.update(path.read_bytes().replace(b"\r\n", b"\n"))
@@ -195,10 +205,14 @@ def generate_harvest_json() -> None:
 def generate_legacy_sqlite() -> None:
     # Build a REAL store (the repo's own schema) holding exactly the two
     # fixed records, with fixed ids/timestamps (direct INSERT — a store.py add
-    # would mint nondeterministic uuids). FTS triggers populate memory_fts;
-    # memory_vec is left empty (embedding-less rows are the degraded-mode
-    # norm). The store is checkpointed into DELETE journal mode so the file
-    # is a single deterministic artifact.
+    # would mint nondeterministic uuids). FTS triggers populate memory_fts.
+    # Row 180 (the credential row the importer must REDACT) also carries the
+    # derived carriers a naive redaction would leak: content_norm, the
+    # embedding columns, a memory_vec vector, and a belief_head whose content
+    # quotes the secret (PR #270 review round: tests/fixtures must exercise
+    # every carrier, not just content/tags). The store is checkpointed into
+    # DELETE journal mode so the file is a single deterministic artifact
+    # (byte-identical per sqlite build; the committed binary is canonical).
     tmp = tempfile.mkdtemp(prefix="zmem180-fixsrc-")
     try:
         db_path = Path(tmp) / "store.sqlite"
@@ -210,7 +224,8 @@ def generate_legacy_sqlite() -> None:
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         if "storelib" in sys.modules:
             raise SystemExit("generate_inputs.py must run before any storelib import")
-        from storelib.schema import init_db
+        from storelib.schema import (_load_vec, _normalize_content,
+                                     _vec0_create_sql, init_db)
         conn = sqlite3.connect(str(db_path))
         try:
             init_db(conn)
@@ -227,6 +242,78 @@ def generate_legacy_sqlite() -> None:
                      record["valid_from"], record["taint"],
                      record["ingestion_ts"], record["trust_score"],
                      record["applied_count"], record["violated_count"]))
+            # Derived carriers on the REDACT target row (180): content_norm,
+            # embedding columns, a memory_vec vector, and a belief_head that
+            # quotes the secret. The import must recompute/clear/rebuild all
+            # of them, so the fixture must plant them. The embedding columns
+            # arrive via the v3 migration (ALTER), not init_db — replicate
+            # them here guarded, exactly as the migration declares them.
+            for alter in ("ALTER TABLE memory ADD COLUMN embedding BLOB",
+                          "ALTER TABLE memory ADD COLUMN embedding_model"
+                          " TEXT DEFAULT ''",
+                          "ALTER TABLE memory ADD COLUMN embedded_at TEXT"):
+                try:
+                    conn.execute(alter)
+                except sqlite3.OperationalError:
+                    pass
+            conn.execute(
+                "UPDATE memory SET content_norm=?, embedding=?,"
+                " embedding_model=?, embedded_at=? WHERE id=?",
+                (_normalize_content(RECORD_180["content"]),
+                 b"\x00" * 32, "fixture-minilm", FIXED_TS, RECORD_180["id"]))
+            try:
+                _load_vec(conn)
+                # _load_vec only loads the extension; the vec0 table itself is
+                # created by connect()'s ensure step — replicate it here with
+                # a dim matching the 32-byte (8 x float32) blob below.
+                conn.execute(_vec0_create_sql(8))
+                vec_ok = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table'"
+                    " AND name='memory_vec'").fetchone() is not None
+            except Exception:
+                vec_ok = False
+            if vec_ok:
+                conn.execute(
+                    "INSERT INTO memory_vec(embedding, memory_id)"
+                    " VALUES (?, ?)",
+                    (b"\x00" * 32, RECORD_180["id"]))
+            # belief_head tables are migration-gated too; create them when
+            # absent so the fixture can exercise the belief-head rebuild.
+            if not _table_exists(conn, "belief_head"):
+                conn.executescript(
+                    "CREATE TABLE IF NOT EXISTS belief_head ("
+                    " id TEXT PRIMARY KEY, namespace TEXT NOT NULL,"
+                    " topic_identity TEXT NOT NULL, content TEXT NOT NULL,"
+                    " head_state TEXT NOT NULL, head_source_id TEXT NOT NULL,"
+                    " support_count INTEGER NOT NULL,"
+                    " refresh_watermark TEXT NOT NULL,"
+                    " generator_revision TEXT NOT NULL,"
+                    " confidence REAL NOT NULL DEFAULT 0.5,"
+                    " signal TEXT NOT NULL DEFAULT 'none',"
+                    " taint TEXT NOT NULL DEFAULT 'trusted_internal',"
+                    " trust_score REAL NOT NULL DEFAULT 1.0,"
+                    " UNIQUE(namespace, topic_identity));"
+                    "CREATE TABLE IF NOT EXISTS belief_head_source ("
+                    " head_id TEXT NOT NULL, source_id TEXT NOT NULL,"
+                    " role TEXT NOT NULL, source_ingestion_ts TEXT NOT NULL,"
+                    " source_checksum TEXT NOT NULL,"
+                    " PRIMARY KEY(head_id, source_id));")
+            conn.execute(
+                "INSERT INTO belief_head (id, namespace, topic_identity,"
+                " content, head_state, head_source_id, support_count,"
+                " refresh_watermark, generator_revision, confidence, signal,"
+                " taint, trust_score)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("00000000-0000-4000-8000-000000000be9", "user:global",
+                 "fixture-180", RECORD_180["content"], "active",
+                 RECORD_180["id"], 1, FIXED_TS, "fixture", 0.5, "test",
+                 "untrusted_tool", 1.0))
+            conn.execute(
+                "INSERT INTO belief_head_source (head_id, source_id, role,"
+                " source_ingestion_ts, source_checksum)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("00000000-0000-4000-8000-000000000be9", RECORD_180["id"],
+                 "primary", FIXED_TS, "fixture"))
             conn.commit()
             # init_db stamps meta.created_at with the wall clock; pin it so
             # the fixture bytes are reproducible (digest-stable regeneration).

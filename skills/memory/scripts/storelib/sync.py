@@ -2084,13 +2084,16 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
               f"own store's export, not a remote/cloud outbox.", file=sys.stderr)
 
     if capture_refused:
-        # Rows refused by the capture policy (reviewed mode, or non-quarantine
-        # refusal shapes). NOT written. One summary note, not per-row, for the
-        # same noise-suppression reason as tombstones_refused.
+        # Rows refused by the capture policy in this non-quarantined counter:
+        # reviewed-mode raises of every refusal shape (secret-like source_ref,
+        # unredactable content/tags, unsafe source path). NOT written. One
+        # summary note, not per-row, for the same noise-suppression reason as
+        # tombstones_refused.
         print(f"[zmem] ingest-jsonl: refused {capture_refused} row(s) under the "
-              f"capture policy (secret-like source_ref in 'reviewed' mode); those rows are "
+              f"capture policy in 'reviewed' mode (secret-like source_ref, "
+              f"unredactable content, or unsafe source path); those rows are "
               f"NOT stored. Re-ingest with --capture-mode manual only "
-              f"if you have verified the source_ref is safe.", file=sys.stderr)
+              f"if you have verified the rows are safe.", file=sys.stderr)
 
     if quarantined:
         # Issue #180: whole-row auto-mode refusals recorded in the quarantine

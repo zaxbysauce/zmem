@@ -10,8 +10,9 @@ source_ref is STRUCTURED provenance. This pins the allowlist contract:
 - CREDENTIAL shapes (key=value, PEM headers, gh*_ tokens, AKIA) still refuse
   on allowlisted refs — defense in depth;
 - `file:` absolute remainders (drive letter, POSIX-absolute, UNC, ~) refuse;
-- content/tags scanning is UNCHANGED: secrets in content still redact in auto
-  mode, and reviewed/manual modes behave exactly as before;
+- content/tags scanning is UNCHANGED in auto mode; since issue #180 the
+  `reviewed` mode RAISES on credential-shaped source_refs (exit 2) while
+  `manual` stays advisory-only — see test_reviewed_mode_never_refuses;
 - the write result surfaces a structured `source_ref_allowlisted` warning so
   the redacted/refused/warnings triad stays honest.
 

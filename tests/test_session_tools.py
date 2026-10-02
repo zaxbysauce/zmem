@@ -696,9 +696,10 @@ class HermesSessionToolsTest(unittest.TestCase):
 
 
 class HermesCapturePolicyTest(unittest.TestCase):
-    """Issue #180: zmem_add returns the SAME normalized quarantine result as
-    the MCP add tool, and the subprocess boundary holds — the provider never
-    imports storelib in-process."""
+    """Issue #180: zmem_add returns the SAME normalized quarantine envelope
+    as the MCP add tool (envelope-forwarding parity against a stubbed store;
+    end-to-end remote-safety runs in the store itself), and the subprocess
+    boundary holds — the provider never imports storelib in-process."""
 
     QUARANTINE_STDOUT = json.dumps({
         "id": None,
