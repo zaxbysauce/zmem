@@ -210,6 +210,16 @@ def fence_row_cost(row: dict[str, Any], *,
     lines = [header, "    " + (row.get("content", "") or "")]
     if row.get("source_ref"):
         lines.append("    source_ref: {}".format(row["source_ref"]))
+    # Page provenance is intentionally a narrow, page-only extension of the
+    # common fence.  Ordinary rows retain their historical bytes.
+    if row.get("type") == "page":
+        for key in ("version_id", "freshness_watermark", "page_checksum"):
+            if row.get(key):
+                lines.append("    {}: {}".format(key, row[key]))
+        for key in ("source_ids", "evidence_ids"):
+            values = row.get(key)
+            if isinstance(values, (list, tuple)) and values:
+                lines.append("    {}: {}".format(key, ", ".join(map(str, values))))
     if row.get("tags"):
         lines.append("    tags: {}".format(row["tags"]))
     ents = row.get("entities") or []
@@ -1088,6 +1098,33 @@ def select_and_budget_for_injection(
         except Exception:
             pass
 
+    # Discover and gate page candidates before invoking ordinary recall so its
+    # budget stays byte-identical on calls where no usable page exists. Only a
+    # real combined pool asks recall to retain its pre-budget canonical rows.
+    page_candidates_pre = []
+    page_candidate_ids_pre = []
+    page_rows_pre = []
+    try:
+        from storelib import pages as _pages  # type: ignore
+        page_candidates_pre = _pages._page_candidates_for_selector(
+            conn, data_dir=resolved_data, query=effective_query,
+            namespace=namespace, moment=moment, lane=lane,
+            user_global_floor=effective_user_global_floor)
+        page_candidate_ids_pre = [r.get("id") for r in page_candidates_pre
+                                  if isinstance(r.get("id"), str)]
+        page_rows_pre = [r for r in page_candidates_pre if r.get("id") not in exclusions]
+        # Derived pages use the same emit-time prompt-injection classifier as
+        # canonical recall rows. A risky page is withheld before budget and
+        # never suppresses any represented source.
+        page_rows_pre = [r for r in page_rows_pre
+                         if not recall_module._classify_injection(r)]
+        page_rows_pre, _page_status, _page_stats = selective_inject_filter(
+            page_rows_pre, with_stats=True)
+    except Exception:
+        page_candidates_pre = []
+        page_candidate_ids_pre = []
+        page_rows_pre = []
+
     capture: dict = {}
     try:
         # Issue #125: cross_rerank goes ONLY in the query branch — it must
@@ -1100,7 +1137,10 @@ def select_and_budget_for_injection(
             include_global=True, global_limit=global_limit,
             no_telemetry=True, for_injection=True,
             exclude_ids=exclusions, _capture=capture,
-            _injection_budget_tokens=budget,
+            # Keep the ordinary retrieval/gate candidate set intact only when
+            # a validated derived row will join it. Page-free calls retain the
+            # exact historic recall budget and ordering.
+            _injection_budget_tokens=(max(budget, 1000000) if page_rows_pre else budget),
             min_confidence=effective_min_confidence,
             include_cross_project=include_cross_project,
             _cross_moment=moment,
@@ -1138,6 +1178,30 @@ def select_and_budget_for_injection(
         if not candidate_ids:
             candidate_ids = [r.get("id") for r in rows
                              if isinstance(r, dict) and isinstance(r.get("id"), str)]
+        # Curated pages are discovered at the common selector boundary.  The
+        # page helper validates immutable artifacts and rechecks live source
+        # and evidence membership; failures simply withhold the derived row.
+        # This preserves the existing recall path for ordinary rows.
+        try:
+            page_rows = list(page_rows_pre)
+            candidate_ids = _ordered_unique(candidate_ids + page_candidate_ids_pre)
+            if page_rows:
+                # Recall already budgeted its ordinary candidates. Reapply the
+                # same shared budget to the combined set so page provenance
+                # pays for its actual fenced bytes.
+                combined = list(rows) + page_rows
+                rows, _used, _dropped, _budget_stats = apply_token_budget(
+                    combined, budget, with_stats=True, legacy_injection_wire=True)
+                parsed["budget_dropped"] = int(parsed.get("budget_dropped", 0) or 0) + _dropped
+                parsed["budget_admission"] = _budget_stats["admission_used"]
+                parsed["budget_truncated"] = int(parsed.get("budget_truncated", 0) or 0) + _budget_stats["truncated"]
+                parsed["budget_dropped_protected"] = int(parsed.get("budget_dropped_protected", 0) or 0) + _budget_stats["dropped_protected"]
+                parsed["tokens_used"] = _budget_stats["admission_used"]
+        except Exception:
+            # Page discovery is derived-data enrichment. Existing canonical
+            # injection must retain its fail-safe behavior if a page directory
+            # is malformed or unavailable.
+            pass
         # Issue #256: read-time credential re-scan on the passive lane —
         # the defense-in-depth twin of the prompt-injection re-scan. Every
         # selected row matching SECRET_CREDENTIAL_PATTERNS (content /
@@ -1167,6 +1231,15 @@ def select_and_budget_for_injection(
             else:
                 displayed_rows.append(row)
         rows = displayed_rows
+        # A page suppresses represented canonical rows only after it survived
+        # the credential/withholding pass and was actually rendered. A
+        # rejected, budget-dropped, or withheld page therefore hides nothing.
+        delivered_page_sources = set()
+        for row in rows:
+            if row.get("type") == "page" and not row.get("withheld_for_secret"):
+                delivered_page_sources.update(row.get("represented_ids") or row.get("source_ids") or [])
+        if delivered_page_sources:
+            rows = [row for row in rows if row.get("type") == "page" or row.get("id") not in delivered_page_sources]
         secret_withheld_count = len(withheld_rows)
         excluded = [rid for rid in exclusions if rid in candidate_ids]
         if not rows and candidate_ids and excluded and set(candidate_ids) <= set(excluded):
@@ -1186,6 +1259,8 @@ def select_and_budget_for_injection(
             rendered = recall_module._format_fenced_recall(
                 rows, header=header, budget_note=parsed.get("budget_note"),
                 legacy_injection_wire=True)
+            if page_rows_pre:
+                parsed["tokens_used"] = estimate_tokens(rendered)
         present = ledger.rows_present_in(rows, rendered)
         # Expansion rows are rendered but deliberately NOT bumped —
         # popularity rewards query-MATCHED rows only (recall.py bump law).

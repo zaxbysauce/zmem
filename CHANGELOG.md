@@ -10,6 +10,19 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.76.0] - 2026-10-02
+
+### Added
+- **Deterministic curated knowledge pages (issue #138):** explicit filesystem
+  pages with immutable version history, grounded source and evidence metadata,
+  deterministic refresh watermarks, byte-preserving section deltas, tombstone
+  retractions, and passive delivery through the shared selector, floors,
+  budget, untrusted fence, and delivery ledger. Added `page read`, `page list`,
+  and `page refresh`; the optional local maintenance adapter is a bounded,
+  recorded JSON action file and never writes page content into canonical memory.
+  Read/list are SQLite-independent, refresh is read-only against an existing
+  store, and failed or partial publication preserves the prior committed page.
+
 ## [0.75.0] - 2026-10-01
 
 ### Added

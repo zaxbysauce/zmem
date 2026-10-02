@@ -836,3 +836,93 @@ decision (`evidence/gates/172-observation.json`): the type is added to the
 effective vocabulary only when that artifact records `accept`; `reject`
 (default and currently recorded) leaves the type vocabulary unchanged and
 ships virtual heads only.
+
+## Curated knowledge pages (issue #138)
+
+Curated pages are explicit, local filesystem artifacts grounded in the
+canonical store. They are not memory rows and they never feed page text,
+page paths, or `page:` source references back into canonical memory. Pages use
+the same resolved data root as the passive selector and delivery ledger. The
+resolution chain gives an explicit `ZMEM_STORE` path precedence over
+`ZMEM_DATA`, so an explicit store keeps `pages/` beside that store; when no
+store path is set, `ZMEM_DATA` supplies the data directory before the host
+fallbacks. Each validated page id has its own directory:
+
+```
+<resolved-data-root>/pages/<page-id>/
+  definition.json
+  current.json
+  page.md
+  versions/v000001.json
+  versions/v000002.json
+```
+
+`definition.json` records the namespace, refresh query, sorted tags, generator
+revision, and creation policy. Each version JSON stores the canonical Markdown
+and its source/evidence grounding. `current.json` is the committed pointer and
+records the version id, freshness watermark, source ids, evidence ids,
+retracted source ids, and the 64-character page checksum. Version files are
+immutable and JSON is sorted, compact UTF-8 with one final LF. `page.md` is a
+compatibility projection; reads and historical reads use the validated pointer
+and immutable version. A lagging or missing projection is repaired only by a
+locked refresh, never by `page read` or `page list`.
+
+Use the explicit commands below. `read` and `list` inspect only the page
+filesystem and do not create, migrate, or open SQLite. `refresh` requires an
+existing store, opens it read-only with query-only mode, waits for the normal
+maintenance/writer quiescence protocol inside the page library, and writes no
+canonical memory rows.
+
+```
+python <store.py> page read --id <page-id> [--version <version-id>]
+python <store.py> page list [--namespace <namespace>]
+python <store.py> page refresh --id <page-id> --query "<source query>" \
+  --namespace <namespace> [--tag <tag>]... [--llm-local]
+```
+
+Refresh snapshots belief heads and live rows matching every requested tag,
+revalidates namespace, temporal, confidence, trust, taint, and evidence
+eligibility before publication, and derives a deterministic freshness
+watermark from the eligible source snapshot. A source tombstone is retracted
+in the next successful version; older versions retain their original text and
+grounding. Empty, invalid, exceptional, or partially published refreshes
+preserve the last committed pointer, projection, checksum, version id, and
+watermark and report `[zmem] page refresh: refused`.
+
+The first refresh may bootstrap a page directory from a valid existing
+`page.md`, preserving every untouched section byte-for-byte; it records the
+supplied namespace, query, and sorted tags in a new `definition.json` and
+publishes `v000001`. A genuinely new directory receives the default required
+refresh section. Once a definition is committed, a refresh with a different
+namespace, query, or tag set is refused without changing any artifact. This
+prevents a command from silently retargeting an existing page.
+
+The optional `--llm-local` path is a recorded local adapter for deterministic
+maintenance tests and offline operation. Set `ZMEM_PAGE_ADAPTER_ACTIONS` to a
+local JSON action file. The adapter receives at most 20 bounded candidates;
+each content field is capped at 400 UTF-8 bytes, and each Markdown operation
+at 4000 UTF-8 bytes. Only `replace_section`, `append_bullet`, and
+`retract_bullet` operations with in-scope citations are accepted. The file is
+data only: no shell commands, dynamic imports, network calls, filesystem paths,
+raw page queries, or executable instruction fields are interpreted. Missing
+recorded configuration is rejected before the store or maintenance lock is
+touched. Invalid actions preserve the prior committed page.
+
+Passive delivery uses the existing shared selector, token budget, lane floors,
+untrusted fence, and delivery ledger. A page is admitted and budgeted as one
+candidate; represented canonical sources are suppressed only after the page
+itself is admitted and rendered. Filtering, floor rejection, or budget
+dropping a page suppresses zero represented source rows. The recorded
+`evidence/gates/172-observation.json` currently says `reject`, so page metadata
+does not expose `runbook` and the `ALLOWED_TYPES` vocabulary is unchanged.
+
+Publication uses a temporary nonce staging directory and installs the
+immutable version and projection before replacing `current.json` last. An
+ordinary precommit failure restores the prior projection and removes the new
+unreferenced version. A process crash can leave staging or unreferenced
+version residue; readers ignore anything not named by the valid current
+pointer, and a later locked refresh may clean residue and restore the
+projection. If filesystem rollback itself fails, refresh reports an explicit
+refusal and the last valid pointer remains authoritative. The implementation
+does not claim atomic recovery when the filesystem cannot provide the required
+operations.

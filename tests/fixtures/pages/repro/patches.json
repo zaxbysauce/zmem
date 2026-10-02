@@ -1,0 +1,18 @@
+{
+  "valid": {
+    "operations": [
+      {"op": "replace_section", "section_id": "refresh", "markdown": "Patched cafe", "citations": ["ev-502"]},
+      {"op": "append_bullet", "section_id": "refresh", "markdown": "Patched bullet", "citations": ["ev-503"]}
+    ]
+  },
+  "invalid": {
+    "operations": [
+      {"op": "replace_section", "section_id": "unknown", "markdown": "must refuse", "citations": ["ev-502"]}
+    ]
+  },
+  "unresolved_citation": {
+    "operations": [
+      {"op": "replace_section", "section_id": "refresh", "markdown": "must refuse", "citations": ["ev-not-in-candidates"]}
+    ]
+  }
+}
