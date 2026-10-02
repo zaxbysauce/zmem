@@ -143,7 +143,10 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[str, str]:
       - encoding/errors on the PARENT's pipe decode, so a child byte sequence
         this console cannot represent is replaced rather than raising here.
     """
-    row_ref = row.get("source_ref") or source_ref
+    raw_ref = row.get("source_ref")
+    # A malformed non-string ref must fail THIS row (child rc!=0 -> failed
+    # count), never crash the whole importer before the subprocess runs.
+    row_ref = raw_ref if isinstance(raw_ref, str) and raw_ref else source_ref
     cmd = [
         sys.executable, str(store_py), "add",
         "--namespace", row["namespace"],
@@ -259,12 +262,13 @@ def main() -> int:
         status, message = ingest_row(store_py, row, source_ref)
         if status == "stored":
             stored += 1
-            preview = row["content"][:80]
-            _print(f"[ingest-harvest] added row {i}: [{row['namespace']}] {row['type']}: {preview}")
+            # No content preview: the raw row text can carry the very
+            # credential the policy redacted (or that dedup kept unstored) —
+            # the status line names the row, the store/ledger holds the text.
+            _print(f"[ingest-harvest] added row {i}: [{row['namespace']}] {row['type']}")
         elif status == "deduped":
             deduped += 1
-            preview = row["content"][:80]
-            _print(f"[ingest-harvest] deduped row {i}: [{row['namespace']}] {row['type']}: {preview}")
+            _print(f"[ingest-harvest] deduped row {i}: [{row['namespace']}] {row['type']}")
         elif status == "quarantined":
             quarantined += 1
             _print(f"[ingest-harvest] QUARANTINED row {i}: {message}", err=True)

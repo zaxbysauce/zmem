@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "685b3fccc6193d21e3a8f85acb18f200adf204ee71cb812850d5c0bc19960e7f",
+  "digest": "553a21f80882e08465d80332443a81392d6d12498062c23f8b9aeeab2a244c33",
   "files": {
     "hermes-plugin/__init__.py": "f3a35ebbf9ddda986e3e643f956b34c1f298fac74555540e63086954b11b811b",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -49,7 +49,7 @@
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
     "scripts/host_canary.py": "0c8ccc8ff1cb585f5951121a5704464a364d5ef94ca579be460625e8ab9262c1",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
-    "scripts/ingest_harvest.py": "5851b95650d917007bb47062c91bd25c131d28a67acf3574973288573454d728",
+    "scripts/ingest_harvest.py": "435282434d476cd553096d8097ecde8dba0e4f6932d151ed1d72b3540e99d2fd",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
     "scripts/refresh-report-schema.json": "a2105db8ca57a6e860c35bf25a6e8f943b70c0f3abaf65fcf2803d9d99b01bea",
     "scripts/refresh_hosts.py": "6c85a1a2cc0e2264348e9427311958388dc807beeb4b9780ab0ab2b50770d2cf",
@@ -75,7 +75,7 @@
     "skills/memory/scripts/storelib/__init__.py": "aa909653b01bf1596eba4337d399b31feb2982651d549763a20305037febf5a7",
     "skills/memory/scripts/storelib/backup.py": "f91492862175bb3007514d3d4d8ea1cc3a6b8297625d7b42ef2306af57a06be3",
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
-    "skills/memory/scripts/storelib/cli.py": "90ad08608a7190727cf63311c4c359e403b611f2833b2989a2afdf39417d0b40",
+    "skills/memory/scripts/storelib/cli.py": "e27cc77e30cdded9192afebaa69af2f5e2e04eb4bb25564c4dc3b747f0acb7f2",
     "skills/memory/scripts/storelib/consolidate.py": "6180c42e25dcd644aff2053a223d76eab56c5a8cf96f72ae96169f64f9396f75",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",

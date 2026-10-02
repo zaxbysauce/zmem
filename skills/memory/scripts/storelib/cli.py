@@ -3786,6 +3786,12 @@ def main():
                         "tags": args.tags,
                         "signal": args.signal,
                         "source_ref": args.source_ref or "",
+                        # Preserve explicitly-supplied add metadata so a
+                        # re-ingestion reconstructs the same row (cubic
+                        # round); None means the flag was not supplied and
+                        # add_memory's defaults would have applied.
+                        "confidence": args.confidence,
+                        "taint": args.taint,
                     }
                     # Same sink resolution as every other importer writer
                     # (sync/_ingest_row): the quarantine dir belongs to the

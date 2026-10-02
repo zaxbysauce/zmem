@@ -1754,7 +1754,7 @@ class CapturePolicyIngestTest(_TwoStoreCase):
             ("77777777-0000-0000-0000-000000000007",))[0])
 
 
-class LegacyImportCaptureTest(_TwoStoreCase):
+class LegacyImportCaptureTest(unittest.TestCase):
     """Issue #180: import-store.py stages, sanitizes, and quarantines.
 
     Leg 1 (success): the legacy fixture source (two rows — a redactable
