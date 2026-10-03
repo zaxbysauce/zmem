@@ -10,6 +10,34 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.78.0] - 2026-10-03
+
+### Added
+- **`search --exact` — literal substring existence check** (issue #263).
+  `store.py search --text` is FTS5-`MATCH`-backed: the text is normalized into
+  a stop-word-filtered, OR-composed term list, so a literal made only of stop
+  words returns zero rows even when the string is present verbatim, FTS5
+  query-syntax characters (`OR`, quotes, a leading `-k`) change the query's
+  meaning instead of matching as text, and a token bag matches regardless of
+  word order — the wrong tool for an existence probe ("is this exact id,
+  path, error string, or redaction marker present?"). `--exact` swaps the
+  matcher for a verbatim, case-sensitive, contiguous substring test against
+  `memory.content` (SQLite `instr`, ≡ Python `in`), honoring the same
+  `--namespace`, `--include-global`/`--global-limit`, `--as-of`, and
+  `--exclude` filters and the same `--no-bump` issue-#21 semantics as plain
+  search, with no embedding model involved and results ordered
+  most-recent-first. Plain `search` without the flag is byte-identical. On
+  the library seam, `recall_memory(..., exact=True)` fail-closes by refusing
+  every combination that could splice non-literal rows into the result
+  (`for_injection`, `scopes`, `include_cross_project`, `link_hops >= 1` —
+  which also covers unfold — and `cross_rerank`), and the exact path skips
+  the belief-head virtual-row merge, whose token-based admission (and
+  represented-row suppression) would both violate the literal-membership
+  contract. Docs in `skills/memory/SKILL.md`; tests in
+  `tests/test_s02_search_exact.py` (frozen acceptance checks) and
+  `tests/test_s02_exact_companions.py` (include-global, as-of, telemetry,
+  library guards, belief isolation).
+
 ## [0.77.0] - 2026-10-02
 
 ### Fixed
