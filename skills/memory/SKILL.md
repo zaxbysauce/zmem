@@ -1063,7 +1063,7 @@ Recall surfaces the taint so trust is visible, mirroring prompt-injection-risk:
 python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
                          [--include-global] [--global-limit 3] [--as-of ISO-8601]
                          [--json]
-python <store.py> search --text "<text>" [--namespace NS] [--limit 10]
+python <store.py> search --text "<text>" [--exact] [--namespace NS] [--limit 10]
                         [--include-global] [--global-limit 3] [--no-bump]
                         [--as-of ISO-8601] [--json]
 python <store.py> supersede --id <full-uuid> [--reason "..."] [--expected-namespace NS]
@@ -1091,6 +1091,19 @@ migration aliases (so `recent --namespace <old pre-v5 key>` finds rows migrated
 to the new key). `search` now accepts `--no-bump` for a *passive* query that records a
 surface on `surfaced_count` (never advancing `retrieval_count`) instead of bumping like
 `recall` (issue #21).
+
+`search --exact` (issue #263) switches the matcher from FTS5 to a **literal
+substring existence check**: `--text` is matched verbatim (case-sensitive,
+contiguous) against `memory.content`, so stop-word-only literals, FTS5 query
+syntax (`OR`, quotes, leading `-k`), and word order all stay literal instead
+of being normalized into a token query. Use it to confirm an exact id, path,
+error string, or redaction marker is or is not present verbatim; plain
+`search` (no `--exact`) is unchanged byte-for-byte. `--exact` honors the same
+`--namespace`, `--include-global`/`--global-limit`, `--as-of`, and `--exclude`
+filters and the same `--no-bump` (issue #21) semantics as plain search, needs
+no embedding model, never link-expands, and orders results most-recent-first.
+An empty `--text` trivially matches every row in scope (Python `"" in content`
+semantics).
 
 `--as-of ISO-8601` (v9, issue #59 4.4) on `recall`/`recent`/`search` returns rows
 **valid at that instant**: `valid_from <= as_of AND (valid_until empty OR
