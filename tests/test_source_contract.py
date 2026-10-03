@@ -1,6 +1,7 @@
 """Focused trust-boundary regression tests for issue #139 source resolution."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -158,6 +159,66 @@ class SourceContractTests(unittest.TestCase):
             malformed.stderr,
             "store.py: error: --context must be between 0 and 20\n",
         )
+
+    def test_cli_source_option_last_value_and_equals_literal_contract(self) -> None:
+        store = SCRIPTS / "store.py"
+        memory_file = self.root / "MEMORY.md"
+        memory_file.write_text("# Source\n\nliteral --flag text\n", encoding="utf-8")
+        env = dict(
+            os.environ,
+            ZMEM_STORE=str(self.root / "store.sqlite"),
+            ZMEM_DATA=str(self.root / "data"),
+            ZMEM_MODELS_DIR=str(self.root / "missing-models"),
+            ZMEM_MODEL_AUTODOWNLOAD="0",
+            ZMEM_EMBED_PROFILE="fake",
+            ZMEM_NAMESPACE="project:source-contract-cli",
+            ZMEM_CODEX_MEMORY=str(memory_file),
+        )
+
+        def run(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(store), *args], cwd=SCRIPTS.parents[2],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+
+        self.assertEqual(run("init").returncode, 0)
+        self.assertEqual(
+            run(
+                "add", "--namespace", "project:source-contract-cli", "--type", "lesson",
+                "--content", "source option fixture", "--source-ref", "MEMORY.md",
+            ).returncode,
+            0,
+        )
+        conn = sqlite3.connect(env["ZMEM_STORE"])
+        try:
+            memory_id = conn.execute("SELECT id FROM memory").fetchone()[0]
+        finally:
+            conn.close()
+
+        literal = run("source", "scan", "--id", memory_id, "--needle=--flag")
+        self.assertEqual(literal.returncode, 0, literal.stderr)
+        literal_result = json.loads(literal.stdout)
+        self.assertEqual(literal_result["needle"], "--flag")
+        self.assertEqual(literal_result["match_count"], 1)
+
+        invalid_last = run("source", "--id", memory_id, "--context", "2", "--context", "nope")
+        self.assertEqual(invalid_last.returncode, 2)
+        self.assertEqual(invalid_last.stdout, "")
+        self.assertEqual(invalid_last.stderr, "store.py: error: --context must be between 0 and 20\n")
+
+        valid_last = run("source", "--id", memory_id, "--context", "nope", "--context", "0")
+        self.assertEqual(valid_last.returncode, 0, valid_last.stderr)
+        self.assertEqual(json.loads(valid_last.stdout)["context_requested"], 0)
+
+        for args, error in (
+            (("source", "scan", "--id", "--needle", "x"), "--id is required"),
+            (("source", "scan", "--id", memory_id, "--needle", "--flag"), "--needle must not be empty"),
+        ):
+            with self.subTest(args=args):
+                missing = run(*args)
+                self.assertEqual(missing.returncode, 2)
+                self.assertEqual(missing.stdout, "")
+                self.assertEqual(missing.stderr, f"store.py: error: {error}\n")
 
 
 if __name__ == "__main__":

@@ -2989,22 +2989,25 @@ def main():
     # argparse can emit a usage block; every other parser keeps its legacy
     # behavior.
     source_argv = sys.argv[1:]
+    parse_argv: list[str] | None = None
     if (source_argv and source_argv[0] == "source"
             and "-h" not in source_argv and "--help" not in source_argv):
         def _source_option(option: str) -> tuple[bool, str | None]:
+            selected: tuple[bool, str | None] = (False, None)
             for index, value in enumerate(source_argv):
                 if value == option:
-                    return True, source_argv[index + 1] if index + 1 < len(source_argv) else None
-                if value.startswith(option + "="):
-                    return True, value[len(option) + 1:]
-            return False, None
+                    following = source_argv[index + 1] if index + 1 < len(source_argv) else None
+                    selected = (True, following if following is None or not following.startswith("--") else None)
+                elif value.startswith(option + "="):
+                    selected = (True, value[len(option) + 1:])
+            return selected
 
         def _source_error(message: str) -> None:
             print(f"store.py: error: {message}", file=sys.stderr)
             sys.exit(2)
 
         has_id, memory_id = _source_option("--id")
-        if not has_id or not memory_id or memory_id.startswith("--"):
+        if not has_id or not memory_id:
             _source_error("--id is required")
         source_is_scan = any(
             value == "scan" and (index == 0 or source_argv[index - 1] not in {
@@ -3014,7 +3017,7 @@ def main():
         )
         if source_is_scan:
             has_needle, needle = _source_option("--needle")
-            if not has_needle or not needle or needle.startswith("--"):
+            if not has_needle or not needle:
                 _source_error("--needle must not be empty")
         else:
             has_context, context = _source_option("--context")
@@ -3025,8 +3028,28 @@ def main():
                     parsed_context = None
                 if parsed_context is None or not 0 <= parsed_context <= 20:
                     _source_error("--context must be between 0 and 20")
+                # argparse converts every occurrence before assigning the
+                # destination. Keep the final source-only context option so
+                # a superseded malformed value cannot escape this command's
+                # established one-line error contract.
+                context_indexes = [
+                    index for index, value in enumerate(source_argv)
+                    if value == "--context" or value.startswith("--context=")
+                ]
+                if len(context_indexes) > 1:
+                    discard: set[int] = set()
+                    for index in context_indexes[:-1]:
+                        discard.add(index)
+                        if (source_argv[index] == "--context"
+                                and index + 1 < len(source_argv)
+                                and not source_argv[index + 1].startswith("--")):
+                            discard.add(index + 1)
+                    parse_argv = [
+                        value for index, value in enumerate(source_argv)
+                        if index not in discard
+                    ]
 
-    args = ap.parse_args()
+    args = ap.parse_args(parse_argv)
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
     # supplied --batch but ordinary reembed retains its historical default.
