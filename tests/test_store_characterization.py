@@ -201,7 +201,7 @@ KNOWN_SUBCMDS = [
     # v12 (issue #64): explicit usage-feedback + dry-run weight tuning.
     "feedback", "tune-weights",
     # Issue #134 (Workstream E): the governed dataset artifact surface.
-    "export-dataset", "publish-dataset", "import-dataset",
+    "export-dataset", "publish-dataset", "import-dataset", "source",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help
@@ -501,7 +501,8 @@ class CharacterizationTests(unittest.TestCase):
         # 37 -> 40: the governed dataset commands joined (issue #134).
         # 40 -> 45: governed training capture/export commands joined (issue #135).
         # 45 -> 47: independent review and trusted terminal revoke joined.
-        self.assertEqual(len(KNOWN_SUBCMDS), 47)
+        # 47 -> 48: read-only provenance inspection joined (issue #139).
+        self.assertEqual(len(KNOWN_SUBCMDS), 48)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
@@ -515,7 +516,7 @@ class CharacterizationTests(unittest.TestCase):
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 47)
+        self.assertEqual(len(KNOWN_SUBCMDS), 48)
 
     def test_recall_clock_seam_is_honored_and_deterministic(self):
         """ZMEM_TEST_NOW pins the scoring clock (see _run_env). Two pins of

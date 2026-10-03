@@ -137,6 +137,68 @@ store's content cap) — datasets are sized for personal-memory corpora,
 not unlimited streams. Point recall at the snapshot by running later commands with
 `ZMEM_STORE=<dest>/snapshot.sqlite`.
 
+## Provenance lookup (issue #139)
+
+`source` is an explicit, local read-only lookup over an existing memory's
+evidence association. It is useful when a local session needs to inspect the
+source window that justified a row; it is not a general transcript or file
+browser. The resolver authorizes the namespace and source root first, then
+uses the associated evidence. If an association is present but its source is
+missing, unsafe, ambiguous, or unavailable, the command refuses and does not
+fall back to the row's `source_ref`.
+
+```bash
+python skills/memory/scripts/store.py source --id <memory-uuid> --context 2
+python skills/memory/scripts/store.py source scan --id <memory-uuid> --needle "literal text"
+```
+
+`--context` is bounded to 0 through 20. `source scan` is a literal scan of one
+resolved session, returns at most 50 matches, and reports truncation when the
+match limit is reached; its needle is never interpreted as a regular
+expression. Malformed `--context` or scan input uses the command's single
+`store.py: error: ...` line and exit 2 contract. Resolution failures are
+visible nonzero refusals.
+
+The show result has exactly these keys: `memory_id`, `namespace`, `source_ref`,
+`evidence_ids`, `source_kind`, `source_path`, `session_id`, `capture_time`,
+`turn_start`, `turn_end`, `byte_start`, `byte_end`, `context_requested`,
+`context_returned`, `truncated`, `truncated_reason`, `excerpt_sha256`, and
+`excerpt`. File-backed hosts select the original UTF-8 byte range before
+decoding, redaction, and hashing, so their byte offsets refer to the original
+file. Native Hermes and ZCode stores retain their verified source/session/
+message anchors but expose explicit `null` byte offsets because those stores do
+not retain the original UTF-8 transcript byte stream.
+
+Authorization is evidence-first and local. `source_ref` is accepted only as a
+relative approved name or recognized scheme identifier; absolute paths, URLs,
+UNC paths, parent escapes, reparse escapes, arbitrary roots, and raw memory
+files are refused. A nonempty `ZMEM_NAMESPACE` value is
+used as the explicit scope. Otherwise, namespace resolution uses the
+normal project identity with cache writes and cache drops disabled for this
+read. The existing namespace alias expansion is applied only within the
+authorized project/global scope. Source lookup opens an existing store with
+SQLite `mode=ro` and `query_only=1`; it does not migrate, checkpoint, rekey,
+lease, queue, feedback, telemetry, transcript, or cache state.
+
+SQLite's coordination behavior has one measured boundary. For the existing
+canonical zmem store, SQLite may create its exact coordination sidecars and
+update SQLite-managed SHM; a newly created WAL must be empty, while
+the database and any pre-existing WAL remain byte-identical. External native
+WAL sources require existing regular safe sidecars; the resolver may coordinate
+an existing `-shm`, but it must not create or delete source sidecars. These
+preflight checks do not prove a concurrent host replacement is race-free;
+changes or failures after preflight remain visible refusals.
+
+Hermes native lookup uses the pinned provider's read-only `SessionDB` API. If
+the canonical Hermes database exists but import, open, validation, or provider
+lookup fails, the resolver refuses without using an export. A JSONL export is
+accepted only when that canonical database is absent, only from an explicitly
+permitted local export, and only within the 50-file and 8 MiB bounds. No runtime
+provider download or installation occurs during lookup; the pinned provider
+lane is provisioned by CI and validated before the fixture is created.
+Repository maintainers must make the `test-source-hermes` status required in
+branch protection; adding the workflow does not enable that policy by itself.
+
 ## Governed training views (issue #135)
 
 Training views are a local, reviewed projection of completed task captures.

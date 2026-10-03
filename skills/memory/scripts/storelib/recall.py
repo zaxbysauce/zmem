@@ -1915,7 +1915,8 @@ ZMEM_FENCE_CLOSE = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 
 def _format_fenced_recall(rows: list[dict], header: str,
                           budget_note: str | None = None,
-                          legacy_injection_wire: bool = False) -> str:
+                          legacy_injection_wire: bool = False,
+                          source_hint: bool = False) -> str:
     """Render a fenced, provenance-tagged bullet block for hook inject.
 
     Issue #58, 3.5: wrap hook-injected memories in a non-executable
@@ -2013,6 +2014,8 @@ def _format_fenced_recall(rows: list[dict], header: str,
         lines.append(f"    {r['content']}")
         if r.get("source_ref"):
             lines.append(f"    source_ref: {r['source_ref']}")
+        if source_hint:
+            lines.append(f"    -> source {r['id']} (store.py source --id {r['id']})")
         if r.get("tags"):
             lines.append(f"    tags: {r['tags']}")
         # v10 (issue #60, 5.4): at most THREE entity NAMES per row (never
@@ -2887,6 +2890,7 @@ def _recall_memory_impl(
                 ),
                 budget_note=(injection_details or {}).get("budget_note") if for_injection else None,
                 legacy_injection_wire=for_injection,
+                source_hint=not for_injection,
             ))
     return results
 

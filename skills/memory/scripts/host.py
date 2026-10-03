@@ -600,7 +600,7 @@ def _cache_put(project_dir: Path, namespace: str) -> None:
         pass
 
 
-def resolve_namespace(project_dir: str | Path) -> str:
+def resolve_namespace(project_dir: str | Path, *, write_cache: bool = True) -> str:
     """The SOLE producer of `project:*` namespace keys — called both by the
     runtime hook launcher (recall) and by the v5 migration (store.py). Never
     hand-type a namespace key; always derive it through this function so
@@ -624,12 +624,14 @@ def resolve_namespace(project_dir: str | Path) -> str:
     remote, status = _get_git_remote_status(p)
     if status == "remote":
         namespace = f"project:{_normalize_remote(remote)}"
-        _cache_put(p, namespace)
+        if write_cache:
+            _cache_put(p, namespace)
         return namespace
     if status == "absent":
         # git ran fine and there is no origin: drop any cached remote key so
         # a later `error` can never resurface the removed origin's identity.
-        _cache_drop(p)
+        if write_cache:
+            _cache_drop(p)
         return f"project:{_norm_abspath_key(p)}"
     cached = _cache_get(p)
     if cached:

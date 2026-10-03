@@ -46,7 +46,7 @@ SECRET_CREDENTIAL_PATTERNS = [
     re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{10,}\b"),

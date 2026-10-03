@@ -79,6 +79,7 @@ from storelib.query_ambiguity import (
     rewrite_ambiguous_query,
     read_recent_edit_basenames,
 )
+from storelib.source import SourceRefusal, scan as source_scan, show as source_show
 
 
 def _warn_reserved_source_ref(source_ref: str | None) -> None:
@@ -1644,7 +1645,17 @@ def main():
                                "(explicit recall only: change-intent queries like "
                                "'what changed about X' otherwise append budgeted "
                                "[PREVIOUSLY] update_of predecessors). Passive "
-                               "surfaces never unfold regardless (--no-bump).")
+                              "surfaces never unfold regardless (--no-bump).")
+
+    p_source = _add_parser("source", help="show verified local provenance for one memory")
+    source_sub = p_source.add_subparsers(dest="source_cmd")
+    p_source.add_argument("--id", dest="source_id")
+    # Parse this ourselves so malformed values use the source command's one
+    # exact stderr line rather than argparse's usage block.
+    p_source.add_argument("--context", nargs="?", const=None, default="2")
+    p_source_scan = source_sub.add_parser("scan", help="literal scan of the resolved source")
+    p_source_scan.add_argument("--id", dest="source_id")
+    p_source_scan.add_argument("--needle")
 
     p_recall.add_argument("--exclude", action="append", default=None,
                           help="repeatable: exclude these memory ids from the results "
@@ -3056,6 +3067,49 @@ def main():
     # available without opening a connection.
     if args.cmd == "path":
         print(STORE_PATH)
+        sys.exit(0)
+
+    # Source resolution is an observation over an existing store.  It must not
+    # initialize, migrate, rekey, lease, or create a cache entry.
+    if args.cmd == "source":
+        if not args.source_id:
+            print("store.py: error: --id is required", file=sys.stderr)
+            sys.exit(2)
+        if args.source_cmd is None:
+            try:
+                args.context = int(args.context)
+            except (TypeError, ValueError):
+                print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
+                sys.exit(2)
+        if args.source_cmd is None and not (0 <= args.context <= 20):
+            print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
+            sys.exit(2)
+        if args.source_cmd == "scan" and not args.needle:
+            print("store.py: error: --needle must not be empty", file=sys.stderr)
+            sys.exit(2)
+        try:
+            from storelib.source import is_safe_regular_path
+            if not is_safe_regular_path(STORE_PATH):
+                raise SourceRefusal("source unavailable")
+            for _suffix in ("-wal", "-shm"):
+                _sidecar = Path(str(STORE_PATH) + _suffix)
+                if os.path.lexists(_sidecar) and not is_safe_regular_path(_sidecar):
+                    raise SourceRefusal("source unavailable")
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.parent)
+            probe = sqlite3.connect(STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)
+            probe.row_factory = sqlite3.Row
+            try:
+                probe.execute("PRAGMA query_only=1")
+                result = (source_scan(probe, memory_id=args.source_id, needle=args.needle)
+                          if args.source_cmd == "scan"
+                          else source_show(probe, memory_id=args.source_id, context=args.context))
+            finally:
+                probe.close()
+        except (SourceRefusal, sqlite3.Error, OSError, ValueError) as exc:
+            print(f"[zmem] source: refused ({exc})", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         sys.exit(0)
 
     # `hygiene` inspects an operator-supplied SNAPSHOT read-only (issue #97),
