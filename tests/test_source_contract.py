@@ -128,6 +128,37 @@ class SourceContractTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertEqual(result.stderr, expected)
 
+    def test_cli_source_help_and_typed_errors_are_public_contract(self) -> None:
+        store = SCRIPTS / "store.py"
+        env = dict(os.environ, ZMEM_STORE=str(self.root / "absent.sqlite"))
+        show_help = subprocess.run(
+            [sys.executable, str(store), "source", "--help"],
+            cwd=SCRIPTS.parents[2], env=env, capture_output=True, text=True, timeout=30,
+        )
+        scan_help = subprocess.run(
+            [sys.executable, str(store), "source", "scan", "--help"],
+            cwd=SCRIPTS.parents[2], env=env, capture_output=True, text=True, timeout=30,
+        )
+        malformed = subprocess.run(
+            [sys.executable, str(store), "source", "--id", "m", "--context", "nope"],
+            cwd=SCRIPTS.parents[2], env=env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(show_help.returncode, 0)
+        self.assertIn("--id MEMORY_ID", show_help.stdout)
+        self.assertIn("memory UUID", show_help.stdout)
+        self.assertIn("--context CONTEXT", show_help.stdout)
+        self.assertIn("turns (0..20)", show_help.stdout)
+        self.assertEqual(scan_help.returncode, 0)
+        self.assertIn("--id MEMORY_ID", scan_help.stdout)
+        self.assertIn("--needle NEEDLE", scan_help.stdout)
+        self.assertIn("literal substring", scan_help.stdout)
+        self.assertEqual(malformed.returncode, 2)
+        self.assertEqual(malformed.stdout, "")
+        self.assertEqual(
+            malformed.stderr,
+            "store.py: error: --context must be between 0 and 20\n",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

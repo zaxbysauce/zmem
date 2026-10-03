@@ -1789,13 +1789,18 @@ def main():
 
     p_source = _add_parser("source", help="show verified local provenance for one memory")
     source_sub = p_source.add_subparsers(dest="source_cmd")
-    p_source.add_argument("--id", dest="source_id")
-    # Parse this ourselves so malformed values use the source command's one
-    # exact stderr line rather than argparse's usage block.
-    p_source.add_argument("--context", nargs="?", const=None, default="2")
+    # The direct and nested forms share a destination.  The direct form keeps
+    # its established early error path so `source scan --id ...` does not need
+    # a duplicate parent option before the subcommand.
+    p_source.add_argument("--id", dest="memory_id", type=str,
+                          help="memory UUID")
+    p_source.add_argument("--context", type=int, default=2,
+                          help="turns (0..20)")
     p_source_scan = source_sub.add_parser("scan", help="literal scan of the resolved source")
-    p_source_scan.add_argument("--id", dest="source_id")
-    p_source_scan.add_argument("--needle")
+    p_source_scan.add_argument("--id", dest="memory_id", type=str,
+                               required=True, help="memory UUID")
+    p_source_scan.add_argument("--needle", type=str, required=True,
+                               help="literal substring")
 
     p_recall.add_argument("--exclude", action="append", default=None,
                           help="repeatable: exclude these memory ids from the results "
@@ -2979,6 +2984,48 @@ def main():
     p_hyg.add_argument("--format", dest="format", choices=("json", "text"),
                        default="json", help="Report format")
 
+    # Source's public error contract intentionally predates its argparse
+    # metadata. Validate the source-only required values and context before
+    # argparse can emit a usage block; every other parser keeps its legacy
+    # behavior.
+    source_argv = sys.argv[1:]
+    if (source_argv and source_argv[0] == "source"
+            and "-h" not in source_argv and "--help" not in source_argv):
+        def _source_option(option: str) -> tuple[bool, str | None]:
+            for index, value in enumerate(source_argv):
+                if value == option:
+                    return True, source_argv[index + 1] if index + 1 < len(source_argv) else None
+                if value.startswith(option + "="):
+                    return True, value[len(option) + 1:]
+            return False, None
+
+        def _source_error(message: str) -> None:
+            print(f"store.py: error: {message}", file=sys.stderr)
+            sys.exit(2)
+
+        has_id, memory_id = _source_option("--id")
+        if not has_id or not memory_id or memory_id.startswith("--"):
+            _source_error("--id is required")
+        source_is_scan = any(
+            value == "scan" and (index == 0 or source_argv[index - 1] not in {
+                "--id", "--context", "--needle",
+            })
+            for index, value in enumerate(source_argv)
+        )
+        if source_is_scan:
+            has_needle, needle = _source_option("--needle")
+            if not has_needle or not needle or needle.startswith("--"):
+                _source_error("--needle must not be empty")
+        else:
+            has_context, context = _source_option("--context")
+            if has_context:
+                try:
+                    parsed_context = int(context) if context is not None else None
+                except ValueError:
+                    parsed_context = None
+                if parsed_context is None or not 0 <= parsed_context <= 20:
+                    _source_error("--context must be between 0 and 20")
+
     args = ap.parse_args()
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
@@ -3247,7 +3294,7 @@ def main():
     # Source resolution is an observation over an existing store.  It must not
     # initialize, migrate, rekey, lease, or create a cache entry.
     if args.cmd == "source":
-        if not args.source_id:
+        if not args.memory_id:
             print("store.py: error: --id is required", file=sys.stderr)
             sys.exit(2)
         if args.source_cmd is None:
@@ -3276,9 +3323,9 @@ def main():
             probe.row_factory = sqlite3.Row
             try:
                 probe.execute("PRAGMA query_only=1")
-                result = (source_scan(probe, memory_id=args.source_id, needle=args.needle)
-                          if args.source_cmd == "scan"
-                          else source_show(probe, memory_id=args.source_id, context=args.context))
+                result = (source_scan(probe, memory_id=args.memory_id, needle=args.needle)
+                           if args.source_cmd == "scan"
+                           else source_show(probe, memory_id=args.memory_id, context=args.context))
             finally:
                 probe.close()
         except (SourceRefusal, sqlite3.Error, OSError, ValueError) as exc:

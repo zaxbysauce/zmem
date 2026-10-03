@@ -159,6 +159,10 @@ expression. Malformed `--context` or scan input uses the command's single
 `store.py: error: ...` line and exit 2 contract. Resolution failures are
 visible nonzero refusals.
 
+When `HERMES_HOME` is unset, native Hermes provenance uses Hermes' own
+canonical-home resolver. JSONL remains a bounded fallback only when that
+resolved home has no canonical database.
+
 The show result has exactly these keys: `memory_id`, `namespace`, `source_ref`,
 `evidence_ids`, `source_kind`, `source_path`, `session_id`, `capture_time`,
 `turn_start`, `turn_end`, `byte_start`, `byte_end`, `context_requested`,

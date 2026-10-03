@@ -395,8 +395,10 @@ jobs:
         shell: bash
         run: python -m pip install --disable-pip-version-check "ruamel.yaml==0.18.16"
 
-      - name: Run pinned Hermes source acceptance (C6)
+      - name: Run pinned Hermes source acceptance and default-home regressions
         shell: bash
         env:
           ZMEM_TEST_HERMES_PROVIDER_ROOT: ${{ github.workspace }}/hermes-agent
-        run: python tests/fixtures/source/repro/checks.py C6 --repo-root .
+        run: |
+          python tests/fixtures/source/repro/checks.py C6 --repo-root .
+          python -m unittest -v tests/test_source_hermes_default.py

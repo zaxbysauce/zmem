@@ -241,8 +241,9 @@ contract.
 
 The resolver recognizes four source layouts: Claude transcript JSONL, Codex
 session JSONL or `MEMORY.md`, native ZCode SQLite, and native Hermes
-`SessionDB`. Hermes JSONL is an explicitly bounded fallback only when the
-canonical Hermes database is absent. File-backed records calculate offsets in
+`SessionDB`. With `HERMES_HOME` unset, Hermes resolves its canonical home;
+Hermes JSONL is an explicitly bounded fallback only when that home has no
+canonical database. File-backed records calculate offsets in
 the original UTF-8 bytes. Native Hermes and ZCode records retain stable
 source/session/message identifiers and return explicit `null` byte offsets
 when their stores do not retain the original transcript byte stream.

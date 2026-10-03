@@ -153,6 +153,28 @@ def _inside(root: Path, candidate: Path) -> bool:
         return False
 
 
+def _hermes_home() -> Path:
+    """Resolve the trusted Hermes home without inventing a platform default.
+
+    An explicit operator override remains usable when Hermes is not importable.
+    When it is unset, only Hermes itself can establish the canonical home: its
+    resolver includes platform and context-local profile selection.  Refuse
+    rather than guessing, because a guessed root cannot prove that a canonical
+    database is absent before the JSONL fallback is considered.
+    """
+    explicit = os.environ.get("HERMES_HOME", "").strip()
+    if explicit:
+        return Path(explicit)
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+    except Exception as exc:
+        raise SourceRefusal("hermes_db_unavailable") from exc
+    if not isinstance(home, Path):
+        raise SourceRefusal("hermes_db_unavailable")
+    return home
+
+
 def _configured_file(ref: str) -> tuple[Path, str]:
     if ref == "raw_memories.md" or ref.endswith(".db"):
         raise SourceRefusal("source unavailable")
@@ -170,7 +192,7 @@ def _configured_file(ref: str) -> tuple[Path, str]:
         default = Path.home() / ".codex" / "MEMORY.md"
         if is_safe_regular_path(default):
             return default, "codex_session"
-    home = Path(os.environ.get("HERMES_HOME", "").strip() or Path.home() / ".hermes")
+    home = _hermes_home()
     sessions = Path(os.environ.get("ZMEM_HERMES_SESSIONS", "").strip() or home / "sessions")
     if not os.path.lexists(home / "state.db"):
         candidate = sessions / ref
@@ -330,7 +352,7 @@ def _zcode(ref: str, anchor: sqlite3.Row, context: int) -> tuple[str, dict[str, 
 
 
 def _hermes(ref: str, anchor: sqlite3.Row, context: int) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    home = Path(os.environ.get("HERMES_HOME", "").strip() or Path.home() / ".hermes")
+    home = _hermes_home()
     db_path, session = home / "state.db", ref.rsplit("/", 1)[1]
     if anchor[2] != session or not isinstance(anchor[5], str) or not anchor[5]:
         raise SourceRefusal("hermes_db_unavailable")
