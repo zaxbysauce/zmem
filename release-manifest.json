@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "6d5a6988c7453d7cd119d26ab42c8d431ec713cb964eac208e1dafa6889c6ba6",
+  "digest": "233681fde5d96ffebdec7e455c68862846810f97f6c5272dd71a0f65a489eb43",
   "files": {
     "hermes-plugin/__init__.py": "f3a35ebbf9ddda986e3e643f956b34c1f298fac74555540e63086954b11b811b",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -87,7 +87,7 @@
     "skills/memory/scripts/storelib/false_inject.py": "21bfc993a36454b8b89a3c32c5f6d404e2663177182094209d5b96c6e34e4211",
     "skills/memory/scripts/storelib/feedback.py": "d5b432b4250ee6eec5e612e4841a1dd5e4f83215e139914b067adf573b947463",
     "skills/memory/scripts/storelib/hygiene.py": "2aa58e727c6b0a96efeaf7ad103404b2a3916771b0a21d911ce935240be3662b",
-    "skills/memory/scripts/storelib/inject.py": "4938c4047452b6327d62a6246002496635e15e0f1d22afbbfd16d3755753b906",
+    "skills/memory/scripts/storelib/inject.py": "f856c330f6e3fe76ad962ebd580eb391cfab7159c30c7c8adb0985e7cf90c973",
     "skills/memory/scripts/storelib/links.py": "687826c8ec6cb207ac5f155d5e22a4f70bbb22dca8dbcd03826f03b7fdb57c11",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
     "skills/memory/scripts/storelib/mine.py": "04f3c68a377f7d538217290f6945791b00d0b9b5d04870a11a7b14f385d3ccff",
@@ -95,7 +95,7 @@
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
     "skills/memory/scripts/storelib/ops_tokens.py": "f32a354f0359eb2354db0df080824047c9448b3ea048de9e99125afd4ad8c5de",
     "skills/memory/scripts/storelib/organize.py": "8613af7b7fd398188073103a1e10a4fcf31e339e6940313233f6c4ed00d08eed",
-    "skills/memory/scripts/storelib/pages.py": "6ff547a4e64d79793136ec02dd84102b3fc3bdac2cc688b80e65a65f2a2f889c",
+    "skills/memory/scripts/storelib/pages.py": "6fe870dd4161bd111620df205fc0d5943f82aa9f09a6aed23e88f4a8ab90bab3",
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
     "skills/memory/scripts/storelib/purge.py": "52a84f66afd5a4ca033d11e8baf2b3c388f6a8acb3f43e4a79f8ffb3a7836104",
     "skills/memory/scripts/storelib/query_ambiguity.py": "7c22244534e72977a05de600b7601a0652a471c705f29fcde27b47dcc65aa325",

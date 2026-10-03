@@ -79,7 +79,7 @@ class OrganizeIntegrationTest(unittest.TestCase):
     """Real-CLI tests. Each test owns a fresh temp store."""
 
     def test_page_source_order_is_stable(self):
-        """Page source bullets follow the shared deterministic ordering."""
+        """Organize then page refresh preserves deterministic ordering."""
         helper_spec = importlib.util.spec_from_file_location(
             "issue138_pages_organize_helper", REPO_ROOT / "tests" / "test_pages.py")
         self.assertIsNotNone(helper_spec)
@@ -88,6 +88,7 @@ class OrganizeIntegrationTest(unittest.TestCase):
         helper_spec.loader.exec_module(helper)
         old = os.environ.copy()
         root = Path(tempfile.mkdtemp(prefix="zmem-organize-page-order-"))
+        db = None
         try:
             os.environ.clear()
             os.environ.update({
@@ -100,17 +101,25 @@ class OrganizeIntegrationTest(unittest.TestCase):
             })
             db, pages = helper._seed_store(root)
             helper._copy_base_page(root)
+            sys.path.insert(0, str(SCRIPTS_DIR))
+            try:
+                organize_module = importlib.import_module("storelib.organize")
+            finally:
+                sys.path.remove(str(SCRIPTS_DIR))
+            report = organize_module.organize(db, force=True, dry_run=False)
+            self.assertFalse(report["skipped_by_cadence_gate"], report)
             helper._refresh(pages, db, root)
             first = (root / "data" / "pages" / "fixture-page" / "page.md").read_bytes()
             current = json.loads((root / "data" / "pages" / "fixture-page" / "current.json").read_text())
             self.assertEqual(current["source_ids"], sorted(current["source_ids"]))
-            # A second refresh with the same snapshot must retain both byte
-            # order and grounding order, regardless of organize's own cadence.
+            # A second explicit refresh with the same snapshot must retain both
+            # byte order and grounding order after the organize pass.
             helper._refresh(pages, db, root)
             second = (root / "data" / "pages" / "fixture-page" / "page.md").read_bytes()
             self.assertEqual(first, second)
-            db.close()
         finally:
+            if db is not None:
+                db.close()
             os.environ.clear()
             os.environ.update(old)
             shutil.rmtree(root, ignore_errors=True)

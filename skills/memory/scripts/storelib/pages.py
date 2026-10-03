@@ -94,7 +94,10 @@ def _page_dir(data_dir: str, page_id: str, *, create: bool = False) -> Path:
 
 
 def _regular(path: Path, *, required: bool = True) -> None:
-    if not path.exists():
+    # ``Path.exists`` follows links and reports False for a dangling symlink.
+    # Readers and publishers must reject that link rather than treating it as
+    # an absent artifact and later replacing or reading through it.
+    if not os.path.lexists(str(path)):
         if required:
             raise PageError("page artifact not found")
         return
@@ -242,7 +245,9 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
     """Read the bounded canonical snapshot with evidence as a hard floor."""
     from storelib.beliefs import belief_head_rows
     from storelib.evidence import evidence_ids_for_memories
-    heads = belief_head_rows(conn, query=query, namespace=namespace, limit=50, as_of=as_of)
+    heads = [head for head in belief_head_rows(
+        conn, query=query, namespace=namespace, limit=50, as_of=as_of
+    ) if head.get("head_state") == "active"]
     clauses = ["namespace=?", "superseded_at IS NULL", "(source_ref IS NULL OR source_ref NOT LIKE 'page:%')"]
     params: list[object] = [namespace]
     temporal_at = as_of or now
@@ -254,8 +259,11 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
         clauses.append("(valid_until IS NULL OR valid_until='' OR valid_until>?)")
         params.append(temporal_at)
     for tag in tags:
-        clauses.append("(',' || replace(tags, ' ', '') || ',') LIKE ?")
-        params.append("%," + tag + ",%")
+        # Tags are caller input.  Escape SQL LIKE metacharacters so a literal
+        # ``_`` or ``%`` tag cannot ground a page in an unrelated source.
+        literal_tag = tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append("(',' || replace(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'")
+        params.append("%," + literal_tag + ",%")
     sql = ("SELECT id,namespace,type,content,tags,source_ref,confidence,signal,taint,"
            "trust_score,ingestion_ts,valid_from,valid_until FROM memory WHERE " + " AND ".join(clauses))
     live = [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -306,6 +314,11 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
     live, _status, _stats = selective_inject_filter(live, with_stats=True)
     valid_head_rows: list[dict] = []
     for head in heads:
+        # Ordinary belief recall may surface a contested head with its state
+        # flag.  Curated pages are a durable derived projection, so only an
+        # active head may ground one.
+        if head.get("head_state") != "active":
+            continue
         ids = [x for x in head.get("source_ids", []) if isinstance(x, str)]
         if ids and not all(evidence.get(x) for x in ids):
             raise PageError("page belief source is missing evidence")
@@ -655,12 +668,20 @@ def _publish(directory: Path, definition: dict, current: dict, version: dict, co
     definition_bytes = _bounded_json(definition)
     current_bytes = _bounded_json(current)
     version_bytes = _bounded_json(version)
+    projection = directory / "page.md"
+    definition_path = directory / "definition.json"
+    # Validate links before taking the rollback snapshot.  ``os.replace`` is
+    # safe for a later race because it replaces the directory entry itself;
+    # this check prevents the initial read from following an attacker-planted
+    # projection or definition link.
+    _regular(projection, required=False)
+    _regular(definition_path, required=False)
     versions = directory / "versions"
     versions.mkdir(parents=True, exist_ok=True)
     stage = directory / (".staging-" + uuid.uuid4().hex)
     stage.mkdir()
-    old_projection = (directory / "page.md").read_bytes() if (directory / "page.md").exists() else None
-    old_definition = (directory / "definition.json").read_bytes() if (directory / "definition.json").exists() else None
+    old_projection = projection.read_bytes() if os.path.lexists(str(projection)) else None
+    old_definition = definition_path.read_bytes() if os.path.lexists(str(definition_path)) else None
     installed_version: Path | None = None
     committed = False
     try:
@@ -674,23 +695,25 @@ def _publish(directory: Path, definition: dict, current: dict, version: dict, co
         # Flat immutable version, projection, then pointer LAST.  A failed
         # projection write has no new pointer and is rolled back below.
         os.replace(version_temp, final_version); installed_version = final_version
-        os.replace(page_temp, directory / "page.md")
+        os.replace(page_temp, projection)
         if definition_was_missing:
-            os.replace(definition_temp, directory / "definition.json")
+            os.replace(definition_temp, definition_path)
         os.replace(current_temp, directory / "current.json")
         committed = True
     except Exception as exc:
         rollback_error = None
         try:
             if old_projection is None:
-                (directory / "page.md").unlink(missing_ok=True)
+                projection.unlink(missing_ok=True)
             else:
-                (directory / "page.md").write_bytes(old_projection)
+                # Never write through the replaced entry: stage the old bytes
+                # locally and atomically replace the entry instead.
+                os.replace(_atomic_write(stage / "rollback-page.md", old_projection), projection)
             if definition_was_missing:
                 if old_definition is None:
-                    (directory / "definition.json").unlink(missing_ok=True)
+                    definition_path.unlink(missing_ok=True)
                 else:
-                    (directory / "definition.json").write_bytes(old_definition)
+                    os.replace(_atomic_write(stage / "rollback-definition.json", old_definition), definition_path)
             if installed_version is not None:
                 installed_version.unlink(missing_ok=True)
         except Exception as rollback_exc:  # retain the valid old pointer either way
@@ -705,7 +728,8 @@ def _publish(directory: Path, definition: dict, current: dict, version: dict, co
             pass
         except OSError as exc:
             # The pointer is already durable. Residue is unreferenced and
-            # ignored by readers; a later locked refresh may remove it.
+            # ignored by readers; operator maintenance owns interrupted-stage
+            # cleanup.
             # Raising here would falsely claim the old commit survived.
             if not committed:
                 raise PageError("page staging cleanup failed") from exc
@@ -728,7 +752,7 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         directory = _page_dir(data_dir, page_id, create=True)
         directory.mkdir(parents=True, exist_ok=True)
         definition_path = directory / "definition.json"
-        definition_was_missing = not definition_path.exists()
+        definition_was_missing = not os.path.lexists(str(definition_path))
         if definition_was_missing:
             definition = {"namespace": namespace, "query": query, "tags": list(normalized_tags),
                           "generator_revision": "pages-v1", "creation_policy": "explicit"}
@@ -742,7 +766,7 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         if not definition_was_missing:
             _definition, old_version, raw = _read_committed(directory)
             base = raw.decode("utf-8")
-        elif projection_path.exists():
+        elif os.path.lexists(str(projection_path)):
             _regular(projection_path)
             base = projection_path.read_bytes().decode("utf-8")
         else:
@@ -753,21 +777,9 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         if effective_now is None:
             from storelib.schema import now_iso
             effective_now = now_iso()
-        # Pin the source collection to one managed read snapshot. The caller
-        # arrives without a transaction; rollback restores that state before
-        # invoking the adapter, then publication revalidates independently.
-        conn.execute("BEGIN")
-        try:
-            rows = _source_rows(conn, query=query, namespace=namespace, tags=normalized_tags, as_of=as_of, data_dir=data_dir, now=effective_now)
-        finally:
-            if conn.in_transaction:
-                conn.rollback()
-        if not rows:
-            raise PageError("no eligible page sources")
-        rendered, source_ids, evidence_ids, bullets = _render_refresh(rows)
-        if not source_ids or not evidence_ids:
-            raise PageError("page sources lack evidence")
-        # Source liveness is re-read under maintenance before adapter work.
+        # Pin the source collection to one managed read snapshot before adapter
+        # work.  The later publication snapshot is a separate revalidation
+        # boundary; avoid a discarded third full-namespace scan here.
         conn.execute("BEGIN")
         try:
             fresh_rows = _source_rows(conn, query=query, namespace=namespace, tags=normalized_tags, as_of=as_of, data_dir=data_dir, now=effective_now)
@@ -776,7 +788,7 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
                 conn.rollback()
         fresh_rendered, source_ids, evidence_ids, fresh_bullets = _render_refresh(fresh_rows)
         if not source_ids:
-            raise PageError("page sources changed during refresh")
+            raise PageError("no eligible page sources")
         if "refresh" not in sections:
             raise PageError("missing refresh section")
         start, end, refresh_body = sections["refresh"]
@@ -882,6 +894,54 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
             raise PageError("maintenance lock release failed") from exc
 
 
+def _page_fts_coverage(content: str, rows: list[dict[str, Any]], query: str) -> tuple[int, float | None]:
+    """Measure page eligibility with recall's exact FTS term semantics.
+
+    A page's derived text and the ordinary rows it represents form one
+    candidate for this purpose.  The transient in-memory index uses the same
+    unicode61 tokenizer, searchable columns, normalized terms, and MATCH
+    expression as ``memory_fts``.  It is never attached to or persisted in
+    the canonical store.
+    """
+    from storelib import recall as _recall
+
+    terms = _recall._normalize_query_terms(query) if query else []
+    if not terms:
+        return 0, None
+    transient: sqlite3.Connection | None = None
+    try:
+        transient = sqlite3.connect(":memory:")
+        transient.execute(
+            "CREATE VIRTUAL TABLE page_relevance_fts USING fts5("
+            "content, tags, tokenize='unicode61')"
+        )
+        transient.execute(
+            "INSERT INTO page_relevance_fts(content,tags) VALUES (?,?)",
+            (
+                " ".join([str(content or "")] + [
+                    str(row.get("content") or "") for row in rows
+                ]),
+                " ".join(str(row.get("tags") or "") for row in rows),
+            ),
+        )
+        matched = sum(
+            1 for term in terms
+            if transient.execute(
+                "SELECT 1 FROM page_relevance_fts WHERE page_relevance_fts MATCH ?",
+                (_recall._fts_expression([term]),),
+            ).fetchone() is not None
+        )
+        return matched, matched / len(terms)
+    except sqlite3.Error:
+        # Recall's lexical lane fails open to no candidates when FTS is
+        # unavailable or rejects a query expression; derived pages follow the
+        # same conservative behavior rather than broadening eligibility.
+        return 0, 0.0
+    finally:
+        if transient is not None:
+            transient.close()
+
+
 def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
                                   query: str, namespace: str, moment: str | None = None,
                                   lane: str | None = None,
@@ -959,6 +1019,15 @@ def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
             if belief_ids:
                 head_names = [sid[len("belief:"):] for sid in belief_ids]
                 belief_ph = ",".join("?" for _ in head_names)
+                active_heads = {str(row[0]) for row in conn.execute(
+                    "SELECT id FROM belief_head WHERE id IN (" + belief_ph + ") "
+                    "AND head_state='active'",
+                    head_names,
+                ).fetchall()}
+                # A derived page must stop surfacing as soon as one of its
+                # represented heads leaves the active state.
+                if active_heads != set(head_names):
+                    continue
                 for head_id, source_id, evidence_id in conn.execute(
                     "SELECT head_id,source_id,evidence_id FROM belief_head_evidence WHERE head_id IN (" + belief_ph + ")",
                     head_names).fetchall():
@@ -975,13 +1044,8 @@ def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
                     exact = False; break
             if not exact:
                 continue
-            from storelib import recall as _recall
-            terms = _recall._normalize_query_terms(query) if query else []
-            haystack = candidate["content"].lower() + " " + " ".join(
-                str(r["content"]) + " " + str(r.get("tags", "")) for r in rows).lower()
-            matched = sum(1 for term in terms if term in haystack)
-            coverage = (matched / len(terms)) if terms else None
-            if terms and not (matched >= 2 or coverage >= 1.0):
+            matched, coverage = _page_fts_coverage(candidate["content"], rows, query)
+            if coverage is not None and not (matched >= 2 or coverage >= 1.0):
                 continue
             import schema_meta
             signal_rank = {"none": 0, "agent": 1, "test": 2, "compile": 3, "lint": 4, "reviewer": 5, "user": 6}

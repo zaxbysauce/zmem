@@ -663,19 +663,26 @@ class PagePassiveSelectorTests(unittest.TestCase):
     def _seed(self, root):
         fixture = self._fixture()
         old = os.environ.copy()
-        os.environ.clear()
-        os.environ.update({
-            "ZMEM_STORE": str(root / "store.sqlite"),
-            "ZMEM_DATA": str(root / "data"),
-            "ZMEM_MODELS_DIR": str(root / "missing-models"),
-            "ZMEM_MODEL_AUTODOWNLOAD": "0",
-            "HOME": str(root / "home"),
-            "USERPROFILE": str(root / "home"),
-        })
-        db, pages = fixture._seed_store(root)
-        fixture._copy_base_page(root)
-        fixture._refresh(pages, db, root)
-        return old, db
+        db = None
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "ZMEM_STORE": str(root / "store.sqlite"),
+                "ZMEM_DATA": str(root / "data"),
+                "ZMEM_MODELS_DIR": str(root / "missing-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "HOME": str(root / "home"),
+                "USERPROFILE": str(root / "home"),
+            })
+            db, pages = fixture._seed_store(root)
+            fixture._copy_base_page(root)
+            fixture._refresh(pages, db, root)
+            return old, db
+        except Exception:
+            if db is not None:
+                db.close()
+            self._restore(old)
+            raise
 
     @staticmethod
     def _restore(old):

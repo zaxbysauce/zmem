@@ -157,6 +157,8 @@ def _row_markers(row: dict[str, Any]) -> list:
         markers.append("[UNTRUSTED WEB]")
     if row.get("contested_link"):
         markers.append("[CONTESTED LINK]")
+    if row.get("withheld_for_secret"):
+        markers.append("[WITHHELD: SECRET]")
     return markers
 
 
@@ -207,12 +209,16 @@ def fence_row_cost(row: dict[str, Any], *,
             row.get("_stale_note", "") or "",
         )
     )
-    lines = [header, "    " + (row.get("content", "") or "")]
-    if row.get("source_ref"):
+    lines = [header]
+    # Credential-withheld rows render only their marked id/type bullet.  Keep
+    # admission cost exact so a marker never becomes unbudgeted fence text.
+    if not row.get("withheld_for_secret"):
+        lines.append("    " + (row.get("content", "") or ""))
+    if not row.get("withheld_for_secret") and row.get("source_ref"):
         lines.append("    source_ref: {}".format(row["source_ref"]))
     # Page provenance is intentionally a narrow, page-only extension of the
     # common fence.  Ordinary rows retain their historical bytes.
-    if row.get("type") == "page":
+    if row.get("type") == "page" and not row.get("withheld_for_secret"):
         for key in ("version_id", "freshness_watermark", "page_checksum"):
             if row.get(key):
                 lines.append("    {}: {}".format(key, row[key]))
@@ -220,10 +226,10 @@ def fence_row_cost(row: dict[str, Any], *,
             values = row.get(key)
             if isinstance(values, (list, tuple)) and values:
                 lines.append("    {}: {}".format(key, ", ".join(map(str, values))))
-    if row.get("tags"):
+    if not row.get("withheld_for_secret") and row.get("tags"):
         lines.append("    tags: {}".format(row["tags"]))
     ents = row.get("entities") or []
-    if ents:
+    if not row.get("withheld_for_secret") and ents:
         lines.append(
             "    entities: " + ", ".join(
                 e.get("name", "?") for e in ents[:3]
@@ -1186,17 +1192,99 @@ def select_and_budget_for_injection(
             page_rows = list(page_rows_pre)
             candidate_ids = _ordered_unique(candidate_ids + page_candidate_ids_pre)
             if page_rows:
-                # Recall already budgeted its ordinary candidates. Reapply the
-                # same shared budget to the combined set so page provenance
-                # pays for its actual fenced bytes.
-                combined = list(rows) + page_rows
-                rows, _used, _dropped, _budget_stats = apply_token_budget(
-                    combined, budget, with_stats=True, legacy_injection_wire=True)
-                parsed["budget_dropped"] = int(parsed.get("budget_dropped", 0) or 0) + _dropped
+                # Recall retained its canonical pool with a widened budget so
+                # the final combined pass is the only admission decision.
+                # First let pages compete without rows they represent.  If a
+                # page does not survive (including credential withholding),
+                # restore its canonical rows and re-admit that fallback pool.
+                ordinary_rows = list(rows)
+                page_secret_markers = []
+                safe_page_rows = []
+                for row in page_rows:
+                    if (row.get("withheld_for_secret")
+                            or recall_module._classify_credential(row)):
+                        # Keep the canonical id/type-only credential marker in
+                        # the envelope, admit its exact fenced cost, and never
+                        # let it suppress its represented canonical sources.
+                        page_secret_markers.append({
+                            "id": row.get("id", ""),
+                            "type": row.get("type", ""),
+                            "confidence": row.get("confidence", 0.0),
+                            "signal": row.get("signal", "none"),
+                            "namespace": row.get("namespace", ""),
+                            "content": "",
+                            "withheld_for_secret": True,
+                        })
+                    else:
+                        safe_page_rows.append(row)
+                page_rows = safe_page_rows
+                # Every repeat uses the original page object, never a row
+                # returned from an earlier admission pass.  That matters if a
+                # page ever becomes a protected type: a prior clipped copy
+                # must not become artificially cheap on the next pass.
+                pages_by_id = {
+                    str(row["id"]): row for row in page_rows
+                    if isinstance(row.get("id"), str)
+                }
+                page_ids = _ordered_unique([
+                    str(row["id"]) for row in page_rows
+                    if isinstance(row.get("id"), str)
+                ])
+
+                def admit_with_pages(active_page_ids):
+                    represented = {
+                        str(source_id)
+                        for page_id in active_page_ids
+                        for source_id in (pages_by_id[page_id].get("represented_ids")
+                                          or pages_by_id[page_id].get("source_ids") or [])
+                        if isinstance(source_id, str)
+                    }
+                    pool = [row for row in ordinary_rows
+                            if row.get("id") not in represented]
+                    pool.extend(pages_by_id[page_id] for page_id in active_page_ids)
+                    # Markers are id/type-only rows, but they still consume
+                    # their exact final-fence cost.  They represent no source
+                    # and therefore never participate in suppression.
+                    pool.extend(page_secret_markers)
+                    admitted, used, dropped, stats = apply_token_budget(
+                        pool, budget, with_stats=True, legacy_injection_wire=True)
+                    survivors = _ordered_unique([
+                        str(row["id"]) for row in admitted
+                        if row.get("type") == "page"
+                        and isinstance(row.get("id"), str)
+                        and str(row["id"]) in pages_by_id
+                    ])
+                    return admitted, used, dropped, stats, survivors
+
+                # Initial admission decides the only page IDs eligible for
+                # later passes.  A rejected page is never reintroduced.
+                rows, _used, _dropped, _budget_stats, active_page_ids = admit_with_pages(page_ids)
+                # Recompute from original canonical rows plus the surviving
+                # page set until it is stable.  Each non-stable pass removes at
+                # least one ID, so this is bounded by eligible pages + one.
+                for _pass in range(len(active_page_ids) + 1):
+                    if not active_page_ids:
+                        rows, _used, _dropped, _budget_stats, _ignored = admit_with_pages([])
+                        break
+                    rows, _used, _dropped, _budget_stats, survivors = admit_with_pages(active_page_ids)
+                    if survivors == active_page_ids:
+                        break
+                    active_page_ids = survivors
+                else:  # defensive: monotonicity above makes this unreachable
+                    rows, _used, _dropped, _budget_stats, _ignored = admit_with_pages([])
+                    active_page_ids = []
+                # These fields describe the final combined admission, rather
+                # than a preliminary widened recall pass.
+                omitted_pages = len(page_ids) - len(active_page_ids)
+                if omitted_pages:
+                    _budget_stats = dict(_budget_stats)
+                    _budget_stats["dropped"] = int(_budget_stats.get("dropped", 0) or 0) + omitted_pages
+                    _dropped = _budget_stats["dropped"]
+                parsed["budget_dropped"] = _dropped
                 parsed["budget_admission"] = _budget_stats["admission_used"]
-                parsed["budget_truncated"] = int(parsed.get("budget_truncated", 0) or 0) + _budget_stats["truncated"]
-                parsed["budget_dropped_protected"] = int(parsed.get("budget_dropped_protected", 0) or 0) + _budget_stats["dropped_protected"]
-                parsed["tokens_used"] = _budget_stats["admission_used"]
+                parsed["budget_truncated"] = _budget_stats["truncated"]
+                parsed["budget_dropped_protected"] = _budget_stats["dropped_protected"]
+                parsed["budget_note"] = budget_note(_budget_stats)
         except Exception:
             # Page discovery is derived-data enrichment. Existing canonical
             # injection must retain its fail-safe behavior if a page directory
@@ -1240,9 +1328,19 @@ def select_and_budget_for_injection(
                 delivered_page_sources.update(row.get("represented_ids") or row.get("source_ids") or [])
         if delivered_page_sources:
             rows = [row for row in rows if row.get("type") == "page" or row.get("id") not in delivered_page_sources]
+        if page_rows_pre:
+            # Match recall.py's envelope metric: row content only.  The
+            # separate ``budget_admission`` field carries full fence costs.
+            parsed["tokens_used"] = sum(
+                estimate_tokens(row.get("content", "") or "")
+                for row in rows if isinstance(row, dict)
+            )
         secret_withheld_count = len(withheld_rows)
         excluded = [rid for rid in exclusions if rid in candidate_ids]
-        if not rows and candidate_ids and excluded and set(candidate_ids) <= set(excluded):
+        if any(row.get("type") == "page" and not row.get("withheld_for_secret")
+               for row in rows if isinstance(row, dict)):
+            reason = "injected"
+        elif not rows and candidate_ids and excluded and set(candidate_ids) <= set(excluded):
             reason = "already-delivered"
         else:
             reason = parsed.get("reason") if isinstance(parsed.get("reason"), str) else "empty-pool"
@@ -1259,8 +1357,6 @@ def select_and_budget_for_injection(
             rendered = recall_module._format_fenced_recall(
                 rows, header=header, budget_note=parsed.get("budget_note"),
                 legacy_injection_wire=True)
-            if page_rows_pre:
-                parsed["tokens_used"] = estimate_tokens(rendered)
         present = ledger.rows_present_in(rows, rendered)
         # Expansion rows are rendered but deliberately NOT bumped —
         # popularity rewards query-MATCHED rows only (recall.py bump law).

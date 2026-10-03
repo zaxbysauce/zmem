@@ -76,8 +76,12 @@ PAGE_BASE = (
 ).encode("utf-8")
 
 
-def _bullet_id(source_id: str, evidence_id: str) -> str:
-    return hashlib.sha256(f"{source_id}\0{evidence_id}".encode()).hexdigest()[:16]
+def _bullet_id(markdown: str, citations: list[str]) -> str:
+    """Match the adapter append/replace bullet identity contract."""
+    return hashlib.sha256(_json_bytes({
+        "markdown": markdown,
+        "citations": sorted(citations),
+    })).hexdigest()[:16]
 
 
 def patches() -> dict:
@@ -100,7 +104,7 @@ def patches() -> dict:
                     "op": "retract_bullet",
                     "section_id": "refresh",
                     "bullet_id": _bullet_id(
-                        "00000000-0000-4000-8000-000000000503", "ev-503"),
+                        "Patched bullet", ["ev-503"]),
                     "citations": ["ev-503"],
                 },
             ]
@@ -136,7 +140,7 @@ def expected_refresh() -> dict:
         "evidence_ids": evidence_ids,
         "freshness_watermark": PAGE_WATERMARK,
         "page_checksum": hashlib.sha256(PAGE_BASE).hexdigest(),
-        "retracted_source_ids": [rows[-1]["id"]],
+        "retracted_source_ids": [],
         "source_ids": source_ids,
         "version_id": "v000001",
     }

@@ -58,16 +58,39 @@ class PageCoreEdgeTests(unittest.TestCase):
                 self._close(tmp, env, db)
 
     def test_swapped_or_dangling_evidence_endpoint_withholds_page(self):
-        for sql, value in (
-            ("DELETE FROM memory_evidence WHERE memory_id=? AND evidence_id=?", fixture.SOURCE_IDS[1]),
-            ("DELETE FROM evidence WHERE id=?", "ev-502"),
+        for sql, params in (
+            ("DELETE FROM memory_evidence WHERE memory_id=? AND evidence_id=?",
+             (fixture.SOURCE_IDS[1], "ev-502")),
+            ("DELETE FROM evidence WHERE id=?", ("ev-502",)),
         ):
             tmp, env, root, db, pages = self._prepared()
             try:
-                db.execute(sql, (value, "ev-502") if "memory_evidence" in sql else (value,)); db.commit()
+                changed = db.execute(sql, params).rowcount
+                self.assertEqual(changed, 1)
+                db.commit()
                 self.assertEqual(self._candidate(pages, db, root), [])
             finally:
                 self._close(tmp, env, db)
+
+    def test_swapped_live_evidence_endpoint_withholds_page(self):
+        """Changing both live grounding edges must invalidate the old page."""
+        tmp, env, root, db, pages = self._prepared()
+        try:
+            changed_memory = db.execute(
+                "UPDATE memory_evidence SET evidence_id=? "
+                "WHERE memory_id=? AND evidence_id=?",
+                ("ev-503", fixture.SOURCE_IDS[1], "ev-502"),
+            ).rowcount
+            changed_head = db.execute(
+                "UPDATE belief_head_evidence SET evidence_id=? "
+                "WHERE source_id=? AND evidence_id=?",
+                ("ev-503", fixture.SOURCE_IDS[1], "ev-502"),
+            ).rowcount
+            self.assertEqual((changed_memory, changed_head), (1, 1))
+            db.commit()
+            self.assertEqual(self._candidate(pages, db, root), [])
+        finally:
+            self._close(tmp, env, db)
 
 
 if __name__ == "__main__":
