@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _load_q01():
@@ -80,6 +81,31 @@ class PagesPurgeFeedback(_Q01._PurgeBase):
         self.assertEqual(purge.returncode, 4, purge.stderr)
         self.assertEqual(outside_file.read_bytes(), before)
         self.assertEqual(self.qone("SELECT COUNT(*) FROM memory WHERE id=?", (target,)), 1)
+
+    def test_unreadable_nested_page_directory_refuses_scan(self):
+        # Patch the directory enumeration itself, rather than file reads: the
+        # old Path.rglob implementation swallowed this exact traversal error.
+        scripts = str(_Q01.SCRIPTS_DIR)
+        sys.path.insert(0, scripts)
+        try:
+            from storelib import purge  # type: ignore
+        finally:
+            sys.path.remove(scripts)
+        pages = self._pages_root()
+        blocked = pages / "unreadable-nested"
+        blocked.mkdir()
+        real_scandir = purge.os.scandir
+        blocked_scans = []
+
+        def deny_nested(path):
+            if Path(path) == blocked:
+                blocked_scans.append(Path(path))
+                raise PermissionError("simulated nested directory denial")
+            return real_scandir(path)
+
+        with patch.object(purge.os, "scandir", side_effect=deny_nested):
+            self.assertFalse(purge._scan_page_artifacts(pages, []))
+        self.assertEqual(blocked_scans, [blocked])
 
     def test_escaped_history_json_residue_refuses_without_projection_or_plaintext(self):
         # The only derived token contains quotes and a backslash. JSON escapes

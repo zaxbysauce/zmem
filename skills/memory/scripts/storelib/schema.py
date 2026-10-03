@@ -314,8 +314,29 @@ def _schema_compat(store_version: int, path) -> str:
 _schema_compat._warned = False
 
 
+_PAGE_REFRESH_REQUIRED_COLUMNS = {
+    # Pages revalidate canonical memory evidence and virtual belief heads on
+    # every refresh.  Evidence arrived with v14, while belief heads are an
+    # additive side schema that can be absent from a store whose meta marker is
+    # otherwise current.  A read-only refresh cannot repair either condition.
+    "evidence": {"id"},
+    "memory_evidence": {"memory_id", "evidence_id"},
+    "belief_head": {
+        "id", "namespace", "topic_identity", "content", "head_state",
+        "head_source_id", "support_count", "refresh_watermark",
+        "generator_revision", "confidence", "signal", "taint",
+        "trust_score",
+    },
+    "belief_head_source": {
+        "head_id", "source_id", "role", "source_ingestion_ts",
+        "source_checksum",
+    },
+    "belief_head_evidence": {"head_id", "source_id", "evidence_id"},
+}
+
+
 def assert_readonly_compatible(conn: sqlite3.Connection) -> None:
-    """Check an already-open read-only connection without migrating it."""
+    """Check an already-open page-refresh connection without migrating it."""
     try:
         row = conn.execute("SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)).fetchone()
     except sqlite3.Error as exc:
@@ -327,6 +348,21 @@ def assert_readonly_compatible(conn: sqlite3.Connection) -> None:
     except (TypeError, ValueError) as exc:
         raise RuntimeError("zmem: page refresh store has invalid schema_version") from exc
     _schema_compat(version, "page refresh store")
+    if version < 14:
+        raise RuntimeError("zmem: page refresh requires schema_version 14 or newer")
+    try:
+        for table, required_columns in _PAGE_REFRESH_REQUIRED_COLUMNS.items():
+            columns = {str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(%s)" % table
+            )}
+            if not required_columns.issubset(columns):
+                raise RuntimeError(
+                    "zmem: page refresh requires complete evidence and belief tables"
+                )
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            "zmem: page refresh requires complete evidence and belief tables"
+        ) from exc
 
 
 def _commit(conn: sqlite3.Connection) -> None:
@@ -538,6 +574,30 @@ MAINTENANCE_WAIT_SECONDS = _env_float("ZMEM_MAINTENANCE_WAIT_SECONDS", 5.0)
 
 MAINTENANCE_POLL_SECONDS = _env_float("ZMEM_MAINTENANCE_POLL_SECONDS", 0.05)
 
+MAINTENANCE_GRACE_DEFAULT_SECONDS = 10.0
+
+
+def _clamped_maintenance_grace(raw: float) -> float:
+    """Clamp the ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS knob (issue #262).
+
+    The grace window must never be weakenable from the environment below what
+    a live acquirer's create-then-token-write gap can produce: _env_float
+    happily parses "nan"/"inf" (and nan fails both < and > comparisons), so
+    the gate is `not isfinite or <= 0` FIRST — those are treated as unset —
+    and only then the floor (1.0 s) and ceiling apply. The ceiling itself is
+    floored at 1.0 s (`max(STALE, 1.0)`) so a sub-second
+    ZMEM_MAINTENANCE_LOCK_STALE_SECONDS can never drag the grace window below
+    the documented 1 s floor via the min() that runs after the floor.
+    """
+    if not math.isfinite(raw) or raw <= 0.0:
+        return MAINTENANCE_GRACE_DEFAULT_SECONDS
+    return min(max(raw, 1.0), max(MAINTENANCE_LOCK_STALE_SECONDS, 1.0))
+
+
+MAINTENANCE_LOCK_GRACE_SECONDS = _clamped_maintenance_grace(
+    _env_float("ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS", MAINTENANCE_GRACE_DEFAULT_SECONDS)
+)
+
 WRITER_LEASE_STALE_SECONDS = _env_float("ZMEM_WRITER_LEASE_STALE_SECONDS", 300.0)
 
 
@@ -666,17 +726,89 @@ def _release_named_lock(name: str, token: str | None) -> None:
         return
     _host.release_lock(_lock_path(name), token)
 
+def _inspect_maintenance_phantom(path: Path) -> tuple[bool, str]:
+    """Classify the maintenance lock at `path` without touching it (issue #262).
+
+    Returns ``(is_phantom, expected_token)``. ``expected_token`` is the EXACT
+    stripped content the classification observed — break_phantom_lock must
+    confirm that same content and never a re-read, because a second read could
+    observe a live successor's token and unlink its lock. Only two shapes are
+    PROVABLY a phantom: a parsed holder whose PID no longer exists, and a
+    stripped-empty file older than MAINTENANCE_LOCK_GRACE_SECONDS (past any
+    live acquirer's create-then-token-write window). Everything else — a live
+    or untestable holder, a vanished file, and non-empty unparseable content
+    (foreign artifacts, which a content-match break could not remove anyway)
+    — is ``(False, "")`` so the caller keeps today's poll-then-refuse
+    behavior; those files intentionally retain the 1800 s stale window.
+    """
+    if _host is None:
+        return (False, "")
+    holder = _host.read_lock_holder_pid(path)
+    if holder is None:
+        return (False, "")
+    token, pid = holder
+    if token == "":
+        try:
+            age = time.time() - os.stat(str(path)).st_mtime
+        except OSError:
+            return (False, "")
+        if age > MAINTENANCE_LOCK_GRACE_SECONDS:
+            return (True, "")
+        return (False, "")
+    if _host.process_alive(pid) is False:
+        return (True, token)
+    return (False, "")
+
+
+def _acquire_maintenance_lock_with_liveness() -> str | None:
+    """``_strict_acquire_lock("maintenance", ...)`` plus holder liveness
+    (issue #262). When the non-blocking acquire fails, classify the lock; a
+    PROVABLY dead holder's phantom is broken (identity-checked) and the
+    acquire retried once.
+
+    Every maintenance-lock consumer routes through here — the every-command
+    probe (_wait_for_maintenance_clear), restore's ladder (backup.py), and
+    purge's ladder (purge.py) — so None uniformly means "a live holder exists,
+    or liveness could not prove otherwise", never "a phantom is squatting".
+    Each consumer's refusal message, exit code, and downstream ladder are
+    byte-identical to before; only the false-positive class is gone.
+    Residual: if the break claim is contended at that instant, None comes
+    back and the caller refuses as before; a re-run succeeds.
+    """
+    path = _lock_path("maintenance")
+    token = _strict_acquire_lock(
+        "maintenance",
+        MAINTENANCE_LOCK_STALE_SECONDS,
+        wait_seconds=0.0,
+    )
+    if token is not None:
+        return token
+    is_phantom, expected = _inspect_maintenance_phantom(path)
+    if not is_phantom or _host is None:
+        return None
+    if not _host.break_phantom_lock(path, expected, MAINTENANCE_LOCK_GRACE_SECONDS):
+        return None
+    return _strict_acquire_lock(
+        "maintenance",
+        MAINTENANCE_LOCK_STALE_SECONDS,
+        wait_seconds=0.0,
+    )
+
+
 def _wait_for_maintenance_clear(op: str) -> None:
-    """Block briefly while restore owns maintenance, then fail clearly."""
+    """Block briefly while restore owns maintenance, then fail clearly.
+
+    The probe classifies the lock by holder liveness (issue #262): a lock
+    whose holder provably no longer exists — a killed process's token, or an
+    empty file past the grace window — is broken and the acquire retried, so
+    a dead holder can no longer park every command for the 1800 s stale
+    window. A genuinely live holder behaves exactly as before.
+    """
     if _host is None:
         return
     deadline = time.time() + MAINTENANCE_WAIT_SECONDS
     while True:
-        token = _strict_acquire_lock(
-            "maintenance",
-            MAINTENANCE_LOCK_STALE_SECONDS,
-            wait_seconds=0.0,
-        )
+        token = _acquire_maintenance_lock_with_liveness()
         if token is not None:
             _release_named_lock("maintenance", token)
             return

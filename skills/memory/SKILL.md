@@ -212,23 +212,30 @@ canonical memory and the last committed page unchanged.
 
 Passive page verification uses a finite cost policy. Metadata discovery may
 scale with the page directory, but expensive source/evidence verification is
-limited to the 50 namespace-matching committed pages with the greatest
+limited to the 50 namespace-eligible committed pages with the greatest
 canonical source snapshot watermark (maximum source `ingestion_ts` plus
-snapshot hash), ordered descending and then by page ID ascending. A 51st page
-is deterministically withheld. It re-enters only when a later refresh advances
-its canonical source snapshot watermark sufficiently; refreshing an unchanged
-snapshot preserves its watermark and may leave it withheld. Pages from another
-namespace cannot displace an eligible page. This is a selection bound, not a
-universal filesystem latency guarantee.
+snapshot hash), ordered descending and then by page ID ascending. The eligible
+set is the requested namespace plus `user:global`, and both share this one
+50-page cap; a newer global page can therefore displace a page from the
+requested namespace. A 51st eligible page is deterministically withheld. It
+re-enters only when a later refresh advances its canonical source snapshot
+watermark sufficiently; refreshing an unchanged snapshot preserves its
+watermark and may leave it withheld. Foreign namespaces remain outside the
+eligible set. This is a selection bound, not a universal filesystem latency
+guarantee.
 
 Publication stages into a nonce directory and replaces `current.json` last.
-Readers use only the valid pointer, so interrupted staging or an unreferenced
-version is residue for operator maintenance; there is no automatic garbage
-collector. First-publication recovery takes a fresh authority snapshot and
-preserves immutable history. Cleanup removes a whole inspected artifact and
-retries the operation; it never deletes an individual historical version as a
-repair. Directory fsync is used where supported, with explicit Windows
-directory durability limits and no universal crash-atomicity claim.
+Default and passive readers use only the valid pointer, so interrupted staging
+or an unreferenced version is residue for operator maintenance. An explicit
+`page read --version` selects and validates the requested version file directly;
+it can read a valid unreferenced version left by interrupted publication and
+does not prove that the version is the committed current pointer. There is no
+automatic garbage collector. First-publication recovery takes a fresh
+authority snapshot and preserves immutable history. Cleanup removes a whole
+inspected artifact and retries the operation; it never deletes an individual
+historical version as a repair. Directory fsync is used where supported, with
+explicit Windows directory durability limits and no universal crash-atomicity
+claim.
 
 Version-2 pages privately bind each represented source to its UTF-8 content
 hash. The public shapes remain stable: `page_read` exposes the existing version
@@ -245,8 +252,14 @@ against the whole pages artifact directory. An existing needle, unsafe path,
 or unscannable artifact fails closed before the row-deletion transaction. The
 operator inspects and removes the whole affected page or staging artifact,
 then retries; historical page versions are never individually deleted as
-cleanup. Passive credential withholding controls delivery only; it does not
-promise encryption or redaction of page content at rest.
+cleanup. When page artifacts exist, the preflight intentionally snapshots the
+full live SQLite database into an in-memory connection, reapplies the pending
+purge there, and derives needles from the exact post-purge survivor set. This
+privacy check has memory and latency that scale with the store; no performance
+bound is promised. If the snapshot or artifact scan cannot complete, purge
+refuses before live row deletion. Passive credential withholding controls
+delivery only; it does not promise encryption or redaction of page content at
+rest.
 
 The current observation gate is recorded as `reject`, so page metadata omits
 `runbook` and the `ALLOWED_TYPES` vocabulary remains unchanged.

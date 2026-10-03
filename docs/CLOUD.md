@@ -950,25 +950,30 @@ does not expose `runbook` and the `ALLOWED_TYPES` vocabulary is unchanged.
 
 Passive verification has a finite cost policy. Metadata discovery may enumerate
 pages, but expensive source/evidence verification is limited to the 50
-namespace-matching committed pages with the greatest canonical source snapshot
+namespace-eligible committed pages with the greatest canonical source snapshot
 watermark (maximum source `ingestion_ts` plus snapshot hash), ordered
-descending and then by page ID ascending. A 51st page is deterministically
-withheld. It re-enters only when a later refresh advances its canonical source
-snapshot watermark sufficiently; refreshing an unchanged snapshot preserves
-its watermark and may leave it withheld. A foreign namespace cannot displace
-an eligible page. This policy documents the bound without promising a
-universal filesystem latency.
+descending and then by page ID ascending. The eligible set is the requested
+namespace plus `user:global`, and both share this one 50-page cap; a newer
+global page can therefore displace a page from the requested namespace. A 51st
+eligible page is deterministically withheld. It re-enters only when a later
+refresh advances its canonical source snapshot watermark sufficiently;
+refreshing an unchanged snapshot preserves its watermark and may leave it
+withheld. A foreign namespace remains outside the eligible set. This policy
+documents the bound without promising a universal filesystem latency.
 
 Publication uses a temporary nonce staging directory and installs the
 immutable version and projection before replacing `current.json` last. An
 ordinary precommit failure restores the prior projection and removes the just-
 installed uncommitted version while leaving prior immutable history untouched.
-A process crash can leave staging or unreferenced version
-residue; readers ignore anything not named by the valid current pointer. There
-is no automatic garbage collector: operator maintenance removes a whole
-staging or page artifact only after inspection, then retries the operation. A
-first publication recovery takes a fresh authority snapshot and preserves any
-existing immutable versions. No individual version is deleted as a repair.
+A process crash can leave staging or unreferenced version residue. Default and
+passive readers ignore anything not named by the valid current pointer, while
+an explicit `page read --version` selects and validates the requested version
+file directly; it can read valid unreferenced residue and does not prove that
+the version is the committed current pointer. There is no automatic garbage
+collector: operator maintenance removes a whole staging or page artifact only
+after inspection, then retries the operation. A first publication recovery
+takes a fresh authority snapshot and preserves any existing immutable
+versions. No individual version is deleted as a repair.
 If filesystem rollback itself fails, refresh reports an explicit refusal and
 the last valid pointer remains authoritative. Directory fsync is used where
 the platform supports it; Windows directory durability limits remain explicit,
@@ -992,5 +997,11 @@ against the whole pages artifact directory. An existing needle, unsafe path,
 or unscannable artifact fails closed before the row-deletion transaction. The
 operator inspects and removes the whole affected page or staging artifact,
 then retries; historical page versions are never individually deleted as
-cleanup. Passive credential withholding is a delivery decision and does not
-claim at-rest encryption or redaction of the stored page content.
+cleanup. When page artifacts exist, the preflight intentionally snapshots the
+full live SQLite database into an in-memory connection, reapplies the pending
+purge there, and derives needles from the exact post-purge survivor set. This
+privacy check has memory and latency that scale with the store; no performance
+bound is promised. If the snapshot or artifact scan cannot complete, purge
+refuses before live row deletion. Passive credential withholding is a delivery
+decision and does not claim at-rest encryption or redaction of the stored page
+content.

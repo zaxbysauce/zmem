@@ -290,6 +290,14 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
         params.append(temporal_at)
         clauses.append("(valid_until IS NULL OR valid_until='' OR valid_until>?)")
         params.append(temporal_at)
+    if tags:
+        # This is deliberately an overinclusive, bound-parameter prefilter.
+        # The literal parser below remains authoritative for comma boundaries,
+        # trim syntax, case, and internal spaces; `instr` only avoids loading
+        # rows that cannot possibly carry each requested literal.
+        for tag in tags:
+            clauses.append("instr(COALESCE(tags, ''), ?) > 0")
+            params.append(tag)
     sql = ("SELECT id,namespace,type,content,tags,source_ref,confidence,signal,taint,"
            "trust_score,ingestion_ts,valid_from,valid_until FROM memory WHERE " + " AND ".join(clauses))
     live = [dict(r) for r in conn.execute(sql, params).fetchall()]

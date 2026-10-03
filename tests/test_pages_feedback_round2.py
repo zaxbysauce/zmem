@@ -201,6 +201,84 @@ class Round2PagesFeedback(unittest.TestCase):
             self.assertIn(source, ids("under_score"))
             self.assertNotIn(source, ids("underXscore"))
 
+    def test_tag_filter_prefilters_sql_candidates_before_literal_parsing(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-pages-r2-tag-prefilter-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = Path(tmp)
+        with _H._isolated_env(root):
+            db, pages = self._seed(root)
+            source = "00000000-0000-4000-8000-000000000502"
+            db.execute("UPDATE memory SET tags='noncandidate'")
+            db.execute("UPDATE memory SET tags='candidate tag' WHERE id=?", (source,))
+            db.commit()
+            real_parser = pages._literal_tags
+            with patch.object(pages, "_literal_tags", wraps=real_parser) as parser:
+                rows = pages._source_rows(
+                    db, query="fixture topic", namespace=_H.NAMESPACE,
+                    tags=("candidate tag",), as_of=None,
+                    data_dir=str(root / "data"), now=_H.NOW,
+                )
+            self.assertIn(source, {row["id"] for row in rows})
+            self.assertEqual(
+                {row["id"] for row in rows if not row["id"].startswith("belief:")},
+                {source},
+            )
+            self.assertEqual(
+                parser.call_count, 1,
+                "only SQL candidate rows should reach exact literal parsing",
+            )
+
+    def test_refresh_refuses_v13_before_page_or_adapter_side_effects(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-pages-r2-v13-refresh-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = Path(tmp)
+        with _H._isolated_env(root):
+            db, pages = self._seed(root)
+            # Match the historically reachable v13 surface: the evidence
+            # tables did not yet exist, although a current reader would accept
+            # the old version marker before this guard.
+            db.execute("DROP TABLE memory_evidence")
+            db.execute("DROP TABLE episode_evidence")
+            db.execute("DROP TABLE evidence")
+            db.execute("UPDATE meta SET value='13' WHERE key='schema_version'")
+            db.commit()
+            adapter_called = False
+
+            def adapter(_payload):
+                nonlocal adapter_called
+                adapter_called = True
+                return {"operations": []}
+
+            with self.assertRaisesRegex(pages.PageError, "page store schema is incompatible"):
+                pages.page_refresh(
+                    db, data_dir=str(root / "data"), page_id=_H.PAGE_ID,
+                    query="fixture topic", namespace=_H.NAMESPACE,
+                    llm_local=True, adapter=adapter,
+                )
+            self.assertFalse(adapter_called)
+            self.assertFalse((root / "data" / "pages" / _H.PAGE_ID).exists())
+            self.assertFalse(db.in_transaction)
+
+    def test_refresh_refuses_current_marker_without_belief_side_schema(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-pages-r2-incomplete-refresh-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = Path(tmp)
+        with _H._isolated_env(root):
+            db, pages = self._seed(root)
+            # belief heads are an additive side schema, independent of the
+            # v14 evidence marker, so version alone cannot prove refresh-safe.
+            db.execute("DROP TABLE belief_head_evidence")
+            db.execute("DROP TABLE belief_head_source")
+            db.execute("DROP TABLE belief_head")
+            db.commit()
+            with self.assertRaisesRegex(pages.PageError, "page store schema is incompatible"):
+                pages.page_refresh(
+                    db, data_dir=str(root / "data"), page_id=_H.PAGE_ID,
+                    query="fixture topic", namespace=_H.NAMESPACE,
+                )
+            self.assertFalse((root / "data" / "pages" / _H.PAGE_ID).exists())
+            self.assertFalse(db.in_transaction)
+
     def test_unmatched_tag_cannot_publish_a_synthetic_belief_head(self):
         tmp = tempfile.mkdtemp(prefix="zmem-pages-r2-head-tags-")
         self.addCleanup(shutil.rmtree, tmp, True)

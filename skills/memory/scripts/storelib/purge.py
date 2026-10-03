@@ -39,10 +39,10 @@ from typing import Any
 
 from storelib.schema import (
     STORE_PATH,
-    MAINTENANCE_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_POLL_SECONDS,
     SCHEMA_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_WAIT_SECONDS,
+    _acquire_maintenance_lock_with_liveness,
     _cleanup_stale_writer_leases,
     _normalize_content,
     _load_vec,
@@ -593,17 +593,10 @@ def _needles(conn: sqlite3.Connection, applied: dict[str, Any]) -> list[str]:
 def _scan_page_artifacts(pages_root: Path, needles: list[str]) -> bool:
     """Return True only when every page artifact is safe and needle-free."""
     def reparse(path: Path) -> bool:
-        try:
-            attrs = path.stat(follow_symlinks=False).st_file_attributes
-        except (OSError, AttributeError):
-            attrs = 0
-        return path.is_symlink() or bool(attrs & 0x400)
-    if reparse(pages_root.parent):
-        return False
-    if not pages_root.exists():
-        return not os.path.lexists(str(pages_root))
-    if reparse(pages_root) or not pages_root.is_dir():
-        return False
+        attrs = getattr(os.stat(path, follow_symlinks=False),
+                        "st_file_attributes", 0)
+        return os.path.islink(path) or bool(attrs & 0x400)
+
     folded_needles = [_ascii_fold(needle) for needle in needles]
 
     def contains_semantic_needle(value: object) -> bool:
@@ -616,32 +609,58 @@ def _scan_page_artifacts(pages_root: Path, needles: list[str]) -> bool:
         if isinstance(value, list):
             return any(contains_semantic_needle(item) for item in value)
         return False
-    try:
-        for path in pages_root.rglob("*"):
-            if reparse(path):
-                return False
-            if path.is_dir():
-                continue
-            if not path.is_file():
-                return False
-            raw_data = path.read_bytes()
-            data = raw_data.lower()
-            if any(needle.encode("utf-8").lower() in data for needle in needles):
-                return False
-            # Immutable history stores page text in compact JSON, where quotes,
-            # slashes and newlines are escaped. Parse only in-root regular JSON
-            # artifacts and scan string values so encoded copies cannot evade
-            # the raw byte check; malformed JSON is unsafe and refuses purge.
-            if path.suffix.lower() == ".json":
-                try:
-                    decoded = json.loads(raw_data.decode("utf-8"))
-                    if contains_semantic_needle(decoded):
-                        return False
-                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+
+    def scan_file(path: Path) -> bool:
+        raw_data = path.read_bytes()
+        data = raw_data.lower()
+        if any(needle.encode("utf-8").lower() in data for needle in needles):
+            return False
+        # Immutable history stores page text in compact JSON, where quotes,
+        # slashes and newlines are escaped. Parse only in-root regular JSON
+        # artifacts and scan string values so encoded copies cannot evade the
+        # raw byte check; malformed JSON is unsafe and refuses purge.
+        if path.suffix.lower() == ".json":
+            try:
+                decoded = json.loads(raw_data.decode("utf-8"))
+                if contains_semantic_needle(decoded):
                     return False
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                return False
+        return True
+
+    def scan_directory(directory: Path) -> bool:
+        # Path.rglob deliberately suppresses child traversal errors.  Each
+        # directory scan here is explicit and non-following, so a denied or
+        # raced subtree is a preflight refusal rather than an omitted artifact.
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if reparse(path):
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    if not scan_directory(path):
+                        return False
+                elif entry.is_file(follow_symlinks=False):
+                    if not scan_file(path):
+                        return False
+                else:
+                    return False
+        return True
+
+    try:
+        if reparse(pages_root.parent):
+            return False
+        try:
+            os.stat(pages_root, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        if reparse(pages_root):
+            return False
+        if not pages_root.is_dir():
+            return False
+        return scan_directory(pages_root)
     except OSError:
         return False
-    return True
 
 
 def _preflight_pages_clean(conn: sqlite3.Connection, requested: list[str], data_dir: Path) -> bool:
@@ -890,8 +909,7 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
     # backup -> consolidate -> live-writer refusal. Maintenance gates writers
     # at their START only, so the lock + lease + backup/consolidate locks are
     # what makes the byte-verify window exclusive.
-    m_token = _strict_acquire_lock(
-        "maintenance", MAINTENANCE_LOCK_STALE_SECONDS, wait_seconds=0.0)
+    m_token = _acquire_maintenance_lock_with_liveness()
     if m_token is None:
         print("[zmem] purge REFUSED: another maintenance operation "
               "(restore, purge) is active; re-run when it finishes",

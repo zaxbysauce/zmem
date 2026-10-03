@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.77.0] - 2026-10-02
+## [0.78.0] - 2026-10-03
 
 ### Added
 - **Deterministic curated knowledge pages (issue #138):** explicit filesystem
@@ -26,8 +26,42 @@ README.
   matching, the finite newest-50 passive verification policy, private source
   content binding with legacy passive withholding, operator-owned residue
   cleanup, and the platform limits on directory durability. The local adapter
-  configuration is `ZMEM_PAGE_ADAPTER_ACTIONS`; missing or invalid actions
-  refuse before the store or maintenance lock is touched.
+  configuration is `ZMEM_PAGE_ADAPTER_ACTIONS`; a missing or non-file
+  configured path refuses before the store or maintenance lock is touched.
+  An existing recording is opened and validated during refresh, so malformed
+  JSON, unreadable bytes, and over-limit actions follow the normal atomic
+  refresh refusal after the store is opened.
+
+## [0.77.0] - 2026-10-02
+
+### Fixed
+- **Maintenance-lock false positives no longer block writes for up to 30
+  minutes** (issue #262). Every `store.py` command — and `restore`/`purge` at
+  their own maintenance gates — now classifies the `.zmem-maintenance.lock`
+  probe by the holder recorded in the lock token instead of by file age alone.
+  A lock whose holder process is dead (killed mid-hold, e.g. by a hook
+  runner's subprocess timeout) or an empty lock file older than a short grace
+  period is recognized as a phantom, removed with the same identity-checked
+  rename-and-confirm dance the stale-lock path uses, and the command proceeds
+  instead of failing with "maintenance is active" until the 1800 s stale
+  window elapsed. A genuinely live maintenance holder is refused exactly as
+  before. The grace window defaults to 10 s and is configurable via
+  `ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS` (values below 1 s — including when a
+  sub-second `ZMEM_MAINTENANCE_LOCK_STALE_SECONDS` would drag the ceiling
+  down — or above the stale window are clamped; non-finite or non-positive
+  values fall back to the default). Disclosed residuals: a lock held by a
+  process in a different PID namespace on the same machine (containers or
+  PID-unsharing sandboxes sharing a store volume) reads as dead and its lock
+  is broken — writers still fail closed through the schema lock, but
+  Hermes existing-only writers and restores/purges longer than the 300 s
+  schema-lock stale window are the residual exposure; pid reuse and unreaped
+  POSIX zombies can read as alive, which simply keeps today's fail-closed
+  behavior until the stale window; and a lock file whose content is
+  non-empty but unparseable (a foreign/manual artifact zmem's own
+  primitives do not produce) keeps today's full 1800 s staleness window.
+  Lock-file reads are bounded to regular files ≤ 4 KB, so foreign or
+  non-regular content at the lock path degrades to "no recorded holder"
+  rather than being parsed.
 
 ## [0.76.0] - 2026-10-01
 
