@@ -39,10 +39,10 @@ from typing import Any
 
 from storelib.schema import (
     STORE_PATH,
-    MAINTENANCE_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_POLL_SECONDS,
     SCHEMA_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_WAIT_SECONDS,
+    _acquire_maintenance_lock_with_liveness,
     _cleanup_stale_writer_leases,
     _normalize_content,
     _load_vec,
@@ -803,8 +803,7 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
     # backup -> consolidate -> live-writer refusal. Maintenance gates writers
     # at their START only, so the lock + lease + backup/consolidate locks are
     # what makes the byte-verify window exclusive.
-    m_token = _strict_acquire_lock(
-        "maintenance", MAINTENANCE_LOCK_STALE_SECONDS, wait_seconds=0.0)
+    m_token = _acquire_maintenance_lock_with_liveness()
     if m_token is None:
         print("[zmem] purge REFUSED: another maintenance operation "
               "(restore, purge) is active; re-run when it finishes",
