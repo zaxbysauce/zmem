@@ -18,7 +18,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from storelib.schema import MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, now_iso
+from storelib.schema import MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _acquire_maintenance_lock_with_liveness, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, now_iso
 
 SNAPSHOT_PREFIX = "store-"
 
@@ -644,11 +644,7 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
             print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
             return 1
 
-    m_token = _strict_acquire_lock(
-        "maintenance",
-        MAINTENANCE_LOCK_STALE_SECONDS,
-        wait_seconds=0.0,
-    )
+    m_token = _acquire_maintenance_lock_with_liveness()
     if m_token is None:
         print("[zmem] restore REFUSED: another maintenance operation is currently "
               "running - destination untouched; re-run when it finishes",

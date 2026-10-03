@@ -45,3 +45,6 @@ tests/fixtures/feedback_*.jsonl text eol=lf
 tests/fixtures/dataset/** text eol=lf
 tests/fixtures/issue126/** text eol=lf
 eval/*.jsonl text eol=lf
+
+# Curated-page fixture bytes are generator/checkpoint contracts on every host.
+tests/fixtures/pages/** text eol=lf

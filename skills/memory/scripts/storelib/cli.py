@@ -927,6 +927,146 @@ def _connect_existing_store() -> sqlite3.Connection:
     return conn
 
 
+# Curated pages are a filesystem surface.  Their read/list commands must not
+# resolve or open the SQLite store at all; refresh only needs a committed,
+# read-only snapshot of the already-existing store and delegates publication
+# and maintenance serialization to ``storelib.pages``.
+_PAGE_ADAPTER_MAX_BYTES = 512 * 1024
+
+
+def _page_data_dir() -> str:
+    """Resolve the page root through the canonical selector data resolver.
+
+    In particular, an explicit ``ZMEM_STORE`` wins over ``ZMEM_DATA`` and
+    places sidecars beside that store.  Read/list remain filesystem-only;
+    this helper performs path resolution and never opens or creates SQLite.
+    """
+    return _injection_data_dir(None)
+
+
+def _page_adapter_path() -> Path | None:
+    """Return the configured recorded adapter file, if it is usable as a file.
+
+    Existence is checked before the refresh store is opened so a missing
+    recorded adapter remains the parser-level exit-2 refusal required by the
+    CLI contract.  JSON/action validation remains in the page library so a
+    malformed existing recording follows the normal atomic refresh refusal.
+    """
+    raw = os.environ.get("ZMEM_PAGE_ADAPTER_ACTIONS")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    path = Path(raw).expanduser()
+    try:
+        if not path.is_file():
+            return None
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _recorded_page_adapter(path: Path):
+    """Build a bounded data-only adapter for a recorded JSON action file."""
+    def adapter(_payload: dict) -> dict:
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(_PAGE_ADAPTER_MAX_BYTES + 1)
+        except OSError as exc:
+            raise ValueError("recorded page adapter is unreadable") from exc
+        if len(raw) > _PAGE_ADAPTER_MAX_BYTES:
+            raise ValueError("recorded page adapter is too large")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("recorded page adapter is not valid UTF-8 JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("recorded page adapter must be a JSON object")
+        return value
+
+    return adapter
+
+
+def _connect_page_store_readonly() -> sqlite3.Connection:
+    """Open the resolved existing store with no init, migration, or writes."""
+    if not STORE_PATH.is_file():
+        raise FileNotFoundError(STORE_PATH)
+    if _schema_host is not None:
+        _schema_host.assert_local_fs(STORE_PATH.parent)
+    uri = STORE_PATH.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=1")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _dispatch_page(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Dispatch all page commands before normal store initialization."""
+    if args.page_cmd == "refresh" and args.llm_local:
+        adapter_path = _page_adapter_path()
+        if adapter_path is None:
+            ap.error("--llm-local requires the recorded maintenance adapter")
+        adapter = _recorded_page_adapter(adapter_path)
+    else:
+        adapter = None
+
+    from storelib.pages import page_list, page_read, page_refresh
+
+    if args.page_cmd == "read":
+        try:
+            result = page_read(
+                data_dir=_page_data_dir(), page_id=args.page_id,
+                version_id=args.version_id,
+            )
+        except Exception as exc:
+            # PageError is a controlled refusal, but keep malformed/foreign
+            # filesystem artifacts fail-closed if the library surfaces a
+            # concrete ValueError/OSError from a mixed-version install.
+            del exc
+            print("[zmem] page read: refused", file=sys.stderr)
+            raise SystemExit(1)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")))
+        raise SystemExit(0)
+
+    if args.page_cmd == "list":
+        try:
+            result = page_list(
+                data_dir=_page_data_dir(), namespace=args.namespace,
+            )
+        except Exception as exc:
+            del exc
+            print("[zmem] page list: refused", file=sys.stderr)
+            raise SystemExit(1)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")))
+        raise SystemExit(0)
+
+    conn = None
+    try:
+        conn = _connect_page_store_readonly()
+        result = page_refresh(
+            conn,
+            data_dir=_page_data_dir(),
+            page_id=args.page_id,
+            query=args.query,
+            namespace=args.namespace,
+            tags=tuple(args.tags or ()),
+            llm_local=args.llm_local,
+            adapter=adapter,
+        )
+    except Exception:
+        # The refresh contract deliberately exposes one stable refusal line;
+        # details from adapter input or local paths must not leak on stderr.
+        print("[zmem] page refresh: refused", file=sys.stderr)
+        raise SystemExit(1)
+    finally:
+        if conn is not None:
+            conn.close()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":")))
+    raise SystemExit(0)
+
+
 def _query_rewrite_output(query: str, rewritten: bool) -> None:
     """Emit the closed query-rewrite wire object in canonical key order."""
     print(json.dumps({"query": query, "rewrite": int(bool(rewritten))},
@@ -1929,6 +2069,33 @@ def main():
     p_list.add_argument("--limit", type=nonnegative_int, default=50)
     p_list.add_argument("--include-superseded", action="store_true")
 
+    # Issue #138: curated pages are explicit filesystem artifacts.  The
+    # nested grammar stays separate from ordinary memory list/read commands so
+    # page read/list can dispatch before any SQLite initialization.
+    p_page = _add_parser("page", help="read, refresh, or list curated pages")
+    page_sub = p_page.add_subparsers(dest="page_cmd", required=True)
+    p_page_read = page_sub.add_parser("read", help="read a curated page")
+    p_page_read.add_argument("--id", dest="page_id", type=str, required=True,
+                             help="page slug")
+    p_page_read.add_argument("--version", dest="version_id", type=str,
+                             default=None, help="historical version id")
+    p_page_refresh = page_sub.add_parser("refresh", help="refresh a curated page")
+    p_page_refresh.add_argument("--id", dest="page_id", type=str, required=True,
+                                help="page slug")
+    p_page_refresh.add_argument("--query", dest="query", type=str, required=True,
+                                help="page source query")
+    p_page_refresh.add_argument("--namespace", dest="namespace", type=str,
+                                required=True, help="page namespace")
+    p_page_refresh.add_argument("--tag", dest="tags", type=str, action="append",
+                                default=[], help="include a source tag; repeatable")
+    p_page_refresh.add_argument(
+        "--llm-local", dest="llm_local", action="store_true", default=False,
+        help="enable the maintenance patch adapter")
+    p_page_list = page_sub.add_parser("list", help="list curated page metadata")
+    p_page_list.add_argument(
+        "--namespace", dest="namespace", type=str, default=None,
+        help="filter page metadata by namespace")
+
     # Evidence is session-scoped.  The required namespace is a context
     # selector only; evidence rows intentionally do not carry a namespace.
     p_evidence = _add_parser("evidence", help="write or inspect host evidence")
@@ -2911,8 +3078,16 @@ def main():
     # Issue #137: --llm-local drives the maintenance action adapter and has no
     # meaning without --belief-heads; refused at parse time, before any
     # maintenance lock or store work.
-    if getattr(args, "llm_local", False) and not getattr(args, "belief_heads", False):
+    if (args.cmd != "page" and getattr(args, "llm_local", False)
+            and not getattr(args, "belief_heads", False)):
         ap.error("--llm-local requires --belief-heads")
+
+    # Issue #138: page commands own their complete dispatch boundary.  Read
+    # and list are filesystem-only; refresh opens an existing store read-only
+    # and delegates maintenance locking/publication to page_refresh.  Keep this
+    # before every normal connect/migration/lease/rekey path.
+    if args.cmd == "page":
+        _dispatch_page(ap, args)
 
     # Issue #99's raw tool input crosses only this private, child-marked
     # channel.  Keep the public CLI grammar unchanged and refuse to consume

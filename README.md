@@ -218,6 +218,44 @@ operators retain the exact missing-ID responses (`memory id not found` for
 `evidence_for` and `evidence id not found` for `evidence_show`) and the legacy
 association behavior.
 
+### Provenance source lookup (issue #139)
+
+The explicit `source` commands provide a bounded, local explanation for an
+existing memory. They resolve evidence associations before considering the
+stored source reference, authorize the project/global namespace and approved
+source root, and refuse missing, unsafe, ambiguous, or unavailable sources.
+They do not browse arbitrary files, write the store, update namespace caches,
+or make network calls.
+
+```bash
+python skills/memory/scripts/store.py source --id <memory-uuid> --context 2
+python skills/memory/scripts/store.py source scan --id <memory-uuid> \
+  --needle "literal text"
+```
+
+`--context` accepts only an integer from 0 through 20. `source scan` is a
+literal, case-sensitive scan with a maximum of 50 matches; the result reports
+when that bound truncates the output. Needles are never regular expressions,
+and malformed arguments use the single-line `store.py: error: ...` exit-2
+contract.
+
+The resolver recognizes four source layouts: Claude transcript JSONL, Codex
+session JSONL or `MEMORY.md`, native ZCode SQLite, and native Hermes
+`SessionDB`. Hermes JSONL is an explicitly bounded fallback only when the
+canonical Hermes database is absent. File-backed records calculate offsets in
+the original UTF-8 bytes. Native Hermes and ZCode records retain stable
+source/session/message identifiers and return explicit `null` byte offsets
+when their stores do not retain the original transcript byte stream.
+
+The lookup opens existing SQLite sources with `mode=ro` and
+`query_only=1`. It may coordinate an existing SQLite `-shm`; a newly created
+WAL must be empty, and database/WAL bytes remain unchanged. External native
+WAL sources require existing regular safe sidecars. Returned excerpts are
+redacted before clipping and hashing, and no source text, absolute path,
+credential, or provider-install detail is emitted in refusal diagnostics. See
+the full source contract and WAL boundary in
+[`docs/CLOUD.md`](docs/CLOUD.md#provenance-lookup-issue-139).
+
 Retention is applied by
 the existing session-cadence maintenance path: rows older than
 the supplied cadence time minus `ZMEM_EVIDENCE_DAYS` (default 30) expire, then the newest

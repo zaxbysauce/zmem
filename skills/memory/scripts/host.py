@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat as _stat
 import subprocess
 import time
 import uuid
@@ -1210,3 +1211,222 @@ def busy_retry(fn, attempts: int = 5):
                 time.sleep(delay)
                 delay *= 2
     raise last_exc
+
+
+# read_lock_holder_pid refuses to read lock "content" from anything larger
+# than this (bytes): a real token is ~50 bytes, so the cap only bites on
+# foreign/oversized blobs planted at the lock path — those classify as
+# no-recorded-holder instead of memory-pressuring the pre-dispatch read.
+MAX_LOCK_READ_BYTES = 4096
+
+
+def process_alive(pid) -> bool | None:
+    """True = a process with this pid exists; False = none does; None = cannot
+    tell. Best-effort, never raises, no subprocesses (issue #262).
+
+    The maintenance-lock liveness check reads the `pid:` half of the token
+    acquire_lock writes and asks exactly one question: is that holder still
+    running? Every uncertain answer must be None, never an exception — the
+    caller fails closed toward today's "maintenance is active" refusal rather
+    than guessing. The pid domain is guarded before any syscall: a hand-made
+    token file can carry a pid that overflows POSIX os.kill (OverflowError —
+    not an OSError) or the Windows DWORD argument (ctypes ArgumentError), and
+    neither may crash the pre-dispatch path of every store command.
+
+    POSIX asks the kernel directly (signal 0 has no effect); PermissionError
+    means the process exists but is not ours. Windows uses
+    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION), which needs no elevation
+    merely to ask whether a pid exists: a handle means the process OBJECT
+    exists, and GetExitCodeProcess distinguishes a running holder from a
+    terminated one — any exit code other than STILL_ACTIVE (259) means the
+    process is dead even though the object survives (a killer that has not
+    closed its handle — the hook-runner timeout case — keeps the object alive,
+    and trusting OpenProcess alone would classify a killed holder as live).
+    ERROR_ACCESS_DENIED (5) on the OPEN itself means the process exists and is
+    protected; ERROR_INVALID_PARAMETER (87) means no such process. The
+    os.name branch order is load-bearing: os.kill is not a liveness probe on
+    Windows (signal 0 maps to GenerateConsoleCtrlEvent, not an existence
+    check), so the POSIX os.kill(pid, 0) semantics must only run off Windows.
+    POSIX residual: an unreaped zombie passes the signal-0 check (kill(2)
+    succeeds until the parent reaps) — transient, and the caller fail-closes
+    toward today's refusal.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid < 1 or pid > 2**31 - 1:
+        return None
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.OpenProcess.argtypes = (
+                ctypes.c_uint32,
+                ctypes.c_bool,
+                ctypes.c_uint32,
+            )
+            k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            k32.GetExitCodeProcess.argtypes = (
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            )
+            handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if handle:
+                try:
+                    code = ctypes.c_uint32(0)
+                    if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                        return code.value == 259  # STILL_ACTIVE = still running
+                finally:
+                    k32.CloseHandle(handle)
+                # The object exists but its exit code is unreadable — treat it
+                # as alive (fail-closed toward the correct refusal).
+                return True
+            err = ctypes.get_last_error()
+            if err == 5:  # ERROR_ACCESS_DENIED — exists, protected
+                return True
+            if err == 87:  # ERROR_INVALID_PARAMETER — no such process
+                return False
+            return None
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+
+
+def read_lock_holder_pid(path):
+    """Read the holder identity out of a lock file (issue #262).
+
+    Returns (token, pid) when the file carries a parseable `<decimal ASCII
+    pid>:` token in the process_alive domain; ("", None) when the file exists
+    but is stripped-EMPTY — a live acquirer may legitimately sit there between
+    _try_create_lock's create and its token write, so emptiness is a distinct
+    state, never "dead"; and None when the file is missing, non-regular (a
+    directory, fifo, or symlink passed the lstat gate), oversized, unreadable,
+    or non-empty but unparseable (foreign/manual artifacts, binary junk, and
+    non-ASCII decimal digit heads included — `str.isdigit()` accepts script
+    digits whose `int()` either raises or maps to an unrelated real pid, so
+    they are classified as no-recorded-holder, keeping the fail-closed window).
+
+    The stat gate is bounded and regular-files-only BEFORE any content is
+    read, and the content read wraps `except Exception` — broader than
+    release_lock's OSError-only shape, which lets `UnicodeDecodeError` (a
+    ValueError) through — so no lock-file content can crash, hang, or
+    memory-pressure the pre-dispatch path of every store command. Strip
+    semantics match release_lock (utf-8 text, .strip()).
+    """
+    try:
+        st = os.stat(str(path), follow_symlinks=False)
+    except OSError:
+        return None
+    if not _stat.S_ISREG(st.st_mode) or st.st_size > MAX_LOCK_READ_BYTES:
+        return None
+    try:
+        content = Path(path).read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if content == "":
+        return ("", None)
+    head, sep, _tail = content.partition(":")
+    if not sep or not head.isascii() or not head.isdigit():
+        return None
+    try:
+        pid = int(head)
+    except ValueError:
+        # isdigit() is broader than int(): superscript digits are
+        # isdigit-true, and digit runs beyond sys.get_int_max_str_digits()
+        # raise — foreign lock content must degrade to "no recorded holder",
+        # never crash the pre-dispatch path (implementation-review R1).
+        return None
+    if pid < 1 or pid > 2**31 - 1:
+        return None
+    return (content, pid)
+
+
+def break_phantom_lock(path, expected_token, min_age_seconds: float = 0.0) -> bool:
+    """Remove the lock file at `path` ONLY IF it is still exactly the phantom
+    the caller classified: stripped content equal to `expected_token` (empty
+    string = a stripped-empty file), and — for the empty-token limb only,
+    where two empty files are content-indistinguishable — older than
+    `min_age_seconds`. True => the phantom instance is gone; False => nothing
+    was touched. Never raises; a live holder's lock is never renamed.
+
+    Why each step exists (issue #262; the module's break history in miniature):
+    - The break claim serializes us against concurrent stale-breaks and other
+      phantom-breaks at the same path. HELD means another breaker owns this
+      break — skip cleanly. UNAVAILABLE (claim mechanism unusable) proceeds
+      unserialized, exactly as _break_stale_lock does: refusing to break would
+      wedge recovery forever.
+    - The under-claim age re-check (empty-token limb only) is the transpose of
+      _break_stale_lock's load-bearing re-stat: stripped-empty content cannot
+      distinguish the classified phantom from a live acquirer sitting inside
+      _try_create_lock's create-then-write window, so only age can — and it
+      must be re-observed under the claim, not trusted from the classification.
+      (Windows self-protects, the rename fails on the acquirer's open fd;
+      POSIX does not.)
+    - The pre-read short-circuit keeps the rename OFF the common path when the
+      file changed hands after classification: a live successor's `pid:uuid`
+      token can never equal the classified dead token, and a refilled empty
+      file was already refused by the age gate. release_lock documents why
+      this pre-read, not the rename, keeps the momentarily-empty-path window
+      off the happy path.
+    - The rename-aside + confirm + put-back body is release_lock's exact
+      pattern with token content as the identity witness. Reads use the same
+      exception envelope as read_lock_holder_pid: a failed or undecodable read
+      at the pre-read means False (nothing renamed); at the confirm it means
+      "cannot prove it is ours" => put back exactly as release_lock does.
+    """
+    p = Path(path)
+    claim = _claim_path(p)
+    state = _acquire_break_claim(claim)
+    if state == _CLAIM_HELD:
+        return False  # another breaker owns this break — skip, touch nothing
+    try:
+        try:
+            content = p.read_text(encoding="utf-8").strip()
+        except Exception:
+            return False
+        if content != expected_token:
+            return False  # changed hands since classification — never rename
+        if expected_token == "" and min_age_seconds > 0.0:
+            try:
+                age = time.time() - os.stat(str(p)).st_mtime
+            except OSError:
+                return False
+            if age <= min_age_seconds:
+                return False  # a live acquirer's fresh empty file — leave it
+        victim = p.with_name(p.name + f".phantom.{uuid.uuid4().hex}")
+        try:
+            os.rename(str(p), str(victim))
+        except OSError:
+            # Lost the rename (already gone, or a Windows sharing violation).
+            return False
+        try:
+            moved = Path(victim).read_text(encoding="utf-8").strip()
+        except Exception:
+            moved = None  # cannot confirm identity => treat as not ours
+        if moved == expected_token:
+            try:
+                os.unlink(str(victim))
+            except OSError:
+                pass
+            return True
+        # We moved something that is not the classified phantom: put it back
+        # exactly as release_lock does (rename preserves content and mtime).
+        if not _rename_noreplace(str(victim), str(p)):
+            # A third process took the free path in that window. Do not
+            # clobber it; drop the file we should never have moved.
+            try:
+                os.unlink(str(victim))
+            except OSError:
+                pass
+        return False
+    finally:
+        if state == _CLAIM_ACQUIRED:
+            _release_break_claim(claim)

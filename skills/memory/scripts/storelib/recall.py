@@ -2016,6 +2016,17 @@ def _format_fenced_recall(rows: list[dict], header: str,
             lines.append(f"    source_ref: {r['source_ref']}")
         if source_hint:
             lines.append(f"    -> source {r['id']} (store.py source --id {r['id']})")
+        # Issue #138's retained page is a derived row.  Keep its grounding
+        # visible through the shared fence without changing ordinary recall
+        # bytes or introducing a host-specific renderer.
+        if r.get("type") == "page":
+            for _key in ("version_id", "freshness_watermark", "page_checksum"):
+                if r.get(_key):
+                    lines.append(f"    {_key}: {r[_key]}")
+            for _key in ("source_ids", "evidence_ids"):
+                _values = r.get(_key)
+                if isinstance(_values, (list, tuple)) and _values:
+                    lines.append("    " + _key + ": " + ", ".join(map(str, _values)))
         if r.get("tags"):
             lines.append(f"    tags: {r['tags']}")
         # v10 (issue #60, 5.4): at most THREE entity NAMES per row (never
