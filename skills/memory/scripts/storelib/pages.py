@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 
-_PAGE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+_PAGE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _VERSION_ID = re.compile(r"^v[0-9]{6}$")
 _SECTION = re.compile(r"<!-- section:([A-Za-z0-9._-]+) -->\n?(.*?)<!-- end-section:\1 -->", re.S)
 _FENCE_MARKERS = ("<<<ZMEM_UNTRUSTED_FENCE>>>", "<<<END_ZMEM_UNTRUSTED_FENCE>>>")
@@ -27,6 +27,10 @@ _MAX_MARKDOWN = 4000
 _MAX_ARTIFACT_BYTES = 262144
 _MAX_ADAPTER_OPERATIONS = 20
 _MAX_OPERATION_CITATIONS = 20
+_MAX_SELECTOR_PAGES = 50
+_WINDOWS_RESERVED = {"con", "prn", "aux", "nul"} | {
+    prefix + str(number) for prefix in ("com", "lpt") for number in range(1, 10)
+}
 
 
 class PageError(ValueError):
@@ -50,8 +54,10 @@ def _bounded_json(value: object) -> bytes:
 
 
 def _validate_id(page_id: str) -> str:
-    if (not isinstance(page_id, str) or page_id in ("", ".", "..")
-            or not _PAGE_ID.fullmatch(page_id)):
+    stem = page_id.split(".", 1)[0].lower() if isinstance(page_id, str) else ""
+    if (not isinstance(page_id, str) or not _PAGE_ID.fullmatch(page_id)
+            or page_id.startswith(".") or page_id.endswith(".")
+            or stem in _WINDOWS_RESERVED):
         raise PageError("invalid page id")
     return page_id
 
@@ -60,9 +66,9 @@ def _root(data_dir: str, *, create: bool = False) -> Path:
     if not isinstance(data_dir, str) or not data_dir:
         raise PageError("invalid data directory")
     root = Path(data_dir).expanduser()
-    if create:
-        root.mkdir(parents=True, exist_ok=True)
     try:
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
         resolved = root.resolve(strict=False)
     except OSError as exc:
         raise PageError("unsafe data directory") from exc
@@ -73,16 +79,16 @@ def _root(data_dir: str, *, create: bool = False) -> Path:
 
 def _page_dir(data_dir: str, page_id: str, *, create: bool = False) -> Path:
     page_id = _validate_id(page_id)
-    base = _root(data_dir, create=create)
-    pages = base / "pages"
-    if create:
-        pages.mkdir(parents=True, exist_ok=True)
-    if pages.exists() and (_is_reparse(pages) or not pages.is_dir()):
-        raise PageError("unsafe page directory")
-    candidate = pages / page_id
-    if candidate.exists() and (_is_reparse(candidate) or not candidate.is_dir()):
-        raise PageError("unsafe page directory")
     try:
+        base = _root(data_dir, create=create)
+        pages = base / "pages"
+        if create:
+            pages.mkdir(parents=True, exist_ok=True)
+        if pages.exists() and (_is_reparse(pages) or not pages.is_dir()):
+            raise PageError("unsafe page directory")
+        candidate = pages / page_id
+        if candidate.exists() and (_is_reparse(candidate) or not candidate.is_dir()):
+            raise PageError("unsafe page directory")
         resolved = candidate.resolve(strict=False)
         if os.path.commonpath((str(base), str(resolved))) != str(base):
             raise PageError("unsafe page path")
@@ -171,9 +177,28 @@ def _read_committed(directory: Path, version_id: str | None = None) -> tuple[dic
     raw = content.encode("utf-8")
     checksum = hashlib.sha256(raw).hexdigest()
     required_version = {"version_id", "freshness_watermark", "source_ids", "evidence_ids", "retracted_source_ids", "page_checksum", "content"}
-    if (not required_version.issubset(version) or set(version) - (required_version | {"bullet_sources"})
+    v2_fields = {"format_version", "source_content_hashes"}
+    version_format = version.get("format_version", 1)
+    allowed = required_version | {"bullet_sources"}
+    if version_format == 2:
+        allowed |= v2_fields
+    if (type(version_format) is not int or version_format not in {1, 2}
+            or not required_version.issubset(version) or set(version) - allowed
             or version.get("version_id") != selected or version.get("page_checksum") != checksum):
         raise PageError("page checksum mismatch")
+    if version_format == 2:
+        hashes = version.get("source_content_hashes")
+        source_ids = version.get("source_ids")
+        if (not isinstance(hashes, dict)
+                or not isinstance(source_ids, list)
+                or any(not isinstance(source_id, str) for source_id in source_ids)
+                or any(not isinstance(key, str) or key.startswith("belief:")
+                       or not isinstance(value, str)
+                       or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                       for key, value in hashes.items())
+                or set(hashes) != {source_id for source_id in source_ids
+                                   if not source_id.startswith("belief:")}):
+            raise PageError("invalid page source hashes")
     for key in ("freshness_watermark", "source_ids", "evidence_ids", "retracted_source_ids", "page_checksum"):
         if version.get(key) != current.get(key) and version_id is None:
             raise PageError("page pointer metadata mismatch")
@@ -190,6 +215,8 @@ def page_read(*, data_dir: str, page_id: str, version_id: str | None = None) -> 
     directory = _page_dir(data_dir, page_id)
     definition, version, raw = _read_committed(directory, version_id)
     result = dict(version)
+    result.pop("format_version", None)
+    result.pop("source_content_hashes", None)
     result["content"] = raw.decode("utf-8")
     result["namespace"] = definition.get("namespace")
     return result
@@ -239,6 +266,11 @@ def page_for_injection(*, data_dir: str, page_id: str) -> dict:
     }
 
 
+def _literal_tags(value: object) -> set[str]:
+    """Parse comma-separated storage tags without changing case or spaces."""
+    return {part.strip() for part in str(value or "").split(",") if part.strip()}
+
+
 def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
                  tags: tuple[str, ...], as_of: str | None,
                  data_dir: str | None = None, now: str | None = None) -> list[dict]:
@@ -258,15 +290,18 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
         params.append(temporal_at)
         clauses.append("(valid_until IS NULL OR valid_until='' OR valid_until>?)")
         params.append(temporal_at)
-    for tag in tags:
-        # Tags are caller input.  Escape SQL LIKE metacharacters so a literal
-        # ``_`` or ``%`` tag cannot ground a page in an unrelated source.
-        literal_tag = tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        clauses.append("(',' || replace(tags, ' ', '') || ',') LIKE ? ESCAPE '\\'")
-        params.append("%," + literal_tag + ",%")
     sql = ("SELECT id,namespace,type,content,tags,source_ref,confidence,signal,taint,"
            "trust_score,ingestion_ts,valid_from,valid_until FROM memory WHERE " + " AND ".join(clauses))
     live = [dict(r) for r in conn.execute(sql, params).fetchall()]
+    if tags:
+        # Stored tags are comma-separated text. Match each normalized field
+        # literally, preserving case and internal spaces (``my tag`` is not
+        # ``mytag``); only surrounding delimiter whitespace is syntax.
+        live = [row for row in live if set(tags).issubset(_literal_tags(row.get("tags")))]
+        matching_ids = {str(row["id"]) for row in live}
+        heads = [head for head in heads if any(
+            isinstance(source_id, str) and source_id in matching_ids
+            for source_id in head.get("source_ids", []))]
     all_source_ids: set[str] = set()
     for h in heads:
         all_source_ids.update(x for x in h.get("source_ids", []) if isinstance(x, str))
@@ -299,9 +334,10 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
             return os.path.commonpath((str(pages_root), str(Path(value[5:]).resolve(strict=False)))) == str(pages_root)
         except (OSError, ValueError):
             return True
-    if any(not evidence.get(r["id"]) for r in live):
-        raise PageError("page source is missing evidence")
-    live = [r for r in live if not page_path_ref(r.get("source_ref"))]
+    # New, never-grounded ordinary rows are ineligible rather than poisoning an
+    # unrelated refresh.  The dangling-association guard above remains strict:
+    # a formerly valid association that points at missing evidence is refused.
+    live = [r for r in live if evidence.get(r["id"]) and not page_path_ref(r.get("source_ref"))]
     for row in live:
         row_id = str(row["id"])
         row["evidence_ids"] = list(evidence.get(row_id, []))
@@ -321,7 +357,7 @@ def _source_rows(conn: sqlite3.Connection, *, query: str, namespace: str,
             continue
         ids = [x for x in head.get("source_ids", []) if isinstance(x, str)]
         if ids and not all(evidence.get(x) for x in ids):
-            raise PageError("page belief source is missing evidence")
+            continue
         if ids and not any(str(x).startswith("page:") for x in ids):
             item = dict(head)
             placeholders = ",".join("?" for _ in (ids + [item["id"]]))
@@ -512,6 +548,44 @@ def _require_live_bullet_authority(rows: list[dict],
             raise PageError("page provenance changed during publication")
 
 
+def _prune_stale_bullets(content: str, bullet_sources: dict[str, dict[str, list[str]]],
+                         rows: list[dict]) -> tuple[str, dict[str, dict[str, list[str]]]]:
+    """Retract whole persisted bullets whose authority is no longer live."""
+    valid_pairs = {
+        (str(source), str(evidence))
+        for row in rows for source, evidence in row.get("_source_evidence_pairs", [])
+    }
+    retained = dict(bullet_sources)
+    result = content
+    for ident, record in bullet_sources.items():
+        sources = record["source_ids"]
+        evidence_ids = record["evidence_ids"]
+        valid = (all(any((source, evidence) in valid_pairs for source in sources)
+                     for evidence in evidence_ids)
+                 and all(any((source, evidence) in valid_pairs for evidence in evidence_ids)
+                         for source in sources))
+        if valid:
+            continue
+        pattern = re.compile(r"<!-- bullet:" + re.escape(ident) + r" -->.*?<!-- end-bullet:" + re.escape(ident) + r" -->\n?", re.S)
+        result, count = pattern.subn("", result, count=1)
+        if count != 1:
+            raise PageError("invalid retained page bullet")
+        retained.pop(ident, None)
+    return result, retained
+
+
+def _source_content_hashes(conn: sqlite3.Connection, source_ids: list[str]) -> dict[str, str]:
+    ordinary = sorted({source_id for source_id in source_ids if not source_id.startswith("belief:")})
+    if not ordinary:
+        raise PageError("page content has no ordinary sources")
+    ph = ",".join("?" for _ in ordinary)
+    rows = conn.execute("SELECT id,content FROM memory WHERE id IN (" + ph + ") AND superseded_at IS NULL", ordinary).fetchall()
+    values = {str(row["id"]): hashlib.sha256(str(row["content"] or "").encode("utf-8")).hexdigest() for row in rows}
+    if set(values) != set(ordinary):
+        raise PageError("page source changed during publication")
+    return values
+
+
 def _snapshot_bytes(rows: list[dict]) -> bytes:
     """Canonical source snapshot used for revalidation and watermarking."""
     return _json_bytes([{
@@ -626,8 +700,13 @@ def _wait_for_writers(store_parent: Path) -> None:
         live = []
         try:
             for lease in leases.glob("*.lease"):
-                if time.time() - lease.stat().st_mtime <= getattr(schema, "WRITER_LEASE_STALE_SECONDS", 300.0):
-                    live.append(lease)
+                try:
+                    if time.time() - lease.stat().st_mtime <= getattr(schema, "WRITER_LEASE_STALE_SECONDS", 300.0):
+                        live.append(lease)
+                except FileNotFoundError:
+                    # A writer can release a lease between directory enumeration
+                    # and stat.  It cannot start work while we hold maintenance.
+                    continue
         except OSError as exc:
             raise PageError("unable to inspect writer leases") from exc
         if not live:
@@ -644,6 +723,25 @@ def _atomic_write(path: Path, payload: bytes) -> Path:
         handle.flush()
         os.fsync(handle.fileno())
     return staged
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Persist directory entries where the host filesystem supports it.
+
+    Windows does not provide the POSIX directory-fd durability primitive; file
+    fsync remains the portable guarantee there.  A failed best-effort directory
+    sync must not turn an already pointer-committed page into a false rollback.
+    """
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        return
 
 
 def _next_version(directory: Path) -> str:
@@ -677,13 +775,17 @@ def _publish(directory: Path, definition: dict, current: dict, version: dict, co
     _regular(projection, required=False)
     _regular(definition_path, required=False)
     versions = directory / "versions"
-    versions.mkdir(parents=True, exist_ok=True)
-    stage = directory / (".staging-" + uuid.uuid4().hex)
-    stage.mkdir()
+    try:
+        versions.mkdir(parents=True, exist_ok=True)
+        stage = directory / (".staging-" + uuid.uuid4().hex)
+        stage.mkdir()
+    except OSError as exc:
+        raise PageError("page publication path unavailable") from exc
     old_projection = projection.read_bytes() if os.path.lexists(str(projection)) else None
     old_definition = definition_path.read_bytes() if os.path.lexists(str(definition_path)) else None
     installed_version: Path | None = None
     committed = False
+    current_path = directory / "current.json"
     try:
         version_temp = _atomic_write(stage / (version["version_id"] + ".json"), version_bytes)
         page_temp = _atomic_write(stage / "page.md", content)
@@ -695,31 +797,51 @@ def _publish(directory: Path, definition: dict, current: dict, version: dict, co
         # Flat immutable version, projection, then pointer LAST.  A failed
         # projection write has no new pointer and is rolled back below.
         os.replace(version_temp, final_version); installed_version = final_version
+        _fsync_directory(versions)
         os.replace(page_temp, projection)
         if definition_was_missing:
             os.replace(definition_temp, definition_path)
-        os.replace(current_temp, directory / "current.json")
+        os.replace(current_temp, current_path)
+        # Pointer replacement is the commit boundary.  It must precede the
+        # best-effort directory sync: an interruption after this line leaves a
+        # valid new pointer/version and must never trigger rollback.
         committed = True
-    except Exception as exc:
+        _fsync_directory(directory)
+    except BaseException as exc:
+        if not committed and installed_version is not None:
+            # An interrupt may land in the tiny bytecode interval immediately
+            # after os.replace(current_temp, current_path).  Recover the fact
+            # from exact candidate pointer bytes and its installed version.
+            try:
+                committed = (current_path.read_bytes() == current_bytes
+                             and installed_version.is_file()
+                             and not installed_version.is_symlink())
+            except OSError:
+                committed = False
         rollback_error = None
-        try:
-            if old_projection is None:
-                projection.unlink(missing_ok=True)
-            else:
-                # Never write through the replaced entry: stage the old bytes
-                # locally and atomically replace the entry instead.
-                os.replace(_atomic_write(stage / "rollback-page.md", old_projection), projection)
-            if definition_was_missing:
-                if old_definition is None:
-                    definition_path.unlink(missing_ok=True)
+        if not committed:
+            try:
+                if old_projection is None:
+                    projection.unlink(missing_ok=True)
                 else:
-                    os.replace(_atomic_write(stage / "rollback-definition.json", old_definition), definition_path)
-            if installed_version is not None:
-                installed_version.unlink(missing_ok=True)
-        except Exception as rollback_exc:  # retain the valid old pointer either way
-            rollback_error = rollback_exc
+                    # Never write through the replaced entry: stage the old bytes
+                    # locally and atomically replace the entry instead.
+                    os.replace(_atomic_write(stage / "rollback-page.md", old_projection), projection)
+                if definition_was_missing:
+                    if old_definition is None:
+                        definition_path.unlink(missing_ok=True)
+                    else:
+                        os.replace(_atomic_write(stage / "rollback-definition.json", old_definition), definition_path)
+                if installed_version is not None:
+                    installed_version.unlink(missing_ok=True)
+            except Exception as rollback_exc:  # retain the valid old pointer either way
+                rollback_error = rollback_exc
         if rollback_error is not None:
             raise PageError("page publication rollback failed") from rollback_error
+        if committed:
+            raise
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         raise PageError("page publication refused") from exc
     finally:
         try:
@@ -745,34 +867,53 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         raise PageError("llm_local requires a page adapter")
     if not isinstance(query, str) or not isinstance(namespace, str) or not namespace:
         raise PageError("invalid page definition")
+    try:
+        from storelib import schema
+        schema.assert_readonly_compatible(conn)
+    except RuntimeError as exc:
+        raise PageError("page store schema is incompatible") from exc
     normalized_tags = tuple(sorted({str(tag).strip() for tag in tags if isinstance(tag, str) and tag.strip()}))
     lock, token = _acquire_actual_maintenance(conn)
     try:
         _wait_for_writers(lock.parent)
         directory = _page_dir(data_dir, page_id, create=True)
-        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PageError("page directory unavailable") from exc
         definition_path = directory / "definition.json"
         definition_was_missing = not os.path.lexists(str(definition_path))
+        bootstrap_without_pointer = (not definition_was_missing
+                                     and not os.path.lexists(str(directory / "current.json")))
         if definition_was_missing:
             definition = {"namespace": namespace, "query": query, "tags": list(normalized_tags),
                           "generator_revision": "pages-v1", "creation_policy": "explicit"}
         else:
             definition = _load_json(definition_path)
+            if (set(definition) != {"namespace", "query", "tags", "generator_revision", "creation_policy"}
+                    or not isinstance(definition.get("namespace"), str)
+                    or not isinstance(definition.get("query"), str)
+                    or not isinstance(definition.get("tags"), list)):
+                raise PageError("invalid page definition")
             if (definition.get("namespace") != namespace or definition.get("query") != query
                     or tuple(definition.get("tags") or []) != normalized_tags):
                 raise PageError("conflicting page definition")
         projection_path = directory / "page.md"
         old_version: dict | None = None
-        if not definition_was_missing:
+        if not definition_was_missing and not bootstrap_without_pointer:
             _definition, old_version, raw = _read_committed(directory)
             base = raw.decode("utf-8")
+        elif bootstrap_without_pointer:
+            # A hard kill can leave a valid definition and unreferenced version
+            # without a pointer. Do not trust the interrupted projection or
+            # delete history; rebuild a fresh bootstrap deterministically.
+            base = "<!-- section:refresh -->\nInitial page\n<!-- end-section:refresh -->\n"
         elif os.path.lexists(str(projection_path)):
             _regular(projection_path)
             base = projection_path.read_bytes().decode("utf-8")
         else:
             base = "<!-- section:refresh -->\nInitial page\n<!-- end-section:refresh -->\n"
         base = base.replace("\r\n", "\n").replace("\r", "\n")
-        sections = _sections(base)
         effective_now = now
         if effective_now is None:
             from storelib.schema import now_iso
@@ -783,18 +924,33 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         conn.execute("BEGIN")
         try:
             fresh_rows = _source_rows(conn, query=query, namespace=namespace, tags=normalized_tags, as_of=as_of, data_dir=data_dir, now=effective_now)
+            _fresh_text, fresh_source_ids, _fresh_evidence, _fresh_bullets = _render_refresh(fresh_rows)
+            fresh_hashes = _source_content_hashes(conn, fresh_source_ids)
         finally:
             if conn.in_transaction:
                 conn.rollback()
         fresh_rendered, source_ids, evidence_ids, fresh_bullets = _render_refresh(fresh_rows)
         if not source_ids:
             raise PageError("no eligible page sources")
+        if old_version is not None:
+            old_ordinary = [source_id for source_id in old_version.get("source_ids", [])
+                            if isinstance(source_id, str) and not source_id.startswith("belief:")]
+            if old_ordinary:
+                ph = ",".join("?" for _ in old_ordinary)
+                for source_id in old_ordinary:
+                    live = conn.execute("SELECT 1 FROM memory WHERE id=? AND superseded_at IS NULL", (source_id,)).fetchone()
+                    if live is not None and conn.execute(
+                            "SELECT 1 FROM memory_evidence me JOIN evidence e ON e.id=me.evidence_id WHERE me.memory_id=?",
+                            (source_id,)).fetchone() is None:
+                        raise PageError("page source is missing evidence")
+        prior_bullets = _trusted_bullet_sources(
+            old_version.get("bullet_sources") if old_version is not None else None)
+        base, prior_bullets = _prune_stale_bullets(base, prior_bullets, fresh_rows)
+        sections = _sections(base)
         if "refresh" not in sections:
             raise PageError("missing refresh section")
         start, end, refresh_body = sections["refresh"]
         content = base[:start] + fresh_rendered + base[end:]
-        prior_bullets = _trusted_bullet_sources(
-            old_version.get("bullet_sources") if old_version is not None else None)
         # An ordinary refresh rewrites only the refresh section.  Keep the
         # separately-authenticated provenance for every untouched section,
         # then replace authority for the old refresh bullets with the current
@@ -844,11 +1000,16 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
         try:
             publish_rows = _source_rows(conn, query=query, namespace=namespace,
                                         tags=normalized_tags, as_of=as_of, data_dir=data_dir, now=effective_now)
+            hash_source_ids = sorted({source_id for record in actual_bullets.values()
+                                      for source_id in record["source_ids"]})
+            publish_hashes = _source_content_hashes(conn, hash_source_ids)
         finally:
             if conn.in_transaction:
                 conn.rollback()
         _fresh_text, publish_sources, publish_evidence, _publish_bullets = _render_refresh(publish_rows)
-        if _snapshot_bytes(publish_rows) != _snapshot_bytes(fresh_rows):
+        if (_snapshot_bytes(publish_rows) != _snapshot_bytes(fresh_rows)
+                or any(fresh_hashes.get(source_id) != digest
+                       for source_id, digest in publish_hashes.items())):
             raise PageError("page sources changed during publication")
         _sections(content)
         # Canonical content and retained sections bypass adapter field caps.
@@ -880,6 +1041,10 @@ def page_refresh(conn: sqlite3.Connection, *, data_dir: str, page_id: str, query
                    "retracted_source_ids": retracted, "page_checksum": checksum}
         version = dict(current); version["content"] = content
         version["bullet_sources"] = actual_bullets
+        version["format_version"] = 2
+        if set(publish_hashes) != {source_id for source_id in source_ids if not source_id.startswith("belief:")}:
+            raise PageError("page source changed during publication")
+        version["source_content_hashes"] = publish_hashes
         _publish(directory, definition, current, version, raw,
                  definition_was_missing=definition_was_missing)
         return {"success": True, **current}
@@ -907,7 +1072,14 @@ def _page_fts_coverage(content: str, rows: list[dict[str, Any]], query: str) -> 
 
     terms = _recall._normalize_query_terms(query) if query else []
     if not terms:
-        return 0, None
+        return (0, 0.0) if query and query.strip() else (0, None)
+    # Structural markers and rendered source/evidence IDs must never make a
+    # page self-relevant.  Index only marked bullet prose; canonical rows and
+    # their tags remain part of the same derived candidate.
+    bullet_prose = []
+    for match in re.finditer(r"<!-- bullet:[A-Za-z0-9._-]+ -->\n?(.*?)<!-- end-bullet:[A-Za-z0-9._-]+ -->", content or "", re.S):
+        body = re.sub(r"(?m)^\s*(?:source_ids|evidence_ids):.*$", "", match.group(1))
+        bullet_prose.append(body.strip())
     transient: sqlite3.Connection | None = None
     try:
         transient = sqlite3.connect(":memory:")
@@ -918,7 +1090,7 @@ def _page_fts_coverage(content: str, rows: list[dict[str, Any]], query: str) -> 
         transient.execute(
             "INSERT INTO page_relevance_fts(content,tags) VALUES (?,?)",
             (
-                " ".join([str(content or "")] + [
+                " ".join(bullet_prose + [
                     str(row.get("content") or "") for row in rows
                 ]),
                 " ".join(str(row.get("tags") or "") for row in rows),
@@ -948,7 +1120,13 @@ def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
                                   user_global_floor: float | None = None) -> list[dict]:
     """Internal selector discovery with current source/evidence revalidation."""
     candidates: list[dict] = []
-    for item in page_list(data_dir=data_dir, namespace=None):
+    metadata = [item for item in page_list(data_dir=data_dir, namespace=None)
+                if item.get("namespace") in {namespace, "user:global"}]
+    # Count eligible namespaces before the cap so foreign artifacts cannot
+    # displace a local page. Newest publication wins; page id breaks ties.
+    metadata.sort(key=lambda item: str(item.get("id", "")))
+    metadata.sort(key=lambda item: str(item.get("freshness_watermark", "")), reverse=True)
+    for item in metadata[:_MAX_SELECTOR_PAGES]:
         page_id = item["id"]
         try:
             candidate = page_for_injection(data_dir=data_dir, page_id=page_id)
@@ -973,6 +1151,15 @@ def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
             if len({r["id"] for r in rows} & set(ordinary)) != len(set(ordinary)):
                 continue
             if any(r["namespace"] != candidate["namespace"] for r in rows):
+                continue
+            hashes = committed.get("source_content_hashes")
+            if committed.get("format_version") != 2 or not isinstance(hashes, dict):
+                continue
+            if set(hashes) != set(ordinary):
+                continue
+            if any(hashes.get(str(row["id"])) != hashlib.sha256(
+                    str(row.get("content") or "").encode("utf-8")).hexdigest()
+                   for row in rows):
                 continue
             pages_root = _root(data_dir) / "pages"
             def page_ref(value: object) -> bool:

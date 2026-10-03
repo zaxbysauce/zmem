@@ -590,6 +590,93 @@ def _needles(conn: sqlite3.Connection, applied: dict[str, Any]) -> list[str]:
     return sorted(needles)
 
 
+def _scan_page_artifacts(pages_root: Path, needles: list[str]) -> bool:
+    """Return True only when every page artifact is safe and needle-free."""
+    def reparse(path: Path) -> bool:
+        try:
+            attrs = path.stat(follow_symlinks=False).st_file_attributes
+        except (OSError, AttributeError):
+            attrs = 0
+        return path.is_symlink() or bool(attrs & 0x400)
+    if reparse(pages_root.parent):
+        return False
+    if not pages_root.exists():
+        return not os.path.lexists(str(pages_root))
+    if reparse(pages_root) or not pages_root.is_dir():
+        return False
+    folded_needles = [_ascii_fold(needle) for needle in needles]
+
+    def contains_semantic_needle(value: object) -> bool:
+        if isinstance(value, str):
+            folded = _ascii_fold(value)
+            return any(needle in folded for needle in folded_needles)
+        if isinstance(value, dict):
+            return any(contains_semantic_needle(item)
+                       for pair in value.items() for item in pair)
+        if isinstance(value, list):
+            return any(contains_semantic_needle(item) for item in value)
+        return False
+    try:
+        for path in pages_root.rglob("*"):
+            if reparse(path):
+                return False
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                return False
+            raw_data = path.read_bytes()
+            data = raw_data.lower()
+            if any(needle.encode("utf-8").lower() in data for needle in needles):
+                return False
+            # Immutable history stores page text in compact JSON, where quotes,
+            # slashes and newlines are escaped. Parse only in-root regular JSON
+            # artifacts and scan string values so encoded copies cannot evade
+            # the raw byte check; malformed JSON is unsafe and refuses purge.
+            if path.suffix.lower() == ".json":
+                try:
+                    decoded = json.loads(raw_data.decode("utf-8"))
+                    if contains_semantic_needle(decoded):
+                        return False
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def _preflight_pages_clean(conn: sqlite3.Connection, requested: list[str], data_dir: Path) -> bool:
+    """Dry-run the connection-local purge before the live transaction.
+
+    The clone sees the exact post-apply survivor set used for byte needles, so
+    soon-to-be-deleted rows cannot accidentally sanction a page copy.
+    """
+    pages_root = data_dir / "pages"
+    if not os.path.lexists(str(pages_root)):
+        # Check the data-root/pages boundary before accepting absence: a
+        # reparse point there must not turn a missing page tree into a
+        # fail-open purge preflight.
+        return _scan_page_artifacts(pages_root, [])
+    clone = sqlite3.connect(":memory:")
+    clone.row_factory = sqlite3.Row
+    try:
+        # Register vec0 before backup when the live schema contains its virtual
+        # table; SQLite otherwise cannot materialize the snapshot safely.
+        if _table_exists(conn, "memory_vec"):
+            _load_vec(clone)
+        conn.backup(clone)
+        resolution = _resolve(clone, requested)
+        clone_denylisted = _denylisted_ids(clone)
+        if any(identifier not in clone_denylisted for identifier in resolution["missing"]):
+            return False
+        applied = _apply_purge_transaction(clone, resolution)
+        needles = _needles(clone, applied)
+        return _scan_page_artifacts(pages_root, needles)
+    except (sqlite3.Error, OSError, RuntimeError, ValueError):
+        return False
+    finally:
+        clone.close()
+
+
 def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, int], dict[str, str]]:
     """optimize -> VACUUM -> checkpoint (busy flag checked) -> byte-verify."""
 
@@ -862,6 +949,13 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 print("[zmem] purge REFUSED: unknown id(s): %s"
                       % ", ".join(unknown), file=sys.stderr)
                 return 3
+            # Pages are immutable derived copies outside SQLite. Derive the
+            # exact post-purge needles in a clone, then refuse before mutating
+            # live state if any safe-to-read page artifact still carries one.
+            if res["chain"] and not _preflight_pages_clean(conn, ids, STORE_PATH.parent):
+                print("[zmem] purge REFUSED: page artifacts require explicit operator cleanup before purge",
+                      file=sys.stderr)
+                return 4
             retry_ids = [i for i in ids if i in denylisted]
             if res["chain"]:
                 try:

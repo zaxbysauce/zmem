@@ -22,6 +22,12 @@ README.
   recorded JSON action file and never writes page content into canonical memory.
   Read/list are SQLite-independent, refresh is read-only against an existing
   store, and failed or partial publication preserves the prior committed page.
+  Documentation now records evidence-first namespace/root guards, literal tag
+  matching, the finite newest-50 passive verification policy, private source
+  content binding with legacy passive withholding, operator-owned residue
+  cleanup, and the platform limits on directory durability. The local adapter
+  configuration is `ZMEM_PAGE_ADAPTER_ACTIONS`; missing or invalid actions
+  refuse before the store or maintenance lock is touched.
 
 ## [0.76.0] - 2026-10-01
 

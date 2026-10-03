@@ -144,7 +144,14 @@ class PagesReviewFeedback(unittest.TestCase):
                     db.close()
 
     def test_page_relevance_uses_recall_fts_token_and_prefix_semantics(self):
-        """Derived pages cannot turn interior substrings into lexical hits."""
+        """Use grounded bullet/source prose after the F-003 markup-only repair.
+
+        The old ``caf``/``cafe`` assertions relied on ``Stable bytes: cafe``
+        in the ungrounded fixture boilerplate and failed once structural page
+        text was correctly removed from the relevance index.  Refreshing after
+        changing a canonical source keeps the Unicode/prefix assertion tied to
+        real represented content and also verifies the F-006 stale-page gate.
+        """
         with tempfile.TemporaryDirectory(prefix="zmem-pages-feedback-relevance-") as tmp:
             root = Path(tmp)
             with _HELPERS._isolated_env(root):
@@ -159,9 +166,19 @@ class PagesReviewFeedback(unittest.TestCase):
                             namespace=_HELPERS.NAMESPACE,
                         )
 
-                    # ``afe`` is an interior substring of stable ``cafe``;
-                    # ordinary recall's unicode61 FTS prefix expression does
-                    # not admit it. The prior raw ``term in haystack`` did.
+                    db.execute(
+                        "UPDATE memory SET content=? WHERE id=?",
+                        ("Café run-book grounded source", _HELPERS.SOURCE_IDS[1]),
+                    )
+                    db.commit()
+                    # Before refresh, the same-id source-content hash makes
+                    # the stale page unavailable to passive delivery.
+                    self.assertEqual(candidates("caf"), [])
+                    _HELPERS._refresh(pages, db, root)
+
+                    # ``afe`` is an interior substring of grounded ``cafe``;
+                    # unicode61 FTS admits the prefix and accent-folded token,
+                    # while the old raw substring check admitted ``afe`` too.
                     self.assertEqual(candidates("afe"), [])
                     self.assertEqual(len(candidates("caf")), 1)
                     self.assertEqual(len(candidates("cafe")), 1)
@@ -173,6 +190,8 @@ class PagesReviewFeedback(unittest.TestCase):
                         ("unrelated ordinary content", "id", "00000000-0000-4000-8000-000000000502"),
                     )
                     db.commit()
+                    self.assertEqual(candidates("id"), [])
+                    _HELPERS._refresh(pages, db, root)
                     self.assertEqual(len(candidates("id")), 1)
                     self.assertEqual(candidates("ca"), [])
 

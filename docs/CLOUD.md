@@ -895,6 +895,20 @@ grounding. Empty, invalid, exceptional, or partially published refreshes
 preserve the last committed pointer, projection, checksum, version id, and
 watermark and report `[zmem] page refresh: refused`.
 
+Eligibility is evidence-first: the requested namespace and resolved data root
+are validated before a page source can participate, and every represented
+ordinary source must have a live evidence row. New candidates without evidence
+are excluded before publication; if a previously published live source loses
+its evidence during revalidation, refresh refuses and preserves the committed
+pointer. Page IDs and page directories
+must remain regular, contained filesystem paths. Refresh tags are repeated
+literal values over stored comma-separated tokens: only delimiter-edge
+whitespace is trimmed, while internal spaces and case are exact. A comma in a
+requested tag is literal input, not a wildcard, and stored commas have no
+escaping extension. A blank or whitespace-only query keeps the existing
+recent-query selector behavior; a nonblank query that normalizes to zero terms
+has zero lexical coverage.
+
 The first refresh may bootstrap a page directory from a valid existing
 `page.md`, preserving every untouched section byte-for-byte; it records the
 supplied namespace, query, and sorted tags in a new `definition.json` and
@@ -917,6 +931,15 @@ raw page queries, or executable instruction fields are interpreted. Missing
 recorded configuration is rejected before the store or maintenance lock is
 touched. Invalid actions preserve the prior committed page.
 
+The adapter is a data-only local maintenance input. It cannot run commands,
+load code, access the network, or name files. The page CLI does not populate or
+drop a cache as part of these operations. `ZMEM_PAGE_ADAPTER_ACTIONS` must be a
+nonblank path to an existing file; a missing or unusable configured path is
+refused before the store is opened. An existing recording is opened and
+validated during refresh, so unreadable bytes, malformed JSON, and over-limit
+actions follow the normal atomic refresh refusal. Adapter failures preserve the
+last committed page and do not change canonical memory.
+
 Passive delivery uses the existing shared selector, token budget, lane floors,
 untrusted fence, and delivery ledger. A page is admitted and budgeted as one
 candidate; represented canonical sources are suppressed only after the page
@@ -925,13 +948,49 @@ dropping a page suppresses zero represented source rows. The recorded
 `evidence/gates/172-observation.json` currently says `reject`, so page metadata
 does not expose `runbook` and the `ALLOWED_TYPES` vocabulary is unchanged.
 
+Passive verification has a finite cost policy. Metadata discovery may enumerate
+pages, but expensive source/evidence verification is limited to the 50
+namespace-matching committed pages with the greatest canonical source snapshot
+watermark (maximum source `ingestion_ts` plus snapshot hash), ordered
+descending and then by page ID ascending. A 51st page is deterministically
+withheld. It re-enters only when a later refresh advances its canonical source
+snapshot watermark sufficiently; refreshing an unchanged snapshot preserves
+its watermark and may leave it withheld. A foreign namespace cannot displace
+an eligible page. This policy documents the bound without promising a
+universal filesystem latency.
+
 Publication uses a temporary nonce staging directory and installs the
 immutable version and projection before replacing `current.json` last. An
-ordinary precommit failure restores the prior projection and removes the new
-unreferenced version. A process crash can leave staging or unreferenced
-version residue; readers ignore anything not named by the valid current
-pointer, and a later locked refresh may clean residue and restore the
-projection. If filesystem rollback itself fails, refresh reports an explicit
-refusal and the last valid pointer remains authoritative. The implementation
-does not claim atomic recovery when the filesystem cannot provide the required
-operations.
+ordinary precommit failure restores the prior projection and removes the just-
+installed uncommitted version while leaving prior immutable history untouched.
+A process crash can leave staging or unreferenced version
+residue; readers ignore anything not named by the valid current pointer. There
+is no automatic garbage collector: operator maintenance removes a whole
+staging or page artifact only after inspection, then retries the operation. A
+first publication recovery takes a fresh authority snapshot and preserves any
+existing immutable versions. No individual version is deleted as a repair.
+If filesystem rollback itself fails, refresh reports an explicit refusal and
+the last valid pointer remains authoritative. Directory fsync is used where
+the platform supports it; Windows directory durability limits remain explicit,
+so the implementation does not claim a universal crash-atomic filesystem.
+
+Page versions use a private format-2 source-content binding. The binding stores
+the UTF-8 content hash for each represented source and is checked before
+passive admission, while `page_read`, `page_list`, and `page_for_injection`
+retain their existing public key sets. `page_read` returns the version keys
+`version_id`, `freshness_watermark`, `source_ids`, `evidence_ids`,
+`retracted_source_ids`, `page_checksum`, and `content`, plus `namespace` and
+the existing optional `bullet_sources`; `format_version` and
+`source_content_hashes` remain private. Legacy format-1 versions stay
+operator-readable but are withheld from passive delivery until a normal
+refresh creates a bound version. Unknown formats are refused. A source
+content change therefore causes passive withholding and refresh recovery rather
+than rewriting old history.
+
+Before canonical `purge` deletes live rows, it preflights derived needles
+against the whole pages artifact directory. An existing needle, unsafe path,
+or unscannable artifact fails closed before the row-deletion transaction. The
+operator inspects and removes the whole affected page or staging artifact,
+then retries; historical page versions are never individually deleted as
+cleanup. Passive credential withholding is a delivery decision and does not
+claim at-rest encryption or redaction of the stored page content.

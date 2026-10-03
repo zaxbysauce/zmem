@@ -314,6 +314,21 @@ def _schema_compat(store_version: int, path) -> str:
 _schema_compat._warned = False
 
 
+def assert_readonly_compatible(conn: sqlite3.Connection) -> None:
+    """Check an already-open read-only connection without migrating it."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError("zmem: page refresh requires a compatible initialized store") from exc
+    if row is None:
+        raise RuntimeError("zmem: page refresh requires a store schema_version")
+    try:
+        version = int(row[0])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("zmem: page refresh store has invalid schema_version") from exc
+    _schema_compat(version, "page refresh store")
+
+
 def _commit(conn: sqlite3.Connection) -> None:
     """conn.commit() with a bounded retry on 'database is locked' — belt and
     suspenders past PRAGMA busy_timeout for the multi-writer box-wide store

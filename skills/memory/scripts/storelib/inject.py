@@ -1188,6 +1188,7 @@ def select_and_budget_for_injection(
         # page helper validates immutable artifacts and rechecks live source
         # and evidence membership; failures simply withhold the derived row.
         # This preserves the existing recall path for ordinary rows.
+        ordinary_rows = list(rows)
         try:
             page_rows = list(page_rows_pre)
             candidate_ids = _ordered_unique(candidate_ids + page_candidate_ids_pre)
@@ -1197,7 +1198,6 @@ def select_and_budget_for_injection(
                 # First let pages compete without rows they represent.  If a
                 # page does not survive (including credential withholding),
                 # restore its canonical rows and re-admit that fallback pool.
-                ordinary_rows = list(rows)
                 page_secret_markers = []
                 safe_page_rows = []
                 for row in page_rows:
@@ -1287,9 +1287,11 @@ def select_and_budget_for_injection(
                 parsed["budget_note"] = budget_note(_budget_stats)
         except Exception:
             # Page discovery is derived-data enrichment. Existing canonical
-            # injection must retain its fail-safe behavior if a page directory
-            # is malformed or unavailable.
-            pass
+            # injection must retain its fail-safe behavior under the original
+            # caller budget, never the temporary widened recall budget.
+            rows, _used, _dropped, _stats = apply_token_budget(
+                ordinary_rows, budget, with_stats=True,
+                legacy_injection_wire=True)
         # Issue #256: read-time credential re-scan on the passive lane —
         # the defense-in-depth twin of the prompt-injection re-scan. Every
         # selected row matching SECRET_CREDENTIAL_PATTERNS (content /
