@@ -222,8 +222,8 @@ association behavior.
 
 The explicit `source` commands provide a bounded, local explanation for an
 existing memory. They resolve evidence associations before considering the
-stored source reference, authorize the project/global namespace and approved
-source root, and refuse missing, unsafe, ambiguous, or unavailable sources.
+stored source reference, authorize the project/global namespace and source
+authority, and refuse missing, unsafe, ambiguous, or unavailable sources.
 They do not browse arbitrary files, write the store, update namespace caches,
 or make network calls.
 
@@ -246,6 +246,24 @@ canonical Hermes database is absent. File-backed records calculate offsets in
 the original UTF-8 bytes. Native Hermes and ZCode records retain stable
 source/session/message identifiers and return explicit `null` byte offsets
 when their stores do not retain the original transcript byte stream.
+
+`ZMEM_TRANSCRIPT`, `ZMEM_AGENT_TRANSCRIPT`, and `ZMEM_CODEX_MEMORY` are trusted
+operator selections of one exact local regular file. A relative provenance
+basename can select only that configured file when its basename matches; it
+cannot select a sibling, parent, alternate file, or a new root. Absolute
+paths, URLs, UNC paths, and traversal references refuse even when they spell
+the configured file. `ZMEM_HERMES_SESSIONS` and `HERMES_HOME/sessions` provide
+directory authority instead: candidates must remain contained by the selected
+directory, pass regular-file and reparse checks, and stay within the existing
+file and count bounds. When no explicit input is set, the canonical roots are
+`~/.codex/MEMORY.md` and `~/.hermes/sessions`. Memory rows, evidence rows, and
+other metadata never grant file-reading authority.
+
+Source lookup keeps the exact requested namespace available even when legacy
+alias metadata has a non-project shape; such aliases are ignored. Only
+project-to-project compatibility aliases are followed, and malformed alias
+metadata refuses safely. Ordinary recall and namespace migration keep their
+existing behavior.
 
 The lookup opens existing SQLite sources with `mode=ro` and
 `query_only=1`. It may coordinate an existing SQLite `-shm`; a newly created
@@ -943,7 +961,9 @@ MCP server:
 | `ZMEM_MCP_DEFAULT_NS` | Opt-in configured default namespace for MCP `add` when the client omits it (issue #71 C; `user:global` otherwise — never a near-miss form like `global`). | — |
 | `ZMEM_AUTO_REKEY` | `0` disables the automatic near-miss namespace rekey on store open (issue #71 C; `--no-auto-rekey` per invocation). | `1` |
 | `ZMEM_HERMES_CORRECTIONS` | `0` disables Hermes correction capture on `pre_llm_call` (issue #71 D; default ON for parity with the other hosts). | `1` |
-| `ZMEM_CODEX_MEMORY` | Codex MEMORY.md path for `mine-history --source codex` (issue #71 I). | `~/.codex/MEMORY.md` |
+| `ZMEM_TRANSCRIPT` | Exact operator-selected Claude transcript file for provenance lookup. The file must be regular and its configured basename must match the relative source reference. | — |
+| `ZMEM_AGENT_TRANSCRIPT` | Exact operator-selected Claude agent transcript file for provenance lookup, with the same basename and regular-file checks as `ZMEM_TRANSCRIPT`. | — |
+| `ZMEM_CODEX_MEMORY` | Codex `MEMORY.md` path for `mine-history --source codex` and exact-file provenance lookup. | `~/.codex/MEMORY.md` |
 | `ZMEM_HERMES_SESSIONS` | Hermes session-JSONL root for `mine-history --source hermes` (issue #71 I). | `~/.hermes/sessions` |
 | `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). A bare text file is an UNSCOPED operator token (full access). A JSON file `{"token": "...", "namespaces": ["project:x", "user:global"]}` scopes the token: requests outside the allow-list fail closed with the stable `namespace_not_allowed` error, and scoped tokens must pass an allowed namespace explicitly on every read (issue #65, 10.2). Omitting `namespaces` — or setting it to `null` — means an UNSCOPED operator token (full access), exactly like a bare text file. | — |
 | `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |

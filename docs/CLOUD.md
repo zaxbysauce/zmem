@@ -142,10 +142,10 @@ not unlimited streams. Point recall at the snapshot by running later commands wi
 `source` is an explicit, local read-only lookup over an existing memory's
 evidence association. It is useful when a local session needs to inspect the
 source window that justified a row; it is not a general transcript or file
-browser. The resolver authorizes the namespace and source root first, then
-uses the associated evidence. If an association is present but its source is
-missing, unsafe, ambiguous, or unavailable, the command refuses and does not
-fall back to the row's `source_ref`.
+browser. The resolver authorizes the namespace and source authority first,
+then uses the associated evidence. If an association is present but its
+source is missing, unsafe, ambiguous, or unavailable, the command refuses and
+does not fall back to the row's `source_ref`.
 
 ```bash
 python skills/memory/scripts/store.py source --id <memory-uuid> --context 2
@@ -172,11 +172,24 @@ not retain the original UTF-8 transcript byte stream.
 Authorization is evidence-first and local. `source_ref` is accepted only as a
 relative approved name or recognized scheme identifier; absolute paths, URLs,
 UNC paths, parent escapes, reparse escapes, arbitrary roots, and raw memory
-files are refused. A nonempty `ZMEM_NAMESPACE` value is
-used as the explicit scope. Otherwise, namespace resolution uses the
+files are refused. `ZMEM_TRANSCRIPT`, `ZMEM_AGENT_TRANSCRIPT`, and
+`ZMEM_CODEX_MEMORY` are trusted operator selections of one exact local regular
+file, including when that file is outside the repository or a conventional
+home. A relative basename can select only the exact configured file; it cannot
+select a sibling, parent, alternate file, or a new root. `ZMEM_HERMES_SESSIONS`
+and `HERMES_HOME/sessions` establish directory authority and retain their
+resolved containment, regular-file, reparse, count, and size checks. With no
+explicit input, the canonical defaults are `~/.codex/MEMORY.md` and
+`~/.hermes/sessions`. Memory rows, evidence rows, and other provenance
+metadata never grant file-reading authority. A nonempty `ZMEM_NAMESPACE` value
+is used as the explicit scope. Otherwise, namespace resolution uses the
 normal project identity with cache writes and cache drops disabled for this
-read. The existing namespace alias expansion is applied only within the
-authorized project/global scope. Source lookup opens an existing store with
+read. Source lookup always retains the exact requested namespace; compatibility
+aliases are followed only when both sides are nonempty `project:*` namespaces.
+Malformed metadata refuses safely. Aliases outside that project-to-project
+shape are not followed, while the exact requested namespace remains usable;
+this cannot widen source authorization. Ordinary recall and namespace
+migration are unchanged. Source lookup opens an existing store with
 SQLite `mode=ro` and `query_only=1`; it does not migrate, checkpoint, rekey,
 lease, queue, feedback, telemetry, transcript, or cache state.
 

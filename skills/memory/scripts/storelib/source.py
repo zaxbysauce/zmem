@@ -9,7 +9,6 @@ import re
 import sqlite3
 from typing import Any
 
-from storelib.recall import _expand_namespace_aliases
 from storelib.write import redact_text
 
 MAX_CONTEXT = 20
@@ -83,9 +82,46 @@ def _namespace() -> str:
     return host.resolve_namespace(Path.cwd(), write_cache=False)
 
 
+def _is_project_namespace(value: object) -> bool:
+    return isinstance(value, str) and value.startswith("project:") and len(value) > len("project:")
+
+
+def _source_namespace_aliases(conn: sqlite3.Connection, namespace: str) -> list[str]:
+    """Return source-safe v5 compatibility aliases for ``namespace``."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='ns_migration_v5'"
+        ).fetchone()
+        migration_map = {}
+        if row is not None:
+            migration_map = json.loads(row[0])
+            if (not isinstance(migration_map, dict) or
+                    any(not isinstance(old, str) or not isinstance(new, str)
+                        for old, new in migration_map.items())):
+                raise SourceRefusal("source unavailable")
+    except SourceRefusal:
+        raise
+    except (RecursionError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise SourceRefusal("source unavailable") from exc
+
+    # Preserve the caller's exact scope. Compatibility applies only between
+    # valid project namespaces, never to global or other legacy scopes.
+    if not _is_project_namespace(namespace):
+        return [namespace]
+    aliases = [namespace]
+    if namespace in migration_map:
+        candidate = migration_map[namespace]
+        if _is_project_namespace(candidate):
+            aliases.append(candidate)
+    else:
+        aliases.extend(old for old, new in migration_map.items()
+                       if new == namespace and _is_project_namespace(old))
+    return aliases
+
+
 def _memory(conn: sqlite3.Connection, memory_id: str) -> tuple[sqlite3.Row, str]:
     namespace = _namespace()
-    aliases = _expand_namespace_aliases(conn, namespace) or [namespace]
+    aliases = _source_namespace_aliases(conn, namespace)
     row = conn.execute(
         "SELECT id,namespace,source_ref FROM memory WHERE id=? AND namespace IN (" +
         ",".join("?" for _ in aliases) + ")", [memory_id, *aliases]).fetchone()

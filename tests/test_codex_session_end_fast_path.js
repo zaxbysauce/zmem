@@ -452,10 +452,23 @@ function testDivergentStoreAndDataRoots() {
             result.status === 0 && result.stdout === "{}\n" && result.stderr === ""
             && storeGone && storePreserved && defaultPreserved);
     } finally {
-        // SessionEnd capture may still briefly hold store.sqlite in its detached
-        // child. Node retries transient busy operations after 100 + ... + 1000 ms
-        // (5.5 s for one operation), covering the capture child's 5 s watchdog.
-        fs.rmSync(tree, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        // The detached capture child can briefly hold this tree on Windows.
+        // A root EPERM can bypass Node's internal retries, so retry the whole
+        // operation for the capture watchdog's five seconds plus a margin.
+        const pause = new Int32Array(new SharedArrayBuffer(4));
+        for (let attempt = 0; ; attempt++) {
+            try {
+                fs.rmSync(tree, { recursive: true, force: true });
+                break;
+            } catch (error) {
+                if (process.platform !== "win32"
+                    || !["EPERM", "EBUSY", "ENOTEMPTY"].includes(error.code)
+                    || attempt >= 60) {
+                    throw error;
+                }
+                Atomics.wait(pause, 0, 0, 100);
+            }
+        }
     }
 }
 
