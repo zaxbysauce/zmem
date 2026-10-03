@@ -39,7 +39,6 @@ from typing import Any
 
 from storelib.schema import (
     STORE_PATH,
-    MAINTENANCE_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_POLL_SECONDS,
     SCHEMA_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_WAIT_SECONDS,

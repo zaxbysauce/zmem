@@ -46,6 +46,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO / "skills" / "memory" / "scripts"
@@ -61,6 +62,11 @@ os.environ["ZMEM_STORE"] = os.path.join(_INPROC_TMP, STORE_FILE_NAME)
 os.environ["ZMEM_DATA"] = _INPROC_TMP
 os.environ["ZMEM_AUTO_REKEY"] = "0"
 os.environ["ZMEM_MAINTENANCE_WAIT_SECONDS"] = "0.3"
+# Hermeticity (cubic F-8c): the in-process class classifies by grace age, so
+# an ambient GRACE/POLL override from a developer shell would skew the pins.
+# Pop both so the frozen defaults (grace 10 s, poll 0.05 s) govern the import.
+os.environ.pop("ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS", None)
+os.environ.pop("ZMEM_MAINTENANCE_POLL_SECONDS", None)
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import host  # noqa: E402
@@ -77,6 +83,7 @@ def _pinned_env(tmp: Path, **overrides) -> dict:
     for knob in (
         "ZMEM_MAINTENANCE_LOCK_STALE_SECONDS",
         "ZMEM_MAINTENANCE_WAIT_SECONDS",
+        "ZMEM_MAINTENANCE_POLL_SECONDS",
         "ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS",
     ):
         env.pop(knob, None)
@@ -131,14 +138,16 @@ def _spawn_killed_holder(tmp: Path, token_tail: str = "cafebabe") -> tuple[int, 
     )
     try:
         line = child.stdout.readline()
+        assert line.startswith("ready") and "True" in line, line
+        token = lock_path.read_text(encoding="utf-8").strip()
+        assert token, "child lock file carries no token"
     finally:
+        # Never leak a live sleeper on an assertion failure (cubic F-8d).
+        if child.poll() is None:
+            child.kill()
+        child.wait()
         if child.stdout is not None:
             child.stdout.close()
-    assert line.startswith("ready") and "True" in line, line
-    token = lock_path.read_text(encoding="utf-8").strip()
-    assert token, "child lock file carries no token"
-    child.kill()
-    child.wait()
     return child.pid, token
 
 
@@ -229,6 +238,25 @@ class ReadLockHolderPidTest(unittest.TestCase):
         # makes int() raise despite isdigit() being true.
         self.assertIsNone(self._read(b"9" * 5000 + b":abc"))
 
+    def test_arabic_indic_digit_head_is_none(self):
+        # "٣".isdigit() is True AND int("٣")==3 SUCCEEDS: without the
+        # isascii() gate a foreign lock would probe an unrelated real pid
+        # (review swarm F1 / cubic F-4).
+        self.assertIsNone(self._read("٣:abc".encode("utf-8")))
+
+    def test_oversized_lock_file_is_none(self):
+        # A hostile multi-KB blob at the lock path must not be read into the
+        # parser (bounded-read gate, MAX_LOCK_READ_BYTES).
+        self.assertIsNone(self._read(b"x" * 8192 + b":abc"))
+
+    def test_directory_at_lock_path_is_none(self):
+        # Non-regular lock "files" (dir/fifo/symlink family) classify as
+        # no-recorded-holder via the lstat+S_ISREG gate.
+        (self.tmp / MAINTENANCE_LOCK_NAME).mkdir()
+        self.assertIsNone(
+            host.read_lock_holder_pid(self.tmp / MAINTENANCE_LOCK_NAME)
+        )
+
     def test_valid_token_parses(self):
         self.assertEqual(
             self._read(b"424242:abcdef0123456789"),
@@ -274,6 +302,29 @@ class BreakPhantomLockSafetyTest(unittest.TestCase):
         self.assertTrue(host.break_phantom_lock(lock, "", min_age_seconds=10.0))
         self.assertFalse(lock.exists())
 
+    def test_content_changed_after_rename_is_put_back(self):
+        # The put-back limb: if the moved-aside file's content no longer
+        # matches the classified token at confirm time (a successor installed
+        # content between our pre-read and our rename), the file must be
+        # restored, not dropped. Patched two-phase read: pre-read matches,
+        # confirm read disagrees (cubic F-8a).
+        lock = _plant(self.tmp, b"999999:aaa")
+        real_read_text = Path.read_text
+        calls = {"n": 0}
+
+        def two_phase_read(self_path, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_read_text(self_path, *args, **kwargs)
+            return "777777:bbb"
+
+        with mock.patch.object(Path, "read_text", two_phase_read):
+            self.assertFalse(host.break_phantom_lock(lock, "999999:aaa"))
+        self.assertTrue(lock.exists())
+        self.assertEqual(
+            lock.read_text(encoding="utf-8").strip(), "999999:aaa"
+        )
+
 
 class ProbeDecisionTest(unittest.TestCase):
     """In-process classification: clamp, verdicts, fail-closed unknown."""
@@ -287,6 +338,16 @@ class ProbeDecisionTest(unittest.TestCase):
         self.assertEqual(clamp(0.5), 1.0)
         self.assertEqual(clamp(3.0), 3.0)
         self.assertEqual(clamp(99999.0), schema.MAINTENANCE_LOCK_STALE_SECONDS)
+
+    def test_grace_clamp_floor_holds_when_stale_window_is_sub_second(self):
+        # A sub-second ZMEM_MAINTENANCE_LOCK_STALE_SECONDS must not drag the
+        # grace ceiling (and therefore the floor) below 1 s (cubic F-2).
+        clamp = schema._clamped_maintenance_grace
+        with mock.patch.object(
+            schema, "MAINTENANCE_LOCK_STALE_SECONDS", 0.5
+        ):
+            self.assertEqual(clamp(3.0), 1.0)
+            self.assertEqual(clamp(10.0), 1.0)
 
     def setUp(self):
         self.verdict = schema._inspect_maintenance_phantom
@@ -463,6 +524,8 @@ class EndToEndPhantomRecoveryTest(unittest.TestCase):
             env=_pinned_env(self.tmp),
         )
         self.assertNotEqual(proc.returncode, 4, proc.stderr)
+        # The gate under test is specifically the MAINTENANCE refusal; the
+        # unknown-id refusal legitimately reuses the "purge REFUSED" prefix.
         self.assertNotIn("another maintenance operation", proc.stderr)
 
 

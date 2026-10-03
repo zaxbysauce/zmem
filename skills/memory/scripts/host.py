@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat as _stat
 import subprocess
 import time
 import uuid
@@ -1210,6 +1211,13 @@ def busy_retry(fn, attempts: int = 5):
     raise last_exc
 
 
+# read_lock_holder_pid refuses to read lock "content" from anything larger
+# than this (bytes): a real token is ~50 bytes, so the cap only bites on
+# foreign/oversized blobs planted at the lock path — those classify as
+# no-recorded-holder instead of memory-pressuring the pre-dispatch read.
+MAX_LOCK_READ_BYTES = 4096
+
+
 def process_alive(pid) -> bool | None:
     """True = a process with this pid exists; False = none does; None = cannot
     tell. Best-effort, never raises, no subprocesses (issue #262).
@@ -1234,8 +1242,12 @@ def process_alive(pid) -> bool | None:
     and trusting OpenProcess alone would classify a killed holder as live).
     ERROR_ACCESS_DENIED (5) on the OPEN itself means the process exists and is
     protected; ERROR_INVALID_PARAMETER (87) means no such process. The
-    os.name branch order is load-bearing: os.kill(pid, 0) on Windows is
-    TerminateProcess, not a liveness probe.
+    os.name branch order is load-bearing: os.kill is not a liveness probe on
+    Windows (signal 0 maps to GenerateConsoleCtrlEvent, not an existence
+    check), so the POSIX os.kill(pid, 0) semantics must only run off Windows.
+    POSIX residual: an unreaped zombie passes the signal-0 check (kill(2)
+    succeeds until the parent reaps) — transient, and the caller fail-closes
+    toward today's refusal.
     """
     try:
         pid = int(pid)
@@ -1289,19 +1301,30 @@ def process_alive(pid) -> bool | None:
 def read_lock_holder_pid(path):
     """Read the holder identity out of a lock file (issue #262).
 
-    Returns (token, pid) when the file carries a parseable `<decimal pid>:`
-    token in the process_alive domain; ("", None) when the file exists but is
-    stripped-EMPTY — a live acquirer may legitimately sit there between
+    Returns (token, pid) when the file carries a parseable `<decimal ASCII
+    pid>:` token in the process_alive domain; ("", None) when the file exists
+    but is stripped-EMPTY — a live acquirer may legitimately sit there between
     _try_create_lock's create and its token write, so emptiness is a distinct
-    state, never "dead"; and None when the file is missing, unreadable, or
-    non-empty but unparseable (foreign/manual artifacts, binary junk included).
+    state, never "dead"; and None when the file is missing, non-regular (a
+    directory, fifo, or symlink passed the lstat gate), oversized, unreadable,
+    or non-empty but unparseable (foreign/manual artifacts, binary junk, and
+    non-ASCII decimal digit heads included — `str.isdigit()` accepts script
+    digits whose `int()` either raises or maps to an unrelated real pid, so
+    they are classified as no-recorded-holder, keeping the fail-closed window).
 
-    The read wraps Exception rather than release_lock's OSError-only shape
-    because read_text on non-UTF-8 bytes raises UnicodeDecodeError, a
-    ValueError: the caller runs on the pre-dispatch path of every store
-    command and must degrade to "no recorded holder", never crash. Strip
+    The stat gate is bounded and regular-files-only BEFORE any content is
+    read, and the content read wraps `except Exception` — broader than
+    release_lock's OSError-only shape, which lets `UnicodeDecodeError` (a
+    ValueError) through — so no lock-file content can crash, hang, or
+    memory-pressure the pre-dispatch path of every store command. Strip
     semantics match release_lock (utf-8 text, .strip()).
     """
+    try:
+        st = os.stat(str(path), follow_symlinks=False)
+    except OSError:
+        return None
+    if not _stat.S_ISREG(st.st_mode) or st.st_size > MAX_LOCK_READ_BYTES:
+        return None
     try:
         content = Path(path).read_text(encoding="utf-8").strip()
     except Exception:
@@ -1309,7 +1332,7 @@ def read_lock_holder_pid(path):
     if content == "":
         return ("", None)
     head, sep, _tail = content.partition(":")
-    if not sep or not head.isdigit():
+    if not sep or not head.isascii() or not head.isdigit():
         return None
     try:
         pid = int(head)

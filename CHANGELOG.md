@@ -24,13 +24,22 @@ README.
   instead of failing with "maintenance is active" until the 1800 s stale
   window elapsed. A genuinely live maintenance holder is refused exactly as
   before. The grace window defaults to 10 s and is configurable via
-  `ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS` (values below 1 s or above the stale
-  window are clamped; non-finite or non-positive values fall back to the
-  default). Two disclosed residuals: a lock held by a process in a different
-  PID namespace (containers sharing a store volume) reads as dead and its
-  lock is broken — single-box usage is unaffected — and a lock file whose
-  content is non-empty but unparseable (a foreign/manual artifact zmem's own
+  `ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS` (values below 1 s — including when a
+  sub-second `ZMEM_MAINTENANCE_LOCK_STALE_SECONDS` would drag the ceiling
+  down — or above the stale window are clamped; non-finite or non-positive
+  values fall back to the default). Disclosed residuals: a lock held by a
+  process in a different PID namespace on the same machine (containers or
+  PID-unsharing sandboxes sharing a store volume) reads as dead and its lock
+  is broken — writers still fail closed through the schema lock, but
+  Hermes existing-only writers and restores/purges longer than the 300 s
+  schema-lock stale window are the residual exposure; pid reuse and unreaped
+  POSIX zombies can read as alive, which simply keeps today's fail-closed
+  behavior until the stale window; and a lock file whose content is
+  non-empty but unparseable (a foreign/manual artifact zmem's own
   primitives do not produce) keeps today's full 1800 s staleness window.
+  Lock-file reads are bounded to regular files ≤ 4 KB, so foreign or
+  non-regular content at the lock path degrades to "no recorded holder"
+  rather than being parsed.
 
 ## [0.76.0] - 2026-10-01
 

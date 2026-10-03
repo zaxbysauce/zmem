@@ -533,11 +533,14 @@ def _clamped_maintenance_grace(raw: float) -> float:
     a live acquirer's create-then-token-write gap can produce: _env_float
     happily parses "nan"/"inf" (and nan fails both < and > comparisons), so
     the gate is `not isfinite or <= 0` FIRST — those are treated as unset —
-    and only then the floor (1.0 s) and ceiling (the stale window) apply.
+    and only then the floor (1.0 s) and ceiling apply. The ceiling itself is
+    floored at 1.0 s (`max(STALE, 1.0)`) so a sub-second
+    ZMEM_MAINTENANCE_LOCK_STALE_SECONDS can never drag the grace window below
+    the documented 1 s floor via the min() that runs after the floor.
     """
     if not math.isfinite(raw) or raw <= 0.0:
         return MAINTENANCE_GRACE_DEFAULT_SECONDS
-    return min(max(raw, 1.0), MAINTENANCE_LOCK_STALE_SECONDS)
+    return min(max(raw, 1.0), max(MAINTENANCE_LOCK_STALE_SECONDS, 1.0))
 
 
 MAINTENANCE_LOCK_GRACE_SECONDS = _clamped_maintenance_grace(
