@@ -10,6 +10,28 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.78.0] - 2026-10-03
+
+### Added
+- **Deterministic curated knowledge pages (issue #138):** explicit filesystem
+  pages with immutable version history, grounded source and evidence metadata,
+  deterministic refresh watermarks, byte-preserving section deltas, tombstone
+  retractions, and passive delivery through the shared selector, floors,
+  budget, untrusted fence, and delivery ledger. Added `page read`, `page list`,
+  and `page refresh`; the optional local maintenance adapter is a bounded,
+  recorded JSON action file and never writes page content into canonical memory.
+  Read/list are SQLite-independent, refresh is read-only against an existing
+  store, and failed or partial publication preserves the prior committed page.
+  Documentation now records evidence-first namespace/root guards, literal tag
+  matching, the finite newest-50 passive verification policy, private source
+  content binding with legacy passive withholding, operator-owned residue
+  cleanup, and the platform limits on directory durability. The local adapter
+  configuration is `ZMEM_PAGE_ADAPTER_ACTIONS`; a missing or non-file
+  configured path refuses before the store or maintenance lock is touched.
+  An existing recording is opened and validated during refresh, so malformed
+  JSON, unreadable bytes, and over-limit actions follow the normal atomic
+  refresh refusal after the store is opened.
+
 ## [0.77.0] - 2026-10-02
 
 ### Fixed

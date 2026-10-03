@@ -842,3 +842,166 @@ decision (`evidence/gates/172-observation.json`): the type is added to the
 effective vocabulary only when that artifact records `accept`; `reject`
 (default and currently recorded) leaves the type vocabulary unchanged and
 ships virtual heads only.
+
+## Curated knowledge pages (issue #138)
+
+Curated pages are explicit, local filesystem artifacts grounded in the
+canonical store. They are not memory rows and they never feed page text,
+page paths, or `page:` source references back into canonical memory. Pages use
+the same resolved data root as the passive selector and delivery ledger. The
+resolution chain gives an explicit `ZMEM_STORE` path precedence over
+`ZMEM_DATA`, so an explicit store keeps `pages/` beside that store; when no
+store path is set, `ZMEM_DATA` supplies the data directory before the host
+fallbacks. Each validated page id has its own directory:
+
+```
+<resolved-data-root>/pages/<page-id>/
+  definition.json
+  current.json
+  page.md
+  versions/v000001.json
+  versions/v000002.json
+```
+
+`definition.json` records the namespace, refresh query, sorted tags, generator
+revision, and creation policy. Each version JSON stores the canonical Markdown
+and its source/evidence grounding. `current.json` is the committed pointer and
+records the version id, freshness watermark, source ids, evidence ids,
+retracted source ids, and the 64-character page checksum. Version files are
+immutable and JSON is sorted, compact UTF-8 with one final LF. `page.md` is a
+compatibility projection; reads and historical reads use the validated pointer
+and immutable version. A lagging or missing projection is repaired only by a
+locked refresh, never by `page read` or `page list`.
+
+Use the explicit commands below. `read` and `list` inspect only the page
+filesystem and do not create, migrate, or open SQLite. `refresh` requires an
+existing store, opens it read-only with query-only mode, waits for the normal
+maintenance/writer quiescence protocol inside the page library, and writes no
+canonical memory rows.
+
+```
+python <store.py> page read --id <page-id> [--version <version-id>]
+python <store.py> page list [--namespace <namespace>]
+python <store.py> page refresh --id <page-id> --query "<source query>" \
+  --namespace <namespace> [--tag <tag>]... [--llm-local]
+```
+
+Refresh snapshots belief heads and live rows matching every requested tag,
+revalidates namespace, temporal, confidence, trust, taint, and evidence
+eligibility before publication, and derives a deterministic freshness
+watermark from the eligible source snapshot. A source tombstone is retracted
+in the next successful version; older versions retain their original text and
+grounding. Empty, invalid, exceptional, or partially published refreshes
+preserve the last committed pointer, projection, checksum, version id, and
+watermark and report `[zmem] page refresh: refused`.
+
+Eligibility is evidence-first: the requested namespace and resolved data root
+are validated before a page source can participate, and every represented
+ordinary source must have a live evidence row. New candidates without evidence
+are excluded before publication; if a previously published live source loses
+its evidence during revalidation, refresh refuses and preserves the committed
+pointer. Page IDs and page directories
+must remain regular, contained filesystem paths. Refresh tags are repeated
+literal values over stored comma-separated tokens: only delimiter-edge
+whitespace is trimmed, while internal spaces and case are exact. A comma in a
+requested tag is literal input, not a wildcard, and stored commas have no
+escaping extension. A blank or whitespace-only query keeps the existing
+recent-query selector behavior; a nonblank query that normalizes to zero terms
+has zero lexical coverage.
+
+The first refresh may bootstrap a page directory from a valid existing
+`page.md`, preserving every untouched section byte-for-byte; it records the
+supplied namespace, query, and sorted tags in a new `definition.json` and
+publishes `v000001`. A genuinely new directory receives the default required
+refresh section. Once a definition is committed, a refresh with a different
+namespace, query, or tag set is refused without changing any artifact. This
+prevents a command from silently retargeting an existing page.
+
+The optional `--llm-local` path is a recorded local adapter for deterministic
+maintenance tests and offline operation. Set `ZMEM_PAGE_ADAPTER_ACTIONS` to a
+local JSON action file. The adapter receives at most 20 bounded candidates;
+each content field is capped at 400 UTF-8 bytes, and each Markdown operation
+at 4000 UTF-8 bytes. Each action set permits at most 20 operations, with at
+most 20 distinct citations per operation. Serialized definition, pointer,
+and version JSON are each limited to 262144 UTF-8 bytes before publication.
+Only `replace_section`, `append_bullet`, and
+`retract_bullet` operations with in-scope citations are accepted. The file is
+data only: no shell commands, dynamic imports, network calls, filesystem paths,
+raw page queries, or executable instruction fields are interpreted. Missing
+recorded configuration is rejected before the store or maintenance lock is
+touched. Invalid actions preserve the prior committed page.
+
+The adapter is a data-only local maintenance input. It cannot run commands,
+load code, access the network, or name files. The page CLI does not populate or
+drop a cache as part of these operations. `ZMEM_PAGE_ADAPTER_ACTIONS` must be a
+nonblank path to an existing file; a missing or unusable configured path is
+refused before the store is opened. An existing recording is opened and
+validated during refresh, so unreadable bytes, malformed JSON, and over-limit
+actions follow the normal atomic refresh refusal. Adapter failures preserve the
+last committed page and do not change canonical memory.
+
+Passive delivery uses the existing shared selector, token budget, lane floors,
+untrusted fence, and delivery ledger. A page is admitted and budgeted as one
+candidate; represented canonical sources are suppressed only after the page
+itself is admitted and rendered. Filtering, floor rejection, or budget
+dropping a page suppresses zero represented source rows. The recorded
+`evidence/gates/172-observation.json` currently says `reject`, so page metadata
+does not expose `runbook` and the `ALLOWED_TYPES` vocabulary is unchanged.
+
+Passive verification has a finite cost policy. Metadata discovery may enumerate
+pages, but expensive source/evidence verification is limited to the 50
+namespace-eligible committed pages with the greatest canonical source snapshot
+watermark (maximum source `ingestion_ts` plus snapshot hash), ordered
+descending and then by page ID ascending. The eligible set is the requested
+namespace plus `user:global`, and both share this one 50-page cap; a newer
+global page can therefore displace a page from the requested namespace. A 51st
+eligible page is deterministically withheld. It re-enters only when a later
+refresh advances its canonical source snapshot watermark sufficiently;
+refreshing an unchanged snapshot preserves its watermark and may leave it
+withheld. A foreign namespace remains outside the eligible set. This policy
+documents the bound without promising a universal filesystem latency.
+
+Publication uses a temporary nonce staging directory and installs the
+immutable version and projection before replacing `current.json` last. An
+ordinary precommit failure restores the prior projection and removes the just-
+installed uncommitted version while leaving prior immutable history untouched.
+A process crash can leave staging or unreferenced version residue. Default and
+passive readers ignore anything not named by the valid current pointer, while
+an explicit `page read --version` selects and validates the requested version
+file directly; it can read valid unreferenced residue and does not prove that
+the version is the committed current pointer. There is no automatic garbage
+collector: operator maintenance removes a whole staging or page artifact only
+after inspection, then retries the operation. A first publication recovery
+takes a fresh authority snapshot and preserves any existing immutable
+versions. No individual version is deleted as a repair.
+If filesystem rollback itself fails, refresh reports an explicit refusal and
+the last valid pointer remains authoritative. Directory fsync is used where
+the platform supports it; Windows directory durability limits remain explicit,
+so the implementation does not claim a universal crash-atomic filesystem.
+
+Page versions use a private format-2 source-content binding. The binding stores
+the UTF-8 content hash for each represented source and is checked before
+passive admission, while `page_read`, `page_list`, and `page_for_injection`
+retain their existing public key sets. `page_read` returns the version keys
+`version_id`, `freshness_watermark`, `source_ids`, `evidence_ids`,
+`retracted_source_ids`, `page_checksum`, and `content`, plus `namespace` and
+the existing optional `bullet_sources`; `format_version` and
+`source_content_hashes` remain private. Legacy format-1 versions stay
+operator-readable but are withheld from passive delivery until a normal
+refresh creates a bound version. Unknown formats are refused. A source
+content change therefore causes passive withholding and refresh recovery rather
+than rewriting old history.
+
+Before canonical `purge` deletes live rows, it preflights derived needles
+against the whole pages artifact directory. An existing needle, unsafe path,
+or unscannable artifact fails closed before the row-deletion transaction. The
+operator inspects and removes the whole affected page or staging artifact,
+then retries; historical page versions are never individually deleted as
+cleanup. When page artifacts exist, the preflight intentionally snapshots the
+full live SQLite database into an in-memory connection, reapplies the pending
+purge there, and derives needles from the exact post-purge survivor set. This
+privacy check has memory and latency that scale with the store; no performance
+bound is promised. If the snapshot or artifact scan cannot complete, purge
+refuses before live row deletion. Passive credential withholding is a delivery
+decision and does not claim at-rest encryption or redaction of the stored page
+content.

@@ -314,6 +314,57 @@ def _schema_compat(store_version: int, path) -> str:
 _schema_compat._warned = False
 
 
+_PAGE_REFRESH_REQUIRED_COLUMNS = {
+    # Pages revalidate canonical memory evidence and virtual belief heads on
+    # every refresh.  Evidence arrived with v14, while belief heads are an
+    # additive side schema that can be absent from a store whose meta marker is
+    # otherwise current.  A read-only refresh cannot repair either condition.
+    "evidence": {"id"},
+    "memory_evidence": {"memory_id", "evidence_id"},
+    "belief_head": {
+        "id", "namespace", "topic_identity", "content", "head_state",
+        "head_source_id", "support_count", "refresh_watermark",
+        "generator_revision", "confidence", "signal", "taint",
+        "trust_score",
+    },
+    "belief_head_source": {
+        "head_id", "source_id", "role", "source_ingestion_ts",
+        "source_checksum",
+    },
+    "belief_head_evidence": {"head_id", "source_id", "evidence_id"},
+}
+
+
+def assert_readonly_compatible(conn: sqlite3.Connection) -> None:
+    """Check an already-open page-refresh connection without migrating it."""
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)).fetchone()
+    except sqlite3.Error as exc:
+        raise RuntimeError("zmem: page refresh requires a compatible initialized store") from exc
+    if row is None:
+        raise RuntimeError("zmem: page refresh requires a store schema_version")
+    try:
+        version = int(row[0])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("zmem: page refresh store has invalid schema_version") from exc
+    _schema_compat(version, "page refresh store")
+    if version < 14:
+        raise RuntimeError("zmem: page refresh requires schema_version 14 or newer")
+    try:
+        for table, required_columns in _PAGE_REFRESH_REQUIRED_COLUMNS.items():
+            columns = {str(row[1]) for row in conn.execute(
+                "PRAGMA table_info(%s)" % table
+            )}
+            if not required_columns.issubset(columns):
+                raise RuntimeError(
+                    "zmem: page refresh requires complete evidence and belief tables"
+                )
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            "zmem: page refresh requires complete evidence and belief tables"
+        ) from exc
+
+
 def _commit(conn: sqlite3.Connection) -> None:
     """conn.commit() with a bounded retry on 'database is locked' — belt and
     suspenders past PRAGMA busy_timeout for the multi-writer box-wide store

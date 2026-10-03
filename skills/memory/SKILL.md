@@ -172,6 +172,98 @@ store/db open `mode=ro`, the report never writes, and a missing/old store is
 an error (never created, never migrated). Memory content stays out of the
 default output (ids/namespaces only; `--miss-verbose` adds a short preview).
 
+### page — read, list, and refresh curated pages (issue #138)
+
+```
+python <store.py> page read --id <page-id> [--version <version-id>]
+python <store.py> page list [--namespace <namespace>]
+python <store.py> page refresh --id <page-id> --query "<source query>" \
+  --namespace <namespace> [--tag <tag>]... [--llm-local]
+```
+
+Curated pages are local filesystem artifacts grounded in canonical memory.
+`read` and `list` are SQLite-independent and never create, migrate, or open a
+store. `refresh` requires an existing store, uses the normal read-only and
+maintenance coordination, and writes no canonical memory rows. The namespace,
+resolved data root, page ID, and regular contained page paths are validated
+before source selection. New candidates without evidence are excluded before
+publication; if a previously published live source loses its evidence during
+revalidation, refresh refuses and preserves the committed pointer.
+
+`--tag` is repeatable. Each tag is one literal over stored comma-separated
+tokens: only delimiter-edge whitespace is trimmed, while internal spaces and
+case are exact. A comma in a requested tag is literal input, not a wildcard,
+and stored commas have no escaping extension. A blank or whitespace-only query
+keeps the existing recent-query selector behavior; a nonblank query that
+normalizes to zero terms has zero lexical coverage. The refresh snapshot and
+its source/evidence associations are revalidated before publication, so a
+changed source causes a refusal and leaves the prior committed pointer intact.
+
+The optional `--llm-local` adapter is enabled only by setting
+`ZMEM_PAGE_ADAPTER_ACTIONS` to a non-empty local JSON action file. It is a
+bounded data-only input for offline maintenance; it cannot run commands, load
+code, access the network, or name files. The page CLI does not populate or drop
+a cache as part of these operations. `ZMEM_PAGE_ADAPTER_ACTIONS` must be a
+nonblank path to an existing file; a missing or unusable configured path is
+refused before the store is opened. An existing recording is opened and
+validated during refresh, so unreadable bytes, malformed JSON, and over-limit
+actions follow the normal atomic refresh refusal. An adapter failure leaves
+canonical memory and the last committed page unchanged.
+
+Passive page verification uses a finite cost policy. Metadata discovery may
+scale with the page directory, but expensive source/evidence verification is
+limited to the 50 namespace-eligible committed pages with the greatest
+canonical source snapshot watermark (maximum source `ingestion_ts` plus
+snapshot hash), ordered descending and then by page ID ascending. The eligible
+set is the requested namespace plus `user:global`, and both share this one
+50-page cap; a newer global page can therefore displace a page from the
+requested namespace. A 51st eligible page is deterministically withheld. It
+re-enters only when a later refresh advances its canonical source snapshot
+watermark sufficiently; refreshing an unchanged snapshot preserves its
+watermark and may leave it withheld. Foreign namespaces remain outside the
+eligible set. This is a selection bound, not a universal filesystem latency
+guarantee.
+
+Publication stages into a nonce directory and replaces `current.json` last.
+Default and passive readers use only the valid pointer, so interrupted staging
+or an unreferenced version is residue for operator maintenance. An explicit
+`page read --version` selects and validates the requested version file directly;
+it can read a valid unreferenced version left by interrupted publication and
+does not prove that the version is the committed current pointer. There is no
+automatic garbage collector. First-publication recovery takes a fresh
+authority snapshot and preserves immutable history. Cleanup removes a whole
+inspected artifact and retries the operation; it never deletes an individual
+historical version as a repair. Directory fsync is used where supported, with
+explicit Windows directory durability limits and no universal crash-atomicity
+claim.
+
+Version-2 pages privately bind each represented source to its UTF-8 content
+hash. The public shapes remain stable: `page_read` exposes the existing version
+keys plus `content` and `namespace` (and optional `bullet_sources`), while
+`page_list` and `page_for_injection` retain their existing key sets. The
+private `format_version` and `source_content_hashes` fields never appear in
+those public results. Legacy version-1 pages remain operator-readable but are
+withheld from passive delivery until a normal refresh creates a bound version;
+unknown formats are refused. Content changes withhold the page and require
+refresh, without rewriting old history.
+
+Before canonical `purge` deletes live rows, it preflights derived needles
+against the whole pages artifact directory. An existing needle, unsafe path,
+or unscannable artifact fails closed before the row-deletion transaction. The
+operator inspects and removes the whole affected page or staging artifact,
+then retries; historical page versions are never individually deleted as
+cleanup. When page artifacts exist, the preflight intentionally snapshots the
+full live SQLite database into an in-memory connection, reapplies the pending
+purge there, and derives needles from the exact post-purge survivor set. This
+privacy check has memory and latency that scale with the store; no performance
+bound is promised. If the snapshot or artifact scan cannot complete, purge
+refuses before live row deletion. Passive credential withholding controls
+delivery only; it does not promise encryption or redaction of page content at
+rest.
+
+The current observation gate is recorded as `reject`, so page metadata omits
+`runbook` and the `ALLOWED_TYPES` vocabulary remains unchanged.
+
 ### recall — surface relevant memories (high-precision)
 ```
 python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
