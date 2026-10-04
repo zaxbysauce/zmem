@@ -1933,6 +1933,12 @@ def main():
 
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
+    p_search.add_argument("--exact", action="store_true",
+                          help="literal substring existence check: match --text "
+                               "verbatim against memory content (no FTS "
+                               "tokenization, stop-words, or query syntax; "
+                               "case-sensitive; same --namespace/--as-of/"
+                               "--exclude filters)")
     p_search.add_argument("--namespace", default=None)
     p_search.add_argument("--limit", type=nonnegative_int, default=10)
     p_search.add_argument("--include-global", action="store_true",
@@ -4293,12 +4299,18 @@ def main():
             # v11 (issue #61, 6.3): same reasoning for link expansion — it is
             # a RECALL behavior; search keeps its byte-identical contract.
             # v13 (issue #65, 10.8): --json emits the read envelope.
+            # v14 (issue #263): --exact swaps the matcher for a literal
+            # substring existence check; guards live in recall_memory (the
+            # search dispatch itself passes none of the refused combos, so
+            # no try/except is needed here — a future recall-side --exact
+            # would follow the supersede dispatch's ValueError->exit-2
+            # pattern instead).
             recall_memory(conn, query=args.text, namespace=args.namespace, limit=args.limit,
                           as_json=args.json, min_confidence=0.0,
                           include_global=args.include_global,
                           global_limit=args.global_limit, no_bump=args.no_bump,
                           hybrid=False, as_of=args.as_of, link_hops=0,
-                          exclude_ids=args.exclude)
+                          exclude_ids=args.exclude, exact=args.exact)
         elif args.cmd == "supersede":
             try:
                 ok = supersede_memory(conn, args.id, args.reason,
