@@ -42,7 +42,7 @@ def _base_env(tmp: str) -> dict:
     env["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-such-models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
     env.setdefault(
-        "ZMEM_MAINTENANCE_WAIT_SECONDS", "15" if stress_workers > 6 else "0.2"
+        "ZMEM_MAINTENANCE_WAIT_SECONDS", "15" if stress_workers > 6 else "5"
     )
     env.setdefault("ZMEM_MAINTENANCE_POLL_SECONDS", "0.02")
     env.setdefault(
@@ -344,6 +344,9 @@ class TestMaintenanceProtocol(HardeningStoreCase):
         token = host.acquire_lock(Path(self.tmp) / ".zmem-maintenance.lock", 600)
         self.assertIsNotNone(token)
         try:
+            # Only this deliberate refusal uses a short budget. Normal writers
+            # need the production wait budget under Windows process contention.
+            refusal_env = {**self.env, "ZMEM_MAINTENANCE_WAIT_SECONDS": "0.2"}
             r = self.run_store(
                 "add",
                 "--namespace",
@@ -354,6 +357,7 @@ class TestMaintenanceProtocol(HardeningStoreCase):
                 "blocked by maintenance",
                 "--signal",
                 "test",
+                env=refusal_env,
             )
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("maintenance is active", r.stderr)
