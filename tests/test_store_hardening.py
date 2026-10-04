@@ -222,6 +222,33 @@ class TestNewerSchemaFailClosed(HardeningStoreCase):
 
 
 class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
+    def _maintenance_lock_snapshot(self):
+        """Return failure-only maintenance evidence without exposing a token."""
+        lock = Path(self.tmp) / ".zmem-maintenance.lock"
+        snapshot = {"exists": lock.exists()}
+        if not snapshot["exists"]:
+            return snapshot
+        try:
+            snapshot["age_seconds"] = round(
+                max(0.0, time.time() - lock.stat().st_mtime), 3)
+        except OSError:
+            snapshot["stat"] = "unreadable"
+        try:
+            holder = host.read_lock_holder_pid(lock)
+        except OSError:
+            snapshot["holder"] = "unreadable"
+        else:
+            snapshot["holder_pid"] = holder[1] if holder else None
+        return snapshot
+
+    def _assert_parallel_successes(self, results):
+        for r in results:
+            self.assertNotEqual(r[0], "EXC", r)
+            if r[0] != 0:
+                self.fail(
+                    f"worker result={r!r}; maintenance_lock="
+                    f"{self._maintenance_lock_snapshot()!r}")
+
     def _run_parallel_adds(self, rows):
         ctx = multiprocessing.get_context("spawn")
         start_evt = ctx.Event()
@@ -242,6 +269,19 @@ class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
             self.assertEqual(p.exitcode, 0)
         return results
 
+    def test_parallel_failure_diagnostic_redacts_lock_token(self):
+        token = f"{os.getpid()}:diagnostic-token-must-not-appear"
+        lock = Path(self.tmp) / ".zmem-maintenance.lock"
+        lock.write_text(token, encoding="utf-8")
+
+        with self.assertRaises(AssertionError) as raised:
+            self._assert_parallel_successes([(2, "", "simulated failure")])
+
+        diagnostic = str(raised.exception)
+        self.assertIn("maintenance_lock=", diagnostic)
+        self.assertIn("'holder_pid': %d" % os.getpid(), diagnostic)
+        self.assertNotIn(token, diagnostic)
+
     def test_simultaneous_cold_open_initializes_once_and_keeps_all_rows(self):
         worker_count = int(os.environ.get("ZMEM_COLD_OPEN_WORKERS", "6"))
         self.assertGreaterEqual(worker_count, 1)
@@ -251,9 +291,7 @@ class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
             for i in range(worker_count)
         ]
         results = self._run_parallel_adds(rows)
-        for r in results:
-            self.assertNotEqual(r[0], "EXC", r)
-            self.assertEqual(r[0], 0, r)
+        self._assert_parallel_successes(results)
 
         conn = sqlite3.connect(self.store)
         try:
@@ -278,9 +316,7 @@ class TestConcurrentColdOpenAndDedup(HardeningStoreCase):
             ("shared duplicate row", "delta", 0.60, "user"),
         ]
         results = self._run_parallel_adds(rows)
-        for r in results:
-            self.assertNotEqual(r[0], "EXC", r)
-            self.assertEqual(r[0], 0, r)
+        self._assert_parallel_successes(results)
 
         conn = sqlite3.connect(self.store)
         try:

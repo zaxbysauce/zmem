@@ -1519,6 +1519,106 @@ def _recall_one_tier(
         scored = _mmr_order(scored, limit, MMR_LAMBDA, norm_map, emb_map)
     return scored[:limit]
 
+def _exact_one_tier(
+    conn: sqlite3.Connection,
+    *,
+    literal: str,
+    ns_list: list[str] | None,
+    limit: int,
+    min_confidence: float | None,
+    as_of: str | None = None,
+) -> list[tuple[float, dict]]:
+    """Literal-substring existence fetch for ONE namespace tier (issue #263).
+
+    Companion to ``_recall_one_tier`` for ``search --exact``: instead of an
+    FTS5 ``MATCH`` over normalized, stop-word-filtered, OR-composed terms, the
+    query is tested verbatim as a substring of ``memory.content`` via SQLite
+    ``instr`` (a binary, case-sensitive, codepoint-faithful test — exactly
+    Python's ``literal in content`` for well-formed UTF-8 TEXT). Stop-word
+    literals, FTS5 query-syntax characters, and word-order all stay literal.
+
+    Namespace/as-of/live/confidence filtering is IDENTICAL to the FTS tier
+    (same clauses, same floor law) so the two paths are drop-in replacements
+    for each other at the call site. There is no relevance ranking — every
+    row is a binary match — so rows carry a constant ``_score`` of 1.0, all
+    ``_rel_*`` lanes are ``None`` (a relevance floor has nothing to measure
+    on a literal match; the inject-gate not-measured exemption applies), and
+    the order is deterministic: most recently ingested first, id tiebreak.
+    Row dicts keep the exact key set and key ORDER of the FTS builder so the
+    shared envelope renders identically.
+    """
+    as_of_clause, as_of_params = _as_of_temporal_predicate(as_of, alias="m")
+    live_clause = "" if as_of else "AND m.superseded_at IS NULL"
+    floor = min_confidence if min_confidence is not None else CONFIDENCE_FLOOR
+    params: list = [literal]
+    ns_clause = ""
+    if ns_list:
+        ns_placeholders = ",".join("?" * len(ns_list))
+        ns_clause = f"AND m.namespace IN ({ns_placeholders})"
+        params.extend(ns_list)
+    params.extend(as_of_params)
+    params.append(floor)
+    params.append(limit)
+    sql = f"""
+        SELECT m.id, m.namespace, m.type, m.content, m.tags, m.source_ref,
+               m.source_hash, m.confidence, m.signal, m.valid_from,
+               m.ingestion_ts, m.retrieval_count, m.surfaced_count, m.last_retrieved,
+               m.valid_until, m.update_of, m.taint, m.trust_score,
+               m.content_norm, m.applied_count, m.violated_count
+        FROM memory m
+        WHERE instr(m.content, ?) > 0
+          {ns_clause}
+          {as_of_clause}
+          {live_clause}
+          AND m.confidence >= ?
+        ORDER BY m.ingestion_ts DESC, m.id
+        LIMIT ?
+    """
+    rows = conn.execute(sql, params).fetchall()
+    scored: list[tuple[float, dict]] = []
+    for r in rows:
+        # Same stale-source demotion as the FTS tier (issue-labeled block at
+        # the _recall_one_tier loop): display AND trust input see the halved
+        # confidence, so a stale literal match ranks no differently from a
+        # stale keyword match downstream.
+        conf = r["confidence"]
+        stale_note = ""
+        if r["source_hash"] and r["source_ref"].startswith("file:"):
+            current = _source_hash(r["source_ref"])
+            if current and current != r["source_hash"]:
+                conf *= 0.5
+                stale_note = " [STALE SOURCE — source file changed since extraction]"
+        row_fields = dict(r)
+        row_fields["confidence"] = conf
+        trust = _row_trust(row_fields)
+        scored.append((1.0, {
+            "id": r["id"],
+            "namespace": r["namespace"],
+            "type": r["type"],
+            "content": r["content"],
+            "tags": r["tags"],
+            "confidence": round(conf, 3),
+            "signal": r["signal"],
+            "source_ref": r["source_ref"],
+            "valid_from": r["valid_from"],
+            "valid_until": r["valid_until"],
+            "update_of": r["update_of"],
+            "taint": r["taint"],
+            "applied_count": int(r["applied_count"] or 0),
+            "violated_count": int(r["violated_count"] or 0),
+            "stale": bool(stale_note),
+            "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
+            "_stale_note": stale_note,
+            "_score": 1.0,
+            "_rel_lex": None,
+            "_rel_cos": None,
+            "_rel_ent": None,
+            "_rel_graph": None,
+            "_graph_arrival_only": False,
+            "trust_score": trust,
+        }))
+    return scored
+
 def _merge_tiers(
     project_scored: list[tuple[float, dict]],
     global_scored: list[tuple[float, dict]],
@@ -2413,6 +2513,7 @@ def _recall_memory_impl(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    exact: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -2489,6 +2590,46 @@ def _recall_memory_impl(
             "scoped recall cannot be combined with include_cross_project=True; "
             "the scoped cross_project tier uses its own admission predicate"
         )
+    if exact:
+        # Issue #263: the exact path's contract is "results are EXACTLY the
+        # memory rows whose content contains the literal". Every combination
+        # refused here would splice rows that never matched the literal (or
+        # reorder/scramble the deterministic result), so each is refused at
+        # the seam instead of silently narrowing the contract. Note
+        # _user_global_floor is deliberately NOT refused: exact rows carry
+        # _rel_*=None, and the floor's not-measured exemption (below) keeps
+        # them — a relevance floor cannot judge a literal match.
+        if for_injection:
+            raise ValueError(
+                "exact cannot be combined with for_injection=True; "
+                "injection surfaces are ranked-recall lanes, not literal "
+                "existence checks"
+            )
+        if scopes is not None:
+            raise ValueError(
+                "exact cannot be combined with scoped recall; scoped tier "
+                "pools are FTS-shaped"
+            )
+        if include_cross_project:
+            raise ValueError(
+                "exact cannot be combined with include_cross_project=True; "
+                "the cross-project tier's admission predicate is not literal "
+                "matching"
+            )
+        if link_hops >= 1:
+            # One guard also covers unfold: _unfold_enabled requires
+            # link_hops >= 1, so refusing expansion refuses both splices.
+            raise ValueError(
+                "exact cannot be combined with link_hops >= 1; link "
+                "expansion and unfold append neighbors that did not match "
+                "the literal"
+            )
+        if cross_rerank:
+            raise ValueError(
+                "exact cannot be combined with cross_rerank=True; rerank "
+                "reorders results and requires a cross-encoder model, which "
+                "the model-absent literal path never touches"
+            )
     now_epoch = _now_epoch()
     if scopes is not None:
         # Tier labels and independent reservations are not consumable by the
@@ -2573,21 +2714,36 @@ def _recall_memory_impl(
     # contract-violating.)
     project_scored: list[tuple[float, dict]] = []
     if scopes is None:
-        project_scored = _recall_one_tier(
-            conn, query=query, ns_list=ns_list, limit=limit,
-            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
-            moment=effective_moment, lane=lane,
-        )
+        # Issue #263: the exact path swaps ONLY the per-tier matcher — the
+        # literal fetch below replaces the FTS fetch; every downstream pass
+        # (merge, exclusion, telemetry, envelope) is shared and shape-equal.
+        if exact:
+            project_scored = _exact_one_tier(
+                conn, literal=query, ns_list=ns_list, limit=limit,
+                min_confidence=min_confidence, as_of=as_of,
+            )
+        else:
+            project_scored = _recall_one_tier(
+                conn, query=query, ns_list=ns_list, limit=limit,
+                min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+                as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
+                moment=effective_moment, lane=lane,
+            )
 
     global_scored: list[tuple[float, dict]] = []
     if do_global:
-        global_scored = _recall_one_tier(
-            conn, query=query, ns_list=global_ns_list, limit=global_limit,
-            min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
-            as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
-            moment=effective_moment, lane=lane,
-        )
+        if exact:
+            global_scored = _exact_one_tier(
+                conn, literal=query, ns_list=global_ns_list, limit=global_limit,
+                min_confidence=min_confidence, as_of=as_of,
+            )
+        else:
+            global_scored = _recall_one_tier(
+                conn, query=query, ns_list=global_ns_list, limit=global_limit,
+                min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
+                as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
+                moment=effective_moment, lane=lane,
+            )
 
     # Issue #235: the user:global tier floor.  The selector threads the
     # resolved floor only on gated passive moments; here a below-floor
@@ -2606,6 +2762,11 @@ def _recall_memory_impl(
     global_floor_withheld = 0
     if (_user_global_floor is not None and _user_global_floor > 0
             and global_scored):
+        # Issue #263 note: on the exact path every global row carries
+        # _rel_*=None (no relevance lanes are measured for a literal match),
+        # so every row takes the not-measured exemption below and the floor
+        # withholds nothing. That is the documented no-op disposition, not a
+        # bug: a relevance floor cannot judge a binary literal match.
         kept_global: list[tuple[float, dict]] = []
         for _score, item in global_scored:
             lane_values = [
@@ -2794,13 +2955,22 @@ def _recall_memory_impl(
     # AFTER canonical candidate selection/expansion and BEFORE selective
     # injection, token admission, telemetry, and delivery-ledger recording —
     # they then flow through the same gate + single token budget as any row.
+    # Issue #263: SKIPPED entirely on the exact path. Belief admission matches
+    # by lowercased alnum term-substring over head+member content (a token
+    # match, not a literal one), and an admitted head's represented-set can
+    # then suppress literal-matched memory rows in _suppress_represented_by_
+    # head_ns below — both directions would break "results are EXACTLY the
+    # rows containing the literal". With no belief rows in the result set that
+    # suppression pass degenerates to a no-op.
     fence_id = _fence_id or ("plain:" + uuid.uuid4().hex)
-    try:
-        belief_rows = _beliefs.belief_head_rows(
-            conn, query=query, namespace=namespace,
-            limit=_beliefs.RECALL_HEAD_LIMIT, as_of=as_of)
-    except sqlite3.Error:
-        belief_rows = []
+    belief_rows: list = []
+    if not exact:
+        try:
+            belief_rows = _beliefs.belief_head_rows(
+                conn, query=query, namespace=namespace,
+                limit=_beliefs.RECALL_HEAD_LIMIT, as_of=as_of)
+        except sqlite3.Error:
+            belief_rows = []
     if belief_rows:
         # F-002 (PR review): virtual heads are classified with the SAME
         # injection-risk classifier as canonical rows, and the passive
@@ -4341,6 +4511,7 @@ def recall_memory(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    exact: bool = False,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
@@ -4354,7 +4525,18 @@ def recall_memory(
     are the internal seam the session-aware selector uses to forward
     the surface policy inputs; the CLI direct path passes the user's
     ``--moment``/``--ops-token`` values.
+
+    ``exact`` (issue #263): literal substring existence mode for
+    ``search --exact`` — the query is matched verbatim against
+    ``memory.content`` instead of going through FTS5. Refused on the
+    injection lane (ranked recall only there).
     """
+    if exact and for_injection:
+        raise ValueError(
+            "exact cannot be combined with for_injection=True; "
+            "injection surfaces are ranked-recall lanes, not literal "
+            "existence checks"
+        )
     # Candidate acquisition below retains the emit-time _classify_injection
     # pass in _recall_memory_impl; the shared passive details builder runs only
     # after those unsafe rows have been omitted on the no_bump path.
@@ -4388,6 +4570,7 @@ def recall_memory(
             moment=moment,
             lane=lane,
             _user_global_floor=_user_global_floor,
+            exact=exact,
         )
 
     if scopes is not None:
