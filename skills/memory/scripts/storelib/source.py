@@ -9,6 +9,7 @@ import re
 import sqlite3
 from typing import Any
 
+from redaction import _redact_secret_like_text_with_positions
 from storelib.write import redact_text
 
 MAX_CONTEXT = 20
@@ -117,6 +118,15 @@ def _source_namespace_aliases(conn: sqlite3.Connection, namespace: str) -> list[
         aliases.extend(old for old, new in migration_map.items()
                        if new == namespace and _is_project_namespace(old))
     return aliases
+
+
+def _source_authorized_namespaces(conn: sqlite3.Connection) -> frozenset[str]:
+    """Namespaces the read-only source resolver can authorize right now.
+
+    Recall source hints call this exact helper so their advertised commands do
+    not promise access that ``source`` will refuse.
+    """
+    return frozenset(_source_namespace_aliases(conn, _namespace()))
 
 
 def _memory(conn: sqlite3.Connection, memory_id: str) -> tuple[sqlite3.Row, str]:
@@ -405,6 +415,25 @@ def show(conn: sqlite3.Connection, memory_id: str, context: int = 2) -> dict[str
     return _resolved(conn, memory_id, context)[0]
 
 
+def _normalise_with_byte_boundaries(original: str) -> tuple[str, list[int]]:
+    """Normalise line endings while retaining original UTF-8 byte boundaries."""
+    pieces: list[str] = []
+    boundaries = [0]
+    source_index = byte_count = 0
+    while source_index < len(original):
+        if original[source_index:source_index + 2] == "\r\n":
+            pieces.append("\n")
+            source_index += 2
+            byte_count += 2
+        else:
+            char = original[source_index]
+            pieces.append("\n" if char == "\r" else char)
+            source_index += 1
+            byte_count += len(char.encode("utf-8"))
+        boundaries.append(byte_count)
+    return "".join(pieces), boundaries
+
+
 def scan(conn: sqlite3.Connection, memory_id: str, needle: str) -> dict[str, Any]:
     if not isinstance(needle, str) or not needle:
         raise ValueError("--needle must not be empty")
@@ -417,41 +446,38 @@ def scan(conn: sqlite3.Connection, memory_id: str, needle: str) -> dict[str, Any
     total = 0
     for row in rows:
         original = str(row["raw"])
-        normal = _normalise(original)
+        normal, boundaries = _normalise_with_byte_boundaries(original)
         # Native stores do not preserve original transcript byte offsets. File
         # records do, so calculate offsets within each source record.
-        boundaries = [0]
-        source_index = byte_count = 0
-        while source_index < len(original):
-            if original[source_index:source_index + 2] == "\r\n":
-                source_index += 2; byte_count += 2
-            else:
-                char = original[source_index]
-                source_index += 1; byte_count += len(char.encode("utf-8"))
-            boundaries.append(byte_count)
+        # Calculate offsets against the original byte stream, while matching
+        # the normalized display string.  ``boundaries`` bridges CRLF and
+        # multibyte characters without changing the public native-null rule.
+        retained_positions: list[int] = []
         at = 0
         while True:
             pos = normal.find(needle, at)
             if pos < 0:
                 break
             total += 1
-            if len(matches) < MAX_SCAN_MATCHES:
+            if len(matches) + len(retained_positions) < MAX_SCAN_MATCHES:
+                retained_positions.append(pos)
+            at = pos + max(1, len(needle))
+        if retained_positions:
+            # Redact the complete record before slicing.  The canonical engine
+            # maps only the retained positions, so redaction cannot change
+            # which raw occurrence centers a snippet or make a marker collision
+            # look like a source occurrence.
+            safe_record, _redaction_count, safe_positions = (
+                _redact_secret_like_text_with_positions(normal, retained_positions))
+            for pos, safe_pos in zip(retained_positions, safe_positions):
                 if row["start"] is None:
                     byte_start = byte_end = None
                 else:
                     byte_start = int(row["start"]) + boundaries[pos]
                     byte_end = int(row["start"]) + boundaries[pos + len(needle)]
-                # Redact the whole record before slicing around a match. A
-                # partial secret can evade a whole-secret pattern if clipping
-                # happens first.
-                safe_record = _redact(normal)
-                safe_pos = safe_record.find(needle)
-                if safe_pos < 0:
-                    safe_pos = 0
                 matches.append({"turn": row["turn"], "byte_start": byte_start,
                                 "byte_end": byte_end,
                                 "excerpt": safe_record[max(0, safe_pos-80):min(len(safe_record), safe_pos+len(needle)+80)]})
-            at = pos + max(1, len(needle))
     return {"memory_id": memory_id, "session_id": shown["session_id"], "source_path": shown["source_path"], "needle": needle, "matches": matches, "match_count": total, "truncated": total > MAX_SCAN_MATCHES, "truncated_reason": "match_limit" if total > MAX_SCAN_MATCHES else None}
 
 

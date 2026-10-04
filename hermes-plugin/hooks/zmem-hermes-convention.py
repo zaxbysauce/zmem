@@ -382,8 +382,8 @@ def main() -> int:
         if isinstance(payload, dict):
             if not isinstance(extra, dict):
                 extra = {}
-            _write_post_tool_evidence(payload, extra)
             _run_convention(payload, extra)
+            _write_post_tool_evidence(payload, extra)
     _emit_empty()
     return 0
 

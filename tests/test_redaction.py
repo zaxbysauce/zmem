@@ -30,7 +30,10 @@ SECRETS_DIR = REPO_ROOT / "tests" / "fixtures" / "secrets"
 sys.path.insert(0, str(SCRIPTS))
 
 from storelib.write import quarantine_import_rows, redact_text  # noqa: E402
-from redaction import redact_training_text  # noqa: E402
+from redaction import (  # noqa: E402
+    _redact_secret_like_text_with_positions,
+    redact_training_text,
+)
 
 SECRET = "ghp_" + "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
 
@@ -102,6 +105,81 @@ class RedactTextHelperTest(unittest.TestCase):
                 exact = "Bearer " + ("A" * 15) + terminal
                 self.assertEqual(redact_text(short), (short, 0))
                 self.assertEqual(redact_text(exact), ("[REDACTED_SECRET]", 1))
+
+    def test_sk_token_terminal_hyphen_is_consumed_without_short_matches(self):
+        short_suffixes = {
+            "sk-": ("A" * 18) + "-",
+            # Keep the generic ``sk-`` alternative below its own 20-character
+            # boundary too; otherwise it would mask this family-negative.
+            "sk-ant-": ("A" * 14) + "-",
+            "sk-proj-": ("A" * 13) + "-",
+        }
+        for prefix in ("sk-", "sk-ant-", "sk-proj-"):
+            with self.subTest(prefix=prefix):
+                token = prefix + ("A" * 19) + "-"
+                self.assertEqual(
+                    redact_text("before " + token + " after"),
+                    ("before [REDACTED_SECRET] after", 1),
+                )
+                short = prefix + short_suffixes[prefix]
+                self.assertEqual(redact_text(short), (short, 0))
+
+    def test_xox_aiza_and_jwt_boundaries_consume_terminal_hyphens(self):
+        cases = (
+            (
+                "xox",
+                "xoxb-" + ("A" * 10),
+                "xoxb-" + ("A" * 9) + "-",
+                "xoxb-" + ("A" * 8) + "-",
+                None,
+            ),
+            (
+                "AIza",
+                "AIza" + ("A" * 35),
+                "AIza" + ("A" * 34) + "-",
+                "AIza" + ("A" * 33) + "-",
+                None,
+            ),
+            (
+                "JWT",
+                "eyJ" + ("A" * 40) + "." + ("B" * 10),
+                "eyJ" + ("A" * 40) + "." + ("B" * 9) + "-",
+                "eyJ" + ("A" * 40) + "." + ("B" * 8) + "-",
+                "[REDACTED_SECRET]." + ("B" * 8) + "-",
+            ),
+        )
+        for family, delimited, terminal_hyphen, short, short_expected in cases:
+            with self.subTest(family=family, case="delimiter"):
+                self.assertEqual(
+                    redact_text(delimited + ","),
+                    ("[REDACTED_SECRET],", 1),
+                )
+            with self.subTest(family=family, case="terminal-hyphen"):
+                self.assertEqual(
+                    redact_text(terminal_hyphen),
+                    ("[REDACTED_SECRET]", 1),
+                )
+                # Source scan uses the same canonical engine with position
+                # mapping, while source show uses redact_text above.
+                self.assertEqual(
+                    _redact_secret_like_text_with_positions(
+                        terminal_hyphen, [0]),
+                    ("[REDACTED_SECRET]", 1, [0]),
+                )
+            with self.subTest(family=family, case="short"):
+                self.assertEqual(
+                    redact_text(short),
+                    (short if short_expected is None else short_expected,
+                     0 if short_expected is None else 1),
+                )
+        # The generic 40-character rule masks the JWT header in its short
+        # negative, but its final component must remain because the JWT rule
+        # itself needs at least ten characters after the dot.
+        # AIza remains exactly 35 characters after its prefix.  The underscore
+        # prevents the generic alphanumeric detector from masking this
+        # fixed-length negative.
+        too_long_aiza = "AIza" + ("A" * 34) + "_A"
+        self.assertEqual(redact_text(too_long_aiza), (too_long_aiza, 0))
 
     def test_non_bearer_scheme_is_not_redacted_by_bearer_rule(self):
         text = "Basic " + "A" * 16

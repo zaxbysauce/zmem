@@ -95,7 +95,8 @@ class SourceContractTests(unittest.TestCase):
         self.assertEqual(result["match_count"], 55)
         self.assertEqual(len(result["matches"]), 50)
         self.assertTrue(result["truncated"])
-        self.assertNotIn(secret[-80:], "\n".join(row["excerpt"] for row in result["matches"]))
+        excerpts = "\n".join(row["excerpt"] for row in result["matches"])
+        self.assertNotIn(secret[-40:], excerpts)
 
     def test_native_anchor_matches_redacted_text_and_scan_offsets_are_null(self) -> None:
         db_path = self.root / "zcode.sqlite"

@@ -153,8 +153,8 @@ python skills/memory/scripts/store.py source scan --id <memory-uuid> --needle "l
 ```
 
 `--context` is bounded to 0 through 20. `source scan` is a literal scan of one
-resolved session, returns at most 50 matches, and reports truncation when the
-match limit is reached; its needle is never interpreted as a regular
+resolved session, returns at most 50 matches, and reports truncation when more
+than 50 matches are found; its needle is never interpreted as a regular
 expression. Malformed `--context` or scan input uses the command's single
 `store.py: error: ...` line and exit 2 contract. Resolution failures are
 visible nonzero refusals.

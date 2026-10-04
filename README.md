@@ -240,7 +240,7 @@ and malformed arguments use the single-line `store.py: error: ...` exit-2
 contract.
 
 The resolver recognizes four source layouts: Claude transcript JSONL, Codex
-session JSONL or `MEMORY.md`, native ZCode SQLite, and native Hermes
+`MEMORY.md`, native ZCode SQLite, and native Hermes
 `SessionDB`. With `HERMES_HOME` unset, Hermes resolves its canonical home;
 Hermes JSONL is an explicitly bounded fallback only when that home has no
 canonical database. File-backed records calculate offsets in

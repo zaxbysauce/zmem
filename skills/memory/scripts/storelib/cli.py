@@ -3015,6 +3015,25 @@ def main():
             })
             for index, value in enumerate(source_argv)
         )
+
+        # ``argparse`` normally prints usage before a parse error.  Source has
+        # an older one-line public error contract, so scope its native parser
+        # error path to the same formatter.  Hook every parser that can own an
+        # error: the root dispatcher, ``source``, and its ``scan`` child.
+        # Unlike a parallel token grammar, this also covers duplicate/bare
+        # subcommands and future argparse validation changes.
+        def _source_parser_error(message: str) -> None:
+            # argparse includes the untrusted token in several messages.  A
+            # malformed source command must not turn a credential or private
+            # path passed as an unknown option into a diagnostic disclosure.
+            if message.startswith("unrecognized arguments:"):
+                _source_error("unrecognized source arguments")
+            else:
+                _source_error("invalid source arguments")
+
+        ap.error = _source_parser_error  # type: ignore[method-assign]
+        p_source.error = _source_parser_error  # type: ignore[method-assign]
+        p_source_scan.error = _source_parser_error  # type: ignore[method-assign]
         if source_is_scan:
             has_needle, needle = _source_option("--needle")
             if not has_needle or not needle:

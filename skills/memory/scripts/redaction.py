@@ -43,13 +43,16 @@ SECRET_CREDENTIAL_PATTERNS = [
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])"),
+    # These token alphabets include ``-``.  A trailing word boundary therefore
+    # cannot consume a terminal hyphen (and the generic form can fail to match
+    # altogether); use the same alphabet-boundary convention as Bearer above.
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+    re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{35}(?![0-9A-Za-z_\-])"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])"),
 ]
 SECRET_GENERIC_PATTERNS = [
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
@@ -121,6 +124,71 @@ def _value_span_replacement(match: "re.Match[str]") -> str:
     return match.group(0)[:start] + REDACTED_SECRET + match.group(0)[end:]
 
 
+def _redact_secret_like_text_with_positions(
+    text: str,
+    positions: list[int],
+) -> tuple[str, int, list[int]]:
+    """Redact with the canonical pattern sequence and map selected positions.
+
+    ``positions`` is intentionally caller-bounded.  Scan needs at most its
+    retained match positions, so it avoids allocating provenance for every
+    character of an otherwise valid 8 MiB record.  A position inside a
+    redacted value maps to the replacement marker's start; callers therefore
+    never search a marker that might itself contain their literal.
+    """
+    redacted = text or ""
+    mapped = list(positions)
+    count = 0
+    for pattern in SECRET_PATTERNS:
+        chunks: list[str] = []
+        ordered = sorted(enumerate(mapped), key=lambda item: item[1])
+        next_mapped = [0] * len(mapped)
+        target_index = 0
+        cursor = 0
+        delta = 0
+        for match in pattern.finditer(redacted):
+            replacement = (_value_span_replacement(match)
+                           if pattern in _VALUE_SPAN_PATTERNS
+                           else REDACTED_SECRET)
+            while (target_index < len(ordered)
+                   and ordered[target_index][1] < match.start()):
+                index, position = ordered[target_index]
+                next_mapped[index] = position + delta
+                target_index += 1
+            while (target_index < len(ordered)
+                   and ordered[target_index][1] < match.end()):
+                index, position = ordered[target_index]
+                if replacement == match.group(0):
+                    next_mapped[index] = position + delta
+                elif pattern in _VALUE_SPAN_PATTERNS:
+                    value_start, value_end = match.span(1)
+                    replacement_start = match.start() + delta
+                    if position < value_start:
+                        next_mapped[index] = position + delta
+                    elif position < value_end:
+                        next_mapped[index] = replacement_start + (value_start - match.start())
+                    else:
+                        next_mapped[index] = (replacement_start + (value_start - match.start())
+                                              + len(REDACTED_SECRET) + (position - value_end))
+                else:
+                    next_mapped[index] = match.start() + delta
+                target_index += 1
+            chunks.append(redacted[cursor:match.start()])
+            chunks.append(replacement)
+            cursor = match.end()
+            delta += len(replacement) - (match.end() - match.start())
+            count += 1
+        while target_index < len(ordered):
+            index, position = ordered[target_index]
+            next_mapped[index] = position + delta
+            target_index += 1
+        if cursor:
+            chunks.append(redacted[cursor:])
+            redacted = "".join(chunks)
+        mapped = next_mapped
+    return redacted, count, mapped
+
+
 def redact_secret_like_text(text: str) -> tuple[str, int]:
     """Replace secret-like VALUES with ``[REDACTED_SECRET]``.
 
@@ -129,14 +197,7 @@ def redact_secret_like_text(text: str) -> tuple[str, int]:
     ``(redacted_text, detection_count)``; the count includes matches whose
     value was already the marker (idempotent no-ops).
     """
-    redacted = text or ""
-    count = 0
-    for pattern in SECRET_PATTERNS:
-        if pattern in _VALUE_SPAN_PATTERNS:
-            redacted, changed = pattern.subn(_value_span_replacement, redacted)
-        else:
-            redacted, changed = pattern.subn(REDACTED_SECRET, redacted)
-        count += changed
+    redacted, count, _positions = _redact_secret_like_text_with_positions(text, [])
     return redacted, count
 
 

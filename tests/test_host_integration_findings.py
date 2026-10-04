@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -293,6 +294,105 @@ class M10HermesHooksUseStoreCli(unittest.TestCase):
                 ("edit", "hermes-compat", "pretool", "src/compat-boundary.py"),
             )
             self.assertEqual(convention_count, ("1",))
+
+    def test_convention_finishes_before_detached_evidence_starts(self):
+        """A real copied hook must not overlap its two store-writer children."""
+        source = (HOOKS_DIR / "zmem-hermes-convention.py").read_text("utf-8")
+
+        def run_hook(hook_source: str, *, convention_waits_for_evidence: bool) -> list[str]:
+            with tempfile.TemporaryDirectory(prefix="zmem-hook-order-") as raw:
+                root = Path(raw)
+                plugin_root = root / "plugin"
+                checkout_root = root / "checkout"
+                hook_dir = plugin_root / "deep" / "hooks"
+                hook_dir.mkdir(parents=True)
+                hook = hook_dir / "zmem-hermes-convention.py"
+                hook.write_text(hook_source, encoding="utf-8")
+                scripts = checkout_root / "skills" / "memory" / "scripts"
+                scripts.mkdir(parents=True)
+                fake_store = scripts / "store.py"
+                fake_store.write_text(textwrap.dedent("""\
+                    import os
+                    import sys
+                    import time
+                    from pathlib import Path
+
+                    root = Path(os.environ["ZMEM_ORDER_ROOT"])
+                    log = root / "order.log"
+
+                    def mark(value):
+                        with log.open("a", encoding="utf-8") as stream:
+                            stream.write(value + "\\n")
+
+                    if sys.argv[1:] == ["hermes-convention"]:
+                        mark("convention_started")
+                        if os.environ.get("ZMEM_TEST_WAIT_FOR_EVIDENCE") == "1":
+                            deadline = time.monotonic() + 2.0
+                            while not (root / "evidence_started").exists() and time.monotonic() < deadline:
+                                time.sleep(0.01)
+                            if not (root / "evidence_started").exists():
+                                sys.exit(87)
+                        time.sleep(0.15)
+                        (root / "convention_complete").write_text("done", encoding="utf-8")
+                        mark("convention_complete")
+                        print("{}")
+                    elif sys.argv[1:] == ["evidence", "write"]:
+                        (root / "evidence_started").write_text("started", encoding="utf-8")
+                        mark("evidence_started")
+                        if not (root / "convention_complete").exists():
+                            mark("evidence_started_before_convention_complete")
+                        print("fake-evidence")
+                        (root / "evidence_complete").write_text("complete", encoding="utf-8")
+                    else:
+                        sys.exit(2)
+                    """), encoding="utf-8")
+                env = self._isolated_env(
+                    root,
+                    ZMEM_HOME=str(checkout_root),
+                    ZMEM_PYTHON=PYTHON,
+                    ZMEM_ORDER_ROOT=str(root),
+                    ZMEM_TEST_WAIT_FOR_EVIDENCE="1" if convention_waits_for_evidence else "0",
+                )
+                event = {
+                    "tool_name": "Edit",
+                    "args": {"file_path": "src/order-boundary.py"},
+                    "session_id": "s-hook-order",
+                    "task_id": "task-order",
+                    "tool_call_id": "call-order",
+                    "result": {"status": "ok"},
+                    "duration_ms": 1,
+                }
+                observed = subprocess.run(
+                    [PYTHON, str(hook)], input=json.dumps(event) + "\n",
+                    capture_output=True, text=True, env=env, timeout=10,
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                self.assertEqual(observed.stdout.strip(), "{}")
+                deadline = time.monotonic() + 5.0
+                while not (root / "evidence_complete").exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                events = (root / "order.log").read_text(encoding="utf-8").splitlines() \
+                    if (root / "order.log").exists() else []
+                self.assertTrue(
+                    (root / "evidence_complete").exists(),
+                    f"detached evidence did not complete; events={events}",
+                )
+                return events
+
+        repaired_events = run_hook(source, convention_waits_for_evidence=False)
+        self.assertIn("convention_complete", repaired_events)
+        self.assertIn("evidence_started", repaired_events)
+        self.assertNotIn("evidence_started_before_convention_complete", repaired_events)
+
+        old_order = "_write_post_tool_evidence(payload, extra)\n            _run_convention(payload, extra)"
+        mutated_source = source.replace(
+            "_run_convention(payload, extra)\n            _write_post_tool_evidence(payload, extra)",
+            old_order,
+        )
+        self.assertNotEqual(mutated_source, source, "order mutation did not apply")
+        old_events = run_hook(mutated_source, convention_waits_for_evidence=True)
+        with self.assertRaises(AssertionError):
+            self.assertNotIn("evidence_started_before_convention_complete", old_events)
 
     def test_store_cli_guard_refusal_precedes_sqlite_connection(self):
         """The no-create evidence path must refuse before opening SQLite."""

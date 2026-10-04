@@ -23,9 +23,10 @@ README.
   does not retain the original byte stream.
 
 ### Security and privacy
-- Source excerpts are redacted before clipping and hashing. SQLite lookups use
-  read-only/query-only connections, avoid cache and network writes, and keep
-  WAL/SHM coordination within the documented existing-sidecar boundary.
+- Source excerpts are redacted before hashing. Source scans redact complete
+  records before clipping match snippets. SQLite lookups use read-only/query-only
+  connections, avoid cache and network writes, and keep WAL/SHM coordination
+  within the documented existing-sidecar boundary.
 - Context is limited to 0–20 turns and scans to 50 literal matches. Refusals
   use stable one-line diagnostics without echoing source content, credentials,
   or private filesystem paths.

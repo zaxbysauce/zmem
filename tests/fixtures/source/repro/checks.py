@@ -238,14 +238,11 @@ def _prepare_hermes_wal_fixture(
 
 
 def _assert_hermes_resolver_uses_canonical_api(repo_root: Path) -> None:
-    """Pin the implementation seam once the issue adds ``storelib.source``.
+    """Bind C6 to an assigned read-only canonical constructor in ``_hermes``.
 
-    Runtime import-failure and missing-sidecar cases below prove fail-closed
-    behavior.  This narrow source assertion prevents an implementation from
-    importing Hermes merely as a capability check and then reading its private
-    SQLite schema directly, which would bypass the canonical provider API.
-    The base has no source module yet, so its historic RED remains a command
-    absence rather than a misleading adapter failure.
+    This AST seam check deliberately does not claim result-flow proof.  The
+    native C6 fixture and the focused Hermes spy contract test the provider
+    calls, returned data, anchors, close, and fail-closed behavior.
     """
     source_module = repo_root / "skills" / "memory" / "scripts" / "storelib" / "source.py"
     if not source_module.is_file():
@@ -254,28 +251,49 @@ def _assert_hermes_resolver_uses_canonical_api(repo_root: Path) -> None:
         tree = ast.parse(source_module.read_text(encoding="utf-8"), filename=str(source_module))
     except SyntaxError as exc:
         raise CheckFailure(f"C6 source resolver has invalid syntax: {exc}") from exc
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+
+    hermes_functions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_hermes"
+    ]
+    if len(hermes_functions) != 1:
+        raise CheckFailure("C6 Hermes resolver must define exactly one module-level _hermes function")
+    hermes = hermes_functions[0]
+
+    def scoped_nodes() -> list[ast.AST]:
+        nodes: list[ast.AST] = []
+        pending = list(hermes.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            nodes.append(node)
+            pending.extend(ast.iter_child_nodes(node))
+        return nodes
+
+    constructors = []
+    for node in scoped_nodes():
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or not isinstance(node.value, ast.Call):
             continue
-        func = node.func
-        is_session_db = (
-            isinstance(func, ast.Name) and func.id == "SessionDB"
-        ) or (
+        func = node.value.func
+        is_session_db = (isinstance(func, ast.Name) and func.id == "SessionDB") or (
             isinstance(func, ast.Attribute) and func.attr == "SessionDB"
         )
         if not is_session_db:
             continue
-        if any(
-            keyword.arg == "read_only"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
-            for keyword in node.keywords
-        ):
-            return
-    raise CheckFailure(
-        "C6 Hermes resolver must call the canonical SessionDB API with read_only=True; "
-        "a direct SQLite schema reader is not an accepted adapter"
-    )
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            continue
+        constructors.append(node.value)
+    if len(constructors) != 1 or not any(
+        keyword.arg == "read_only"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in constructors[0].keywords
+    ):
+        raise CheckFailure(
+            "C6 Hermes _hermes must assign exactly one canonical SessionDB(..., read_only=True)"
+        )
 
 
 def _env(scratch: Path, **extra: str) -> dict[str, str]:
@@ -581,6 +599,7 @@ def _assert_canonical_store_coordination_only(
     index.  This exception is exclusive to the exact canonical store path; it
     does not apply to transcripts, caches, queues, or external native hosts.
     """
+    scratch = scratch.resolve()
     store_path = store_path.resolve()
     try:
         main = str(store_path.relative_to(scratch))
