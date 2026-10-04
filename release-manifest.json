@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "424ca9cd23928f325daafd2c190e30c914ca7b86fbf78517ee0dc095467bc730",
+  "digest": "edc8377ee87169f55ada3bdaface788c87fa76684c0d6b2befc80334de5d485c",
   "files": {
     "hermes-plugin/__init__.py": "f3a35ebbf9ddda986e3e643f956b34c1f298fac74555540e63086954b11b811b",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "3d85bcfe63f601c0ecc93faa0765fe9435c0124fe416ac1f4ae43643e4cacf1b",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fb4362d885142bf743c3a5c4aa12ae92c9a1274ca445f307e4b4dc699b4f69bd",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "7412de7444f21f3b819e68754f6242a4676b80ac5138b245c7d93a1ce24ab2c6",
+    "hermes-plugin/plugin.yaml": "0ebd083001a4f484b661c2b58136dd2e09922a7ce811c00735e7b2f670e27388",
     "hermes-plugin/server/auth.py": "c2804ea5da0fcb4d1e2901d49f3936d1745ce869574bafb78752db78f43960f2",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
@@ -33,7 +33,7 @@
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
     "hooks/zmem-pretool-recall.sh": "65c824791fa6b2d7172a7a40e3a55f5882ca41ccf900ccb0246ff0e64c22c52e",
     "hooks/zmem-recall.sh": "cb4262b4ec0eb3dc6e89698bfdd684976746a9700b43c0970d14efa53f05d91a",
-    "hooks/zmem-reflect.sh": "4ebbeab99716c0c55fa972fc1f3f134822079e0e3c65eab63348b4311e1b8d91",
+    "hooks/zmem-reflect.sh": "0bfd533855d867553cbefe81e7fb87880ea2d6f4935132dabb6bfcdec05c31a2",
     "hooks/zmem-session-end.sh": "8734408904c0382a94b55d0b1a4c39a49a2da797bd473050d2b2891c9a283cfe",
     "hooks/zmem-session-start.sh": "254deb6d60063a4a4b86f434b84ed1232c3f7071c67cdee4bbe63206dfe5ad22",
     "hooks/zmem-subagent-recall.sh": "aab144cf0b1723fe113200f22659cbba0aabcccdb18e1e3cc5e14660a25e9588",
@@ -109,5 +109,5 @@
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
     "skills/memory/scripts/storelib/write.py": "90b2992c6ff1bcfc9a92661533965bd0468f5c1bc280bab169d291983075725e"
   },
-  "version": "0.79.0"
+  "version": "0.80.0"
 }

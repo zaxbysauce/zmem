@@ -379,6 +379,17 @@ def _subagent_lines():
             cnt = 0
         ts = _clean_field(sidecar.get("tool_summary") or ("%d failure(s)" % cnt))
         line = "  - agent %s (%s): %d failure(s) (%s)" % (aid, atype, cnt, ts)
+        # #257: surface the sidecar per-failure detail lines (written by
+        # zmem-subagent-reflect.sh, capped at 5 there). Mirror the writer
+        # DETAIL_LIMIT so a hostile or edited sidecar cannot exceed it,
+        # and sanitize through the same _clean_field collapse+cap as every
+        # other rendered field (PRR-007): one line, bounded, cannot break
+        # the prompt structure. Fail-open: a malformed details value (absent,
+        # null, or not a list) renders nothing instead of crashing the hook.
+        sdetails = sidecar.get("details")
+        if isinstance(sdetails, list):
+            for d in sdetails[:5]:
+                line = line + "\n    detail: " + _clean_field(d)
         rej = _clean_field(sidecar.get("rejections") or "")
         if rej:
             line = line + "\n    user rejections: " + rej
