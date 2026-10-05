@@ -347,7 +347,7 @@ CTX_JSON="$("$PYTHON_BIN" -c '
 import json, shlex, sys
 obj = json.loads(sys.argv[1])
 descriptor = obj["descriptor"]
-store = shlex.quote(sys.argv[2])
+store = shlex.quote(sys.executable) + " " + shlex.quote(sys.argv[2])
 namespace = shlex.quote(sys.argv[3])
 source_ref = shlex.quote("session:" + obj["session"])
 claim = "when X happens, do Y, because Z"

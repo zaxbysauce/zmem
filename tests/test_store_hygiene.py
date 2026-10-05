@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -63,7 +64,7 @@ FIXTURE_DIGESTS = {
     "rows.jsonl": "f9ddde2d2463b288c84d46d3e9ebf669e4c4697d13fabeaa09347f6226c511a5",
     "origin-map.json": "85c8f54cb4c69e922b4e243222b89cb11f4a1d35d453d036e3e075db3f039972",
     "evidence-map.json": "1ae0ed47b76f84b0959195fe604c7caf4751c32e72767a2f3754015ce2d69155",
-    "expected-report.json": "b8c0ef8bdb9ed1a4586b523043ef7550c3835dd62c08772f0ee61af63166b686",
+    "expected-report.json": "3ff6007dbd61e03a8569f9befff776264ed65378db613577f90a134fc69d8853",
 }
 
 HERMES_NS = "user:global"
@@ -186,7 +187,8 @@ class StoreHygieneTest(unittest.TestCase):
         self.assertEqual(action["namespace"], HERMES_NS)
         self.assertEqual(
             action["action"],
-            "python skills/memory/scripts/store.py update"
+            shlex.quote(sys.executable)
+            + " skills/memory/scripts/store.py update"
             f" --id {_hermes_id(1)}"
             " --content grounded test lesson for valid case"
             " --signal test"
@@ -382,7 +384,8 @@ class StoreHygieneCliTest(unittest.TestCase):
         self.assertIn("namespaces:", text)
         self.assertIn("none-upgrade actions: 1", text)
         self.assertIn(
-            "python skills/memory/scripts/store.py update --id "
+            shlex.quote(sys.executable)
+            + " skills/memory/scripts/store.py update --id "
             "00000000-0000-4000-8000-000000000001",
             text,
         )

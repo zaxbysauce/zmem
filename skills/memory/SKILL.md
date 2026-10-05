@@ -20,13 +20,17 @@ ZCode's memory system has three tiers:
 - **Tier 4 — Procedural:** the skills library. (Extended later with evals + index.)
 
 ## Finding store.py
-The SessionStart hook injects the absolute path to `store.py` into context each
-session (look for `# Memory skill: invoke "...store.py" <subcommand>`). Use that
-exact path. On Windows it will be a Windows-format path like
+The SessionStart hook injects a ready-to-run store command into context each
+session (look for the `# Memory skill: invoke ...` note). Run the command it
+shows as-is: it names the shell-quoted interpreter the hook itself resolved
+ahead of the absolute `store.py` path, so it cannot hit a stub `python` on
+Windows. Use that exact `store.py` path. On Windows it will be a
+Windows-format path like
 `C:\Users\...\plugins\data\zmem@...\skills\memory\scripts\store.py`
 (the `...` segments are elision placeholders, not real paths).
 If you cannot find the injected path, the script is at the plugin root under
-`skills/memory/scripts/store.py`.
+`skills/memory/scripts/store.py` — invoke it through an explicit interpreter
+(`python` / `python3`), never as a bare path.
 
 ## When to use
 - **Before a non-trivial task:** `recall` relevant past lessons. High-precision-first:

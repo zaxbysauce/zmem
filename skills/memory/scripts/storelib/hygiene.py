@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import sqlite3
 import sys
 from pathlib import Path
@@ -36,8 +37,12 @@ GROUNDED_SIGNALS = ("test", "compile", "lint", "reviewer")
 # in either direction between the none row and the grounded row.
 TRIAGE_RELATIONS = ("supports", "updates", "extends", "derives")
 
+# Interpreter rendered from the running process (sys.executable, quoted) so
+# the suggested command cannot resolve a PATH python stub — same surfacing
+# rule as the hook-injected commands (issue #259).
 _UPGRADE_COMMAND = (
-    "python skills/memory/scripts/store.py update"
+    shlex.quote(sys.executable)
+    + " skills/memory/scripts/store.py update"
     " --id {none_id} --content {content} --signal {signal}"
     " --source-ref {proof_ref} --json"
 )
