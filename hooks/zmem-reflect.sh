@@ -484,10 +484,12 @@ if count == 0:
     #       (test/compile/lint, the #123 vocabulary) over the transcript;
     #       the user-correction count reuses the rejections this hook already
     #       collected. When nothing changed, the state is re-recorded
-    #       silently (the closeout skill review pass surfaces it later) and
-    #       no additionalContext is emitted. A broken scan (nonzero exit or
-    #       unparseable output) emits nothing AND leaves the persisted state
-    #       untouched: a broken substrate must neither nag every Stop nor
+    #       silently (a future closeout skill review pass, the Step 0.5
+    #       extension named in SKILL.md, is the intended reader; it is not
+    #       built yet) and no additionalContext is emitted. A broken scan
+    #       (nonzero exit or unparseable output) emits nothing AND leaves
+    #       the persisted state untouched: a broken substrate must neither
+    #       nag every Stop nor
     #       blank the record.
     current_signals = {}
     scan_ok = False

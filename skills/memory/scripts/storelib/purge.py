@@ -763,6 +763,12 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     for path in ops.glob("*.ledger.tmp.*"):
         path.unlink()
         stats["tmp_removed"] += 1
+    # #258: the per-session signal-state sidecar writes through the same
+    # uuid-suffixed tmp pattern; reap its crashed-write orphans alongside
+    # the ledger ones so ops/ never leaks either family.
+    for path in ops.glob("*.signals.tmp.*"):
+        path.unlink()
+        stats["tmp_removed"] += 1
     for path in ops.glob("*.ledger"):
         doc = json.loads(path.read_text(encoding="utf-8"))
         entries = doc.get("entries")

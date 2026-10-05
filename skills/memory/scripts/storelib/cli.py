@@ -2718,7 +2718,7 @@ def main():
     p_fail.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
                         help="ZCode episodic db.sqlite path (default ~/.zcode/cli/db/db.sqlite)")
     p_fail.add_argument("--db-timeout", dest="db_timeout", type=float, default=None,
-                        help="seconds to wait on a busy ZCode db before reporting a "
+                        help="seconds to wait for a busy ZCode db before reporting a "
                              "substrate error (default: ZMEM_FAILURES_DB_TIMEOUT_S or 1.0; "
                              "clamped to 0.1-5.0)")
 
