@@ -1999,6 +1999,23 @@ likely-secret text is redacted; in `manual` matching items are annotated
 `"secret_warning": true` but kept verbatim for review. (`--json` is accepted for
 parity with the issue's syntax; output is always JSON.)
 
+### signals — recognized runner signals for a session (read-only)
+```
+python <store.py> signals [--session SESSION] [--transcript PATH] [--db PATH]
+```
+Reports the session's tracked runner signals as
+`{"signals": {"test": "pass", "lint": "fail", ...}}` — the LAST status of
+each recognized runner family in the transcript, classified by
+`capture_quality.infer_signal` (`test`/`compile`/`lint`; everything else,
+including the db substrate where `tool_usage` carries no command text, is
+untracked). This is the read command behind the Stop hook's signal-change
+gate (issue #258). **Read-only and store-independent** like `failures` —
+dispatched before `connect()`. Exit-code contract: checked results
+(including a missing transcript path, which falls to the db leg) exit 0; a
+genuine substrate error (transcript present but unreadable) prints
+`{"signals": {}, "error": ...}` and exits 2, so the hook can suppress
+without touching its persisted state.
+
 ### source-exists / ops-append — capture adapter bridges
 ```
 python <store.py> source-exists --namespace NS --source-ref REF --json
@@ -3006,6 +3023,26 @@ default; clamped to 0.1-5.0; `store.py failures --db-timeout` overrides);
 detector at a scratch copy without touching `~/.zcode`; empty/unset means the
 default `~/.zcode/cli/db/db.sqlite`); `ZMEM_REFLECT=0` (exactly `0`) disables
 the whole Stop hook — unset, empty, or any other value keeps it enabled.
+
+### The no-failure nudge fires only on a signal change (#258)
+When the session has no tool failures and no rejections, the success nudge
+("you may have learned something worth capturing") is gated on a state
+TRANSITION, not the state itself: it fires on the first Stop of a session,
+when a recognized runner signal appears or flips (`test`/`compile`/`lint`
+via `capture_quality.infer_signal` over the transcript's Bash commands,
+read through `store.py signals`), or when the user-correction count moves —
+and otherwise stays silent. The last-seen signal state is persisted per
+session at `<ZMEM_DATA>/ops/<sha256(session)[:32]>.signals` (atomic
+tmp-file + `os.replace` write, reaped by the backup sweep) and re-recorded
+on every quiet Stop, so "silent" means no `additionalContext`, never a
+missing record: the closeout skill's Step 0.5 candidate-review pass
+(`skills/closeout/SKILL.md`) is the intended future reader of that record;
+a later PR extends it to surface suppressed signals. Substrate notes: on
+the ZCode db substrate `tool_usage` has no command text, so no runner
+signals are tracked and the nudge fires once per session; if `signals`
+cannot read the substrate (nonzero exit), the hook emits nothing and
+leaves the persisted state untouched — a broken substrate must neither nag
+every Stop nor blank the record.
 
 ### Subagent reflection is parent-side (#204)
 The `zmem-subagent-reflect.sh` SubagentStop hook NEVER prompts the finishing

@@ -10,6 +10,37 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.83.0] - 2026-10-04
+
+### Fixed
+- **The no-failure Stop nudge now fires only when a signal changed (issue
+  #258, Workstream R PR 2)**. The `count == 0` branch of
+  `hooks/zmem-reflect.sh` emitted the "you may have learned something worth
+  capturing" nudge unconditionally on every quiet Stop — a state predicate,
+  not a transition predicate — so on long or multi-turn sessions the nudge
+  was constant-per-Stop noise regardless of whether anything changed. The
+  branch now nudges only when the tracked signal state differs from the
+  last persisted state for the session: the first Stop of a session always
+  counts, and a recognized runner signal appearing or flipping re-arms the
+  nudge. Signals reuse the #123 vocabulary — `store.py signals` (new,
+  read-only, store-independent, dispatched beside `failures`) classifies
+  the transcript's Bash commands with `capture_quality.infer_signal`
+  (`test`/`compile`/`lint`; last status per signal wins) — plus the
+  user-correction count the hook already computes. The last-seen state is
+  persisted at `<ZMEM_DATA>/ops/<sha256(session)[:32]>.signals` with the
+  delivery-ledger atomic write (uuid-suffixed tmp + fsync + `os.replace`,
+  reaped by the backup sweep) and re-recorded on every quiet Stop, so
+  "silent" means no `additionalContext`, never a missing record — the
+  closeout skill's Step 0.5 candidate-review pass is the intended future
+  reader. A broken scan (nonzero exit or unparseable output) emits nothing
+  and leaves the persisted state untouched. Substrate note: the ZCode
+  episodic db carries no command text, so on that host the nudge fires once
+  per session rather than re-arming on runner flips. The nudge text, the
+  rejection branch, the failure branch, and the #123 failure-side
+  recurrence gate are unchanged; tests in
+  `tests/test_r02_nudge_on_signal_change.py`,
+  `tests/test_signals_cmd.py`, and `tests/test_r02_signal_state.py`.
+
 ## [0.82.0] - 2026-10-05
 
 ### Fixed

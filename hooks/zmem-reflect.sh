@@ -186,7 +186,7 @@ fi
 #   4. builds the prompt with untrusted failure details fenced as data,
 #   5. prints a bare {"additionalContext":…} (or {}).
 CTX_JSON="$(printf '%s' "$INPUT" | "$PYTHON_BIN" -c '
-import glob, json, os, re, shlex, sys, subprocess, time
+import glob, hashlib, json, os, re, shlex, sys, subprocess, time, uuid
 from datetime import datetime, timezone
 
 raw_stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -448,9 +448,15 @@ if pending_subagents and (lesson_exists or (count == 0 and not rej_msg)):
     ) % (len(pending_subagents), "\n".join(_subagent_lines()), store_py_arg, ns_arg, refs)
     emit({"additionalContext": msg})
 
-# 4a. No failures → lightweight nudge. With user rejections, surface them
-#     specifically (a stated reason is the highest-signal correction in a
-#     transcript); without rejections, keep the original success nudge unchanged.
+# 4a. No failures -> lightweight nudge, gated on a signal CHANGE (#258).
+#     With user rejections, surface them specifically (a stated reason is the
+#     highest-signal correction in a transcript); without rejections, the
+#     success nudge fires only when the tracked signal state changed since
+#     the last nudge: a recognized runner run appeared or flipped
+#     (test/compile/lint via capture_quality infer_signal over the
+#     transcript), a user correction count moved, or this is the first Stop
+#     of the session (no persisted state). When nothing changed, the state
+#     is re-recorded silently for the closeout skill and nothing is emitted.
 if count == 0:
     if rej_msg:
         msg = (
@@ -469,6 +475,85 @@ if count == 0:
                 "--source-ref <one of the subagent keys>)"
             ) % (len(pending_subagents), "\n".join(_subagent_lines()))
         emit({"additionalContext": msg})
+
+    # 4a-2. Signal-change gate (#258): the no-failure nudge fires only when
+    #       the tracked signal state CHANGED since the last nudge for this
+    #       session. A missing state file is the first Stop and always
+    #       counts as changed. Runner signals come from store.py signals,
+    #       which classifies Bash commands via capture_quality infer_signal
+    #       (test/compile/lint, the #123 vocabulary) over the transcript;
+    #       the user-correction count reuses the rejections this hook already
+    #       collected. When nothing changed, the state is re-recorded
+    #       silently (the closeout skill review pass surfaces it later) and
+    #       no additionalContext is emitted. A broken scan (nonzero exit or
+    #       unparseable output) emits nothing AND leaves the persisted state
+    #       untouched: a broken substrate must neither nag every Stop nor
+    #       blank the record.
+    current_signals = {}
+    scan_ok = False
+    try:
+        sig_argv = [sys.executable, store_py, "signals", "--session", session_id,
+                    "--db", db_path]
+        if transcript:
+            sig_argv += ["--transcript", transcript]
+        sig_out = subprocess.check_output(
+            sig_argv, stderr=subprocess.DEVNULL, timeout=10
+        ).decode("utf-8", "replace")
+        sig_obj = json.loads(sig_out) if sig_out.strip() else {}
+        if isinstance(sig_obj, dict) and isinstance(sig_obj.get("signals"), dict):
+            current_signals = sig_obj["signals"]
+            scan_ok = True
+    except Exception:
+        scan_ok = False
+    if not scan_ok:
+        emit({})
+    user_corrections = len(rejections)
+
+    def _signal_state_path():
+        stem = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        return os.path.join(data_dir, "ops", stem + ".signals")
+
+    def _write_signal_state(path, obj):
+        # Atomic tmp + os.replace (the delivery-ledger pattern): a reader
+        # never observes a partial file, and a same-volume rename is atomic
+        # on Windows too. 0600 at open mirrors the reviewed ledger posture
+        # (the mode bit is a no-op on Windows; the residual is documented
+        # there). Fail-open: the nudge path never depends on this write.
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp." + uuid.uuid4().hex
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    state_path = _signal_state_path()
+    prev = None
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            prev = loaded
+    except Exception:
+        prev = None
+    _write_signal_state(state_path, {
+        "version": 1,
+        "signals": current_signals,
+        "user_corrections": user_corrections,
+        "updated": datetime.now(timezone.utc).isoformat(),
+    })
+    if (prev is not None
+            and prev.get("signals") == current_signals
+            and prev.get("user_corrections") == user_corrections):
+        emit({})
     msg = (
         "ZMem reflection: this session had no tool failures, but you may have "
         "learned something worth capturing — a convention, a debugging insight, "
