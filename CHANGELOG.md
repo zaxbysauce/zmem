@@ -10,7 +10,7 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
-## [0.83.0] - 2026-10-04
+## [0.83.0] - 2026-10-05
 
 ### Fixed
 - **The no-failure Stop nudge now fires only when a signal changed (issue
