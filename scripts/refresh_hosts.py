@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import filecmp
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -224,7 +226,7 @@ def _iter_mirror_files(root: Path) -> list[tuple[Path, Path]]:
                 # Symlinked checkout entries are not regular source files and
                 # must never be followed into the mirrored host cache.
                 continue
-            if name in EXCLUDED_DIRS:
+            if _is_mirror_excluded(name, True, current == root):
                 continue
             try:
                 mode = os.lstat(child).st_mode
@@ -239,11 +241,9 @@ def _iter_mirror_files(root: Path) -> list[tuple[Path, Path]]:
             # Git worktrees use a root-level ``.git`` file containing a
             # gitdir pointer.  It is checkout metadata just like a .git
             # directory and must not be mirrored into a host cache.
-            if current == root and name == ".git":
+            if _is_mirror_excluded(name, False, current == root):
                 continue
             if child.is_symlink() or _is_reparse_point(child):
-                continue
-            if name.endswith(EXCLUDED_SUFFIXES):
                 continue
             try:
                 mode = os.lstat(child).st_mode
@@ -727,6 +727,8 @@ def _stage_plan(
     expected_hashes: dict[str, str],
     mirror: list[tuple[Path, Path]],
     created_dirs: list[Path],
+    sweep_stale: bool = False,
+    report_path: Path | None = None,
 ) -> tuple[list[_HostPlan], list[_Operation]]:
     plans: list[_HostPlan] = []
     operations: list[_Operation] = []
@@ -739,6 +741,13 @@ def _stage_plan(
         cache, registry, marketplaces = _adapter_paths(home, host, version)
         plans.append(_HostPlan(host, cache, registry, marketplaces, None, expected_digest))
     _validate_destinations(plans, checkout=checkout)
+    if sweep_stale:
+        # Destinations are validated (no symlinked ancestors) and nothing of
+        # this run has been staged yet, so every match is from an earlier run.
+        for warning in _sweep_stale_staged_temps(
+            home, hosts, version, report_path
+        ):
+            print(f"refresh_hosts: warning: {warning}", file=sys.stderr)
     _ensure_parent_paths(
         (
             path
@@ -850,6 +859,274 @@ def _stage_plan(
             ) from exc
         raise
     return plans, operations
+
+
+# Claude Code writes per-process liveness markers into the live cache version
+# directory (``<cache>/.in_use/<pid>``).  They are host-owned state, not mirror
+# content, so the no-op comparison ignores that one root-level directory on the
+# destination side.  ``.orphaned_at`` is deliberately NOT ignored: a swap clears it.
+_HOST_OWNED_ROOT_DIR = ".in_use"
+
+
+def _is_mirror_excluded(name: str, is_dir: bool, at_root: bool) -> bool:
+    """The mirror's exclusion rule, shared with ``_iter_mirror_files``."""
+    if is_dir:
+        return name in EXCLUDED_DIRS
+    # A root-level ``.git`` file is worktree metadata, never mirrored.
+    return (at_root and name == ".git") or name.endswith(EXCLUDED_SUFFIXES)
+
+
+def _in_use_dir_is_plain(path: Path) -> bool:
+    """True when ``.in_use`` is a real directory holding only regular files."""
+    if path.is_symlink() or _is_reparse_point(path):
+        return False
+    if not stat.S_ISDIR(os.lstat(path).st_mode):
+        return False
+    with os.scandir(path) as entries:
+        for entry in entries:
+            child = Path(entry.path)
+            try:
+                if child.is_symlink() or _is_reparse_point(child):
+                    return False
+                if not stat.S_ISREG(os.lstat(child).st_mode):
+                    return False
+            except FileNotFoundError:
+                # A session exited and removed its marker mid-scan; a vanished
+                # liveness marker is not a cache difference.
+                continue
+    return True
+
+
+def _mirror_tree_files(
+    root: Path, ignore_host_state: bool = False
+) -> dict[str, Path] | None:
+    """Map case-sensitive POSIX relative path -> file, or None if not a clean mirror.
+
+    Exclusions come from ``_is_mirror_excluded``, the same predicate
+    ``_iter_mirror_files`` uses.  With ``ignore_host_state`` (destination side
+    only) a root-level ``.in_use`` directory is skipped after verifying it holds
+    only regular, non-link files.  Any symlink, junction, reparse point,
+    non-regular entry or enumeration error returns ``None`` so the caller treats
+    the tree as changed and the normal transaction handles it.
+    """
+    try:
+        if root.is_symlink() or _is_reparse_point(root) or not root.is_dir():
+            return None
+        files: dict[str, Path] = {}
+        failed: list[OSError] = []
+        for dirpath, dirnames, filenames in os.walk(
+            root, topdown=True, followlinks=False, onerror=failed.append
+        ):
+            current = Path(dirpath)
+            at_root = current == root
+            kept: list[str] = []
+            for name in dirnames:
+                child = current / name
+                if child.is_symlink() or _is_reparse_point(child):
+                    return None
+                if ignore_host_state and at_root and name == _HOST_OWNED_ROOT_DIR:
+                    if not _in_use_dir_is_plain(child):
+                        return None
+                    continue
+                if _is_mirror_excluded(name, True, at_root):
+                    continue
+                if not stat.S_ISDIR(os.lstat(child).st_mode):
+                    return None
+                kept.append(name)
+            dirnames[:] = kept
+            for name in filenames:
+                child = current / name
+                if child.is_symlink() or _is_reparse_point(child):
+                    return None
+                if _is_mirror_excluded(name, False, at_root):
+                    continue
+                if not stat.S_ISREG(os.lstat(child).st_mode):
+                    return None
+                files[child.relative_to(root).as_posix()] = child
+        if failed:
+            return None
+        return files
+    except OSError:
+        return None
+
+
+def _cache_matches_staged(
+    destination: Path, staged: Path, *, ignore_host_state: bool = False
+) -> bool:
+    """Exact full-mirror comparison: same file set, raw-byte-equal contents."""
+    installed = _mirror_tree_files(
+        destination, ignore_host_state=ignore_host_state
+    )
+    wanted = _mirror_tree_files(staged)
+    if installed is None or wanted is None or set(installed) != set(wanted):
+        return False
+    try:
+        return all(
+            filecmp.cmp(str(installed[rel]), str(wanted[rel]), shallow=False)
+            for rel in wanted
+        )
+    except OSError:
+        return False
+
+
+def _destination_matches_staged(operation: _Operation, plan: _HostPlan) -> bool:
+    """Whether committing *operation* would leave its destination unchanged.
+
+    Cache directories must match the staged mirror exactly (see
+    ``_cache_matches_staged``) and also carry the expected runtime digest; the
+    digest alone is not enough because it covers only the runtime surface and
+    normalizes CRLF.  Registry and marketplace files must be regular, non-link
+    files holding exactly the staged bytes.  Anything unreadable or unusual
+    counts as "changed" so the normal transaction (and its existing validation
+    and rollback) handles it.
+    """
+    destination = operation.destination
+    if operation.kind == "cache":
+        return (
+            plan.before_digest is not None
+            and plan.before_digest == plan.after_digest
+            and _cache_matches_staged(
+                destination,
+                operation.source,
+                ignore_host_state=operation.host == "claude",
+            )
+        )
+    try:
+        info = os.stat(str(destination), follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or _is_reparse_point(destination):
+            return False
+        return destination.read_bytes() == operation.source.read_bytes()
+    except OSError:
+        return False
+
+
+def _discard_skipped_temps(
+    operations: list[_Operation], retained: set[Path]
+) -> list[str]:
+    """Best-effort removal of staged temporaries of skipped operations.
+
+    A no-op run must not fail because a scanner briefly holds a freshly
+    written temp file, so removal is retried briefly and a persistent failure is
+    returned as a warning.  The path is recorded in ``retained`` so no later
+    cleanup pass retries or mistakes it for a disposable transaction temp.
+    """
+    warnings: list[str] = []
+    for operation in operations:
+        for path in (operation.source, operation.backup):
+            if path is None:
+                continue
+            error: OSError | None = None
+            for attempt in range(3):
+                try:
+                    _remove_path(path)
+                    error = None
+                    break
+                except FileNotFoundError:
+                    error = None
+                    break
+                except OSError as exc:
+                    error = exc
+                    time.sleep(0.1 * (attempt + 1))
+            if error is not None:
+                retained.add(path)
+                warnings.append(f"could not remove staged temporary {path}: {_message(error)}")
+    return warnings
+
+
+_STALE_STAGED_TEMP_RE = re.compile(
+    r"^\.zmem-refresh-(?:codex|claude|zcode)-(?:cache|registry|marketplace)-"
+    r"[0-9a-f]{%d}(?:\.tmp)?$" % (_TEMP_RANDOM_BYTES * 2)
+)
+
+
+def _sweep_stale_staged_temps(
+    home: Path,
+    hosts: tuple[str, ...],
+    version: str,
+    report_path: Path | None = None,
+) -> list[str]:
+    """Remove leftover staged and report temporaries from earlier runs.
+
+    Runs under the refresh lock, so no other refresh owns them.  Only names
+    that match this module's staged-temp pattern or the exact report sibling
+    temp pattern are touched, and only real directories or regular files;
+    links are never followed.  ``-backup-`` names never match: a retained
+    preimage is operator recovery data.  Every failure is returned as a warning
+    and never aborts the run.
+    """
+    warnings: list[str] = []
+    parents: dict[str, Path] = {}
+    report_temp_pattern: re.Pattern[str] | None = None
+    try:
+        for host in hosts:
+            cache, registry, marketplaces = _adapter_paths(home, host, version)
+            for destination in (cache, registry, *marketplaces):
+                if destination is not None:
+                    parents[os.path.normcase(str(destination.parent))] = destination.parent
+        if report_path is not None:
+            report_path = Path(report_path)
+            parents[os.path.normcase(str(report_path.parent))] = report_path.parent
+            report_temp_pattern = re.compile(
+                rf"^\.{re.escape(report_path.name)}\.[0-9a-f]"
+                rf"{{{_TEMP_RANDOM_BYTES * 2}}}\.tmp$"
+            )
+    except Exception as exc:
+        return [f"cannot enumerate stale staged temporaries: {_message(exc)}"]
+    for parent in parents.values():
+        try:
+            if parent.is_symlink() or _is_reparse_point(parent) or not parent.is_dir():
+                continue
+            entries = [Path(entry.path) for entry in os.scandir(parent)]
+        except OSError as exc:
+            warnings.append(
+                f"cannot scan stale temporary parent {parent}: {_message(exc)}"
+            )
+            continue
+        for path in entries:
+            if not _STALE_STAGED_TEMP_RE.match(path.name) and not (
+                report_temp_pattern is not None
+                and report_path is not None
+                and parent == report_path.parent
+                and report_temp_pattern.match(path.name)
+            ):
+                continue
+            try:
+                if path.is_symlink() or _is_reparse_point(path):
+                    continue
+                mode = os.lstat(path).st_mode
+                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                    continue
+                _remove_path(path)
+            except Exception as exc:
+                warnings.append(f"could not sweep stale temporary {path}: {_message(exc)}")
+    return warnings
+
+
+def _drop_unchanged_operations(
+    plans: list[_HostPlan], operations: list[_Operation], retained: set[Path]
+) -> tuple[list[_Operation], list[str]]:
+    """Remove every operation whose destination already holds the staged bytes.
+
+    Each operation is judged independently, so a host whose registry drifted
+    still keeps its (identical) live cache directory in place.  A plan left
+    with no operations is marked ``unchanged``.  Returns the remaining
+    operations and non-fatal warnings about staged temporaries that could not
+    be removed.
+    """
+    plan_by_host = {plan.host: plan for plan in plans}
+    kept: list[_Operation] = []
+    dropped: list[_Operation] = []
+    for operation in operations:
+        plan = plan_by_host.get(operation.host)
+        if plan is not None and _destination_matches_staged(operation, plan):
+            dropped.append(operation)
+        else:
+            kept.append(operation)
+    kept_hosts = {operation.host for operation in kept}
+    for plan in plans:
+        if plan.host not in kept_hosts:
+            plan.status = "unchanged"
+    return kept, _discard_skipped_temps(dropped, retained)
 
 
 def _backup_operations(operations: list[_Operation]) -> None:
@@ -1329,6 +1606,8 @@ def _refresh_transaction_locked(
             expected_hashes,
             mirror,
             created_dirs,
+            sweep_stale=not dry_run,
+            report_path=report_path,
         )
         if dry_run:
             for plan in plans:
@@ -1342,11 +1621,26 @@ def _refresh_transaction_locked(
                 _atomic_write_report(report_path, report, report_created_dirs)
             return report
 
+        # No-op fast path: any destination (cache, registry, marketplace file)
+        # that already holds the exact bytes about to be written is left
+        # untouched, and a host with nothing to change is reported
+        # "unchanged".  Renaming a live cache directory fails on Windows while
+        # any process holds a handle inside it, so skipping the swap is what
+        # lets an up-to-date refresh succeed.
+        operations, skipped_warnings = _drop_unchanged_operations(
+            plans, operations, retained_backups
+        )
+        for warning in skipped_warnings:
+            # Non-fatal: the destinations are already correct.  The report
+            # contract has no warning field (any mismatch makes ok false), so
+            # surface the leftover temp on stderr instead.
+            print(f"refresh_hosts: warning: {warning}", file=sys.stderr)
+        for plan in plans:
+            if plan.status != "unchanged":
+                plan.status = "refreshed"
         # Stage the final report before any destination is changed.  It is
         # committed as the last transaction operation, so a report failure
         # rolls back the cache and registry replacements as well.
-        for plan in plans:
-            plan.status = "refreshed"
         report_operation: _Operation | None = None
         if report_path is not None:
             staged_report = _stage_report(report_path, _build_report(

@@ -1132,6 +1132,19 @@ The digests cover the served runtime surface; a successful run has
 `mismatchCount: 0`, `ok: true`, and no per-host mismatches. A failure records
 actionable mismatch text and returns nonzero.
 
+A destination that already matches what would be written is left untouched: a
+cache must equal the staged mirror exactly (same files with case-sensitive
+paths, raw-byte-equal, no links; `.git`, `graphify-out`, `__pycache__`, `.pyc`,
+and `.pyo` are ignored as in the mirror, and Claude Code's root-level
+`.in_use/` liveness-marker directory is ignored only for Claude caches, but not
+`.orphaned_at`), and a
+registry or marketplace file must hold the exact staged bytes. A host with
+nothing to change reports `status: "unchanged"` (otherwise `"refreshed"`;
+`"dry-run"` and `"failed"` are unchanged), so an up-to-date run no longer
+renames the live cache. Any cache difference still replaces the cache
+directory and can still fail on Windows while a session holds files open in it; a version
+bump installs beside the old version directory instead.
+
 Refresh is fail-closed. It validates every requested host, registry shape,
 release manifest, staged copy, marketplace source, and digest before the first
 destination replacement. During commit it backs up every existing destination

@@ -205,6 +205,32 @@ class _RefreshFixtureMixin:
             paths.extend(Path(p) for p in row["marketplacePaths"])
         return [p for p in paths if p.exists() and p.is_file()]
 
+    def _dirty_caches(self, hosts: tuple[str, ...] = HOSTS) -> None:
+        """Make the installed caches differ so the next refresh must replace them."""
+        for row in self._report()["hosts"]:
+            if row["host"] in hosts:
+                (Path(row["cacheRoot"]) / "hooks/zmem-recall.sh").write_bytes(b"# stale\n")
+
+    def _dirty_all_destinations(self) -> None:
+        """Also drift every registry and marketplace file so all kinds are replaced."""
+        self._dirty_caches()
+        for row in self._report()["hosts"]:
+            if row["registryPath"] is not None:
+                registry = Path(row["registryPath"])
+                data = json.loads(registry.read_text(encoding="utf-8"))
+                records = data["plugins"]
+                if isinstance(records, dict):
+                    records = records["zmem@zmem"]
+                for record in records:
+                    if record.get("name", "zmem") == "zmem":
+                        record["gitCommitSha"] = "d" * 40
+                registry.write_bytes(
+                    (json.dumps(data, separators=(",", ":")) + "\n").encode("utf-8")
+                )
+            for path in row["marketplacePaths"]:
+                marketplace = Path(path)
+                marketplace.write_bytes(marketplace.read_bytes() + b" ")
+
     def _state(self, report: dict | None = None) -> dict[str, bytes]:
         report = report or self._report()
         return {str(p): p.read_bytes() for p in self._reported_paths(report)}
@@ -516,6 +542,7 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
             for row in self._report()["hosts"]
             for path in row["marketplacePaths"]
         )
+        self._dirty_all_destinations()
         removed: list[Path] = []
         real_remove = refresh_hosts._remove_path
 
@@ -579,6 +606,7 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
 
     def test_injected_os_replace_failure_is_nonzero_and_rolls_back_every_destination(self):
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        self._dirty_caches()
         before_report = self._report()
         before = self._state(before_report)
         before_tree = {
@@ -614,8 +642,473 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
                          "rollback must remove temp/backup residue as well")
         self.assertFalse(self._report()["ok"])
 
+    # --- no-op fast path -------------------------------------------------
+
+    def _destination_paths(self, report: dict) -> set[Path]:
+        paths: set[Path] = set()
+        for row in report["hosts"]:
+            paths.add(Path(row["cacheRoot"]).resolve())
+            if row["registryPath"] is not None:
+                paths.add(Path(row["registryPath"]).resolve())
+            paths.update(Path(p).resolve() for p in row["marketplacePaths"])
+        return paths
+
+    def _record_destination_replaces(self, destinations: set[Path]):
+        """Patch os.replace; return (calls touching a destination, patcher)."""
+        touched: list[tuple[str, str]] = []
+        real_replace = os.replace
+
+        def recorder(src, dst, *args, **kwargs):
+            if Path(src).resolve() in destinations or Path(dst).resolve() in destinations:
+                touched.append((str(src), str(dst)))
+            return real_replace(src, dst, *args, **kwargs)
+
+        return touched, mock.patch.object(
+            refresh_hosts.os, "replace", side_effect=recorder
+        )
+
+    def _tmp_residue(self) -> list[str]:
+        return sorted(
+            str(p.relative_to(self.home))
+            for p in self.home.rglob("*")
+            if ".zmem-refresh-" in p.name
+        )
+
+    def _home_tree(self) -> dict[str, tuple[str, bytes | None]]:
+        return {
+            str(p.relative_to(self.home)): ("dir", None) if p.is_dir()
+            else ("file", p.read_bytes())
+            for p in self.home.rglob("*")
+        }
+
+    def test_second_refresh_of_unchanged_checkout_touches_no_destination(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        first = self._report()
+        self.assertEqual({row["status"] for row in first["hosts"]}, {"refreshed"})
+        before = self._state(first)
+        destinations = self._destination_paths(first)
+
+        touched, patch = self._record_destination_replaces(destinations)
+        with patch:
+            status = self._main_status(*self._refresh_args())
+
+        self.assertEqual(status, 0)
+        self.assertEqual(touched, [], "unchanged destinations must not be renamed")
+        report = self._report()
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["mismatchCount"], 0)
+        self.assertEqual([row["status"] for row in report["hosts"]], ["unchanged"] * 3)
+        for row in report["hosts"]:
+            self.assertEqual(row["beforeDigest"], row["afterDigest"])
+        self.assertEqual(self._state(report), before)
+        self.assertEqual(self._tmp_residue(), [], "staged temporaries must be removed")
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is unavailable")
+        schema = json.loads((SCRIPTS / "refresh-report-schema.json").read_text(encoding="utf-8"))
+        jsonschema.validate(report, schema)
+
+    def test_mixed_refresh_replaces_only_destinations_that_differ(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        first = self._report()
+        caches = {row["host"]: Path(row["cacheRoot"]).resolve() for row in first["hosts"]}
+        self._dirty_caches(("codex",))
+        # Claude's cache is identical but its registry drifted; ZCode is intact.
+        claude_registry = self.home / ".claude/plugins/installed_plugins.json"
+        registry = json.loads(claude_registry.read_text(encoding="utf-8"))
+        registry["plugins"]["zmem@zmem"][0]["gitCommitSha"] = "d" * 40
+        claude_registry.write_bytes(
+            (json.dumps(registry, separators=(",", ":")) + "\n").encode("utf-8")
+        )
+        zcode_row = next(r for r in first["hosts"] if r["host"] == "zcode")
+        zcode_before = self._state({"hosts": [zcode_row]})
+
+        touched, patch = self._record_destination_replaces(self._destination_paths(first))
+        with patch:
+            status = self._main_status(*self._refresh_args())
+
+        self.assertEqual(status, 0)
+        report = self._report()
+        self.assertEqual(
+            {row["host"]: row["status"] for row in report["hosts"]},
+            {"codex": "refreshed", "claude": "refreshed", "zcode": "unchanged"},
+        )
+        replaced = {Path(p).resolve() for pair in touched for p in pair}
+        self.assertIn(caches["codex"], replaced)
+        self.assertIn(claude_registry.resolve(), replaced)
+        # Claude's identical cache is not renamed; nothing under ZCode is.
+        self.assertNotIn(caches["claude"], replaced)
+        zcode_paths = {Path(zcode_row["cacheRoot"]).resolve(),
+                       Path(zcode_row["registryPath"]).resolve(),
+                       *(Path(p).resolve() for p in zcode_row["marketplacePaths"])}
+        self.assertTrue(zcode_paths.isdisjoint(replaced))
+        self.assertEqual(
+            (caches["codex"] / "hooks/zmem-recall.sh").read_bytes(),
+            (self.checkout / "hooks/zmem-recall.sh").read_bytes(),
+        )
+        fixed = json.loads(claude_registry.read_text(encoding="utf-8"))
+        self.assertEqual(fixed["plugins"]["zmem@zmem"][0]["gitCommitSha"], report["gitCommitSha"])
+        self.assertEqual(self._state({"hosts": [zcode_row]}), zcode_before)
+        self.assertEqual(self._tmp_residue(), [])
+
+    def test_failure_in_changed_host_rolls_back_and_preserves_unchanged_hosts(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        first = self._report()
+        self._dirty_caches(("codex",))
+        before_tree = self._home_tree()
+        codex_cache = next(Path(r["cacheRoot"]).resolve()
+                           for r in first["hosts"] if r["host"] == "codex")
+        real_replace = os.replace
+
+        def fail_codex_cache(src, dst):
+            if Path(dst).resolve() == codex_cache:
+                raise OSError("injected replacement failure")
+            return real_replace(src, dst)
+
+        with mock.patch.object(refresh_hosts.os, "replace", side_effect=fail_codex_cache):
+            status = self._main_status(*self._refresh_args())
+        self.assertNotEqual(status, 0)
+        self.assertEqual(self._home_tree(), before_tree)
+        self.assertFalse(self._report()["ok"])
+
+    def test_dry_run_still_reports_dry_run_for_unchanged_hosts(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        self.assertEqual(self._main_status(*self._refresh_args(), "--dry-run"), 0)
+        self.assertEqual({row["status"] for row in self._report()["hosts"]}, {"dry-run"})
+
+    def test_version_bump_installs_beside_old_version_without_renaming_it(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        first = self._report()
+        old_caches = {Path(row["cacheRoot"]).resolve() for row in first["hosts"]}
+
+        def cache_bytes() -> dict[str, bytes]:
+            return {
+                str(p): p.read_bytes()
+                for cache in old_caches for p in cache.rglob("*") if p.is_file()
+            }
+
+        old_state = cache_bytes()
+
+        new_version = "0.37.0"
+        for path in self.checkout.rglob("*"):
+            if ".git" in path.parts or not path.is_file():
+                continue
+            if path.suffix in {".json", ".yaml"} and path.name != "release-manifest.json":
+                path.write_bytes(path.read_bytes().replace(VERSION.encode(), new_version.encode()))
+        files = tree_hashes(self.checkout)
+        _write(self.checkout / "release-manifest.json", _json_bytes({
+            "version": new_version, "algorithm": "sha256-crlf-norm",
+            "files": files, "digest": aggregate(files),
+        }))
+        _commit(self.checkout)
+
+        existed: dict[tuple[str, str], bool] = {}
+        real_backup = refresh_hosts._backup_operations
+
+        def observe(operations):
+            real_backup(operations)
+            for op in operations:
+                existed[(op.host, op.kind)] = op.existed
+
+        touched, patch = self._record_destination_replaces(old_caches)
+        with mock.patch.object(refresh_hosts, "_backup_operations", side_effect=observe), patch:
+            status = self._main_status(*self._refresh_args())
+
+        self.assertEqual(status, 0)
+        self.assertEqual(touched, [], "the old version directory must not be renamed")
+        for host in HOSTS:
+            self.assertIs(existed[(host, "cache")], False)
+        report = self._report()
+        self.assertEqual(report["version"], new_version)
+        for row in report["hosts"]:
+            self.assertEqual(row["status"], "refreshed")
+            self.assertEqual(Path(row["cacheRoot"]).name, new_version)
+            self.assertTrue(Path(row["cacheRoot"]).is_dir())
+        self.assertEqual(cache_bytes(), old_state)
+
+    def _assert_all_refreshed(self) -> dict:
+        report = self._report()
+        self.assertTrue(report["ok"])
+        self.assertEqual({row["status"] for row in report["hosts"]}, {"refreshed"})
+        return report
+
+    def test_change_outside_runtime_surface_replaces_every_cache(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        plugin_json = self.checkout / ".claude-plugin/plugin.json"
+        data = json.loads(plugin_json.read_text(encoding="utf-8"))
+        data["hooks"] = "./hooks/NEW.json"
+        plugin_json.write_text(json.dumps(data), encoding="utf-8")
+        new_sha = _commit(self.checkout)
+
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+
+        report = self._assert_all_refreshed()
+        self.assertEqual(report["gitCommitSha"], new_sha)
+        for row in report["hosts"]:
+            self.assertEqual(
+                (Path(row["cacheRoot"]) / ".claude-plugin/plugin.json").read_bytes(),
+                plugin_json.read_bytes(),
+            )
+
+    def test_extra_stale_file_in_cache_is_removed_by_refresh(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._report()["hosts"]:
+            stale = Path(row["cacheRoot"]) / "commands/removed-command.md"
+            _write(stale, b"stale")
+
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+
+        for row in self._assert_all_refreshed()["hosts"]:
+            self.assertFalse((Path(row["cacheRoot"]) / "commands").exists())
+
+    def test_crlf_only_difference_in_cache_is_replaced(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        expected = (self.checkout / "hooks/zmem-recall.sh").read_bytes()
+        for row in self._report()["hosts"]:
+            script = Path(row["cacheRoot"]) / "hooks/zmem-recall.sh"
+            script.write_bytes(script.read_bytes().replace(b"\n", b"\r\n"))
+
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+
+        for row in self._assert_all_refreshed()["hosts"]:
+            self.assertEqual(
+                (Path(row["cacheRoot"]) / "hooks/zmem-recall.sh").read_bytes(), expected
+            )
+
+    def test_excluded_bytecode_in_cache_does_not_defeat_the_noop_path(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._report()["hosts"]:
+            _write(Path(row["cacheRoot"]) / "hooks/__pycache__/x.cpython-311.pyc", b"\0")
+            _write(Path(row["cacheRoot"]) / "hooks/__pycache__/x.cpython-311.pyo", b"\0")
+            _write(Path(row["cacheRoot"]) / "graphify-out/graph.json", b"{}")
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        self.assertEqual({r["status"] for r in self._report()["hosts"]}, {"unchanged"})
+
+    def test_symlink_inside_cache_is_never_treated_as_unchanged(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        cache = Path(self._report()["hosts"][0]["cacheRoot"])
+        staged = self.tmp / "mirror"
+        shutil.copytree(cache, staged)
+        self.assertTrue(refresh_hosts._cache_matches_staged(cache, staged))
+        link = cache / "link.txt"
+        try:
+            link.symlink_to(cache / "hooks/zmem-recall.sh")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable")
+        self.assertFalse(refresh_hosts._cache_matches_staged(cache, staged))
+
+    def test_claude_in_use_markers_do_not_defeat_the_noop_path(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        first = self._report()
+        markers: list[Path] = []
+        for row in (row for row in first["hosts"] if row["host"] == "claude"):
+            for pid in ("12345", "67890"):
+                marker = Path(row["cacheRoot"]) / ".in_use" / pid
+                _write(marker, b'{"pid":%s,"procStartFt":"1"}' % pid.encode())
+                markers.append(marker)
+
+        touched, patch = self._record_destination_replaces(self._destination_paths(first))
+        with patch:
+            status = self._main_status(*self._refresh_args())
+
+        self.assertEqual(status, 0)
+        self.assertEqual(touched, [], "host-owned .in_use markers must not force a swap")
+        self.assertEqual([r["status"] for r in self._report()["hosts"]], ["unchanged"] * 3)
+        self.assertTrue(all(m.is_file() for m in markers))
+
+    def test_root_in_use_directory_in_non_claude_cache_is_a_difference(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        first = self._report()
+        non_claude = [row for row in first["hosts"] if row["host"] != "claude"]
+        markers = [
+            Path(row["cacheRoot"]) / ".in_use/other-tool" for row in non_claude
+        ]
+        for marker in markers:
+            _write(marker, b"live")
+
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+
+        rows = {row["host"]: row for row in self._report()["hosts"]}
+        for row in non_claude:
+            self.assertEqual(rows[row["host"]]["status"], "refreshed")
+        self.assertTrue(all(not marker.exists() for marker in markers))
+
+    def test_in_use_marker_vanishing_mid_scan_is_not_a_difference(self):
+        in_use = self.tmp / "vanish" / ".in_use"
+        _write(in_use / "12345", b"{}")
+        _write(in_use / "67890", b"{}")
+        real_lstat = os.lstat
+
+        def flaky_lstat(path, *args, **kwargs):
+            if Path(path).name == "12345":
+                raise FileNotFoundError(path)
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(refresh_hosts.os, "lstat", side_effect=flaky_lstat):
+            self.assertTrue(refresh_hosts._in_use_dir_is_plain(in_use))
+
+    def test_nested_in_use_directory_is_not_ignored(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._report()["hosts"]:
+            _write(Path(row["cacheRoot"]) / "skills/.in_use/1", b"x")
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._assert_all_refreshed()["hosts"]:
+            self.assertFalse((Path(row["cacheRoot"]) / "skills/.in_use").exists())
+
+    def test_orphaned_at_marker_forces_a_swap(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._report()["hosts"]:
+            _write(Path(row["cacheRoot"]) / ".orphaned_at", b"1")
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._assert_all_refreshed()["hosts"]:
+            self.assertFalse((Path(row["cacheRoot"]) / ".orphaned_at").exists())
+
+    def test_in_use_directory_with_subdirectory_is_not_plain_host_state(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        cache = Path(self._report()["hosts"][0]["cacheRoot"])
+        staged = self.tmp / "mirror"
+        shutil.copytree(cache, staged)
+        _write(cache / ".in_use/1", b"x")
+        self.assertTrue(
+            refresh_hosts._cache_matches_staged(
+                cache, staged, ignore_host_state=True
+            )
+        )
+        _write(cache / ".in_use/sub/2", b"x")
+        self.assertFalse(
+            refresh_hosts._cache_matches_staged(
+                cache, staged, ignore_host_state=True
+            )
+        )
+
+    def test_case_only_rename_outside_runtime_surface_is_a_change(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        renamed: list[Path] = []
+        for row in self._report()["hosts"]:
+            original = Path(row["cacheRoot"]) / ".claude-plugin/plugin.json"
+            target = original.with_name("PLUGIN.json")
+            os.replace(original, target)
+            renamed.append(target)
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        for row in self._assert_all_refreshed()["hosts"]:
+            names = [p.name for p in (Path(row["cacheRoot"]) / ".claude-plugin").iterdir()]
+            self.assertIn("plugin.json", names)
+            self.assertNotIn("PLUGIN.json", names)
+
+    @unittest.skipUnless(os.name == "nt", "directory junctions are Windows-only")
+    def test_directory_junction_inside_cache_is_never_unchanged(self):
+        import _winapi
+
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        cache = Path(self._report()["hosts"][0]["cacheRoot"])
+        staged = self.tmp / "mirror"
+        shutil.copytree(cache, staged)
+        self.assertTrue(refresh_hosts._cache_matches_staged(cache, staged))
+        target = self.tmp / "junction-target"
+        target.mkdir()
+        _winapi.CreateJunction(str(target), str(cache / "junction"))
+        self.assertFalse(refresh_hosts._cache_matches_staged(cache, staged))
+
+    def test_stale_staged_temps_are_swept_but_backups_are_retained(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        cache = Path(self._report()["hosts"][0]["cacheRoot"])
+        token = "0123456789abcdef" * 2
+        stale_dir = cache.parent / f".zmem-refresh-codex-cache-{token}"
+        _write(stale_dir / "x", b"x")
+        stale_file = self.home / ".claude/plugins" / f".zmem-refresh-claude-registry-{token}.tmp"
+        _write(stale_file, b"x")
+        stale_report = self.report.with_name(f".{self.report.name}.{token}.tmp")
+        _write(stale_report, b"stale report")
+        backup = cache.parent / f".zmem-refresh-codex-cache-backup-{token}.tmp"
+        _write(backup / "x", b"preimage")
+        unrelated = cache.parent / ".zmem-refresh-notes"
+        _write(unrelated, b"keep")
+
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+
+        self.assertFalse(stale_dir.exists())
+        self.assertFalse(stale_file.exists())
+        self.assertFalse(stale_report.exists())
+        self.assertTrue(backup.exists(), "retained preimages are recovery data")
+        self.assertTrue(unrelated.exists())
+        self.assertEqual({r["status"] for r in self._report()["hosts"]}, {"unchanged"})
+
+    def test_stale_temp_sweep_failure_is_nonfatal(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        cache = Path(self._report()["hosts"][0]["cacheRoot"])
+        stale = cache.parent / (".zmem-refresh-codex-cache-" + "ab" * 16)
+        _write(stale / "x", b"x")
+        real_remove = refresh_hosts._remove_path
+
+        def flaky(path):
+            if Path(path) == stale:
+                raise OSError("injected sweep failure")
+            return real_remove(path)
+
+        stderr = io.StringIO()
+        with mock.patch.object(refresh_hosts, "_remove_path", side_effect=flaky), \
+                contextlib.redirect_stderr(stderr):
+            status = self._main_status(*self._refresh_args())
+        self.assertEqual(status, 0, stderr.getvalue())
+        self.assertIn("could not sweep stale temporary", stderr.getvalue())
+        self.assertTrue(stale.exists())
+
+    def test_stale_temp_parent_scan_failure_warns(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        cache = Path(self._report()["hosts"][0]["cacheRoot"])
+        scan_parent = cache.parent
+        real_scandir = os.scandir
+
+        def flaky_scandir(path):
+            if Path(path) == scan_parent:
+                raise PermissionError("injected parent scan denial")
+            return real_scandir(path)
+
+        with mock.patch.object(
+            refresh_hosts.os, "scandir", side_effect=flaky_scandir
+        ):
+            warnings = refresh_hosts._sweep_stale_staged_temps(
+                self.home, ("codex",), self._report()["version"], self.report
+            )
+
+        self.assertTrue(
+            any(
+                "cannot scan stale temporary parent" in warning
+                for warning in warnings
+            ),
+            warnings,
+        )
+
+    def test_skipped_temp_cleanup_failure_is_a_nonfatal_warning(self):
+        self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        real_remove = refresh_hosts._remove_path
+        failed: list[Path] = []
+
+        def flaky(path):
+            name = Path(path).name
+            if name.startswith(".zmem-refresh-") and "-report-" not in name:
+                failed.append(Path(path))
+                raise OSError("injected scanner lock")
+            return real_remove(path)
+
+        stderr = io.StringIO()
+        with mock.patch.object(refresh_hosts, "_remove_path", side_effect=flaky), \
+                mock.patch.object(refresh_hosts.time, "sleep"), \
+                contextlib.redirect_stderr(stderr):
+            status = self._main_status(*self._refresh_args())
+
+        self.assertEqual(status, 0, stderr.getvalue())
+        self.assertTrue(failed)
+        report = self._report()
+        self.assertTrue(report["ok"])
+        self.assertEqual({r["status"] for r in report["hosts"]}, {"unchanged"})
+        self.assertIn("could not remove staged temporary", stderr.getvalue())
+        self.assertTrue(all(p.exists() for p in failed), "leftover temp is retained")
+
     def test_report_write_failure_is_nonzero_and_rolls_back_all_destinations(self):
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
+        self._dirty_all_destinations()
         before_report = self._report()
         before = self._state(before_report)
         before_tree = {
