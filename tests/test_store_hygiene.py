@@ -72,14 +72,17 @@ FIXTURE_DIGESTS = {
     "expected-report.json": "86489602e06de408e08c17ee2c9b15057994cffcf778b73b31a0fdb200c7acb8",
 }
 
-# Interpreter-token normalization: any single-quoted token immediately before
-# the upgrade-command script path is the generating machine's sys.executable
-# (rendered by hygiene._UPGRADE_COMMAND, issue #259). In JSON bytes the token
-# carries escaped backslashes (C:\\Python311\\...); the pattern accepts both
-# the raw and escaped forms and is anchored to the fixed script-path suffix,
-# so it cannot eat unrelated content.
+# Interpreter-token normalization: the token immediately before the
+# upgrade-command script path is the generating machine's sys.executable
+# (rendered by hygiene._UPGRADE_COMMAND as shlex.quote(sys.executable),
+# issue #259). shlex.quote is a NO-OP on typical POSIX paths, so the token
+# appears either single-quoted (Windows, JSON-escaped backslashes:
+# 'C:\\Python311\\python.exe') or bare (POSIX: /opt/.../python3); the
+# pattern accepts both, is anchored to the fixed script-path suffix, and
+# excludes whitespace and quotes in the bare form so it cannot creep
+# backward into the surrounding JSON.
 _INTERP_RE = re.compile(
-    r"'(?:\\.|[^'\\])*' skills/memory/scripts/store\.py update")
+    r"(?:'(?:\\.|[^'\\])*'|[^\s'\"]+) skills/memory/scripts/store\.py update")
 
 
 def _norm_interp(data):
