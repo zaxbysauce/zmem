@@ -137,6 +137,28 @@ class SignalsClassificationTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["signals"], {})
 
+    def test_list_content_rejection_records_no_signal(self):
+        # Review round 8: CC emits tool_result content as a string OR a
+        # list of {type:"text", ...} blocks; a rejection in the list shape
+        # must also record no signal (previously misrecorded as "fail").
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "r2", "name": "Bash",
+                 "input": {"command": "pytest tests/x.py"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result",
+                 "content": [{"type": "text", "text": (
+                     "The user doesn't want to proceed.\n"
+                     "the user said:\nnot now")}],
+                 "is_error": True, "tool_use_id": "r2"}]}},
+        ]
+        Path(self.transcript).write_text(
+            "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        r = _run_signals(_env(self.tmp), "--session", "sigtest",
+                         "--transcript", self.transcript)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["signals"], {})
+
     def test_sibling_tooluseresult_error_counts_as_fail(self):
         # Review PRR-008: an error-shaped toolUseResult sibling counts as a
         # fail even when the block's is_error flag is false/absent — the

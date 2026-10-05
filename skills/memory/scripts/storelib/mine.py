@@ -37,9 +37,12 @@ except ImportError:
 # capture_quality must degrade only the signals walker (to an empty map,
 # via the None fallback below) instead of failing the whole mine module —
 # which would take every store.py subcommand down with it (review PRR-011).
+# Exception (not just ImportError) matches the base lazy-import guard's
+# containment: a syntactically-broken capture_quality must degrade the
+# same way, not kill the CLI.
 try:
     from capture_quality import infer_signal as _infer_signal
-except ImportError:
+except Exception:
     try:
         sys.path.insert(0, os.path.dirname(__file__))
         from capture_quality import infer_signal as _infer_signal  # type: ignore
@@ -571,12 +574,13 @@ def _signals_from_transcript(path: str) -> dict:
             # Classify the outcome the way the failure walker does: a user
             # rejection means the run never executed, so it records NO
             # signal (never a "fail"); an error-shaped ``toolUseResult``
-            # sibling counts as a fail even when is_error is absent.
+            # sibling counts as a fail even when is_error is absent. Block
+            # content goes through _result_text because CC emits
+            # tool_result content as a string OR a list of text blocks.
             texts = []
             if isinstance(tur, str):
                 texts.append(tur)
-            if isinstance(b.get("content"), str):
-                texts.append(b["content"])
+            texts.append(_result_text(b.get("content")))
             if any(_is_rejection_text(t) for t in texts):
                 continue
             failed = b.get("is_error") is True or (
