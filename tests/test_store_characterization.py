@@ -201,7 +201,8 @@ KNOWN_SUBCMDS = [
     # v12 (issue #64): explicit usage-feedback + dry-run weight tuning.
     "feedback", "tune-weights",
     # Issue #134 (Workstream E): the governed dataset artifact surface.
-    "export-dataset", "publish-dataset", "import-dataset",
+    # Issue #139: read-only evidence-backed provenance inspection.
+    "export-dataset", "publish-dataset", "import-dataset", "source",
     # Issue #138: explicit curated page filesystem commands.
     "page",
 ]
@@ -504,21 +505,22 @@ class CharacterizationTests(unittest.TestCase):
         # 40 -> 45: governed training capture/export commands joined (issue #135).
         # 45 -> 47: independent review and trusted terminal revoke joined.
         # 47 -> 48: curated page filesystem commands joined (issue #138).
-        self.assertEqual(len(KNOWN_SUBCMDS), 48)
+        # 48 -> 49: read-only provenance inspection joined (issue #139).
+        self.assertEqual(len(KNOWN_SUBCMDS), 49)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
         # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # stays frozen at 48 after the #138 page addition).
+        # stays frozen at 49 after the #138 page and #139 source additions).
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 48)
+        self.assertEqual(len(KNOWN_SUBCMDS), 49)
 
     def test_page_help_surface(self):
         """Pin the nested issue #138 grammar and operator-facing help text."""

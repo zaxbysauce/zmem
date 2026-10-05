@@ -1180,10 +1180,29 @@ class ReleaseBreakRaceTest(unittest.TestCase):
         self.lock = Path(self.tmp) / ".zmem-rel.lock"
         self.real_rename = os.rename
         self.addCleanup(setattr, os, "rename", self.real_rename)
+        self.real_read_text = Path.read_text
+        self.addCleanup(setattr, Path, "read_text", self.real_read_text)
+        self.real_retry_is_windows = host._RELEASE_RETRY_IS_WINDOWS
+        self.addCleanup(setattr, host, "_RELEASE_RETRY_IS_WINDOWS",
+                        self.real_retry_is_windows)
+        self.real_sleep = host.time.sleep
+        self.addCleanup(setattr, host.time, "sleep", self.real_sleep)
 
     def _residue(self) -> list:
         return sorted(p.name for p in Path(self.tmp).iterdir()
                       if ".stale." in p.name or ".release." in p.name)
+
+    def _windows_retry_seam(self):
+        sleeps = []
+        host._RELEASE_RETRY_IS_WINDOWS = True
+        host.time.sleep = lambda seconds: sleeps.append(seconds)
+        return sleeps
+
+    @staticmethod
+    def _windows_error(winerror, message="sharing"):
+        exc = OSError(13, message)
+        exc.winerror = winerror
+        return exc
 
     def test_release_never_deletes_a_live_lock_installed_after_our_check(self):
         """Our lock is broken as stale and replaced by another process's LIVE
@@ -1291,22 +1310,176 @@ class ReleaseBreakRaceTest(unittest.TestCase):
         self.assertFalse(self.lock.exists())
         self.assertEqual(self._residue(), [])
 
-    def test_release_survives_a_rename_that_fails(self):
-        """If the aside-rename itself fails (sharing violation, already gone),
-        release is a silent no-op — never raises, never falls back to a blind
-        unlink."""
+    def test_transient_retryable_rename_failure_releases(self):
         tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        calls = []
 
-        def boom(src, dst, *a, **kw):
-            raise OSError(13, "denied")
+        def transient(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            if len(calls) == 1:
+                raise self._windows_error(32)
+            return self.real_rename(src, dst, *a, **kw)
 
-        os.rename = boom
-        try:
-            host.release_lock(self.lock, tok)
-        finally:
-            os.rename = self.real_rename
+        os.rename = transient
+        host.release_lock(self.lock, tok)
 
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [0.01])
+        self.assertFalse(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_persistent_retryable_rename_failure_is_bounded(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        calls = []
+
+        def persistent(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            raise self._windows_error(32)
+
+        os.rename = persistent
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, [0.01])
         self.assertTrue(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_nonretryable_windows_rename_failure_is_single_attempt(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        calls = []
+
+        def denied(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            raise self._windows_error(5, "access denied")
+
+        os.rename = denied
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_posix_does_not_retry_even_a_windows_sharing_error(self):
+        tok = host.acquire_lock(self.lock, 600)
+        calls = []
+        host._RELEASE_RETRY_IS_WINDOWS = False
+
+        def sharing(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            raise self._windows_error(32)
+
+        os.rename = sharing
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_retry_rechecks_a_foreign_successor_before_renaming_again(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        calls = []
+
+        def successor_then_sharing(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            os.unlink(str(self.lock))
+            self.lock.write_text("successor-token", encoding="utf-8")
+            raise self._windows_error(32)
+
+        os.rename = successor_then_sharing
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [0.01])
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(),
+                         "successor-token")
+        self.assertEqual(self._residue(), [])
+
+    def test_retry_returns_when_the_lock_disappears_before_fresh_read(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        calls = []
+
+        def gone_then_sharing(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            os.unlink(str(self.lock))
+            raise self._windows_error(32)
+
+        os.rename = gone_then_sharing
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [0.01])
+        self.assertFalse(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_retry_returns_when_the_fresh_read_is_unavailable(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        calls = []
+        fresh_read = {"fail": False}
+
+        def sharing(src, dst, *a, **kw):
+            calls.append((str(src), str(dst)))
+            fresh_read["fail"] = True
+            raise self._windows_error(32)
+
+        def unavailable(path, *a, **kw):
+            if path == self.lock and fresh_read["fail"]:
+                raise self._windows_error(32)
+            return self.real_read_text(path, *a, **kw)
+
+        os.rename = sharing
+        Path.read_text = unavailable
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [0.01])
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_transient_retryable_confirmation_read_releases(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        reads = []
+
+        def transient(path, *a, **kw):
+            if ".release." in path.name:
+                reads.append(path)
+                if len(reads) == 1:
+                    raise self._windows_error(32)
+            return self.real_read_text(path, *a, **kw)
+
+        Path.read_text = transient
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(sleeps, [0.01])
+        self.assertFalse(self.lock.exists())
+        self.assertEqual(self._residue(), [])
+
+    def test_persistent_retryable_confirmation_read_preserves_lock(self):
+        tok = host.acquire_lock(self.lock, 600)
+        sleeps = self._windows_retry_seam()
+        reads = []
+
+        def persistent(path, *a, **kw):
+            if ".release." in path.name:
+                reads.append(path)
+                raise self._windows_error(32)
+            return self.real_read_text(path, *a, **kw)
+
+        Path.read_text = persistent
+        host.release_lock(self.lock, tok)
+
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(sleeps, [0.01])
+        self.assertTrue(self.lock.exists())
+        self.assertEqual(self.lock.read_text(encoding="utf-8").strip(), tok)
         self.assertEqual(self._residue(), [])
 
 

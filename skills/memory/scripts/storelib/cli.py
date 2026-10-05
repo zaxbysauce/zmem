@@ -79,6 +79,7 @@ from storelib.query_ambiguity import (
     rewrite_ambiguous_query,
     read_recent_edit_basenames,
 )
+from storelib.source import SourceRefusal, scan as source_scan, show as source_show
 
 
 def _warn_reserved_source_ref(source_ref: str | None) -> None:
@@ -1784,7 +1785,22 @@ def main():
                                "(explicit recall only: change-intent queries like "
                                "'what changed about X' otherwise append budgeted "
                                "[PREVIOUSLY] update_of predecessors). Passive "
-                               "surfaces never unfold regardless (--no-bump).")
+                              "surfaces never unfold regardless (--no-bump).")
+
+    p_source = _add_parser("source", help="show verified local provenance for one memory")
+    source_sub = p_source.add_subparsers(dest="source_cmd")
+    # The direct and nested forms share a destination.  The direct form keeps
+    # its established early error path so `source scan --id ...` does not need
+    # a duplicate parent option before the subcommand.
+    p_source.add_argument("--id", dest="memory_id", type=str,
+                          help="memory UUID")
+    p_source.add_argument("--context", type=int, default=2,
+                          help="turns (0..20)")
+    p_source_scan = source_sub.add_parser("scan", help="literal scan of the resolved source")
+    p_source_scan.add_argument("--id", dest="memory_id", type=str,
+                               required=True, help="memory UUID")
+    p_source_scan.add_argument("--needle", type=str, required=True,
+                               help="literal substring")
 
     p_recall.add_argument("--exclude", action="append", default=None,
                           help="repeatable: exclude these memory ids from the results "
@@ -2974,7 +2990,91 @@ def main():
     p_hyg.add_argument("--format", dest="format", choices=("json", "text"),
                        default="json", help="Report format")
 
-    args = ap.parse_args()
+    # Source's public error contract intentionally predates its argparse
+    # metadata. Validate the source-only required values and context before
+    # argparse can emit a usage block; every other parser keeps its legacy
+    # behavior.
+    source_argv = sys.argv[1:]
+    parse_argv: list[str] | None = None
+    if (source_argv and source_argv[0] == "source"
+            and "-h" not in source_argv and "--help" not in source_argv):
+        def _source_option(option: str) -> tuple[bool, str | None]:
+            selected: tuple[bool, str | None] = (False, None)
+            for index, value in enumerate(source_argv):
+                if value == option:
+                    following = source_argv[index + 1] if index + 1 < len(source_argv) else None
+                    selected = (True, following if following is None or not following.startswith("--") else None)
+                elif value.startswith(option + "="):
+                    selected = (True, value[len(option) + 1:])
+            return selected
+
+        def _source_error(message: str) -> None:
+            print(f"store.py: error: {message}", file=sys.stderr)
+            sys.exit(2)
+
+        has_id, memory_id = _source_option("--id")
+        if not has_id or not memory_id:
+            _source_error("--id is required")
+        source_is_scan = any(
+            value == "scan" and (index == 0 or source_argv[index - 1] not in {
+                "--id", "--context", "--needle",
+            })
+            for index, value in enumerate(source_argv)
+        )
+
+        # ``argparse`` normally prints usage before a parse error.  Source has
+        # an older one-line public error contract, so scope its native parser
+        # error path to the same formatter.  Hook every parser that can own an
+        # error: the root dispatcher, ``source``, and its ``scan`` child.
+        # Unlike a parallel token grammar, this also covers duplicate/bare
+        # subcommands and future argparse validation changes.
+        def _source_parser_error(message: str) -> None:
+            # argparse includes the untrusted token in several messages.  A
+            # malformed source command must not turn a credential or private
+            # path passed as an unknown option into a diagnostic disclosure.
+            if message.startswith("unrecognized arguments:"):
+                _source_error("unrecognized source arguments")
+            else:
+                _source_error("invalid source arguments")
+
+        ap.error = _source_parser_error  # type: ignore[method-assign]
+        p_source.error = _source_parser_error  # type: ignore[method-assign]
+        p_source_scan.error = _source_parser_error  # type: ignore[method-assign]
+        if source_is_scan:
+            has_needle, needle = _source_option("--needle")
+            if not has_needle or not needle:
+                _source_error("--needle must not be empty")
+        else:
+            has_context, context = _source_option("--context")
+            if has_context:
+                try:
+                    parsed_context = int(context) if context is not None else None
+                except ValueError:
+                    parsed_context = None
+                if parsed_context is None or not 0 <= parsed_context <= 20:
+                    _source_error("--context must be between 0 and 20")
+                # argparse converts every occurrence before assigning the
+                # destination. Keep the final source-only context option so
+                # a superseded malformed value cannot escape this command's
+                # established one-line error contract.
+                context_indexes = [
+                    index for index, value in enumerate(source_argv)
+                    if value == "--context" or value.startswith("--context=")
+                ]
+                if len(context_indexes) > 1:
+                    discard: set[int] = set()
+                    for index in context_indexes[:-1]:
+                        discard.add(index)
+                        if (source_argv[index] == "--context"
+                                and index + 1 < len(source_argv)
+                                and not source_argv[index + 1].startswith("--")):
+                            discard.add(index + 1)
+                    parse_argv = [
+                        value for index, value in enumerate(source_argv)
+                        if index not in discard
+                    ]
+
+    args = ap.parse_args(parse_argv)
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
     # supplied --batch but ordinary reembed retains its historical default.
@@ -3237,6 +3337,49 @@ def main():
     # available without opening a connection.
     if args.cmd == "path":
         print(STORE_PATH)
+        sys.exit(0)
+
+    # Source resolution is an observation over an existing store.  It must not
+    # initialize, migrate, rekey, lease, or create a cache entry.
+    if args.cmd == "source":
+        if not args.memory_id:
+            print("store.py: error: --id is required", file=sys.stderr)
+            sys.exit(2)
+        if args.source_cmd is None:
+            try:
+                args.context = int(args.context)
+            except (TypeError, ValueError):
+                print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
+                sys.exit(2)
+        if args.source_cmd is None and not (0 <= args.context <= 20):
+            print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
+            sys.exit(2)
+        if args.source_cmd == "scan" and not args.needle:
+            print("store.py: error: --needle must not be empty", file=sys.stderr)
+            sys.exit(2)
+        try:
+            from storelib.source import is_safe_regular_path
+            if not is_safe_regular_path(STORE_PATH):
+                raise SourceRefusal("source unavailable")
+            for _suffix in ("-wal", "-shm"):
+                _sidecar = Path(str(STORE_PATH) + _suffix)
+                if os.path.lexists(_sidecar) and not is_safe_regular_path(_sidecar):
+                    raise SourceRefusal("source unavailable")
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.parent)
+            probe = sqlite3.connect(STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)
+            probe.row_factory = sqlite3.Row
+            try:
+                probe.execute("PRAGMA query_only=1")
+                result = (source_scan(probe, memory_id=args.memory_id, needle=args.needle)
+                           if args.source_cmd == "scan"
+                           else source_show(probe, memory_id=args.memory_id, context=args.context))
+            finally:
+                probe.close()
+        except (SourceRefusal, sqlite3.Error, OSError, ValueError) as exc:
+            print(f"[zmem] source: refused ({exc})", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         sys.exit(0)
 
     # `hygiene` inspects an operator-supplied SNAPSHOT read-only (issue #97),

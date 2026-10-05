@@ -42,6 +42,7 @@ from storelib.episodes import EPISODE_SUMMARY_TAGS, EpisodeError, build_extracti
 # Issue #124 (Workstream E): observational operation-feedback surface.
 from storelib.delivery_ledger import FeedbackSidecarError, feedback_event_path, feedback_seen, record_feedback_event
 from storelib.evidence import evidence_ids_for_memory
+from storelib.source import source_scan, source_show
 from storelib.feedback import apply_operation_feedback
 from storelib.recall import APPLIED_FEEDBACK_FACTOR, VIOLATED_FEEDBACK_FACTOR
 # Issue #134 (Workstream E): governed dataset artifact surface.

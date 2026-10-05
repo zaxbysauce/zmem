@@ -2013,9 +2013,23 @@ def _splice_cross_rows(results: list, cross_scored: list) -> list:
 ZMEM_FENCE_OPEN = "<<<ZMEM_UNTRUSTED_FENCE>>>"
 ZMEM_FENCE_CLOSE = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 
+
+def _source_hint_namespaces(conn: sqlite3.Connection) -> frozenset[str]:
+    """Use source's own current-namespace authorization for text hints."""
+    try:
+        from storelib.source import _source_authorized_namespaces
+        return _source_authorized_namespaces(conn)
+    except Exception:
+        # Recall remains available when source's read-only resolver cannot
+        # establish a namespace; it simply must not advertise an unusable hint.
+        return frozenset()
+
+
 def _format_fenced_recall(rows: list[dict], header: str,
                           budget_note: str | None = None,
-                          legacy_injection_wire: bool = False) -> str:
+                          legacy_injection_wire: bool = False,
+                          source_hint: bool = False,
+                          source_hint_namespaces: frozenset[str] | None = None) -> str:
     """Render a fenced, provenance-tagged bullet block for hook inject.
 
     Issue #58, 3.5: wrap hook-injected memories in a non-executable
@@ -2113,6 +2127,9 @@ def _format_fenced_recall(rows: list[dict], header: str,
         lines.append(f"    {r['content']}")
         if r.get("source_ref"):
             lines.append(f"    source_ref: {r['source_ref']}")
+        if (source_hint and source_hint_namespaces is not None
+                and r.get("namespace") in source_hint_namespaces):
+            lines.append(f"    -> source {r['id']} (store.py source --id {r['id']})")
         # Issue #138's retained page is a derived row.  Keep its grounding
         # visible through the shared fence without changing ordinary recall
         # bytes or introducing a host-specific renderer.
@@ -3068,6 +3085,10 @@ def _recall_memory_impl(
                 ),
                 budget_note=(injection_details or {}).get("budget_note") if for_injection else None,
                 legacy_injection_wire=for_injection,
+                source_hint=not for_injection,
+                source_hint_namespaces=(
+                    _source_hint_namespaces(conn) if not for_injection else frozenset()
+                ),
             ))
     return results
 

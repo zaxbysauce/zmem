@@ -60,6 +60,41 @@ def _read_evidence(store_path: Path) -> list[tuple[object, ...]]:
         conn.close()
 
 
+def _drain_plugin_workers(plugin) -> None:
+    """Wait for this loaded provider's detached workers before store cleanup."""
+    errors: list[str] = []
+    capture_acquired = 0
+    capture_deadline = time.monotonic() + plugin._TRAINING_CAPTURE_TIMEOUT_S + 1.0
+    try:
+        while capture_acquired < plugin._TRAINING_CAPTURE_INFLIGHT_MAX:
+            remaining = capture_deadline - time.monotonic()
+            if remaining <= 0 or not plugin._TRAINING_CAPTURE_INFLIGHT.acquire(
+                timeout=remaining
+            ):
+                errors.append(
+                    "capture permits stalled "
+                    f"({capture_acquired}/{plugin._TRAINING_CAPTURE_INFLIGHT_MAX})"
+                )
+                break
+            capture_acquired += 1
+    finally:
+        for _ in range(capture_acquired):
+            plugin._TRAINING_CAPTURE_INFLIGHT.release()
+
+    evidence_deadline = time.monotonic() + plugin._STORE_TIMEOUT_S + 1.0
+    while plugin._NATIVE_EVIDENCE_QUEUE.unfinished_tasks:
+        remaining = evidence_deadline - time.monotonic()
+        if remaining <= 0:
+            errors.append(
+                "evidence queue stalled "
+                f"({plugin._NATIVE_EVIDENCE_QUEUE.unfinished_tasks} unfinished)"
+            )
+            break
+        time.sleep(min(0.05, remaining))
+    if errors:
+        raise AssertionError("provider worker drain failed: " + "; ".join(errors))
+
+
 @contextmanager
 def _loaded_plugin():
     """Load the plugin with only the minimal SDK registration surface."""
@@ -88,7 +123,17 @@ def _loaded_plugin():
         try:
             yield module
         finally:
-            sys.modules.pop(module_name, None)
+            body_raised = sys.exc_info()[0] is not None
+            try:
+                _drain_plugin_workers(module)
+            except AssertionError:
+                # Preserve an assertion raised by the test body while still
+                # making the best bounded cleanup attempt before the isolated
+                # environment and temporary store are released.
+                if not body_raised:
+                    raise
+            finally:
+                sys.modules.pop(module_name, None)
 
 
 class _Context:
@@ -231,13 +276,8 @@ class RuntimeGuardrailTest(unittest.TestCase):
                             error_message=None,
                         )
 
-                    deadline = time.monotonic() + 5.0
-                    rows: list[tuple[object, ...]] = []
-                    while time.monotonic() < deadline:
-                        rows = _read_evidence(store_path)
-                        if len(rows) >= 2:
-                            break
-                        time.sleep(0.05)
+                    _drain_plugin_workers(plugin)
+                    rows = _read_evidence(store_path)
                     self.assertEqual(len(rows), 2, "real evidence workers did not persist two rows")
                     observed_paths = set()
                     for evidence_id, sid, lane, moment, kind, ts, digest, excerpt, ref_path, ref_offset in rows:

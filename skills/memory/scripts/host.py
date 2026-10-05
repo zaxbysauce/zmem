@@ -601,7 +601,7 @@ def _cache_put(project_dir: Path, namespace: str) -> None:
         pass
 
 
-def resolve_namespace(project_dir: str | Path) -> str:
+def resolve_namespace(project_dir: str | Path, *, write_cache: bool = True) -> str:
     """The SOLE producer of `project:*` namespace keys — called both by the
     runtime hook launcher (recall) and by the v5 migration (store.py). Never
     hand-type a namespace key; always derive it through this function so
@@ -625,12 +625,14 @@ def resolve_namespace(project_dir: str | Path) -> str:
     remote, status = _get_git_remote_status(p)
     if status == "remote":
         namespace = f"project:{_normalize_remote(remote)}"
-        _cache_put(p, namespace)
+        if write_cache:
+            _cache_put(p, namespace)
         return namespace
     if status == "absent":
         # git ran fine and there is no origin: drop any cached remote key so
         # a later `error` can never resurface the removed origin's identity.
-        _cache_drop(p)
+        if write_cache:
+            _cache_drop(p)
         return f"project:{_norm_abspath_key(p)}"
     cached = _cache_get(p)
     if cached:
@@ -790,6 +792,16 @@ _BREAK_CLAIM_SUFFIX = ".break"
 # never sleeps, and the transient it exists for resolved within 2 attempts in
 # every one of 473 measured occurrences.
 _CLAIM_CREATE_ATTEMPTS = 5
+
+# release_lock normally treats a failed rename as a harmless no-op.  Windows
+# sharing violations are the narrow exception: a close from the last reader
+# can race this rename even though no other lock owner exists.  Keep the seam
+# module-local so tests can exercise the Windows behavior without changing
+# process-global os.name.
+_RELEASE_RETRY_IS_WINDOWS = os.name == "nt"
+_RELEASE_RETRY_WINERRORS = frozenset((32, 33))
+_RELEASE_RETRY_ATTEMPTS = 2
+_RELEASE_RETRY_DELAY_SECONDS = 0.01
 
 # _acquire_break_claim outcomes.
 _CLAIM_ACQUIRED = "acquired"      # we own it; we must release it
@@ -1149,24 +1161,50 @@ def release_lock(path: str | Path, token: str | None) -> None:
     if not token or token == _NO_LOCK_TOKEN:
         return
     p = Path(path)
-    try:
-        content = p.read_text(encoding="utf-8").strip()
-    except OSError:
-        return
-    if content != token:
-        return  # already broken and re-taken by someone else — nothing to do
+    attempts = (_RELEASE_RETRY_ATTEMPTS if _RELEASE_RETRY_IS_WINDOWS else 1)
 
-    aside = p.with_name(p.name + f".release.{uuid.uuid4().hex}")
-    try:
-        os.rename(str(p), str(aside))
-    except OSError:
-        # Already gone, or a sharing violation — someone else is handling it.
+    def retryable(exc: OSError) -> bool:
+        return (_RELEASE_RETRY_IS_WINDOWS and
+                getattr(exc, "winerror", None) in _RELEASE_RETRY_WINERRORS)
+
+    aside = None
+    for attempt in range(attempts):
+        # Re-read after a retryable rename failure.  The failed attempt may
+        # have raced a stale breaker that installed a successor, or may have
+        # lost the path entirely; neither case may trigger another rename.
+        try:
+            content = p.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        if content != token:
+            return  # already broken and re-taken — nothing to do
+
+        aside = p.with_name(p.name + f".release.{uuid.uuid4().hex}")
+        try:
+            os.rename(str(p), str(aside))
+            break
+        except OSError as exc:
+            if attempt + 1 >= attempts or not retryable(exc):
+                return
+            time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
+    else:
         return
 
-    try:
-        moved = Path(aside).read_text(encoding="utf-8").strip()
-    except OSError:
-        moved = None  # cannot confirm identity => treat as not ours
+    # `aside` is set immediately before the successful rename above.
+    assert aside is not None
+    moved = None
+    for attempt in range(attempts):
+        try:
+            moved = Path(aside).read_text(encoding="utf-8").strip()
+            break
+        except OSError as exc:
+            # A Windows reader may keep the moved file briefly unavailable.
+            # If confirmation never succeeds, preserve the existing safety
+            # behavior: put the unconfirmed file back without clobbering a
+            # successor.
+            if attempt + 1 >= attempts or not retryable(exc):
+                break
+            time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
 
     if moved == token:
         try:

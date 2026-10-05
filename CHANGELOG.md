@@ -10,6 +10,32 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.81.0] - 2026-10-04
+
+### Added
+- **Evidence-first provenance lookup (issue #139):** added the local
+  read-only `source` and `source scan` commands for bounded inspection of the
+  evidence behind a memory. Resolution is namespace- and source-root-scoped,
+  uses the pinned Hermes provider only when its native database is available,
+  and accepts an explicitly bounded Hermes JSONL fallback only when that
+  database is absent. File sources preserve original UTF-8 offsets; native
+  Hermes and ZCode sources report explicit `null` offsets when the provider
+  does not retain the original byte stream.
+
+### Security and privacy
+- Source excerpts are redacted before hashing. Source scans redact complete
+  records before clipping match snippets. SQLite lookups use read-only/query-only
+  connections, avoid cache and network writes, and keep WAL/SHM coordination
+  within the documented existing-sidecar boundary.
+- Context is limited to 0–20 turns and scans to 50 literal matches. Refusals
+  use stable one-line diagnostics without echoing source content, credentials,
+  or private filesystem paths.
+
+### Fixed
+- **Windows maintenance-lock release robustness (issue #139):** transient
+  sharing violations retry with bounded fresh ownership and confirmation reads,
+  while successor locks and no-clobber cleanup remain protected.
+
 ## [0.80.0] - 2026-10-04
 
 ### Fixed
