@@ -116,6 +116,47 @@ class SignalsClassificationTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(json.loads(r.stdout)["signals"], {})
 
+    def test_rejected_runner_call_records_no_signal(self):
+        # Review PRR-008: a user rejection means the run never executed —
+        # the walker records NO signal for it (never a "fail"), mirroring
+        # the failure walker's rejection split.
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "r1", "name": "Bash",
+                 "input": {"command": "pytest tests/x.py"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result",
+                 "content": ("The user doesn't want to proceed.\n"
+                             "the user said:\nnot now"),
+                 "is_error": True, "tool_use_id": "r1"}]}},
+        ]
+        Path(self.transcript).write_text(
+            "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        r = _run_signals(_env(self.tmp), "--session", "sigtest",
+                         "--transcript", self.transcript)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["signals"], {})
+
+    def test_sibling_tooluseresult_error_counts_as_fail(self):
+        # Review PRR-008: an error-shaped toolUseResult sibling counts as a
+        # fail even when the block's is_error flag is false/absent — the
+        # same channel the failure walker honors.
+        records = [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "s1", "name": "Bash",
+                 "input": {"command": "python -m pytest -q"}}]}},
+            {"type": "user", "toolUseResult": "Error: 1 failed, 2 passed",
+             "message": {"content": [
+                {"type": "tool_result", "content": "done",
+                 "is_error": False, "tool_use_id": "s1"}]}},
+        ]
+        Path(self.transcript).write_text(
+            "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        r = _run_signals(_env(self.tmp), "--session", "sigtest",
+                         "--transcript", self.transcript)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["signals"], {"test": "fail"})
+
     def test_malformed_lines_are_skipped(self):
         # Per-line parse errors are checked results, not failures.
         _write_transcript(self.transcript, [("pytest tests/x.py", False)])
@@ -148,18 +189,34 @@ class SignalsExitContractTest(unittest.TestCase):
         self.assertEqual(json.loads(r.stdout), {"signals": {}})
 
     def test_unreadable_transcript_exits_two(self):
-        # Genuine substrate error. chmod 0o000 only forbids reads on POSIX
-        # (and non-root); if the platform still lets us read it, the leg
-        # cannot run here — skip rather than assert a vacuous pass.
+        # Genuine substrate error. POSIX forces it with chmod 0o000; Windows
+        # with a cross-process region lock (open succeeds there, read
+        # raises). If the platform ignores the fault, the leg cannot run
+        # here — skip rather than assert a vacuous pass.
         transcript = os.path.join(self.tmp, "t.jsonl")
         _write_transcript(transcript, [("pytest tests/x.py", False)])
-        os.chmod(transcript, 0o000)
-        try:
+        undos = []
+        if os.name == "nt":
+            import msvcrt
+            handle = os.open(transcript, os.O_RDWR)
             try:
-                with open(transcript, "rb"):
-                    pass
-                self.skipTest("platform ignores chmod 0o000; no way to "
-                              "force an unreadable file here")
+                msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                os.close(handle)
+                self.skipTest("cannot lock a file region on this platform")
+            undos.append(lambda: (msvcrt.locking(handle, msvcrt.LK_UNLCK, 1),
+                                  os.close(handle)))
+        else:
+            os.chmod(transcript, 0o000)
+            undos.append(lambda: os.chmod(transcript, 0o644))
+        try:
+            # Probe with a real READ: on Windows the lock leaves open()
+            # working and only read() raising.
+            try:
+                with open(transcript, "rb") as f:
+                    f.read(1)
+                self.skipTest("platform ignores the forced read fault; no "
+                              "way to force an unreadable file here")
             except OSError:
                 pass
             r = _run_signals(_env(self.tmp), "--session", "sigtest",
@@ -168,7 +225,11 @@ class SignalsExitContractTest(unittest.TestCase):
             obj = json.loads(r.stdout)
             self.assertIn("error", obj)
         finally:
-            os.chmod(transcript, 0o644)
+            for fn in undos:
+                try:
+                    fn()
+                except OSError:
+                    pass
 
     def test_injected_walker_oserror_exits_two(self):
         # Portable exit-2 pin: the walker's file-level OSError must reach

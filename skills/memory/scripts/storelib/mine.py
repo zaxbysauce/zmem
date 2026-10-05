@@ -25,7 +25,6 @@ try:
     from corrections import classify_error_type as _classify_error_type
     from corrections import aggregate_errors as _aggregate_errors
     from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT
-    from capture_quality import infer_signal as _infer_signal
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
     from corrections import detect_patterns as _detect_patterns  # type: ignore
@@ -33,7 +32,19 @@ except ImportError:
     from corrections import classify_error_type as _classify_error_type  # type: ignore
     from corrections import aggregate_errors as _aggregate_errors  # type: ignore
     from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore
-    from capture_quality import infer_signal as _infer_signal  # type: ignore
+
+# Deliberately NOT in the corrections try-block above: a broken
+# capture_quality must degrade only the signals walker (to an empty map,
+# via the None fallback below) instead of failing the whole mine module —
+# which would take every store.py subcommand down with it (review PRR-011).
+try:
+    from capture_quality import infer_signal as _infer_signal
+except ImportError:
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from capture_quality import infer_signal as _infer_signal  # type: ignore
+    except Exception:
+        _infer_signal = None
 import storelib.schema as _schema
 from storelib.schema import _host
 from storelib.write import _normalize_capture_mode, redact_text
@@ -538,6 +549,10 @@ def _signals_from_transcript(path: str) -> dict:
 
     # Pass 2: join tool_result flags to commands; LAST status per signal.
     signals: dict = {}
+    if _infer_signal is None:
+        # capture_quality unavailable (PRR-011 containment): an honest empty
+        # map beats a walker that cannot classify.
+        return signals
     for o in records:
         if not isinstance(o, dict):
             continue
@@ -545,6 +560,7 @@ def _signals_from_transcript(path: str) -> dict:
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, list):
             continue
+        tur = o.get("toolUseResult")
         for b in content:
             if not (isinstance(b, dict) and b.get("type") == "tool_result"):
                 continue
@@ -552,9 +568,23 @@ def _signals_from_transcript(path: str) -> dict:
             cmd = commands.get(tid) if isinstance(tid, str) else None
             if cmd is None:
                 continue
+            # Classify the outcome the way the failure walker does: a user
+            # rejection means the run never executed, so it records NO
+            # signal (never a "fail"); an error-shaped ``toolUseResult``
+            # sibling counts as a fail even when is_error is absent.
+            texts = []
+            if isinstance(tur, str):
+                texts.append(tur)
+            if isinstance(b.get("content"), str):
+                texts.append(b["content"])
+            if any(_is_rejection_text(t) for t in texts):
+                continue
+            failed = b.get("is_error") is True or (
+                isinstance(tur, str)
+                and tur.strip().lower().startswith("error"))
             sig = _infer_signal(cmd)
             if sig in ("test", "compile", "lint"):
-                signals[sig] = "fail" if b.get("is_error") is True else "pass"
+                signals[sig] = "fail" if failed else "pass"
     return signals
 
 def cmd_signals(session: str, transcript: str, db: str) -> int:

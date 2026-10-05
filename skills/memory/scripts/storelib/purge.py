@@ -766,10 +766,18 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         stats["tmp_removed"] += 1
     # #258: the per-session signal-state sidecar writes through the same
     # uuid-suffixed tmp pattern; reap its crashed-write orphans alongside
-    # the ledger ones so ops/ never leaks either family.
+    # the ledger ones so ops/ never leaks either family. Best-effort, unlike
+    # the ledger scrub below: this family is written on EVERY quiet Stop of
+    # EVERY session, so a tmp vanishing between the glob and this unlink
+    # (the writer os.replace won) is a benign race that must neither abort
+    # the purge (the scrub is fail-closed for LEDGERS only) nor disturb a
+    # live writer (review PRR-002).
     for path in ops.glob("*.signals.tmp.*"):
-        path.unlink()
-        stats["tmp_removed"] += 1
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
     for path in ops.glob("*.ledger"):
         doc = json.loads(path.read_text(encoding="utf-8"))
         entries = doc.get("entries")

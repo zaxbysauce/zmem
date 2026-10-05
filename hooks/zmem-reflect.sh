@@ -454,9 +454,11 @@ if pending_subagents and (lesson_exists or (count == 0 and not rej_msg)):
 #     success nudge fires only when the tracked signal state changed since
 #     the last nudge: a recognized runner run appeared or flipped
 #     (test/compile/lint via capture_quality infer_signal over the
-#     transcript), a user correction count moved, or this is the first Stop
-#     of the session (no persisted state). When nothing changed, the state
-#     is re-recorded silently for the closeout skill and nothing is emitted.
+#     transcript), or this is the first Stop of the session (no persisted
+#     state). Rejections need no counter here: they have their own
+#     always-fire branch above, so a count could never change inside this
+#     branch (review PRR-001). When nothing changed, the state is
+#     re-recorded silently for the closeout skill and nothing is emitted.
 if count == 0:
     if rej_msg:
         msg = (
@@ -482,8 +484,9 @@ if count == 0:
     #       counts as changed. Runner signals come from store.py signals,
     #       which classifies Bash commands via capture_quality infer_signal
     #       (test/compile/lint, the #123 vocabulary) over the transcript;
-    #       the user-correction count reuses the rejections this hook already
-    #       collected. When nothing changed, the state is re-recorded
+    #       rejections carry no counter here (their own branch above always
+    #       fires, so a count could never move — review PRR-001). When
+    #       nothing changed, the state is re-recorded
     #       silently (a future closeout skill review pass, the Step 0.5
     #       extension named in SKILL.md, is the intended reader; it is not
     #       built yet) and no additionalContext is emitted. A broken scan
@@ -509,10 +512,12 @@ if count == 0:
         scan_ok = False
     if not scan_ok:
         emit({})
-    user_corrections = len(rejections)
 
     def _signal_state_path():
-        stem = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        # errors=replace: a pathological session id (surrogate-escaped env
+        # bytes) must degrade the stem, never kill the whole hook output.
+        stem = hashlib.sha256(
+            session_id.encode("utf-8", "replace")).hexdigest()[:32]
         return os.path.join(data_dir, "ops", stem + ".signals")
 
     def _write_signal_state(path, obj):
@@ -520,7 +525,10 @@ if count == 0:
         # never observes a partial file, and a same-volume rename is atomic
         # on Windows too. 0600 at open mirrors the reviewed ledger posture
         # (the mode bit is a no-op on Windows; the residual is documented
-        # there). Fail-open: the nudge path never depends on this write.
+        # there). Fail-open: the nudge path never depends on this write,
+        # and the tmp is unlinked on any failure so a crashed write leaves
+        # no orphan (the purge reaper stays the backstop for a hard kill).
+        tmp = None
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp." + uuid.uuid4().hex
@@ -530,12 +538,19 @@ if count == 0:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            tmp = None
             try:
                 os.chmod(path, 0o600)
             except OSError:
                 pass
         except OSError:
             pass
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     state_path = _signal_state_path()
     prev = None
@@ -546,15 +561,21 @@ if count == 0:
             prev = loaded
     except Exception:
         prev = None
+    if (isinstance(prev, dict)
+            and isinstance(prev.get("version"), int)
+            and prev.get("version") > 1):
+        # Forward compat (mirrors the sidecar gate near the top of this
+        # block): a record from a newer plugin is left untouched for that
+        # consumer; this Stop stays silent without writing, so an old
+        # client can neither downgrade a newer record nor nag-storm the
+        # session it cannot interpret.
+        emit({})
     _write_signal_state(state_path, {
         "version": 1,
         "signals": current_signals,
-        "user_corrections": user_corrections,
         "updated": datetime.now(timezone.utc).isoformat(),
     })
-    if (prev is not None
-            and prev.get("signals") == current_signals
-            and prev.get("user_corrections") == user_corrections):
+    if prev is not None and prev.get("signals") == current_signals:
         emit({})
     msg = (
         "ZMem reflection: this session had no tool failures, but you may have "
