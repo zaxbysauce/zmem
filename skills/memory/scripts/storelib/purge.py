@@ -753,9 +753,10 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, 
 def scrub_ledgers(data_dir: Path, drop_ids: set[str],
                   needles: list[str]) -> dict[str, int]:
     """Drop purged/derived-deleted ids' entries and any needle-bearing entry
-    from <data>/ops/*.ledger; delete orphaned .ledger.tmp.* partial writes.
-    FAIL-CLOSED: an unreadable or unwritable ledger raises (AC7 is
-    unconditional); a file with no matching entries is left untouched."""
+    from <data>/ops/*.ledger; delete orphaned .ledger.tmp.* and
+    .signals.tmp.* partial writes. FAIL-CLOSED: an unreadable or unwritable
+    ledger raises (AC7 is unconditional); a file with no matching entries is
+    left untouched."""
     ops = data_dir / "ops"
     stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0}
     if not ops.is_dir():
