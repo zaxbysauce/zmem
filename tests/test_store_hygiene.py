@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -60,12 +61,49 @@ for _k, _v in _prior_env.items():
 
 # The four fixture digests (issue #97 fixture contract). Regenerate fixtures
 # with: python tests/fixtures/store_hygiene/generate.py
+# expected-report.json is hashed INTERPRETER-NORMALIZED (see _norm_interp):
+# the upgrade action embeds the generating machine's sys.executable, so the
+# raw bytes differ per machine and only the normalized form is a stable,
+# machine-independent drift target (issue #259 CI round).
 FIXTURE_DIGESTS = {
     "rows.jsonl": "f9ddde2d2463b288c84d46d3e9ebf669e4c4697d13fabeaa09347f6226c511a5",
     "origin-map.json": "85c8f54cb4c69e922b4e243222b89cb11f4a1d35d453d036e3e075db3f039972",
     "evidence-map.json": "1ae0ed47b76f84b0959195fe604c7caf4751c32e72767a2f3754015ce2d69155",
-    "expected-report.json": "3ff6007dbd61e03a8569f9befff776264ed65378db613577f90a134fc69d8853",
+    "expected-report.json": "86489602e06de408e08c17ee2c9b15057994cffcf778b73b31a0fdb200c7acb8",
 }
+
+# Interpreter-token normalization: any single-quoted token immediately before
+# the upgrade-command script path is the generating machine's sys.executable
+# (rendered by hygiene._UPGRADE_COMMAND, issue #259). In JSON bytes the token
+# carries escaped backslashes (C:\\Python311\\...); the pattern accepts both
+# the raw and escaped forms and is anchored to the fixed script-path suffix,
+# so it cannot eat unrelated content.
+_INTERP_RE = re.compile(
+    r"'(?:\\.|[^'\\])*' skills/memory/scripts/store\.py update")
+
+
+def _norm_interp(data):
+    """Interpreter-normalized bytes (issue #259): replace the machine-specific
+    quoted sys.executable token with a stable sentinel so committed fixtures
+    and fresh regenerations compare equal on every platform."""
+    if isinstance(data, bytes):
+        data = data.decode("utf-8")
+    return _INTERP_RE.sub(
+        "<<INTERPRETER>> skills/memory/scripts/store.py update",
+        data).encode("utf-8")
+
+
+def _norm_obj(obj):
+    """Dict/list/string recursive form of the same normalization, for
+    live-report vs committed-fixture dict compares."""
+    if isinstance(obj, str):
+        return _INTERP_RE.sub(
+            "<<INTERPRETER>> skills/memory/scripts/store.py update", obj)
+    if isinstance(obj, list):
+        return [_norm_obj(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _norm_obj(v) for k, v in obj.items()}
+    return obj
 
 HERMES_NS = "user:global"
 NS_SWARM = "project:github.com/zaxbyhub/opencode-swarm"
@@ -133,16 +171,21 @@ class StoreHygieneTest(unittest.TestCase):
         # review 199-a): hash them, not the scratch regeneration. CRLF is
         # normalized because a Windows checkout may materialize the tracked
         # copies as CRLF while the generator writes LF on every platform.
+        # expected-report.json is additionally interpreter-normalized (see
+        # _norm_interp): its upgrade action embeds the generating machine's
+        # sys.executable, which is the ONLY machine-varying content.
         for name, expected_digest in FIXTURE_DIGESTS.items():
             blob = (FIXTURE_DIR / name).read_bytes()
-            normalized = blob.replace(b"\r\n", b"\n")
+            normalized = _norm_interp(blob).replace(b"\r\n", b"\n")
             self.assertEqual(
                 hashlib.sha256(normalized).hexdigest(), expected_digest, name)
         # Generator determinism: a fresh regeneration must be byte-identical
-        # to the tracked copies (after newline normalization).
+        # to the tracked copies (after newline + interpreter normalization).
         for name in FIXTURE_DIGESTS:
-            regenerated = (self.fixtures / name).read_bytes().replace(b"\r\n", b"\n")
-            tracked = (FIXTURE_DIR / name).read_bytes().replace(b"\r\n", b"\n")
+            regenerated = _norm_interp(
+                (self.fixtures / name).read_bytes()).replace(b"\r\n", b"\n")
+            tracked = _norm_interp(
+                (FIXTURE_DIR / name).read_bytes()).replace(b"\r\n", b"\n")
             self.assertEqual(regenerated, tracked, name)
 
     def test_report_counts_and_duplicates(self):
@@ -150,8 +193,10 @@ class StoreHygieneTest(unittest.TestCase):
 
         # Report shape matches the generated expectation byte-for-byte
         # (expected-report.json omits nothing: build_report never adds the
-        # digest; main() does).
-        self.assertEqual(report, self.expected)
+        # digest; main() does). Interpreter-normalized on both sides: the
+        # committed fixture carries the generating machine's sys.executable
+        # in its upgrade action (issue #259).
+        self.assertEqual(_norm_obj(report), _norm_obj(self.expected))
 
         self.assertEqual(report["totals"],
                          {"rows": 855, "live": 853, "tombstoned": 2})
