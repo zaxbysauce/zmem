@@ -753,9 +753,10 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, 
 def scrub_ledgers(data_dir: Path, drop_ids: set[str],
                   needles: list[str]) -> dict[str, int]:
     """Drop purged/derived-deleted ids' entries and any needle-bearing entry
-    from <data>/ops/*.ledger; delete orphaned .ledger.tmp.* partial writes.
-    FAIL-CLOSED: an unreadable or unwritable ledger raises (AC7 is
-    unconditional); a file with no matching entries is left untouched."""
+    from <data>/ops/*.ledger; delete orphaned .ledger.tmp.* and
+    .signals.tmp.* partial writes. FAIL-CLOSED: an unreadable or unwritable
+    ledger raises (AC7 is unconditional); a file with no matching entries is
+    left untouched."""
     ops = data_dir / "ops"
     stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0}
     if not ops.is_dir():
@@ -763,6 +764,20 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     for path in ops.glob("*.ledger.tmp.*"):
         path.unlink()
         stats["tmp_removed"] += 1
+    # #258: the per-session signal-state sidecar writes through the same
+    # uuid-suffixed tmp pattern; reap its crashed-write orphans alongside
+    # the ledger ones so ops/ never leaks either family. Best-effort, unlike
+    # the ledger scrub below: this family is written on EVERY quiet Stop of
+    # EVERY session, so a tmp vanishing between the glob and this unlink
+    # (the writer os.replace won) is a benign race that must neither abort
+    # the purge (the scrub is fail-closed for LEDGERS only) nor disturb a
+    # live writer (review PRR-002).
+    for path in ops.glob("*.signals.tmp.*"):
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
     for path in ops.glob("*.ledger"):
         doc = json.loads(path.read_text(encoding="utf-8"))
         entries = doc.get("entries")

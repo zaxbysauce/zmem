@@ -1908,9 +1908,12 @@ What one purge does:
   needle): typically an evidence row no memory references — the rescan that
   owns those is issue #181;
 - scrubs the ids (and any needle-bearing entry) from the `<data>/ops/*.ledger`
-  delivery ledgers and removes orphaned `.ledger.tmp.*` partial writes. The
-  `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl` ops sidecars are NOT
-  scrubbed (outside the ledger contract) — treat them as residue surfaces;
+  delivery ledgers and removes orphaned `.ledger.tmp.*` and
+  `.signals.tmp.*` partial writes. The
+  `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl`/`.signals` ops
+  sidecars are NOT scrubbed (outside the ledger contract; `.signals`
+  carries only signal names/statuses/counts, and the finished file is
+  swept on the shared ops mtime policy) — treat them as residue surfaces;
 - records the ids in the `purged_id` deny-list so `ingest-jsonl` will not
   re-insert them from a peer export (child records referencing a purged id
   are skipped or blanked, never fatal);
@@ -1998,6 +2001,26 @@ only**; other hosts' histories are out of scope. In `ZMEM_CAPTURE_MODE=auto`
 likely-secret text is redacted; in `manual` matching items are annotated
 `"secret_warning": true` but kept verbatim for review. (`--json` is accepted for
 parity with the issue's syntax; output is always JSON.)
+
+### signals — recognized runner signals for a session (read-only)
+```
+python <store.py> signals [--session SESSION] [--transcript PATH] [--db PATH]
+```
+Reports the session's tracked runner signals as
+`{"signals": {"test": "pass", "lint": "fail", ...}}` — the LAST status of
+each recognized runner family in the transcript, classified by
+`capture_quality.infer_signal` (`test`/`compile`/`lint`; everything else,
+including the db substrate where `tool_usage` carries no command text, is
+untracked). A user-REJECTED runner call records no signal (the run never
+executed — same rejection split as `failures`), and an error-shaped
+`toolUseResult` sibling counts as `fail` even when the block's `is_error`
+flag is false. This is the read command behind the Stop hook's
+signal-change gate (issue #258). **Read-only and store-independent** like
+`failures` — dispatched before `connect()`. Exit-code contract: checked results
+(including a missing transcript path, which falls to the db leg) exit 0; a
+genuine substrate error (transcript present but unreadable) prints
+`{"signals": {}, "error": ...}` and exits 2, so the hook can suppress
+without touching its persisted state.
 
 ### source-exists / ops-append — capture adapter bridges
 ```
@@ -3006,6 +3029,36 @@ default; clamped to 0.1-5.0; `store.py failures --db-timeout` overrides);
 detector at a scratch copy without touching `~/.zcode`; empty/unset means the
 default `~/.zcode/cli/db/db.sqlite`); `ZMEM_REFLECT=0` (exactly `0`) disables
 the whole Stop hook — unset, empty, or any other value keeps it enabled.
+
+### The no-failure nudge fires only on a signal change (#258)
+When the session has no tool failures and no rejections, the success nudge
+("you may have learned something worth capturing") is gated on a state
+TRANSITION, not the state itself: it fires on the first Stop of a session
+or when a recognized runner signal appears or flips (`test`/`compile`/`lint`
+via `capture_quality.infer_signal` over the transcript's Bash commands,
+read through `store.py signals`), and otherwise stays silent. Rejections
+need no separate trigger — they have their own always-fire branch above
+this gate (review PRR-001). "Recognized" is prefix-exact: bare `pytest`,
+`python -m pytest|unittest`, `python -m compileall`, `ruff check`, and
+`biome check` classify; compound commands (`cd x && pytest`, `uv run
+pytest`) do not, so sessions that only invoke runners that way still see
+the once-per-session behavior. The last-seen signal state is persisted per
+session at `<ZMEM_DATA>/ops/<sha256(session)[:32]>.signals` (atomic
+tmp-file + `os.replace` write; the finished file is swept on the shared
+7-day ops mtime policy, crashed-write `*.signals.tmp.*` orphans are
+reaped by `purge`) and re-recorded on every quiet Stop until a lesson is
+captured for the session — the lesson-dedup exit precedes the gate, so
+the record freezes from that point (silent still means no
+`additionalContext`, never suppression of the signal itself): the
+closeout skill's Step 0.5 candidate-review pass
+(`skills/closeout/SKILL.md`) is the intended future reader of that record;
+a later PR extends it to surface suppressed signals. Substrate notes: on
+the ZCode db substrate `tool_usage` has no command text, so no runner
+signals are tracked and the nudge fires once per session; a missing
+transcript path reads as a checked-empty scan (the hook treats it as a
+fresh quiet session); if `signals` cannot read the substrate (nonzero
+exit), the hook emits nothing and leaves the persisted state untouched —
+a broken substrate must neither nag every Stop nor blank the record.
 
 ### Subagent reflection is parent-side (#204)
 The `zmem-subagent-reflect.sh` SubagentStop hook NEVER prompts the finishing

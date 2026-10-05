@@ -32,6 +32,22 @@ except ImportError:
     from corrections import classify_error_type as _classify_error_type  # type: ignore
     from corrections import aggregate_errors as _aggregate_errors  # type: ignore
     from corrections import SAMPLE_EXTRACT_LIMIT as _SAMPLE_EXTRACT_LIMIT  # type: ignore
+
+# Deliberately NOT in the corrections try-block above: a broken
+# capture_quality must degrade only the signals walker (to an empty map,
+# via the None fallback below) instead of failing the whole mine module —
+# which would take every store.py subcommand down with it (review PRR-011).
+# Exception (not just ImportError) matches the base lazy-import guard's
+# containment: a syntactically-broken capture_quality must degrade the
+# same way, not kill the CLI.
+try:
+    from capture_quality import infer_signal as _infer_signal
+except Exception:
+    try:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from capture_quality import infer_signal as _infer_signal  # type: ignore
+    except Exception:
+        _infer_signal = None
 import storelib.schema as _schema
 from storelib.schema import _host
 from storelib.write import _normalize_capture_mode, redact_text
@@ -479,6 +495,131 @@ def cmd_failures(session: str, transcript: str, db: str,
         result = {"count": 0, "details": [], "rejections": [], "error": msg}
         print(json.dumps(result))
         print(f"[zmem] failures: detection substrate error: {msg}", file=sys.stderr)
+        return 2
+    print(json.dumps(result))
+    return 0
+
+def _signals_from_transcript(path: str) -> dict:
+    """Scan a Claude Code transcript JSONL for recognized runner signals
+    (issue #258).
+
+    Returns a mapping of signal name (``test``/``compile``/``lint`` — the
+    ``capture_quality.infer_signal`` vocabulary, nothing invented here) to
+    the LAST status of that signal in the file, ``"pass"`` or ``"fail"``
+    (chronological order; a signal appears only once a run of it produced a
+    tool_result). Commands that classify as ``none`` are not tracked; only
+    Bash tool_use blocks carry shell command text to classify.
+
+    Deliberate divergence from :func:`_failures_from_transcript`: malformed
+    LINES are skipped (a partial transcript is a checked result, same as the
+    failure walker), but a FILE-LEVEL read error (``OSError`` on open)
+    PROPAGATES instead of degrading to empty — ``cmd_signals`` must be able
+    to distinguish unreadable from signal-free, because the Stop-hook gate
+    (#258) must never mistake a broken substrate for a quiet session (that
+    confusion would nag once and blank the persisted signal record).
+    """
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw_lines = [ln for ln in f if ln.strip()]
+
+    records = []
+    for ln in raw_lines:
+        try:
+            records.append(json.loads(ln))
+        except Exception:
+            continue  # skip malformed lines, keep scanning
+
+    # Pass 1: tool_use_id -> shell command (from Bash tool_use input).
+    commands = {}
+    for o in records:
+        if not isinstance(o, dict):
+            continue
+        msg = o.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                continue
+            tid = b.get("id")
+            if not (isinstance(tid, str) and tid):
+                continue
+            if str(b.get("name") or "").lower() != "bash":
+                continue
+            inp = b.get("input")
+            cmd = inp.get("command") if isinstance(inp, dict) else None
+            if isinstance(cmd, str):
+                commands[tid] = cmd
+
+    # Pass 2: join tool_result flags to commands; LAST status per signal.
+    signals: dict = {}
+    if _infer_signal is None:
+        # capture_quality unavailable (PRR-011 containment): an honest empty
+        # map beats a walker that cannot classify.
+        return signals
+    for o in records:
+        if not isinstance(o, dict):
+            continue
+        msg = o.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        tur = o.get("toolUseResult")
+        for b in content:
+            if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                continue
+            tid = b.get("tool_use_id")
+            cmd = commands.get(tid) if isinstance(tid, str) else None
+            if cmd is None:
+                continue
+            # Classify the outcome the way the failure walker does: a user
+            # rejection means the run never executed, so it records NO
+            # signal (never a "fail"); an error-shaped ``toolUseResult``
+            # sibling counts as a fail even when is_error is absent. Block
+            # content goes through _result_text because CC emits
+            # tool_result content as a string OR a list of text blocks.
+            texts = []
+            if isinstance(tur, str):
+                texts.append(tur)
+            texts.append(_result_text(b.get("content")))
+            if any(_is_rejection_text(t) for t in texts):
+                continue
+            failed = b.get("is_error") is True or (
+                isinstance(tur, str)
+                and tur.strip().lower().startswith("error"))
+            sig = _infer_signal(cmd)
+            if sig in ("test", "compile", "lint"):
+                signals[sig] = "fail" if failed else "pass"
+    return signals
+
+def cmd_signals(session: str, transcript: str, db: str) -> int:
+    """Print ``{"signals": {...}}`` for the session's recognized runner runs.
+
+    Transcript wins when given and present (Claude Code); otherwise the db
+    substrate (ZCode) yields an EMPTY map — ``tool_usage`` carries tool
+    name/status but no command text, and deriving a signal from the tool name
+    alone would guess, violating the honest-signal vocabulary (#123). On the
+    db substrate the Stop-hook nudge therefore degrades to once-per-session
+    rather than re-arming on runner flips (documented in SKILL.md).
+
+    Exit-code contract (mirrors ``cmd_failures``, #36 M7): a CHECKED result —
+    including legitimately-absent substrates (missing transcript path falls
+    through to the db leg exactly like ``cmd_failures``) — prints and exits
+    0; a GENUINE substrate error (transcript present but unreadable) prints
+    an error object and exits 2 so the hook can suppress without overwriting
+    its persisted state. Self-contained: never opens the ZMem store.
+    """
+    del session, db  # CLI symmetry with `failures`; neither is consulted.
+    try:
+        if transcript and os.path.isfile(transcript):
+            signals = _signals_from_transcript(transcript)
+            result = {"signals": signals}
+        else:
+            result = {"signals": {}}
+    except Exception as exc:
+        msg = _sanitize_exc_text(str(exc))
+        result = {"signals": {}, "error": msg}
+        print(json.dumps(result))
+        print(f"[zmem] signals: detection substrate error: {msg}", file=sys.stderr)
         return 2
     print(json.dumps(result))
     return 0

@@ -205,6 +205,9 @@ KNOWN_SUBCMDS = [
     "export-dataset", "publish-dataset", "import-dataset", "source",
     # Issue #138: explicit curated page filesystem commands.
     "page",
+    # Issue #258: the Stop-hook signal-change gate's read command (reads a
+    # transcript JSONL, never the store — dispatched beside `failures`).
+    "signals",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help
@@ -506,21 +509,22 @@ class CharacterizationTests(unittest.TestCase):
         # 45 -> 47: independent review and trusted terminal revoke joined.
         # 47 -> 48: curated page filesystem commands joined (issue #138).
         # 48 -> 49: read-only provenance inspection joined (issue #139).
-        self.assertEqual(len(KNOWN_SUBCMDS), 49)
+        # 49 -> 50: the signals read command joined (issue #258).
+        self.assertEqual(len(KNOWN_SUBCMDS), 50)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
         # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # stays frozen at 49 after the #138 page and #139 source additions).
+        # stays frozen at 50 after the #258 signals addition).
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 49)
+        self.assertEqual(len(KNOWN_SUBCMDS), 50)
 
     def test_page_help_surface(self):
         """Pin the nested issue #138 grammar and operator-facing help text."""

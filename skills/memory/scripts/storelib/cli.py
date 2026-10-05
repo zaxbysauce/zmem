@@ -35,7 +35,7 @@ from storelib.evidence import (
     write_evidence,
 )
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_clear, cmd_queue_list, cmd_promote_store, source_exists
+from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists
 from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
@@ -2722,6 +2722,17 @@ def main():
                              "substrate error (default: ZMEM_FAILURES_DB_TIMEOUT_S or 1.0; "
                              "clamped to 0.1-5.0)")
 
+    p_sig = _add_parser(
+        "signals",
+        help="report recognized runner signals for a session (transcript JSONL)")
+    p_sig.add_argument("--session", default="",
+                       help="session id (accepted for symmetry with failures)")
+    p_sig.add_argument("--transcript", default="",
+                       help="Claude Code transcript JSONL path (wins when present)")
+    p_sig.add_argument("--db", default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
+                       help="ZCode episodic db.sqlite path (accepted for symmetry; "
+                            "the db substrate carries no command text)")
+
     p_corr = _add_parser(
         "corrections",
         help="mine user corrections from a Claude Code transcript JSONL (read-only)")
@@ -3223,6 +3234,14 @@ def main():
     if args.cmd == "failures":
         sys.exit(cmd_failures(session=args.session, transcript=args.transcript, db=args.db,
                               db_timeout=args.db_timeout))
+
+    # `signals` is store-independent for the same reason as `failures` (it
+    # reads a transcript JSONL, never the ZMem store) and branches BEFORE
+    # connect() for the same fail-open reason. The #258 Stop-hook nudge gate
+    # calls this to decide whether a quiet session's tracked signal state
+    # changed since the last nudge.
+    if args.cmd == "signals":
+        sys.exit(cmd_signals(session=args.session, transcript=args.transcript, db=args.db))
 
     # `corrections` is store-independent (it mines a transcript JSONL, never the
     # ZMem store) and read-only by design (candidates are reviewed by an
