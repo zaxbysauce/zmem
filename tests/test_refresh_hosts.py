@@ -1061,7 +1061,7 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
         real_scandir = os.scandir
 
         def flaky_scandir(path):
-            if Path(path) == scan_parent:
+            if os.path.samefile(path, scan_parent):
                 raise PermissionError("injected parent scan denial")
             return real_scandir(path)
 
