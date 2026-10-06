@@ -19,10 +19,14 @@ retrieved-wrong costs more than retrieved-nothing.
 
 ## Step 0 — Locate the store and resolve the namespace
 
-The SessionStart hook injects the `store.py` path into context each session
-(look for `# Memory skill: invoke ...`). Use that exact path. Fallback:
-`${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/store.py` (Claude Code) or
-`${ZCODE_PLUGIN_ROOT}/...` (ZCode). Set `S` to it for the commands below.
+The SessionStart hook injects a ready-to-run store command into context
+each session (look for `# Memory skill: invoke ...`): the shell-quoted
+interpreter the hook resolved, then the `store.py` path. Set `P` to that
+interpreter token and `S` to the `store.py` path for the commands below —
+and prefer running the injected command verbatim. Fallback: resolve an
+interpreter explicitly (`py -3` on Windows) and set
+`S=${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/store.py` (Claude Code) or
+`${ZCODE_PLUGIN_ROOT}/...` (ZCode).
 
 **Never hand-write a namespace.** Keys are derived from the git remote, so a
 guessed `project:<foldername>` writes somewhere nothing ever queries. Derive it:
@@ -51,7 +55,7 @@ store (hooks only queue; this skill writes). If this session-start hook surface
 mentioned a pending count, or you want to check, review the queue now:
 
 ```bash
-python "$S" queue-list --namespace "<derived namespace>" --json
+"$P" "$S" queue-list --namespace "<derived namespace>" --json
 ```
 
 The `items[]` shape is a superset of transcript-mining (`corrections`) items, so
@@ -123,10 +127,10 @@ deferred items in place), and prune stale low-confidence candidates:
 
 ```bash
 # remove the specific processed item ids
-python "$S" queue-clear --namespace "<derived namespace>" --id <id> --id <id>
+"$P" "$S" queue-clear --namespace "<derived namespace>" --id <id> --id <id>
 
 # prune stale (past decay) items with confidence < 0.6
-python "$S" queue-clear --namespace "<derived namespace>" --drop-stale
+"$P" "$S" queue-clear --namespace "<derived namespace>" --drop-stale
 ```
 
 ## Step 1 — Recall before you write
@@ -134,7 +138,7 @@ python "$S" queue-clear --namespace "<derived namespace>" --drop-stale
 For each candidate lesson, check what the store already believes:
 
 ```bash
-python "$S" recall --query "<the lesson in a few words>" --limit 5 --hybrid --no-bump
+"$P" "$S" recall --query "<the lesson in a few words>" --limit 5 --hybrid --no-bump
 ```
 
 Three outcomes, and they lead to different actions:
@@ -157,13 +161,13 @@ FIRST and treat a hit as blocking review (see the memory skill's
 "Decision-point checkpoints" section for the full contract):
 
 - before `git stash pop` (stash-consume) —
-  `python "$S" recall --query "git stash pop foreign stash conflict"`
+  `"$P" "$S" recall --query "git stash pop foreign stash conflict"`
 - before `git reset --soft` (squash assembly) —
-  `python "$S" recall --query "git reset soft origin main stale tree"`
+  `"$P" "$S" recall --query "git reset soft origin main stale tree"`
 - before `git push` —
-  `python "$S" recall --query "git push stale tree fetch rebase verify"`
+  `"$P" "$S" recall --query "git push stale tree fetch rebase verify"`
 - before editing a file named by a stored citation/ratchet lesson —
-  `python "$S" recall --query "<path basename> ratchet citation re-pin"`
+  `"$P" "$S" recall --query "<path basename> ratchet citation re-pin"`
 
 ## Step 2 — Capture, with a hard bar
 
@@ -195,7 +199,7 @@ Write the content as an actionable claim, not a story. Include the trigger
 condition ("when X, do Y, because Z") so recall can match a future situation.
 
 ```bash
-python "$S" add \
+"$P" "$S" add \
   --namespace "<derived namespace or user:global>" \
   --type <lesson|convention|fact|preference|decision|constraint> \
   --content "<specific, actionable, includes the trigger condition>" \
@@ -231,7 +235,7 @@ If this session disproved, replaced, or outdated a stored memory, tombstone it.
 This preserves history while removing it from recall (issue #59):
 
 ```bash
-python "$S" invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
+"$P" "$S" invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
 ```
 
 `invalidate` REQUIRES a reason — it is the preferred form for "this fact is no
@@ -240,7 +244,7 @@ same topic (wrong details, now corrected) use `update` instead, which is
 append-only and preserves point-in-time recall:
 
 ```bash
-python "$S" update --id <full-uuid> --content "<the corrected lesson>"
+"$P" "$S" update --id <full-uuid> --content "<the corrected lesson>"
 ```
 
 `update` tombstones the old row, creates a NEW live row, and links the new row
@@ -255,7 +259,7 @@ a future session.
 ## Step 4 — Consolidate near-duplicates
 
 ```bash
-python "$S" consolidate --dry-run
+"$P" "$S" consolidate --dry-run
 ```
 
 Review the proposed clusters. Merging is namespace-scoped — it will not fold one
@@ -266,7 +270,7 @@ store was consolidated recently and has not grown enough to warrant another pass
 If the clusters look right:
 
 ```bash
-python "$S" consolidate
+"$P" "$S" consolidate
 ```
 
 A real run that the cadence gate declines prints `[zmem] consolidate: skipped by
@@ -275,7 +279,7 @@ consolidate anyway — e.g. you just imported a large batch of near-duplicates �
 pass `--force`:
 
 ```bash
-python "$S" consolidate --force
+"$P" "$S" consolidate --force
 ```
 
 **Contested clusters are never auto-merged — not even by `--force`.** Similarity
@@ -294,7 +298,7 @@ Pruning low-value, never-surfaced, never-retrieved rows is opt-in and destructiv
 first and only proceed if they are genuinely noise:
 
 ```bash
-python "$S" consolidate --prune --dry-run
+"$P" "$S" consolidate --prune --dry-run
 ```
 
 **`retrieval_count = 0` is NOT evidence a memory is unused.** Since hook-driven recall is
@@ -307,7 +311,7 @@ not read `retrieval_count = 0` as "dead weight".
 ## Step 5 — Review promotion candidates
 
 ```bash
-python "$S" promote --dry-run
+"$P" "$S" promote --dry-run
 ```
 
 Promotion turns a lesson into a `SKILL.md` in **both** `~/.claude/skills` and
@@ -323,7 +327,7 @@ The `description` is the entire trigger surface — a vague one means the skill
 never fires and the promotion was wasted. Always write it yourself:
 
 ```bash
-python "$S" promote --id <uuid> --description "Use when <explicit trigger context> — <what it prevents>" --confirm
+"$P" "$S" promote --id <uuid> --description "Use when <explicit trigger context> — <what it prevents>" --confirm
 ```
 
 `--confirm` is required to actually write; `--dry-run` alone changes nothing.

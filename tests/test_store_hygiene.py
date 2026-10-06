@@ -69,7 +69,7 @@ FIXTURE_DIGESTS = {
     "rows.jsonl": "f9ddde2d2463b288c84d46d3e9ebf669e4c4697d13fabeaa09347f6226c511a5",
     "origin-map.json": "85c8f54cb4c69e922b4e243222b89cb11f4a1d35d453d036e3e075db3f039972",
     "evidence-map.json": "1ae0ed47b76f84b0959195fe604c7caf4751c32e72767a2f3754015ce2d69155",
-    "expected-report.json": "86489602e06de408e08c17ee2c9b15057994cffcf778b73b31a0fdb200c7acb8",
+    "expected-report.json": "1fe329bc6ab6bae4e265723a0ca28d92cd1e20e8281374a7884de72289880495",
 }
 
 # Interpreter-token normalization: the token immediately before the
@@ -236,11 +236,13 @@ class StoreHygieneTest(unittest.TestCase):
         self.assertEqual(
             action["action"],
             shlex.quote(sys.executable)
-            + " skills/memory/scripts/store.py update"
-            f" --id {_hermes_id(1)}"
-            " --content grounded test lesson for valid case"
-            " --signal test"
-            " --source-ref session:fixture-valid-case --json",
+            + " " + shlex.quote(str(Path(hygiene.__file__).resolve().parents[1] / "store.py"))
+            + " update"
+            + " --id " + shlex.quote(_hermes_id(1))
+            + " --content " + shlex.quote("grounded test lesson for valid case")
+            + " --signal " + shlex.quote("test")
+            + " --source-ref " + shlex.quote("session:fixture-valid-case")
+            + " --json",
         )
         self.assertIn("session:fixture-valid-case", action["reason"])
 
@@ -433,8 +435,9 @@ class StoreHygieneCliTest(unittest.TestCase):
         self.assertIn("none-upgrade actions: 1", text)
         self.assertIn(
             shlex.quote(sys.executable)
-            + " skills/memory/scripts/store.py update --id "
-            "00000000-0000-4000-8000-000000000001",
+            + " " + shlex.quote(str(Path(hygiene.__file__).resolve().parents[1] / "store.py"))
+            + " update --id "
+            + shlex.quote("00000000-0000-4000-8000-000000000001"),
             text,
         )
         self.assertIn("review artifacts", text)

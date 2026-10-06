@@ -24,13 +24,15 @@ The SessionStart hook injects a ready-to-run store command into context each
 session (look for the `# Memory skill: invoke ...` note). Run the command it
 shows as-is: it names the shell-quoted interpreter the hook itself resolved
 ahead of the absolute `store.py` path, so it cannot hit a stub `python` on
-Windows. Use that exact `store.py` path. On Windows it will be a
+Windows. The `store.py` path is the second quoted token in that command.
+On Windows it will be a
 Windows-format path like
 `C:\Users\...\plugins\data\zmem@...\skills\memory\scripts\store.py`
 (the `...` segments are elision placeholders, not real paths).
 If you cannot find the injected path, the script is at the plugin root under
-`skills/memory/scripts/store.py` — invoke it through an explicit interpreter
-(`python` / `python3`), never as a bare path.
+`skills/memory/scripts/store.py` — invoke it through an explicitly
+resolved interpreter (`py -3` on Windows, `python3` on macOS/Linux), never
+as a bare path and never bare `python3` on Windows (Store stub).
 
 ## When to use
 - **Before a non-trivial task:** `recall` relevant past lessons. High-precision-first:
@@ -47,9 +49,11 @@ If you cannot find the injected path, the script is at the plugin root under
 
 ## Commands
 
-Store commands run `python <store.py path> <subcommand>`; `doctor` is the one
-separate diagnostic script shown below. On Windows use `python`
-(NOT `python3` — that is a Windows Store stub).
+Store commands run `<interpreter> <store.py path> <subcommand>` — use the
+interpreter the injected command names, or an explicitly resolved one
+(`py -3` on Windows). Never bare `python3` on Windows — that is a Windows
+Store stub — and never a bare `store.py` path (the script has no shebang).
+`doctor` is the one separate diagnostic script shown below.
 
 ### doctor — read-only install diagnostics
 ```

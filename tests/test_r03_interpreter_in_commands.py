@@ -163,6 +163,7 @@ class InterpreterInReflectCommandsTest(unittest.TestCase):
             env.pop(key, None)
         env.update({
             "ZMEM_DATA": self.tmp,
+            "ZMEM_STORE": os.path.join(self.tmp, "store.sqlite"),
             "ZMEM_SESSION": "rtest",
             "ZMEM_NAMESPACE": "project:rtest",
             "ZMEM_MODELS_DIR": os.path.join(self.tmp, "missing-models"),
@@ -315,12 +316,17 @@ class InterpreterBindingCensusTest(unittest.TestCase):
                         "%s must bind the interpreter from sys.executable"
                         % rel)
                 # No bare-path binding may survive anywhere in the site.
+                # (?m) line-anchors the pattern (the review round found the
+                # bare `$` form could never fire mid-file), and the variable
+                # alternation names only the store-path binding variables so
+                # legitimate namespace bindings (shlex.quote(sys.argv[3]))
+                # never match. The concatenation continuation after the first
+                # shlex.quote call also keeps prefixed bindings from matching.
                 self.assertNotRegex(
-                    text, r"=\s*shlex\.quote\(store_py\)\s*$",
+                    text,
+                    r"(?m)^\s*(?:store|store_py|store_py_arg)\s*=\s*"
+                    r"shlex\.quote\([^)]*\)\s*$",
                     "%s still binds a bare store path" % rel)
-                self.assertNotRegex(
-                    text, r"=\s*shlex\.quote\(sys\.argv\[\d\]\)\s*$",
-                    "%s still binds a bare argv path" % rel)
 
 
 if __name__ == "__main__":

@@ -61,9 +61,9 @@ The passive `--for-injection --json` lane of `recall` and `recent` accepts
 `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` attribution
 flags. An empty query selects recent memories; `pretool` is the only moment
 that composes the store-side operation ring. Use
-`python <store.py> delivery-clear --session-id=<id>` for terminal session
+`<interpreter> <store.py> delivery-clear --session-id=<id>` for terminal session
 cleanup of both the ledger and pending sidecars. Use
-`python <store.py> ledger-clear --session-id=<id>` for the reusable,
+`<interpreter> <store.py> ledger-clear --session-id=<id>` for the reusable,
 ledger-only PreCompact path; the equals form supports ids beginning with `-`.
 Neither command opens SQLite. The former
 hook-owned pending, compact-summary, and task-text sidecars, plus the
@@ -160,7 +160,7 @@ MCP server — one `select_and_budget_for_injection` call and one complete JSON
 envelope; no consumer-side renderer, no second budget run:
 
 ```
-python <store.py> prefetch --query "<text>" --namespace <ns> \
+<interpreter> <store.py> prefetch --query "<text>" --namespace <ns> \
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
   [--ops-token <token>]... [--exclude <memory-id>]...
@@ -1186,25 +1186,27 @@ where you want project-scoped conventions (ZCode only), and fill it in
 
 ## Usage
 
-The SessionStart hook injects the absolute path to `store.py` into context each
-session — use that exact path. Common operations:
+The SessionStart hook injects a ready-to-run store command into context each
+session — the shell-quoted interpreter the hook resolved, then the `store.py`
+path. Run it as-is, or substitute any resolved interpreter for `<interpreter>`
+below (`py -3` on Windows). Common operations:
 
 ```bash
 # Recall relevant lessons before a task (scoped to current project)
-python <store.py> recall --query "FTS5 sqlite" --namespace "project:myrepo"
+<interpreter> <store.py> recall --query "FTS5 sqlite" --namespace "project:myrepo"
 
 # Capture a lesson (signal=test means a test verified it)
-python <store.py> add \
+<interpreter> <store.py> add \
   --namespace "project:myrepo" --type lesson \
   --content "This repo uses pytest, not unittest." \
   --tags "python,testing" --signal test
 
 # See what's stored
-python <store.py> list --namespace "project:myrepo"
-python <store.py> stats
+<interpreter> <store.py> list --namespace "project:myrepo"
+<interpreter> <store.py> stats
 
 # Tombstone a stale lesson (keeps history)
-python <store.py> supersede --id <uuid> --reason "no longer applies"
+<interpreter> <store.py> supersede --id <uuid> --reason "no longer applies"
 ```
 
 The full command reference is in the `memory` skill (type `/memory` in ZCode).
@@ -1217,11 +1219,11 @@ have existing Claude Code transcripts on this machine, `mine-history` (issue
 
 ```bash
 # Scan the current project's Claude Code transcripts (read-only)
-python <store.py> mine-history --days 90 --json          # report only
+<interpreter> <store.py> mine-history --days 90 --json          # report only
 # OR queue candidates for the closeout review flow (source=history-mine)
-python <store.py> mine-history --days 90 --queue
+<interpreter> <store.py> mine-history --days 90 --queue
 # sweep everything, not just the current project
-python <store.py> mine-history --all-projects --days 90 --queue
+<interpreter> <store.py> mine-history --all-projects --days 90 --queue
 ```
 
 Then run the **closeout** skill (`/closeout`) to review the queued candidates:
@@ -1341,7 +1343,7 @@ committed snapshot up to a full sync-repo read/write loop: see
 - Keep **one canonical physical store path** per machine. If two hosts resolve
   to different physical stores, that is a cutover failure, not a supported mode.
 - Backups and restores are first-class maintenance commands:
-  `python <store.py> backup` and `python <store.py> restore --from <snapshot> --force`.
+  `<interpreter> <store.py> backup` and `<interpreter> <store.py> restore --from <snapshot> --force`.
   Run restores when no session is actively writing.
 - Review skill promotion before writing it. `promote --confirm` writes into the
   host skill surfaces and should stay a reviewed step, not an automatic one.
@@ -1402,8 +1404,8 @@ Capture adapters use two public, machine-readable bridge commands rather than
 importing store internals:
 
 ```text
-python <store.py> source-exists --namespace NS --source-ref REF --json
-python <store.py> ops-append --session SESSION --tool TOOL --op OP --json
+<interpreter> <store.py> source-exists --namespace NS --source-ref REF --json
+<interpreter> <store.py> ops-append --session SESSION --tool TOOL --op OP --json
 ```
 
 `source-exists` prints `{"exists":false}` and exits 0 when the store is absent;
@@ -1498,14 +1500,14 @@ lose semantic recall.
 
 **Check status** (one command away from noticing drift):
 
-- `python <store.py> stats` reports live embedding coverage
+- `<interpreter> <store.py> stats` reports live embedding coverage
   (`with_embedding=` / `without_embedding=`), whether embeddings are available,
   the reason if not, and the resolved models dir.
 - `python skills/memory/scripts/doctor.py` reports embedding availability + the
   reason + the resolved interpreter (so the multi-Python case is diagnosable).
 
 **Backfill existing unembedded rows:** once the root cause is fixed, run
-`python <store.py> reembed` to embed live rows that are missing embeddings.
+`<interpreter> <store.py> reembed` to embed live rows that are missing embeddings.
    Use `reembed --all [--profile NAME]` to convert the whole store to another
    profile/dimension atomically (see SKILL.md "reembed" and "Embedding
    profiles"); profiles are selected with `ZMEM_EMBED_PROFILE`.
@@ -1518,7 +1520,7 @@ lose semantic recall.
    sentence-transformers PyTorch weights differ by design; verification has no
    override or bypass.
 
-   Run `python <store.py> reembed --check` for a read-only consistency census.
+   Run `<interpreter> <store.py> reembed --check` for a read-only consistency census.
    It reports live rows missing vectors, orphan vector rows, and live embedding
    blobs whose byte length does not match the declared vector dimension. A
    clean store prints `reembed check: 0 inconsistencies`; an inconsistent store
@@ -1537,8 +1539,8 @@ For imported rows whose namespace needs an operator-supplied correction, use an
 ordered map of quoted `source_ref` prefixes to validated namespace targets:
 
 ```bash
-python <store.py> rekey-namespace --map map.yaml --dry-run
-python <store.py> rekey-namespace --map map.yaml --confirm
+<interpreter> <store.py> rekey-namespace --map map.yaml --dry-run
+<interpreter> <store.py> rekey-namespace --map map.yaml --confirm
 ```
 
 The map is a narrow UTF-8 YAML subset: unindented quoted pairs only, with blank
