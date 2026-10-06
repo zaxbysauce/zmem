@@ -10,6 +10,12 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.84.0] - 2026-10-05
+
+### Fixed
+
+- Every hook-suggested memory command now names the interpreter the hook itself ran under: the SessionStart memory-skill note and all Stop-hook nudges (subagent hand-off, rejections, no-failure, failure) prefix the shell-quoted `sys.executable` ahead of the `store.py` path, as do the convention-capture and capture-failure prompts and the store hygiene report upgrade-command plan (#259). A bare `python`/`python3` token could resolve to the Windows Store python stub and silently no-op, and a bare `store.py` path is not executable at all (no shebang); the suggested commands are now copy-paste runnable as-is.
+
 ## [0.83.0] - 2026-10-05
 
 ### Fixed

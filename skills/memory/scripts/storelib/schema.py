@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import struct
@@ -18,6 +19,11 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from storelib.opcmds import command_prefix
+except ImportError:  # direct-script import context
+    from opcmds import command_prefix
 
 # Shared single source of truth (dependency-free, resolved from this dir).
 try:
@@ -553,7 +559,7 @@ def assert_embedding_compatible(conn: sqlite3.Connection, *, allow_rebuild: bool
         return
     if allow_rebuild:
         return
-    fix = f"store.py reembed --all --profile {prof_name}"
+    fix = command_prefix() + " reembed --all --profile " + shlex.quote(prof_name)
     raise RuntimeError(
         f"profile '{prof_name}' expects {prof_dim}-dim embeddings but the store "
         f"holds {live_dim}-dim data — refusing to mix dimensions. Run "

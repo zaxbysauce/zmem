@@ -347,13 +347,13 @@ CTX_JSON="$("$PYTHON_BIN" -c '
 import json, shlex, sys
 obj = json.loads(sys.argv[1])
 descriptor = obj["descriptor"]
-store = shlex.quote(sys.argv[2])
+render_store = shlex.quote(sys.executable) + " " + shlex.quote(sys.argv[2])
 namespace = shlex.quote(sys.argv[3])
 source_ref = shlex.quote("session:" + obj["session"])
 claim = "when X happens, do Y, because Z"
 command = ("%s add --namespace %s --type lesson --content %s --tags %s "
            "--signal %s --source-ref %s" %
-           (store, namespace, shlex.quote(claim), shlex.quote(obj["tags"]),
+           (render_store, namespace, shlex.quote(claim), shlex.quote(obj["tags"]),
             obj["signal"], source_ref))
 msg = ("ZMem auto-capture: a repeated or recognized tool failure was observed. "
        "Capture a generalizable lesson only when the claim is grounded in a "

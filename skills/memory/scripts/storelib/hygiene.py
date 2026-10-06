@@ -20,10 +20,13 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import sqlite3
 import sys
 from pathlib import Path
 from urllib.request import pathname2url
+
+from storelib.opcmds import command_prefix
 
 # The six known junk namespaces from the 2026-09-10 audit (issue #97 scope).
 # Always reported as exactly this list, in sorted order.
@@ -36,11 +39,21 @@ GROUNDED_SIGNALS = ("test", "compile", "lint", "reviewer")
 # in either direction between the none row and the grounded row.
 TRIAGE_RELATIONS = ("supports", "updates", "extends", "derives")
 
-_UPGRADE_COMMAND = (
-    "python skills/memory/scripts/store.py update"
-    " --id {none_id} --content {content} --signal {signal}"
-    " --source-ref {proof_ref} --json"
-)
+# Interpreter rendered from the running process (sys.executable, quoted) so
+# the suggested command cannot resolve a PATH python stub — same surfacing
+# rule as the hook-injected commands (issue #259). Built per call (not a
+# format template) so every interpolated value is shell-quoted: the rendered
+# action is copy-paste runnable as-is, and no format-brace in an unusual
+# interpreter path can raise out of report building.
+def _upgrade_command(none_id: str, content: str, signal: str,
+                     proof_ref: str) -> str:
+    return (command_prefix()
+            + " update"
+            + " --id " + shlex.quote(none_id)
+            + " --content " + shlex.quote(content)
+            + " --signal " + shlex.quote(signal)
+            + " --source-ref " + shlex.quote(proof_ref)
+            + " --json")
 
 
 def _invalid() -> int:
@@ -189,7 +202,7 @@ def build_report(conn: sqlite3.Connection, *, origin_map: dict, evidence_map: li
             "none_id": none_id,
             "namespace": none_row["namespace"],
             "signal": grounded["signal"],
-            "action": _UPGRADE_COMMAND.format(
+            "action": _upgrade_command(
                 none_id=none_id,
                 content=grounded["content"],
                 signal=grounded["signal"],

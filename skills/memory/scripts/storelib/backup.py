@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import struct
@@ -18,6 +19,7 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
+from storelib.opcmds import command_prefix
 from storelib.schema import MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _acquire_maintenance_lock_with_liveness, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, now_iso
 
 SNAPSHOT_PREFIX = "store-"
@@ -786,7 +788,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             # as every other post-pre-restore-backup failure branch below.
             if prerestore_path:
                 print(f"[zmem] restore: roll back with "
-                      f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+                      f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
             return 1
 
     try:
@@ -803,7 +805,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         # trustworthy — point at the safety copy taken in step 2.
         if prerestore_path:
             print(f"[zmem] restore: roll back with "
-                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
         return 1
 
     # --- 4. Post-copy verification on the restored destination. ---
@@ -821,7 +823,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
               file=sys.stderr)
         if prerestore_path:
             print(f"[zmem] restore: roll back with "
-                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
         return 1
 
     if _host is not None:
@@ -835,7 +837,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
               file=sys.stderr)
         if prerestore_path:
             print(f"[zmem] restore: roll back with "
-                  f"`store.py restore --from {prerestore_path} --force`", file=sys.stderr)
+                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
         return 1
     print("[zmem] restore: OK")
     return 0

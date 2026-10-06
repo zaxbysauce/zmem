@@ -106,6 +106,14 @@ WINDOWS_BASH_CANDIDATES = (
 )
 
 
+def _prefix() -> str:
+    """Shell-quoted interpreter + absolute store.py path for operator
+    command hints (issue #259 surfacing rule). Lazy import: the storelib
+    package path is only guaranteed after doctor's own sys.path setup."""
+    from storelib.opcmds import command_prefix
+    return command_prefix()
+
+
 def _norm_path(path: str | Path) -> str:
     return str(Path(os.path.abspath(str(path)))).replace("/", "\\").lower()
 
@@ -1700,7 +1708,7 @@ def _check_operational_health(resolved_store: Path) -> list[dict]:
                         f"last_{name}: (never) — maintenance has not run yet. The "
                         f"session-start hook fires {name} on a cadence; if this store "
                         f"predates the hook or the hook is disabled, run "
-                        f"`store.py {'backup --if-due' if name == 'backup' else 'consolidate'}` manually.",
+                        f"`{_prefix()} {'backup --if-due' if name == 'backup' else 'consolidate'}` manually.",
                         key=key,
                     )
                 )
@@ -3197,7 +3205,7 @@ def _check_entity_tables(resolved_store: Path) -> dict:
             f"memory row(s) — the deterministic extractor should have derived "
             f"at least namespace/tag entities on write (issue #60, 5.2). "
             f"Re-run a writable store.py command to trigger the migration "
-            f"backfill, then inspect with `store.py entity-list`.",
+            f"backfill, then inspect with `{_prefix()} entity-list`.",
             entities=n_entities,
             links=n_links,
             memories=n_memory,
@@ -3206,7 +3214,7 @@ def _check_entity_tables(resolved_store: Path) -> dict:
         "entity-tables",
         "pass",
         f"entity identity tables present (entities={n_entities}, "
-        f"links={n_links}); inspect with `store.py entity-list`.",
+        f"links={n_links}); inspect with `{_prefix()} entity-list`.",
         entities=n_entities,
         links=n_links,
         memories=n_memory,
@@ -3285,7 +3293,7 @@ def _check_link_tables(resolved_store: Path) -> dict:
             "warn",
             f"trust_score range [{lo}, {hi}] outside [0.0, 1.0] — writes "
             "clamp in SQL, so this store was hand-edited; inspect with "
-            "`store.py get --json`.",
+            f"`{_prefix()} get --json`.",
             trust_min=lo,
             trust_max=hi,
         )
@@ -3294,7 +3302,7 @@ def _check_link_tables(resolved_store: Path) -> dict:
         "pass",
         f"memory_link table present (edges={n_links}); trust_score in range "
         f"[{lo if lo is not None else 'n/a'}, {hi if hi is not None else 'n/a'}]; "
-        "inspect with `store.py links --id <uuid>`.",
+        f"inspect with `{_prefix()} links --id <uuid>`.",
         edges=n_links,
         trust_min=lo,
         trust_max=hi,
@@ -3375,7 +3383,7 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
             "warn",
             "non-integer usage counter value(s) — writes only ever store "
             "integers, so this store was hand-edited; inspect with "
-            "`store.py get --json`.",
+            f"`{_prefix()} get --json`.",
             applied_min=lo_applied,
             applied_max=hi_applied,
             violated_min=lo_violated,
@@ -3388,7 +3396,7 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
             "warn",
             f"negative usage counter value(s) (applied_min={lo_applied}, "
             f"violated_min={lo_violated}) — writes only increment, so this "
-            "store was hand-edited; inspect with `store.py get --json`.",
+            f"store was hand-edited; inspect with `{_prefix()} get --json`.",
             applied_min=lo_applied,
             violated_min=lo_violated,
         )
@@ -3425,7 +3433,7 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
         feedback_note = " feedback totals unavailable"
     summary = (
         f"usage counters present and sane (applied_max={hi_applied}, "
-        f"violated_max={hi_violated}); written by `store.py feedback` and "
+        f"violated_max={hi_violated}); written by `{_prefix()} feedback` and "
         "matched operation feedback."
         f" feedback: total_applied={feedback_values['total_applied']}"
         f" total_violated={feedback_values['total_violated']}"
@@ -3747,7 +3755,7 @@ def _recommendations(checks: list[dict]) -> list[str]:
                 notes.append(
                     f"{expired} training capture record(s), including inactive "
                     "partials, exceeded the 30-day local retention window. Run "
-                    "`python <store.py> purge-training-captures --confirm`; "
+                    f"`{_prefix()} purge-training-captures --confirm`; "
                     "doctor remains read-only, and session-cadence also sweeps "
                     "expired capture rows before backup."
                 )
@@ -4040,7 +4048,7 @@ def _embedding_health_warnings(
         warnings.append(
             "hybrid recall default is ON but this store has ZERO embedded "
             "rows — the vector lane has nothing to fuse. Run "
-            "`store.py reembed` to backfill once the model files are in place."
+            f"`{_prefix()} reembed` to backfill once the model files are in place."
         )
     return warnings
 

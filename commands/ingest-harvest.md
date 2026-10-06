@@ -18,10 +18,14 @@ locally-drafted lesson: check the store first, then decide.
 
 ## Step 0 — Locate the store and the ingest script
 
-The SessionStart hook injects the `store.py` path into context (look for
-`# Memory skill: invoke ...`). Use that exact path; fall back to
-`${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/store.py` (Claude Code) or
-`${ZCODE_PLUGIN_ROOT}/...` (ZCode). Set `S` to it for the commands below.
+The SessionStart hook injects a ready-to-run store command into context
+(look for `# Memory skill: invoke ...`): the shell-quoted interpreter the
+hook resolved, then the `store.py` path. Set `P` to that interpreter token
+and `S` to the `store.py` path for the commands below — and prefer running
+the injected command verbatim. Fallback: resolve an interpreter explicitly
+(`py -3` on Windows) and set
+`S=${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/store.py` (Claude Code) or
+`${ZCODE_PLUGIN_ROOT}/...` (ZCode).
 
 This command runs in the **user's project repo**, not the zmem plugin
 checkout — a bare `scripts/ingest_harvest.py` will not resolve there. Derive
@@ -50,7 +54,7 @@ For **each** item, before deciding anything, check what the store already
 believes — scoped to that item's own namespace:
 
 ```bash
-python "$S" recall --query "<distinctive terms from the item's content>" \
+"$P" "$S" recall --query "<distinctive terms from the item's content>" \
   --namespace "<the item's namespace>" --limit 5 --hybrid --no-bump
 ```
 
@@ -59,7 +63,7 @@ Read the near-hits, don't just glance at scores. Three outcomes:
 - **Already there, still true** → drop the item. Record it as "merged into
   existing <id>" in your report.
 - **There, but this item corrects or updates it** → note it for supersession
-  (run `python "$S" supersede --id <uuid> --reason "..."` yourself, outside
+  (run `"$P" "$S" supersede --id <uuid> --reason "..."` yourself, outside
   this command's batch-add step, then let the corrected item survive to
   Step 3).
 - **Not there / genuinely new** → the item survives to Step 3.
@@ -82,7 +86,7 @@ signal rather than restating what already exists.
 For the items that survived Steps 2–3, run:
 
 ```bash
-python "$H" <harvest-file> \
+"$P" "$H" <harvest-file> \
   --source-ref "session:<batch-tag>" \
   --store "$S"
 ```
@@ -96,14 +100,14 @@ omitted, `ingest_harvest.py` defaults it to `session:harvest-<file-stem>`
 explicitly with a batch tag that actually identifies the source session,
 since the default is only as meaningful as the file name it derives from.
 
-Alternatively, for a small number of survivors, call `python "$S" add
+Alternatively, for a small number of survivors, call `"$P" "$S" add
 --namespace ... --type ... --content ... --tags ... --signal ... --source-ref
 "session:<batch-tag>"` per item directly — either path is fine as long as
 every surviving item actually gets written.
 
 ## Step 5 — Verify and report
 
-After ingestion, spot-check with `python "$S" recall --query "..." --namespace
+After ingestion, spot-check with `"$P" "$S" recall --query "..." --namespace
 "..." --no-bump` for at least one surviving item to confirm it landed. Then
 report plainly:
 

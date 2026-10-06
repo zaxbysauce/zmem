@@ -347,7 +347,7 @@ if lesson_exists and not pending_subagents:
 # before rendering — closing the same shell-injection path fixed in
 # zmem-convention-capture.sh (a hostile origin URL can embed quotes /
 # $(...) / backticks).
-store_py_arg = shlex.quote(store_py)
+store_py_arg = shlex.quote(sys.executable) + " " + shlex.quote(store_py)
 ns_arg = shlex.quote(ns)
 source_ref_arg = shlex.quote("session:" + session_id)
 

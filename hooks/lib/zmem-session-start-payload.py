@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -534,8 +535,9 @@ def main():
     # Keep queue/recent/promotion work on the second emission so a slow or
     # unavailable store never prevents the core memory fast path.
     tier0 = build_tier0_context(core, agents, host)
-    store_note = ("# Memory skill: invoke `%s <subcommand>` to recall/add/search memories."
-                  % store_py) if store_py and os.path.isfile(store_py) else ""
+    store_note = ("# Memory skill: invoke `%s %s <subcommand>` to recall/add/search memories."
+                  % (shlex.quote(sys.executable),
+                     shlex.quote(store_py))) if store_py and os.path.isfile(store_py) else ""
     nudge = _native_nudge(host, settings_dir, marker)
     first_ctx = _soft_trim("\n\n".join(x for x in (tier0, store_note, nudge) if x), budget)
     first_payload = {}
