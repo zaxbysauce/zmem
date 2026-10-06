@@ -400,7 +400,7 @@ Capture retention is local SQLite retention. Purging expired rows does not
 remove earlier operator-owned training output folders or their published
 copies. Doctor reports an intentional expired-retention warning with
 `status: "warn"`; after checking that no export is active, run
-`python <store.py> purge-training-captures --confirm` and rerun doctor.
+`<interpreter> <store.py> purge-training-captures --confirm` and rerun doctor.
 
 ## Tier 1 — Memory pack (read-only snapshot, committed to the repo)
 
@@ -410,7 +410,7 @@ for a project into a single markdown file, commit it, and point the repo's
 gets that memory for free, with no store connection at all.
 
 ```bash
-python <store.py> export-pack \
+<interpreter> <store.py> export-pack \
   --namespace project:github.com/<org>/<repo> \
   --out <repo>/.zmem-pack.md \
   [--project-limit 50] \
@@ -583,7 +583,7 @@ compromise of the store, and rebuild rather than "clean up" — see the
   exports the store to JSONL and pushes it to a **private** sync repo (never
   the public/working repo — this is your memory, not shippable content):
   ```bash
-  python <store.py> export-jsonl \
+  <interpreter> <store.py> export-jsonl \
     --out sync/memory.jsonl \
     [--namespace NS] \
     [--include-superseded]
@@ -667,7 +667,7 @@ compromise of the store, and rebuild rather than "clean up" — see the
 - **Local side ingests the outbox** on its own cadence — **without**
   `--allow-tombstones`:
   ```bash
-  python <store.py> ingest-jsonl --in sync-repo/outbox/<file>.jsonl \
+  <interpreter> <store.py> ingest-jsonl --in sync-repo/outbox/<file>.jsonl \
     --source-ref "cloud:<cloud-session-id>"
   ```
   Repeated ingestion of the same outbox file — or overlap between two cloud
@@ -687,7 +687,7 @@ compromise of the store, and rebuild rather than "clean up" — see the
   land without one are FTS-only until they are embedded, so semantic recall
   and dedup silently under-perform on exactly the newest knowledge:
   ```bash
-  python <store.py> reembed   # backfill missing embeddings
+  <interpreter> <store.py> reembed   # backfill missing embeddings
   # or convert the whole store to another profile:
   #   reembed --all [--profile NAME] [--batch N] [--dry-run] [--confirm]
   ```
@@ -959,9 +959,9 @@ maintenance/writer quiescence protocol inside the page library, and writes no
 canonical memory rows.
 
 ```
-python <store.py> page read --id <page-id> [--version <version-id>]
-python <store.py> page list [--namespace <namespace>]
-python <store.py> page refresh --id <page-id> --query "<source query>" \
+<interpreter> <store.py> page read --id <page-id> [--version <version-id>]
+<interpreter> <store.py> page list [--namespace <namespace>]
+<interpreter> <store.py> page refresh --id <page-id> --query "<source query>" \
   --namespace <namespace> [--tag <tag>]... [--llm-local]
 ```
 

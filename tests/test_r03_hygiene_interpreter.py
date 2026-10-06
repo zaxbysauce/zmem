@@ -25,6 +25,7 @@ OPCMDS = REPO_ROOT / "skills" / "memory" / "scripts" / "storelib" / "opcmds.py"
 PAYLOAD = REPO_ROOT / "hooks" / "lib" / "zmem-session-start-payload.py"
 SCHEMA = REPO_ROOT / "skills" / "memory" / "scripts" / "storelib" / "schema.py"
 BACKUP = REPO_ROOT / "skills" / "memory" / "scripts" / "storelib" / "backup.py"
+DOCTOR = REPO_ROOT / "skills" / "memory" / "scripts" / "doctor.py"
 
 
 def first_token(cmd):
@@ -85,6 +86,15 @@ class OperatorCommandPrefixPin(unittest.TestCase):
         self.assertEqual(backup.count("command_prefix()"), 4,
                          "all four backup rollback hints must use the prefix")
 
+    def test_doctor_hints_use_the_prefix(self):
+        doctor = DOCTOR.read_text(encoding="utf-8")
+        self.assertGreaterEqual(doctor.count("{_prefix()} "), 8,
+                                "doctor command hints must use the prefix")
+        self.assertNotRegex(doctor, r'f"`store\.py ',
+                            "bare backticked store.py hint must not return")
+        # The prose mention f"store.py run will create ..." (no backticks) is
+        # not a copy-paste hint; only the backticked form is pinned above.
+
     def test_rendered_prefix_is_existing_executable_and_path(self):
         sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
         import storelib.opcmds as opcmds
@@ -103,15 +113,20 @@ class OperatorCommandPrefixPin(unittest.TestCase):
             "skills/memory/scripts/store.py"), stripped[1])
 
     def test_no_bare_or_literal_python_hint_returns(self):
-        for path in (SCHEMA, BACKUP):
+        # The backticked copy-paste form is pinned everywhere; the plain
+        # f"store.py form is schema-specific (its prose f"store.py run ...
+        # mentions in doctor.py/backup.py are not copy-paste hints).
+        for path in (SCHEMA, BACKUP, DOCTOR):
             text = path.read_text(encoding="utf-8")
             with self.subTest(site=str(path.relative_to(REPO_ROOT))):
                 self.assertNotRegex(
                     text, r'f"`store\.py ',
                     "bare backticked store.py hint must not return")
-                self.assertNotRegex(
-                    text, r'f"store\.py ',
-                    "bare f-string store.py hint must not return")
+
+    def test_schema_hint_plain_form_does_not_return(self):
+        schema = SCHEMA.read_text(encoding="utf-8")
+        self.assertNotRegex(schema, r'f"store\.py ',
+                            "bare f-string store.py hint must not return")
 
 
 if __name__ == "__main__":

@@ -183,9 +183,9 @@ default output (ids/namespaces only; `--miss-verbose` adds a short preview).
 ### page — read, list, and refresh curated pages (issue #138)
 
 ```
-python <store.py> page read --id <page-id> [--version <version-id>]
-python <store.py> page list [--namespace <namespace>]
-python <store.py> page refresh --id <page-id> --query "<source query>" \
+<interpreter> <store.py> page read --id <page-id> [--version <version-id>]
+<interpreter> <store.py> page list [--namespace <namespace>]
+<interpreter> <store.py> page refresh --id <page-id> --query "<source query>" \
   --namespace <namespace> [--tag <tag>]... [--llm-local]
 ```
 
@@ -274,12 +274,12 @@ The current observation gate is recorded as `reject`, so page metadata omits
 
 ### recall — surface relevant memories (high-precision)
 ```
-python <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
+<interpreter> <store.py> recall --query "<query>" [--namespace NS] [--limit 5]
   [--link-hops 0|1] [--link-budget N]
                           [--include-global] [--global-limit 3] [--hybrid]
                           [--no-hybrid] [--no-mmr] [--no-bump]
                           [--as-of ISO-8601] [--no-unfold] [--json]
-python <store.py> recall --query "<query>" --explain [--target ID|FRAGMENT]
+<interpreter> <store.py> recall --query "<query>" --explain [--target ID|FRAGMENT]
                           [--json]
 ```
 Returns live (non-superseded) memories matching the query, filtered by confidence
@@ -971,16 +971,16 @@ closed moments are `session_start`, `user_prompt`, `pretool`, `subagent`, and
 The exact session-aware CLI forms are:
 
 ```
-python <store.py> recall --query "<text>" --for-injection --json \
+<interpreter> <store.py> recall --query "<text>" --for-injection --json \
   --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]...
-python <store.py> recent --for-injection --json \
+<interpreter> <store.py> recent --for-injection --json \
   --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]...
-python <store.py> ledger-clear --session-id=<id>
-python <store.py> delivery-clear --session-id=<id>
+<interpreter> <store.py> ledger-clear --session-id=<id>
+<interpreter> <store.py> delivery-clear --session-id=<id>
 ```
 
 The passive `recall` and `recent` commands accept the additive attribution
@@ -1016,7 +1016,7 @@ is the command's only output mode, and there is no consumer-side renderer or
 second budget run.
 
 ```
-python <store.py> prefetch --query "<text>" --namespace <ns> \
+<interpreter> <store.py> prefetch --query "<text>" --namespace <ns> \
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
   [--ops-token <token>]... [--exclude <memory-id>]...
@@ -1050,7 +1050,7 @@ to the legacy for-injection envelope without the ledger key.
 
 ### add — capture a memory
 ```
-python <store.py> add \
+<interpreter> <store.py> add \
   --namespace "project:<basename>" \
   --type <fact|lesson|convention|preference|decision|constraint> \
   --content "<the knowledge, specific and actionable>" \
@@ -1098,10 +1098,10 @@ Legacy rows already stranded under a near-miss namespace
 
 ### update / invalidate — append-only revision and contradiction corrections (v9, issue #59)
 ```
-python <store.py> update --id <full-uuid> --content "<new content>" \
+<interpreter> <store.py> update --id <full-uuid> --content "<new content>" \
   [--namespace NS] [--type ...] [--tags ...] [--source-ref ...] [--confidence F]
   [--signal ...] [--taint ...] [--capture-mode manual|reviewed|auto]
-python <store.py> invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
+<interpreter> <store.py> invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
 ```
 - **`update`** is append-only knowledge revision: it creates a NEW live row with the
   new content, tombstones the target row (`superseded_at=now, valid_until=now,
@@ -1161,19 +1161,19 @@ Recall surfaces the taint so trust is visible, mirroring prompt-injection-risk:
 
 ### recent / search / supersede / update / invalidate / list / get / stats
 ```
-python <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
+<interpreter> <store.py> recent [--namespace NS] [--limit 5] [--min-confidence 0.5]
                          [--include-global] [--global-limit 3] [--as-of ISO-8601]
                          [--json]
-python <store.py> search --text "<text>" [--exact] [--namespace NS] [--limit 10]
+<interpreter> <store.py> search --text "<text>" [--exact] [--namespace NS] [--limit 10]
                         [--include-global] [--global-limit 3] [--no-bump]
                         [--as-of ISO-8601] [--json]
-python <store.py> supersede --id <full-uuid> [--reason "..."] [--expected-namespace NS]
-python <store.py> invalidate --id <full-uuid> --reason "..." [--expected-namespace NS]
-python <store.py> update --id <full-uuid> --content "<new content>" [overrides...]
+<interpreter> <store.py> supersede --id <full-uuid> [--reason "..."] [--expected-namespace NS]
+<interpreter> <store.py> invalidate --id <full-uuid> --reason "..." [--expected-namespace NS]
+<interpreter> <store.py> update --id <full-uuid> --content "<new content>" [overrides...]
                        [--expected-old-namespace NS]
-python <store.py> list [--namespace NS] [--include-superseded]
-python <store.py> get --id <uuid>
-python <store.py> stats
+<interpreter> <store.py> list [--namespace NS] [--include-superseded]
+<interpreter> <store.py> get --id <uuid>
+<interpreter> <store.py> stats
 ```
 Read envelope (v13, issue #65 10.8): `recall`/`recent`/`search --json` print
 `{"results", "count", "omitted", "injection_risk", "tokens_used",
@@ -1230,9 +1230,9 @@ the vec lane should be re-run with `--no-hybrid` to include the FTS lane.
 
 ### reembed — backfill or rebuild semantic embeddings
 ```
-python <store.py> reembed
-python <store.py> reembed --all [--profile NAME] [--batch N] [--dry-run]
-python <store.py> reembed --check
+<interpreter> <store.py> reembed
+<interpreter> <store.py> reembed --all [--profile NAME] [--batch N] [--dry-run]
+<interpreter> <store.py> reembed --check
 ```
 Flagless form (unchanged contract): backfills embeddings for live memories that
 are MISSING them when the optional embedding runtime and model are available.
@@ -1334,10 +1334,10 @@ degrade and the passive/shadow opt-in state stay visible.
 ### episode-open / episode-add / episode-close / episode-list — session containers (v13, issue #65 10.7)
 
 ```
-python <store.py> episode-open --namespace "project:<basename>" [--json]
-python <store.py> episode-add --episode <uuid> --memory <uuid> [--json]
-python <store.py> episode-close --episode <uuid> [--summary] [--json]
-python <store.py> episode-list [--namespace NS] [--json]
+<interpreter> <store.py> episode-open --namespace "project:<basename>" [--json]
+<interpreter> <store.py> episode-add --episode <uuid> --memory <uuid> [--json]
+<interpreter> <store.py> episode-close --episode <uuid> [--summary] [--json]
+<interpreter> <store.py> episode-list [--namespace NS] [--json]
 ```
 
 An **episode** groups the memories captured during one working session
@@ -1432,9 +1432,9 @@ and never prints the token value.
 
 ### promote — review and install a reusable skill
 ```
-python <store.py> promote --dry-run [--namespace NS]
-python <store.py> promote --id <uuid> --confirm [--description "..."]
-python <store.py> promote --id <uuid> --confirm --install-approved
+<interpreter> <store.py> promote --dry-run [--namespace NS]
+<interpreter> <store.py> promote --id <uuid> --confirm [--description "..."]
+<interpreter> <store.py> promote --id <uuid> --confirm --install-approved
 ```
 `--confirm` writes a review candidate; `--install-approved` is the additional
 explicit gate that installs the reviewed skill into Codex, Claude Code, and
@@ -1459,8 +1459,8 @@ works and nothing says it doesn't:
 
 ### feedback — record explicit usage feedback (Voyager counters)
 ```
-python <store.py> feedback --id <uuid> --applied
-python <store.py> feedback --id <uuid> --violated
+<interpreter> <store.py> feedback --id <uuid> --applied
+<interpreter> <store.py> feedback --id <uuid> --violated
 ```
 Increments exactly one of the row's `applied_count` / `violated_count`
 (schema v12) and prints a one-line JSON summary
@@ -1542,7 +1542,7 @@ fixtures under `tests/fixtures/adapters/` prove both converters.
 
 ### tune-weights — suggest recall scoring weights (dry-run only)
 ```
-python <store.py> tune-weights --dry-run --gold eval/gold.jsonl [--k 5]
+<interpreter> <store.py> tune-weights --dry-run --gold eval/gold.jsonl [--k 5]
 ```
 Evaluates the shipped composite weights (W_BM25/W_CONFIDENCE/W_RECENCY/
 W_POPULARITY) against a gold set, hill-climbs a small deterministic candidate
@@ -1559,7 +1559,7 @@ gold set, a missing `--dry-run`, or an evaluation failure.
 
 ### consolidate — merge near-duplicate memories
 ```
-python <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS] [--force] [--merge-contested] [--json]
+<interpreter> <store.py> consolidate [--threshold 0.80] [--prune] [--dry-run] [--namespace NS] [--force] [--merge-contested] [--json]
 ```
 Clusters live memories by embedding cosine similarity (Jaccard token overlap when
 embeddings are unavailable), picks a keeper, merges metadata, and supersedes the
@@ -1618,7 +1618,7 @@ and exit 0 rather than clustering the same rows twice.
 
 ### organize — sleep-time organization (SessionStart cadence job)
 ```
-python <store.py> organize [--prune] [--dry-run] [--force] [--json]
+<interpreter> <store.py> organize [--prune] [--dry-run] [--force] [--json]
 ```
 The SessionStart sleep-time maintenance job (issue #62, 7.7): the
 `session-cadence` batch that the start hook launches detached runs ORGANIZE, not
@@ -1746,10 +1746,10 @@ template store with `store.py organize --dry-run` before upgrading.
 
 ### rekey-namespace — remediate stranded namespace rows (admin)
 ```
-python <store.py> rekey-namespace --near-miss-global [--to user:global] [--dry-run] --confirm
-python <store.py> rekey-namespace --from <old-namespace> --to <new-namespace> [--dry-run] --confirm
-python <store.py> rekey-namespace --map <map.yaml> --dry-run
-python <store.py> rekey-namespace --map <map.yaml> --confirm
+<interpreter> <store.py> rekey-namespace --near-miss-global [--to user:global] [--dry-run] --confirm
+<interpreter> <store.py> rekey-namespace --from <old-namespace> --to <new-namespace> [--dry-run] --confirm
+<interpreter> <store.py> rekey-namespace --map <map.yaml> --dry-run
+<interpreter> <store.py> rekey-namespace --map <map.yaml> --confirm
 ```
 Rewrites the `namespace` column of live rows. The primary use is remediating
 legacy rows stranded under a global near-miss namespace (`global`,
@@ -1798,7 +1798,7 @@ endpoints are checked on every apply.
 
 ### promote-store — merge a leftover second store (admin, issue #71 E)
 ```
-python <store.py> promote-store --from <path-to-store.sqlite> [--dry-run]
+<interpreter> <store.py> promote-store --from <path-to-store.sqlite> [--dry-run]
 ```
 One-shot merge of a leftover second store (e.g. `~/.zcode/memory/store.sqlite`)
 into the canonical one. Read-only on the source; source ids are PRESERVED so
@@ -1808,7 +1808,7 @@ store and recommends this command.
 
 ### backup — verified snapshot with retention
 ```
-python <store.py> backup [--retention 7] [--out-dir DIR] [--if-due]
+<interpreter> <store.py> backup [--retention 7] [--out-dir DIR] [--if-due]
 ```
 Writes `store-<UTC timestamp>.sqlite` into the backup dir (`--out-dir`, else
 `$ZMEM_BACKUP_DIR`, else `<store dir>/backups`) using SQLite's Online Backup API,
@@ -1830,7 +1830,7 @@ flag the backup always runs. Also single-flighted (its own lockfile).
 
 ### restore — recover the store from a snapshot
 ```
-python <store.py> restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
+<interpreter> <store.py> restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
 ```
 Refuses unless `--force` when a store already exists. Verifies the snapshot's
 own `integrity_check` **before** touching the destination, then takes a
@@ -1880,7 +1880,7 @@ any credential that was ever passively delivered remains mandatory.
 
 ### purge — durably remove a memory's content (issue #255)
 ```
-python <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]
+<interpreter> <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]
 ```
 `update`/`invalidate` **tombstone** a row — the plaintext survives in the row,
 the FTS index, side tables, derived copies and ledger files. `purge` is the
@@ -1982,7 +1982,7 @@ imports skip evidence rows that were junctioned to a purged memory
 
 ### sweep — prune stale per-session cooldown sentinels
 ```
-python <store.py> sweep [--marker-dir DIR] [--max-age-days 7] [--dry-run]
+<interpreter> <store.py> sweep [--marker-dir DIR] [--max-age-days 7] [--dry-run]
 ```
 Removes the `.capture-prompted-<session>` / `.convention-prompted-<session>`
 cooldown markers the capture/convention hooks leave in the data dirs (issue #23).
@@ -1995,7 +1995,7 @@ session so the markers stay bounded; `--dry-run` counts without deleting.
 
 ### corrections — mine user corrections from a transcript (read-only)
 ```
-python <store.py> corrections --transcript <path> [--json]
+<interpreter> <store.py> corrections --transcript <path> [--json]
 ```
 Scans a Claude Code transcript JSONL for user corrections. (User *rejections*
 are a separate signal — reported by `store.py failures` and surfaced by the
@@ -2012,7 +2012,7 @@ parity with the issue's syntax; output is always JSON.)
 
 ### signals — recognized runner signals for a session (read-only)
 ```
-python <store.py> signals [--session SESSION] [--transcript PATH] [--db PATH]
+<interpreter> <store.py> signals [--session SESSION] [--transcript PATH] [--db PATH]
 ```
 Reports the session's tracked runner signals as
 `{"signals": {"test": "pass", "lint": "fail", ...}}` — the LAST status of
@@ -2032,8 +2032,8 @@ without touching its persisted state.
 
 ### source-exists / ops-append — capture adapter bridges
 ```
-python <store.py> source-exists --namespace NS --source-ref REF --json
-python <store.py> ops-append --session SESSION --tool TOOL --op OP --json
+<interpreter> <store.py> source-exists --namespace NS --source-ref REF --json
+<interpreter> <store.py> ops-append --session SESSION --tool TOOL --op OP --json
 ```
 `source-exists` prints `{"exists":false}` with exit 0 for a missing store and
 otherwise opens the store read-only without creation or migration. `ops-append`
@@ -2048,8 +2048,8 @@ convention-compatibility hook only. It does not control the commit-only
 
 ### queue-list / queue-clear — review live-captured corrections (read-only / clear)
 ```
-python <store.py> queue-list --namespace NS [--json]
-python <store.py> queue-clear --namespace NS [--id ID ...] [--all] [--drop-stale]
+<interpreter> <store.py> queue-list --namespace NS [--json]
+<interpreter> <store.py> queue-clear --namespace NS [--id ID ...] [--all] [--drop-stale]
 ```
 The `capture-correction` hook (UserPromptSubmit, Claude Code / ZCode / Codex)
 queues mid-session user corrections ("no, use X", "remember: ...") into a
@@ -2068,7 +2068,7 @@ missing.
 
 ### export-pack — render a Tier 1 markdown memory pack
 ```
-python <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
+<interpreter> <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \
   [--global-limit 15] [--min-confidence 0.6] [--max-bytes 32768]
 ```
 Renders live memories from `--namespace` and `user:global` (confidence DESC,
@@ -2083,7 +2083,7 @@ both sections are empty.
 
 ### export-jsonl — export Tier 3 sync JSONL
 ```
-python <store.py> export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
+<interpreter> <store.py> export-jsonl [--out FILE] [--namespace NS] [--include-superseded]
 ```
 Writes one memory row per line (no embeddings) for box-to-box sync via
 `ingest-jsonl`. Default: all namespaces, live rows only; `--namespace` scopes
@@ -2113,9 +2113,9 @@ The explicit trusted local adapters accept reviewed JSON input and keep the
 state transitions separate:
 
 ```bash
-python <store.py> capture-training-delivery --input delivery.json
-python <store.py> capture-training-acknowledge --input acknowledgement.json
-python <store.py> capture-training-completion --input completion.json
+<interpreter> <store.py> capture-training-delivery --input delivery.json
+<interpreter> <store.py> capture-training-acknowledge --input acknowledgement.json
+<interpreter> <store.py> capture-training-completion --input completion.json
 ```
 
 Every reviewer-acceptance outcome requires a separate local review transition,
@@ -2125,7 +2125,7 @@ correction evidence:
 ```bash
 ZMEM_TRAINING_CALLER_ID=operator-a \
 ZMEM_TRAINING_REVIEWER_IDS=operator-b \
-python <store.py> capture-training-review --input review.json
+<interpreter> <store.py> capture-training-review --input review.json
 ```
 
 `ZMEM_TRAINING_CALLER_ID` is the local caller identity and
@@ -2152,7 +2152,7 @@ warning with output status `warn` and stays read-only; an operator can run the
 explicit cleanup instead:
 
 ```bash
-python <store.py> purge-training-captures --confirm
+<interpreter> <store.py> purge-training-captures --confirm
 ```
 
 Before enabling export, install PyArrow in the store-host interpreter:
@@ -2181,7 +2181,7 @@ before exporting.
 ### export-training — write reviewed SFT and preference views
 
 ```bash
-python <store.py> export-training DIR --snapshot-id ID \
+<interpreter> <store.py> export-training DIR --snapshot-id ID \
   --reviewer-confirmed [--namespace NS] [--quarantine-raw]
 ```
 
@@ -2218,7 +2218,7 @@ python <doctor.py> --project . --training-output ./training \
 
 The cleanup skips candidates newer than 24 hours and rechecks mtimes before
 removal. For `./training`, a candidate is `./.training-staging-*`. The remedy
-for an expired-retention warning is `python <store.py>
+for an expired-retention warning is `<interpreter> <store.py>
 purge-training-captures --confirm`, followed by another doctor run. The
 exporter bounds work at 10,000 source captures by default. Set
 ZMEM_TRAINING_MAX_ROWS to a lower positive limit when needed; exceeding the
@@ -2237,7 +2237,7 @@ file order; re-ingesting the same file is an exact no-op.
 
 ### ingest-jsonl — import Tier 3 sync JSONL
 ```
-python <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode auto|reviewed|manual]
+<interpreter> <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode auto|reviewed|manual]
 ```
 Imports a JSONL file written by `export-jsonl`. Every row is validated before
 touching the store, and a bad row is counted and reported by line number
@@ -2423,13 +2423,13 @@ host support, queue saturation, or writer failure. This is one evidence
 capability, not completion of the larger #163 pre-LLM/pre-verify transport.
 
 ```text
-python <store.py> evidence write < payload.json
-python <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] [--moment MOMENT] [--json]
-python <store.py> evidence show --namespace NS --id UUID [--json]
-python <store.py> evidence for MEMORY_ID --json
-python <store.py> evidence for --memory-id MEMORY_ID --json  # legacy alias
-python <store.py> evidence scoped-show --namespace NS --id UUID [--json]
-python <store.py> evidence associations --id UUID --json  # hidden operator helper
+<interpreter> <store.py> evidence write < payload.json
+<interpreter> <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] [--moment MOMENT] [--json]
+<interpreter> <store.py> evidence show --namespace NS --id UUID [--json]
+<interpreter> <store.py> evidence for MEMORY_ID --json
+<interpreter> <store.py> evidence for --memory-id MEMORY_ID --json  # legacy alias
+<interpreter> <store.py> evidence scoped-show --namespace NS --id UUID [--json]
+<interpreter> <store.py> evidence associations --id UUID --json  # hidden operator helper
 ```
 
 The required `--namespace` argument on legacy CLI `list`/`show` is a
@@ -2487,7 +2487,7 @@ duplicate-key/hash/reference validation, and one outer transaction. Use the
 explicit all-or-nothing form with bounded staging for evidence transfers:
 
 ```text
-python <store.py> ingest-jsonl --in evidence.jsonl --strict
+<interpreter> <store.py> ingest-jsonl --in evidence.jsonl --strict
 ```
 
 The automatic discriminator path also chooses strict staging when it can parse
@@ -2610,7 +2610,7 @@ over live, undeclared, or outcome-selected inputs are not baselines.
 
 ### entity-list — inspect entity identity (v10, issue #60)
 ```
-python <store.py> entity-list [--kind person|project|tool|preference|other] [--json]
+<interpreter> <store.py> entity-list [--kind person|project|tool|preference|other] [--json]
 ```
 Lists the entities the deterministic extractor minted: id, kind, canonical
 name, all normalized aliases, and how many memories link to each. `--kind`
@@ -2620,7 +2620,7 @@ the entity lane actually matches.
 
 ### entity-merge — reconcile duplicate entities (v10, issue #60)
 ```
-python <store.py> entity-merge --from <entity-id> --to <entity-id> [--confirm]
+<interpreter> <store.py> entity-merge --from <entity-id> --to <entity-id> [--confirm]
 ```
 Merges two entities: the `--from` entity's aliases and memory links move to
 `--to`, then `--from` is deleted. DRY RUN BY DEFAULT — without `--confirm`
@@ -2643,8 +2643,8 @@ returns all its linked memories.
 
 ### links — inspect (or curate) a memory's associative links (v11, issue #61)
 ```
-python <store.py> links --id <uuid> [--json]           # list every edge
-python <store.py> links --add --id <a> --id <b> \
+<interpreter> <store.py> links --id <uuid> [--json]           # list every edge
+<interpreter> <store.py> links --add --id <a> --id <b> \
     --relation <related|supports|contradicts|updates|extends|derives> \
     [--score S] [--reason "..."]
 ```
@@ -2669,7 +2669,7 @@ knob exists; link generation never calls a model).
 
 ### contradict — record a contradiction (v11, issue #61)
 ```
-python <store.py> contradict --id <a> --id <b> --reason "<why they conflict>"
+<interpreter> <store.py> contradict --id <a> --id <b> --reason "<why they conflict>"
 ```
 Inserts a `contradicts` pair (both directions) and applies the trust event
 to BOTH rows: `trust_score` −0.10 each, clamped to [0.0, 1.0] (ten
@@ -2980,7 +2980,7 @@ tag. The first kind seen for an alias wins; reconcile with `entity-merge`.
 The `rebuild-fts` subcommand rebuilds the FTS5 index from scratch (useful after
 bulk imports or if the index drifts):
 ```
-python <store.py> rebuild-fts
+<interpreter> <store.py> rebuild-fts
 ```
 
 ## Sole memory system on Claude Code (replace native)

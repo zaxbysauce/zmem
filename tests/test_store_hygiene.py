@@ -69,39 +69,42 @@ FIXTURE_DIGESTS = {
     "rows.jsonl": "f9ddde2d2463b288c84d46d3e9ebf669e4c4697d13fabeaa09347f6226c511a5",
     "origin-map.json": "85c8f54cb4c69e922b4e243222b89cb11f4a1d35d453d036e3e075db3f039972",
     "evidence-map.json": "1ae0ed47b76f84b0959195fe604c7caf4751c32e72767a2f3754015ce2d69155",
-    "expected-report.json": "1fe329bc6ab6bae4e265723a0ca28d92cd1e20e8281374a7884de72289880495",
+    "expected-report.json": "b1485d66d309415778db44d7000007ac68271b446b4f0871055d6f306c080cd9",
 }
 
-# Interpreter-token normalization: the token immediately before the
-# upgrade-command script path is the generating machine's sys.executable
-# (rendered by hygiene._UPGRADE_COMMAND as shlex.quote(sys.executable),
-# issue #259). shlex.quote is a NO-OP on typical POSIX paths, so the token
-# appears either single-quoted (Windows, JSON-escaped backslashes:
-# 'C:\\Python311\\python.exe') or bare (POSIX: /opt/.../python3); the
-# pattern accepts both, is anchored to the fixed script-path suffix, and
-# excludes whitespace and quotes in the bare form so it cannot creep
-# backward into the surrounding JSON.
+# Machine-prefix normalization: everything machine-varying ahead of the
+# fixed script-path suffix — the interpreter token AND (since the feedback
+# round made the store path absolute) the store-path token. Each token is
+# either single-quoted (Windows; JSON-escaped backslashes like
+# 'C:\\Python311\\python.exe') or bare (POSIX: /opt/.../python3); one or two
+# tokens, anchored by the fixed suffix so the pattern cannot creep backward
+# into the surrounding JSON.
+_MACHINE_TOKEN = r"(?:'(?:\\.|[^'\\])*'|[^\s'\"]+)"
 _INTERP_RE = re.compile(
-    r"(?:'(?:\\.|[^'\\])*'|[^\s'\"]+) skills/memory/scripts/store\.py update")
+    _MACHINE_TOKEN + r" " + _MACHINE_TOKEN + r" update --id ")
+# Sentinel for the machine-varying tokens. Masking bound (deliberate): the
+# interpreter + store-path SPELLING is not digest-pinned; the property "an
+# existing interpreter is named ahead of the script path" is pinned by
+# tests/test_r03_hygiene_interpreter.py (source + render probes) and by the
+# in-file exact-equality assertions.
+_NORM_SENTINEL = "<<MACHINE>> update --id "
 
 
 def _norm_interp(data):
-    """Interpreter-normalized bytes (issue #259): replace the machine-specific
-    quoted sys.executable token with a stable sentinel so committed fixtures
-    and fresh regenerations compare equal on every platform."""
+    """Machine-normalized bytes (issue #259): replace the machine-specific
+    interpreter + store-path tokens with a stable sentinel so committed
+    fixtures and fresh regenerations compare equal on every platform and
+    checkout path."""
     if isinstance(data, bytes):
         data = data.decode("utf-8")
-    return _INTERP_RE.sub(
-        "<<INTERPRETER>> skills/memory/scripts/store.py update",
-        data).encode("utf-8")
+    return _INTERP_RE.sub(_NORM_SENTINEL, data).encode("utf-8")
 
 
 def _norm_obj(obj):
     """Dict/list/string recursive form of the same normalization, for
     live-report vs committed-fixture dict compares."""
     if isinstance(obj, str):
-        return _INTERP_RE.sub(
-            "<<INTERPRETER>> skills/memory/scripts/store.py update", obj)
+        return _INTERP_RE.sub(_NORM_SENTINEL, obj)
     if isinstance(obj, list):
         return [_norm_obj(x) for x in obj]
     if isinstance(obj, dict):

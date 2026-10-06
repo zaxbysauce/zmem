@@ -228,8 +228,8 @@ They do not browse arbitrary files, write the store, update namespace caches,
 or make network calls.
 
 ```bash
-python skills/memory/scripts/store.py source --id <memory-uuid> --context 2
-python skills/memory/scripts/store.py source scan --id <memory-uuid> \
+<interpreter> skills/memory/scripts/store.py source --id <memory-uuid> --context 2
+<interpreter> skills/memory/scripts/store.py source scan --id <memory-uuid> \
   --needle "literal text"
 ```
 
