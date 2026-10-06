@@ -54,7 +54,7 @@ embeddings or derived index bytes ever leave the store through it.
 ### Path 1 — Local export (`export-dataset`)
 
 ```bash
-python skills/memory/scripts/store.py export-dataset ./my-dataset \
+<interpreter> skills/memory/scripts/store.py export-dataset ./my-dataset \
   --namespace "project:github.com/you/your-repo"
 ```
 
@@ -79,7 +79,7 @@ deliberately published.
 ### Path 3 — Explicit Hub publish (`publish-dataset`)
 
 ```bash
-python skills/memory/scripts/store.py publish-dataset ./my-dataset \
+<interpreter> skills/memory/scripts/store.py publish-dataset ./my-dataset \
   hf://datasets/you/your-memories
 ```
 
@@ -116,8 +116,8 @@ importers must use the revision reported by the publish (printed as
 ### Path 4 — Revision-pinned import (`import-dataset`)
 
 ```bash
-python skills/memory/scripts/store.py import-dataset ./my-dataset --revision <source_snapshot_hash> --dest ./imported-snap
-python skills/memory/scripts/store.py import-dataset hf://datasets/you/your-memories --revision <40-char-commit-sha> --dest ./imported-snap
+<interpreter> skills/memory/scripts/store.py import-dataset ./my-dataset --revision <source_snapshot_hash> --dest ./imported-snap
+<interpreter> skills/memory/scripts/store.py import-dataset hf://datasets/you/your-memories --revision <40-char-commit-sha> --dest ./imported-snap
 ```
 
 The revision must match the dataset's `source_snapshot_hash` exactly (Hub
@@ -148,8 +148,8 @@ source is missing, unsafe, ambiguous, or unavailable, the command refuses and
 does not fall back to the row's `source_ref`.
 
 ```bash
-python skills/memory/scripts/store.py source --id <memory-uuid> --context 2
-python skills/memory/scripts/store.py source scan --id <memory-uuid> --needle "literal text"
+<interpreter> skills/memory/scripts/store.py source --id <memory-uuid> --context 2
+<interpreter> skills/memory/scripts/store.py source scan --id <memory-uuid> --needle "literal text"
 ```
 
 `--context` is bounded to 0 through 20. `source scan` is a literal scan of one
@@ -268,11 +268,11 @@ The explicit local adapters use JSON input files so the attestation and
 completion fields can be reviewed before the write:
 
 ```bash
-python skills/memory/scripts/store.py capture-training-delivery \
+<interpreter> skills/memory/scripts/store.py capture-training-delivery \
   --input delivery.json
-python skills/memory/scripts/store.py capture-training-acknowledge \
+<interpreter> skills/memory/scripts/store.py capture-training-acknowledge \
   --input acknowledgement.json
-python skills/memory/scripts/store.py capture-training-completion \
+<interpreter> skills/memory/scripts/store.py capture-training-completion \
   --input completion.json
 ```
 
@@ -287,7 +287,7 @@ An independent local review is required for reviewer-acceptance corrections:
 ```bash
 ZMEM_TRAINING_CALLER_ID=operator-a \
 ZMEM_TRAINING_REVIEWER_IDS=operator-b \
-python skills/memory/scripts/store.py capture-training-review \
+<interpreter> skills/memory/scripts/store.py capture-training-review \
   --input review.json
 ```
 
@@ -330,7 +330,7 @@ Export requires an immutable source snapshot and an explicit reviewer
 confirmation before opening the store:
 
 ```bash
-python skills/memory/scripts/store.py export-training ./training \
+<interpreter> skills/memory/scripts/store.py export-training ./training \
   --snapshot-id <snapshot-id> \
   --reviewer-confirmed \
   [--namespace project:github.com/you/your-repo] \

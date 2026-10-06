@@ -88,12 +88,21 @@ class OperatorCommandPrefixPin(unittest.TestCase):
 
     def test_doctor_hints_use_the_prefix(self):
         doctor = DOCTOR.read_text(encoding="utf-8")
-        self.assertGreaterEqual(doctor.count("{_prefix()} "), 8,
+        self.assertGreaterEqual(doctor.count("{_prefix()} "), 10,
                                 "doctor command hints must use the prefix")
-        self.assertNotRegex(doctor, r'f"`store\.py ',
-                            "bare backticked store.py hint must not return")
-        # The prose mention f"store.py run will create ..." (no backticks) is
-        # not a copy-paste hint; only the backticked form is pinned above.
+        # Structural: ANY backticked store.py / <store.py> hint outside a
+        # comment line must route through _prefix() (round-2 review: the
+        # f-anchored form was blind to plain-string and <store.py> hints).
+        bad = []
+        for ln, line in enumerate(doctor.splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if re.search(r"`store\.py ", line) or re.search(
+                    r"`python <store\.py> ", line):
+                bad.append(ln)
+        self.assertEqual(bad, [],
+                         "bare backticked store hints at lines %s" % bad)
 
     def test_rendered_prefix_is_existing_executable_and_path(self):
         sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))

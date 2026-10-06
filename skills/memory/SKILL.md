@@ -2781,7 +2781,7 @@ Operator workflow:
    ```bash
    # Option A (preferred): the store's verified backup writes a
    # crash-consistent store-<stamp>.sqlite snapshot.
-   python skills/memory/scripts/store.py backup
+   <interpreter> skills/memory/scripts/store.py backup
    # Option B: SQLite's online backup API.
    sqlite3 ~/.zmem/store.sqlite ".backup '/tmp/snapshot.sqlite'"
    ```
@@ -2790,7 +2790,7 @@ Operator workflow:
    SQLite `mode=ro`, so even an accident cannot write):
 
    ```bash
-   python skills/memory/scripts/store.py hygiene \
+   <interpreter> skills/memory/scripts/store.py hygiene \
      --store /tmp/snapshot.sqlite \
      --origin-map origin-map.json --evidence-map evidence-map.json \
      --out report.json --format json

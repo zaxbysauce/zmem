@@ -3396,7 +3396,7 @@ def _check_voyager_counters(resolved_store: Path) -> dict:
             "warn",
             f"negative usage counter value(s) (applied_min={lo_applied}, "
             f"violated_min={lo_violated}) — writes only increment, so this "
-            "store was hand-edited; inspect with `store.py get --json`.",
+            f"store was hand-edited; inspect with `{_prefix()} get --json`.",
             applied_min=lo_applied,
             violated_min=lo_violated,
         )
@@ -3755,7 +3755,7 @@ def _recommendations(checks: list[dict]) -> list[str]:
                 notes.append(
                     f"{expired} training capture record(s), including inactive "
                     "partials, exceeded the 30-day local retention window. Run "
-                    "`python <store.py> purge-training-captures --confirm`; "
+                    f"`{_prefix()} purge-training-captures --confirm`; "
                     "doctor remains read-only, and session-cadence also sweeps "
                     "expired capture rows before backup."
                 )
