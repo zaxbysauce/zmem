@@ -251,6 +251,67 @@ class TestResolveNamespaceNormalization(unittest.TestCase):
             clone_b = _make_git_repo(tmp_path / "checkout2", "https://github.com/ZaxbyHub/opencode-swarm.git")
             self.assertEqual(host.resolve_namespace(clone_a), host.resolve_namespace(clone_b))
 
+    def test_launcher_and_provider_share_no_origin_key(self):
+        """Issue #161 parity: a no-origin checkout must key identically for
+        the hook launcher and the Hermes provider's derive branch.
+
+        The launcher side is host.resolve_namespace itself — zmem-launch.js
+        shells out to exactly that function (zmem-launch.js:285-294) — so
+        equality with it IS the launcher-parity assertion. The provider side
+        is loaded the same way tests/test_hermes_config.py loads it (stub
+        agent modules + path import; hermes-plugin/ is not a package).
+        Post-fix method: fails on the pre-#161 provider by design."""
+        import types as _types
+
+        plugin_path = REPO_ROOT / "hermes-plugin" / "__init__.py"
+        agent = _types.ModuleType("agent")
+        mp = _types.ModuleType("agent.memory_provider")
+
+        class MemoryProvider:  # tests/test_hermes_transport.py stub pattern
+            pass
+
+        mp.MemoryProvider = MemoryProvider
+        agent.memory_provider = mp
+        sys.modules.setdefault("agent", agent)
+        sys.modules.setdefault("agent.memory_provider", mp)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_hermes_161_namespace_parity", plugin_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_hermes_161_namespace_parity"] = mod
+        spec.loader.exec_module(mod)
+
+        drop = {"ZMEM_NAMESPACE", "ZMEM_HOME", "ZMEM_HERMES_MODE",
+                "ZMEM_MCP_URL", "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
+                "ZMEM_HERMES_DEADLINE_S"}
+        scratch = Path(tempfile.mkdtemp(prefix="zmem-161-parity-"))
+        patcher = mock.patch.dict(
+            os.environ,
+            {"ZMEM_STORE": str(scratch / "store.sqlite"),
+             "ZMEM_DATA": str(scratch)},
+            clear=False,
+        )
+        try:
+            patcher.start()
+            for key in drop:
+                os.environ.pop(key, None)
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp) / "no-origin"
+                repo.mkdir(parents=True)
+                subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+                launcher_key = host.resolve_namespace(repo)
+                with mock.patch.object(mod, "_run_store"):
+                    provider = mod.ZmemMemoryProvider()
+                    provider.initialize(
+                        session_id="parity", agent_workspace=str(repo))
+                provider_key = provider._namespace
+        finally:
+            patcher.stop()
+            shutil.rmtree(str(scratch), ignore_errors=True)
+        self.assertTrue(launcher_key.startswith("project:"))
+        self.assertEqual(provider_key, launcher_key)
+        self.assertEqual(provider_key.encode("utf-8"),
+                         launcher_key.encode("utf-8"))
+
 
 class TestLoopbackProxyRemoteRewrite(unittest.TestCase):
     """CCR (Claude Code cloud/remote) sessions see their GitHub repo through a
