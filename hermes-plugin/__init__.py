@@ -14,6 +14,15 @@ Install: drop this directory into ``~/.hermes/plugins/memory/zmem/`` (or set
 ``ZMEM_HOME`` to point at a zmem checkout). The provider auto-detects
 ``store.py`` relative to its own location when shipped inside the zmem repo,
 so ``ZMEM_HOME`` is optional for a standalone install.
+
+Issue #161: the provider also carries a typed configuration surface
+(``get_config_schema`` / ``save_config``) persisted at
+``<hermes_home>/zmem/config.json``; ``initialize`` merges it under the
+environment (env vars always win per key). Trust model: the cwd fallback in
+the config-path chain means a ``zmem/config.json`` committed inside an
+opened workspace is trusted to select the transport endpoint and namespace
+(the file is data — parsed, validated, fail-closed — but it does steer
+network I/O; set ``ZMEM_HOME`` or pass ``hermes_home`` to override).
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -67,6 +77,7 @@ _CORE_MD_REL = Path("core.md")
 _STORE_TIMEOUT_S = 20
 # Max chars of a query passed to store.py by the memory tools' argv.
 _MAX_QUERY_CHARS = 500
+_MAX_CONFIG_BYTES = 1_048_576
 # Max chars of a query delegated to the transport (issue #160).  argv-safety
 # bound only — the store boundary owns classification-on-complete-prompt and
 # the rewrite output cap; see prefetch().
@@ -1422,6 +1433,155 @@ def _structured_write_response(r: Dict[str, Any], *, ok_result: str) -> str:
 
 # -- provider ----------------------------------------------------------------
 
+# Issue #161: the typed provider-configuration schema.  Order is the
+# host-facing contract (ten entries, fixed); ``token_file`` is schema-only —
+# the issue scopes token behavior to #160, whose resolvers own the
+# ZMEM_MCP_TOKEN_FILE channel, so no provider code path consumes the value.
+def _config_schema_entries() -> List[Dict[str, Any]]:
+    """Fresh schema entries per call so hosts cannot mutate the shared shape."""
+    return [
+        {"key": "mode",
+         "description": "Transport mode: local subprocess store or MCP over HTTP.",
+         "type": "enum", "default": "local",
+         "choices": ("local", "mcp"), "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "url",
+         "description": "MCP endpoint URL used when mode is mcp.",
+         "type": "text", "default": "",
+         "choices": None, "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "token_file",
+         "description": "Path to a bearer-token file for MCP auth (read by the #160 token resolver from ZMEM_MCP_TOKEN_FILE).",
+         "type": "text", "default": "",
+         "choices": None, "minimum": None,
+         "secret": True, "env_var": "ZMEM_MCP_TOKEN_FILE"},
+        {"key": "namespace_policy",
+         "description": "How the memory namespace is chosen: derived from the agent workspace, or fixed.",
+         "type": "enum", "default": "derive",
+         "choices": ("derive", "fixed"), "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "fixed_namespace",
+         "description": "Namespace used when namespace_policy is fixed (must satisfy the zmem namespace grammar).",
+         "type": "text", "default": "user:global",
+         "choices": None, "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "injection_token_budget",
+         "description": "Maximum tokens of memory context injected per turn (0 = provider default). Schema-only in this release; consumed by #162/#177.",
+         "type": "integer", "default": 0,
+         "choices": None, "minimum": 0,
+         "secret": None, "env_var": None},
+        {"key": "global_policy",
+         "description": "Whether user:global memories may be recalled in project sessions. Schema-only in this release; consumed by #163.",
+         "type": "enum", "default": "include",
+         "choices": ("include", "exclude"), "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "deadline_s",
+         "description": "Wall-clock budget in seconds for each prefetch (must be > 0; the #160 resolver clamps to its own maximum).",
+         "type": "number", "default": 6.0,
+         "choices": None, "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "query_context",
+         "description": "Whether recall queries carry surrounding conversation context. Schema-only in this release; consumed by #162.",
+         "type": "boolean", "default": True,
+         "choices": None, "minimum": None,
+         "secret": None, "env_var": None},
+        {"key": "auto_retain",
+         "description": "Opt-in flag consumed by the retention workstream (#177); disabled by default.",
+         "type": "boolean", "default": False,
+         "choices": None, "minimum": None,
+         "secret": None, "env_var": None},
+    ]
+
+
+# The nine keys save_config persists — everything but the secret token_file.
+_PERSISTED_CONFIG_KEYS = (
+    "mode", "url", "namespace_policy", "fixed_namespace",
+    "injection_token_budget", "global_policy", "deadline_s",
+    "query_context", "auto_retain",
+)
+
+# Config key -> #160 seam env key.  token_file deliberately absent (see
+# _config_schema_entries): ZMEM_MCP_TOKEN_FILE stays owned by transport.py.
+_CONFIG_ENV_KEYS = {
+    "mode": "ZMEM_HERMES_MODE",
+    "url": "ZMEM_MCP_URL",
+    "deadline_s": "ZMEM_HERMES_DEADLINE_S",
+}
+
+_HOST_MODULE: Optional[Any] = None
+
+
+def _load_host_module():
+    """Import skills/memory/scripts/host.py lazily for namespace derivation.
+
+    The provider never imports the memory-store library (issue #161); host.py
+    is stdlib-only at module top and is the same producer the launcher uses,
+    which is what makes provider and launcher namespace keys agree byte for
+    byte.  Any failure returns None and the caller falls back to
+    ``user:global``.
+    """
+    global _HOST_MODULE
+    if _HOST_MODULE is not None:
+        return _HOST_MODULE
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    scripts_dir = Path(home) / "skills" / "memory" / "scripts"
+    host_path = scripts_dir / "host.py"
+    if not host_path.is_file():
+        return None
+    try:
+        # Pure file-path import, mirroring _host()'s collision-proofing
+        # (see its docstring): no sys.path insertion and no sys.modules
+        # slot claimed under a generic name — a long-lived host process
+        # must not have zmem's scripts dir shadow future `import host` /
+        # `import store` statements from other plugins.  host.py is
+        # stdlib-only at module top, so the by-path load is self-sufficient
+        # for resolve_namespace.
+        spec = importlib.util.spec_from_file_location("zmem_host", host_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _HOST_MODULE = module
+        return module
+    except Exception:
+        return None
+
+
+def _hermes_config_path(hermes_home=None) -> Path:
+    """Resolve <hermes_home>/zmem/config.json: kwarg, then ZMEM_HOME, then cwd."""
+    home = hermes_home or os.environ.get("ZMEM_HOME") or os.getcwd()
+    return Path(home) / "zmem" / "config.json"
+
+
+_SCHEMA_META_MODULE: Optional[Any] = None
+
+
+def _load_schema_meta_module():
+    """Import skills/memory/scripts/schema_meta.py by path (stdlib-only),
+    for fixed_namespace grammar validation.  Returns None on any failure;
+    the caller then skips grammar validation rather than failing closed on
+    a broken in-tree helper."""
+    global _SCHEMA_META_MODULE
+    if _SCHEMA_META_MODULE is not None:
+        return _SCHEMA_META_MODULE
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    module_path = (Path(home) / "skills" / "memory" / "scripts"
+                   / "schema_meta.py")
+    if not module_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "zmem_schema_meta", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCHEMA_META_MODULE = module
+        return module
+    except Exception:
+        return None
+
+
 class ZmemMemoryProvider(MemoryProvider):
     """ZMem local-first memory — subprocess-bridges Hermes to ``store.py``."""
 
@@ -1441,17 +1601,188 @@ class ZmemMemoryProvider(MemoryProvider):
         self._mode = None
         self._mode_reason = "mode=none unavailable"
         self._transport = None
-        self._select_transport()
+        # Issue #161: normalized config + the keys explicitly set in it.
+        # A quiet default-home probe runs here so a config-only provider is
+        # available before initialize; initialize is the authoritative load
+        # and the only warning site.
+        self._config: Optional[Dict[str, Any]] = None
+        self._config_explicit: frozenset = frozenset()
+        try:
+            cfg, explicit, status = self._load_config_source(None)
+        except Exception:
+            # A deleted cwd or unreadable default home must not break
+            # construction; stay env-only (initialize re-loads).
+            cfg, explicit, status = None, frozenset(), "missing"
+        if status in ("missing", "empty", "ok"):
+            self._config = cfg
+            self._config_explicit = frozenset(explicit)
+            self._select_transport(
+                self._config_overlay(cfg, self._config_explicit))
+        else:
+            # Malformed/invalid default-home config: stay env-only here;
+            # initialize re-loads, warns once, and fails closed.
+            self._select_transport()
 
-    def _select_transport(self) -> None:
+    def _load_config_source(self, hermes_home):
+        """Load <hermes_home>/zmem/config.json.
+
+        Returns ``(config, explicit_keys, status)`` where status is one of
+        ``missing`` (no file), ``empty`` (zero-byte), ``ok``,
+        ``malformed`` (bad JSON / non-object), or ``invalid`` (schema
+        violation).  Missing and empty yield schema defaults; malformed and
+        invalid yield defaults plus a sentinel the caller must fail closed
+        on.
+        """
+        try:
+            path = _hermes_config_path(hermes_home)
+            with open(path, "rb") as handle:
+                # Bounded read: cap+1 so an oversized file is detected by
+                # size, not by allocating it (review round 6).
+                raw = handle.read(_MAX_CONFIG_BYTES + 1)
+        except (FileNotFoundError, NotADirectoryError, OSError, ValueError,
+                MemoryError):
+            # ValueError covers a NUL byte in the resolved home path;
+            # OSError covers a deleted process cwd (os.getcwd() inside);
+            # MemoryError covers allocation failure before the cap applies.
+            logger.debug(
+                "zmem config: load failed (%s); using defaults", hermes_home)
+            return self._normalize_config({}), frozenset(), "missing"
+        if len(raw) > _MAX_CONFIG_BYTES:
+            return self._normalize_config({}), frozenset(), "invalid"
+        if not raw.strip():
+            return self._normalize_config({}), frozenset(), "empty"
+        try:
+            # utf-8-sig tolerates a BOM (Windows editors write one by
+            # default); json.loads on a decoded-with-BOM string raises.
+            values = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return self._normalize_config({}), frozenset(), "malformed"
+        if not isinstance(values, dict):
+            return self._normalize_config({}), frozenset(), "malformed"
+        schema = _config_schema_entries()
+        schema_keys = {entry["key"] for entry in schema}
+        defaults = {entry["key"]: entry["default"] for entry in schema}
+        try:
+            cfg = self._normalize_config(values)
+        except ValueError:
+            return self._normalize_config({}), frozenset(), "invalid"
+        # "Explicit" for a FILE means "differs from the schema default":
+        # save_config always persists all nine keys, so bare presence carries
+        # no intent.  Kwarg overrides (merged by initialize) are true
+        # presence and are unioned in there.
+        explicit = frozenset(
+            key for key in values
+            if key in schema_keys and cfg[key] != defaults[key])
+        return cfg, explicit, "ok"
+
+    def _normalize_config(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize user-supplied config against the schema (issue #161).
+
+        Starts from the ten defaults, trims every string, ignores unknown
+        keys, converts deadline_s to float and injection_token_budget to
+        int, and raises ValueError for every contract-invalid category.
+        """
+        if not isinstance(values, dict):
+            raise ValueError("zmem config: expected a dict of values")
+        schema = _config_schema_entries()
+        defaults = {entry["key"]: entry["default"] for entry in schema}
+        choices = {entry["key"]: entry["choices"] for entry in schema
+                   if entry["choices"] is not None}
+        cfg = dict(defaults)
+        for key, raw in values.items():
+            if key not in cfg:
+                continue  # unknown keys are ignored, not rejected
+            if key in choices:
+                candidate = raw.strip() if isinstance(raw, str) else raw
+                if candidate not in choices[key]:
+                    raise ValueError(
+                        f"zmem config: {key} must be one of "
+                        f"{list(choices[key])}, got {raw!r}")
+                cfg[key] = candidate
+            elif key in ("url", "token_file", "fixed_namespace"):
+                cfg[key] = "" if raw is None else str(raw).strip()
+                if key == "url" and cfg[key]:
+                    if not cfg[key].lower().startswith(("http://", "https://")):
+                        raise ValueError(
+                            f"zmem config: url must start with http:// or "
+                            f"https://, got {raw!r}")
+            elif key == "injection_token_budget":
+                try:
+                    budget = int(raw)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"zmem config: injection_token_budget must be an "
+                        f"integer, got {raw!r}")
+                if budget < 0:
+                    raise ValueError(
+                        "zmem config: injection_token_budget must be >= 0")
+                cfg[key] = budget
+            elif key == "deadline_s":
+                try:
+                    deadline = float(raw)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"zmem config: deadline_s must be a number, got "
+                        f"{raw!r}")
+                if not math.isfinite(deadline) or deadline <= 0:
+                    raise ValueError(
+                        "zmem config: deadline_s must be finite and > 0")
+                cfg[key] = deadline
+            elif key in ("query_context", "auto_retain"):
+                if not isinstance(raw, bool):
+                    raise ValueError(
+                        f"zmem config: {key} must be a boolean, got {raw!r}")
+                cfg[key] = raw
+            else:  # pragma: no cover - schema and branches move together
+                raise ValueError(f"zmem config: unhandled key {key}")
+        if not cfg["fixed_namespace"]:
+            raise ValueError(
+                "zmem config: fixed_namespace must not be empty")
+        grammar = _load_schema_meta_module()
+        if grammar is not None and not grammar.is_valid_namespace(
+                cfg["fixed_namespace"]):
+            raise ValueError(
+                f"zmem config: fixed_namespace is not a valid namespace: "
+                f"{cfg['fixed_namespace']!r}")
+        return cfg
+
+    def _config_overlay(self, cfg, explicit_keys):
+        """Build the effective env mapping for the #160 seam (issue #161).
+
+        Precedence per key: os.environ wins; then explicit kwargs/file
+        keys; then file values that differ from the schema default.  A
+        schema-default value in a file never masks the environment (a
+        save_config-written file carries all nine keys, so file presence
+        alone carries no intent).  token_file maps to no seam key: token
+        behavior is owned by #160.
+        """
+        if not isinstance(cfg, dict):
+            return None
+        effective = dict(os.environ)
+        defaults = {entry["key"]: entry["default"]
+                    for entry in _config_schema_entries()}
+        for cfg_key, env_key in _CONFIG_ENV_KEYS.items():
+            if str(effective.get(env_key) or "").strip():
+                continue
+            if cfg_key in (explicit_keys or ()):
+                effective[env_key] = str(cfg[cfg_key])
+            elif cfg[cfg_key] != defaults[cfg_key]:
+                effective[env_key] = str(cfg[cfg_key])
+        return effective
+
+    def _select_transport(self, effective=None) -> None:
         """Resolve TransportMode once and build the matching transport."""
         if _transport is None:
             return
-        mode, reason = _transport.resolve_transport_mode()
+        env = effective if effective is not None else os.environ
+        mode, reason = _transport.resolve_transport_mode(env)
         self._mode, self._mode_reason = mode, reason
         if mode is None:
+            # Re-selection (issue #161) can downgrade a previously available
+            # provider; a stale transport must not survive is_available()=False.
+            self._transport = None
             return
-        deadline_s = _transport.resolve_deadline_s()
+        deadline_s = _transport.resolve_deadline_s(env)
         executor = _transport.DeadlineExecutor()
         if mode is _transport.TransportMode.local:
             store_py = _resolve_store_py()
@@ -1463,7 +1794,7 @@ class ZmemMemoryProvider(MemoryProvider):
                 store_py=str(store_py), executor=executor,
                 deadline_s=deadline_s)
         else:
-            url = os.environ.get("ZMEM_MCP_URL", "").strip()
+            url = str(env.get("ZMEM_MCP_URL", "") or "").strip()
             self._transport = _transport.McpHttp(
                 url=url, executor=executor, deadline_s=deadline_s)
 
@@ -1673,8 +2004,44 @@ class ZmemMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         resolved_session = str(session_id or "").strip()
-        resolved_namespace = self._resolve_namespace(**kwargs)
+
+        # Issue #161: load <hermes_home>/zmem/config.json (hermes_home
+        # kwarg, then ZMEM_HOME, then cwd), merge explicit config-keyword
+        # overrides over the file values, and re-select the transport
+        # through the #160 resolvers with the config overlay.  A malformed
+        # or schema-invalid file fails closed: exactly one warning,
+        # in-memory defaults retained, no transport re-selection, no store
+        # init, and the provider stays uninitialized.
+        cfg, explicit, status = self._load_config_source(
+            kwargs.get("hermes_home"))
+        if status in ("malformed", "invalid"):
+            logger.warning(
+                "zmem: ignoring %s config at %s; using defaults",
+                status, _hermes_config_path(kwargs.get("hermes_home")))
+            # Fail closed for every initialize, warm or fresh: drop back to
+            # schema defaults, clear explicit keys, and mark the provider
+            # uninitialized (the running session binding is left untouched).
+            with self._turn_ticket_lock:
+                self._config = self._normalize_config({})
+                self._config_explicit = frozenset()
+                self._initialized = False
+            return
+        schema_keys = {entry["key"] for entry in _config_schema_entries()}
+        overrides = {key: kwargs[key] for key in schema_keys
+                     if key in kwargs}
+        if overrides:
+            merged = dict(cfg)
+            merged.update(overrides)
+            cfg = self._normalize_config(merged)
+            explicit = frozenset(explicit | set(overrides))
+        # Publish config + transport + namespace as one lock-protected
+        # transition so a concurrent prefetch cannot pair the new namespace
+        # with the old transport (review round 5, PRR-012).
         with self._turn_ticket_lock:
+            self._config = cfg
+            self._config_explicit = frozenset(explicit)
+            self._select_transport(self._config_overlay(cfg, explicit))
+            resolved_namespace = self._resolve_namespace(**kwargs)
             self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
             self._initialized = True
 
@@ -1689,19 +2056,55 @@ class ZmemMemoryProvider(MemoryProvider):
                 r = _run_store(["init"])
                 if not r["ok"]:
                     logger.warning("zmem: store.py init failed: %s", r["stderr"])
-    def _resolve_namespace(self, **kwargs) -> str:
-        """Namespace precedence: ZMEM_NAMESPACE env → user:<user_id> → user:global.
 
-        Mirrors the mem0 user_id pattern. Gateway sessions (Telegram/Discord/
-        Slack) have no cwd, so cwd-based project:* is meaningless here.
+    def _resolve_namespace(self, **kwargs) -> str:
+        """Namespace precedence (issue #161): ZMEM_NAMESPACE env → config
+        namespace_policy="fixed" → the agent-workspace project key derived
+        by ``host.resolve_namespace`` (the same producer the launcher uses,
+        so keys agree byte for byte) → ``user:global``.
+
+        The prior ``user:<user_id>`` branch is retired by the issue's
+        precedence list; gateway sessions re-scope through the workspace
+        derivation and this is documented in the release notes.
+
+        Degradation note: the by-path host load cannot reach
+        ``storelib.namespace_cache`` (no sys.path entry for the scripts
+        dir), so on a git failure the provider falls back to
+        ``user:global`` while the launcher may serve a cached ``project:*``
+        key — captured memories can land where recall will not look until
+        the next successful derivation.
         """
         env_ns = os.environ.get("ZMEM_NAMESPACE", "").strip()
         if env_ns:
             return env_ns
-        user_id = (kwargs.get("user_id") or "").strip()
-        if user_id:
-            return f"user:{user_id}"
+        cfg = self._config if isinstance(self._config, dict) else {}
+        if cfg.get("namespace_policy") == "fixed":
+            fixed = str(cfg.get("fixed_namespace") or "").strip()
+            if fixed:
+                return fixed
+        if "agent_workspace" in kwargs:
+            # Read a provided workspace BEFORE touching Path.cwd(): a dead
+            # process cwd must not discard an explicitly passed workspace.
+            workspace = kwargs.get("agent_workspace")
+        else:
+            try:
+                workspace = Path.cwd()
+            except Exception:
+                workspace = None
+        if workspace:
+            host = _load_host_module()
+            if host is not None:
+                try:
+                    return host.resolve_namespace(workspace)
+                except Exception:
+                    pass
         return "user:global"
+
+    def auto_retain_enabled(self) -> bool:
+        """The only retention signal exported by issue #161 (consumed by
+        #177); False whenever the field is absent."""
+        cfg = self._config if isinstance(self._config, dict) else {}
+        return bool(cfg.get("auto_retain", False))
 
     # -- recall -------------------------------------------------------------
 
@@ -1753,6 +2156,16 @@ class ZmemMemoryProvider(MemoryProvider):
         prompt_digest = _hermes_prompt_digest(q)
         explicit_session = str(session_id or "").strip()
         with self._turn_ticket_lock:
+            # Re-read the transport under the same lock that published it
+            # (issue #161, PRR-012): reading transport and namespace in one
+            # critical section prevents a concurrent initialize from pairing
+            # the new namespace with the old transport.
+            transport = self._transport
+            if transport is None:
+                logger.debug(
+                    "zmem prefetch: no transport (reason=%s)",
+                    self._mode_reason)
+                return ""
             active_session = self._session_id
             if explicit_session and active_session and explicit_session != active_session:
                 return ""
@@ -2328,7 +2741,9 @@ class ZmemMemoryProvider(MemoryProvider):
         **kwargs,
     ) -> None:
         resolved_session = str(new_session_id or "").strip()
-        # Namespace may change if the new session is a different gateway user.
+        # Namespace re-derivation follows the issue-#161 precedence (config
+        # policy / agent_workspace); the config file itself is NOT reloaded
+        # here — session-switch config reload is #162's surface.
         resolved_namespace = self._resolve_namespace(**kwargs)
         with self._turn_ticket_lock:
             self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
@@ -2499,12 +2914,60 @@ class ZmemMemoryProvider(MemoryProvider):
         return None
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
-        """No secrets; ZMEM_HOME is an env var. Empty list is correct."""
-        return []
+        """The typed zmem provider schema (issue #161): ten entries, fixed
+        order, eight contract keys each.  No token value ever appears."""
+        return [dict(entry) for entry in _config_schema_entries()]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        """No-op — zmem is env-var-only (ZMEM_HOME, ZMEM_DATA, ZMEM_NAMESPACE)."""
-        return None
+        """Normalize then atomically persist the nine non-secret keys to
+        ``<hermes_home>/zmem/config.json`` (issue #161).
+
+        The file is UTF-8, sorted-key JSON with one trailing LF, written to
+        a sibling temporary file that is flushed, fsynced, and os.replace'd
+        into place.  token_file is never serialized.  Validation and
+        filesystem failures raise ValueError and leave any previous
+        destination bytes unchanged.
+        """
+        cfg = self._normalize_config(values)
+        payload = json.dumps(
+            {key: cfg[key] for key in _PERSISTED_CONFIG_KEYS},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        target_dir = Path(hermes_home) / "zmem"
+        target = target_dir / "config.json"
+        tmp = None
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(
+                f"config.json.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, target)
+            try:
+                dir_fd = os.open(target_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass  # best-effort durability; the replace itself succeeded
+        except OSError as exc:
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            raise ValueError(
+                f"zmem: failed to persist config to {target}: {exc}")
 
     def backup_paths(self) -> List[str]:
         """``hermes backup`` captures the shared store."""
