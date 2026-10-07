@@ -10,6 +10,14 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.86.0] - 2026-10-07
+
+### Added
+
+- **Hermes provider configuration contract (issue #161)**: `get_config_schema` now returns the typed ten-entry provider schema (mode, url, token_file, namespace_policy, fixed_namespace, injection_token_budget, global_policy, deadline_s, query_context, auto_retain), and `save_config` atomically persists the nine non-secret keys to `<hermes_home>/zmem/config.json` (sorted UTF-8 JSON, one trailing LF; `token_file` is never serialized). `initialize` loads that config — missing or zero-byte files mean defaults, and a malformed, oversized, or schema-invalid file logs exactly one warning and fails closed with the provider left uninitialized — merges explicit config keyword overrides, and re-selects the #160 transport with env-over-config precedence: the environment always wins per key, explicit kwargs beat file values, and file values apply only where they differ from schema defaults (a defaults-plus-one-key save never masks `ZMEM_MCP_URL`). A quiet construction-time config probe makes a config-only `mode=mcp` provider available before `initialize`. Config `url` values must be http(s); `fixed_namespace` must satisfy the zmem namespace grammar; the config file is size-capped, BOM-tolerant, and deeply nested junk fails closed.
+- **Workspace-derived namespaces (issue #161)**: `namespace_policy=derive` (the default) resolves the namespace through the same `host.resolve_namespace` producer the launcher uses, so provider and launcher namespace keys agree byte for byte; `namespace_policy=fixed` pins `fixed_namespace` (grammar-validated). Precedence is `ZMEM_NAMESPACE` env, then the fixed policy, then the workspace key, then `user:global`. The provider's previous `user:<user_id>` branch is retired per the issue contract: gateway sessions now re-scope to the workspace-derived key.
+- **`auto_retain_enabled()` (issue #161)**: the retention-policy signal for the #177 evidence-gated retention workstream, default `False`. `token_file` is schema-only in this release: validated and exposed for host UIs, never persisted, and never read by the provider — MCP token behavior remains #160's `ZMEM_MCP_TOKEN_FILE`/`ZMEM_MCP_TOKEN` environment channel.
+
 ## [0.85.0] - 2026-10-07
 
 ### Added
