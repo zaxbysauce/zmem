@@ -35,7 +35,7 @@ from storelib.evidence import (
     write_evidence,
 )
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists
+from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_add, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists
 from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
@@ -2768,6 +2768,35 @@ def main():
     _qc_grp.add_argument("--drop-stale", action="store_true",
                          help="remove stale items with confidence < 0.6")
 
+    # queue-add (issue #260): the write-side sibling of queue-list/queue-clear.
+    # Cheap closeout note — never touches the store (no connect/embedding/dedup).
+    p_queue_add = _add_parser(
+        "queue-add",
+        help="append a cheap closeout note to a namespace's correction "
+             "queue (sidecar, store-independent; reviewed via queue-list)")
+    p_queue_add.add_argument("--namespace", required=True,
+                             help="namespace to queue the note under")
+    p_queue_add.add_argument("--message", required=True,
+                             help="note text (capture-policy secret redaction "
+                                  "applies per ZMEM_CAPTURE_MODE)")
+    # Same type enum as add/update: an accepted note is later promoted through
+    # `add --type`, so it must carry a promotable type from the start.
+    p_queue_add.add_argument("--type", dest="type_", required=True,
+                             choices=list(ALLOWED_TYPES))
+    p_queue_add.add_argument("--patterns", default="",
+                             help="optional trigger pattern description")
+    p_queue_add.add_argument("--confidence", type=float, default=0.7,
+                             help="reviewer confidence (default 0.7)")
+    p_queue_add.add_argument("--sentiment", default="note",
+                             help="item sentiment (default note)")
+    p_queue_add.add_argument("--decay-days", dest="decay_days", type=int,
+                             default=90,
+                             help="days before the item is flagged stale "
+                                  "(default 90)")
+    p_queue_add.add_argument("--json", action="store_true",
+                             help="emit a machine-readable receipt "
+                                  "(prose goes to stderr)")
+
     p_source_exists = _add_parser(
         "source-exists", help="check whether a live source reference exists")
     p_source_exists.add_argument("--namespace", dest="namespace", required=True,
@@ -3251,15 +3280,22 @@ def main():
     if args.cmd == "corrections":
         sys.exit(cmd_corrections(transcript=args.transcript))
 
-    # `queue-list` / `queue-clear` operate on the store-INDEPENDENT sidecar
-    # queue file (correction_queue), never the ZMem store, so they branch
+    # `queue-list` / `queue-clear` / `queue-add` operate on the store-INDEPENDENT
+    # sidecar queue file (correction_queue), never the ZMem store, so they branch
     # BEFORE connect()/migrate() — a bad/locked/missing store can never block
-    # closeout queue review (same policy as `failures`/`corrections`/`sweep`).
+    # closeout queue review or a cheap closeout note (same policy as
+    # `failures`/`corrections`/`sweep`).
     if args.cmd == "queue-list":
         sys.exit(cmd_queue_list(namespace=args.namespace, as_json=args.json))
     if args.cmd == "queue-clear":
         sys.exit(cmd_queue_clear(namespace=args.namespace, ids=args.id,
                                  clear_all=args.all, drop_stale=args.drop_stale))
+    if args.cmd == "queue-add":
+        sys.exit(cmd_queue_add(namespace=args.namespace, message=args.message,
+                               type_=args.type_, patterns=args.patterns,
+                               confidence=args.confidence,
+                               sentiment=args.sentiment,
+                               decay_days=args.decay_days, as_json=args.json))
 
     # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
     # so session lifecycle cleanup remains idempotent and SQLite-independent.

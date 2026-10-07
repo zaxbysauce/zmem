@@ -2046,10 +2046,12 @@ import store internals directly.
 convention-compatibility hook only. It does not control the commit-only
 `zmem-convention-capture.sh` prompt.
 
-### queue-list / queue-clear — review live-captured corrections (read-only / clear)
+### queue-list / queue-clear / queue-add — review live-captured corrections (read-only / clear / author a note)
 ```
 <interpreter> <store.py> queue-list --namespace NS [--json]
 <interpreter> <store.py> queue-clear --namespace NS [--id ID ...] [--all] [--drop-stale]
+<interpreter> <store.py> queue-add --namespace NS --message TEXT --type lesson \
+  [--patterns P] [--confidence 0.7] [--sentiment note] [--decay-days 90] [--json]
 ```
 The `capture-correction` hook (UserPromptSubmit, Claude Code / ZCode / Codex)
 queues mid-session user corrections ("no, use X", "remember: ...") into a
@@ -2062,9 +2064,22 @@ organize/backup/sweep on its own lease). `queue-list` shows the pending candidat
 store via `add --signal user` only if they clear the closeout rubric);
 `queue-clear` removes processed ids (`--id`), empties the queue (`--all`), or
 prunes stale low-confidence items (`--drop-stale`) — exactly one selector is
-required (a flag-less invocation is rejected, not a silent full wipe). Both are store-independent
+required (a flag-less invocation is rejected, not a silent full wipe). All three are store-independent
 (they never open or write the store), so they work even if the store is locked or
 missing.
+
+`queue-add` (issue #260) is the write-side sibling: a closeout session can jot
+a cheap, low-ceremony note for a FUTURE closeout to review — cheap now, fully
+processed later — instead of running the full `add` ceremony (embedding,
+dedup/supersede matching) on a note whose whole point is to be reviewed first.
+It appends through the same capture queue machinery the hook uses (same
+atomic write, same `MAX_QUEUE_SIZE` oldest-drop cap, same `ZMEM_CAPTURE_MODE`
+secret redaction) and stamps `source: "closeout-note"` so `queue-list`
+consumers can tell a closeout-authored note from a live-captured
+(`source: "live-capture"`) or mined (`source: "history-mine"`) candidate. A
+`queue-add` item is reviewed under the SAME closeout Step 0.5 rubric as any
+other queue item — there is no fast track; `--type` accepts exactly the `add`
+command's type enum so an accepted note promotes unchanged.
 
 ### export-pack — render a Tier 1 markdown memory pack
 ```

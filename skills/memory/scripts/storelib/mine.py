@@ -1256,6 +1256,60 @@ def cmd_queue_clear(*, namespace: str, ids, clear_all: bool, drop_stale: bool) -
         return 0
 
 
+# Issue #260: queue-add stamps a source distinct from make_item's hard-coded
+# "live-capture" and mine-history's "history-mine" so queue-list consumers
+# (and the closeout rubric) can tell a closeout-authored note from an
+# automatically captured or mined candidate. make_item has no `source`
+# parameter by design; the post-call dict stamp is the same precedented
+# extension point _queue_mined uses for "history-mine" (see above).
+QUEUE_ADD_SOURCE = "closeout-note"
+
+
+def cmd_queue_add(*, namespace: str, message: str, type_: str,
+                  patterns: str = "", confidence: float = 0.7,
+                  sentiment: str = "note", decay_days: int = 90,
+                  as_json: bool = False) -> int:
+    """Append a cheap closeout note to a namespace's queue (issue #260).
+
+    Store-independent like queue-list/queue-clear (dispatches BEFORE
+    connect()): no store connect, no embedding, no dedup/supersede matching —
+    the whole point is cheap now, reviewed later. Builds the item with the
+    UNCHANGED correction_queue.make_item (same capture-policy secret redaction
+    resolved from ZMEM_CAPTURE_MODE; auto stores the redacted form, manual
+    keeps the original with secret_warning) and appends via the UNCHANGED
+    append_queue (atomic temp + os.replace, MAX_QUEUE_SIZE oldest-drop cap),
+    then stamps the source. A failed append is reported honestly with rc 1 —
+    unlike queue-clear's rc-0 fail-open (a destructive maintenance op), the
+    caller RELIES on this write having landed.
+    """
+    if not (message or "").strip():
+        print("[zmem] queue-add: --message must be non-empty", file=sys.stderr)
+        return 2
+    try:
+        import correction_queue as _cq
+        item = _cq.make_item(
+            message=message, type_=type_, patterns=patterns,
+            confidence=confidence, sentiment=sentiment,
+            decay_days=decay_days, session="",
+            namespace=namespace,
+            host=os.environ.get("ZMEM_HOST") or "cli",
+        )
+        item["source"] = QUEUE_ADD_SOURCE
+        ok = _cq.append_queue(namespace, item)
+    except Exception:
+        ok = False
+    if not ok:
+        print("[zmem] queue-add: failed (queue untouched)", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps({"ok": True, "id": item["id"],
+                          "namespace": namespace, "source": QUEUE_ADD_SOURCE}))
+    else:
+        print("[zmem] queue-add: queued note %s to %s (source=%s)"
+              % (item["id"][:8], namespace, QUEUE_ADD_SOURCE))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Issue #71 E: promote-store — one-shot merge of a leftover second store into
 # the canonical one. Optional companion to doctor's `second-stores` check.

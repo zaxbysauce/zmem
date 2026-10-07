@@ -184,7 +184,7 @@ KNOWN_SUBCMDS = [
     "promote", "promote-store", "rekey-namespace", "backup", "restore",
     "export-pack",
     "export-jsonl", "ingest-jsonl", "failures", "corrections", "queue-list",
-    "queue-clear", "mine-history", "sweep",
+    "queue-clear", "queue-add", "mine-history", "sweep",
     # Issue #135: governed capture adapters and the read-only training view.
     "capture-training-delivery", "capture-training-acknowledge",
     "capture-training-completion", "capture-training-review",
@@ -510,21 +510,22 @@ class CharacterizationTests(unittest.TestCase):
         # 47 -> 48: curated page filesystem commands joined (issue #138).
         # 48 -> 49: read-only provenance inspection joined (issue #139).
         # 49 -> 50: the signals read command joined (issue #258).
-        self.assertEqual(len(KNOWN_SUBCMDS), 50)
+        # 50 -> 51: the queue-add write command joined (issue #260).
+        self.assertEqual(len(KNOWN_SUBCMDS), 51)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
         # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # stays frozen at 50 after the #258 signals addition).
+        # stays frozen at 51 after the #260 queue-add addition).
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 50)
+        self.assertEqual(len(KNOWN_SUBCMDS), 51)
 
     def test_page_help_surface(self):
         """Pin the nested issue #138 grammar and operator-facing help text."""

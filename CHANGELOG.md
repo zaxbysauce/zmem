@@ -10,6 +10,30 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.85.0] - 2026-10-07
+
+### Added
+
+- **New `store.py queue-add` subcommand (issue #260, Workstream R PR 4)** — the
+  write-side sibling of `queue-list`/`queue-clear`. A closeout session can jot
+  a cheap, low-ceremony note for a future closeout to review (`queue-add
+  --namespace NS --message TEXT --type lesson [--patterns P] [--confidence 0.7]
+  [--sentiment note] [--decay-days 90] [--json]`) instead of running the full
+  `add` ceremony (embedding, dedup/supersede matching) on a note whose whole
+  point is to be reviewed first. It appends through the UNCHANGED
+  `correction_queue.make_item` + `append_queue` the capture hook uses (same
+  atomic write, same `MAX_QUEUE_SIZE` oldest-drop cap, same
+  `ZMEM_CAPTURE_MODE` secret redaction), never touches the store (dispatched
+  before `connect()` exactly like its siblings), and stamps `source:
+  "closeout-note"` so `queue-list` consumers can tell a closeout-authored note
+  from a live-captured (`"live-capture"`) or mined (`"history-mine"`)
+  candidate. A `queue-add` item is reviewed under the same closeout Step 0.5
+  rubric as any other queue item — no fast track; `--type` accepts exactly the
+  `add` command's type enum so an accepted note promotes unchanged. The
+  memory-skill command docs and the closeout skill document the new surface,
+  and the `test_store_characterization` subcommand freeze records the join
+  (50 -> 51).
+
 ## [0.84.0] - 2026-10-05
 
 ### Fixed
