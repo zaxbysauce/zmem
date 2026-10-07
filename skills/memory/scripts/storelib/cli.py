@@ -2794,8 +2794,9 @@ def main():
                              help="days before the item is flagged stale "
                                   "(default 90)")
     p_queue_add.add_argument("--json", action="store_true",
-                             help="emit a machine-readable receipt "
-                                  "(prose goes to stderr)")
+                             help="emit a machine-readable success receipt "
+                                  "on stdout (errors are reported as prose "
+                                  "on stderr)")
 
     p_source_exists = _add_parser(
         "source-exists", help="check whether a live source reference exists")
