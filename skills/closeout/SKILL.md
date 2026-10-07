@@ -58,6 +58,14 @@ mentioned a pending count, or you want to check, review the queue now:
 "$P" "$S" queue-list --namespace "<derived namespace>" --json
 ```
 
+This skill can also AUTHOR a queue item itself: when a closeout wants to jot a
+cheap, low-ceremony note for a future closeout to review (something worth
+capturing but not worth the full `add` ceremony now), use `queue-add
+--namespace "<derived namespace>" --message ... --type lesson` (issue #260). It
+writes the same sidecar queue via the same capture machinery (`source` is
+stamped `closeout-note`), never touches the store, and the note is reviewed
+under the rubric below exactly like any other item — no fast track.
+
 The `items[]` shape is a superset of transcript-mining (`corrections`) items, so
 the same review discipline applies. For each item, apply the adapted
 claude-reflect rubric — executed by YOU (the session's agent) reading this

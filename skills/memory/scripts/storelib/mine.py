@@ -1256,6 +1256,99 @@ def cmd_queue_clear(*, namespace: str, ids, clear_all: bool, drop_stale: bool) -
         return 0
 
 
+# Issue #260: queue-add stamps a source distinct from make_item's hard-coded
+# "live-capture" and mine-history's "history-mine" so queue-list consumers
+# (and the closeout rubric) can tell a closeout-authored note from an
+# automatically captured or mined candidate. make_item has no `source`
+# parameter by design; the post-call dict stamp is the same precedented
+# extension point _queue_mined uses for "history-mine" (see above).
+QUEUE_ADD_SOURCE = "closeout-note"
+
+
+def cmd_queue_add(*, namespace: str, message: str, type_: str,
+                  patterns: str = "", confidence: float = 0.7,
+                  sentiment: str = "note", decay_days: int = 90,
+                  as_json: bool = False) -> int:
+    """Append a cheap closeout note to a namespace's queue (issue #260).
+
+    Store-independent like queue-list/queue-clear (dispatches BEFORE
+    connect()): no store connect, no embedding, no dedup/supersede matching —
+    the whole point is cheap now, reviewed later. Builds the item with the
+    UNCHANGED correction_queue.make_item (capture-policy secret redaction
+    resolved from ZMEM_CAPTURE_MODE: auto stores the redacted form, manual
+    keeps the original with secret_warning) and appends via the UNCHANGED
+    append_queue (atomic temp + os.replace, MAX_QUEUE_SIZE oldest-drop cap),
+    then stamps the source. --patterns/--sentiment are free agent text on
+    this path (the hook derives them from a bounded detector), so they are
+    redacted here before make_item sees them and flag secret_warning when
+    redaction fired. A failed append is reported honestly with rc 1 —
+    unlike queue-clear's rc-0 fail-open (a destructive maintenance op), the
+    caller RELIES on this write having landed.
+    """
+    if not (message or "").strip():
+        print("[zmem] queue-add: --message must be non-empty", file=sys.stderr)
+        return 2
+    # Reviewer PRR-001/PRR-004 (PR #295 feedback): non-finite confidence would
+    # serialize as non-standard JSON (NaN/Infinity) that strict queue
+    # consumers reject AND make the item permanently immune to
+    # `queue-clear --drop-stale` (NaN < 0.6 is False); decay_days < 1 makes
+    # _flag_stale never mark the item stale — same unprunable outcome.
+    if not (math.isfinite(confidence) and 0.0 <= confidence <= 1.0):
+        print("[zmem] queue-add: --confidence must be a finite value "
+              "between 0.0 and 1.0", file=sys.stderr)
+        return 2
+    if decay_days < 1:
+        print("[zmem] queue-add: --decay-days must be at least 1",
+              file=sys.stderr)
+        return 2
+    # Reviewer PRR-003: the store write path rejects content over
+    # MAX_CONTENT_CHARS at promotion time; enforce the same bound here so an
+    # oversized note cannot wedge itself into a MAX_QUEUE_SIZE slot it can
+    # never promote out of.
+    try:
+        from storelib.schema import MAX_CONTENT_CHARS
+    except ImportError:
+        MAX_CONTENT_CHARS = 65536
+    if len(message) > MAX_CONTENT_CHARS:
+        print("[zmem] queue-add: --message is %d chars, over the %d "
+              "store limit; a note this large could never be promoted"
+              % (len(message), MAX_CONTENT_CHARS), file=sys.stderr)
+        return 2
+    try:
+        import correction_queue as _cq
+        # Reviewer PRR-002 (PR #295 feedback, critic-confirmed): make_item
+        # redacts only `message`; patterns/sentiment pass through verbatim.
+        # The hook feeds these fields from corrections.detect_patterns
+        # (bounded names / fixed enum), but queue-add takes free agent text,
+        # so redact here and surface a warning like the message path does.
+        from redaction import redact_secret_like_text
+        patterns, patterns_redactions = redact_secret_like_text(patterns)
+        sentiment, sentiment_redactions = redact_secret_like_text(sentiment)
+        item = _cq.make_item(
+            message=message, type_=type_, patterns=patterns,
+            confidence=confidence, sentiment=sentiment,
+            decay_days=decay_days, session="",
+            namespace=namespace,
+            host=os.environ.get("ZMEM_HOST") or "cli",
+        )
+        if patterns_redactions or sentiment_redactions:
+            item["secret_warning"] = True
+        item["source"] = QUEUE_ADD_SOURCE
+        ok = _cq.append_queue(namespace, item)
+    except Exception:
+        ok = False
+    if not ok:
+        print("[zmem] queue-add: failed (queue untouched)", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps({"ok": True, "id": item["id"],
+                          "namespace": namespace, "source": QUEUE_ADD_SOURCE}))
+    else:
+        print("[zmem] queue-add: queued note %s to %s (source=%s)"
+              % (item["id"][:8], namespace, QUEUE_ADD_SOURCE))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Issue #71 E: promote-store — one-shot merge of a leftover second store into
 # the canonical one. Optional companion to doctor's `second-stores` check.
