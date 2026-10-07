@@ -2066,6 +2066,13 @@ class ZmemMemoryProvider(MemoryProvider):
         The prior ``user:<user_id>`` branch is retired by the issue's
         precedence list; gateway sessions re-scope through the workspace
         derivation and this is documented in the release notes.
+
+        Degradation note: the by-path host load cannot reach
+        ``storelib.namespace_cache`` (no sys.path entry for the scripts
+        dir), so on a git failure the provider falls back to
+        ``user:global`` while the launcher may serve a cached ``project:*``
+        key — captured memories can land where recall will not look until
+        the next successful derivation.
         """
         env_ns = os.environ.get("ZMEM_NAMESPACE", "").strip()
         if env_ns:
