@@ -11,9 +11,7 @@ Same isolation discipline as the frozen suite: module-top env pin, mocked
 """
 
 import atexit  # noqa: E402
-import hashlib  # noqa: E402
 import importlib.util  # noqa: E402
-import json  # noqa: E402
 import os  # noqa: E402
 import shutil  # noqa: E402
 import sys  # noqa: E402
@@ -72,14 +70,6 @@ def _load_provider():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def _persisted_bytes(values):
-    persisted = {k: v for k, v in values.items() if k != "token_file"}
-    return (
-        json.dumps(persisted, ensure_ascii=False, sort_keys=True,
-                   separators=(",", ":")) + "\n"
-    ).encode("utf-8")
 
 
 class WarmFailClosedTest(unittest.TestCase):

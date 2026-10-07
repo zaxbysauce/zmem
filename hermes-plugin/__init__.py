@@ -14,6 +14,11 @@ Install: drop this directory into ``~/.hermes/plugins/memory/zmem/`` (or set
 ``ZMEM_HOME`` to point at a zmem checkout). The provider auto-detects
 ``store.py`` relative to its own location when shipped inside the zmem repo,
 so ``ZMEM_HOME`` is optional for a standalone install.
+
+Issue #161: the provider also carries a typed configuration surface
+(``get_config_schema`` / ``save_config``) persisted at
+``<hermes_home>/zmem/config.json``; ``initialize`` merges it under the
+environment (env vars always win per key).
 """
 
 from __future__ import annotations
@@ -68,6 +73,7 @@ _CORE_MD_REL = Path("core.md")
 _STORE_TIMEOUT_S = 20
 # Max chars of a query passed to store.py by the memory tools' argv.
 _MAX_QUERY_CHARS = 500
+_MAX_CONFIG_BYTES = 1_048_576
 # Max chars of a query delegated to the transport (issue #160).  argv-safety
 # bound only — the store boundary owns classification-on-complete-prompt and
 # the rewrite output cap; see prefetch().
@@ -1451,17 +1457,17 @@ def _config_schema_entries() -> List[Dict[str, Any]]:
          "choices": ("derive", "fixed"), "minimum": None,
          "secret": None, "env_var": None},
         {"key": "fixed_namespace",
-         "description": "Namespace used verbatim when namespace_policy is fixed.",
+         "description": "Namespace used when namespace_policy is fixed (must satisfy the zmem namespace grammar).",
          "type": "text", "default": "user:global",
          "choices": None, "minimum": None,
          "secret": None, "env_var": None},
         {"key": "injection_token_budget",
-         "description": "Maximum tokens of memory context injected per turn (0 = provider default).",
+         "description": "Maximum tokens of memory context injected per turn (0 = provider default). Schema-only in this release; consumed by #162/#177.",
          "type": "integer", "default": 0,
          "choices": None, "minimum": 0,
          "secret": None, "env_var": None},
         {"key": "global_policy",
-         "description": "Whether user:global memories may be recalled in project sessions.",
+         "description": "Whether user:global memories may be recalled in project sessions. Schema-only in this release; consumed by #163.",
          "type": "enum", "default": "include",
          "choices": ("include", "exclude"), "minimum": None,
          "secret": None, "env_var": None},
@@ -1471,7 +1477,7 @@ def _config_schema_entries() -> List[Dict[str, Any]]:
          "choices": None, "minimum": None,
          "secret": None, "env_var": None},
         {"key": "query_context",
-         "description": "Whether recall queries carry surrounding conversation context.",
+         "description": "Whether recall queries carry surrounding conversation context. Schema-only in this release; consumed by #162.",
          "type": "boolean", "default": True,
          "choices": None, "minimum": None,
          "secret": None, "env_var": None},
@@ -1543,6 +1549,35 @@ def _hermes_config_path(hermes_home=None) -> Path:
     return Path(home) / "zmem" / "config.json"
 
 
+_SCHEMA_META_MODULE: Optional[Any] = None
+
+
+def _load_schema_meta_module():
+    """Import skills/memory/scripts/schema_meta.py by path (stdlib-only),
+    for fixed_namespace grammar validation.  Returns None on any failure;
+    the caller then skips grammar validation rather than failing closed on
+    a broken in-tree helper."""
+    global _SCHEMA_META_MODULE
+    if _SCHEMA_META_MODULE is not None:
+        return _SCHEMA_META_MODULE
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    module_path = (Path(home) / "skills" / "memory" / "scripts"
+                   / "schema_meta.py")
+    if not module_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "zmem_schema_meta", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCHEMA_META_MODULE = module
+        return module
+    except Exception:
+        return None
+
+
 class ZmemMemoryProvider(MemoryProvider):
     """ZMem local-first memory — subprocess-bridges Hermes to ``store.py``."""
 
@@ -1594,16 +1629,22 @@ class ZmemMemoryProvider(MemoryProvider):
         invalid yield defaults plus a sentinel the caller must fail closed
         on.
         """
-        path = _hermes_config_path(hermes_home)
         try:
+            path = _hermes_config_path(hermes_home)
             raw = path.read_bytes()
-        except (FileNotFoundError, NotADirectoryError, OSError):
+        except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
+            # ValueError covers a NUL byte in the resolved home path, and
+            # OSError covers a deleted process cwd (os.getcwd() inside).
             return self._normalize_config({}), frozenset(), "missing"
+        if len(raw) > _MAX_CONFIG_BYTES:
+            return self._normalize_config({}), frozenset(), "invalid"
         if not raw.strip():
             return self._normalize_config({}), frozenset(), "empty"
         try:
-            values = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
+            # utf-8-sig tolerates a BOM (Windows editors write one by
+            # default); json.loads on a decoded-with-BOM string raises.
+            values = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
             return self._normalize_config({}), frozenset(), "malformed"
         if not isinstance(values, dict):
             return self._normalize_config({}), frozenset(), "malformed"
@@ -1649,6 +1690,11 @@ class ZmemMemoryProvider(MemoryProvider):
                 cfg[key] = candidate
             elif key in ("url", "token_file", "fixed_namespace"):
                 cfg[key] = "" if raw is None else str(raw).strip()
+                if key == "url" and cfg[key]:
+                    if not cfg[key].lower().startswith(("http://", "https://")):
+                        raise ValueError(
+                            f"zmem config: url must start with http:// or "
+                            f"https://, got {raw!r}")
             elif key == "injection_token_budget":
                 try:
                     budget = int(raw)
@@ -1681,6 +1727,12 @@ class ZmemMemoryProvider(MemoryProvider):
         if not cfg["fixed_namespace"]:
             raise ValueError(
                 "zmem config: fixed_namespace must not be empty")
+        grammar = _load_schema_meta_module()
+        if grammar is not None and not grammar.is_valid_namespace(
+                cfg["fixed_namespace"]):
+            raise ValueError(
+                f"zmem config: fixed_namespace is not a valid namespace: "
+                f"{cfg['fixed_namespace']!r}")
         return cfg
 
     def _config_overlay(self, cfg, explicit_keys):
@@ -1715,6 +1767,9 @@ class ZmemMemoryProvider(MemoryProvider):
         mode, reason = _transport.resolve_transport_mode(env)
         self._mode, self._mode_reason = mode, reason
         if mode is None:
+            # Re-selection (issue #161) can downgrade a previously available
+            # provider; a stale transport must not survive is_available()=False.
+            self._transport = None
             return
         deadline_s = _transport.resolve_deadline_s(env)
         executor = _transport.DeadlineExecutor()
@@ -1955,9 +2010,10 @@ class ZmemMemoryProvider(MemoryProvider):
             # Fail closed for every initialize, warm or fresh: drop back to
             # schema defaults, clear explicit keys, and mark the provider
             # uninitialized (the running session binding is left untouched).
-            self._config = self._normalize_config({})
-            self._config_explicit = frozenset()
-            self._initialized = False
+            with self._turn_ticket_lock:
+                self._config = self._normalize_config({})
+                self._config_explicit = frozenset()
+                self._initialized = False
             return
         schema_keys = {entry["key"] for entry in _config_schema_entries()}
         overrides = {key: kwargs[key] for key in schema_keys
@@ -1967,12 +2023,14 @@ class ZmemMemoryProvider(MemoryProvider):
             merged.update(overrides)
             cfg = self._normalize_config(merged)
             explicit = frozenset(explicit | set(overrides))
-        self._config = cfg
-        self._config_explicit = frozenset(explicit)
-        self._select_transport(self._config_overlay(cfg, explicit))
-
-        resolved_namespace = self._resolve_namespace(**kwargs)
+        # Publish config + transport + namespace as one lock-protected
+        # transition so a concurrent prefetch cannot pair the new namespace
+        # with the old transport (review round 5, PRR-012).
         with self._turn_ticket_lock:
+            self._config = cfg
+            self._config_explicit = frozenset(explicit)
+            self._select_transport(self._config_overlay(cfg, explicit))
+            resolved_namespace = self._resolve_namespace(**kwargs)
             self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
             self._initialized = True
 
@@ -2655,7 +2713,9 @@ class ZmemMemoryProvider(MemoryProvider):
         **kwargs,
     ) -> None:
         resolved_session = str(new_session_id or "").strip()
-        # Namespace may change if the new session is a different gateway user.
+        # Namespace re-derivation follows the issue-#161 precedence (config
+        # policy / agent_workspace); the config file itself is NOT reloaded
+        # here — session-switch config reload is #162's surface.
         resolved_namespace = self._resolve_namespace(**kwargs)
         with self._turn_ticket_lock:
             self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
@@ -2851,11 +2911,27 @@ class ZmemMemoryProvider(MemoryProvider):
             target_dir.mkdir(parents=True, exist_ok=True)
             tmp = target.with_name(
                 f"config.json.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
-            with open(tmp, "w", encoding="utf-8", newline="") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
             os.replace(tmp, target)
+            try:
+                dir_fd = os.open(target_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass  # best-effort durability; the replace itself succeeded
         except OSError as exc:
             if tmp is not None:
                 try:
