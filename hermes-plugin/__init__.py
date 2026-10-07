@@ -1521,11 +1521,15 @@ def _load_host_module():
     if not host_path.is_file():
         return None
     try:
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
+        # Pure file-path import, mirroring _host()'s collision-proofing
+        # (see its docstring): no sys.path insertion and no sys.modules
+        # slot claimed under a generic name — a long-lived host process
+        # must not have zmem's scripts dir shadow future `import host` /
+        # `import store` statements from other plugins.  host.py is
+        # stdlib-only at module top, so the by-path load is self-sufficient
+        # for resolve_namespace.
         spec = importlib.util.spec_from_file_location("zmem_host", host_path)
         module = importlib.util.module_from_spec(spec)
-        sys.modules["zmem_host"] = module
         spec.loader.exec_module(module)
         _HOST_MODULE = module
         return module
@@ -1564,7 +1568,12 @@ class ZmemMemoryProvider(MemoryProvider):
         # and the only warning site.
         self._config: Optional[Dict[str, Any]] = None
         self._config_explicit: frozenset = frozenset()
-        cfg, explicit, status = self._load_config_source(None)
+        try:
+            cfg, explicit, status = self._load_config_source(None)
+        except Exception:
+            # A deleted cwd or unreadable default home must not break
+            # construction; stay env-only (initialize re-loads).
+            cfg, explicit, status = None, frozenset(), "missing"
         if status in ("missing", "empty", "ok"):
             self._config = cfg
             self._config_explicit = frozenset(explicit)
@@ -1943,6 +1952,12 @@ class ZmemMemoryProvider(MemoryProvider):
             logger.warning(
                 "zmem: ignoring %s config at %s; using defaults",
                 status, _hermes_config_path(kwargs.get("hermes_home")))
+            # Fail closed for every initialize, warm or fresh: drop back to
+            # schema defaults, clear explicit keys, and mark the provider
+            # uninitialized (the running session binding is left untouched).
+            self._config = self._normalize_config({})
+            self._config_explicit = frozenset()
+            self._initialized = False
             return
         schema_keys = {entry["key"] for entry in _config_schema_entries()}
         overrides = {key: kwargs[key] for key in schema_keys
@@ -1991,7 +2006,10 @@ class ZmemMemoryProvider(MemoryProvider):
             fixed = str(cfg.get("fixed_namespace") or "").strip()
             if fixed:
                 return fixed
-        workspace = kwargs.get("agent_workspace", Path.cwd())
+        try:
+            workspace = kwargs.get("agent_workspace", Path.cwd())
+        except Exception:
+            workspace = None
         if workspace:
             host = _load_host_module()
             if host is not None:
