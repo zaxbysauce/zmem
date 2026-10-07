@@ -229,6 +229,23 @@ class NamespacePrecedencePinTest(unittest.TestCase):
             provider.initialize(session_id="s", hermes_home=str(home),
                                 deadline_s=-3.0)
 
+    def test_provided_workspace_survives_dead_cwd(self):
+        # Reviewer round-3: the kwarg must be read BEFORE Path.cwd() is
+        # evaluated, so an explicitly passed agent_workspace still derives
+        # the namespace even when the process cwd is unusable.
+        mod = _load_provider()
+        provider = mod.ZmemMemoryProvider()
+
+        class _FakeHost:
+            def resolve_namespace(self, workspace):
+                return "project:derived-from-" + str(workspace).replace("\\", "/").lower()
+
+        with mock.patch.object(mod, "_load_host_module", return_value=_FakeHost()), \
+                mock.patch("pathlib.Path.cwd", side_effect=FileNotFoundError("cwd gone")):
+            ns = provider._resolve_namespace(
+                agent_workspace="E:/some/ws")
+        self.assertEqual(ns, "project:derived-from-e:/some/ws")
+
 
 if __name__ == "__main__":
     unittest.main()

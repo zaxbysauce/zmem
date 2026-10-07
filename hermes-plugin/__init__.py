@@ -2006,10 +2006,15 @@ class ZmemMemoryProvider(MemoryProvider):
             fixed = str(cfg.get("fixed_namespace") or "").strip()
             if fixed:
                 return fixed
-        try:
-            workspace = kwargs.get("agent_workspace", Path.cwd())
-        except Exception:
-            workspace = None
+        if "agent_workspace" in kwargs:
+            # Read a provided workspace BEFORE touching Path.cwd(): a dead
+            # process cwd must not discard an explicitly passed workspace.
+            workspace = kwargs.get("agent_workspace")
+        else:
+            try:
+                workspace = Path.cwd()
+            except Exception:
+                workspace = None
         if workspace:
             host = _load_host_module()
             if host is not None:
