@@ -174,8 +174,11 @@ class TokenFileReachTest(unittest.TestCase):
                                 token_file="Z:/nonexistent/token.txt")
         # The seam key mapping must not carry token_file at all.
         self.assertNotIn("token_file", mod._CONFIG_ENV_KEYS)
-        # The constructed MCP transport must hold no explicit token.
-        self.assertIsNone(getattr(provider._transport, "_explicit_token", None))
+        # The constructed MCP transport must hold no explicit token: the
+        # #160 McpHttp constructor stores it as _token (transport.py:355) —
+        # an assertion that fails if token_file is ever wired into
+        # construction.
+        self.assertIsNone(getattr(provider._transport, "_token", None))
         # And the overlay built for selection must not carry the env key
         # from config: recompute and inspect.
         overlay = provider._config_overlay(provider._config,
