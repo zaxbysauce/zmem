@@ -18,7 +18,11 @@ so ``ZMEM_HOME`` is optional for a standalone install.
 Issue #161: the provider also carries a typed configuration surface
 (``get_config_schema`` / ``save_config``) persisted at
 ``<hermes_home>/zmem/config.json``; ``initialize`` merges it under the
-environment (env vars always win per key).
+environment (env vars always win per key). Trust model: the cwd fallback in
+the config-path chain means a ``zmem/config.json`` committed inside an
+opened workspace is trusted to select the transport endpoint and namespace
+(the file is data — parsed, validated, fail-closed — but it does steer
+network I/O; set ``ZMEM_HOME`` or pass ``hermes_home`` to override).
 """
 
 from __future__ import annotations
@@ -1631,10 +1635,17 @@ class ZmemMemoryProvider(MemoryProvider):
         """
         try:
             path = _hermes_config_path(hermes_home)
-            raw = path.read_bytes()
-        except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
-            # ValueError covers a NUL byte in the resolved home path, and
-            # OSError covers a deleted process cwd (os.getcwd() inside).
+            with open(path, "rb") as handle:
+                # Bounded read: cap+1 so an oversized file is detected by
+                # size, not by allocating it (review round 6).
+                raw = handle.read(_MAX_CONFIG_BYTES + 1)
+        except (FileNotFoundError, NotADirectoryError, OSError, ValueError,
+                MemoryError):
+            # ValueError covers a NUL byte in the resolved home path;
+            # OSError covers a deleted process cwd (os.getcwd() inside);
+            # MemoryError covers allocation failure before the cap applies.
+            logger.debug(
+                "zmem config: load failed (%s); using defaults", hermes_home)
             return self._normalize_config({}), frozenset(), "missing"
         if len(raw) > _MAX_CONFIG_BYTES:
             return self._normalize_config({}), frozenset(), "invalid"
@@ -2138,6 +2149,16 @@ class ZmemMemoryProvider(MemoryProvider):
         prompt_digest = _hermes_prompt_digest(q)
         explicit_session = str(session_id or "").strip()
         with self._turn_ticket_lock:
+            # Re-read the transport under the same lock that published it
+            # (issue #161, PRR-012): reading transport and namespace in one
+            # critical section prevents a concurrent initialize from pairing
+            # the new namespace with the old transport.
+            transport = self._transport
+            if transport is None:
+                logger.debug(
+                    "zmem prefetch: no transport (reason=%s)",
+                    self._mode_reason)
+                return ""
             active_session = self._session_id
             if explicit_session and active_session and explicit_session != active_session:
                 return ""

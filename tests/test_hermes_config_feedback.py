@@ -236,6 +236,32 @@ class NamespacePrecedencePinTest(unittest.TestCase):
                 agent_workspace="E:/some/ws")
         self.assertEqual(ns, "project:derived-from-e:/some/ws")
 
+    def test_dead_cwd_config_path_fails_closed_with_debug(self):
+        # Reviewer round-6: _load_config_source must catch the deleted-cwd
+        # os.getcwd() and log a debug, not raise into the host.
+        mod = _load_provider()
+        provider = mod.ZmemMemoryProvider()
+        with mock.patch("os.getcwd", side_effect=FileNotFoundError("cwd gone")):
+            with self.assertLogs(mod.logger, level="DEBUG") as logged:
+                cfg, explicit, status = provider._load_config_source(None)
+        self.assertEqual(status, "missing")
+        self.assertEqual(cfg, provider._normalize_config({}))
+
+    def test_stale_transport_cleared_on_mode_none_reselection(self):
+        # Reviewer round-6: re-selection to no mode must clear _transport
+        # so is_available()=False means no live transport (PRR-004).
+        os.environ["ZMEM_MCP_URL"] = "http://127.0.0.1:9/mcp"
+        mod = _load_provider()
+        provider = mod.ZmemMemoryProvider()
+        self.assertIsNotNone(provider._transport)
+        os.environ["ZMEM_HERMES_MODE"] = "bogus"
+        with mock.patch.object(
+                mod._transport, "resolve_transport_mode",
+                return_value=(None, "test unavailable")):
+            provider._select_transport()
+        self.assertIsNone(provider._transport)
+        self.assertIsNone(provider._mode)
+
 
 if __name__ == "__main__":
     unittest.main()
