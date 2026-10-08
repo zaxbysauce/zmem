@@ -190,7 +190,7 @@ class HermesPrefetchTest(unittest.TestCase):
         provider.queue_prefetch("project alpha", session_id="sid-a")
 
         self.assertEqual(len(scheduler.submissions), 1)
-        self.assertEqual(provider._pending_keys,
+        self.assertEqual(set(provider._pending_keys),
                          {("sid-a", expected_fingerprint)})
 
         # Second AC1 half: after the job runs, a fresh cache hit returns the
@@ -287,7 +287,11 @@ class HermesPrefetchTest(unittest.TestCase):
         mod, provider, scheduler, deadline = self._provider(
             transport=transport)
 
-        first = provider.prefetch("no match", session_id="sid-b")
+        # Review TC-07: use the ACTIVE session ("sid-a") — a foreign
+        # session_id is rejected by the pairing gate before any transport
+        # call, which made this leg vacuous (the count-0 assertion read the
+        # constructor default).
+        first = provider.prefetch("no match", session_id="sid-a")
         self.assertEqual(first, "")
         self.assertEqual(provider.recall_status().count, 0)
 
@@ -429,7 +433,7 @@ class _ProviderBoundaryTest(unittest.TestCase):
         self.assertIsNone(bare._scheduler)
         self.assertIsNone(bare.queue_prefetch("project alpha",
                                               session_id="sid-a"))
-        self.assertEqual(bare._pending_keys, set())
+        self.assertEqual(bare._pending_keys, {})
 
 
 if __name__ == "__main__":

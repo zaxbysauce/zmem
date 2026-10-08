@@ -954,8 +954,8 @@ class ProviderEnvelopeTest(unittest.TestCase):
         # TTL is served from the provider cache without re-hitting the store
         # (this pin previously expected the store's already-delivered "");
         # the ledger assertions below prove the store saw exactly one
-        # delivery, and the TTL-expired path stays covered by the
-        # rewind/reset provider tests.
+        # delivery, and the TTL-expired path stays covered by
+        # test_stale_cache_runs_live_recall in tests/test_hermes_prefetch.py.
         second = self.provider.prefetch("stash pop", session_id=self.SESSION_ID)
         self.assertEqual(second, first)
 
