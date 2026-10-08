@@ -130,6 +130,28 @@ zmem: redacted <N> secret-like value(s) from the captured memory (value not show
 The stored row shows `[REDACTED_SECRET]` markers where the values were; the raw
 value must never appear in your feedback, the store, or the transcript.
 
+**Convention-drift scan (issue #261):** after the per-item review above and
+BEFORE clearing the queue below, run the read-only drift scan once — it
+cross-references the queue you just reviewed against the namespace's LIVE
+`convention` rows and surfaces any convention a queued correction contradicts
+(polarity flip + shared content stem; false positives are acceptable, it only
+surfaces candidates):
+
+```bash
+"$P" "$S" convention-drift --namespace "<derived namespace>" --json
+```
+
+Run it BEFORE `queue-clear`: cleared items are gone from the sidecar, so a
+scan after clearing would only see deferred survivors. On an existing store
+the scan writes nothing — surfaced ids are update candidates for YOU to act
+on deliberately (Step 3's `invalidate --id <uuid> --reason ...` when the
+correction wins, or keep the convention and reject the item when it does
+not; a missing store is created by the ordinary open path, exactly like
+`list`). An empty `{"candidates": []}` is the normal outcome; the queue
+loader fails open, so a missing or corrupt queue file also reads as an empty
+result. A store-level failure exits before the scan with an error — report
+"drift scan unavailable" in that case, and never abort closeout over it.
+
 After processing, clear the processed items from the queue (leave explicitly
 deferred items in place), and prune stale low-confidence candidates:
 
@@ -349,6 +371,10 @@ State plainly:
 - Whether consolidation merged anything
 - Correction candidates reviewed (from Step 0.5's queue): reviewed N, captured M,
   rejected K (and why)
+- Convention-drift candidates (from Step 0.5's drift scan): <candidate ids or
+  "none"> — live `convention` rows this session's queued corrections
+  contradict (issue #261); name each id and what you did (invalidated, kept
+  with the correction rejected, or deferred with why)
 - Skills promoted (and why those, not the others)
 - What you deliberately did **not** capture, and why
 

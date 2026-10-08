@@ -35,7 +35,7 @@ from storelib.evidence import (
     write_evidence,
 )
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_add, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists
+from storelib.mine import cmd_convention_drift, cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_add, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists
 from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
@@ -2798,6 +2798,18 @@ def main():
                                   "on stdout (errors are reported as prose "
                                   "on stderr)")
 
+    # convention-drift (issue #261): the read-side companion of the queue
+    # family. Unlike queue-list/queue-clear/queue-add it reads the STORE too
+    # (live convention rows), so it dispatches AFTER connect() like `list`.
+    p_convention_drift = _add_parser(
+        "convention-drift",
+        help="list live convention rows the namespace's queued corrections "
+             "contradict (read-only update candidates)")
+    p_convention_drift.add_argument("--namespace", required=True,
+                                    help="namespace to scan")
+    p_convention_drift.add_argument("--json", action="store_true",
+                                    help="emit {\"candidates\": [{\"id\": ...}]}")
+
     p_source_exists = _add_parser(
         "source-exists", help="check whether a live source reference exists")
     p_source_exists.add_argument("--namespace", dest="namespace", required=True,
@@ -3731,11 +3743,14 @@ def main():
     # remediation work, and the auto pass running first would consume the rows
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
-    if args.cmd not in ("rekey-namespace", "export-dataset", "export-training") \
+    if args.cmd not in ("rekey-namespace", "export-dataset", "export-training",
+                        "convention-drift") \
             and not existing_only_evidence_write:
         # export-dataset joins the exemption (issue #134): it is a pure-read
         # surface and must not trigger the near-miss rekey's writes against
-        # the store it is reading.
+        # the store it is reading. convention-drift joins it (issue #261)
+        # for the same reason: a drift scan that auto-rekeyed namespaces
+        # would violate its own read-only contract on near-miss stores.
         _auto_near_miss_rekey(conn, force_off=getattr(args, "no_auto_rekey", False))
 
     # Issue #63, 8.2: fail-closed embedding-profile gate. Applied ONLY to
@@ -4525,6 +4540,11 @@ def main():
             sys.exit(0 if get_memory(conn, args.id) else 1)
         elif args.cmd == "list":
             list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
+        elif args.cmd == "convention-drift":
+            # Post-connect like `list` (needs the store AND the queue sidecar);
+            # read-only and auto-rekey-exempt (see the exemption tuple above).
+            sys.exit(cmd_convention_drift(conn, namespace=args.namespace,
+                                          as_json=args.json))
         elif args.cmd == "stats":
             stats(conn)
         elif args.cmd == "rebuild-fts":
