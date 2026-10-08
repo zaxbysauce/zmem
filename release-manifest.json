@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "047a0b142866d6a80b375a506596bd34b1d8851eebc90de354dda2e3c268a9a3",
+  "digest": "7a614c6bebe084c4977e9fcbfaee39a71a3d9629aa0e7d8c6f38e61b5cbf02ed",
   "files": {
     "hermes-plugin/__init__.py": "9da21eaa6ac0ab42cbc3fbca3f58ccce3f118de3d7ffa51621d658f9bc452266",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -55,8 +55,8 @@
     "scripts/refresh_hosts.py": "aae858aacc2d776b3e834c775b578ce9893b9d9c1d46e13d142db001188d35fc",
     "scripts/release_gate.py": "0fee2823312e51cdd7b0a4827509aa806907e06ae95b87b2a90f532997c76ecb",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
-    "skills/closeout/SKILL.md": "6839cf08f352f82509ef769731f72e74808c6e2d937e1ac19fe8ca5835480437",
-    "skills/memory/SKILL.md": "7a8043aa91c809afb06ffbead4699cd882c12a97c9ae460cc0f790f52494e030",
+    "skills/closeout/SKILL.md": "b43f4c9fc602917bd5f627560f1ab5abbfb3b34e60ad0d27f7a219a7492368ef",
+    "skills/memory/SKILL.md": "dadac57331787a57a8be98bc39560085ce382b082dbef8233a768889e900ee12",
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
@@ -90,7 +90,7 @@
     "skills/memory/scripts/storelib/inject.py": "0df5119aee304a1e4c25c96257e21ae21b9e6b309a91fcc5d10ef156af25792c",
     "skills/memory/scripts/storelib/links.py": "687826c8ec6cb207ac5f155d5e22a4f70bbb22dca8dbcd03826f03b7fdb57c11",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
-    "skills/memory/scripts/storelib/mine.py": "80b4e06bd7126088a9ad0f85fafa684b421c0bd549bf06af518d85b10a3c99c2",
+    "skills/memory/scripts/storelib/mine.py": "248ef2f1ab6f9edff90ea2dec2676b18231019785e02e40e1e56a2f92fae5cea",
     "skills/memory/scripts/storelib/miss_rate.py": "afa06b6662ca3675745b687b3fdaa2e7892d668afa7fa92bceeed6f08f84ebf6",
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
     "skills/memory/scripts/storelib/opcmds.py": "5a38c9c7c94e5b14a11d62cfde11e1c920805abeb29a92a4421d8ca9a121791b",

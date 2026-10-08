@@ -2096,22 +2096,26 @@ enum, so an accepted note needs no type conversion when it is promoted.
 <interpreter> <store.py> convention-drift --namespace NS [--json]
 ```
 Read-only drift scan (issue #261): loads the namespace's queued correction
-items (the same sidecar `queue-list` reads) and the namespace's live rows,
-keeps `type == "convention"` (filtered in Python — `list` has no `--type`
-flag), and reports each convention row some queued item's message
-CONTRADICTS by the same lexical/polarity overlap the write-time
-dedupe/supersede guard uses (negation-polarity flip + at least one shared
-content stem; token-disjoint notes never flag). `--json` emits
-`{"candidates": [{"id": ...}, ...]}`; plain mode prints one
-`- <id> :: <preview>` line per candidate. It never writes — no invalidate,
-update, supersede, or telemetry, and the store file stays byte-identical —
-surfaced ids are update candidates for the reviewer's deliberate
-`update`/`invalidate` at closeout (false positives are acceptable; a missed
-real contradiction is the failure mode it minimizes). Unlike the queue
-family it opens the store (it reads live rows), so it dispatches after
-connect like `list`; it is exempt from the automatic near-miss rekey (a
-pure-read surface must not trigger the rekey's writes). Works without an
-embedding model — the predicate is lexical only.
+items (the same sidecar `queue-list` reads — every item, regardless of its
+`stale` flag) and the namespace's live rows, keeps `type == "convention"`
+(filtered in Python — `list` has no `--type` flag), and reports each
+convention row some queued item's message CONTRADICTS: the write-time dedupe
+guard's negation-polarity signal (polarity flip) plus at least one shared
+content stem (the stem term is specific to this scan; token-disjoint notes
+never flag). `--json` emits `{"candidates": [{"id": ...}, ...]}`; plain mode
+prints one `- <id> :: <preview>` line per candidate, or
+`(no convention-drift candidates)` when there are none; both modes exit 0.
+On an existing store it writes nothing — no invalidate, update, supersede,
+or telemetry, and the store file stays byte-identical (a missing store is
+created by the ordinary open path, exactly like `list`) — surfaced ids are
+update candidates for the reviewer's deliberate `update`/`invalidate` at
+closeout (false positives are acceptable; a missed real contradiction is the
+failure mode it minimizes). The queue loader fails open: a missing or
+corrupt queue file reads as an empty result. Unlike the queue family it
+opens the store (it reads live rows), so it dispatches after connect like
+`list`; it is exempt from the automatic near-miss rekey (a pure-read surface
+must not trigger the rekey's writes). Works without an embedding model — the
+predicate is lexical only.
 
 ### export-pack — render a Tier 1 markdown memory pack
 ```

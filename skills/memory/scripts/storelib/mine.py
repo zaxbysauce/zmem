@@ -1354,20 +1354,26 @@ def cmd_convention_drift(conn, *, namespace: str, as_json: bool) -> int:
     (issue #261, Workstream R PR 5).
 
     Read-only by contract: it loads the namespace's queued correction items
-    (the same sidecar `queue-list` reads, fail-open to []) and the
-    namespace's live rows through the list-shaped read (list_memory's WHERE
-    clauses plus its ORDER BY; no LIMIT — a window here would silently MISS
-    convention rows, and the issue names false negatives as the primary
-    risk), then filters `type == "convention"` in Python (`list` has no
-    --type flag). A row becomes a candidate when some queued item's message
-    DISAGREES with it by polarity (`_polarity_signature` differs — the same
-    signal the write-time dedupe guard `dedup_polarity_conflict` applies)
-    while sharing at least one `_predicate_tokens` content stem, so a
-    token-disjoint note never flags. False positives are acceptable by the
-    issue's constraint; it only SURFACES ids for a reviewer's deliberate
-    `update`/`invalidate` — nothing is written (no bump, no telemetry, no
-    supersede; the store file stays byte-identical, pinned by
-    tests/test_r05_convention_drift.py).
+    (the same sidecar `queue-list` reads, fail-open to [] — a missing or
+    corrupt queue file is indistinguishable from an empty one by the
+    loader's documented fail-open design) and the namespace's live rows
+    through the list-shaped read (list_memory's WHERE clauses plus its
+    ORDER BY; no LIMIT — a window here would silently MISS convention rows,
+    and the issue names false negatives as the primary risk), then filters
+    `type == "convention"` in Python (`list` has no --type flag). A row
+    becomes a candidate when some queued item's message DISAGREES with it by
+    polarity (`_polarity_signature` differs — the same SIGNAL the write-time
+    dedupe guard `dedup_polarity_conflict` applies, though that guard tests
+    the polarity flip alone) while sharing at least one `_predicate_tokens`
+    content stem, so a token-disjoint note never flags. Every queued item is
+    scanned regardless of its `stale` flag (the FP-leaning, false-negative-
+    minimizing direction the issue sanctions; queue-list renders stale items
+    and `queue-clear --drop-stale` prunes the low-confidence ones). False
+    positives are acceptable by the issue's constraint; it only SURFACES ids
+    for a reviewer's deliberate `update`/`invalidate` — on an EXISTING store
+    nothing is written (no bump, no telemetry, no supersede; the store file
+    stays byte-identical, pinned by tests/test_r05_convention_drift.py; a
+    missing store is created by the ordinary open path, exactly like `list`).
 
     Dispatches AFTER connect() (unlike queue-list/queue-clear/queue-add) —
     it needs the store as well as the queue — and is exempt from

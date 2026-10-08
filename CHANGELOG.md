@@ -21,12 +21,15 @@ README.
   namespace's queued items and its live rows through the list-shaped read
   (no new query path; `type == "convention"` filtered in Python — `list`
   has no `--type` flag) and reports each convention row some queued
-  message CONTRADICTS, using the same lexical/polarity overlap the
-  write-time dedupe guard applies (negation-polarity flip plus at least one
-  shared content stem; false positives acceptable, missed contradictions
-  minimized). `--json` emits `{"candidates": [{"id": ...}, ...]}`.
-  Nothing is ever written — no invalidate/update/supersede/telemetry, the
-  store file stays byte-identical — and the command is exempt from the
+  message CONTRADICTS, using the write-time dedupe guard's negation-polarity
+  signal plus a shared-content-stem term specific to this scan (polarity
+  flip plus at least one shared content stem; false positives acceptable,
+  missed contradictions minimized). `--json` emits
+  `{"candidates": [{"id": ...}, ...]}`.
+  On an existing store nothing is ever written — no
+  invalidate/update/supersede/telemetry, the store file stays
+  byte-identical (a missing store is created by the ordinary open path,
+  exactly like `list`) — and the command is exempt from the
   automatic near-miss rekey (a pure read must not trigger its writes,
   export-dataset precedent). The closeout skill wires the scan into Step
   0.5 and adds a "Convention-drift candidates" line to the Step 6 report
