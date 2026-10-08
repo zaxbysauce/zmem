@@ -28,6 +28,7 @@ network I/O; set ``ZMEM_HOME`` or pass ``hermes_home`` to override).
 from __future__ import annotations
 
 import contextvars
+import copy
 import hashlib
 import importlib.util
 import json
@@ -43,7 +44,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 try:
@@ -63,6 +64,36 @@ except ModuleNotFoundError as _exc:
         "inside a Hermes host process that places it on sys.path. If you are "
         "seeing this outside Hermes, this import is expected to fail."
     ) from None
+
+try:  # issue #162: use the host's own status record when the SDK exposes it.
+    from agent.memory_provider import RecallStatus  # type: ignore[no-redef]
+except (ImportError, ModuleNotFoundError):  # test stubs and older SDKs
+    class RecallStatus:  # type: ignore[no-redef]
+        """Provider recall status surfaced to the host via ``recall_status``.
+
+        Deliberately a plain class, NOT a ``@dataclass``: dataclass
+        processing resolves the module through ``sys.modules``, which a
+        file-path-loaded plugin (the standard test and host loading
+        pattern) is not guaranteed to be registered under — the decorator
+        raised AttributeError at import time in that shape.
+        """
+
+        __slots__ = ("provider_label", "count")
+
+        def __init__(self, provider_label: str = "zmem", count: int = 0) \
+                -> None:
+            self.provider_label = provider_label
+            self.count = count
+
+        def __repr__(self) -> str:
+            return "RecallStatus(provider_label=%r, count=%r)" % (
+                self.provider_label, self.count)
+
+        def __eq__(self, other: object) -> bool:
+            return (isinstance(other, RecallStatus)
+                    and self.provider_label == other.provider_label
+                    and self.count == other.count)
+
 
 logger = logging.getLogger(__name__)
 
@@ -1582,10 +1613,185 @@ def _load_schema_meta_module():
         return None
 
 
+# -- passive prefetch cache (issue #162) -------------------------------------
+
+PREFETCH_CACHE_TTL_S = 30.0
+
+# Required-keys fallback used only when the store-owned constants cannot be
+# loaded (mirrors the #158 closed envelope shape; see the module docstring of
+# hermes-plugin/transport.py for the same fourteen names).
+_ENVELOPE_REQUIRED_FALLBACK = (
+    "results", "count", "omitted", "reason", "excluded", "candidate_ids",
+    "tokens_used", "tokens_budget", "budget_dropped", "budget_admission",
+    "budget_truncated", "budget_dropped_protected", "arms", "rendered",
+)
+
+_ENVELOPE_KEYS_MODULE: Optional[Any] = None
+_ENVELOPE_KEYS_WARNED = False
+
+
+def _load_envelope_key_constants():
+    """Consume the #158 envelope key policy from the store's own source.
+
+    Loads ``skills/memory/scripts/storelib/inject.py`` by file path under a
+    private module name (the same stdlib-only pattern as
+    ``_load_schema_meta_module`` above — that module's import-time surface is
+    stdlib-only; its selector imports are lazy), so this plugin consumes the
+    store-owned ``INJECTION_ENVELOPE_REQUIRED`` / ``INJECTION_ENVELOPE_OPTIONAL``
+    frozensets instead of defining another set. Returns the pair, or ``None``
+    on any load failure (the caller then degrades to required-keys-present
+    validation, the same coercion the #160 transports already apply).
+    """
+    global _ENVELOPE_KEYS_MODULE, _ENVELOPE_KEYS_WARNED
+    if _ENVELOPE_KEYS_MODULE is not None:
+        return _ENVELOPE_KEYS_MODULE
+    global _ENVELOPE_KEYS_WARNED
+    home = _resolve_zmem_home()
+    if home is None:
+        if not _ENVELOPE_KEYS_WARNED:
+            _ENVELOPE_KEYS_WARNED = True
+            logger.warning(
+                "zmem: envelope key policy unavailable (no zmem checkout "
+                "resolved); falling back to required-keys-present "
+                "validation")
+        return None
+    module_path = (Path(home) / "skills" / "memory" / "scripts"
+                   / "storelib" / "inject.py")
+    if not module_path.is_file():
+        if not _ENVELOPE_KEYS_WARNED:
+            _ENVELOPE_KEYS_WARNED = True
+            logger.warning(
+                "zmem: envelope key policy unavailable (%s missing); "
+                "falling back to required-keys-present validation",
+                module_path)
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "zmem_envelope_keys", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        required = getattr(module, "INJECTION_ENVELOPE_REQUIRED", None)
+        optional = getattr(module, "INJECTION_ENVELOPE_OPTIONAL", None)
+        if not isinstance(required, (frozenset, set)) \
+                or not isinstance(optional, (frozenset, set)):
+            return None
+        _ENVELOPE_KEYS_MODULE = (frozenset(required), frozenset(optional))
+        return _ENVELOPE_KEYS_MODULE
+    except Exception:
+        return None
+
+
+def _is_trivial_query(normalized_query: str) -> bool:
+    """A bare pleasantry never warms the cache nor hits the store (#162)."""
+    return normalized_query.casefold() in ("ok", "yes", "no", "thanks",
+                                           "thank you")
+
+
+class _ThreadScheduler:
+    """Production Scheduler seam (#162): one daemon thread per submission.
+
+    The host manager bounds its own joins; provider-side jobs are additionally
+    deadline-bounded by the shared :class:`transport.DeadlineExecutor`, and
+    ``queue_prefetch`` dedupes per (session, fingerprint) key, so at most one
+    background job exists per key.  Daemon threads can never block host exit.
+    """
+
+    def submit(self, fn: Callable[[], Any]) -> object:
+        worker = threading.Thread(target=fn, daemon=True,
+                                  name="zmem-prefetch")
+        worker.start()
+        return worker
+
+
+_PREFETCH_CACHE_MAX_ENTRIES = 64
+# A hostile/oversized remote envelope must not enter the cache; honest
+# store fences are budget-capped far below this.
+_PREFETCH_RENDERED_MAX_CHARS = 1_000_000
+
+
+class _PrefetchCache:
+    """The 30-second complete-envelope cache keyed by (session, fingerprint).
+
+    Pure in-process state under one lock: deep-copied envelopes and their
+    insertion instants.  A hit is fresh only when
+    ``clock() - inserted_at < ttl_s`` — at exactly ``ttl_s`` the entry is
+    deleted and the miss is returned.  No store, ledger, socket, or
+    subprocess I/O ever happens under (or from) this lock.
+    """
+
+    def __init__(self, *, ttl_s: float, clock: Callable[[], float]) -> None:
+        self._ttl_s = float(ttl_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: Dict[tuple[str, str], Any] = {}
+        self._inserted_at: Dict[tuple[str, str], float] = {}
+
+    def get(self, key: tuple[str, str]) -> Optional[dict]:
+        with self._lock:
+            inserted = self._inserted_at.get(key)
+            if inserted is None:
+                return None
+            now = self._clock()
+            if now - inserted < self._ttl_s:
+                envelope = self._entries.get(key)
+                return copy.deepcopy(envelope) if isinstance(envelope, dict) \
+                    else None
+            del self._inserted_at[key]
+            self._entries.pop(key, None)
+            return None
+
+    def put(self, key: tuple[str, str], envelope: dict) -> None:
+        with self._lock:
+            # Bound resident memory: evict the oldest entry past the cap
+            # (review PRR-007 — eviction was lazy-only, so a long session
+            # with N distinct queries retained N deep-copied envelopes).
+            while len(self._entries) >= _PREFETCH_CACHE_MAX_ENTRIES:
+                oldest = min(self._inserted_at, key=self._inserted_at.get)
+                self._entries.pop(oldest, None)
+                self._inserted_at.pop(oldest, None)
+            self._entries[key] = copy.deepcopy(envelope)
+            self._inserted_at[key] = self._clock()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._inserted_at.clear()
+
+    def clear_session(self, session_id: str) -> None:
+        with self._lock:
+            stale = [key for key in self._entries if key[0] == session_id]
+            for key in stale:
+                self._entries.pop(key, None)
+                self._inserted_at.pop(key, None)
+
+
 class ZmemMemoryProvider(MemoryProvider):
     """ZMem local-first memory — subprocess-bridges Hermes to ``store.py``."""
 
-    def __init__(self) -> None:
+    def __init__(self, scheduler: Optional[object] = None,
+                 deadline: Optional[object] = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        # Issue #162 seam.  Both dependencies default to None so the 15+
+        # existing no-arg construction sites (and register() before
+        # initialize) keep working: a None scheduler leaves queue_prefetch
+        # inert; a None deadline makes _select_transport build the production
+        # DeadlineExecutor.  register() passes real production instances.
+        # The provider never assigns one object to both attributes.
+        self._scheduler = scheduler
+        self._deadline = deadline
+        self._clock = clock
+        self._deadline_s: float = (
+            _transport.resolve_deadline_s() if _transport is not None
+            else 6.0)
+        self._prefetch_cache = _PrefetchCache(
+            ttl_s=PREFETCH_CACHE_TTL_S, clock=self._clock)
+        # Key -> ownership token.  A job's finally may only remove the
+        # marker it owns, so a switch-back re-registration (review
+        # PRR-003) can never have its marker discarded by a stale job.
+        self._pending_keys: Dict[tuple[str, str], str] = {}
+        self._session_generation: Dict[str, int] = {}
+        self._state_lock = threading.RLock()
+        self._last_status = RecallStatus(provider_label="zmem", count=0)
         self._session_id: str = ""
         self._namespace: str = "user:global"
         self._initialized: bool = False
@@ -1783,7 +1989,10 @@ class ZmemMemoryProvider(MemoryProvider):
             self._transport = None
             return
         deadline_s = _transport.resolve_deadline_s(env)
-        executor = _transport.DeadlineExecutor()
+        self._deadline_s = deadline_s
+        if self._deadline is None:
+            self._deadline = _transport.DeadlineExecutor()
+        executor = self._deadline
         if mode is _transport.TransportMode.local:
             store_py = _resolve_store_py()
             if store_py is None:  # pragma: no cover - mode resolution checked
@@ -1823,13 +2032,20 @@ class ZmemMemoryProvider(MemoryProvider):
 
     def _rotate_turn_epoch_locked(self, session_id: str, namespace: str) -> int:
         """Replace the active correlation scope as one lock-protected action."""
-        # After the provider's first epoch there is no identity on an omitted
-        # session callback that can distinguish a delayed old event from the
-        # current session.  Keep this fail-closed for the provider lifetime;
-        # only constructing a fresh provider resets it.
+        # Issue #162: the session being LEFT loses its generation validity —
+        # every rotation path (on_session_switch, on_session_end, initialize,
+        # including a switch-back to a previously seen session) invalidates
+        # that session's in-flight background jobs at their put-time re-check.
+        # Lock order (never backwards): _turn_ticket_lock -> _state_lock ->
+        # the _PrefetchCache internal lock.
         if self._turn_epoch > 0:
             self._omitted_turn_callbacks_blocked = True
         self._turn_epoch += 1
+        old_session = self._session_id
+        if old_session:
+            with self._state_lock:
+                self._session_generation[old_session] = (
+                    self._session_generation.get(old_session, 0) + 1)
         self._session_id = session_id
         self._namespace = namespace
         self._turn_tickets.clear()
@@ -2130,21 +2346,26 @@ class ZmemMemoryProvider(MemoryProvider):
         return ""
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Passive recall before each turn via the selected transport.
+        """Passive recall before each turn: 30 s cache, then the transport.
 
-        The transport boundary (issue #160) returns the complete parsed
-        #158/#159 envelope — one ``store.py prefetch`` subprocess in local
-        mode, the MCP ``prefetch`` tool over HTTP in remote mode, both under
-        ``ZMEM_HERMES_DEADLINE_S`` — and this adapter extracts ``rendered``.
-        The store subprocess owns selection, budget, the delivery ledger, and
-        the user_prompt query rewrite (its ``ZMEM_QUERY_CONTEXT`` gate); the
-        provider performs no local selection and no rewrite of its own.
+        Issue #162 layering on top of the #160 boundary: the (session,
+        fingerprint) key covers the normalized query, namespace, moment and
+        lane; a fresh ``_PrefetchCache`` hit returns the cached envelope's
+        ``rendered`` with zero transport calls; a miss runs the live
+        transport call through ``self._deadline.run`` (never joining a
+        pending background job).  The transport boundary returns the
+        complete parsed #158/#159 envelope and the store subprocess owns
+        selection, budget, the delivery ledger, and the user_prompt query
+        rewrite; the provider performs no local selection and no rewrite of
+        its own.  Transport failures are recognized (coerced empty envelope:
+        empty ``arms`` and zero budget) and never cached.
         """
         # Issue #110 (P0-5): passive-injection kill switch — no store
         # subprocess, empty delivery, one log line carrying the marker.
         if _inject_disabled():
             logger.info(
                 "zmem prefetch: status=silent reason=disabled (ZMEM_INJECT=0)")
+            self._set_status_count(0)
             return ""
         transport = self._transport
         if transport is None:
@@ -2178,6 +2399,8 @@ class ZmemMemoryProvider(MemoryProvider):
             sid = explicit_session or active_session
             namespace = self._namespace
             epoch = self._turn_epoch
+            with self._state_lock:
+                generation = self._session_generation.get(sid, 0)
             omitted_blocked = (
                 not explicit_session and self._omitted_turn_callbacks_blocked
             )
@@ -2185,17 +2408,55 @@ class ZmemMemoryProvider(MemoryProvider):
                 return ""
             if omitted_blocked:
                 return ""
-        envelope = transport.prefetch(
-            q,
-            namespace=namespace,
-            session_id=sid,
-            moment="user_prompt",
-            ops_tokens=[],
-            lane="hermes-provider",
-        )
-        if not isinstance(envelope, dict) or not isinstance(envelope.get("rendered"), str):
-            logger.debug("zmem prefetch: missing or malformed rendered envelope")
+        key, normalized = self._prefetch_request(q, sid, namespace)
+        if not key[1]:
+            # Empty or trivial query: no store call, status count 0 (#162).
+            self._set_status_count(0)
             return ""
+        cached = self._prefetch_cache.get(key)
+        if cached is not None:
+            self._set_status_count(
+                cached.get("count", 0)
+                if isinstance(cached.get("count"), int)
+                and not isinstance(cached.get("count"), bool) else 0)
+            if explicit_session and active_session:
+                self._remember_turn_prefetch(sid, namespace, epoch, q, cached)
+            return cached["rendered"]
+
+        envelope = self._deadline.run(
+            lambda: self._run_live_prefetch(normalized, sid, namespace,
+                                            transport),
+            self._deadline_s)
+        if not isinstance(envelope, dict):
+            logger.debug(
+                "zmem prefetch: status=silent reason=malformed-envelope")
+            self._set_status_count(0)
+            return ""
+        if self._is_transport_failure(envelope):
+            logger.debug(
+                "zmem prefetch: status=silent reason=transport-failure")
+            self._set_status_count(0)
+            return ""
+        if not self._envelope_is_valid(envelope):
+            logger.debug(
+                "zmem prefetch: status=silent reason=invalid-envelope "
+                "(keys=%s)", sorted(envelope) if isinstance(envelope, dict)
+                else None)
+            self._set_status_count(0)
+            return ""
+        if envelope.get("reason") == "already-delivered":
+            # Review PRR-001: never cache an already-delivered envelope.  In
+            # the queue-vs-live race the ledger gives the rows to exactly one
+            # caller; overwriting the winner's full envelope with the loser's
+            # empty one would suppress replay of content the user may never
+            # have seen.  Next turn re-queries the store, which still
+            # enforces the ledger.
+            self._set_status_count(0)
+            if explicit_session and active_session:
+                self._remember_turn_prefetch(sid, namespace, epoch, q,
+                                             envelope)
+            return envelope["rendered"]
+        self._set_status_count(envelope["count"])
         # The official Hermes lifecycle gives us no safe capture key at
         # prefetch time.  Retain a bounded, redacted envelope in the matching
         # provider-owned turn ticket; sync_turn starts the capture first and
@@ -2203,13 +2464,233 @@ class ZmemMemoryProvider(MemoryProvider):
         # An omitted prefetch has no callback identity.  It may provide
         # ordinary passive context in the initial epoch, but it must never
         # attach an envelope to an explicit ticket.
+        with self._state_lock:
+            # Cache only while this request's session era is still current —
+            # a put landing after a switch's clear_session must not survive.
+            # (The already-delivered envelope never reaches this put: it
+            # returns at the reason gate above — the single live guard.)
+            if self._session_generation.get(sid, 0) == generation:
+                self._prefetch_cache.put(key, envelope)
         if explicit_session and active_session:
             self._remember_turn_prefetch(sid, namespace, epoch, q, envelope)
         return envelope["rendered"]
 
+    def _prefetch_request(self, query: str, session_id: str,
+                          namespace: str) -> tuple[tuple[str, str], str]:
+        """Build the #162 cache key and the normalized transport query.
+
+        ``namespace`` is a REQUIRED parameter fed solely from the caller's
+        lock-captured value (never ``self._namespace`` re-read here) so the
+        fingerprint and the transport call always name the same namespace.
+        """
+        normalized = " ".join(str(query or "").split())[:_MAX_QUERY_CHARS]
+        if not normalized or _is_trivial_query(normalized):
+            return (("", ""), "")
+        sid = str(session_id or "").strip() or self._session_id
+        payload = (b"zmem-prefetch-v1\0" + normalized.encode("utf-8")
+                   + b"\0" + str(namespace).encode("utf-8")
+                   + b"\0user_prompt\0hermes-provider")
+        digest = hashlib.sha256(payload).hexdigest()
+        return ((sid, digest), normalized)
+
+    def _run_live_prefetch(self, query: str, session_id: str,
+                           namespace: str,
+                           transport: Any) -> Optional[Dict[str, Any]]:
+        """One live transport recall with the lock-captured pairing (#162).
+
+        Takes the captured namespace AND the pinned transport instance — no
+        ``self._namespace`` / ``self._transport`` re-read inside the body.
+        """
+        if transport is None:
+            return None
+        envelope = transport.prefetch(
+            query,
+            namespace=namespace,
+            session_id=session_id,
+            moment="user_prompt",
+            ops_tokens=[],
+            lane="hermes-provider",
+        )
+        if isinstance(envelope, dict) and "context" in envelope:
+            # The #159 MCP server adds an additive `context` alias that
+            # duplicates `rendered` (mcp_server.py).  Strip it before the
+            # closed-key check — a server-additive alias is not a store key,
+            # and rejecting it would blackout every MCP-mode response.
+            envelope = {k: v for k, v in envelope.items() if k != "context"}
+        return envelope
+
+    def _is_transport_failure(self, envelope: Dict[str, Any]) -> bool:
+        """Recognize the #160 coerced failure envelope so failures never
+        cache: every transport failure class returns ``arms == {}`` with
+        ``tokens_budget == 0``, while a genuine store envelope (including a
+        real empty pool) always carries a positive budget.  Caching a
+        transient failure would suppress recall for a full TTL."""
+        return envelope.get("arms") == {} \
+            and envelope.get("tokens_budget", 0) == 0
+
+    def _envelope_is_valid(self, envelope: object) -> bool:
+        """Validate one candidate envelope against the consumed #158 key
+        policy (all required keys, nothing outside required ∪ optional) and
+        the issue's value shapes; on a constants-load failure degrade to the
+        #160 transport-equivalent required-keys-present check."""
+        if not isinstance(envelope, dict):
+            return False
+        keys = _load_envelope_key_constants()
+        if keys is not None:
+            required, optional = keys
+            if not required.issubset(envelope.keys()):
+                logger.debug(
+                    "zmem prefetch: envelope missing required keys %s",
+                    sorted(required - set(envelope.keys())))
+                return False
+            unknown = set(envelope.keys()) - (required | optional)
+            if unknown:
+                # Review PRR-005: a store newer than this plugin emits a key
+                # this build does not know; make the resulting recall blackout
+                # diagnosable instead of byte-identical to a zero-hit.
+                logger.debug(
+                    "zmem prefetch: envelope carries unknown keys %s "
+                    "(store newer than plugin?)", sorted(unknown))
+                return False
+        else:
+            for name in _ENVELOPE_REQUIRED_FALLBACK:
+                if name not in envelope:
+                    return False
+        numeric = ("count", "omitted", "tokens_used", "tokens_budget",
+                   "budget_dropped", "budget_admission", "budget_truncated",
+                   "budget_dropped_protected")
+        for field in numeric:
+            value = envelope.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                return False
+        rendered = envelope.get("rendered")
+        if not isinstance(rendered, str):
+            return False
+        if len(rendered) > _PREFETCH_RENDERED_MAX_CHARS:
+            logger.debug(
+                "zmem prefetch: envelope rendered exceeds %d chars; "
+                "refusing", _PREFETCH_RENDERED_MAX_CHARS)
+            return False
+        for field in ("results", "excluded", "candidate_ids"):
+            if not isinstance(envelope.get(field), list):
+                return False
+        for item in envelope["excluded"]:
+            if not isinstance(item, str):
+                return False
+        return True
+
+    def _set_status_count(self, count: int) -> None:
+        with self._state_lock:
+            self._last_status = RecallStatus(provider_label="zmem",
+                                             count=count)
+
+    def recall_status(self) -> RecallStatus:
+        """The last recall status observed by this provider (#162)."""
+        return self._last_status
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """No-op — the manager already background-caches external prefetch."""
+        """Queue one deduplicated background warm per (session, key) (#162).
+
+        Returns without submitting when the kill switch is on, the seam is
+        absent (no-arg construction), the query is empty/trivial, a fresh
+        cache entry exists, the key is already pending, or no transport is
+        configured.  The pending key check-and-insert is one atomic
+        ``_state_lock`` section; a submit failure removes the key and never
+        raises into Hermes.
+        """
+        scheduler = self._scheduler
+        if scheduler is None or _inject_disabled():
+            return None
+        raw_query = query if isinstance(query, str) else ""
+        q = raw_query.strip()[:_MAX_PROMPT_CHARS]
+        explicit_session = str(session_id or "").strip()
+        with self._turn_ticket_lock:
+            transport = self._transport
+            if transport is None:
+                return None
+            active_session = self._session_id
+            sid = explicit_session or active_session
+            if not sid:
+                return None
+            namespace = self._namespace
+        key, normalized = self._prefetch_request(q, sid, namespace)
+        if not key[1]:
+            return None
+        if self._prefetch_cache.get(key) is not None:
+            return None
+        with self._state_lock:
+            if key in self._pending_keys:
+                return None
+            token = uuid.uuid4().hex
+            self._pending_keys[key] = token
+            generation = self._session_generation.get(sid, 0)
+        try:
+            scheduler.submit(
+                lambda: self._run_prefetch_job(key, normalized, sid,
+                                               namespace, transport,
+                                               generation, token))
+        except Exception:
+            with self._state_lock:
+                if self._pending_keys.get(key) == token:
+                    del self._pending_keys[key]
         return None
+
+    def _run_prefetch_job(self, key: tuple[str, str], query: str,
+                          session_id: str, namespace: str, transport: Any,
+                          generation: int, token: str) -> None:
+        """Background warm body: bounded fetch, era-gated store, no raises.
+
+        The fetch uses the submit-time pinned transport and namespace (no
+        run-time re-read — a cross-era fetch would carry store-side ledger
+        side effects under the wrong namespace even with a gated put).  The
+        pending-check and ``cache.put`` are one ``_state_lock`` critical
+        section; the job never touches ``_last_status`` and never writes the
+        ledger.
+        """
+        try:
+            if transport is None:
+                return
+            with self._state_lock:
+                # Pre-fetch era re-check (review PRR-002): shrinks the window
+                # in which a job records store delivery for a session that a
+                # concurrent switch has already invalidated.  A switch landing
+                # mid-fetch can still slip through — the store-owned fence is
+                # future work — but the common switch-before-fetch case is
+                # now refused before the child spawns.
+                if self._pending_keys.get(key) != token:
+                    return
+                if self._session_generation.get(session_id, 0) != generation:
+                    return
+            envelope = self._deadline.run(
+                lambda: self._run_live_prefetch(query, session_id, namespace,
+                                                transport),
+                self._deadline_s)
+            if not isinstance(envelope, dict) \
+                    or self._is_transport_failure(envelope) \
+                    or not self._envelope_is_valid(envelope):
+                return
+            if envelope.get("reason") == "already-delivered":
+                # PRR-001 (review round 5, Critical): the sync call can win
+                # the ledger race and cache the FULL envelope while this job
+                # was still in flight; overwriting the winner with this
+                # job's already-delivered loser would suppress replay of
+                # content the user may never have seen.
+                return
+            with self._state_lock:
+                if self._pending_keys.get(key) != token:
+                    return
+                if self._session_generation.get(session_id, 0) != generation:
+                    return
+                self._prefetch_cache.put(key, envelope)
+        except Exception as exc:
+            logger.debug("zmem prefetch warm failed for %s/%s: %s",
+                         session_id, key[1][:12], exc)
+            return
+        finally:
+            with self._state_lock:
+                if self._pending_keys.get(key) == token:
+                    del self._pending_keys[key]
 
     # -- tools --------------------------------------------------------------
 
@@ -2743,10 +3224,55 @@ class ZmemMemoryProvider(MemoryProvider):
         resolved_session = str(new_session_id or "").strip()
         # Namespace re-derivation follows the issue-#161 precedence (config
         # policy / agent_workspace); the config file itself is NOT reloaded
-        # here — session-switch config reload is #162's surface.
+        # on a switch (no issue requests that; #162 owns the cache,
+        # generation, pending-key, and ledger invalidation performed here).
         resolved_namespace = self._resolve_namespace(**kwargs)
         with self._turn_ticket_lock:
+            old_session_id = self._session_id
+            # _rotate_turn_epoch_locked bumps the LEFT session's generation
+            # under _state_lock, invalidating that session's in-flight
+            # background prefetch jobs at their put-time re-check.
             self._rotate_turn_epoch_locked(resolved_session, resolved_namespace)
+        # One critical section for the switch invalidation: the 30 s cache
+        # entries of the old session go, its pending keys go, and the status
+        # resets — all without waiting for any in-flight job.
+        with self._state_lock:
+            self._last_status = RecallStatus(provider_label="zmem", count=0)
+            self._prefetch_cache.clear_session(old_session_id)
+            self._pending_keys = {
+                key: token for key, token in self._pending_keys.items()
+                if key[0] != old_session_id
+            }
+        if reset and old_session_id:
+            # Issue #158 owns the ledger-clear operation; the provider only
+            # invokes it through the subprocess boundary.  In MCP mode (with
+            # or without a local checkout) the server-side ledger is NOT
+            # cleared here — where a local store.py exists this clears the
+            # LOCAL store instead; either way a failure logs and the
+            # provider fails open.
+            result = _run_store(["ledger-clear", "--session-id",
+                                 old_session_id])
+            # Review PRR-006: sanitize both interpolated fields (raw sid ->
+            # _decision_sid allowlist; raw stderr -> _sanitize_store_error)
+            # and surface the store's own cleared flag — the child reports
+            # ok:true even when the clear was refused by a lock, so ok alone
+            # is not a faithful witness of the side effect.
+            cleared = None
+            try:
+                cleared = json.loads(result.get("stdout") or "{}").get(
+                    "cleared")
+            except (ValueError, TypeError):
+                cleared = None
+            if not result.get("ok"):
+                logger.warning(
+                    "zmem: ledger-clear failed for session %s: %s",
+                    _decision_sid(old_session_id),
+                    _sanitize_store_error(result))
+            elif cleared is False:
+                logger.warning(
+                    "zmem: ledger-clear reported not-cleared for session %s",
+                    _decision_sid(old_session_id))
+        return None
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Detached housekeeping — organize + backup if due.
@@ -3012,7 +3538,13 @@ def _active_memory_provider_name() -> str:
 
 def register(ctx) -> None:
     """Register ZMem as a memory provider plugin."""
-    provider = ZmemMemoryProvider()
+    # Issue #162: construct the production scheduler and DeadlineExecutor at
+    # registration time — never at module import time — and hand both to the
+    # provider as separate objects.
+    deadline = (_transport.DeadlineExecutor()
+                if _transport is not None else None)
+    scheduler = _ThreadScheduler()
+    provider = ZmemMemoryProvider(scheduler=scheduler, deadline=deadline)
     ctx.register_memory_provider(provider)
     # New Hermes SDKs expose the observational collector only when zmem is the
     # active provider.  Older SDKs have no register_hook; that context remains

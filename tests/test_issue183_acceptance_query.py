@@ -244,9 +244,19 @@ class Issue183QueryAcceptance(unittest.TestCase):
 
                 def stub_transport_prefetch(query, **kwargs):
                     delegations.append((query, dict(kwargs)))
+                    # Issue #162: the provider validates the full #158
+                    # envelope; the shared-bytes fixture carries every
+                    # required key.
                     return json.loads(
                         '{"rendered":"shared-bytes","results":[],'
-                        '"reason":"injected"}\n')
+                        '"count":0,"omitted":0,"reason":"injected",'
+                        '"excluded":[],"candidate_ids":[],"tokens_used":0,'
+                        '"tokens_budget":1500,"budget_dropped":0,'
+                        '"budget_admission":0,"budget_truncated":0,'
+                        '"budget_dropped_protected":0,'
+                        '"arms":{"fts":{"pre":0,"post":0},'
+                        '"vec":{"pre":0,"post":0},"ent":{"pre":0,"post":0},'
+                        '"graph":{"pre":0,"post":0}}}\n')
 
                 def unexpected_store(args, timing=None, input_text=None):
                     del timing, input_text

@@ -785,6 +785,21 @@ inactive — **copy users must set `ZMEM_HOME`** to this repo's checkout path
    ```
    Symlink/junction installs skip this — auto-detection handles it.
 
+#### Background prefetch cache (issue #162)
+
+The Hermes provider caches the complete recall envelope for 30 seconds per
+(session, normalized query): a fresh hit serves the store-rendered fence
+with zero transport calls, and `queue_prefetch` warms likely prompts in the
+background — deduplicated per session and fingerprint, with per-session
+generations so a session switch never lands a stale envelope.
+Already-delivered envelopes are passed through but never cached.
+`recall_status()` reports the count delivered by the last recall. A session
+switch invalidates the provider cache and pending warm-ups; `reset=True`
+additionally clears the store-side delivery ledger for the old session
+(local mode — in MCP mode the server-side ledger is not cleared and the
+provider logs a warning instead; rewinds never clear the ledger, so
+delivered ids stay excluded).
+
 ### Hermes Agent — remote (MCP server, different machine on the LAN)
 
 A Hermes agent running on a **different machine** (e.g. a gateway box serving

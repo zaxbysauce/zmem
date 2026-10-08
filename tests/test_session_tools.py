@@ -950,8 +950,14 @@ class ProviderEnvelopeTest(unittest.TestCase):
         self.assertEqual(first, self.expected["rendered"])
         self.assertNotIn("<memory-context>", first)
 
+        # Issue #162: the same (session, fingerprint) inside the 30 s cache
+        # TTL is served from the provider cache without re-hitting the store
+        # (this pin previously expected the store's already-delivered "");
+        # the ledger assertions below prove the store saw exactly one
+        # delivery, and the TTL-expired path stays covered by
+        # test_stale_cache_runs_live_recall in tests/test_hermes_prefetch.py.
         second = self.provider.prefetch("stash pop", session_id=self.SESSION_ID)
-        self.assertEqual(second, "")
+        self.assertEqual(second, first)
 
         ledger_path = self.data_dir / "ops" / (
             hashlib.sha256(self.SESSION_ID.encode("utf-8")).hexdigest()[:32]

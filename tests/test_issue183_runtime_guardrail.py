@@ -336,6 +336,13 @@ class RuntimeGuardrailTest(unittest.TestCase):
                         return real_transport_prefetch(query, **kwargs)
 
                     provider._transport.prefetch = observe_transport
+                    # Issue #162: the no-marker prefetch above cached the
+                    # empty answer for this (session, fingerprint) inside the
+                    # 30 s TTL; the store's rewrite context has since changed,
+                    # so this phase invalidates provider state the way a
+                    # session transition would before proving the live
+                    # delivery through the rewritten store boundary.
+                    provider.on_session_switch(SESSION)
                     try:
                         delivered = provider.prefetch("continue", session_id=SESSION)
                     finally:

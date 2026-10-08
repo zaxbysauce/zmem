@@ -209,7 +209,11 @@ class RealExecutorDeadlineTest(unittest.TestCase):
         self.assertLess(elapsed, 10.0)
 
     def test_provider_truncates_over_4096_char_query(self):
-        """F3: the raw prompt is truncated to _MAX_PROMPT_CHARS (4096)."""
+        """F3, re-pinned by issue #162: the raw prompt is still truncated at
+        ``_MAX_PROMPT_CHARS`` (4096) for the ticket/tombstone digest, and the
+        transport now receives the whitespace-normalized query capped at
+        ``_MAX_QUERY_CHARS`` (500) — the cache fingerprint covers exactly
+        that text, so the two bounds can never diverge on the wire."""
         os.environ["ZMEM_HOME"] = str(REPO_ROOT)
         self.addCleanup(os.environ.pop, "ZMEM_HOME", None)
         provider_mod = _load_provider()
@@ -224,8 +228,7 @@ class RealExecutorDeadlineTest(unittest.TestCase):
         provider._transport = _RecordingTransport()
         provider.prefetch("x" * 5000, session_id="s")
         self.assertEqual(len(seen), 1)
-        self.assertEqual(len(seen[0]), 4096)
-        self.assertEqual(len(seen[0]), provider_mod._MAX_PROMPT_CHARS)
+        self.assertEqual(len(seen[0]), provider_mod._MAX_QUERY_CHARS)
         self.assertTrue(all(ch == "x" for ch in seen[0]))
 
 
