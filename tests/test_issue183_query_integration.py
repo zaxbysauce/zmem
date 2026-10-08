@@ -783,10 +783,10 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
         self.assertEqual([args[0] for args in calls], ["query-rewrite", "recall"])
         self.assertEqual(calls[1][calls[1].index("--query") + 1], "empty.py")
 
-        # Issue #160 repin: an empty prompt is delegated ONCE with query ""
-        # (the queryless selector path inside store.py's prefetch replaces the
-        # old provider-side rewrite-before-recent sequence; the store-leg
-        # checks below still pin the shared empty-query rewrite itself).
+        # Issue #162 repin (supersedes the #160 empty-delegation pin): an
+        # empty or trivial prompt is refused by the provider's trivial-query
+        # gate and never reaches the transport; the store-leg checks below
+        # still pin the shared empty-query rewrite at the store boundary.
         provider = _load_provider()
         with tempfile.TemporaryDirectory(prefix="zmem-183-empty-delegate-") as raw:
             empty_tmp = Path(raw)

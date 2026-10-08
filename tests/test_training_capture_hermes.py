@@ -769,26 +769,35 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             self.assertEqual(provider._turn_tickets, [])
 
     def test_oversized_snapshot_fields_fail_closed_without_snapshot(self):
+        # Issue #162 fixture modernization + oracle repair (review round 3):
+        # every case now carries the full 14-key envelope the provider
+        # validates, and sync_turn supplies task_id so the snapshot branch
+        # is REACHABLE — the old shape (no task_id, partial dicts) could
+        # never enqueue a snapshot, making the no-snapshot assertion
+        # vacuous.  The oversized fields ride keys the closed #158 policy
+        # allows (rendered / effective_ops), so the bounding caps — not the
+        # key policy — are what fail the snapshot closed; the healthy
+        # control proves the oracle can observe a snapshot.
         with _plugin_context() as plugin:
             def oversized(limit: int) -> str:
                 return "x " * (limit // 2 + 1)
 
-            oversized_envelopes = (
-                {
-                    "rendered": oversized(plugin._HERMES_TICKET_RENDERED_MAX_BYTES),
-                    "effective_ops": [],
-                    "transform_version": "v1",
-                },
-                _full_envelope("context"),
-                _full_envelope(
-                    "context",
-                    transform_version=oversized(
-                        plugin._HERMES_TICKET_VERSION_MAX_BYTES),
-                ),
+            cases = (
+                ("oversized-rendered",
+                 _full_envelope(
+                     oversized(plugin._HERMES_TICKET_RENDERED_MAX_BYTES)),
+                 False),
+                ("oversized-effective-ops",
+                 _full_envelope(
+                     "context",
+                     effective_ops=[oversized(
+                         plugin._HERMES_TICKET_OPS_MAX_BYTES)]),
+                 False),
+                ("healthy-control", _full_envelope("context"), True),
             )
-            for index, envelope in enumerate(oversized_envelopes):
+            for label, envelope, expect_snapshot in cases:
                 provider = plugin.ZmemMemoryProvider()
-                provider._session_id = f"session-hermes-{index}"
+                provider._session_id = f"session-hermes-{label}"
                 provider._namespace = "project:hermes-hook"
                 provider._transport = mock.Mock()
                 provider._transport.prefetch.return_value = envelope
@@ -804,8 +813,15 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                         1, "prompt", session_id=provider._session_id,
                     )
                     provider.prefetch("prompt", session_id=provider._session_id)
-                    provider.sync_turn("prompt", "response", session_id=provider._session_id)
-                self.assertEqual(calls, [], f"field case {index} unexpectedly snapshotted")
+                    provider.sync_turn("prompt", "response",
+                                       session_id=provider._session_id,
+                                       task_id=f"task-{label}")
+                if expect_snapshot:
+                    self.assertEqual([action for action, _ in calls],
+                                     ["snapshot"], label)
+                else:
+                    self.assertEqual(calls, [],
+                                     f"{label} unexpectedly snapshotted")
 
     def test_reinitialize_same_session_clears_stale_turn_ticket(self):
         with _plugin_context() as plugin:
