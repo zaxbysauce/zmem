@@ -59,6 +59,24 @@ def _plugin_context():
         yield module
 
 
+
+def _full_envelope(rendered, **extra):
+    """Issue #162: the provider validates the complete #158 envelope, so the
+    mock transports here carry every required key (a bare rendered dict is
+    malformed now and would fail open to "")."""
+    envelope = {
+        "results": [], "count": 0, "omitted": 0, "reason": "injected",
+        "excluded": [], "candidate_ids": [], "tokens_used": 0,
+        "tokens_budget": 1500, "budget_dropped": 0, "budget_admission": 0,
+        "budget_truncated": 0, "budget_dropped_protected": 0,
+        "arms": {"fts": {"pre": 0, "post": 0}, "vec": {"pre": 0, "post": 0},
+                 "ent": {"pre": 0, "post": 0}, "graph": {"pre": 0, "post": 0}},
+        "rendered": rendered,
+    }
+    envelope.update(extra)
+    return envelope
+
+
 class HermesTrainingCaptureTests(unittest.TestCase):
     def test_real_capture_subprocess_uses_the_private_five_second_cap(self):
         with _plugin_context() as plugin:
@@ -76,9 +94,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
         with _plugin_context() as plugin:
             provider = plugin.ZmemMemoryProvider()
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "preinit context", "effective_ops": [], "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("preinit context")
             before = (provider._session_id, provider._namespace, provider._turn_epoch,
                       list(provider._turn_tickets), provider._omitted_turn_callbacks_blocked)
             with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "0", "ZMEM_INJECT": "1"}, clear=False), \
@@ -161,11 +177,14 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._session_id = "session-hermes"
             provider._namespace = "project:hermes-hook"
             calls = []
-            envelope = {
-                "rendered": "<<<ZMEM_UNTRUSTED_FENCE>>>context<<<END>>>",
-                "effective_ops": ["zmem_search"],
-                "transform_version": "v2",
-            }
+            # Issue #162: the provider validates the closed #158 key
+            # policy, so the transport envelope cannot carry
+            # transform_version (not a #158 key) - the snapshot records the
+            # _hermes_ticket_envelope default for it.
+            envelope = _full_envelope(
+                "<<<ZMEM_UNTRUSTED_FENCE>>>context<<<END>>>",
+                effective_ops=[],
+            )
             provider._transport = mock.Mock()
             provider._transport.prefetch.return_value = envelope
             with mock.patch.dict(os.environ, {"ZMEM_QUERY_CONTEXT": "0", "ZMEM_INJECT": "1"}, clear=False), \
@@ -188,7 +207,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             self.assertEqual(action, "snapshot")
             self.assertEqual(payload["rendered"], envelope["rendered"])
             self.assertEqual(payload["effective_ops"], envelope["effective_ops"])
-            self.assertEqual(payload["transform_version"], "v2")
+            self.assertEqual(payload["transform_version"], "v1")
             self.assertEqual(payload["capture_key"], start.call_args.args[1]["capture_key"])
             self.assertEqual(start.call_args.args[1]["host_task_id"], "task-hermes")
             self.assertEqual(payload["host_task_id"], "task-hermes")
@@ -199,9 +218,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._session_id = "session-hermes"
             provider._namespace = "project:hermes-hook"
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "context", "effective_ops": [], "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("context")
             starts = []
             snapshots = []
             with mock.patch.object(
@@ -228,9 +245,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._session_id = "session-hermes"
             provider._namespace = "project:hermes-hook"
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "context", "effective_ops": [], "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("context")
             calls = []
             with mock.patch.object(plugin, "_run_training_capture",
                                    return_value={"capture_id": "capture-hermes"}) as start, \
@@ -254,8 +269,8 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._namespace = "project:hermes-hook"
             provider._transport = mock.Mock()
             provider._transport.prefetch.side_effect = [
-                {"rendered": "context-a", "effective_ops": [], "transform_version": "v1"},
-                {"rendered": "context-b", "effective_ops": [], "transform_version": "v1"},
+                _full_envelope("context-a"),
+                _full_envelope("context-b"),
             ]
             calls = []
             with mock.patch.object(plugin, "_run_training_capture",
@@ -282,9 +297,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._session_id = "session-hermes"
             provider._namespace = "project:hermes-hook"
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "context", "effective_ops": [], "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("context")
             calls = []
             with mock.patch.object(plugin, "_run_training_capture",
                                    return_value={"capture_id": "capture-hermes"}) as start, \
@@ -344,11 +357,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             def delayed_prefetch(*_args, **_kwargs):
                 entered.set()
                 self.assertTrue(release.wait(2.0))
-                return {
-                    "rendered": "delayed context",
-                    "effective_ops": [],
-                    "transform_version": "v1",
-                }
+                return _full_envelope("delayed context")
 
             provider._transport.prefetch.side_effect = delayed_prefetch
             provider.on_turn_start(1, "same prompt", session_id="session-same")
@@ -379,11 +388,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._transport.prefetch.side_effect = lambda *_args, **_kwargs: (
                 entered.set(),
                 release.wait(2.0),
-                {
-                    "rendered": "late duplicate context",
-                    "effective_ops": [],
-                    "transform_version": "v1",
-                },
+                _full_envelope("late duplicate context"),
             )[-1]
             starts = []
             snapshots = []
@@ -436,11 +441,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider.on_session_switch("session-new")
             starts = []
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "must not fetch",
-                "effective_ops": [],
-                "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("must not fetch")
             with mock.patch.object(
                 plugin, "_run_training_capture",
                 side_effect=lambda action, payload: starts.append((action, payload))
@@ -467,11 +468,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider = plugin.ZmemMemoryProvider()
             provider.initialize("session-first")
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "first epoch context",
-                "effective_ops": [],
-                "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("first epoch context")
             starts = []
             snapshots = []
             with mock.patch.object(
@@ -506,11 +503,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider.initialize("session-old")
             provider.on_session_switch("session-new")
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "current context",
-                "effective_ops": [],
-                "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("current context")
             starts = []
             snapshots = []
             with mock.patch.object(
@@ -653,11 +646,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._session_id = "session-hermes-long"
             provider._namespace = "project:hermes-hook"
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "long-turn context",
-                "effective_ops": ["zmem_search"],
-                "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("long-turn context")
             clock = [100.0]
             calls = []
             with mock.patch.object(plugin.time, "monotonic", side_effect=lambda: clock[0]), \
@@ -706,9 +695,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._namespace = "project:hermes-hook"
             provider._transport = mock.Mock()
             raw = "Bearer sk-test-12345678901234567890 user@example.com"
-            provider._transport.prefetch.return_value = {
-                "rendered": raw, "effective_ops": [raw], "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope(raw, effective_ops=[raw])
             calls = []
             with mock.patch.object(plugin, "_run_training_capture",
                                    return_value={"capture_id": "capture-hermes"}), \
@@ -792,18 +779,12 @@ class HermesTrainingCaptureTests(unittest.TestCase):
                     "effective_ops": [],
                     "transform_version": "v1",
                 },
-                {
-                    "rendered": "context",
-                    "effective_ops": [
-                        oversized(plugin._HERMES_TICKET_VERSION_MAX_BYTES)
-                    ],
-                    "transform_version": "v1",
-                },
-                {
-                    "rendered": "context",
-                    "effective_ops": [],
-                    "transform_version": oversized(plugin._HERMES_TICKET_VERSION_MAX_BYTES),
-                },
+                _full_envelope("context"),
+                _full_envelope(
+                    "context",
+                    transform_version=oversized(
+                        plugin._HERMES_TICKET_VERSION_MAX_BYTES),
+                ),
             )
             for index, envelope in enumerate(oversized_envelopes):
                 provider = plugin.ZmemMemoryProvider()
@@ -859,11 +840,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
             provider._session_id = "session-hermes-real"
             provider._namespace = "project:hermes-real"
             provider._transport = mock.Mock()
-            provider._transport.prefetch.return_value = {
-                "rendered": "real adapter context",
-                "effective_ops": ["zmem_search"],
-                "transform_version": "v1",
-            }
+            provider._transport.prefetch.return_value = _full_envelope("real adapter context")
             observed_starts = []
             original_capture = plugin._run_training_capture
 
@@ -1003,7 +980,7 @@ class HermesTrainingCaptureTests(unittest.TestCase):
 
         completed = mock.Mock()
         completed.communicate.return_value = (
-            json.dumps({"rendered": "", "effective_ops": [], "transform_version": "v1"}), "",
+            json.dumps(_full_envelope("")), "",
         )
         with mock.patch.object(transport.subprocess, "Popen", return_value=completed) as popen:
             with mock.patch.dict(os.environ, {}, clear=True):

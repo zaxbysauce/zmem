@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import contextvars
 import copy
-import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -69,12 +68,31 @@ except ModuleNotFoundError as _exc:
 try:  # issue #162: use the host's own status record when the SDK exposes it.
     from agent.memory_provider import RecallStatus  # type: ignore[no-redef]
 except (ImportError, ModuleNotFoundError):  # test stubs and older SDKs
-    @dataclasses.dataclass(frozen=True)
     class RecallStatus:  # type: ignore[no-redef]
-        """Provider recall status surfaced to the host via ``recall_status``."""
+        """Provider recall status surfaced to the host via ``recall_status``.
 
-        provider_label: str = "zmem"
-        count: int = 0
+        Deliberately a plain class, NOT a ``@dataclass``: dataclass
+        processing resolves the module through ``sys.modules``, which a
+        file-path-loaded plugin (the standard test and host loading
+        pattern) is not guaranteed to be registered under — the decorator
+        raised AttributeError at import time in that shape.
+        """
+
+        __slots__ = ("provider_label", "count")
+
+        def __init__(self, provider_label: str = "zmem", count: int = 0) \
+                -> None:
+            self.provider_label = provider_label
+            self.count = count
+
+        def __repr__(self) -> str:
+            return "RecallStatus(provider_label=%r, count=%r)" % (
+                self.provider_label, self.count)
+
+        def __eq__(self, other: object) -> bool:
+            return (isinstance(other, RecallStatus)
+                    and self.provider_label == other.provider_label
+                    and self.count == other.count)
 
 
 logger = logging.getLogger(__name__)

@@ -679,7 +679,20 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
 
         def recording_transport_prefetch(query, **kwargs):
             delegations.append((query, dict(kwargs)))
-            return {"rendered": "selected"}
+            # Issue #162: the provider validates the full #158 envelope, so
+            # the fixture carries every required key (a bare rendered dict
+            # is malformed now and would fail open to "").
+            return dict({
+                "results": [], "count": 0, "omitted": 0, "reason": "ok",
+                "excluded": [], "candidate_ids": [], "tokens_used": 0,
+                "tokens_budget": 1500, "budget_dropped": 0,
+                "budget_admission": 0, "budget_truncated": 0,
+                "budget_dropped_protected": 0,
+                "arms": {"fts": {"pre": 0, "post": 0},
+                         "vec": {"pre": 0, "post": 0},
+                         "ent": {"pre": 0, "post": 0},
+                         "graph": {"pre": 0, "post": 0}},
+            }, rendered="selected")
 
         def unexpected_store(args, timing=None, input_text=None):
             del timing, input_text
@@ -790,13 +803,14 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
 
                 instance._transport.prefetch = wrapped_prefetch
                 try:
+                    # Issue #162 repin (supersedes the #160 empty-delegation
+                    # pin): an empty prompt is refused by the trivial-query
+                    # gate and never reaches the transport.
                     self.assertEqual(instance.prefetch("", session_id="s"), "")
+                    self.assertEqual(instance.prefetch("thanks", session_id="s"), "")
                 finally:
                     instance._transport.prefetch = original_prefetch
-                self.assertEqual(len(delegations), 1, delegations)
-                self.assertEqual(delegations[0][0], "")
-                self.assertEqual(delegations[0][1]["moment"], "user_prompt")
-                self.assertEqual(delegations[0][1]["lane"], "hermes-provider")
+                self.assertEqual(len(delegations), 0, delegations)
 
         with tempfile.TemporaryDirectory(prefix="zmem-183-query-prefetch-") as raw:
             tmp = Path(raw)

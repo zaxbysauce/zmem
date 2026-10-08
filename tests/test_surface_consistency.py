@@ -126,10 +126,21 @@ class AdapterScanTest(unittest.TestCase):
         # selector call, passive by construction (there is no retrieval to
         # bump) — so the pin is the delegation plus the transport's local
         # argv running that command.
+        live = self._method_body(text, "_run_live_prefetch")
+        # Issue #162: prefetch delegates through the _run_live_prefetch
+        # helper (cache-first; the live path is deadline-bounded), which is
+        # where the issue #160 transport delegation now lives — the passive
+        # no-bump #159 prefetch command is unchanged behind it.
+        self.assertIn(
+            "_run_live_prefetch",
+            prefetch,
+            "Hermes prefetch must route its live path through the #162 "
+            "deadline-bounded helper",
+        )
         self.assertIn(
             "transport.prefetch",
-            prefetch,
-            "Hermes prefetch must delegate to the issue #160 transport "
+            live,
+            "the live helper must delegate to the issue #160 transport "
             "(the passive no-bump #159 prefetch command)",
         )
         transport = (REPO_ROOT / "hermes-plugin" / "transport.py").read_text(

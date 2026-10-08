@@ -89,11 +89,19 @@ def _load_compat_hook():
 
 # A complete #158/#159 selector envelope (the transport coerces to exactly
 # this key set), used by the recording transport stubs below.
+# Issue #162: a genuine store "ok" envelope always carries a positive
+# budget and a populated arms object; the zero-budget/empty-arms shape is
+# the #160 transports' coerced FAILURE envelope and the provider's failure
+# discriminator (which keeps a transient timeout from being cached for a
+# full TTL) classifies it as such.  This fixture was modernized to the
+# realistic shape so it exercises the success path.
 _OK_ENVELOPE = {
     "results": [], "count": 0, "omitted": 0, "reason": "ok",
     "excluded": [], "candidate_ids": [], "tokens_used": 0,
-    "tokens_budget": 0, "budget_dropped": 0, "budget_admission": 0,
-    "budget_truncated": 0, "budget_dropped_protected": 0, "arms": {},
+    "tokens_budget": 1500, "budget_dropped": 0, "budget_admission": 0,
+    "budget_truncated": 0, "budget_dropped_protected": 0,
+    "arms": {"fts": {"pre": 0, "post": 0}, "vec": {"pre": 0, "post": 0},
+             "ent": {"pre": 0, "post": 0}, "graph": {"pre": 0, "post": 0}},
     "rendered": "",
 }
 
@@ -211,9 +219,11 @@ class WaveD2QueryEdges(unittest.TestCase):
                 self.assertEqual(provider.prefetch("continue", session_id="s"), "")
 
     def test_provider_empty_user_prompt_uses_shared_rewrite_before_recent(self):
-        # Issue #160 repin: an empty prompt is delegated ONCE with query "";
-        # the queryless selector path inside store.py's prefetch replaces the
-        # old provider-side rewrite-before-recent sequence.
+        # Issue #162 repin (supersedes the #160 delegation pin): an empty or
+        # trivial prompt is refused by the provider's trivial-query gate —
+        # it never reaches the transport and never warms the cache.  The
+        # queryless selector path inside store.py's prefetch remains the
+        # store-owned rewrite source for the surfaces that still delegate.
         provider_mod = _load_provider()
         delegations: list[tuple[str, dict]] = []
 
@@ -226,15 +236,17 @@ class WaveD2QueryEdges(unittest.TestCase):
             provider._namespace = "project:d2"
             self.assertIsNotNone(provider._transport)
             provider._transport.prefetch = recording_prefetch
-            self.assertEqual(provider.prefetch("", session_id="s"), "ok")
-        self.assertEqual(len(delegations), 1, delegations)
-        self.assertEqual(delegations[0][0], "")
-        self.assertEqual(delegations[0][1]["moment"], "user_prompt")
+            self.assertEqual(provider.prefetch("", session_id="s"), "")
+            self.assertEqual(provider.prefetch("ok", session_id="s"), "")
+        self.assertEqual(len(delegations), 0, delegations)
 
     def test_provider_classifies_full_prompt_before_500_char_output_cap(self):
-        # Issue #160 repin: the provider delegates the RAW prompt — no
-        # provider-side pre-truncation.  Classification-on-complete-prompt
-        # and the 500-char rewrite output cap are store-owned
+        # Issue #162 repin (supersedes the #160 raw-delegation pin): the
+        # provider delegates the whitespace-normalized query capped at
+        # _MAX_QUERY_CHARS (500) — the cache fingerprint covers exactly that
+        # text, so key and transport input can never diverge.  The full
+        # prompt is still what the ticket/tombstone digest sees, and
+        # classification and the rewrite output cap remain store-owned
         # (storelib/query_ambiguity.py), reached through the delegated
         # prefetch subprocess.
         provider_mod = _load_provider()
@@ -257,8 +269,9 @@ class WaveD2QueryEdges(unittest.TestCase):
 
         self.assertEqual(len(delegations), 1, delegations)
         delegated_query, delegated_kwargs = delegations[0]
-        self.assertEqual(delegated_query, prompt)
-        self.assertEqual(len(delegated_query), len(prompt))
+        normalized = " ".join(prompt.split())[:provider_mod._MAX_QUERY_CHARS]
+        self.assertEqual(delegated_query, normalized)
+        self.assertLessEqual(len(delegated_query), provider_mod._MAX_QUERY_CHARS)
         self.assertEqual(delegated_kwargs["moment"], "user_prompt")
         self.assertEqual(delegated_kwargs["lane"], "hermes-provider")
 

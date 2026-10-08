@@ -235,8 +235,12 @@ class PassiveParityTest(unittest.TestCase):
             entries = json.loads(ledger_path.read_text(encoding="utf-8"))["entries"]
             self.assertEqual([entry["id"] for entry in entries], ROW_IDS)
 
+            # Issue #162: the immediate repeat is served from the 30 s
+            # provider cache (previously the store's already-delivered "");
+            # the raw store envelope asserted below still proves the
+            # store-side ledger kept its already-delivered semantics.
             second = provider.prefetch("stash pop", session_id=session_id)
-            self.assertEqual(second, "")
+            self.assertEqual(second, first)
 
             envelope = subprocess.run(
                 [
