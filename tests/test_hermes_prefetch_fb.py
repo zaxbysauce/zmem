@@ -167,6 +167,38 @@ class AlreadyDeliveredNotCachedTest(unittest.TestCase):
         self.assertIsNone(provider._prefetch_cache.get(key),
                           "the already-delivered loser must not be re-cached")
 
+    def test_job_loser_never_overwrites_sync_winner(self):
+        # Review round 5 Critical: the sync call wins the ledger race and
+        # caches the FULL envelope; the queued job then runs, gets the
+        # already-delivered loser, and must NOT overwrite the winner.
+        fake = _load_fake_executor()
+        mod = _load_provider("zmem_162_fb_jobloser")
+        scheduler = fake.FakeExecutor()
+        deadline = fake.FakeExecutor()
+        transport = FakeTransport()
+        provider = _provider(mod, scheduler, deadline, transport)
+        key = ("sid-a", _fingerprint("project alpha"))
+        submitted = []
+        original_submit = scheduler.submit
+
+        def recording_submit(fn, delay_s=None):
+            submitted.append(fn)
+            return original_submit(fn, delay_s=delay_s)
+
+        scheduler.submit = recording_submit
+        provider.queue_prefetch("project alpha", session_id="sid-a")
+        # The sync call runs FIRST: it reaches the store, delivers, and
+        # caches the full envelope (the pending job has not run yet).
+        rendered = provider.prefetch("project alpha", session_id="sid-a")
+        self.assertNotEqual(rendered, "")
+        self.assertEqual(provider._prefetch_cache.get(key)["count"], 3)
+        # Now the queued job unwinds against the spent ledger: it gets the
+        # already-delivered loser and must leave the winner untouched.
+        submitted[0]()
+        cached = provider._prefetch_cache.get(key)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["count"], 3)
+
     def test_already_delivered_with_no_winner_not_cached(self):
         fake = _load_fake_executor()
         mod = _load_provider("zmem_162_fb_ad2")

@@ -2422,9 +2422,7 @@ class ZmemMemoryProvider(MemoryProvider):
             if explicit_session and active_session:
                 self._remember_turn_prefetch(sid, namespace, epoch, q, cached)
             return cached["rendered"]
-        if prompt_digest is None:
-            logger.debug(
-                "zmem prefetch: status=silent reason=prompt-too-long")
+
         envelope = self._deadline.run(
             lambda: self._run_live_prefetch(normalized, sid, namespace,
                                             transport),
@@ -2469,8 +2467,9 @@ class ZmemMemoryProvider(MemoryProvider):
         with self._state_lock:
             # Cache only while this request's session era is still current —
             # a put landing after a switch's clear_session must not survive.
-            if self._session_generation.get(sid, 0) == generation \
-                    and envelope.get("reason") != "already-delivered":
+            # (The already-delivered envelope never reaches this put: it
+            # returns at the reason gate above — the single live guard.)
+            if self._session_generation.get(sid, 0) == generation:
                 self._prefetch_cache.put(key, envelope)
         if explicit_session and active_session:
             self._remember_turn_prefetch(sid, namespace, epoch, q, envelope)
@@ -2670,6 +2669,13 @@ class ZmemMemoryProvider(MemoryProvider):
             if not isinstance(envelope, dict) \
                     or self._is_transport_failure(envelope) \
                     or not self._envelope_is_valid(envelope):
+                return
+            if envelope.get("reason") == "already-delivered":
+                # PRR-001 (review round 5, Critical): the sync call can win
+                # the ledger race and cache the FULL envelope while this job
+                # was still in flight; overwriting the winner with this
+                # job's already-delivered loser would suppress replay of
+                # content the user may never have seen.
                 return
             with self._state_lock:
                 if self._pending_keys.get(key) != token:
