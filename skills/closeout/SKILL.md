@@ -141,6 +141,22 @@ deferred items in place), and prune stale low-confidence candidates:
 "$P" "$S" queue-clear --namespace "<derived namespace>" --drop-stale
 ```
 
+**Convention-drift scan (issue #261):** after the per-item review above, run
+the read-only drift scan once — it cross-references the queue you just
+reviewed against the namespace's LIVE `convention` rows and surfaces any
+convention a queued correction contradicts (polarity flip + shared content
+stem; false positives are acceptable, it only surfaces candidates):
+
+```bash
+"$P" "$S" convention-drift --namespace "<derived namespace>" --json
+```
+
+It NEVER writes anything — surfaced ids are update candidates for YOU to act
+on deliberately (Step 3's `invalidate --id <uuid> --reason ...` when the
+correction wins, or keep the convention and reject the item when it does
+not). An empty `{"candidates": []}` is the normal outcome; a failed scan
+(read error) reads as "drift scan unavailable" in the report, never an abort.
+
 ## Step 1 — Recall before you write
 
 For each candidate lesson, check what the store already believes:
@@ -349,6 +365,10 @@ State plainly:
 - Whether consolidation merged anything
 - Correction candidates reviewed (from Step 0.5's queue): reviewed N, captured M,
   rejected K (and why)
+- Convention-drift candidates (from Step 0.5's drift scan): <candidate ids or
+  "none"> — live `convention` rows this session's queued corrections
+  contradict (issue #261); name each id and what you did (invalidated, kept
+  with the correction rejected, or deferred with why)
 - Skills promoted (and why those, not the others)
 - What you deliberately did **not** capture, and why
 

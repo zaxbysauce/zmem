@@ -1349,6 +1349,75 @@ def cmd_queue_add(*, namespace: str, message: str, type_: str,
     return 0
 
 
+def cmd_convention_drift(conn, *, namespace: str, as_json: bool) -> int:
+    """Surface live `convention` rows a queued correction contradicts
+    (issue #261, Workstream R PR 5).
+
+    Read-only by contract: it loads the namespace's queued correction items
+    (the same sidecar `queue-list` reads, fail-open to []) and the
+    namespace's live rows through the list-shaped read (list_memory's WHERE
+    clauses plus its ORDER BY; no LIMIT — a window here would silently MISS
+    convention rows, and the issue names false negatives as the primary
+    risk), then filters `type == "convention"` in Python (`list` has no
+    --type flag). A row becomes a candidate when some queued item's message
+    DISAGREES with it by polarity (`_polarity_signature` differs — the same
+    signal the write-time dedupe guard `dedup_polarity_conflict` applies)
+    while sharing at least one `_predicate_tokens` content stem, so a
+    token-disjoint note never flags. False positives are acceptable by the
+    issue's constraint; it only SURFACES ids for a reviewer's deliberate
+    `update`/`invalidate` — nothing is written (no bump, no telemetry, no
+    supersede; the store file stays byte-identical, pinned by
+    tests/test_r05_convention_drift.py).
+
+    Dispatches AFTER connect() (unlike queue-list/queue-clear/queue-add) —
+    it needs the store as well as the queue — and is exempt from
+    `_auto_near_miss_rekey` (a pure-read surface must not trigger the
+    rekey's writes; export-dataset precedent).
+    """
+    try:
+        import correction_queue as _cq
+        items = _cq.load_queue(namespace)
+    except Exception:
+        items = []
+    messages = []
+    for it in items:
+        msg = it.get("message")
+        if isinstance(msg, str) and msg.strip():
+            messages.append(msg)
+    # Function-local import (the dedup_polarity_conflict pattern):
+    # consolidate imports write/sync at module top and sync imports this
+    # module, so a module-level import would cycle.
+    from storelib.consolidate import _polarity_signature, _predicate_tokens
+    pairs = [(_polarity_signature(m), _predicate_tokens(m)) for m in messages]
+    rows = conn.execute(
+        "SELECT id, type, content FROM memory "
+        "WHERE namespace=? AND superseded_at IS NULL "
+        "ORDER BY ingestion_ts DESC",
+        (namespace,),
+    ).fetchall()
+    candidates = []
+    for row in rows:
+        if row["type"] != "convention":
+            continue
+        content = row["content"] or ""
+        row_polarity = _polarity_signature(content)
+        row_tokens = _predicate_tokens(content)
+        hit = any(pol != row_polarity and bool(tokens & row_tokens)
+                  for pol, tokens in pairs)
+        if hit:
+            candidates.append(row)
+    if as_json:
+        print(json.dumps({"candidates": [{"id": r["id"]} for r in candidates]}))
+        return 0
+    if not candidates:
+        print("(no convention-drift candidates)")
+        return 0
+    for r in candidates:
+        preview = " ".join((r["content"] or "").split())[:80]
+        print("- %s :: %s" % (r["id"], preview))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Issue #71 E: promote-store — one-shot merge of a leftover second store into
 # the canonical one. Optional companion to doctor's `second-stores` check.

@@ -2091,6 +2091,28 @@ is reviewed under the SAME closeout Step 0.5 rubric as any other queue item —
 there is no fast track; `--type` accepts exactly the `add` command's type
 enum, so an accepted note needs no type conversion when it is promoted.
 
+### convention-drift — surface conventions a queued correction contradicts (read-only)
+```
+<interpreter> <store.py> convention-drift --namespace NS [--json]
+```
+Read-only drift scan (issue #261): loads the namespace's queued correction
+items (the same sidecar `queue-list` reads) and the namespace's live rows,
+keeps `type == "convention"` (filtered in Python — `list` has no `--type`
+flag), and reports each convention row some queued item's message
+CONTRADICTS by the same lexical/polarity overlap the write-time
+dedupe/supersede guard uses (negation-polarity flip + at least one shared
+content stem; token-disjoint notes never flag). `--json` emits
+`{"candidates": [{"id": ...}, ...]}`; plain mode prints one
+`- <id> :: <preview>` line per candidate. It never writes — no invalidate,
+update, supersede, or telemetry, and the store file stays byte-identical —
+surfaced ids are update candidates for the reviewer's deliberate
+`update`/`invalidate` at closeout (false positives are acceptable; a missed
+real contradiction is the failure mode it minimizes). Unlike the queue
+family it opens the store (it reads live rows), so it dispatches after
+connect like `list`; it is exempt from the automatic near-miss rekey (a
+pure-read surface must not trigger the rekey's writes). Works without an
+embedding model — the predicate is lexical only.
+
 ### export-pack — render a Tier 1 markdown memory pack
 ```
 <interpreter> <store.py> export-pack --namespace NS [--out FILE] [--project-limit 50] \

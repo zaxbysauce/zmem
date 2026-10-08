@@ -10,6 +10,32 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.87.0] - 2026-10-08
+
+### Added
+
+- **New `store.py convention-drift` subcommand (issue #261, Workstream R
+  PR 5)** — a read-only closeout surface connecting the correction queue
+  (#47 live capture / mine-history, #260 `queue-add`) to the store's
+  `convention` rows. `convention-drift --namespace NS [--json]` loads the
+  namespace's queued items and its live rows through the list-shaped read
+  (no new query path; `type == "convention"` filtered in Python — `list`
+  has no `--type` flag) and reports each convention row some queued
+  message CONTRADICTS, using the same lexical/polarity overlap the
+  write-time dedupe guard applies (negation-polarity flip plus at least one
+  shared content stem; false positives acceptable, missed contradictions
+  minimized). `--json` emits `{"candidates": [{"id": ...}, ...]}`.
+  Nothing is ever written — no invalidate/update/supersede/telemetry, the
+  store file stays byte-identical — and the command is exempt from the
+  automatic near-miss rekey (a pure read must not trigger its writes,
+  export-dataset precedent). The closeout skill wires the scan into Step
+  0.5 and adds a "Convention-drift candidates" line to the Step 6 report
+  next to "Correction candidates reviewed"; surfaced ids stay update
+  candidates for the reviewer's deliberate `update`/`invalidate`.
+  Guarded by tests/test_r05_convention_drift.py: contradiction named
+  exactly once, token-disjoint note names nothing, non-convention rows
+  never candidates, store bytes identical across a detection run.
+
 ## [0.86.0] - 2026-10-07
 
 ### Added
