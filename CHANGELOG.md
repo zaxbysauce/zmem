@@ -10,6 +10,19 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.88.0] - 2026-10-08
+
+### Added
+
+- **Hermes provider background prefetch cache (issue #162)**: the provider now keeps a 30-second complete-envelope cache keyed by (session id, fingerprint), where the fingerprint is the documented SHA-256 over the normalized query, namespace, `user_prompt` moment, and `hermes-provider` lane. A fresh hit returns the store-rendered fence with zero transport calls; a stale entry (>= 30 s) runs exactly one live transport call and stores the replacement. Empty and trivial queries ("ok", "yes", "no", "thanks", "thank you") never touch the cache or the store.
+- **`queue_prefetch` (issue #162)**: the previously no-op hint now submits exactly one deduplicated background job per (session, fingerprint) through an injected scheduler seam — pending keys, per-session generations, and submit failures (which remove the key and never raise into Hermes) included. Jobs are daemon-bounded and store results only while the key is pending and the session generation is still current, so a session switch can never land a stale envelope. A transient transport failure (the coerced empty-envelope shape) is recognized and never cached, so a timeout cannot suppress recall for a full TTL.
+- **`recall_status()` (issue #162)**: the provider surfaces a `RecallStatus(provider_label="zmem", count=N)` for every valid envelope — including valid zero-row deliveries — and resets to count 0 on empty/trivial queries, transport failures, and session switches.
+
+### Changed
+
+- **Session-switch invalidation (issue #162)**: `on_session_switch` now captures the old session before rebinding, clears that session's cache entries and pending keys as one atomic step, and resets the recall status; the session being left loses generation validity on every rotation path (switch, rewind, end, re-initialize), invalidating in-flight background jobs at their put-time re-check. `reset=True` additionally clears the old session's store-side delivery ledger through the #158-owned `store.py ledger-clear --session-id <sid>` subprocess operation (fail-open on failure; in MCP mode the server-side ledger is NOT cleared — the provider logs a warning instead; a transport-level clear surface is future work), while `rewound=True` clears only provider state so delivered ids stay excluded.
+- **`prefetch` normalization (issue #162)**: the query sent to the transport is whitespace-normalized and capped at the store's 500-char query bound, and the cache fingerprint covers exactly that text, so the cache key and the transport input can never diverge. Turn-ticket and tombstone digests keep the prior prompt text (issue #161 correlation unchanged).
+
 ## [0.87.0] - 2026-10-08
 
 ### Added
