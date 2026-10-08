@@ -218,7 +218,7 @@ class WaveD2QueryEdges(unittest.TestCase):
                     deadline_s=6.0)
                 self.assertEqual(provider.prefetch("continue", session_id="s"), "")
 
-    def test_provider_empty_user_prompt_uses_shared_rewrite_before_recent(self):
+    def test_provider_empty_and_trivial_prompts_are_refused_before_transport(self):
         # Issue #162 repin (supersedes the #160 delegation pin): an empty or
         # trivial prompt is refused by the provider's trivial-query gate —
         # it never reaches the transport and never warms the cache.  The
