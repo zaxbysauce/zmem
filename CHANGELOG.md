@@ -10,6 +10,42 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.92.0] - 2026-10-09
+
+### Added
+- **`store.py report` — per-session injection repeat and composition report
+  (issue #249, Workstream P PR 1):** a new read-only subcommand that aggregates
+  the existing decision log into the two tables Workstream P PRs 2-4 need as a
+  measurable baseline, instead of hand-grepping `zmem-decisions.log`. `rows[<id>]`
+  carries `delivered` / `sessions` / `max_per_session` (the per-session repeat
+  rate), and `by_tier_moment[<tier>][<moment>]` splits `delivered` against
+  `withheld` (the `all=` candidates that were not injected) by moment and by the
+  tier derived from each row's stored namespace. Human table by default,
+  `--json` for machines.
+- **Read-only is structural, not incidental.** The subcommand early-dispatches
+  before the shared `connect()` lifecycle, because `_prepare_store` runs
+  `PRAGMA journal_mode=WAL` and the auto-near-miss rekey writes. The store is
+  read through an `immutable=1` handle when no WAL residue is present (creating
+  nothing), or through a private staged copy of `store.sqlite` + `-wal` when it
+  is — a plain `?mode=ro` open creates sidecars and mutates the `-shm` bytes in
+  place, which would break the byte-identity contract.
+- **Reuses the shipped readers rather than forking them:** the rotation-aware,
+  CRLF-tolerant `parse_bg_log`, and the PRR-014 `_moment_of` sanitizer, so a
+  hostile `moment=` in log text can never become a report key.
+
+### Notes
+- Tier labels come from the stored namespace using the three labels this
+  command's contract defines (`project`, `global`, `unknown`). The live
+  five-tier scoped recall model spells its global tier `user_global` and adds
+  `domain` / `fleet_host` / `cross_project`; its cross-project tiers are
+  caller-relative and cannot be reproduced by an offline report with no current
+  project, so they are disclosed in the report's `caveats` rather than invented.
+- Tier labels are read from a point-in-time snapshot. An id absent from that
+  snapshot is reported as `unknown`. The log-derived figures
+  (`rows[*].delivered/sessions/max_per_session`) and the tier-summed
+  delivered/withheld totals are unaffected; only the per-tier split can shift,
+  so `unknown`-bucket movement is not evidence of tier migration.
+
 ## [0.90.0] - 2026-10-09
 
 ### Added

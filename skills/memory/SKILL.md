@@ -461,6 +461,41 @@ intentionally excluded from that 5×4 projection but remain visible in
 aggregate statistics. The local Hermes provider writes `hermes-provider`; the
 remote compatibility path writes `hermes-compat`, and invalid explicit lanes
 return structured status 2 before store work while absent lanes stay omitted.
+
+#### `store.py report` — per-session repeat and composition report (issue #249)
+
+`store.py report [--decision-log <path>] [--json]` aggregates the decision log
+into the repeat rate and composition tables, read-only. It is the instrumentation
+Workstream P PRs 2-4 use as their before/after baseline.
+
+- `rows[<id>]` — `delivered` (total deliveries), `sessions` (distinct `sid=`
+  count), `max_per_session` (busiest single session), and the row's `tier`.
+  Lines with no `sid=` count toward `delivered` but contribute no session, and
+  the run says so in `caveats`.
+- `by_tier_moment[<tier>][<moment>]` — `delivered` (the `ids=` entries) against
+  `withheld` (the `all=` candidates that were not injected).
+
+`--decision-log` defaults to `<data dir>/zmem-decisions.log`, falling back to the
+legacy `zmem-bg.log`. Rotated segments (`.1` … `.N`) are included. Without
+`--json` a human table prints; with `--json` stdout is exactly one compact JSON
+document, so it can be piped into `jq` unchanged.
+
+**Tier labels** come from the row's stored namespace: a `project:` namespace is
+`project`, `user:global` is `global`, and anything else — including an id no
+longer in the store — is `unknown`. The live five-tier scoped recall model spells
+its global tier `user_global` and adds `domain` / `fleet_host` /
+`cross_project`; its cross-project tiers depend on the CALLER's current project,
+which an offline report does not have, so it does not invent them.
+
+**Read it with `caveats`.** Tier labels come from a point-in-time snapshot; an id
+missing from that snapshot is reported as `unknown`. The log-derived figures and
+the tier-summed totals are unaffected, but the per-tier split can shift, so
+`unknown`-bucket movement between two runs is not evidence of tier migration.
+
+The command never writes to the store, the ledger, or the log. It opens the store
+through an `immutable=1` handle when there is no WAL residue, or through a
+private staged copy of `store.sqlite` + `-wal` when there is; a plain read-only
+open would create sidecars and mutate `-shm` in place.
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
 Decision-point prompts are prose with zero lexical overlap with the
