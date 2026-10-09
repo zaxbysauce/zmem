@@ -106,11 +106,11 @@ class CaptureDocumentationTest(unittest.TestCase):
             self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", text)
         self.assertIn("Hermes convention-compatibility hook only", readme)
         self.assertIn("source-exists --namespace NS --source-ref REF --json", readme)
-        self.assertIn("ops-append --session SESSION --tool TOOL --op OP --json", readme)
+        self.assertIn("ops-append --namespace NS --session-id SESSION --tool TOOL --operation OP --json", readme)
         self.assertIn("those five covered surfaces", memory)
         self.assertIn("ZMEM_CONVENTION_INTERVAL", memory)
         self.assertIn("source-exists --namespace NS --source-ref REF --json", memory)
-        self.assertIn("ops-append --session SESSION --tool TOOL --op OP --json", memory)
+        self.assertIn("ops-append --namespace NS --session-id SESSION --tool TOOL --operation OP --json", memory)
         self.assertIn("Is this project-bound or box-wide?", closeout)
         self.assertIn("store.py invalidate --id <uuid> --reason", closeout)
 

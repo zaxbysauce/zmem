@@ -2115,7 +2115,9 @@ def _check_served_drift(repo_root: Path) -> dict:
 # implements (diffed against hermes-plugin/__init__.py). The manifest's
 # `hooks:` list must be a subset of these — Hermes' plugin doctor reports
 # declared-vs-registered drift, so an invented name here is exactly the
-# "3-line stub" class of bug this check exists to catch.
+# "3-line stub" class of bug this check exists to catch.  Issue #163 adds
+# the three provider-mode callbacks (registered in a fixed order only when
+# zmem is the active provider).
 _HERMES_PROVIDER_HOOKS = {
     "prefetch",
     "queue_prefetch",
@@ -2124,6 +2126,8 @@ _HERMES_PROVIDER_HOOKS = {
     "on_pre_compress",
     "on_memory_write",
     "post_tool_call",
+    "pre_llm_call",
+    "pre_verify",
 }
 
 

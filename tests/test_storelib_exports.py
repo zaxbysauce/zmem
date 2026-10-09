@@ -296,8 +296,9 @@ class CaptureCliBoundaryTest(unittest.TestCase):
         self.assertEqual(found.stderr, "")
 
     def test_ops_append_json_contract(self):
-        result = self._run("ops-append", "--session", "capture-cli-session",
-                           "--tool", "Bash", "--op", "git status", "--json")
+        result = self._run("ops-append", "--namespace", "project:test",
+                           "--session-id", "capture-cli-session",
+                           "--tool", "Bash", "--operation", "git status", "--json")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '{"ok":true}\n')
         self.assertEqual(result.stderr, "")

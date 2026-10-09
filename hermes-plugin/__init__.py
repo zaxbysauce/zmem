@@ -1703,6 +1703,231 @@ class _ThreadScheduler:
         return worker
 
 
+# ---------------------------------------------------------------------------
+# Issue #163 provider callbacks: bounded operation capture, envelope recall,
+# and the verify continue-nudge.  The provider cannot import store-side
+# modules (process boundary — the store subprocess is the only bridge), so
+# the token derivation and query composition below are PURE LOCAL COPIES of
+# the bounded rules in ``skills/memory/scripts/storelib/ops_tokens.py``
+# (``derive_ops_tokens`` / ``compose_inject_query``).  Keep the two in sync:
+# the store-side module remains the only implementation of sidecar
+# derivation; these copies only decide what the provider schedules and
+# composes in memory.
+# ---------------------------------------------------------------------------
+
+_PROVIDER_OPS_MAX_TOKENS = 12
+_PROVIDER_OPS_MAX_TAIL_CHARS = 240
+_PROVIDER_OPS_RESERVED_TAIL_CHARS = 150
+_PROVIDER_QUERY_MAX_CHARS = 500
+_PROVIDER_OPS_MAX_CHARS = 512          # bounded operation string
+_PROVIDER_TOOL_NAME_MAX_CHARS = 32     # ring-side tool cap
+_PROVIDER_SESSION_TOKENS_MAX = 12      # in-memory per-session token entries
+_PROVIDER_SESSION_ID_MAX_CHARS = 128   # bound untrusted host ids (PRR-018)
+_PROVIDER_CALLBACK_STATE_MAX = 64      # per-session entries (PRR-021)
+
+# A token must be entirely allowlisted characters to be emitted.
+_PROVIDER_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/+-]+$")
+
+# Secret-SHAPED tokens are dropped before the file-shaped gate (review
+# PRR-91-002): a literal credential pasted into a command must never reach
+# the ring sidecar or a recall query.
+_PROVIDER_SECRET_SHAPE_RE = re.compile(
+    r"^(?:gh[pousr]_|github_pat_|sk-ant|sk-proj|sk-|xox[baprs]-|AKIA|"
+    r"glpat-|shpat_|dop_v1_|npm_|pypi-)",
+    re.IGNORECASE,
+)
+
+_PROVIDER_RUNNER_HEADS = frozenset({
+    "git", "gh", "svn",
+    "npm", "pnpm", "yarn", "bun", "deno",
+    "pip", "pip3", "uv", "poetry", "pipx",
+    "cargo", "go", "mvn", "gradle", "make", "cmake",
+    "docker", "kubectl", "helm", "terraform",
+    "python", "python3", "pytest", "py.test", "tox", "nox",
+    "node", "npx", "tsc", "eslint", "biome", "prettier", "ruff", "mypy",
+    "robocopy", "rsync", "curl",
+})
+
+_PROVIDER_HAZARDOUS_SUBS = frozenset({
+    "push", "pull", "fetch", "reset", "stash", "rebase", "merge", "revert",
+    "checkout", "restore", "clean", "cherry-pick", "filter-branch",
+    "submodule", "worktree", "amend", "force-push", "apply", "pop",
+})
+
+
+def _provider_clean_token(tok: str) -> str:
+    """Lowercase, strip surrounding punctuation noise, and allowlist-check
+    one candidate token (local copy of the store-side rule)."""
+    tok = tok.strip().strip("\"'`;,(){}[]<>|&$").lower()
+    if not tok:
+        return ""
+    # Keep file-shaped context useful without persisting absolute or nested
+    # paths from host commands.
+    if ("/" in tok or "\\" in tok) and not tok.startswith(("origin/", "refs/")):
+        tok = tok.replace("\\", "/").rsplit("/", 1)[-1]
+        if not tok:
+            return ""
+    if not _PROVIDER_TOKEN_RE.match(tok):
+        return ""
+    return tok
+
+
+def _derive_provider_ops_tokens(*events: str) -> list:
+    """Bounded, deduped, lowercased operation tokens from tool-event strings
+    (pure provider-local copy of the store-side bounded rules).
+
+    Order: most recent event's tokens first (callers pass newest-last; the
+    walk is reversed so fresh operations win the cap).  Complete tokens only,
+    capped at 12 tokens and a 240-character tail.
+    """
+    out: list = []
+    seen = set()
+
+    def _push(tok: str) -> None:
+        if len(out) >= _PROVIDER_OPS_MAX_TOKENS:
+            return
+        if tok and tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+
+    for event in reversed(list(events)):  # newest first
+        if not event:
+            continue
+        if len(out) >= _PROVIDER_OPS_MAX_TOKENS:
+            break
+        words = event.split()
+        if not words:
+            continue
+        head = words[0].strip().strip("\"'`").lower()
+        head = head.rsplit("/", 1)[-1] or head  # /usr/bin/git -> git
+        if head in _PROVIDER_RUNNER_HEADS:
+            _push(head)
+            for i, w in enumerate(words[1:5]):
+                raw_structural = any(c in w for c in "./_-\\")
+                t = _provider_clean_token(w)
+                if not t or t.startswith("-"):
+                    continue
+                if _PROVIDER_SECRET_SHAPE_RE.match(t):
+                    continue
+                if i == 0 or t in _PROVIDER_HAZARDOUS_SUBS or any(
+                        c in t for c in "./_-") or raw_structural:
+                    _push(t)
+        else:
+            # Non-runner event: keep the basename, only when file-shaped.
+            last = words[-1] if words else ""
+            base = last.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            t = _provider_clean_token(base)
+            # PRR-022: a dash-prefixed token becomes an argv OPTION when the
+            # transport splices it after --ops-token (argparse exit 2 ->
+            # silent session recall blackout).  Drop it at derivation.
+            if t and not t.startswith("-") \
+                    and not _PROVIDER_SECRET_SHAPE_RE.match(t):
+                if "." in t or "-" in t or "_" in t:
+                    _push(t)
+
+    tail: list = []
+    used = 0
+    for tok in out:
+        if len(tok) > _PROVIDER_OPS_RESERVED_TAIL_CHARS:
+            continue
+        if used + len(tok) + 1 > _PROVIDER_OPS_MAX_TAIL_CHARS:
+            break
+        tail.append(tok)
+        used += len(tok) + 1
+    return tail
+
+
+def _compose_provider_query(prompt: str, ops_tokens: list) -> str:
+    """Compose the recall query: prose + the reserved ops-token tail inside
+    the 500-character cap (pure provider-local copy of the store-side
+    composition contract).
+
+    BYTE-EXACT IDENTITY: with no tokens the result is exactly
+    ``prompt.strip()[:500]``; with tokens the tail keeps at most 150
+    characters of joined complete tokens after one separator space, and the
+    prose share shrinks so the whole stays within 500.
+    """
+    base = (prompt or "").strip()[:_PROVIDER_QUERY_MAX_CHARS]
+    tail = " ".join(t for t in ops_tokens if t)
+    if not tail:
+        return base
+    if len(tail) > _PROVIDER_OPS_RESERVED_TAIL_CHARS:
+        # Cut at the last complete token; a single token longer than the
+        # slice is dropped whole rather than severed (never happens with
+        # _derive_provider_ops_tokens output, kept as a hard guarantee).
+        tail = tail[:_PROVIDER_OPS_RESERVED_TAIL_CHARS].rsplit(" ", 1)[0]
+        if not tail:
+            return base
+    prose_budget = max(0, _PROVIDER_QUERY_MAX_CHARS
+                       - _PROVIDER_OPS_RESERVED_TAIL_CHARS - 1)
+    prose = base[:prose_budget].rstrip()
+    return (prose + " " + tail).strip()[:_PROVIDER_QUERY_MAX_CHARS]
+
+
+def _provider_convention_nudge(session: str) -> str:
+    """Periodic capture reminder (wording copied byte-for-byte from the
+    compatibility hook's historical convention nudge; do not import that
+    hook — the provider is a separate process boundary)."""
+    return (
+        "ZMem convention capture: you just completed several tool calls. If you "
+        "discovered a reusable convention, pattern, or workaround during this "
+        "session — something that would help a future session facing a similar "
+        "task — capture it now by calling the zmem_add tool:\n"
+        '  zmem_add with type="convention", content="<the lesson>", '
+        'signal="<test|reviewer|user|none>", source_ref="session:%s"\n'
+        "If nothing generalizable applies, do nothing." % (session,)
+    )
+
+
+def _provider_failure_nudge(session: str) -> str:
+    """Pending-failure reminder (wording copied byte-for-byte from the
+    store-side canonical ``_hermes_failure_nudge`` — ASCII hyphens, bytes
+    are contract)."""
+    return (
+        "ZMem auto-capture: a tool failed earlier this session "
+        "(source_ref=session:%s). If a generalizable lesson can be "
+        "derived from that failure - a gotcha, a misconfiguration, a wrong "
+        "assumption - capture it now by calling the zmem_add tool:\n"
+        '  zmem_add with type="lesson", content="<the lesson, with the error '
+        'context>", signal="none", source_ref="session:%s"\n'
+        "If the failure was transient or not generalizable, do nothing."
+        % (session, session)
+    )
+
+
+def _provider_verify_nudge(session: str) -> str:
+    """Reflect-before-stop nudge (wording copied byte-for-byte from the
+    compatibility verify hook's canonical text)."""
+    return (
+        "ZMem reflect-before-stop: you're about to finish a coding turn. "
+        "Before you do, consider whether you discovered anything worth "
+        "capturing for future sessions — a gotcha, a convention, a corrected "
+        "assumption. If so, capture it now by calling the zmem_add tool:\n"
+        '  zmem_add with type="lesson", content="<the lesson>", '
+        'signal="<test|reviewer|user|none>", source_ref="session:%s"\n'
+        "If nothing generalizable, finish the turn." % (session,)
+    )
+
+
+def _provider_interval_from_env(raw: str | None) -> int:
+    """Parse ``ZMEM_CONVENTION_INTERVAL``: positive integer, default 10;
+    empty, nonnumeric, and nonpositive values all resolve to 10."""
+    text = (raw or "").strip()
+    if not text:
+        return 10
+    try:
+        value = int(text)
+    except ValueError:
+        return 10
+    return value if value > 0 else 10
+
+
+def _provider_query_context_enabled() -> bool:
+    """Whitespace-tolerated ``ZMEM_QUERY_CONTEXT`` kill switch (the repo
+    convention: only the trimmed value ``0`` disables; empty keeps it on)."""
+    return (os.environ.get("ZMEM_QUERY_CONTEXT", "") or "").strip() != "0"
+
+
 _PREFETCH_CACHE_MAX_ENTRIES = 64
 # A hostile/oversized remote envelope must not enter the cache; honest
 # store fences are budget-capped far below this.
@@ -1768,13 +1993,14 @@ class _PrefetchCache:
 class ZmemMemoryProvider(MemoryProvider):
     """ZMem local-first memory — subprocess-bridges Hermes to ``store.py``."""
 
-    def __init__(self, scheduler: Optional[object] = None,
+    def __init__(self, *, scheduler: Optional[object] = None,
                  deadline: Optional[object] = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
-        # Issue #162 seam.  Both dependencies default to None so the 15+
-        # existing no-arg construction sites (and register() before
-        # initialize) keep working: a None scheduler leaves queue_prefetch
-        # inert; a None deadline makes _select_transport build the production
+        # Issue #162 seam (#163: the two executor seams are keyword-only).
+        # Both dependencies default to None so the 15+ existing no-arg
+        # construction sites (and register() before initialize) keep
+        # working: a None scheduler leaves queue_prefetch inert; a None
+        # deadline makes _select_transport build the production
         # DeadlineExecutor.  register() passes real production instances.
         # The provider never assigns one object to both attributes.
         self._scheduler = scheduler
@@ -1791,6 +2017,13 @@ class ZmemMemoryProvider(MemoryProvider):
         self._pending_keys: Dict[tuple[str, str], str] = {}
         self._session_generation: Dict[str, int] = {}
         self._state_lock = threading.RLock()
+        # Issue #163 per-session callback state, keyed by session id:
+        # {"tool_count": int, "prompted": bool, "ops_tokens": [str],
+        #  "pending_nudge": str}.  Created lazily on the first callback for
+        # a session; entries are cleared only when the provider instance is
+        # constructed — callback payload omission never resets an entry.
+        self._callback_state: Dict[str, Dict[str, Any]] = {}
+        self._callback_state_lock = threading.RLock()
         self._last_status = RecallStatus(provider_label="zmem", count=0)
         self._session_id: str = ""
         self._namespace: str = "user:global"
@@ -2692,17 +2925,72 @@ class ZmemMemoryProvider(MemoryProvider):
                 if self._pending_keys.get(key) == token:
                     del self._pending_keys[key]
 
-    # -- tools --------------------------------------------------------------
+    # -- provider observation hooks (issue #163) ---------------------------
+
+    def _callback_entry(self, session_id: str) -> Dict[str, Any]:
+        """Create-or-return one per-session callback-state entry.  Caller
+        holds ``_callback_state_lock``.  Bounded (PRR-021): past 64 sessions
+        the oldest entry is evicted — nudge/prompted state is best-effort
+        telemetry-adjacent bookkeeping, never worth unbounded growth."""
+        entry = self._callback_state.get(session_id)
+        if entry is None:
+            if len(self._callback_state) >= _PROVIDER_CALLBACK_STATE_MAX:
+                oldest = next(iter(self._callback_state))
+                del self._callback_state[oldest]
+            entry = {"tool_count": 0, "prompted": False, "ops_tokens": [],
+                     "pending_nudge": ""}
+            self._callback_state[session_id] = entry
+        return entry
+
+    def _set_pending_nudge_for_test(self, session_id: str, text: str) -> None:
+        """TEST-ONLY seam: arm a pending nudge without a real tool call.
+        Never called by production callbacks; trims and caps at 500 code
+        points, mirroring the production payload bounds."""
+        clean = (text or "").strip()
+        if not clean:
+            return
+        with self._callback_state_lock:
+            entry = self._callback_entry(session_id.strip())
+            entry["pending_nudge"] = clean[:_PROVIDER_QUERY_MAX_CHARS]
+
+    def _schedule_ops_append(self, namespace: str, session_id: str,
+                             tool: str, operation: str) -> None:
+        """One bounded store-side append through the scheduler + deadline
+        seams.  Every failure class (payload, scheduler, serialization,
+        filesystem, deadline, subprocess, executor) is swallowed — ring
+        health never affects hook behavior."""
+        def _job() -> None:
+            def _call() -> Dict[str, Any]:
+                return _run_store([
+                    "ops-append",
+                    "--namespace", namespace,
+                    "--session-id", session_id,
+                    "--tool", tool,
+                    "--operation", operation,
+                ])
+
+            deadline = self._deadline
+            if deadline is not None and hasattr(deadline, "run"):
+                deadline.run(_call, self._deadline_s)
+            else:
+                _call()
+
+        scheduler = self._scheduler
+        if scheduler is None or not hasattr(scheduler, "submit"):
+            return
+        try:
+            scheduler.submit(_job)
+        except Exception:
+            return
 
     def post_tool_call(self, **kwargs: Any) -> Dict[str, Any]:
-        """Observe one Hermes tool call without delaying the host turn.
-
-        Hermes dispatches this observer with keyword arguments.  The callback
-        only copies bounded evidence into a daemon queue; the queue worker
-        uses the existing ``_run_store`` CLI seam and drops on overflow.
-        """
+        """Observe one Hermes tool call (issue #163): retain the bounded
+        telemetry prelude, capture one bounded operation into the store-side
+        ring through the scheduler seam, and arm the session's pending
+        nudge.  Fail-open: returns ``{}`` on every path, never raises into
+        Hermes."""
         try:
-            session_id = str(kwargs.get("session_id") or self._session_id or "").strip()
+            session_id = str(kwargs.get("session_id") or self._session_id or "").strip()[:_PROVIDER_SESSION_ID_MAX_CHARS]
             _background_training_capture("observe", {
                 "host": "hermes",
                 "hook_name": "post_tool_call",
@@ -2719,7 +3007,255 @@ class ZmemMemoryProvider(MemoryProvider):
             _enqueue_native_evidence(dict(kwargs))
         except Exception:
             pass
+
+        # Issue #163: with the query-context kill switch on, return before
+        # changing tool_count, ops_tokens, or the pending-nudge state.
+        if not _provider_query_context_enabled():
+            return {}
+
+        session_id = str(kwargs.get("session_id") or self._session_id or "").strip()[:_PROVIDER_SESSION_ID_MAX_CHARS]
+        tool_name = str(kwargs.get("tool_name") or "").strip()
+        if not session_id or not tool_name:
+            return {}
+        try:
+            namespace = (self._resolve_namespace(**kwargs) or "").strip()
+        except Exception:
+            namespace = ""
+        if not namespace:
+            return {}
+        tool_name = tool_name[:_PROVIDER_TOOL_NAME_MAX_CHARS]
+
+        # Normalize the Hermes keyword mapping.  ``args`` may arrive under
+        # either name; a non-mapping value is an empty mapping.
+        tool_input = kwargs.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = kwargs.get("args")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        # Operation scan in contract order: string values only, first
+        # non-empty wins; nested mappings are traversed only at those
+        # named paths.
+        operation = ""
+        for candidate in (kwargs.get("command"), kwargs.get("cmd"),
+                          tool_input.get("command"), tool_input.get("cmd"),
+                          tool_input.get("file_path"),
+                          tool_input.get("notebook_path"),
+                          tool_input.get("path")):
+            if isinstance(candidate, str):
+                text = candidate.strip()
+                if text:
+                    operation = text
+                    break
+        if not operation:
+            return {}
+        operation = operation[:_PROVIDER_OPS_MAX_CHARS]
+
+        status = str(kwargs.get("status") or "").strip().lower()
+        interval = _provider_interval_from_env(
+            os.environ.get("ZMEM_CONVENTION_INTERVAL"))
+
+        derived = _derive_provider_ops_tokens(operation)
+        try:
+            with self._callback_state_lock:
+                entry = self._callback_entry(session_id)
+                entry["tool_count"] += 1
+                if derived:
+                    merged = list(entry["ops_tokens"]) + list(derived)
+                    entry["ops_tokens"] = merged[-_PROVIDER_SESSION_TOKENS_MAX:]
+                if not entry["pending_nudge"]:
+                    if status == "error":
+                        entry["pending_nudge"] = _provider_failure_nudge(
+                            session_id)
+                    elif entry["tool_count"] % interval == 0:
+                        entry["pending_nudge"] = _provider_convention_nudge(
+                            session_id)
+        except Exception:
+            return {}
+        self._schedule_ops_append(namespace, session_id, tool_name, operation)
         return {}
+
+    def pre_llm_call(self, **kwargs: Any) -> Dict[str, Any]:
+        """Passive recall before one Hermes LLM call (issue #163): compose
+        the query from the user message or the pending nudge, recall through
+        the #160 transport under the deadline seam, validate the #158
+        envelope strictly, and return ``{"context": <fence + nudge>}`` or
+        ``{}`` — never raise into Hermes."""
+        if _inject_disabled():
+            return {}
+        session_id = str(kwargs.get("session_id") or self._session_id or "").strip()[:_PROVIDER_SESSION_ID_MAX_CHARS]
+        if not session_id:
+            return {}
+        try:
+            namespace = (self._resolve_namespace(**kwargs) or "").strip()
+        except Exception:
+            namespace = ""
+        if not namespace:
+            return {}
+
+        query_context = _provider_query_context_enabled()
+        with self._callback_state_lock:
+            entry = self._callback_entry(session_id)
+            ops_snapshot = list(entry["ops_tokens"]) if query_context else []
+            pending_nudge = str(entry.get("pending_nudge") or "").strip()
+
+        user_message = kwargs.get("user_message")
+        source_text = user_message \
+            if isinstance(user_message, str) and user_message.strip() \
+            else pending_nudge
+        query = _compose_provider_query(" ".join(
+            (source_text or "").split()), ops_snapshot)
+
+        transport = self._transport
+        if transport is None or not hasattr(transport, "prefetch"):
+            return {}
+        deadline = self._deadline
+
+        def _call() -> Any:
+            return transport.prefetch(
+                query,
+                namespace=namespace,
+                session_id=session_id,
+                moment="user_prompt",
+                ops_tokens=list(ops_snapshot),
+                lane="hermes-provider",
+            )
+
+        try:
+            if deadline is not None and hasattr(deadline, "run"):
+                envelope = deadline.run(_call, self._deadline_s)
+            else:
+                envelope = _call()
+        except Exception:
+            return {}
+        if envelope is None:            # #160 timeout sentinel
+            return {}
+        if isinstance(envelope, dict) and "context" in envelope:
+            # PRR-003 (mirror of the #162 strip): the #159 MCP server adds
+            # an additive `context` alias duplicating `rendered` on every
+            # response; a server-additive alias is not a store key, and the
+            # strict check below would blackout every MCP-mode recall.
+            envelope = {k: v for k, v in envelope.items() if k != "context"}
+        if not self._provider_envelope_is_valid(envelope):
+            return {}
+        rendered = envelope.get("rendered")
+        if not isinstance(rendered, str) or not rendered:
+            return {}
+        combined = rendered
+        if pending_nudge:
+            combined = rendered + "\n" + pending_nudge
+        with self._callback_state_lock:
+            # Clear only the nudge this call copied (a concurrent callback
+            # may have armed a newer one for the same session).
+            entry = self._callback_entry(session_id)
+            if str(entry.get("pending_nudge") or "").strip() == pending_nudge:
+                entry["pending_nudge"] = ""
+        return {"context": combined}
+
+    def _provider_envelope_is_valid(self, envelope: object) -> bool:
+        """Strict #158 envelope policy for the provider callback: all 14
+        required keys, and unknown keys rejected against the store's OWN
+        key policy (#162's runtime-constants pattern — a frozen copy went
+        stale the same release: PRR-002).  Value shapes are the shapes the
+        real store emits: ``budget_admission`` is an int on the wire
+        (PRR-001 — the dict form this validator originally demanded is
+        emitted by no producer).  Deliberately NOT shared with #162's
+        prefetch validator (different tolerance, pinned behavior)."""
+        if not isinstance(envelope, dict):
+            return False
+        required, optional = self._provider_envelope_key_policy()
+        for name in required:
+            if name not in envelope:
+                return False
+        for key in envelope:
+            if key not in required and key not in optional:
+                return False
+        for field in ("count", "omitted", "tokens_used", "tokens_budget",
+                      "budget_dropped", "budget_admission",
+                      "budget_truncated", "budget_dropped_protected"):
+            value = envelope.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) \
+                    or value < 0:
+                return False
+        if not isinstance(envelope.get("arms"), dict):
+            return False
+        excluded = envelope.get("excluded")
+        if not isinstance(excluded, list):
+            return False
+        for item in excluded:
+            if not isinstance(item, str):
+                return False
+        rendered = envelope.get("rendered")
+        if not isinstance(rendered, str):
+            return False
+        # PRR-019: same hostile/oversized-remote-envelope cap as the #162
+        # path — a multi-megabyte "rendered" must not become model context.
+        if len(rendered) > _PREFETCH_RENDERED_MAX_CHARS:
+            return False
+        return True
+
+    def _provider_envelope_key_policy(self) -> tuple[frozenset, frozenset]:
+        """The store's own envelope key contract (required, optional), read
+        from the storelib constants when reachable exactly like the #162
+        path; otherwise the #158 fallback required keys plus every
+        documented store-optional key (a frozen optional set went stale the
+        same release it shipped — PRR-002 — so the degraded path stays
+        permissive on KNOWN keys and strict on unknown ones)."""
+        keys = _load_envelope_key_constants()
+        if keys is not None:
+            return keys
+        return (frozenset(_ENVELOPE_REQUIRED_FALLBACK),
+                frozenset(("injection_risk", "candidate_lanes",
+                           "budget_note", "effective_ops",
+                           "secret_withheld", "global_withheld")))
+
+    def pre_verify(self, **kwargs: Any) -> Dict[str, Any]:
+        """Reflect-before-stop probe (issue #163): when the session captured
+        tool activity but has no live lesson yet, return the exact continue
+        nudge once; the prompted marker persists in callback state.  Every
+        failure class returns ``{}`` without changing state and never
+        raises into Hermes."""
+        if _inject_disabled():
+            return {}
+        session_id = str(kwargs.get("session_id") or self._session_id or "").strip()[:_PROVIDER_SESSION_ID_MAX_CHARS]
+        if not session_id:
+            return {}
+        with self._callback_state_lock:
+            entry = self._callback_entry(session_id)
+            if entry["tool_count"] <= 0 or entry["prompted"]:
+                return {}
+
+        def _call() -> Dict[str, Any]:
+            return _run_store(["source-ref-exists",
+                               "--source-ref", "session:" + session_id])
+
+        try:
+            deadline = self._deadline
+            if deadline is not None and hasattr(deadline, "run"):
+                result = deadline.run(_call, self._deadline_s)
+            else:
+                result = _call()
+        except Exception:
+            return {}
+        if not isinstance(result, dict):
+            return {}
+        if result.get("returncode") != 0:
+            return {}
+        try:
+            payload = json.loads(str(result.get("stdout") or ""))
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(payload, dict) \
+                or "exists" not in payload:
+            return {}
+        with self._callback_state_lock:
+            entry = self._callback_entry(session_id)
+            entry["prompted"] = True
+        if payload.get("exists") is True:
+            return {}
+        return {"action": "continue",
+                "message": _provider_verify_nudge(session_id)}
+
+    # -- tools --------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return list(_TOOL_SCHEMAS)
@@ -3536,6 +4072,38 @@ def _active_memory_provider_name() -> str:
         return ""
 
 
+def _provider_mode_for_test(active: str) -> bool:
+    """Provider-mode predicate (issue #163): true only when the active
+    memory provider is exactly ``zmem``.  A missing configuration, ``None``,
+    and every read exception resolve to ``""`` upstream and return False."""
+    return active == "zmem"
+
+
+def _active_provider_is_zmem() -> bool:
+    """Whether Hermes's active memory provider is zmem (issue #163).  Reads
+    the exact Hermes helper through the same seam as
+    ``_active_memory_provider_name``; any failure means compatibility mode."""
+    return _provider_mode_for_test(_active_memory_provider_name())
+
+
+def _register_provider_hooks(ctx: Any, provider: "ZmemMemoryProvider") -> None:
+    """Register exactly the three provider callbacks (issue #163) in this
+    fixed order.  One exception boundary: a registration failure is logged
+    and the already-registered provider stays registered — the exception
+    never activates the compatibility callbacks and never breaks startup."""
+    register_hook = getattr(ctx, "register_hook", None)
+    if not callable(register_hook):
+        return
+    try:
+        register_hook("post_tool_call", provider.post_tool_call)
+        register_hook("pre_llm_call", provider.pre_llm_call)
+        register_hook("pre_verify", provider.pre_verify)
+    except Exception:
+        logger.debug("zmem: provider hook registration failed; the memory "
+                     "provider itself stays registered", exc_info=True)
+        return
+
+
 def register(ctx) -> None:
     """Register ZMem as a memory provider plugin."""
     # Issue #162: construct the production scheduler and DeadlineExecutor at
@@ -3546,16 +4114,11 @@ def register(ctx) -> None:
     scheduler = _ThreadScheduler()
     provider = ZmemMemoryProvider(scheduler=scheduler, deadline=deadline)
     ctx.register_memory_provider(provider)
-    # New Hermes SDKs expose the observational collector only when zmem is the
-    # active provider.  Older SDKs have no register_hook; that context remains
-    # fully usable with provider registration alone.
-    if _active_memory_provider_name() != "zmem":
+    # Issue #163: provider mode registers exactly three native Hermes hooks
+    # in a fixed order; every other active value keeps compatibility mode
+    # with zero provider callback registrations.  Older SDKs have no
+    # register_hook; that context remains fully usable with provider
+    # registration alone.
+    if not _active_provider_is_zmem():
         return
-    register_hook = getattr(ctx, "register_hook", None)
-    if not callable(register_hook):
-        return
-    try:
-        register_hook("post_tool_call", provider.post_tool_call)
-    except Exception:
-        # A host-side collector is optional and must never break startup.
-        return
+    _register_provider_hooks(ctx, provider)
