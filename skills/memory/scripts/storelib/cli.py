@@ -3087,6 +3087,18 @@ def main():
     p_hyg.add_argument("--format", dest="format", choices=("json", "text"),
                        default="json", help="Report format")
 
+    p_rep = _add_parser(
+        "report",
+        help="read-only per-session repeat and tier/moment composition report "
+             "over the decision log (issue #249)")
+    p_rep.add_argument("--decision-log", dest="decision_log", type=str,
+                       default=None,
+                       help="explicit decision-log path (default: <data dir>/"
+                            "zmem-decisions.log, falling back to the legacy "
+                            "zmem-bg.log)")
+    p_rep.add_argument("--json", dest="as_json", action="store_true",
+                       help="emit one machine-readable JSON document")
+
     # Source's public error contract intentionally predates its argparse
     # metadata. Validate the source-only required values and context before
     # argparse can emit a usage block; every other parser keeps its legacy
@@ -3578,6 +3590,22 @@ def main():
             "--out", args.out,
             "--format", args.format,
         ]))
+
+    # `report` aggregates the decision log against the store, read-only (issue
+    # #249). Like `hygiene` above it dispatches BEFORE
+    # connect()/_prepare_store()/_auto_near_miss_rekey(): _prepare_store's
+    # PRAGMA journal_mode=WAL rewrites a DELETE-mode store's header bytes, and
+    # the rekey writes, so a report reached through that lifecycle could not
+    # honour its read-only contract. Placement here is load-bearing, not
+    # stylistic — the module opens the store itself through an immutable
+    # handle, or through a private staged copy when WAL residue is present,
+    # and never through connect().
+    if args.cmd == "report":
+        from storelib.decision_report import main as _report_main
+
+        sys.exit(_report_main([
+            "--decision-log", args.decision_log,
+        ] + (["--json"] if args.as_json else [])))
 
     # Query rewriting is intentionally an early, read-only command.  Keeping
     # this branch before every connect/_prepare/migration path is what makes a
