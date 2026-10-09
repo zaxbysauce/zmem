@@ -505,6 +505,47 @@ class TestImportSmoke(unittest.TestCase):
             result2 = import_store.run_import(source_store, dest_dir, force=True)
             self.assertTrue(result2["source_unchanged"])
 
+    def test_hindsight_source_dispatches_to_deterministic_destination(self):
+        """Issue #181: --source hindsight maps the committed ten-record
+        fixture to a deterministic destination (counts + digest), refuses a
+        second run without --force, and a forced re-run reproduces the same
+        digest."""
+        import hashlib
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "zmem_import_store_hindsight", SCRIPTS_DIR / "import-store.py"
+        )
+        import_store = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(import_store)
+
+        fixtures = Path(__file__).resolve().parent / "fixtures" / "hindsight"
+        expected_bytes = (fixtures / "expected.jsonl").read_bytes()
+        expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest_dir = Path(tmp) / "dest"
+            result = import_store.run_hindsight_import(
+                fixtures / "import.jsonl", dest_dir, force=False)
+
+            self.assertEqual(result["source_count"], 10)
+            self.assertEqual(result["destination_count"], 10)
+            self.assertEqual(result["output_sha256"], expected_digest)
+            self.assertEqual(
+                (dest_dir / "hindsight-import.jsonl").read_bytes(),
+                expected_bytes)
+
+            # A second import into the same non-empty dest without --force
+            # must refuse rather than silently overwrite.
+            with self.assertRaises(FileExistsError):
+                import_store.run_hindsight_import(
+                    fixtures / "import.jsonl", dest_dir, force=False)
+
+            # --force reproduces the identical digest.
+            result2 = import_store.run_hindsight_import(
+                fixtures / "import.jsonl", dest_dir, force=True)
+            self.assertEqual(result2["output_sha256"], expected_digest)
+
 
 class TestLegacyPluginStoreFallback(unittest.TestCase):
     """PR review PRR-002 (HIGH): a user who has not yet run import-store.py must

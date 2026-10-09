@@ -10,6 +10,43 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.89.0] - 2026-10-08
+
+### Added
+
+- **New `store.py rescan-secrets` subcommand (issue #181, Workstream L
+  PR 2)** — live secret rescan and remediation through the single shared
+  capture policy (#180). `rescan-secrets --dry-run` reports every live row
+  the policy would now change (exact compact JSON: `mode`, `rows_scanned`,
+  `rows_needing_review`, ascending `ids`) without writing a byte; `rescan-secrets
+  --apply` redacts each candidate through an append-only update lineage —
+  tombstone plus `[REDACTED_SECRET]` successor carrying `update_of` — in ONE
+  transaction, rolling the whole batch back (exit 2, store byte-identical) on
+  any policy refusal or dedup fold. The scan opens the existing store
+  byte-neutrally and read-only, so a dry-run leaves the scanned file
+  SHA-256-identical (WAL stores included). Caveat: the tombstoned
+  predecessor keeps its original content by append-only design (still
+  FTS-indexed and reachable via as-of queries) — use `store.py purge --id`
+  (#255) for durable byte-level removal.
+- **New Hindsight JSONL import: `import-store.py --source hindsight --input
+  <export.jsonl> --dest-dir <dir>` (issue #181)** — maps the six Hindsight
+  source kinds (`world`, `experience`, `observation`, `kv`, `current`,
+  `event`) to destination `fact` rows while preserving the source kind in
+  deterministic `hindsight:*` tags, and retaining supplied metadata and
+  occurrence dates in a canonical `hindsight-import.jsonl` written beside
+  the store (byte-deterministic; the import reports its SHA-256). That
+  canonical file retains the export VERBATIM — the store rows are the
+  redacted surface — so credential-bearing exports persist plaintext in it;
+  it is written owner-only inside the destination and must be treated as
+  secret material. The destination is staged and fail-closed: every
+  malformed, duplicate, unsupported, or invalid record fails with exit 1
+  BEFORE a destination is created, and an existing destination stays
+  byte-identical across every failed import up to the final accept
+  (including `--force` retries); if the final store-and-output swap is
+  interrupted after the store landed, the failure says so and an idempotent
+  `--force` re-run restores the matched pair. The legacy SQLite import path
+  is unchanged.
+
 ## [0.88.0] - 2026-10-08
 
 ### Added

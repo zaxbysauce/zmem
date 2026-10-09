@@ -48,3 +48,8 @@ eval/*.jsonl text eol=lf
 
 # Curated-page fixture bytes are generator/checkpoint contracts on every host.
 tests/fixtures/pages/** text eol=lf
+
+# Issue #181: the canonical Hindsight JSONL fixtures are byte-contract
+# inputs (compared with read_bytes() and pinned by digest); keep checkout
+# bytes LF-stable under Windows autocrlf.
+tests/fixtures/hindsight/*.jsonl text eol=lf

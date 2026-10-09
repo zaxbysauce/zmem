@@ -1848,6 +1848,103 @@ def update_memory(
         raise
 
 
+def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
+    """Live-store secret rescan and remediation (issue #181, Workstream L 2).
+
+    Re-evaluates every LIVE memory row through the single capture-policy
+    entry point (``apply_capture_policy`` in auto mode) — the same policy
+    every importer routes through (#180) — and reports (dry-run) or applies
+    (apply) append-only redaction for rows the policy would now change.
+
+    A candidate is a row whose policy-returned content, source_ref, or tags
+    differ from the stored values, compared per field (warnings alone never
+    make a candidate). A ``CapturePolicyRefusal`` propagates from the scan
+    itself: an unredactable row (e.g. a ``sudo -S`` password on stdin) can
+    never become a candidate, and the refusal fires before any transaction
+    opens, so store bytes never move on the failure path.
+
+    Dry-run performs the SELECT and the policy calls only — no BEGIN,
+    INSERT, UPDATE, commit, checkpoint, FTS rebuild, or embedding work.
+
+    Apply opens ONE ``BEGIN IMMEDIATE`` after the complete candidate list
+    is known and calls ``update_memory`` once per candidate with the
+    sanitized content, tags, and source reference (all three passed
+    explicitly — None would inherit the original secret-bearing values from
+    the old row). Every call must return ``created_new=True``: a dedup fold
+    means the redaction cannot land as its own row, so the whole batch
+    rolls back and raises — an un-remediable store fails loudly instead of
+    silently skipping rows. ``update_memory`` joins the caller's open
+    transaction, so one commit lands the entire batch atomically; its human
+    progress prints are captured and routed to stderr so stdout stays a
+    single machine-readable line.
+
+    Returns exactly ``{"mode", "rows_scanned", "rows_needing_review",
+    "ids"}`` with ``ids`` ascending and candidate-only.
+    """
+    import io as _io
+
+    rows = conn.execute(
+        "SELECT id, content, tags, source_ref FROM memory "
+        "WHERE superseded_at IS NULL ORDER BY id ASC"
+    ).fetchall()
+    candidates: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        content = row["content"] or ""
+        tags = row["tags"] or ""
+        source_ref = row["source_ref"] or ""
+        new_content, new_source_ref, new_tags, _warnings = (
+            apply_capture_policy(content=content, source_ref=source_ref,
+                                 tags=tags, capture_mode="auto"))
+        if (new_content != content or new_tags != tags
+                or new_source_ref != source_ref):
+            candidates.append((row["id"], new_content, new_tags,
+                               new_source_ref))
+
+    result = {
+        "mode": "apply" if apply else "dry-run",
+        "rows_scanned": len(rows),
+        "rows_needing_review": len(candidates),
+        "ids": [c[0] for c in candidates],
+    }
+    if not apply:
+        return result
+
+    captured = _io.StringIO()
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        with contextlib.redirect_stdout(captured):
+            for mid, new_content, new_tags, new_source_ref in candidates:
+                _res, created_new = update_memory(
+                    conn,
+                    mid=mid,
+                    content=new_content,
+                    tags=new_tags,
+                    source_ref=new_source_ref,
+                    capture_mode="auto",
+                )
+                if not created_new:
+                    raise ValueError(
+                        f"redaction for {mid} folded into an existing row "
+                        "(dedup) instead of creating its own replacement; "
+                        "append-only lineage is impossible for this batch"
+                    )
+        _commit(conn)
+    except BaseException:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        progress = captured.getvalue()
+        if progress.strip():
+            sys.stderr.write(progress)
+        raise
+    progress = captured.getvalue()
+    if progress.strip():
+        sys.stderr.write(progress)
+    return result
+
+
 class FeedbackTargetError(ValueError):
     """Raised by feedback_memory when the --id does not resolve to a LIVE
     memory row (unknown id, or an id already tombstoned by supersede/

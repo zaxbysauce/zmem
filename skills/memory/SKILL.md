@@ -1878,6 +1878,20 @@ by design. To remove a
 confirmed secret from the store entirely, use `purge` (#255); rotation of
 any credential that was ever passively delivered remains mandatory.
 
+### rescan-secrets — live secret rescan/remediation (issue #181)
+```
+<interpreter> <store.py> rescan-secrets --dry-run | --apply
+```
+Re-evaluates every LIVE row through `apply_capture_policy` (auto mode).
+`--dry-run` prints one compact JSON line (`mode`, `rows_scanned`,
+`rows_needing_review`, ascending `ids`) through a read-only handle — the
+scanned store stays byte-identical. `--apply` redacts each candidate via
+`update`'s append-only lineage (tombstone + `[REDACTED_SECRET]` successor
+carrying `update_of`) in ONE transaction; any policy refusal or dedup fold
+rolls the whole batch back (exit 2, store untouched). The tombstoned
+predecessor keeps its plaintext (FTS-indexed, `--as-of` reachable) — run
+`purge` (below) on the reported ids for durable removal.
+
 ### purge — durably remove a memory's content (issue #255)
 ```
 <interpreter> <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]
@@ -2350,7 +2364,8 @@ content/tags scanning is unchanged. The write result carries a structured
 `apply_capture_policy` (storelib.write) is THE single capture-policy entry
 point. Every importer routes through it: CLI `add`/`update` (via
 `add_memory`/`update_memory`), `ingest-jsonl` and `ingest-jsonl --strict`,
-`import-store.py`, `scripts/ingest_harvest.py`, MCP `add`, Hermes `zmem_add`
+`import-store.py`, `rescan-secrets` (the store-wide rescan/remediation
+scan), `scripts/ingest_harvest.py`, MCP `add`, Hermes `zmem_add`
 (the last three via the `store.py` subprocess boundary — no adapter
 re-implements pattern matching). The pattern registry lives in
 `redaction.py` as the only source; `redact_text` and the read-time

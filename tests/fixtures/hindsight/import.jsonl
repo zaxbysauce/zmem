@@ -1,0 +1,10 @@
+{"kind":"world","id":"00000000-0000-4000-8000-000000000001","text":"The fixture planet is blue.","tags":["zeta","zeta"],"metadata":{"source":"fixture"}}
+{"type":"experience","id":"00000000-0000-4000-8000-000000000002","namespace":"project:fixture","text":"The fixture agent visited Paris.","tags":["alpha"],"metadata":{}}
+{"kind":"observation","id":"00000000-0000-4000-8000-000000000003","namespace":"project:fixture","text":"The fixture agent prefers blue.","source_ref":"hindsight:provided-observation","occurred_start":"2026-01-01T00:00:00Z","occurred_end":"2026-01-01T01:00:00Z"}
+{"type":"kv","id":"00000000-0000-4000-8000-000000000004","text":"theme=blue","tags":["state-candidate","state-candidate"]}
+{"kind":"current","id":"00000000-0000-4000-8000-000000000005","namespace":"project:fixture","text":"Current theme is blue.","tags":["current"]}
+{"type":"event","id":"00000000-0000-4000-8000-000000000006","text":"The fixture agent changed theme.","source_ref":"session:fixture-181","tags":["event"],"occurred_start":"2026-01-02T00:00:00Z","occurred_end":"2026-01-02T00:00:00Z"}
+{"kind":"world","id":"00000000-0000-4000-8000-000000000007","text":"Fixture country is Canada."}
+{"type":"experience","id":"00000000-0000-4000-8000-000000000008","namespace":"user:global","text":"Fixture agent learned Rust.","metadata":{"source":"hindsight","confidence":"high"}}
+{"kind":"observation","id":"00000000-0000-4000-8000-000000000009","text":"Fixture work is asynchronous.","tags":["a","hindsight:observation"]}
+{"type":"event","id":"00000000-0000-4000-8000-000000000010","namespace":"project:fixture","text":"Fixture deployment completed.","metadata":{"severity":"info"}}
