@@ -29,6 +29,7 @@ from storelib.evidence import (
     EVIDENCE_ASSOCIATION_PAGE_MAX,
     EVIDENCE_KINDS,
     EVIDENCE_LANES,
+    EVIDENCE_MAX_EXCERPT_CHARS,
     EVIDENCE_MOMENTS,
     normalize_evidence_ids,
     sweep_evidence,
@@ -53,7 +54,7 @@ from storelib.rekey import (MapError, apply_namespace_map, assert_store_schema_c
                             embedding_census, load_vec_extension,
                             load_vec_extension_if_available, open_readonly_store, parse_namespace_map,
                             preview_namespace_map)
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, SUPPORTED_SCHEMA_VERSION
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, now_iso, SUPPORTED_SCHEMA_VERSION
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.dataset import (
     cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
@@ -1271,6 +1272,96 @@ def cmd_evidence_write(
     return 0
 
 
+_DELEGATION_PAYLOAD_KEYS = (
+    "child_session_id", "parent_session_id", "result_sha256", "task_sha256",
+)
+_DELEGATION_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _flagged_evidence_flags_present(args: argparse.Namespace) -> bool:
+    """True when any flagged ``evidence write`` option was supplied (issue #164).
+
+    Sentinel-based (``default=None``), never truthiness: an explicitly empty
+    ``--session-id`` value must still select the flagged mode and fail its own
+    validation rather than silently falling back to the legacy stdin shape.
+    """
+    return any(
+        getattr(args, name) is not None
+        for name in ("kind", "session_id", "lane", "moment", "ref_path")
+    )
+
+
+def cmd_evidence_write_flagged(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    session_id: str,
+    lane: str,
+    moment: str,
+    ref_path: str,
+    payload: dict[str, object],
+) -> int:
+    """Flagged ``evidence write`` adapter (issue #164).
+
+    Reads the four-key delegation compact payload from stdin, validates it
+    contains nothing but two string session ids and two lowercase 64-hex
+    digests, then writes one row through ``write_evidence`` with the store
+    timestamp (``now_iso()``), ``ref_offset=None`` and the payload — validated
+    redaction-free — as the excerpt.  Validation and JSON errors raise
+    ``ValueError``/``json`` errors for the caller's exit-2 path; writer
+    failures are caught here, rolled back, and reported through the exit-1
+    ``{"ok":false,"error":"writer failure"}`` envelope.
+    """
+    required = ("kind", "session_id", "lane", "moment", "ref_path")
+    supplied = tuple(
+        value for value in (kind, session_id, lane, moment, ref_path)
+        if value is not None
+    )
+    if len(supplied) != len(required):
+        raise ValueError(
+            "flagged evidence write requires --kind, --session-id, --lane, "
+            "--moment and --ref-path together"
+        )
+    if not isinstance(payload, dict) or set(payload) != set(_DELEGATION_PAYLOAD_KEYS):
+        raise ValueError(
+            "delegation payload keys must be exactly child_session_id, "
+            "parent_session_id, result_sha256 and task_sha256"
+        )
+    for key in ("child_session_id", "parent_session_id"):
+        if not isinstance(payload[key], str):
+            raise ValueError(f"{key} must be a string")
+    for key in ("result_sha256", "task_sha256"):
+        value = payload[key]
+        if not isinstance(value, str) or not _DELEGATION_DIGEST_RE.fullmatch(value):
+            raise ValueError(f"{key} must be a lowercase 64-character sha256 hex digest")
+    excerpt = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(excerpt) > EVIDENCE_MAX_EXCERPT_CHARS:
+        raise ValueError(
+            "delegation payload exceeds the evidence excerpt cap of "
+            f"{EVIDENCE_MAX_EXCERPT_CHARS} characters"
+        )
+    try:
+        stored_id = write_evidence(
+            conn,
+            session_id=session_id,
+            lane=lane,
+            moment=moment,
+            kind=kind,
+            ts=now_iso(),
+            excerpt=excerpt,
+            ref_path=ref_path,
+            ref_offset=None,
+            redact=False,
+        )
+        conn.commit()
+    except (sqlite3.Error, OverflowError):
+        conn.rollback()
+        print('{"ok":false,"error":"writer failure"}')
+        sys.exit(1)
+    print(json.dumps({"ok": True, "id": stored_id}, sort_keys=True))
+    return 0
+
+
 def cmd_evidence_list(
     conn: sqlite3.Connection,
     *,
@@ -2126,7 +2217,23 @@ def main():
     # selector only; evidence rows intentionally do not carry a namespace.
     p_evidence = _add_parser("evidence", help="write or inspect host evidence")
     evidence_sub = p_evidence.add_subparsers(dest="evidence_cmd", required=True)
-    evidence_sub.add_parser("write", help="write one JSON evidence object from stdin")
+    p_evidence_write = evidence_sub.add_parser(
+        "write", help="write one JSON evidence object from stdin")
+    p_evidence_write.add_argument(
+        "--kind", dest="kind", type=str, choices=("delegation",), required=False,
+        help="Evidence kind to write")
+    p_evidence_write.add_argument(
+        "--session-id", dest="session_id", type=str, required=False,
+        help="Evidence session id")
+    p_evidence_write.add_argument(
+        "--lane", dest="lane", type=str, choices=EVIDENCE_LANES, required=False,
+        help="Host lane for the evidence")
+    p_evidence_write.add_argument(
+        "--moment", dest="moment", type=str, choices=EVIDENCE_MOMENTS,
+        required=False, help="Injection moment for the evidence")
+    p_evidence_write.add_argument(
+        "--ref-path", dest="ref_path", type=str, required=False,
+        help="Stable evidence reference")
     p_evidence_list = evidence_sub.add_parser("list", help="list evidence rows")
     p_evidence_list.add_argument("--namespace", dest="namespace", type=str,
                                  required=True, help="namespace to inspect")
@@ -3984,6 +4091,15 @@ def main():
             if args.evidence_cmd == "write":
                 try:
                     payload = _read_one_json_object()
+                    if _flagged_evidence_flags_present(args):
+                        # Issue #164 flagged mode: four-key delegation payload,
+                        # store-generated ts, ok/id envelope on stdout. Writer
+                        # failure exits 1 from inside the handler; validation
+                        # errors fall through to the shared exit-2 mapping.
+                        sys.exit(cmd_evidence_write_flagged(
+                            conn, kind=args.kind, session_id=args.session_id,
+                            lane=args.lane, moment=args.moment,
+                            ref_path=args.ref_path, payload=payload))
                     sys.exit(cmd_evidence_write(conn, payload=payload))
                 except DuplicateJSONKeyError:
                     conn.rollback()
