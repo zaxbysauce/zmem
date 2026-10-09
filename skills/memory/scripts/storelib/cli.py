@@ -35,7 +35,7 @@ from storelib.evidence import (
     write_evidence,
 )
 from storelib.links import LINK_RELATIONS, cmd_contradict, cmd_links
-from storelib.mine import cmd_convention_drift, cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_add, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists
+from storelib.mine import cmd_convention_drift, cmd_corrections, cmd_failures, cmd_mine_history, cmd_mine_history_adapters, cmd_ops_append, cmd_queue_add, cmd_queue_clear, cmd_queue_list, cmd_promote_store, cmd_signals, source_exists, source_ref_exists
 from storelib.promote import promote_memory
 # _reembed: NOT called here (dispatch uses reembed_embeddings) but kept as
 # this module's re-export surface for `storelib/__init__.py` and legacy
@@ -2849,14 +2849,28 @@ def main():
     p_source_exists.add_argument("--json", dest="json", action="store_true",
                                  default=False, help="emit a machine-readable result")
 
+    p_source_ref_exists = _add_parser(
+        "source-ref-exists",
+        help="check whether a live lesson row carries this source_ref "
+             "(issue #163 provider pre_verify probe)")
+    p_source_ref_exists.add_argument("--source-ref", dest="source_ref",
+                                     required=True,
+                                     help="Exact source_ref to check")
+    p_source_ref_exists.add_argument("--json", dest="json", action="store_true",
+                                     default=False,
+                                     help="emit a machine-readable result")
+
     p_ops_append = _add_parser(
         "ops-append", help="append one normalized operation-ring event")
-    p_ops_append.add_argument("--session", dest="session", required=True,
-                              help="session id")
+    p_ops_append.add_argument("--namespace", dest="namespace", required=True,
+                              help="Namespace for the operation ring")
+    p_ops_append.add_argument("--session-id", "--session", dest="session_id",
+                              required=True,
+                              help="Session id for the operation ring")
     p_ops_append.add_argument("--tool", dest="tool", required=True,
-                              help="tool name")
-    p_ops_append.add_argument("--op", dest="op", required=True,
-                              help="operation descriptor")
+                              help="Tool name")
+    p_ops_append.add_argument("--operation", "--op", dest="operation",
+                              required=True, help="Bounded operation string")
     p_ops_append.add_argument("--json", dest="json", action="store_true",
                               default=False, help="emit a machine-readable result")
 
@@ -3600,13 +3614,38 @@ def main():
         print('{"exists":%s}' % ("true" if exists else "false"))
         sys.exit(0)
 
+    # Issue #163: lesson-only, namespace-agnostic source_ref probe for the
+    # provider pre_verify continue-nudge.  Same read-only pre-connect shape
+    # as source-exists: an absent, locked, or legacy store answers "no
+    # lesson" without being created or migrated.
+    if args.cmd == "source-ref-exists":
+        try:
+            if not STORE_PATH.is_file():
+                print('{"exists":false}')
+                sys.exit(0)
+            if _schema_host is not None:
+                _schema_host.assert_local_fs(STORE_PATH.parent)
+            probe = sqlite3.connect(
+                STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                probe.execute("PRAGMA query_only=1")
+                exists = source_ref_exists(probe, source_ref=args.source_ref)
+            finally:
+                probe.close()
+        except Exception:
+            print("[zmem] source-ref-exists failed", file=sys.stderr)
+            sys.exit(1)
+        print('{"exists":%s}' % ("true" if exists else "false"))
+        sys.exit(0)
+
     # The operation ring is a sidecar, never a SQLite write.  Its owning
     # normalizer remains storelib.ops_tokens; this CLI is the only bridge used
     # by capture hooks that cannot import store internals.
     if args.cmd == "ops-append":
         sys.exit(cmd_ops_append(
-            data_dir=str(STORE_PATH.parent), session=args.session,
-            tool=args.tool, op=args.op))
+            data_dir=str(STORE_PATH.parent), namespace=args.namespace,
+            session=args.session_id, tool=args.tool, operation=args.operation))
 
     # One JSON payload crosses from the stdlib-only Hermes hook into the store
     # process.  It is parsed before any stateful work; malformed input is a

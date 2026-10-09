@@ -190,10 +190,13 @@ Schema v14 adds three additive evidence tables: `evidence`,
 observation data rather than model instructions. The writer validates the
 closed lane/moment/kind sets, requires a second-precision UTC timestamp,
 redacts before capping the excerpt at 400 characters, and stores
-`SHA256(kind|ts|final_excerpt)`. When the zmem provider is active, its implemented native callback is
-`post_tool_call` only: it admits a bounded payload to a detached local writer,
-fails open on malformed or unavailable host data, and does not add the remote
-`pre_llm_call`/`pre_verify` transport promised by the larger #163 idea.
+`SHA256(kind|ts|final_excerpt)`. When the zmem provider is active (issue #163), the plugin natively registers
+`post_tool_call`, `pre_llm_call`, and `pre_verify`: `post_tool_call` admits a
+bounded payload to a detached local writer and fails open on malformed or
+unavailable host data; `pre_llm_call` delivers passive recall through the
+#160 transport with strict envelope validation; `pre_verify` delivers the
+reflect-before-stop continue nudge once per session. Every callback fails
+open — each returns `{}` and never raises into Hermes.
 
 Legacy unscoped CLI/operator reads use `evidence list --namespace NS` and
 `evidence show --namespace NS --id UUID`; on these commands, `--namespace` is a
@@ -746,8 +749,13 @@ inactive — **copy users must set `ZMEM_HOME`** to this repo's checkout path
    memory:
      provider: zmem
    ```
-4. (Optional, recommended) Enable the reflection loop. Find your absolute
-   plugin path first:
+4. (Optional, recommended) Enable the compatibility reflection loop. With
+   `memory.provider: zmem` the plugin already registers native
+   `post_tool_call` / `pre_llm_call` / `pre_verify` callbacks (issue #163);
+   the shell hooks below are the compatibility reflection loop and can run
+   BESIDE the native callbacks — install them only if you want the richer
+   convention/failure shell behavior too. Find your absolute plugin path
+   first:
    ```bash
    python -c "from hermes_constants import get_hermes_home; print(get_hermes_home())"
    ```
@@ -1420,14 +1428,17 @@ importing store internals:
 
 ```text
 <interpreter> <store.py> source-exists --namespace NS --source-ref REF --json
-<interpreter> <store.py> ops-append --session SESSION --tool TOOL --op OP --json
+<interpreter> <store.py> ops-append --namespace NS --session-id SESSION --tool TOOL --operation OP --json
 ```
 
 `source-exists` prints `{"exists":false}` and exits 0 when the store is absent;
 it opens an existing store read-only and never creates or migrates one.
 `ops-append` prints `{"ok":true}` after appending the bounded operation-ring
-record. Invalid input or unavailable state returns a nonzero status so hook
-adapters can preserve their documented fail-open envelope.
+record; an operation that derives no tokens is the declared successful no-op
+(the ring is keyed by session id; the namespace is carried for the provider
+path, issue #163). Invalid input or unavailable state prints `{"ok":false}`
+and returns a nonzero status so hook adapters can preserve their documented
+fail-open envelope.
 
 **Rolling a host back to a previous version.** Plugin caches pin a version
 directory and never overwrite older ones (see [Upgrade](#upgrade)), so a

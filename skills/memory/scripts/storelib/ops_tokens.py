@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from typing import List
 
@@ -249,7 +250,12 @@ def derive_ops_tokens(*events: str) -> List[str]:
             last = words[-1] if words else ""
             base = last.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             t = _clean_token(base)
-            if t and not _SECRET_SHAPE_RE.match(t):
+            # Issue #163 (PRR-022): a dash-prefixed token becomes an argv
+            # OPTION downstream (--ops-token / spliced FTS terms) and is
+            # refused or misparsed — drop it at derivation, same rule the
+            # runner branch applies.
+            if t and not t.startswith("-") \
+                    and not _SECRET_SHAPE_RE.match(t):
                 if "." in t or "-" in t or "_" in t:
                     _push(t)
 
@@ -530,7 +536,7 @@ def read_ops_ring(
 
 def append_ops_ring(data_dir: str, session_id: str, tool: str, op: str) -> bool:
     """Append one operation event to the per-session ring (write side,
-    called from the PostToolUse / post_tool_call hooks).
+    called from the post_tool_call hooks).
 
     Spec B (#85): the sidecar stores ONLY the tool name plus the
     ALLOWLISTED operation tokens (git subcommand chains, test-runner verbs,
@@ -539,10 +545,13 @@ def append_ops_ring(data_dir: str, session_id: str, tool: str, op: str) -> bool:
     write chokepoint, so no raw command ever lands on disk. An event that
     derives to nothing is not written at all.
 
-    Ring-capped: when the file exceeds ``_RING_MAX_BYTES`` it is trimmed to
-    the newest ``_RING_TRIM_TO_LINES`` lines before the append. Best-effort:
-    returns False on any failure — callers never let ring health affect
-    hook behavior.
+    Ring-capped (#163): enforced AFTER the append — complete JSONL lines
+    are dropped oldest-first until the ring holds at most
+    ``_RING_TRIM_TO_LINES`` lines AND at most ``_RING_MAX_BYTES`` UTF-8
+    bytes, then the newest complete lines are rewritten atomically. A torn
+    trailing line (no newline) is never retained. Best-effort: returns
+    False on any failure — callers never let ring health affect hook
+    behavior.
     """
     if not data_dir or not session_id or not op:
         return False
@@ -557,34 +566,67 @@ def append_ops_ring(data_dir: str, session_id: str, tool: str, op: str) -> bool:
     })
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            # Trim at the exact boundary too: appending one more event to a
-            # file already at the cap must not leave an over-cap ring until a
-            # later, unrelated append happens.
-            if os.path.getsize(path) >= _RING_MAX_BYTES:
-                # Issue #122: rotate atomically — the retained tail is
-                # written to a same-directory temp file (flush + fsync) and
-                # renamed over the live ring, so an interrupted trim can
-                # never leave partial JSONL. A failed replace keeps the
-                # original bytes.
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    tail = f.readlines()[-_RING_TRIM_TO_LINES:]
-                tmp = path + ".tmp"
+        # PRR-007: repair a torn trailing line BEFORE appending — an append
+        # in "a" mode would otherwise concatenate this event onto the torn
+        # bytes, fusing both into one unparseable line.  Truncate to the
+        # last complete newline so the torn partial bytes are dropped.
+        with open(path, "a+b") as f:
+            size = f.seek(0, os.SEEK_END)
+            if size:
+                f.seek(size - 1)
+                if f.read(1) != b"\n":
+                    f.seek(0)
+                    raw = f.read()
+                    last_nl = raw.rfind(b"\n")
+                    f.seek(last_nl + 1 if last_nl >= 0 else 0)
+                    f.truncate()
+            f.write(line.encode("utf-8") + b"\n")
+        # Issue #163: enforce BOTH caps after the append, so 65 appends of
+        # any size can never leave 65 live events.  Keep the newest
+        # complete lines that fit both bounds and rotate atomically
+        # (#122 pattern: same-directory temp, flush + fsync, replace) so
+        # an interrupted trim never leaves partial JSONL.
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        parts = raw.split("\n")
+        if parts and parts[-1] == "":
+            parts.pop()          # trailing newline's empty tail
+        elif parts:
+            parts.pop()          # torn tail without a newline: never kept
+        kept = []
+        total = 0
+        for ln in reversed(parts):
+            size = len((ln + "\n").encode("utf-8"))
+            if len(kept) >= _RING_TRIM_TO_LINES or total + size > _RING_MAX_BYTES:
+                break
+            kept.append(ln)
+            total += size
+        kept.reverse()
+        if len(kept) != len(parts):
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                    for kept_line in kept:
+                        f.write(kept_line + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except OSError as exc:
+                # PRR-008: a swallowed replace failure used to leave the
+                # caps unenforced with {"ok":true} and no signal (Windows
+                # raises WinError 5 when a reader holds the ring open).
+                # Surface it on stderr — stdout stays machine-parseable and
+                # ring health still never fails the caller.
                 try:
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        f.writelines(tail)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, path)
+                    sys.stderr.write(
+                        "[zmem] ops ring trim failed; caps deferred "
+                        "(%s)\n" % (exc,))
+                except Exception:
+                    pass
+                try:
+                    os.remove(tmp)
                 except OSError:
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+                    pass
         return True
     except OSError:
         return False

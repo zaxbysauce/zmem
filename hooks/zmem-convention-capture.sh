@@ -183,7 +183,7 @@ QUERY_CONTEXT="$(env_value ZMEM_QUERY_CONTEXT)"
 QUERY_CONTEXT="$(printf '%s' "$QUERY_CONTEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 if [ "$QUERY_CONTEXT" != "0" ]; then
   [ -n "$OP" ] || emit_empty
-  OPS_RESULT="$("$PYTHON_BIN" "$STORE_PY_PY" ops-append --session "$SESSION_ID" --tool "$TOOL" --op "$OP" --json 2>/dev/null)" || emit_empty
+  OPS_RESULT="$("$PYTHON_BIN" "$STORE_PY_PY" ops-append --namespace "${NS:-user:global}" --session-id "$SESSION_ID" --tool "$TOOL" --operation "$OP" --json 2>/dev/null)" || emit_empty
   "$PYTHON_BIN" -c 'import json,sys; o=json.loads(sys.argv[1]); raise SystemExit(0 if o.get("ok") is True else 1)' "$OPS_RESULT" 2>/dev/null || emit_empty
 fi
 

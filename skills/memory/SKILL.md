@@ -2047,13 +2047,18 @@ without touching its persisted state.
 ### source-exists / ops-append — capture adapter bridges
 ```
 <interpreter> <store.py> source-exists --namespace NS --source-ref REF --json
-<interpreter> <store.py> ops-append --session SESSION --tool TOOL --op OP --json
+<interpreter> <store.py> ops-append --namespace NS --session-id SESSION --tool TOOL --operation OP --json
 ```
 `source-exists` prints `{"exists":false}` with exit 0 for a missing store and
 otherwise opens the store read-only without creation or migration. `ops-append`
-prints `{"ok":true}` after appending the bounded operation-ring record. Invalid
-arguments or unavailable state return nonzero; adapters translate that through
-their documented fail-open envelopes. Neither command authorizes a hook to
+prints `{"ok":true}` after appending the bounded operation-ring record; a
+no-token operation is the declared successful no-op (issue #163).
+`--namespace` is REQUIRED (old invocations without it exit 2 with no stdout
+payload). Invalid arguments or unavailable state print `{"ok":false}` and
+return nonzero; adapters translate that through their documented fail-open
+envelopes. With `memory.provider=zmem` the plugin's native post_tool_call /
+pre_llm_call / pre_verify callbacks run BESIDE any installed compatibility
+shell hooks (both paths are operational; suppression is operator-managed). Neither command authorizes a hook to
 import store internals directly.
 
 `ZMEM_CONVENTION_INTERVAL` remains the legacy cadence for the Hermes
@@ -2482,11 +2487,13 @@ closed lane/moment/kind sets and second-precision UTC timestamps.
 `evidence write` validates the payload before insert; it redacts first, caps the
 final excerpt at 400 Unicode characters, hashes `kind|ts|final_excerpt`, and
 leaves the transaction commit to its caller. The CLI writer commits its own
-one-row transaction. When the zmem provider is active, the native Hermes writer is the registered
-`post_tool_call` callback only. It sends a bounded private payload through the
-existing local store bridge and fails open on malformed input, unavailable
-host support, queue saturation, or writer failure. This is one evidence
-capability, not completion of the larger #163 pre-LLM/pre-verify transport.
+one-row transaction. When the zmem provider is active (issue #163), the plugin natively registers
+`post_tool_call`, `pre_llm_call`, and `pre_verify`. The registered
+`post_tool_call` sends a bounded private payload through the existing local
+store bridge and fails open on malformed input, unavailable host support,
+queue saturation, or writer failure; `pre_llm_call` and `pre_verify` complete
+the #163 provider surface (transport recall with strict envelope validation,
+and the once-per-session reflect-before-stop nudge). All three fail open.
 
 ```text
 <interpreter> <store.py> evidence write < payload.json

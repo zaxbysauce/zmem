@@ -70,14 +70,48 @@ def source_exists(conn: sqlite3.Connection, *, namespace: str,
     return row is not None
 
 
-def cmd_ops_append(*, data_dir: str, session: str, tool: str, op: str) -> int:
-    """Append one normalized operation-ring event through the store boundary."""
+def source_ref_exists(conn: sqlite3.Connection, *, source_ref: str) -> bool:
+    """Return whether a live ``lesson`` row carries this source_ref (#163).
+
+    The provider-mode ``pre_verify`` callback probes this through
+    ``store.py source-ref-exists`` rather than opening SQLite itself.  Unlike
+    ``source_exists`` the check is deliberately namespace-agnostic (the
+    provider resolves its namespace for recall, but a captured lesson from
+    any namespace for the same session still proves the reflection happened)
+    and lesson-only: convention/observation rows must not suppress the
+    continue nudge.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM memory WHERE type = 'lesson' AND source_ref = ? "
+        "AND superseded_at IS NULL LIMIT 1",
+        (source_ref,),
+    ).fetchone()
+    return row is not None
+
+
+def cmd_ops_append(*, data_dir: str, namespace: str, session: str, tool: str,
+                   operation: str) -> int:
+    """Append one normalized operation-ring event through the store boundary
+    (#163 provider contract).
+
+    ``namespace`` is carried for the provider path and future fleet-parity
+    routing; today the ring is keyed by session id only.  A no-token
+    derivation is the declared successful no-op: the writer is never
+    invoked, ``{"ok":true}`` prints, and the exit code is 0.
+    """
     try:
         from storelib import ops_tokens
 
-        if not ops_tokens.append_ops_ring(data_dir, session, tool, op):
+        if not (namespace or "").strip() or not (session or "").strip() \
+                or not (tool or "").strip() or not (operation or "").strip():
+            raise ValueError("namespace, session, tool and operation are required")
+        if not ops_tokens.derive_ops_tokens(operation):
+            print('{"ok":true}')
+            return 0
+        if not ops_tokens.append_ops_ring(data_dir, session, tool, operation):
             raise RuntimeError("operation ring append rejected")
     except Exception:
+        print('{"ok":false}')
         print("[zmem] ops-append failed", file=sys.stderr)
         return 1
     print('{"ok":true}')

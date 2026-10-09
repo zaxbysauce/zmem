@@ -347,30 +347,60 @@ class RingTest(unittest.TestCase):
                 f.write(('{"ops": "x' + "y" * 200 + '"}\n') * 400)
             ops_tokens.append_ops_ring(tmp, "cap", "Bash", "git stash pop")
             lines = ring.read_text(encoding="utf-8").strip().splitlines()
+            # Issue #163: the dual cap holds AFTER the append — 400 fat
+            # pre-existing lines plus the new event must trim to the cap
+            # with the newest event retained.
             self.assertLessEqual(len(lines),
-                                 ops_tokens._RING_TRIM_TO_LINES + 1)
+                                 ops_tokens._RING_TRIM_TO_LINES)
             self.assertIn("git stash pop", lines[-1])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_ring_exact_boundary_trims_before_append(self):
+    def test_ring_byte_cap_binds_without_line_overflow(self):
+        """#163: the 65536-byte branch must bite on its own — few events,
+        each oversized, still trims (the old pre-append-only trim left the
+        over-byte ring untouched when the size was under the boundary)."""
+        tmp = tempfile.mkdtemp(prefix="zmem-ops-ring-bytes-")
+        try:
+            ring = Path(ops_tokens._ring_path(tmp, "bytes"))
+            ring.parent.mkdir(parents=True)
+            # Line = 18-char prefix + fat + '"}' + newline. 40 x (18 + 1650
+            # + 3) = 66,840 bytes: over _RING_MAX_BYTES with far fewer than
+            # _RING_TRIM_TO_LINES lines. (An earlier 1600-char fat landed
+            # 596 bytes UNDER the cap — the branch never fired; review
+            # round 4 caught the vacuous fixture.)
+            fat = "y" * 1650
+            line_len = 18 + len(fat) + 3
+            self.assertGreater(40 * line_len, ops_tokens._RING_MAX_BYTES)
+            with open(ring, "w", encoding="utf-8") as f:
+                for i in range(40):
+                    f.write('{"ops": "git push %s"}\n' % fat)
+            ops_tokens.append_ops_ring(tmp, "bytes", "Bash", "git stash pop")
+            raw = ring.read_bytes()
+            self.assertLessEqual(len(raw), ops_tokens._RING_MAX_BYTES)
+            lines = raw.decode("utf-8").strip().splitlines()
+            self.assertLessEqual(len(lines), ops_tokens._RING_TRIM_TO_LINES)
+            self.assertIn("git stash pop", lines[-1])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ring_boundary_trims_after_append(self):
+        """#163: 65 small appends leave at most _RING_TRIM_TO_LINES live
+        events — the post-append cap, not the pre-append trim."""
         tmp = tempfile.mkdtemp(prefix="zmem-ops-ring-boundary-")
-        previous = ops_tokens._RING_MAX_BYTES
         try:
             ring = Path(ops_tokens._ring_path(tmp, "boundary"))
             ring.parent.mkdir(parents=True)
-            lines = [json.dumps({"ops": f"git push event-{i}"}) + "\n"
-                     for i in range(65)]
-            raw = "".join(lines)
-            ops_tokens._RING_MAX_BYTES = len(raw)
-            ring.write_text(raw, encoding="utf-8")
-            self.assertTrue(ops_tokens.append_ops_ring(
-                tmp, "boundary", "Bash", "git stash pop"))
-            rewritten = ring.read_text(encoding="utf-8")
-            self.assertNotIn("event-0", rewritten)
-            self.assertIn("git stash pop", rewritten.splitlines()[-1])
+            for i in range(ops_tokens._RING_TRIM_TO_LINES + 1):
+                self.assertTrue(ops_tokens.append_ops_ring(
+                    tmp, "boundary", "Bash", "git push event-%d" % i))
+            lines = ring.read_text(encoding="utf-8").strip().splitlines()
+            self.assertLessEqual(len(lines),
+                                 ops_tokens._RING_TRIM_TO_LINES)
+            self.assertIn("event-%d" % ops_tokens._RING_TRIM_TO_LINES,
+                          lines[-1])
+            self.assertNotIn("event-0", ring.read_text(encoding="utf-8"))
         finally:
-            ops_tokens._RING_MAX_BYTES = previous
             shutil.rmtree(tmp, ignore_errors=True)
 
 
