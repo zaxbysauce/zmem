@@ -10,6 +10,14 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.91.0] - 2026-10-09
+
+### Added
+
+- **Hermes `on_delegation` evidence (issue #164, Workstream H PR 7 of 8)**: the provider callback now hashes the exact task and result strings (UTF-8 SHA-256, hashed before any trimming) and sends exactly one flagged `store.py evidence write --kind delegation --session-id <parent> --lane hermes-provider --moment subagent --ref-path delegation:<parent>:<child>` request with a four-field compact payload (child/parent session ids plus both digests; sorted keys, one trailing LF) on UTF-8 stdin — never the raw task or result text, never a memory row, never a ledger or correction-queue touch. The parent session id comes from the callback kwargs first, then the provider's own initialized session (bounded to the 128-char untrusted-id cap); an empty parent, a non-string task/result, or a payload that cannot fit the 400-char excerpt cap skips the write with a debug log and no subprocess. Every failure class — OSError, subprocess failure, malformed store stdout, rejected envelope — is swallowed with only the exception class logged, zero retries, and `None` returned into Hermes; `on_pre_compress` is untouched and no compression callback is registered.
+- **Flagged `evidence write` CLI mode (issue #164)**: `store.py evidence write` accepts `--kind` (currently `delegation`), `--session-id`, `--lane`, `--moment` and `--ref-path`. With flags present the command reads the four-key delegation payload from stdin, validates both digests are lowercase 64-character hex, generates the timestamp inside the store process (`schema.now_iso()`), stores the payload verbatim as the excerpt, and answers `{"ok":true,"id":"<stored-id>"}` on stdout; missing/partial flags, malformed JSON, or invalid payloads exit 2 with a sanitized error (the payload is never echoed), and writer failures exit 1 with `{"ok":false,"error":"writer failure"}`. Without flags the legacy full-row stdin mode and its bare stored-id stdout are byte-identical for every existing consumer (the native evidence worker, the convention hook, the host launcher, and the fixture repro helpers).
+- **Redaction exemption for validated delegation digests (issue #164)**: `write_evidence` gains a keyword-only `redact: bool = True` parameter. The flagged adapter — which has already proven the excerpt is solely two string session ids and two lowercase 64-hex digests — is the only caller passing `redact=False`, because the redactor's hex-token pattern would otherwise rewrite both SHA-256 content digests to `[REDACTED_SECRET]` and destroy the correlatable evidence the delegation contract stores; every other caller keeps the default redaction path unchanged.
+
 ## [0.90.0] - 2026-10-09
 
 ### Added

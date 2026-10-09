@@ -1990,6 +1990,23 @@ class _PrefetchCache:
                 self._inserted_at.pop(key, None)
 
 
+# Issue #164: delegation evidence cap.  This mirrors the store-side
+# EVIDENCE_MAX_EXCERPT_CHARS as a LOCAL constant — the provider never imports
+# storelib — so a delegation payload that cannot be stored whole is skipped
+# before the subprocess rather than silently truncated mid-JSON.
+_DELEGATION_EVIDENCE_EXCERPT_MAX_CHARS = 400
+
+
+def _delegation_hash(value: str) -> str:
+    """SHA-256 of the exact UTF-8 bytes of ``value`` (issue #164).
+
+    The hash input is the original string — never trimmed, normalized, or
+    truncated — so a task or result with trailing whitespace hashes
+    differently from its stripped form.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 class ZmemMemoryProvider(MemoryProvider):
     """ZMem local-first memory — subprocess-bridges Hermes to ``store.py``."""
 
@@ -3868,8 +3885,99 @@ class ZmemMemoryProvider(MemoryProvider):
     def on_delegation(
         self, task: str, result: str, *, child_session_id: str = "", **kwargs
     ) -> None:
-        """Deferred — no subagent delegation capture in v1."""
+        """Fail-open delegation evidence producer (issue #164).
+
+        Hashes the exact task and result strings, then sends ONE flagged
+        ``evidence write`` store request recording the child and parent
+        session ids and both digests — never the raw task/result text, never
+        a memory row.  The parent id comes from ``kwargs`` first, then the
+        provider's own initialized session (the session delegating IS the
+        parent).  Every failure class — non-string input, empty parent,
+        OSError, subprocess failure, malformed store stdout, writer failure —
+        is swallowed with a debug log carrying only the exception class; there
+        is no retry and nothing ever raises into Hermes.
+        """
+        try:
+            if not isinstance(task, str) or not isinstance(result, str):
+                logger.debug(
+                    "zmem on_delegation skipped: non-string task or result")
+                return None
+            parent = str(
+                kwargs.get("parent_session_id") or self._session_id or ""
+            ).strip()[:_PROVIDER_SESSION_ID_MAX_CHARS]
+            child = str(child_session_id or "").strip()
+            child = child[:_PROVIDER_SESSION_ID_MAX_CHARS]
+            if not parent:
+                logger.debug("zmem on_delegation skipped: no parent session id")
+                return None
+            self._write_delegation_evidence(
+                task_sha256=_delegation_hash(task),
+                result_sha256=_delegation_hash(result),
+                child_session_id=child,
+                parent_session_id=parent,
+            )
+        except Exception as exc:  # pragma: no cover — defensive fail-open
+            logger.debug(
+                "zmem on_delegation evidence failed (%s)", type(exc).__name__)
         return None
+
+    def _write_delegation_evidence(
+        self,
+        *,
+        task_sha256: str,
+        result_sha256: str,
+        child_session_id: str,
+        parent_session_id: str,
+    ) -> None:
+        """Send the one delegation ``evidence write`` subprocess request.
+
+        Builds the four-field compact payload (sorted keys, compact
+        separators, one trailing LF), sends it on UTF-8 stdin with the exact
+        issue-#164 argv, and verifies the success envelope.  A payload that
+        cannot be stored whole (over the excerpt cap) is skipped before the
+        subprocess.  Store-side failures are logged at debug and dropped;
+        raising seams (tests) propagate to ``on_delegation``'s handler.
+        """
+        payload = json.dumps(
+            {
+                "child_session_id": child_session_id,
+                "parent_session_id": parent_session_id,
+                "result_sha256": result_sha256,
+                "task_sha256": task_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+        if len(payload) > _DELEGATION_EVIDENCE_EXCERPT_MAX_CHARS:
+            logger.debug(
+                "zmem on_delegation skipped: payload exceeds %d chars",
+                _DELEGATION_EVIDENCE_EXCERPT_MAX_CHARS)
+            return
+        response = _run_store(
+            [
+                "evidence", "write",
+                "--kind", "delegation",
+                "--session-id", parent_session_id,
+                "--lane", "hermes-provider",
+                "--moment", "subagent",
+                "--ref-path",
+                f"delegation:{parent_session_id}:{child_session_id}",
+            ],
+            input_text=payload,
+        )
+        if not isinstance(response, dict) or not response.get("ok"):
+            logger.debug("zmem delegation evidence write failed")
+            return
+        try:
+            envelope = json.loads(response.get("stdout") or "")
+        except (TypeError, ValueError):
+            logger.debug("zmem delegation evidence envelope malformed")
+            return
+        if (not isinstance(envelope, dict)
+                or envelope.get("ok") is not True
+                or not envelope.get("id")):
+            logger.debug("zmem delegation evidence envelope rejected")
+            return
 
     def sync_turn(
         self,

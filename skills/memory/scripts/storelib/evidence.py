@@ -147,12 +147,21 @@ def write_evidence(
     ref_path: str,
     ref_offset: int | None,
     id: str | None = None,
+    redact: bool = True,
 ) -> str:
     """Validate, redact, cap, hash, and insert one evidence row.
 
     The caller owns the transaction.  In particular, this helper never calls
     ``commit``: duplicate IDs and SQL failures are therefore naturally part of
     the caller's rollback boundary.
+
+    ``redact`` (issue #164) may be False ONLY from a caller that has already
+    validated the excerpt cannot contain secret-like content (the flagged
+    ``evidence write`` adapter proves the payload is two string session ids
+    plus two lowercase 64-hex digests before passing it).  SHA-256 content
+    digests are non-secret correlation fingerprints that the redactor's
+    hex-token pattern would otherwise destroy; every other caller keeps the
+    default redaction path.
     """
     session_id = _required_text(session_id, "session_id", max_chars=512)
     if lane is not None and lane not in EVIDENCE_LANES:
@@ -185,8 +194,9 @@ def write_evidence(
         raise ValueError("id must be a 36-character UUID-shaped string")
 
     excerpt = excerpt[:EVIDENCE_INPUT_MAX_EXCERPT_CHARS]
-    final_excerpt, _ = redact_text(excerpt)
-    final_excerpt = final_excerpt[:EVIDENCE_MAX_EXCERPT_CHARS]
+    if redact:
+        excerpt, _ = redact_text(excerpt)
+    final_excerpt = excerpt[:EVIDENCE_MAX_EXCERPT_CHARS]
     digest = hashlib.sha256(
         f"{kind}|{ts}|{final_excerpt}".encode("utf-8")
     ).hexdigest()
