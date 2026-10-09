@@ -4,7 +4,11 @@
     {
       "name": "zmem",
       "source": ".",
+<<<<<<< HEAD
       "version": "0.91.0"
+=======
+      "version": "0.92.0"
+>>>>>>> 7272a50 (feat(report): per-session repeat and composition report (issue #249, release 0.91.0))
     }
   ]
 }

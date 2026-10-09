@@ -211,6 +211,8 @@ KNOWN_SUBCMDS = [
     # Issue #181 (Workstream L PR 2): live secret rescan/remediation through
     # the shared capture policy (--dry-run/--apply are real flags).
     "rescan-secrets",
+    # Issue #249: the decision-log repeat/composition report read command.
+    "report",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help
@@ -516,21 +518,22 @@ class CharacterizationTests(unittest.TestCase):
         # 50 -> 51: the queue-add write command joined (issue #260).
         # 51 -> 52: the convention-drift read command joined (issue #261).
         # 52 -> 53: the rescan-secrets command joined (issue #181).
-        self.assertEqual(len(KNOWN_SUBCMDS), 53)
+        # 53 -> 54: the decision-log report read command joined (issue #249).
+        self.assertEqual(len(KNOWN_SUBCMDS), 54)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
         # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # stays frozen at 53 after the #181 rescan-secrets addition).
+        # counts only the ones whose flag surface is asserted here).
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 53)
+        self.assertEqual(len(KNOWN_SUBCMDS), 54)
 
     def test_page_help_surface(self):
         """Pin the nested issue #138 grammar and operator-facing help text."""
