@@ -75,12 +75,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
+import io
+import json
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -90,8 +94,13 @@ except ImportError:
     _host = None
 
 from storelib.entity import relink_memory  # noqa: E402
-from storelib.schema import _load_vec, _normalize_content  # noqa: E402
+from storelib.schema import _load_vec, _normalize_content, init_db, migrate  # noqa: E402
 from storelib.purge import _ID_SIDE_TABLES, _head_surviving_source  # noqa: E402
+from storelib.sync import (  # noqa: E402
+    _INGEST_ID_RE,
+    _validate_sync_row,
+    cmd_ingest_jsonl_strict,
+)
 from storelib.write import (  # noqa: E402
     MAX_CONTENT_CHARS,
     CapturePolicyRefusal,
@@ -608,15 +617,375 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
     }
 
 
+# --- Hindsight JSONL import (issue #181, Workstream L PR 2) -----------------
+#
+# `--source hindsight --input <export.jsonl>` maps a Hindsight export into a
+# destination store while PRESERVING the source kind: every record becomes a
+# destination `fact` row carrying deterministic `hindsight:*` tags, and the
+# supplied Hindsight metadata + occurrence dates ride along in a canonical
+# JSONL written beside the store (the memory table has no metadata columns —
+# the canonical JSONL is the metadata/occurrence-authoritative artifact; the
+# store receives the memory-shaped projection).
+
+# Accepted source kinds, exactly the issue's six.
+_HINDSIGHT_KINDS = ("world", "experience", "observation", "kv", "current",
+                    "event")
+
+# The parse phase materializes the whole export before the bounded strict
+# ingest lane runs, so the input carries its own size gate (mirrors the sync
+# lane's STRICT_MAX_BYTES).
+HINDSIGHT_MAX_INPUT_BYTES = 64 * 1024 * 1024
+
+
+def _reject_json_constant(name: str) -> float:
+    """json.loads parse_constant hook: NaN/Infinity/-Infinity are malformed
+    JSON (the issue lists malformed JSON as a content failure), and the
+    canonical serializer would otherwise re-emit them as bare tokens no
+    RFC-8259 consumer can parse."""
+    raise ValueError(f"non-finite JSON constant {name}")
+
+
+def _json_object_no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """json.loads object_pairs_hook: reject duplicate keys at every nesting
+    level (the strict lane's own _strict_object_pairs semantics), so the
+    canonical output is a faithful — not last-wins-collapsed — canonicalization."""
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        out[key] = value
+    return out
+
+
+def _parse_hindsight_records(input_path: Path) -> list[dict]:
+    """Parse + validate a Hindsight JSONL export into canonical records.
+
+    Every violation raises ValueError BEFORE any destination work (the CLI
+    maps it to ``[import] FAILED:`` + exit 1): malformed JSON, a non-object
+    record, both or neither of ``kind``/``type``, an unsupported kind, a
+    non-UUID-shaped or duplicate id, an empty ``text``, a non-string
+    namespace/source_ref, a non-list ``tags`` (or non-string entry), a
+    non-object ``metadata``, or a non-string/non-null ``occurred_start``/
+    ``occurred_end`` — plus any non-null date STRING that does not parse the
+    store's exact ``%Y-%m-%dT%H:%M:%SZ`` writer format (mirrors the sync
+    validator's ISO rule: a malformed date string is a content failure, not
+    a silent pass-through).
+    """
+    text = input_path.read_text(encoding="utf-8")
+    records: list[dict] = []
+    seen_ids: set[str] = set()
+    for lineno, line in enumerate(text.split("\n"), 1):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line, parse_constant=_reject_json_constant,
+                             object_pairs_hook=_json_object_no_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"line {lineno}: malformed JSON: {exc}") from exc
+        except ValueError as exc:
+            raise ValueError(f"line {lineno}: {exc}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"line {lineno}: record must be a JSON object")
+        has_kind = "kind" in obj
+        has_type = "type" in obj
+        if has_kind == has_type:
+            raise ValueError(
+                f"line {lineno}: record must carry exactly one of "
+                f"'kind' or 'type'")
+        source_kind = obj["kind"] if has_kind else obj["type"]
+        if source_kind not in _HINDSIGHT_KINDS:
+            raise ValueError(
+                f"line {lineno}: unsupported source kind {source_kind!r} "
+                f"(accepted: {', '.join(_HINDSIGHT_KINDS)})")
+        mid = obj.get("id")
+        if not isinstance(mid, str) or not _INGEST_ID_RE.match(mid):
+            raise ValueError(
+                f"line {lineno}: 'id' must be a 36-char UUID-shaped string")
+        if mid in seen_ids:
+            raise ValueError(f"line {lineno}: duplicate id {mid}")
+        seen_ids.add(mid)
+        content = obj.get("text")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(
+                f"line {lineno}: 'text' must be a non-empty string")
+        namespace = obj.get("namespace", "user:global")
+        if not isinstance(namespace, str):
+            raise ValueError(
+                f"line {lineno}: 'namespace' must be a string when present")
+        source_ref = obj.get("source_ref", f"hindsight:{mid}")
+        if not isinstance(source_ref, str):
+            raise ValueError(
+                f"line {lineno}: 'source_ref' must be a string when present")
+        tags_in = obj.get("tags", [])
+        if not isinstance(tags_in, list) or any(
+                not isinstance(t, str) for t in tags_in):
+            raise ValueError(
+                f"line {lineno}: 'tags' must be a list of strings when present")
+        metadata = obj.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"line {lineno}: 'metadata' must be an object when present")
+        occurred = {}
+        for field in ("occurred_start", "occurred_end"):
+            value = obj.get(field, None)
+            if value is None:
+                occurred[field] = None
+                continue
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"line {lineno}: '{field}' must be a string or null")
+            try:
+                time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                raise ValueError(
+                    f"line {lineno}: '{field}' is not a valid ISO-8601 UTC "
+                    f"timestamp (expected YYYY-MM-DDTHH:MM:SSZ)") from None
+            occurred[field] = value
+        # Deterministic, kind-preserving tags: sorted set-union of the input
+        # tags with the kind markers. Only tags are sorted — metadata keeps
+        # its parsed key order verbatim (a canonical-bytes contract).
+        extra = [f"hindsight:{source_kind}"]
+        if source_kind == "observation":
+            extra.append("hindsight:observation")
+        if source_kind in ("kv", "current"):
+            extra.append("state-candidate")
+        if source_kind == "event":
+            extra.append("hindsight:event")
+        tags_out = ",".join(sorted(set(list(tags_in) + extra)))
+        records.append({
+            "kind": "memory",
+            "id": mid,
+            "namespace": namespace,
+            "type": "fact",
+            "content": content,
+            "tags": tags_out,
+            "source_ref": source_ref,
+            "metadata": metadata,
+            "occurred_start": occurred["occurred_start"],
+            "occurred_end": occurred["occurred_end"],
+        })
+    if not records:
+        raise ValueError("no records found in input")
+    return records
+
+
+def _serialize_canonical_record(record: dict) -> str:
+    """One canonical JSONL line: fixed key order, compact separators,
+    ensure_ascii=False, U+2028/U+2029/U+0085 escaped (mirrors sync.py's
+    export serializer), LF-terminated."""
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    line = (line.replace("\u2028", "\\u2028")
+                .replace("\u2029", "\\u2029")
+                .replace("\u0085", "\\u0085"))
+    return line + "\n"
+
+
+def run_hindsight_import(input_path: Path, dest_dir: Path,
+                         force: bool = False) -> dict:
+    """Import a Hindsight JSONL export into a destination directory.
+
+    Fail-closed contract identical in spirit to run_import: the input is
+    fully parsed and validated (including a pass/fail gate through
+    ``_validate_sync_row`` — its return value is discarded; the canonical
+    JSONL is serialized from the canonical records) BEFORE the destination
+    is touched; the staged store is built in a staging directory INSIDE
+    dest_dir and only ``os.replace``d into place after the strict ingest
+    succeeds, the staged count equals the source count, and
+    ``PRAGMA integrity_check`` reports ok. Every failure up to that point
+    removes ONLY the
+    staging directory — an existing destination stays byte-identical, and
+    nothing is ever written outside dest_dir (the strict ingest lane raises
+    on capture refusals instead of writing quarantine ledgers).
+
+    Ingest runs through the strict all-or-nothing lane with
+    ``capture_mode="auto"``: every row is redacted by the single capture
+    policy, ids are preserved, and any refusal/malformed row fails the whole
+    import (a documented deviation from the issue's literal legacy-lane
+    wording — the legacy lane's quarantine ledger writes to
+    ``dirname(STORE_PATH)``, outside this command's destination contract).
+
+    Byte-identity scope: every PRE-ACCEPT failure (parse, validation,
+    non-empty destination, staging, ingest, count, integrity) leaves an
+    existing destination byte-identical and removes only the staging
+    directory. The two final ``os.replace`` calls are not jointly atomic —
+    exactly like run_import's store/core.md seam, a second-replace failure
+    discloses that the store landed and heals via an idempotent ``--force``
+    re-run. The canonical ``hindsight-import.jsonl`` is the VERBATIM-faithful
+    canonicalization of the operator's input (metadata/occurrence
+    authoritative); the STORE is the redacted surface — a credential in the
+    input lands redacted in store rows but verbatim in the JSONL, which is
+    written owner-only inside dest_dir after publication and reproduced
+    verbatim by any re-import, so the file itself must be treated as secret
+    material.
+    """
+    if not input_path.exists():
+        raise FileNotFoundError(f"input not found: {input_path}")
+    input_size = input_path.stat().st_size
+    if input_size > HINDSIGHT_MAX_INPUT_BYTES:
+        raise ValueError(
+            f"input is {input_size} bytes, over the "
+            f"{HINDSIGHT_MAX_INPUT_BYTES} limit")
+    records = _parse_hindsight_records(input_path)
+    for record in records:
+        # Pass/fail gate only: the validator normalizes into the
+        # memory-shaped projection and drops metadata/occurred_*.
+        _validate_sync_row(dict(record), None)
+
+    if _host is not None:
+        _host.assert_local_fs(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_store = dest_dir / "store.sqlite"
+    dest_output = dest_dir / "hindsight-import.jsonl"
+    if _existing_store_is_nonempty(dest_store) and not force:
+        raise FileExistsError(
+            f"destination store already exists and is non-empty: {dest_store} "
+            f"(pass --force to overwrite)"
+        )
+
+    print(f"[import] source: {input_path}")
+    print(f"[import] dest:   {dest_store}")
+
+    canonical_text = "".join(
+        _serialize_canonical_record(r) for r in records)
+    output_sha256 = hashlib.sha256(
+        canonical_text.encode("utf-8")).hexdigest()
+
+    stage_dir = Path(tempfile.mkdtemp(prefix=".hindsight-181-", dir=dest_dir))
+    staged_store = stage_dir / "store.sqlite"
+    staged_output = stage_dir / "hindsight-import.jsonl"
+    try:
+        # newline="\n" pins LF at the byte level on Windows write side.
+        with open(staged_output, "w", encoding="utf-8", newline="\n") as f:
+            f.write(canonical_text)
+        staged_conn = sqlite3.connect(str(staged_store))
+        try:
+            staged_conn.row_factory = sqlite3.Row
+            init_db(staged_conn)
+            migrate(staged_conn)
+            staged_conn.commit()
+            # The strict lane prints its own diagnostics; keep stdout clean
+            # for the count/digest report lines below.
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = cmd_ingest_jsonl_strict(
+                    staged_conn,
+                    in_path=str(staged_output),
+                    source_ref=None,
+                    allow_tombstones=False,
+                    capture_mode="auto",
+                )
+            if rc != 0:
+                raise RuntimeError(
+                    "strict ingest failed (return code "
+                    f"{rc}); nothing was committed to the destination")
+            staged_conn.commit()
+            row = staged_conn.execute(
+                "SELECT COUNT(*) FROM memory").fetchone()
+            destination_count = row[0]
+            if destination_count != len(records):
+                raise RuntimeError(
+                    f"count mismatch: source_count={len(records)} but the "
+                    f"staged store holds {destination_count} row(s) — a "
+                    "capture refusal or dedup fold made the migration "
+                    "non-deterministic; refusing")
+            integrity = staged_conn.execute(
+                "PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise RuntimeError(
+                    f"staged store failed integrity_check: {integrity}")
+            # Defensive: ensure no rollback-journal/WAL sidecar can race the
+            # atomic replace (run_import precedent).
+            staged_conn.execute("PRAGMA journal_mode=DELETE")
+            staged_conn.commit()
+        finally:
+            staged_conn.close()
+        # Accept (run_import's guarded-seam precedent, review round: the two
+        # replaces are not jointly atomic). The destination's stale
+        # -wal/-shm/-journal sidecars are stashed aside FIRST — left in place,
+        # SQLite would replay them onto the newly replaced database and
+        # silently resurrect the previous generation's rows (the same hazard
+        # run_import guards at its own replace). If the OUTPUT replace fails
+        # after the store landed, disclose exactly that — an access-denied on
+        # the JSONL alone would hide a replaced destination store.
+        store_replaced = False
+        stashed: list[tuple[Path, Path]] = []
+        try:
+            stashed = _stash_dest_sidecars(dest_store)
+            os.replace(staged_store, dest_store)
+            store_replaced = True
+            os.replace(staged_output, dest_output)
+        except OSError as exc:
+            if store_replaced:
+                # Only the output swap failed; the store itself landed. The
+                # stashed sidecars belong to the replaced-away store — drop
+                # them, never re-home them beside the NEW store.
+                for stash, _orig in stashed:
+                    try:
+                        stash.unlink()
+                    except OSError:
+                        pass
+                raise OSError(
+                    f"{exc}; the destination store WAS updated but writing "
+                    f"{dest_output.name} failed — close any process holding "
+                    "it open, then re-run this import with --force (the "
+                    "import is idempotent) to restore the matched pair"
+                ) from exc
+            # Store not yet replaced: put the prior destination back exactly.
+            for stash, orig in stashed:
+                try:
+                    os.replace(stash, orig)
+                except OSError:
+                    pass
+            raise
+        for stash, _orig in stashed:
+            try:
+                stash.unlink()
+            except OSError:
+                pass
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+    if _host is not None:
+        _host.set_owner_only_perms(dest_dir)
+        _host.set_owner_only_perms(dest_store)
+        _host.set_owner_only_perms(dest_output)
+
+    print(f"[import] hindsight: source_count={len(records)} "
+          f"destination_count={destination_count}")
+    print(f"[import] hindsight: output_sha256={output_sha256}")
+    print(f"[import] done: {dest_store}")
+
+    return {
+        "source_count": len(records),
+        "destination_count": destination_count,
+        "output_sha256": output_sha256,
+        "dest": str(dest_store),
+        "output": str(dest_output),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Import a legacy ZMem/ZCode store into the box-wide location")
-    ap.add_argument("--source", required=True, help="path to the legacy store.sqlite")
+    ap.add_argument("--source", required=True, help="legacy store path or the literal hindsight")
     ap.add_argument("--dest-dir", required=True, help="destination directory (e.g. ~/.zmem)")
+    ap.add_argument("--input", dest="input_path", type=Path, default=None,
+                    help="Hindsight JSONL export when --source hindsight")
     ap.add_argument("--force", action="store_true", help="overwrite a non-empty destination store")
     args = ap.parse_args()
 
+    if args.source == "hindsight":
+        if args.input_path is None:
+            ap.error("--source hindsight requires --input")
+    elif args.input_path is not None:
+        ap.error("--input is only valid with --source hindsight")
+
     try:
-        run_import(Path(args.source).expanduser(), Path(args.dest_dir).expanduser(), force=args.force)
+        if args.source == "hindsight":
+            run_hindsight_import(args.input_path.expanduser(),
+                                 Path(args.dest_dir).expanduser(),
+                                 force=args.force)
+        else:
+            run_import(Path(args.source).expanduser(),
+                       Path(args.dest_dir).expanduser(), force=args.force)
     except Exception as e:
         print(f"[import] FAILED: {e}", file=sys.stderr)
         sys.exit(1)

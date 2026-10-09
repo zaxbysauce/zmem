@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "389ff81ac9f6447b1688355b8064f2f102ee0ae507ab08b63dc0c3cfdb885def",
+  "digest": "a130b50dc1ec89ac7c07972ca046a916f6fae01a53151a8000ffe06ca53b20d1",
   "files": {
     "hermes-plugin/__init__.py": "5f20f5bd35fececc31d72dde9ec5ca5f9989a9850bf8b02d127031c128b58dab",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "48f85a387b1e07082324acaef8abdb8eea309f08d88f007b4ec3666c0f6a945d",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fb4362d885142bf743c3a5c4aa12ae92c9a1274ca445f307e4b4dc699b4f69bd",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "f1b950ba5dcd0fed464f16ed5b9847cd76a8b048563e44776113c4e76b83d55a",
+    "hermes-plugin/plugin.yaml": "d9ae0b055dd866dbb2a1991484a588f5403da57a594adaa5a61d182b57701e8b",
     "hermes-plugin/server/auth.py": "c2804ea5da0fcb4d1e2901d49f3936d1745ce869574bafb78752db78f43960f2",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
@@ -56,7 +56,7 @@
     "scripts/release_gate.py": "0fee2823312e51cdd7b0a4827509aa806907e06ae95b87b2a90f532997c76ecb",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "b43f4c9fc602917bd5f627560f1ab5abbfb3b34e60ad0d27f7a219a7492368ef",
-    "skills/memory/SKILL.md": "dadac57331787a57a8be98bc39560085ce382b082dbef8233a768889e900ee12",
+    "skills/memory/SKILL.md": "b5f5a2fb221ef1940dff06fbaa38564e67dff3cce53a3f3c65dba355a7c43d66",
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
@@ -67,7 +67,7 @@
     "skills/memory/scripts/embeddings.py": "5828b0a26701315f730ba383bc4545bffe9f64859ec7426161dde65acfa6cd0a",
     "skills/memory/scripts/history_mining.py": "83cf4930a502fb581818ef174a17753bc525e28e7295cf7d3d48292ca42f6672",
     "skills/memory/scripts/host.py": "a2984390447a97202d898d3c583db560d7f70c640075a590bab4d911291f968e",
-    "skills/memory/scripts/import-store.py": "b798a65f92e588900b87c43776f648192691fde57592eeab9de75ea6ba3565a8",
+    "skills/memory/scripts/import-store.py": "2cf64b3acaf2260459a549a9fb808a90538369ffbfccd7180ef8a0f99fe9408d",
     "skills/memory/scripts/redaction.py": "ddaf7dc8db56ab9cf5d00cf76c3a87d8804ad4d54d74103833eea5f0b6bc05bf",
     "skills/memory/scripts/requirements-training.txt": "87e2a26eba83329b6be02d566fea3feab9e887296d67b7bae4b34a4b60445c88",
     "skills/memory/scripts/schema_meta.py": "bf06b4f26b520de381725aa284ea1aea7fe3bd2c02222945c14f842b3963a1a3",
@@ -75,7 +75,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "44b7648a7cd0fc4dbc659556ae63a4314db3f53570bf85b4d2e7702583e62657",
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
-    "skills/memory/scripts/storelib/cli.py": "0bb34991709c03d6348bfd7bf96447fa7ac29a4641592f026275bccd049f02b6",
+    "skills/memory/scripts/storelib/cli.py": "59becbfa0c32c48c13d3f7f5b92f8322e490a1bcf3b69951895c409f52ecc5e3",
     "skills/memory/scripts/storelib/consolidate.py": "6180c42e25dcd644aff2053a223d76eab56c5a8cf96f72ae96169f64f9396f75",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
@@ -109,7 +109,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "90b2992c6ff1bcfc9a92661533965bd0468f5c1bc280bab169d291983075725e"
+    "skills/memory/scripts/storelib/write.py": "a09693c9d7e0b1e316dba766efe0ec88f1bf3c16149869bf94469767d843d56b"
   },
-  "version": "0.88.0"
+  "version": "0.89.0"
 }

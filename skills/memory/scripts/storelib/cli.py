@@ -53,13 +53,13 @@ from storelib.rekey import (MapError, apply_namespace_map, assert_store_schema_c
                             embedding_census, load_vec_extension,
                             load_vec_extension_if_available, open_readonly_store, parse_namespace_map,
                             preview_namespace_map)
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, SUPPORTED_SCHEMA_VERSION
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.dataset import (
     cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
     export_dataset, import_dataset, publish_dataset,
 )
-from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, QUARANTINE_REASONS, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, _normalize_capture_mode, add_memory, feedback_memory, quarantine_import_row, rekey_namespace, supersede_memory, update_memory, warn_reserved_source_ref
+from storelib.write import CapturePolicyRefusal, ContentTooLarge, FeedbackTargetError, QUARANTINE_REASONS, _GLOBAL_NEAR_MISS_STEMS, _global_near_miss_key, _normalize_capture_mode, add_memory, feedback_memory, quarantine_import_row, rekey_namespace, rescan_secrets, supersede_memory, update_memory, warn_reserved_source_ref
 from storelib.delivery_ledger import FeedbackSidecarError
 from storelib.feedback import apply_operation_feedback
 from storelib.training_capture import (
@@ -923,6 +923,21 @@ def _connect_existing_store() -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _connect_existing_store_readonly() -> sqlite3.Connection:
+    """Open an already-created store strictly read-only (issue #181 review:
+    a byte-identity-contracted read surface must not hold a rw handle — on a
+    WAL store, an rw connection's last-close checkpoint can rewrite the main
+    database file). No init, migration, or parent mkdir."""
+    if not STORE_PATH.is_file():
+        raise FileNotFoundError(STORE_PATH)
+    uri = STORE_PATH.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=1")
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
@@ -2495,6 +2510,21 @@ def main():
                          help="REQUIRED to actually write. rekey-namespace without "
                               "--confirm (and without --dry-run) refuses with exit 2.")
 
+    # Issue #181 (Workstream L PR 2): live secret rescan/remediation. The
+    # required mutually-exclusive mode group pins exactly one of --dry-run
+    # (report only, byte-preserving) or --apply (append-only redaction).
+    p_scan = _add_parser(
+        "rescan-secrets",
+        help="rescan live rows for secret-like content through the shared "
+             "capture policy (issue #181)")
+    group = p_scan.add_mutually_exclusive_group(required=True)
+    group.add_argument("--dry-run", dest="dry_run", action="store_true",
+                       default=False,
+                       help="report live credential rows without writing")
+    group.add_argument("--apply", dest="apply", action="store_true",
+                       default=False,
+                       help="redact live credential rows through append-only updates")
+
     p_backup = _add_parser(
         "backup", help="take a verified, retention-rotated snapshot of the store")
     p_backup.add_argument("--retention", type=int, default=BACKUP_DEFAULT_RETENTION,
@@ -3195,6 +3225,75 @@ def main():
                 map_conn.close()
             _release_writer_lease(map_lease)
 
+    # Issue #181 (Workstream L PR 2): rescan-secrets dispatches EARLY, before
+    # the shared connect()/_prepare_store lifecycle, with its own complete
+    # lock/open/error ladder (the rekey-namespace map-block shape). Two
+    # reasons this must never go through the shared lifecycle: (1) the scan's
+    # read-only and refusal-path byte-identity contracts (AC1/AC2) are broken
+    # by _prepare_store's PRAGMA journal_mode=WAL, which rewrites a
+    # DELETE-mode store's header bytes before any rescan code runs; (2) a
+    # missing store must refuse loudly instead of being silently created as
+    # an empty store that scans zero rows.
+    if args.cmd == "rescan-secrets":
+        scan_lease = None
+        scan_conn = None
+        try:
+            # Every failure below renders as `[zmem] rescan-secrets: ...` +
+            # exit 2 (review round: the maintenance probe used to sit outside
+            # this try, escaping as a raw traceback with exit 1).
+            _wait_for_maintenance_clear("rescan-secrets")
+            if _schema_host is not None:
+                # House UNC/network/OneDrive gate (rekey's early block
+                # precedent): --apply is a write surface like any other.
+                _schema_host.assert_local_fs(STORE_PATH.resolve().parent)
+            if args.apply:
+                scan_lease = _acquire_writer_lease("rescan-secrets")
+                # The append-only lineage INSERT names columns added by the
+                # v8-v14 migrations, and assert_store_schema_compatible only
+                # refuses NEWER stores — an unmigrated older store would fail
+                # mid-batch with an opaque sqlite error. Refuse it up front.
+                _probe = _connect_existing_store_readonly()
+                try:
+                    stamp = _probe.execute(
+                        "SELECT value FROM meta WHERE key='schema_version'"
+                    ).fetchone()
+                finally:
+                    _probe.close()
+                if stamp is None or str(stamp[0]) != str(SUPPORTED_SCHEMA_VERSION):
+                    raise RuntimeError(
+                        "store schema version "
+                        f"{stamp[0] if stamp is not None else 'missing'} is "
+                        f"not the supported {SUPPORTED_SCHEMA_VERSION}; run "
+                        "any zmem command once to migrate, then retry")
+            # Dry-run opens strictly read-only: its byte-identity contract
+            # must hold on WAL stores too, where an rw connection's
+            # last-close checkpoint can rewrite the main database file.
+            scan_conn = (_connect_existing_store() if args.apply
+                         else _connect_existing_store_readonly())
+            assert_store_schema_compatible(scan_conn, STORE_PATH)
+            if args.apply:
+                # update_memory embeds when the embeddings module is
+                # available; the shared embedding gate is unreachable from
+                # this early block, so apply checks it here (dry-run never
+                # embeds).
+                assert_embedding_compatible(scan_conn)
+            result = rescan_secrets(scan_conn, apply=args.apply)
+            # Exactly one compact JSON line, LF-terminated at the byte level:
+            # a Windows text-mode print() would translate the newline to
+            # CRLF and break the byte contract (issue #181 AC1).
+            sys.stdout.buffer.write(
+                (json.dumps(result, sort_keys=True,
+                            separators=(",", ":")) + "\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+            sys.exit(0)
+        except Exception as exc:
+            print(f"[zmem] rescan-secrets: {exc}", file=sys.stderr)
+            sys.exit(2)
+        finally:
+            if scan_conn is not None:
+                scan_conn.close()
+            _release_writer_lease(scan_lease)
+
     if args.cmd == "reembed" and args.check:
         check_conn = None
         try:
@@ -3744,13 +3843,17 @@ def main():
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
     if args.cmd not in ("rekey-namespace", "export-dataset", "export-training",
-                        "convention-drift") \
+                        "convention-drift", "rescan-secrets") \
             and not existing_only_evidence_write:
         # export-dataset joins the exemption (issue #134): it is a pure-read
         # surface and must not trigger the near-miss rekey's writes against
         # the store it is reading. convention-drift joins it (issue #261)
         # for the same reason: a drift scan that auto-rekeyed namespaces
         # would violate its own read-only contract on near-miss stores.
+        # rescan-secrets joins it (issue #181) as defense-in-depth: the
+        # command early-dispatches above and never reaches this site, but if
+        # that ever changes, a dry-run must not write and apply's write set
+        # must stay exactly the redaction lineage.
         _auto_near_miss_rekey(conn, force_off=getattr(args, "no_auto_rekey", False))
 
     # Issue #63, 8.2: fail-closed embedding-profile gate. Applied ONLY to
