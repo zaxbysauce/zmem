@@ -51,6 +51,42 @@ Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the
 README.
 
+## [0.93.0] - 2026-10-11
+
+### Fixed
+- **The delivery ledger now records every row that was actually rendered
+  (issue #250, Workstream P PR 2):** passive injection renders link-expansion
+  neighbours and graph-only rows to the model, but the ledger only ever recorded
+  the popularity-bump list — which explicitly excludes both row kinds. A
+  neighbour pulled in by an already-delivered parent was therefore never
+  recognised as already-delivered and re-rendered on every subsequent event in
+  the session.
+- **One list was doing two unrelated jobs.** `present` in
+  `select_and_budget_for_injection` was filtered to drop `link_relation` and
+  `_graph_arrival_only` rows — correct for *popularity* under #136, which rewards
+  query-matched rows only — and that same filtered list was then handed to
+  `ledger.record` as the *delivery* set under #114, which counts anything
+  rendered. The two semantics were conflated, so rows exempted from the first
+  were silently exempted from the second.
+- **The accounting is now split at the source.** `ledger_rows` is every row
+  proven present in the rendered fence (bounded by `rows_present_in`, so a
+  budget-dropped or gate-rejected row is still never recorded) and feeds
+  `ledger.record`. `bump_rows` is `ledger_rows` minus expansion and graph-only
+  rows and feeds `_bump_telemetry`. Popularity accounting is unchanged; the
+  withheld-secret filter (#256) is applied first so one guard still covers both
+  consumers.
+
+### Changed
+- **An already-delivered parent no longer contributes its neighbours through
+  link expansion (issue #250):** `expand_recall_links` accepts an optional
+  `exclude_ids` and skips excluded seed rows, threaded at the `recall_memory`
+  call site in `recall.py`. On the passive lane those exclusions are the
+  session's delivered ids. The parameter defaults to `None`, so every other
+  caller — including the non-`recall_memory` ones — is unaffected, expansion
+  still runs when nothing is excluded, and a link-free store keeps
+  byte-identical output. `explain_recall` is deliberately untouched: it has no
+  exclusion surface by design (`--exclude` is rejected alongside `--explain`).
+
 ## [0.92.0] - 2026-10-09
 
 ### Added

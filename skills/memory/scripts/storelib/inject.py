@@ -1359,28 +1359,47 @@ def select_and_budget_for_injection(
             rendered = recall_module._format_fenced_recall(
                 rows, header=header, budget_note=parsed.get("budget_note"),
                 legacy_injection_wire=True)
-        present = ledger.rows_present_in(rows, rendered)
-        # Expansion rows are rendered but deliberately NOT bumped —
-        # popularity rewards query-MATCHED rows only (recall.py bump law).
-        present = [row for row in present
-                   if not row.get("link_relation")
-                   and not row.get("_graph_arrival_only")]
+        # Two accounting sets, one source of truth for "was this rendered".
+        #
+        #   ledger_rows  DELIVERED (#114): every row proven present in the
+        #                rendered fence. Suppression depends on this being
+        #                complete — the injection lane's exclusion input is the
+        #                caller's exclude_ids merged with delivered_ids
+        #                (inject.py:1096), and only delivered_ids can ever
+        #                contain a neighbour.
+        #   bump_rows    POPULARITY (#136): query-matched rows only.
+        #                Link-expansion and graph-only neighbours render but
+        #                must not be rewarded, or a supplementary neighbour
+        #                outranks a genuine match in later recalls.
+        #
+        # Issue #250: sharing ONE filtered list silently exempted expansion and
+        # graph-only rows from the delivery ledger too, so a neighbour pulled
+        # in by an already-delivered parent re-rendered on every subsequent
+        # event in the session — the suppression path was correct but starved.
+        ledger_rows = ledger.rows_present_in(rows, rendered)
         # Issue #256: a withheld row is not rendered content (#114 rendered-row
         # law) — never bumped, never ledgered. Shape-dependent backstop: today
         # the [WITHHELD: SECRET] prefix already fails rows_present_in's
         # marker whitelist, but that auto-drop depends on the fence shape; if
         # the marker ever matched, this filter is the sole bump/ledger guard
-        # (proven by the c-iso mutation probe).
-        present = [row for row in present
-                   if not row.get("withheld_for_secret")]
-        if present:
+        # (proven by the c-iso mutation probe). Applied FIRST so a single
+        # guard covers both consumers and bump_rows stays a subset of
+        # ledger_rows by construction.
+        ledger_rows = [row for row in ledger_rows
+                       if not row.get("withheld_for_secret")]
+        # Expansion rows are rendered but deliberately NOT bumped —
+        # popularity rewards query-MATCHED rows only (recall.py bump law).
+        bump_rows = [row for row in ledger_rows
+                     if not row.get("link_relation")
+                     and not row.get("_graph_arrival_only")]
+        if bump_rows:
             try:
                 recall_module._bump_telemetry(
-                    conn, [r["id"] for r in present], no_bump=True)
+                    conn, [r["id"] for r in bump_rows], no_bump=True)
             except Exception:
                 pass
         try:
-            ledger.record(resolved_data, session_id, present, moment)
+            ledger.record(resolved_data, session_id, ledger_rows, moment)
         except Exception:
             # Rendering has already produced safe fenced text; a delivery
             # write failure is fail-open and must not discard that text.

@@ -473,6 +473,7 @@ def expand_recall_links(
     conn: sqlite3.Connection, results: list[dict], *,
     ns_list: list[str] | None, budget: int, as_of: str | None = None,
     min_confidence: float | None = None, no_bump: bool = False,
+    exclude_ids: list[str] | None = None,
 ) -> list[dict]:
     """Budgeted 1-hop link expansion at recall (issue #61, 6.3).
 
@@ -487,18 +488,31 @@ def expand_recall_links(
     and NOTHING writes those keys on non-expansion rows, so a link-free store
     keeps byte-identical recall output. When ``as_of`` is set, an edge is
     eligible only when its ``created_at`` is at or before that instant.
+
+    Issue #250: ``exclude_ids`` names seed rows the caller has already decided
+    against — on the passive lane those are the session's delivered ids. A
+    delivered parent must not contribute its neighbours, or expansion re-pulls a
+    row the session has already seen. Defaults to ``None`` so every existing
+    caller (including the non-``recall_memory`` ones) is unaffected, and a
+    link-free store stays byte-identical either way.
     """
     from storelib.recall import _classify_injection, _fetch_by_ids
 
     if budget <= 0 or not results:
         return []
 
+    seeds = results
+    if exclude_ids:
+        _excluded = set(exclude_ids)
+        seeds = [r for r in results if r["id"] not in _excluded]
+        if not seeds:
+            return []
     have = {r["id"] for r in results}
     as_of_dt = _parse_iso_utc(as_of) if as_of else None
     # Best edge per candidate neighbor id: highest score wins; ties break by
     # (relation, parent id) so the choice is deterministic run-to-run.
     best: dict[str, tuple[float, str, str]] = {}
-    for r in results:
+    for r in seeds:
         rid = r["id"]
         sql = (
             "SELECT src_id, dst_id, relation, score, created_at FROM memory_link "

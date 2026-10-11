@@ -2891,9 +2891,15 @@ def _recall_memory_impl(
     bump_ids = [r["id"] for r in results
                 if not r.get("_graph_arrival_only")]
     if link_hops >= 1 and link_budget >= 1 and results:
+        # Issue #250: an already-excluded seed contributes no neighbours. On
+        # the passive lane those exclusions are the session's delivered ids,
+        # so without this an already-delivered parent keeps re-pulling its
+        # neighbour through expansion. Empty on the plain path's own pre-filter
+        # only when nothing was excluded, which is what AC8 pins.
         results = results + expand_recall_links(
             conn, results, ns_list=ns_list, budget=link_budget, as_of=as_of,
             min_confidence=min_confidence, no_bump=no_bump,
+            exclude_ids=exclude_ids,
         )
 
     # Issue #82: change-intent lineage unfold — EXPLICIT recall only. Runs
