@@ -205,7 +205,7 @@ provider also implements the `on_delegation` callback: each subagent
 delegation is recorded as one bounded, fail-open evidence write carrying the
 task/result SHA-256 digests plus the child and parent session ids — never
 the raw text. Every callback fails
-open — each returns `{}` (or `None`) and never raises into Hermes.
+open — the callbacks above never raise into Hermes.
 
 Legacy unscoped CLI/operator reads use `evidence list --namespace NS` and
 `evidence show --namespace NS --id UUID`; on these commands, `--namespace` is a
