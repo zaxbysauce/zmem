@@ -1,0 +1,52 @@
+{
+  "delegation": {
+    "child_session_id": "00000000-0000-4000-8000-000000000164",
+    "parent_session_id": "00000000-0000-4000-8000-000000000165",
+    "result": "Native fixture delegation completed",
+    "task": "Delegate the native fixture task"
+  },
+  "namespace": "project:fixture",
+  "prompts": {
+    "nontrivial": "Explain the fixture recall",
+    "trivial": "ok"
+  },
+  "rows": [
+    {
+      "content": "fixture fact one for native recall",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "tags": [
+        "fixture",
+        "native"
+      ],
+      "type": "fact"
+    },
+    {
+      "content": "fixture fact two for native recall",
+      "id": "00000000-0000-4000-8000-000000000002",
+      "tags": [
+        "fixture",
+        "native"
+      ],
+      "type": "fact"
+    },
+    {
+      "content": "fixture lesson three for native recall",
+      "id": "00000000-0000-4000-8000-000000000003",
+      "tags": [
+        "fixture",
+        "native"
+      ],
+      "type": "lesson"
+    }
+  ],
+  "sessions": {
+    "primary": "session-a",
+    "secondary": "session-b"
+  },
+  "tier0_core_md": "# Core Memory (native fixture)\n\nTier-0 text pinned by the native Hermes suite (issue #165).\nStable rules only; injected through system_prompt_block.\n",
+  "timestamp": "2026-09-10T00:00:00Z",
+  "tool_result": {
+    "content": "git status --short",
+    "role": "tool"
+  }
+}

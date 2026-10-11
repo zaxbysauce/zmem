@@ -1,0 +1,30 @@
+{
+  "candidate_ids_sorted": [
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
+    "00000000-0000-4000-8000-000000000003"
+  ],
+  "compat_mode_events": [
+    "pre_llm_call:zmem-hermes-reflect.py"
+  ],
+  "compat_mode_provider_callbacks": 0,
+  "delegation_ref_path": "delegation:00000000-0000-4000-8000-000000000165:00000000-0000-4000-8000-000000000164",
+  "mode_exclusivity_note": "provider mode registers exactly one provider and the three provider hooks; compatibility mode registers zero plugin hooks and delivers exactly one shell-hook context",
+  "nontrivial_context_blocks": 1,
+  "provider_mode_compatibility_hook_calls": 0,
+  "provider_mode_events": [
+    "post_tool_call:zmem",
+    "pre_llm_call:zmem",
+    "pre_verify:zmem"
+  ],
+  "system_note_prefix": "[System note: The following is recalled memory context,",
+  "tier0_core_md": "# Core Memory (native fixture)\n\nTier-0 text pinned by the native Hermes suite (issue #165).\nStable rules only; injected through system_prompt_block.\n",
+  "tool_role": "tool",
+  "trivial_context_blocks": 0,
+  "two_turn_delivery": {
+    "turn1_reason": "injected",
+    "turn2_reason": "already-delivered"
+  },
+  "wrapper_close": "</memory-context>",
+  "wrapper_open": "<memory-context>"
+}
