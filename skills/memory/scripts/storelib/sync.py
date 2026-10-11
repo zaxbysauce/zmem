@@ -663,17 +663,20 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
     digest = obj["hash"]
     if not isinstance(digest, str):
         raise ValueError("evidence hash must be a string")
-    # Transport check, verbatim first: a row whose stored hash already covers
-    # its exported excerpt is re-imported unchanged.  This keeps the
-    # redaction-exempt delegation writer (issue #164) round-trip stable — its
-    # excerpt intentionally carries 64-hex digests that re-redaction would
-    # rewrite, breaking the stored hash.  The redact-then-verify fallback
-    # below remains for rows that need the transport normalization; both
-    # paths prove the row was not tampered with in transit.
-    verbatim = hashlib.sha256(
-        f"{obj['kind']}|{ts}|{excerpt}".encode("utf-8")
-    ).hexdigest()
-    if digest == verbatim and len(excerpt) <= EVIDENCE_MAX_EXCERPT_CHARS:
+    # Transport check, verbatim first — DELEGATION ROWS ONLY (issue #164).
+    # A flagged delegation excerpt intentionally carries 64-hex digests that
+    # re-redaction would rewrite, breaking the stored hash; a row whose
+    # excerpt validates as exactly the shape the flagged writer accepts
+    # (four keys, whitespace-free ids, lowercase 64-hex digests) proves it
+    # could have come from that writer, so its verbatim hash is accepted.
+    # Every other kind keeps the redact-then-verify transport normalization:
+    # a remote-authored self-hashed row must not bypass import redaction
+    # (sync files are remote-authored data).
+    if (digest == hashlib.sha256(
+            f"{obj['kind']}|{ts}|{excerpt}".encode("utf-8")).hexdigest()
+            and len(excerpt) <= EVIDENCE_MAX_EXCERPT_CHARS
+            and obj["kind"] == "delegation"
+            and _is_validated_delegation_excerpt(excerpt)):
         obj = dict(obj)
         obj["excerpt"] = excerpt
         return obj
@@ -690,6 +693,32 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
     obj["excerpt"] = final_excerpt
     obj["hash"] = expected
     return obj
+
+
+def _is_validated_delegation_excerpt(excerpt: str) -> bool:
+    """True when ``excerpt`` is exactly the shape the flagged delegation
+    writer (issue #164) accepts: a four-key JSON object whose session ids
+    are whitespace-free strings and whose digests are lowercase 64-hex.
+    Mirrors ``cli.cmd_evidence_write_flagged``'s validation so the strict
+    importer's verbatim path admits only rows that writer could produce."""
+    try:
+        payload = json.loads(excerpt)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict) or set(payload) != {
+        "child_session_id", "parent_session_id",
+        "result_sha256", "task_sha256",
+    }:
+        return False
+    for key in ("child_session_id", "parent_session_id"):
+        value = payload[key]
+        if not isinstance(value, str) or re.search(r"\s", value):
+            return False
+    for key in ("result_sha256", "task_sha256"):
+        value = payload[key]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            return False
+    return True
 
 
 def _strict_association_row(obj: dict, lineno: int, table: str) -> dict:

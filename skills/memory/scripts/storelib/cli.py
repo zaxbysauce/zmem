@@ -1330,6 +1330,8 @@ def cmd_evidence_write_flagged(
     for key in ("child_session_id", "parent_session_id"):
         if not isinstance(payload[key], str):
             raise ValueError(f"{key} must be a string")
+        if not payload[key].strip():
+            raise ValueError(f"{key} must be a non-empty string")
         if re.search(r"\s", payload[key]):
             raise ValueError(f"{key} must not contain whitespace")
     for key in ("result_sha256", "task_sha256"):

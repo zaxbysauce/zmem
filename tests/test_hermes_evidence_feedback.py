@@ -238,9 +238,7 @@ class HermesEvidenceFeedbackTest(unittest.TestCase):
             self.assertEqual(len(seam.calls), expected_calls, msg=target)
 
     def test_cli_excerpt_cap_boundary_accepts_400(self):
-        proc = _cli(_flags(), input_text=None)
         base = _compact()
-        obj = json.loads(base)
         deficit = 400 - len(base)
         payload = _compact(child=_CHILD + "f" * deficit) + "\n"
         proc = _cli(_flags(), input_text=payload)
@@ -333,6 +331,75 @@ class HermesEvidenceFeedbackTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertNotIn("unrecognized arguments", proc.stderr)
         self.assertIn("evidence write failed", proc.stderr)
+
+
+    def _ingest_crafted(self, row):
+        """Write one crafted JSONL evidence row and ingest it into a fresh
+        store; returns (returncode, evidence-row count)."""
+        store_a = Path(tempfile.mkdtemp(prefix="zmem-164-fb-craft-"))
+        store_b = Path(tempfile.mkdtemp(prefix="zmem-164-fb-target-"))
+        env_b = dict(os.environ, ZMEM_STORE=str(store_b / "store.sqlite"),
+                     ZMEM_DATA=str(store_b))
+        self.assertEqual(_cli(["init"], env=env_b).returncode, 0)
+        export_path = store_a / "crafted.jsonl"
+        export_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        proc = _cli(["ingest-jsonl", "--in", str(export_path)], env=env_b)
+        conn = sqlite3.connect(str(store_b / "store.sqlite"))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM evidence").fetchone()[0]
+        finally:
+            conn.close()
+        return proc.returncode, count
+
+    def test_strict_import_rejects_self_hashed_non_delegation(self):
+        """A remote-authored NON-delegation row with a self-computed verbatim
+        hash and redactable content must not land unredacted (review round 2:
+        the verbatim branch is delegation-gated)."""
+        excerpt = json.dumps({"note": "sk-ant-" + "A" * 40}, sort_keys=True,
+                             separators=(",", ":"))
+        ts = "2026-10-10T00:00:00Z"
+        row = {
+            "table": "evidence",
+            "id": str(uuid.uuid4()),
+            "session_id": "sync-session",
+            "lane": "hermes-provider",
+            "moment": "pretool",
+            "kind": "tool_call",
+            "ts": ts,
+            "excerpt": excerpt,
+            "hash": hashlib.sha256(
+                f"tool_call|{ts}|{excerpt}".encode("utf-8")).hexdigest(),
+            "ref_path": "hermes://sync/1",
+            "ref_offset": None,
+        }
+        rc, count = self._ingest_crafted(row)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(count, 0)
+
+    def test_strict_import_rejects_delegation_whitespace_id_self_hash(self):
+        """A delegation-kind row whose payload id carries whitespace fails
+        the writer-shape validation, so its self-computed verbatim hash
+        cannot land it (purge-survivor vector closed at import too)."""
+        excerpt = _compact(child="bad id with spaces")
+        ts = "2026-10-10T00:00:00Z"
+        row = {
+            "table": "evidence",
+            "id": str(uuid.uuid4()),
+            "session_id": _PARENT,
+            "lane": "hermes-provider",
+            "moment": "subagent",
+            "kind": "delegation",
+            "ts": ts,
+            "excerpt": excerpt,
+            "hash": hashlib.sha256(
+                f"delegation|{ts}|{excerpt}".encode("utf-8")).hexdigest(),
+            "ref_path": f"delegation:{_PARENT}:bad id",
+            "ref_offset": None,
+        }
+        rc, count = self._ingest_crafted(row)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(count, 0)
 
 
 if __name__ == "__main__":

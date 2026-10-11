@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "dfe6abc1938331a2f4d5b3308f15e6320b2d2b0e30ffd014bbfc504006ceb6b2",
+  "digest": "5f9df05541e4b250a450e4773b4b4b530f9b06a2f274f4e4570126833015d9c9",
   "files": {
     "hermes-plugin/__init__.py": "04822475587f5bd50ccb13c2253a508dabd2247ec046b3927acb69dcc03f86cc",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -75,7 +75,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "44b7648a7cd0fc4dbc659556ae63a4314db3f53570bf85b4d2e7702583e62657",
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
-    "skills/memory/scripts/storelib/cli.py": "7089b10546da2c2ede4060a5b774fd49d93401eb14d3cb6cc10eab4f691472ea",
+    "skills/memory/scripts/storelib/cli.py": "266113c635f6ec90a95a5880b11a787c372e1abc710bc23d68f0e1ff0cecf26b",
     "skills/memory/scripts/storelib/consolidate.py": "6180c42e25dcd644aff2053a223d76eab56c5a8cf96f72ae96169f64f9396f75",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
@@ -104,7 +104,7 @@
     "skills/memory/scripts/storelib/rekey.py": "ed7e38f9660c2aa3aa6b2251e133f06d574bd87f3bd23c714fd585472ec6dfb3",
     "skills/memory/scripts/storelib/schema.py": "8f0062c9cd65178f44a21eb586520a6a9ff5ec3c24b7964b57f1a99c4173c235",
     "skills/memory/scripts/storelib/source.py": "72050fcc2ed63c3f99089ece204022038ccfeff13017cf2505ea3c288df5c3a2",
-    "skills/memory/scripts/storelib/sync.py": "5a2d0f335c51bcd51e99dd4721a2e9df9afe299bc3aceaba4f845d8acb1dea2b",
+    "skills/memory/scripts/storelib/sync.py": "074c4b2994a0db83488ae7e7dbb538499b077ada0e7e9db5ca922b8a302f30e4",
     "skills/memory/scripts/storelib/training.py": "a308dcc6289e4c16efb0286a14c65dc8de0b400334d99cda80e24ae101cea4d6",
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
