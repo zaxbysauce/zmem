@@ -3198,6 +3198,18 @@ def main():
     p_hyg.add_argument("--format", dest="format", choices=("json", "text"),
                        default="json", help="Report format")
 
+    p_rep = _add_parser(
+        "report",
+        help="read-only per-session repeat and tier/moment composition report "
+             "over the decision log (issue #249)")
+    p_rep.add_argument("--decision-log", dest="decision_log", type=str,
+                       default=None,
+                       help="explicit decision-log path (default: <data dir>/"
+                            "zmem-decisions.log, falling back to the legacy "
+                            "zmem-bg.log)")
+    p_rep.add_argument("--json", dest="as_json", action="store_true",
+                       help="emit one machine-readable JSON document")
+
     # Source's public error contract intentionally predates its argparse
     # metadata. Validate the source-only required values and context before
     # argparse can emit a usage block; every other parser keeps its legacy
@@ -3689,6 +3701,30 @@ def main():
             "--out", args.out,
             "--format", args.format,
         ]))
+
+    # `report` aggregates the decision log against the store, read-only (issue
+    # #249). Like `hygiene` above it dispatches BEFORE
+    # connect()/_prepare_store()/_auto_near_miss_rekey(): _prepare_store's
+    # PRAGMA journal_mode=WAL rewrites a DELETE-mode store's header bytes, and
+    # the rekey writes, so a report reached through that lifecycle could not
+    # honour its read-only contract. Placement here is load-bearing, not
+    # stylistic — the module opens the store itself through an immutable
+    # handle, or through a private staged copy when WAL residue is present,
+    # and never through connect().
+    if args.cmd == "report":
+        from storelib.decision_report import main as _report_main
+
+        # Build the child argv rather than splicing the outer value in: an
+        # omitted --decision-log is None, and forwarding that literal into a
+        # nested parser is only harmless by accident (the inner flag declares
+        # no type=, so argparse identity-passes it). Omitting the flag instead
+        # exercises the documented default-path fallback explicitly.
+        _report_argv = []
+        if args.decision_log:
+            _report_argv += ["--decision-log", args.decision_log]
+        if args.as_json:
+            _report_argv.append("--json")
+        sys.exit(_report_main(_report_argv))
 
     # Query rewriting is intentionally an early, read-only command.  Keeping
     # this branch before every connect/_prepare/migration path is what makes a
