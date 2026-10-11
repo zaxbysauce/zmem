@@ -402,5 +402,34 @@ class HermesEvidenceFeedbackTest(unittest.TestCase):
         self.assertEqual(count, 0)
 
 
+    def test_strict_import_rejects_delegation_duplicate_key_self_hash(self):
+        """A delegation-kind row whose excerpt carries duplicate JSON keys
+        fails the strict-pairs shape validation (the raw string is stored
+        verbatim, so earlier duplicate values would smuggle unseen text)."""
+        smuggled = (
+            '{"child_session_id":"bad id with spaces","child_session_id":'
+            '"' + _CHILD + '","parent_session_id":"' + _PARENT + '"'
+            ',"result_sha256":"' + _RESULT_SHA + '","task_sha256":"'
+            + _TASK_SHA + '"}')
+        ts = "2026-10-10T00:00:00Z"
+        row = {
+            "table": "evidence",
+            "id": str(uuid.uuid4()),
+            "session_id": _PARENT,
+            "lane": "hermes-provider",
+            "moment": "subagent",
+            "kind": "delegation",
+            "ts": ts,
+            "excerpt": smuggled,
+            "hash": hashlib.sha256(
+                f"delegation|{ts}|{smuggled}".encode("utf-8")).hexdigest(),
+            "ref_path": f"delegation:{_PARENT}:{_CHILD}",
+            "ref_offset": None,
+        }
+        rc, count = self._ingest_crafted(row)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(count, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

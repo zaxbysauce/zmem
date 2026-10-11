@@ -702,7 +702,11 @@ def _is_validated_delegation_excerpt(excerpt: str) -> bool:
     Mirrors ``cli.cmd_evidence_write_flagged``'s validation so the strict
     importer's verbatim path admits only rows that writer could produce."""
     try:
-        payload = json.loads(excerpt)
+        # Strict pairs hook: the verbatim branch stores the RAW excerpt
+        # string, so a duplicate-key excerpt would smuggle text in earlier
+        # values past a last-wins parse.  The writer's own stdin parser
+        # rejects duplicates; the importer must too.
+        payload = json.loads(excerpt, object_pairs_hook=_strict_object_pairs)
     except ValueError:
         return False
     if not isinstance(payload, dict) or set(payload) != {
