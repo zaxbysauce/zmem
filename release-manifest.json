@@ -3,6 +3,7 @@
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
   "digest": "5861eb018fa68149218f6a55e89ea70c3cebf186c8ef59633f6a30649f3064ad",
 =======
   "digest": "0ecf5ce9526906e1f8692aef7cc56627d15da312913498d273c48ec80dd9e187",
@@ -13,6 +14,9 @@
 =======
   "digest": "07c876a750a39a1ccc3ef95800ed18fa7a2f5d4e9824e3d4891fef861cf81da4",
 >>>>>>> 4ce8f4b (fix(report): close reviewer's HIGH and LOW on the feedback round)
+=======
+  "digest": "8993de5b9f80e36427e08e1eb31d5f4a415e6a9ff1a176c7f088ef886fe5baae",
+>>>>>>> d12e846 (docs(report): state the refusal-channel wording exactly (issue #249))
   "files": {
     "hermes-plugin/__init__.py": "04822475587f5bd50ccb13c2253a508dabd2247ec046b3927acb69dcc03f86cc",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -75,6 +79,7 @@
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     "skills/memory/SKILL.md": "53c18165ffd83a33fcd33993362747545e1c50c869bb197425fcd4056694e8dd",
 =======
     "skills/memory/SKILL.md": "43cf3c38534871ab828e334352583511aa1baa25a28dec0ea86e97fba9c4c330",
@@ -85,6 +90,9 @@
 =======
     "skills/memory/SKILL.md": "111908c117283575899a2fdc0317c3d13ceef02b1698ad8404012c242e70068a",
 >>>>>>> 4ce8f4b (fix(report): close reviewer's HIGH and LOW on the feedback round)
+=======
+    "skills/memory/SKILL.md": "76bb16624d12400ed994eb5c8e35ca072a71ed3e561c98a93326455be6e959c7",
+>>>>>>> d12e846 (docs(report): state the refusal-channel wording exactly (issue #249))
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",

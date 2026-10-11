@@ -516,9 +516,10 @@ the journal entirely and would report the uncommitted pages of an in-flight
 transaction as real rows. The staging directory is created owner-only and is
 removed on every path including failures; a directory that survives removal is
 never left silent — on a successful run it is appended to `caveats`, and on a
-refusal it is carried in the refusal message itself. `-shm` is never copied —
-SQLite rebuilds it from the `-wal`, and copying it fails outright under a live
-writer on Windows.
+refusal it is reported alongside it (folded into the refusal message, or on its
+own `[zmem] report:` stderr line for a non-`ReportError` failure). `-shm` is
+never copied — SQLite rebuilds it from the `-wal`, and copying it fails
+outright under a live writer on Windows.
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
 Decision-point prompts are prose with zero lexical overlap with the
