@@ -525,8 +525,10 @@ class CharacterizationTests(unittest.TestCase):
 
     def test_organize_and_consolidate_expose_belief_flags(self):
         # Issue #137: --belief-heads and --llm-local are FLAGS on the two
-        # maintenance subcommands (never new subcommands — KNOWN_SUBCMDS
-        # counts only the ones whose flag surface is asserted here).
+        # maintenance subcommands, never new subcommands. KNOWN_SUBCMDS is the
+        # FULL CLI surface (every subcommand, not just the two whose flag
+        # surface is asserted below), so the point is that adding these flags
+        # left that count unchanged.
         for cmd in ("organize", "consolidate"):
             r = _run_cli({}, cmd, "--help")
             self.assertEqual(r.returncode, 0, f"{cmd} --help rc={r.returncode}")

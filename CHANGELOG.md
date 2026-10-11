@@ -31,7 +31,10 @@ README.
   place, which would break the byte-identity contract.
 - **Reuses the shipped readers rather than forking them:** the rotation-aware,
   CRLF-tolerant `parse_bg_log`, and the PRR-014 `_moment_of` sanitizer, so a
-  hostile `moment=` in log text can never become a report key.
+  hostile `moment=` in log text can never become an *unsanitized* report key.
+  The sanitizer rewrites rather than rejects, so the guarantee is "no
+  metacharacters reach a key" — a hostile moment still buckets under a
+  sanitized key of its own, which is what the acceptance contract pins.
 
 ### Notes
 - Tier labels come from the stored namespace using the three labels this

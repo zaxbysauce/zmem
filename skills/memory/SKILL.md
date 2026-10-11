@@ -470,15 +470,30 @@ Workstream P PRs 2-4 use as their before/after baseline.
 
 - `rows[<id>]` — `delivered` (total deliveries), `sessions` (distinct `sid=`
   count), `max_per_session` (busiest single session), and the row's `tier`.
-  Lines with no `sid=` count toward `delivered` but contribute no session, and
-  the run says so in `caveats`.
+  Lines carrying no usable `sid=` count toward `delivered` but contribute no
+  session, and the run says so in `caveats`. **The writers' `sid=unknown`
+  placeholder counts as no session**: it is what every host without a session id
+  emits, so pooling it would invent one session and attribute unrelated
+  deliveries to it. This matches how the sibling readers already treat it.
 - `by_tier_moment[<tier>][<moment>]` — `delivered` (the `ids=` entries) against
-  `withheld` (the `all=` candidates that were not injected).
+  `withheld` (the `all=` candidates that were not injected). `delivered` counts
+  only lines the shared injected-line predicate accepts, so ids on a
+  `status=silent` line are never reported as deliveries; their candidate pool is
+  still counted as `withheld`, because a candidate was offered either way.
+
+Top-level JSON keys: `decision_log`, `decision_lines`, `ts_first`, `ts_last`,
+`rows`, `by_tier_moment`, `caveats`. `ts_first`/`ts_last` are the decision
+timestamps actually covered, so two runs can be checked for an overlapping window
+before a before/after difference is read as a behaviour change.
 
 `--decision-log` defaults to `<data dir>/zmem-decisions.log`, falling back to the
 legacy `zmem-bg.log`. Rotated segments (`.1` … `.N`) are included. Without
 `--json` a human table prints; with `--json` stdout is exactly one compact JSON
-document, so it can be piped into `jq` unchanged.
+document, so it can be piped into `jq` unchanged — **including on a refusal**,
+where stdout carries `{"ok": false, "error": "..."}` at exit code 2 and the
+human `[zmem] report:` line goes to stderr. A missing or unreadable log is
+reported as a `caveats` entry rather than a silent empty report, because an
+empty report and an unreadable log are otherwise indistinguishable.
 
 **Tier labels** come from the row's stored namespace: a `project:` namespace is
 `project`, `user:global` is `global`, and anything else — including an id no
@@ -493,9 +508,16 @@ the tier-summed totals are unaffected, but the per-tier split can shift, so
 `unknown`-bucket movement between two runs is not evidence of tier migration.
 
 The command never writes to the store, the ledger, or the log. It opens the store
-through an `immutable=1` handle when there is no WAL residue, or through a
-private staged copy of `store.sqlite` + `-wal` when there is; a plain read-only
-open would create sidecars and mutate `-shm` in place.
+through an `immutable=1` handle only when there is no residue at all, or through
+a private staged copy of `store.sqlite` + `-wal` + `-journal` when there is; a
+plain read-only open would create sidecars and mutate `-shm` in place. A hot
+rollback `-journal` also forces the staged path on purpose: `immutable=1` ignores
+the journal entirely and would report the uncommitted pages of an in-flight
+transaction as real rows. The staging directory is created owner-only, is removed
+on every path including failures, and a directory that somehow survives removal is
+reported as a `caveats` warning rather than left silently. `-shm` is never
+copied — SQLite rebuilds it from the `-wal`, and copying it fails outright under
+a live writer on Windows.
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
 Decision-point prompts are prose with zero lexical overlap with the

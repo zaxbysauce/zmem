@@ -62,7 +62,7 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from storelib.false_inject import _moment_of
+from storelib.false_inject import _is_injected_line, _moment_of
 from storelib.miss_rate import parse_bg_log
 
 DECISIONS_LOG_NAME = "zmem-decisions.log"
@@ -72,6 +72,15 @@ TIER_PROJECT = "project"
 TIER_GLOBAL = "global"
 TIER_UNKNOWN = "unknown"
 GLOBAL_NAMESPACE = "user:global"
+
+# The writers substitute this literal when the host supplies no session id
+# (plugin __init__.py, zmem-recall-body.py, mcp_server.py). It is NOT a
+# session: pooling every such delivery under one bucket would report an
+# invented session and attribute unrelated deliveries to it. The sibling
+# readers already treat it as sessionless (false_inject._is_injected_line
+# consumers, miss_rate sid_coverage), so this report follows the repo's own
+# convention rather than inventing a second one.
+SESSIONLESS_SID = "unknown"
 
 _UNDETERMINED_TIER_CAVEAT = (
     "Tier labels come from the row's stored namespace, using the three labels "
@@ -96,10 +105,19 @@ _COUNTING_BASES_CAVEAT = (
     "delivered counts DELIVERY OCCURRENCES: by_tier_moment[*][*].delivered is "
     "the number of times an id of that tier appears in a decision line's ids "
     "list at that moment, which is why the tier-summed delivered total equals "
-    "the sum of rows[*].delivered. withheld counts DISTINCT CANDIDATES: it is "
-    "the number of ids appearing in a line's all list that are not in the same "
-    "line's ids list at that moment, so the same id offered twice is one "
-    "candidate, not two."
+    "the sum of rows[*].delivered. withheld counts DISTINCT CANDIDATES WITHIN "
+    "ONE LINE: it is the number of ids appearing in a line's all list that are "
+    "not in that same line's ids list, so the same id offered twice on one "
+    "line is one candidate, not two. The same id withheld on two different "
+    "lines is two candidate opportunities and is counted twice."
+)
+
+_RETENTION_CAVEAT = (
+    "This report covers the retained decision-log family only. Rotation caps "
+    "how much history survives (see ZMEM_BG_LOG_MAX_BYTES and ZMEM_LOG_ROTATIONS), "
+    "so a long gap between two runs is not evidence that nothing was injected "
+    "-- it may simply have rotated away. Compare ts_first/ts_last across runs "
+    "before reading a before/after difference as a behaviour change."
 )
 
 
@@ -117,8 +135,45 @@ def _resolve_store_path() -> str:
 
 def _resolve_data_dir() -> str:
     """Where a bare decision log lives when --decision-log is omitted."""
-    from storelib import schema
     return str(Path(_resolve_store_path()).parent)
+
+
+def _counts_as_session(sid) -> bool:
+    """Whether a line's ``sid=`` denotes a real, distinguishable session.
+
+    False for an absent sid AND for the writers' ``unknown`` placeholder: the
+    latter is what every host without a session id emits, so counting it would
+    invent one session out of unrelated deliveries from different hosts.
+    """
+    return bool(sid) and sid != SESSIONLESS_SID
+
+
+def _escape_rendered(value) -> str:
+    """Neutralize control characters before untrusted text reaches a terminal.
+
+    ``moment`` is sanitized at parse time because it becomes a report KEY, but a
+    row ``id`` is only ever printed, and the text surface prints it raw. A
+    hostile or hand-edited id carrying ANSI/OSC escapes would otherwise drive
+    the operator's terminal. This mirrors the escaper storelib.cli applies to
+    rendered evidence, and is deliberately a no-op on the JSON surface: JSON
+    escapes control characters itself, and the ids there are machine keys that
+    a consumer joins on, so they must stay byte-exact.
+    """
+    text = str(value)
+    out = []
+    for char in text:
+        codepoint = ord(char)
+        if char == "\t":
+            out.append(r"\t")
+        elif char == "\r":
+            out.append(r"\r")
+        elif char == "\n":
+            out.append(r"\n")
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            out.append("\\x%02x" % codepoint)
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 # ---------------------------------------------------------------- log side
@@ -139,16 +194,44 @@ def resolve_log_path(explicit: str | None, data_dir: str) -> str:
     return decisions
 
 
-def parse_decision_log(log_path: str) -> list:
-    """Rotation-aware, CRLF-tolerant, never-raising parse of the log family.
+def parse_decision_log(log_path: str) -> tuple:
+    """Rotation-aware, CRLF-tolerant parse of the log family.
 
     Delegates to the single shared parser rather than forking one: it reads
-    ``<log>.1 .. <log>.N`` then the active file, skips torn and non-decision
-    lines, and returns ``[]`` for a missing file."""
+    ``<log>.1 .. <log>.N`` then the active file and skips torn and non-decision
+    lines.
+
+    Returns ``(lines, problems)``. A missing log and a parse failure both yield
+    zero lines, but they are DIFFERENT outcomes and the caller must be able to
+    tell them apart -- an empty report from a typo'd path is otherwise
+    indistinguishable from a genuinely decision-free window, which is exactly
+    the kind of silent wrong answer this tool exists to avoid. Each is reported
+    as a caveat rather than a refusal so that a partially readable log still
+    produces its real numbers.
+    """
+    problems: list = []
+    path = Path(log_path)
+    if not path.exists():
+        problems.append(
+            "no decision log at %s; every row is reported as undelivered. Check "
+            "the --decision-log path -- an absolute or relative typo resolves "
+            "quietly to an empty report" % log_path)
+        return [], problems
     try:
-        return parse_bg_log(Path(log_path))
-    except Exception:
-        return []
+        lines = parse_bg_log(path)
+    except Exception as exc:  # never expected: parse_bg_log is documented
+        # never-raising, but the contract is only as good as its guards, and a
+        # swallowed total parse failure must never look like an empty window.
+        problems.append(
+            "the decision log at %s could not be parsed (%s: %s); the report "
+            "below covers no lines" % (log_path, type(exc).__name__, exc))
+        return [], problems
+    if not lines:
+        problems.append(
+            "the decision log at %s was read but contained no decision lines. "
+            "An empty log and an unreadable one look the same in the numbers "
+            "below" % log_path)
+    return lines, problems
 
 
 # --------------------------------------------------------------- store side
@@ -167,18 +250,45 @@ def _verify_readable(conn, what: str) -> None:
 
 
 def _stage_copy(store_path: Path) -> tuple:
-    """Copy ``store.sqlite`` + ``-wal`` into a private temp dir and open the
-    copy. ``-shm`` is intentionally not copied. Returns (conn, staging_dir);
-    the caller owns closing both."""
-    stage = tempfile.mkdtemp(prefix="zmem-report-stage-")
+    """Copy the store family into a private temp dir and open the copy.
+
+    ``-shm`` is intentionally not copied: it is derived state SQLite rebuilds
+    from the ``-wal``. ``-journal`` IS copied when present, so that SQLite
+    replays the rollback on the staged copy instead of this report reading
+    uncommitted pages as committed ones.
+
+    ``copyfile`` rather than ``copy2``: copy2 preserves the mode bits, so a
+    read-only store produced a read-only staged copy that rmtree could not
+    remove on Windows -- leaking a full copy of the operator's store on a
+    perfectly successful run.
+
+    Returns (conn, staging_dir); the caller owns closing both.
+    """
     conn = None
+    stage = None
     try:
-        for name in (str(store_path), str(store_path) + "-wal"):
+        # Inside the try AND converted to ReportError: a full disk or an
+        # unwritable TMPDIR must surface as the contracted refusal, exactly
+        # like the copy2 failure below, not as a raw OSError traceback at
+        # exit 1. One function, one failure shape.
+        try:
+            stage = tempfile.mkdtemp(prefix="zmem-report-stage-")
+        except OSError as exc:
+            raise ReportError(
+                "cannot create a staging directory: %s" % exc) from exc
+        # Owner-only where the platform supports it: this directory transiently
+        # holds a copy of the operator's entire store.
+        try:
+            os.chmod(stage, 0o700)
+        except OSError:
+            pass
+        for name in (str(store_path), str(store_path) + "-wal",
+                     str(store_path) + "-journal"):
             src = Path(name)
             if not src.exists():
                 continue
             try:
-                shutil.copy2(src, Path(stage, src.name))
+                shutil.copyfile(src, Path(stage, src.name))
             except OSError as exc:
                 # A TOCTOU delete, a full disk, or an antivirus/OneDrive lock
                 # all land here. Every one must surface as the contracted
@@ -206,8 +316,25 @@ def _stage_copy(store_path: Path) -> tuple:
                 conn.close()
             except sqlite3.Error:
                 pass
-        shutil.rmtree(stage, ignore_errors=True)
+        _discard_stage(stage)
         raise
+
+
+def _discard_stage(stage) -> str | None:
+    """Remove a staging directory, reporting whether it actually went away.
+
+    ``rmtree(ignore_errors=True)`` cannot distinguish "removed" from "silently
+    refused", so a leftover full copy of the operator's store was invisible.
+    Returns a warning when anything survived, None on a clean removal.
+    """
+    if stage is None:
+        return None
+    shutil.rmtree(stage, ignore_errors=True)
+    if os.path.isdir(stage):
+        return ("a temporary copy of the store staged at %s could not be "
+                "removed and still holds the operator's memory rows; delete "
+                "that directory by hand" % stage)
+    return None
 
 
 def open_store_for_report(store_path: Path):
@@ -221,7 +348,10 @@ def open_store_for_report(store_path: Path):
         return None, None, ["no store at %s; every id is reported under the "
                             "'unknown' tier" % store_path]
     wal = Path(str(store_path) + "-wal")
-    if not wal.exists():
+    journal = Path(str(store_path) + "-journal")
+    has_wal = wal.exists()
+    has_journal = journal.exists()
+    if not (has_wal or has_journal):
         # Common case: a cleanly-closed store leaves no residue, so the
         # operator's file can be read directly and atomically without copying
         # anything or creating a sidecar.
@@ -251,21 +381,41 @@ def open_store_for_report(store_path: Path):
         return conn, None, caveats
     # Residue present: the shared store must not be opened at all (a mode=ro
     # read mutates the -shm bytes in place), so read a private copy.
-    caveats.append(
-        "the store carried WAL residue; it was read through a private copy so "
-        "the operator's files were never opened or modified")
+    if has_wal:
+        caveats.append(
+            "the store carried WAL residue; it was read through a private copy "
+            "so the operator's files were never opened or modified")
+    if has_journal:
+        # A hot rollback journal means a transaction was in flight when this
+        # ran. immutable=1 would ignore the journal entirely and report the
+        # UNCOMMITTED pages as real rows, so this deliberately does NOT take the
+        # direct path: staging copies the journal too and SQLite replays the
+        # rollback against the copy.
+        caveats.append(
+            "the store carried an in-flight rollback journal, so an unfinished "
+            "transaction was live; tier labels come from a private copy on "
+            "which that transaction was rolled back, and so may predate the "
+            "transaction rather than reflect it")
     conn, stage = _stage_copy(store_path)
     return conn, stage, caveats
 
 
-def namespace_tiers(conn, ids) -> dict:
-    """Map each id to a tier derived from its stored namespace. Ids absent
-    from the store (purged, or committed inside the snapshot window) become
-    ``unknown`` rather than failing the report."""
+def namespace_tiers(conn, ids) -> tuple:
+    """Map each id to a tier derived from its stored namespace.
+
+    Returns ``(tiers, failed_chunks, first_error)``. Ids absent from the store
+    (purged, or committed inside the snapshot window) become ``unknown``, which
+    is an honest answer. A chunk whose lookup FAILED is a different thing
+    entirely -- a corrupt or partially-unreadable store would otherwise report
+    every real row as ``unknown`` with no signal that anything went wrong, so
+    the failure is counted and handed back for the caller to disclose.
+    """
     tiers = {i: TIER_UNKNOWN for i in ids}
     if conn is None or not ids:
-        return tiers
+        return tiers, 0, None
     id_list = sorted(ids)
+    failed = 0
+    first_error = None
     # Chunked so a very large log cannot build an unbounded IN clause.
     for start in range(0, len(id_list), 400):
         chunk = id_list[start:start + 400]
@@ -274,7 +424,13 @@ def namespace_tiers(conn, ids) -> dict:
             rows = conn.execute(
                 "SELECT id, namespace FROM memory WHERE id IN (%s)" % marks,
                 chunk).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            # Verified against a store whose first page reads fine but whose
+            # later pages are corrupt: LIMIT 1 succeeded, this query raised,
+            # and the report still exited 0 with every row 'unknown'.
+            failed += 1
+            if first_error is None:
+                first_error = str(exc)
             continue
         for row in rows:
             ns = row["namespace"] or ""
@@ -282,7 +438,7 @@ def namespace_tiers(conn, ids) -> dict:
                 tiers[row["id"]] = TIER_GLOBAL
             elif ns.startswith("project:"):
                 tiers[row["id"]] = TIER_PROJECT
-    return tiers
+    return tiers, failed, first_error
 
 
 # -------------------------------------------------------------- aggregation
@@ -312,17 +468,22 @@ def build_decision_report(log_path: str, store_path: str) -> dict:
     The two bases differ deliberately. A repeated delivery is a real event worth
     counting; a repeated candidate is one thing that was not chosen.
     """
-    lines = parse_decision_log(log_path)
+    lines, caveats = parse_decision_log(log_path)
 
     delivered_per_id: dict = {}
     per_session: dict = {}
     max_per_session: dict = {}
     sessions_seen: dict = {}
     sessionless_lines = 0
+    non_injected_lines = 0
     tier_moment: dict = {}
     candidates: set = set()
+    stamps: list = []
 
     for line in lines:
+        stamp = line.get("ts")
+        if isinstance(stamp, int):
+            stamps.append(stamp)
         moment = _moment_of(line)
         # Occurrence-wise: rows[].delivered counts EVERY appearance of an id,
         # so the tier table must too or the reconciliation invariant breaks on
@@ -336,18 +497,29 @@ def build_decision_report(log_path: str, store_path: str) -> dict:
         candidates.update(ids)
         candidates.update(withheld)
 
-        for row_id in ids:
-            delivered_per_id[row_id] = delivered_per_id.get(row_id, 0) + 1
-            sid = line.get("sid")
-            if sid:
-                sessions_seen.setdefault(row_id, set()).add(sid)
-                key = (row_id, sid)
-                # Running max per row, so a long log stays linear rather than
-                # rescanning every (row, session) pair per reported row.
-                per_session[key] = per_session.get(key, 0) + 1
-                if per_session[key] > max_per_session.get(row_id, 0):
-                    max_per_session[row_id] = per_session[key]
-        if ids or withheld:
+        # DELIVERED is gated on the shared injected-line predicate: a legacy or
+        # mixed-version envelope can carry ids on a status=silent line, and
+        # counting those would report deliveries that never happened.
+        # WITHHELD is not gated -- a candidate pool was offered regardless of
+        # whether the line went on to deliver, which is exactly what the
+        # delivered-vs-withheld composition measures.
+        injected = _is_injected_line(line)
+        if not injected:
+            non_injected_lines += 1
+
+        if injected:
+            for row_id in ids:
+                delivered_per_id[row_id] = delivered_per_id.get(row_id, 0) + 1
+                sid = line.get("sid")
+                if _counts_as_session(sid):
+                    sessions_seen.setdefault(row_id, set()).add(sid)
+                    key = (row_id, sid)
+                    # Running max per row, so a long log stays linear rather
+                    # than rescanning every (row, session) pair per row.
+                    per_session[key] = per_session.get(key, 0) + 1
+                    if per_session[key] > max_per_session.get(row_id, 0):
+                        max_per_session[row_id] = per_session[key]
+        if injected and ids or withheld:
             buckets = tier_moment.setdefault(moment, {})
             # PER-LINE counting (the approved plan's formula): every id in this
             # line contributes 1 to its own tier bucket. Ids are accumulated as
@@ -356,25 +528,24 @@ def build_decision_report(log_path: str, store_path: str) -> dict:
             # what makes the tier-summed totals reconcile with the sum of
             # rows[*].delivered.
             got = buckets.setdefault("delivered_ids", Counter())
-            for row_id in ids:          # occurrence-wise, NOT the deduped set
-                got[row_id] += 1
+            for row_id in ids if injected else ():
+                got[row_id] += 1      # occurrence-wise, NOT the deduped set
             miss = buckets.setdefault("withheld_ids", Counter())
             for row_id in withheld:
                 miss[row_id] += 1
-        if not line.get("sid") and ids:
+        if injected and ids and not _counts_as_session(line.get("sid")):
             # Only lines that actually DELIVERED something are worth the
-            # caveat: a sidless line with no ids contributes nothing to
+            # caveat: a sessionless line with no ids contributes nothing to
             # `delivered`, so claiming it "counts toward delivered" would be
             # literally false.
             sessionless_lines += 1
 
     conn = None
     stage = None
-    caveats: list = []
     try:
         conn, stage, open_caveats = open_store_for_report(Path(store_path))
         caveats.extend(open_caveats)
-        tiers = namespace_tiers(conn, candidates)
+        tiers, failed_chunks, first_error = namespace_tiers(conn, candidates)
 
         by_tier_moment: dict = {}
         for moment, buckets in sorted(tier_moment.items()):
@@ -391,8 +562,11 @@ def build_decision_report(log_path: str, store_path: str) -> dict:
                 conn.close()
             except sqlite3.Error:
                 pass
-        if stage is not None:
-            shutil.rmtree(stage, ignore_errors=True)
+        # Surfaced, not swallowed: a leftover staging dir is a full copy of the
+        # operator's store sitting in temp, and the operator has to know.
+        leftover = _discard_stage(stage)
+        if leftover:
+            caveats.append(leftover)
 
     rows = {}
     for row_id in sorted(delivered_per_id):
@@ -405,15 +579,38 @@ def build_decision_report(log_path: str, store_path: str) -> dict:
 
     if sessionless_lines:
         caveats.append(
-            "%d decision line(s) carried no sid=, so they count toward "
-            "delivered but cannot contribute a session" % sessionless_lines)
+            "%d delivering line(s) carried no usable sid= (absent, or the "
+            "writers' %r placeholder for a host with no session id), so they "
+            "count toward delivered but cannot contribute a session"
+            % (sessionless_lines, SESSIONLESS_SID))
+    if non_injected_lines:
+        caveats.append(
+            "%d parsed line(s) were not delivery lines (status/reason pairs "
+            "the shared injected-line predicate rejects); ids on them are "
+            "excluded from delivered rather than counted as deliveries"
+            % non_injected_lines)
+    if failed_chunks:
+        caveats.append(
+            "%d id-lookup chunk(s) failed against the store (%s), so the ids "
+            "in them are reported under the 'unknown' tier. This is a store "
+            "read failure, not an absent row -- do not read those 'unknown' "
+            "labels as 'not in the store'" % (failed_chunks, first_error))
     caveats.append(_COUNTING_BASES_CAVEAT)
     caveats.append(_UNDETERMINED_TIER_CAVEAT)
     caveats.append(_SNAPSHOT_CAVEAT)
+    caveats.append(_RETENTION_CAVEAT)
+    if stamps:
+        caveats.append(
+            "This run covered decision timestamps %d..%d inclusive; a "
+            "before/after comparison is only like-for-like if both runs cover "
+            "an overlapping window, because the log family is capped by "
+            "rotation." % (min(stamps), max(stamps)))
 
     return {
         "decision_log": str(log_path),
         "decision_lines": len(lines),
+        "ts_first": min(stamps) if stamps else None,
+        "ts_last": max(stamps) if stamps else None,
         "rows": rows,
         "by_tier_moment": by_tier_moment,
         "caveats": caveats,
@@ -424,16 +621,21 @@ def render_text(report: dict) -> str:
     """Human table. All of this goes to STDOUT only in non-JSON mode; under
     --json stdout stays strictly json.loads-parseable."""
     out = []
-    out.append("decision log: %s" % report["decision_log"])
+    out.append("decision log: %s" % _escape_rendered(report["decision_log"]))
     out.append("decision lines: %d" % report["decision_lines"])
+    if report.get("ts_first") is not None:
+        out.append("timestamps: %d..%d"
+                   % (report["ts_first"], report["ts_last"]))
     out.append("")
     out.append("repeat rate per row id (delivered / sessions / max per session)")
     if not report["rows"]:
         out.append("  (no delivered rows)")
     for row_id, agg in report["rows"].items():
+        # Ids come from log text and are only ever printed here, so they are
+        # escaped at the rendering boundary. JSON mode leaves them byte-exact.
         out.append("  [%s] tier=%s delivered=%d sessions=%d max_per_session=%d"
-                   % (row_id, agg["tier"], agg["delivered"], agg["sessions"],
-                      agg["max_per_session"]))
+                   % (_escape_rendered(row_id), agg["tier"], agg["delivered"],
+                      agg["sessions"], agg["max_per_session"]))
     out.append("")
     out.append("delivered vs withheld by tier and moment")
     if not report["by_tier_moment"]:
@@ -447,8 +649,20 @@ def render_text(report: dict) -> str:
         out.append("")
         out.append("caveats")
         for note in report["caveats"]:
-            out.append("  - %s" % note)
+            out.append("  - %s" % _escape_rendered(note))
     return "\n".join(out)
+
+
+def _emit_json(payload: dict) -> None:
+    """Write exactly one compact, sorted, LF-terminated JSON document.
+
+    ``sys.stdout.buffer.write`` rather than ``print``: a Windows text-mode
+    newline would become CRLF and break the byte contract (the same shape
+    ``rescan-secrets`` uses in cli.py).
+    """
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    sys.stdout.buffer.write(text.encode("utf-8"))
+    sys.stdout.buffer.flush()
 
 
 def main(argv: list | None = None) -> int:
@@ -468,17 +682,34 @@ def main(argv: list | None = None) -> int:
         store_path = _resolve_store_path()
         report = build_decision_report(log_path, store_path)
     except ReportError as exc:
-        print("[zmem] report: %s" % exc, file=sys.stderr)
-        return 2
+        return _refuse(str(exc), args.as_json)
+    except Exception as exc:  # noqa: BLE001 - see _refuse for why this is broad
+        # An unexpected failure must still honour the --json promise: a caller
+        # piping stdout into jq gets valid JSON either way, and the traceback
+        # still reaches stderr so the bug stays debuggable.
+        import traceback
+        traceback.print_exc()
+        return _refuse("unexpected %s: %s" % (type(exc).__name__, exc),
+                       args.as_json)
 
     if args.as_json:
-        # One compact, sorted, LF-terminated document. sys.stdout.buffer.write
-        # is used because a Windows text-mode newline would become CRLF and
-        # break the byte contract (the rescan-secrets shape, cli.py:3281).
-        payload = json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
-        sys.stdout.buffer.write(payload.encode("utf-8"))
-        sys.stdout.buffer.flush()
+        _emit_json(report)
         return 0
 
     print(render_text(report))
     return 0
+
+
+def _refuse(message: str, as_json: bool) -> int:
+    """Refuse with exit 2, keeping stdout valid JSON when --json was asked for.
+
+    The documented --json contract is that stdout is exactly one compact JSON
+    document, so it can be piped into jq unchanged. Emitting nothing there made
+    ``json.loads(r.stdout)`` raise on every refusal, which is exactly when a
+    caller most needs to read the error programmatically. The human line still
+    goes to stderr, so text-mode callers see the same message as before.
+    """
+    if as_json:
+        _emit_json({"error": message, "ok": False})
+    print("[zmem] report: %s" % message, file=sys.stderr)
+    return 2

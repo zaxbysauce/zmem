@@ -202,26 +202,44 @@ class ReportDispatchGuardrailTest(unittest.TestCase):
             "journal_mode=WAL and _auto_near_miss_rekey writes. "
             "report=%d connect=%d" % (report_line, connect_line))
 
+    @staticmethod
+    def _report_block(src: str) -> str:
+        """The `report` dispatch, located by BOUNDARIES rather than a pinned
+        literal.
+
+        A hardcoded copy of the block text silently went stale the moment the
+        dispatch was rewritten, and the old code then skipTest()ed itself --
+        degrading the one test that proves this guardrail can fail into a
+        no-op, at exactly the moment someone edits the thing it guards.
+        Slicing from the `if args.cmd == "report":` header to the next
+        top-level `if args.cmd ==` dispatch survives any edit INSIDE the block.
+        """
+        lines = src.splitlines()
+        start = None
+        for i, line in enumerate(lines):
+            if 'if args.cmd == "report":' in line:
+                start = i
+                break
+        if start is None:
+            raise AssertionError("no `report` dispatch found in cli.py")
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if lines[j].lstrip().startswith("if args.cmd =="):
+                end = j
+                break
+        return "\n".join(lines[start:end])
+
     def test_report_guardrail_is_red_when_dispatch_is_moved_after_connect(self):
         """Proves the guardrail is discriminating: mutate a COPY of cli.py so
         the dispatch follows connect(), and re-run the same structural rule.
         The live cli.py is never modified."""
         src = CLI_PY.read_text(encoding="utf-8")
-        block = (
-            '    if args.cmd == "report":\n'
-            '        from storelib.decision_report import main as _report_main\n'
-            '\n'
-            '        sys.exit(_report_main([\n'
-            '            "--decision-log", args.decision_log,\n'
-            '        ] + (["--json"] if args.as_json else [])))\n'
-            '\n')
-        if block not in src:
-            self.skipTest("dispatch block text drifted; update the mutation")
-        mutated = src.replace(block, "")
+        block = self._report_block(src)
+        mutated = src.replace(block, "", 1)
         connect_line = self._connect_line(mutated)
         mutated_lines = mutated.splitlines()
         # Re-insert the dispatch well after connect(), as a regression would.
-        mutated_lines.insert(connect_line, block.rstrip("\n"))
+        mutated_lines.insert(connect_line, block)
         mutated = "\n".join(mutated_lines) + "\n"
 
         self.assertGreater(
@@ -231,6 +249,19 @@ class ReportDispatchGuardrailTest(unittest.TestCase):
             self._report_block_line(mutated) < connect_line,
             "the structural rule must FAIL on the mutated source, otherwise "
             "the guardrail is vacuous")
+
+    def test_report_block_is_locatable(self):
+        """The mutation above depends on _report_block finding a real dispatch.
+        Assert that explicitly instead of letting a miss surface as an opaque
+        downstream failure (or, worse, as a skip)."""
+        src = CLI_PY.read_text(encoding="utf-8")
+        block = self._report_block(src)
+        self.assertIn("_report_main", block,
+                      "the located dispatch must actually call the report "
+                      "main, or this guardrail is guarding nothing")
+        self.assertIn("_report_argv", block,
+                      "the dispatch must build its argv rather than splicing "
+                      "the outer --decision-log value in")
 
 
 class SupplementaryPinTest(_ReportCase):
@@ -417,11 +448,20 @@ class WalResidueTest(_ReportCase):
             "WAL residue")
         self.assertEqual(data["rows"][self.gid]["tier"], "global")
         # The operator's files must be untouched: residue is READ, never
-        # mutated, and no new sidecar may appear.
+        # mutated, and no new sidecar may appear. Comparing the WHOLE snapshot
+        # (name -> bytes, every file, recursive) rather than just the filename
+        # list and the -shm bytes is what closes the gap a review mutation
+        # exploited: appending 4096 bytes to the operator's store.sqlite left
+        # every assertion here green, because the store body was never
+        # compared. The full dict equality catches a changed byte in ANY file.
+        changed = sorted(k for k in set(after) & set(before)
+                         if after[k] != before[k])
         self.assertEqual(
-            sorted(after), sorted(before),
-            "the residue path must create no file (diff: added=%s removed=%s)"
-            % (sorted(set(after) - set(before)), sorted(set(before) - set(after))))
+            after, before,
+            "the residue path must leave every file in the data dir "
+            "byte-identical and create none: added=%s removed=%s changed=%s"
+            % (sorted(set(after) - set(before)),
+               sorted(set(before) - set(after)), changed))
         self.assertEqual(
             after.get("store.sqlite-shm"), before.get("store.sqlite-shm"),
             "the -shm bytes must be unchanged: a mode=ro read mutates them in "
@@ -454,8 +494,21 @@ class StoreErrorContractTest(_ReportCase):
                          "%s must not leak a traceback" % label)
         self.assertIn(expect_fragment, r.stderr,
                       "%s must name the cause" % label)
-        self.assertEqual(r.stdout, "",
-                         "%s must leave stdout empty on a refusal" % label)
+        # The documented --json contract is that stdout carries exactly one
+        # JSON document, so a refusal must honour it too. This assertion used
+        # to be `stdout == ''`, which is precisely the F-020 defect: a caller
+        # doing json.loads(r.stdout) on the documented machine surface raised
+        # JSONDecodeError at the one moment it most needed the error
+        # programmatically. The stderr line above is what text-mode callers see.
+        try:
+            error_doc = json.loads(r.stdout)
+        except ValueError as exc:
+            self.fail("%s must leave stdout json.loads-parseable under --json; "
+                      "got %r (%s)" % (label, r.stdout[:200], exc))
+        self.assertFalse(error_doc.get("ok", False),
+                         "%s refusal envelope must carry ok=false" % label)
+        self.assertIn(expect_fragment, error_doc.get("error", ""),
+                      "%s refusal envelope must name the cause" % label)
         self.assertEqual(leaked, [],
                          "%s leaked a staging directory holding a copy of the "
                          "operator's store" % label)
@@ -555,6 +608,17 @@ class StoreErrorContractTest(_ReportCase):
         handle = wintypes.HANDLE()
         kernel32 = ctypes.windll.kernel32
         kernel32.CreateFileW.restype = wintypes.HANDLE
+        # argtypes are load-bearing, not decoration: without them ctypes
+        # marshals the Python str path with the default (c_int) conversion,
+        # which truncates the pointer and makes the call fail for a reason
+        # unrelated to locking -- so the test would skip on every run and pin
+        # nothing. Review comment on this PR (cubic P2).
+        kernel32.CreateFileW.argtypes = (
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        )
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.CreateFileW(
             store, GENERIC_READ, FILE_SHARE_NONE, None, OPEN_EXISTING,
             0x80, None)  # 0x80 = FILE_ATTRIBUTE_NORMAL
@@ -653,9 +717,21 @@ class LiveWriterTest(_ReportCase):
 
         writer = _LiveWriter(Path(self.tmp, "store.sqlite"))
         writer.start()
+        attempts = []
         try:
             time.sleep(0.35)
-            r = self._run_report()
+            # Retry a bounded number of times. A torn staged copy legitimately
+            # refuses rather than reporting a partial read, so a single refusal
+            # is tolerated — but an ALWAYS-refusing tool must not pass this
+            # test. That vacuity was proven by mutation: neutering the report to
+            # refuse unconditionally left this test green, because the old code
+            # returned on rc==2 before reaching a single assertion below.
+            for _ in range(5):
+                attempt = self._run_report()
+                attempts.append(attempt)
+                if attempt.returncode == 0:
+                    break
+                time.sleep(0.2)
         finally:
             writer.stop.set()
             writer.join(timeout=10)
@@ -664,11 +740,17 @@ class LiveWriterTest(_ReportCase):
                            "the live writer must have committed rows, else "
                            "this test proves nothing about concurrency")
 
-        if r.returncode == 2:
-            # A torn staged copy legitimately refuses rather than reporting a
-            # partial read. Verify the refusal is the documented contract.
-            self.assertIn("[zmem] report:", r.stderr)
-            return
+        succeeded = [a for a in attempts if a.returncode == 0]
+        if not succeeded:
+            for refused in attempts:
+                self.assertIn("[zmem] report:", refused.stderr)
+                self.assertNotIn("Traceback", refused.stderr)
+            self.fail(
+                "every one of %d concurrent attempts refused (last stderr: %s); "
+                "the success path this test exists to pin was never reached, so "
+                "the test would pass for a report that simply always refuses"
+                % (len(attempts), attempts[-1].stderr.strip()[:300]))
+        r = succeeded[0]
         self.assertEqual(r.returncode, 0, r.stderr)
         data = json.loads(r.stdout)
 

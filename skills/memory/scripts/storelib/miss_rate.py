@@ -189,6 +189,27 @@ def _parse_id_list(raw: str) -> list:
     return re.findall(r"'([^']*)'", raw)
 
 
+def _safe_int(raw, default=None):
+    """int() that cannot raise on hostile log input.
+
+    Python 3.11+ caps decimal->int conversion at ``sys.get_int_max_str_digits()``
+    (4300 by default) and raises ValueError beyond it. A ``\d+`` regex group
+    admits an arbitrarily long digit string, so an oversized ``omitted=`` /
+    ``ops=`` / ``exc=`` in a hand-edited or corrupted log used to raise out of
+    ``parse_bg_log`` -- defeating its documented "Never raises" contract and
+    costing every consumer the ENTIRE log, not just the one bad line.
+    An unparseable count is reported as ``default`` (the field's own absent
+    sentinel) and the line is kept, because the surrounding fields on that line
+    are still valid evidence. Mirrors the ``t_ms`` guard below.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def parse_bg_log(path) -> list:
     """Parse decision lines from a decision log, ROTATION-AWARE (#129).
 
@@ -293,17 +314,17 @@ def parse_bg_log(path) -> list:
                 "ts": ts,
                 "status": status,
                 "reason": reason,
-                "omitted": int(omitted) if omitted else 0,
+                "omitted": _safe_int(omitted, 0),
                 "ids": _parse_id_list(ids_raw),
                 "all": _parse_id_list(all_raw),
                 "tok_used": tok_used,
                 "tok_budget": tok_budget,
-                "ops": int(ops) if ops else None,
+                "ops": _safe_int(ops),
                 # Issue #117: the additive exc= exclusion count (rows the
                 # caller suppressed via the delivery ledger). None on lines
                 # that predate the field - no join reads it today, but parsed
                 # parity keeps the report honest about suppressions.
-                "exc": int(exc) if exc else None,
+                "exc": _safe_int(exc),
                 "sid": sid,
                 "moment": moment,
                 "lane": lane,

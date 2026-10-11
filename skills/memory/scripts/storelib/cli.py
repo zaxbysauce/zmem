@@ -3714,9 +3714,17 @@ def main():
     if args.cmd == "report":
         from storelib.decision_report import main as _report_main
 
-        sys.exit(_report_main([
-            "--decision-log", args.decision_log,
-        ] + (["--json"] if args.as_json else [])))
+        # Build the child argv rather than splicing the outer value in: an
+        # omitted --decision-log is None, and forwarding that literal into a
+        # nested parser is only harmless by accident (the inner flag declares
+        # no type=, so argparse identity-passes it). Omitting the flag instead
+        # exercises the documented default-path fallback explicitly.
+        _report_argv = []
+        if args.decision_log:
+            _report_argv += ["--decision-log", args.decision_log]
+        if args.as_json:
+            _report_argv.append("--json")
+        sys.exit(_report_main(_report_argv))
 
     # Query rewriting is intentionally an early, read-only command.  Keeping
     # this branch before every connect/_prepare/migration path is what makes a
