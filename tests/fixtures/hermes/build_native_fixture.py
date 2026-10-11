@@ -3,13 +3,19 @@
 
 Writes ``native_cases.json`` (inputs: prompts, rows, sessions, delegation
 literals, one role-``tool`` result, Tier-0 core text) and
-``native_cases.expected.json`` (the exact manager-boundary output projection
-the suite must reproduce byte-for-byte).  Both files are sorted-key UTF-8 JSON
-with one final LF; the generator prints each file's SHA-256 so the PR can pin
-the digests.  Deterministic by construction: no clock, no store, no network,
-no random ids — every literal is fixed here.
+``native_cases.expected.json`` (the reviewed expected projection: the suite
+asserts the load-bearing keys against it, while byte-for-byte
+reproducibility of both files is enforced by the release checks, which
+regenerate into a scratch dir and byte-compare).  Both files are sorted-key
+UTF-8 JSON with one final LF; the generator prints each file's SHA-256 so
+the PR can pin the digests.  Deterministic by construction: no clock, no
+store, no network, no random ids — every literal is fixed here.
 
 Run:  python tests/fixtures/hermes/build_native_fixture.py [--output-dir DIR]
+
+The no-argument form regenerates the committed fixtures in place (the
+output dir defaults to this file's directory); an explicit --output-dir
+regenerates them for a byte-comparison without touching the committed files.
 """
 
 from __future__ import annotations

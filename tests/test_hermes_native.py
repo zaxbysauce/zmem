@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from concurrent.futures import Future
@@ -56,6 +57,13 @@ os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 _MODE_ENV_KEYS = (
     "ZMEM_HOME", "ZMEM_MCP_URL", "ZMEM_MCP_NAMESPACE", "ZMEM_NAMESPACE",
     "ZMEM_QUERY_CONTEXT", "ZMEM_BACKUP_DIR", "ZMEM_INJECT", "ZMEM_CORE_MD",
+    # Operator-shell hermeticity (PR review PRR-001): these are read live
+    # from os.environ by the cached plugin module and the store children at
+    # call time, so ambient values silently change test outcomes. setUp
+    # pops every key in-process (after snapshotting for restore) and
+    # _child_env strips them from child envs.
+    "ZMEM_CAPTURE", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_CAPTURE_MODE",
+    "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
 )
 
 with open(FIXTURE_DIR / "native_cases.json", encoding="utf-8") as _handle:
@@ -226,9 +234,18 @@ class _ResourceGuards:
         self.thread_count = 0
         self.join_count = 0
         self.socket_count = 0
+        self._model_dirs = []
+        module_models_dir = os.environ.get("ZMEM_MODELS_DIR")
+        if module_models_dir:
+            self._model_dirs.append(Path(module_models_dir))
         self._real_thread = threading.Thread
         self._real_join = threading.Thread.join
         self._real_socket = None
+
+    def add_model_dir(self, path) -> None:
+        """Register an additional per-test models dir to police (PR review
+        PRR-007: children get a per-store dir, not the module-level one)."""
+        self._model_dirs.append(Path(path))
 
     @staticmethod
     def _is_plumbing(kwargs) -> bool:
@@ -280,10 +297,10 @@ class _ResourceGuards:
                          "real joins performed: %d" % self.join_count)
         test.assertEqual(self.socket_count, 0,
                          "real sockets created: %d" % self.socket_count)
-        models_dir = Path(os.environ["ZMEM_MODELS_DIR"])
-        test.assertFalse(
-            models_dir.exists(),
-            "model download attempted: %s exists" % models_dir)
+        for models_dir in self._model_dirs:
+            test.assertFalse(
+                models_dir.exists(),
+                "model download attempted: %s exists" % models_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +316,19 @@ def _child_env(extra=None) -> dict:
     if extra:
         env.update(extra)
     return env
+
+
+def _unlink_quiet(path) -> None:
+    """Remove a temp file, retrying once: on Windows a just-killed child can
+    still hold the handle briefly after TimeoutExpired (PR review PRR-013)."""
+    try:
+        os.unlink(path)
+    except OSError:
+        time.sleep(0.05)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _run_cli(argv, extra_env=None, input_text=None):
@@ -317,19 +347,22 @@ def _run_cli(argv, extra_env=None, input_text=None):
                                                errors="replace")
         return proc.returncode, proc.stdout or "", stderr_text
     finally:
-        try:
-            os.unlink(err_path)
-        except OSError:
-            pass
+        _unlink_quiet(err_path)
 
 
 class _ScratchStore:
     """A per-test seeded store: three rows via the real add CLI, then id and
-    timestamp pinning by rowid (store_builder.py precedent; test-side only)."""
+    timestamp pinning by rowid (store_builder.py precedent; test-side only).
+
+    Construction only creates the directory; setUp registers the cleanup
+    BEFORE calling seed(), so a seed failure cannot leak the temp dir
+    (PR review PRR-013)."""
 
     def __init__(self):
         self.dir = Path(tempfile.mkdtemp(prefix="zmem-165-store-"))
         self.path = self.dir / "store.sqlite"
+
+    def seed(self):
         for row in CASES["rows"]:
             code, out, err = _run_cli([
                 "add", "--namespace", _NAMESPACE, "--type", row["type"],
@@ -452,13 +485,22 @@ class _ThreadFreeTransport:
 
     def prefetch(self, query, *, namespace, session_id, moment, ops_tokens,
                  lane="hermes-provider"):
-        argv = ["prefetch", "--query", query, "--namespace", namespace,
+        # Production parity (PR review PRR-008): leading-dash queries ride
+        # the `--query=` form (transport._query_args), and the child gets
+        # ZMEM_CAPTURE defaulted on exactly like LocalSubprocess.
+        if query.startswith("-"):
+            query_args = ["--query=" + query]
+        else:
+            query_args = ["--query", query]
+        argv = ["prefetch"] + query_args + ["--namespace", namespace,
                 "--session-id", session_id, "--moment", moment,
                 "--lane", lane]
         for token in ops_tokens:
             argv += ["--ops-token", token]
         argv.append("--json")
-        code, out, err = _run_cli(argv, extra_env=self._store.env())
+        child_env = self._store.env()
+        child_env.setdefault("ZMEM_CAPTURE", "1")
+        code, out, err = _run_cli(argv, extra_env=child_env)
         if code != 0:
             raise RuntimeError("transport prefetch failed (%d): %s%s"
                                % (code, out[-400:], err[-400:]))
@@ -511,14 +553,28 @@ class HermesNativeIntegrationTest(unittest.TestCase):
         _assert_vendored_headers()
 
     def setUp(self):
+        # Snapshot then POP the mode keys in-process (PR review PRR-001):
+        # the cached plugin module and the store children read these from
+        # os.environ at call time, so ambient operator values would silently
+        # change outcomes. _restore_env puts the operator's values back.
         self._prior_env = {key: os.environ.get(key)
                            for key in _MODE_ENV_KEYS}
-        self.store = _ScratchStore()
-        self.addCleanup(self.store.cleanup)
+        for key in _MODE_ENV_KEYS:
+            os.environ.pop(key, None)
+        # Guards entered BEFORE store creation so the seeding subprocesses
+        # are covered by the counters too (the subprocess plumbing exclusion
+        # keeps the counts at zero); cleanup is registered before seed() so
+        # a seed failure cannot leak the temp dir (PRR-013).
         self._guards = _ResourceGuards()
         self._guards.__enter__()
         self.addCleanup(self._guards.__exit__, None, None, None)
+        self.store = _ScratchStore()
+        self.addCleanup(self.store.cleanup)
+        self._guards.add_model_dir(self.store.dir / "missing-models")
+        # Restore registration precedes seed() so a seed failure also
+        # unwinds the in-process env pops (review round 2 nit).
         self.addCleanup(self._restore_env)
+        self.store.seed()
 
     def _restore_env(self):
         for key, value in self._prior_env.items():
@@ -724,10 +780,12 @@ class HermesNativeIntegrationTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--lane") + 1], "hermes-provider")
         self.assertIn("--moment", argv)
         self.assertEqual(argv[argv.index("--moment") + 1], "subagent")
+        self.assertIn("--session-id", argv)
+        self.assertEqual(argv[argv.index("--session-id") + 1], _PARENT_SID)
         self.assertIn("--ref-path", argv)
         self.assertEqual(
             argv[argv.index("--ref-path") + 1],
-            "delegation:%s:%s" % (_PARENT_SID, _CHILD_SID))
+            EXPECTED["delegation_ref_path"])
         payload = json.loads(calls[0]["input_text"])
         self.assertEqual(payload["child_session_id"], _CHILD_SID)
         self.assertEqual(payload["parent_session_id"], _PARENT_SID)
@@ -840,10 +898,7 @@ class HermesNativeIntegrationTest(unittest.TestCase):
             hook_stderr = Path(err_path).read_text(encoding="utf-8",
                                                    errors="replace")
         finally:
-            try:
-                os.unlink(err_path)
-            except OSError:
-                pass
+            _unlink_quiet(err_path)
         self._guards.assert_zero(self)
 
         self.assertEqual(proc.returncode, 0, hook_stderr[-500:])

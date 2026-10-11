@@ -1,4 +1,5 @@
 # Vendored from hermes-agent cdf4c76; update only with an explicit source-pin change.
+# MIT License, Copyright (c) 2025 Nous Research -- https://github.com/NousResearch/hermes-agent
 """MemoryManager — fans the agent's memory hooks out to registered providers.
 
 The builtin provider is always allowed; only ONE external plugin provider may be

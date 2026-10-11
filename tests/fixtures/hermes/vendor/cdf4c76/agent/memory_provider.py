@@ -1,4 +1,5 @@
 # Vendored from hermes-agent cdf4c76; update only with an explicit source-pin change.
+# MIT License, Copyright (c) 2025 Nous Research -- https://github.com/NousResearch/hermes-agent
 """Abstract base class for pluggable memory providers.
 
 Plugins ship in ``plugins/memory/<name>/``, activated via ``memory.provider`` (ONE external
