@@ -699,7 +699,8 @@ def _is_validated_delegation_excerpt(excerpt: str) -> bool:
     """True when ``excerpt`` is exactly the shape the flagged delegation
     writer (issue #164) accepts: a four-key JSON object whose session ids
     are whitespace-free strings and whose digests are lowercase 64-hex.
-    Mirrors ``cli.cmd_evidence_write_flagged``'s validation so the strict
+    Mirrors ``cli.cmd_evidence_write_flagged``'s validation (non-empty,
+    whitespace-free ids; lowercase 64-hex digests) so the strict
     importer's verbatim path admits only rows that writer could produce."""
     try:
         # Strict pairs hook: the verbatim branch stores the RAW excerpt
@@ -716,7 +717,8 @@ def _is_validated_delegation_excerpt(excerpt: str) -> bool:
         return False
     for key in ("child_session_id", "parent_session_id"):
         value = payload[key]
-        if not isinstance(value, str) or re.search(r"\s", value):
+        if not isinstance(value, str) or not value.strip()\
+                or re.search(r"\s", value):
             return False
     for key in ("result_sha256", "task_sha256"):
         value = payload[key]

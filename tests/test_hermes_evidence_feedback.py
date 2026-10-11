@@ -431,5 +431,30 @@ class HermesEvidenceFeedbackTest(unittest.TestCase):
         self.assertEqual(count, 0)
 
 
+    def test_strict_import_rejects_delegation_empty_id_self_hash(self):
+        """A delegation-kind row with an empty child id and a verbatim
+        self-hash fails the writer-shape validation (the writer rejects
+        empty ids), so it cannot land via the verbatim path."""
+        excerpt = _compact(child="")
+        ts = "2026-10-10T00:00:00Z"
+        row = {
+            "table": "evidence",
+            "id": str(uuid.uuid4()),
+            "session_id": _PARENT,
+            "lane": "hermes-provider",
+            "moment": "subagent",
+            "kind": "delegation",
+            "ts": ts,
+            "excerpt": excerpt,
+            "hash": hashlib.sha256(
+                f"delegation|{ts}|{excerpt}".encode("utf-8")).hexdigest(),
+            "ref_path": f"delegation:{_PARENT}:",
+            "ref_offset": None,
+        }
+        rc, count = self._ingest_crafted(row)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(count, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
