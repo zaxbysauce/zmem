@@ -62,9 +62,11 @@
     "missing_hook_ids",
     "trust_state",
     "hermes_sha",
-    "hermes_version_measured"
+    "hermes_version_measured",
+    "lanes"
   ],
   "enums": {
+    "lane_status": ["ok", "active", "degraded", "error", "not_applicable"],
     "verdict": ["pass", "fail", "skip"],
     "compact_result": ["survived", "dropped", "unknown"],
     "hermes_mode": ["gateway", "provider", "compatibility"]
@@ -106,6 +108,7 @@
     "entry kind directory carries only kind; kind file carries size and sha256; kind symlink carries a POSIX-relative target",
     "hermes lanes: verdict in (pass, fail) requires callback_evidence to be a nonempty list of nonempty strings; skip exempts it",
     "hermes lanes: mode must be one of the hermes_mode enum values",
+    "lanes: when present, an object with exactly fts/vector/entity/graph/temporal keys, each an object with a lane_status status and optional string reason (issue #131)",
     "claude-compact: compact_result is required and must be one of the compact_result enum values (unknown on every indeterminate path, including skip)",
     "zcode-duplicate: one_copy is required and must record the single-copy probe (verdict plus reason single-copy-pass on success)"
   ]

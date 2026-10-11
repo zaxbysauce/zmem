@@ -768,6 +768,15 @@ def _warn_degraded_embeddings_once(content: str) -> None:
                 detail = " (minilm.onnx absent from the resolved models dir)"
             elif reason == "tokenizer_missing":
                 detail = " (tokenizer.json absent from the resolved models dir)"
+            # Issue #131: the write path is the first-live-capture surface for
+            # presence-level reasons (is_available()'s gate short-circuits
+            # before _ensure_loaded, so a missing model never reaches the load
+            # failure branches). Record the once-per-data-dir sentinel here,
+            # fail-open — a notice failure never blocks the row.
+            try:
+                _embeddings.degraded_notice(reason)
+            except Exception:
+                pass
             print(
                 "[zmem] WARNING: memory stored without an embedding — semantic "
                 "dedup-on-write, vector recall, and embedding-seeded "

@@ -943,6 +943,136 @@ def _connect_existing_store_readonly() -> sqlite3.Connection:
     return conn
 
 
+def cmd_embedding_health(as_json: bool = False) -> int:
+    """Store-side embedding lane health (issue #131).
+
+    Read-only against the live store (`_connect_existing_store_readonly` —
+    no WAL-header rewrite). Forces the load/checksum seam before building the
+    object so a tampered model reports ``model_checksum_mismatch`` (or
+    ``model_load_failed``) rather than a presence-only 'ok'. When degraded,
+    creates the once-per-data-dir sentinel via ``embeddings.degraded_notice``
+    and prints the operator line ``vector lane: degraded (<reason>)`` to
+    stderr. With ``--json``: exactly one compact sorted-key JSON line + LF on
+    stdout, written through ``sys.stdout.buffer`` so Windows text mode cannot
+    turn the LF into CRLF (the rescan-secrets byte contract). Exit 1 ONLY for
+    an unreadable store; every recognized degraded reason exits 0 — a
+    degraded vector lane is a supported state, not a command failure.
+    """
+    import embeddings as _embeddings
+
+    try:
+        conn = _connect_existing_store_readonly()
+    except (FileNotFoundError, OSError, sqlite3.Error):
+        print("[zmem] embedding-health: store unreadable", file=sys.stderr)
+        return 1
+
+    try:
+        st = _embeddings.availability_status()
+        # Presence-only probes cannot see a tampered or unloadable model
+        # (checksum_ok is None until the first load attempt). Force the same
+        # seam production uses so the reported reason is the real one. The
+        # per-recall hook probe sets ZMEM_EMBEDDING_HEALTH_SHALLOW=1 to skip
+        # the force (it only needs the notice bits; the write path's own load
+        # covers the tampered case) — an explicit operator run stays deep.
+        if (st.get("available") and st.get("checksum_ok") is None
+                and st.get("profile") != "fake"
+                and os.environ.get("ZMEM_EMBEDDING_HEALTH_SHALLOW", "0") != "1"):
+            _embeddings._ensure_loaded()
+            st = _embeddings.availability_status()
+        reason = st.get("reason")
+        if reason == "ok":
+            reason = None
+        degraded = reason is not None
+        vector_status = "degraded" if degraded else "active"
+
+        notice_created = False
+        if degraded and reason in _embeddings._DEGRADED_REASONS:
+            try:
+                notice_created = _embeddings.degraded_notice(reason)
+            except Exception:
+                notice_created = False
+
+        notice_path = None
+        try:
+            env_data = os.environ.get("ZMEM_DATA")
+            if env_data:
+                notice_dir = Path(env_data)
+            else:
+                import host
+                notice_dir = Path(host.resolve_store_path()).parent
+            notice_path = notice_dir / _embeddings.DEGRADED_NOTICE_NAME
+        except Exception:
+            notice_path = None
+        notice_present = bool(notice_path and notice_path.is_file())
+
+        last_embed = None
+        last_index = None
+        backlog = 0
+        try:
+            row = conn.execute(
+                "SELECT MAX(embedded_at) AS le FROM memory "
+                "WHERE superseded_at IS NULL").fetchone()
+            last_embed = row["le"] if row else None
+        except sqlite3.Error:
+            last_embed = None
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM memory "
+                "WHERE superseded_at IS NULL "
+                "AND (embedding IS NULL OR length(embedding) = 0)").fetchone()
+            backlog = int(row["n"] or 0) if row else 0
+        except sqlite3.Error:
+            backlog = 0
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'last_successful_index'"
+            ).fetchone()
+            last_index = row["value"] if row else None
+        except sqlite3.Error:
+            last_index = None
+
+        result = {
+            "reason": reason,
+            "vector_status": vector_status,
+            "notice_created": notice_created,
+            "notice_present": notice_present,
+            "models_dir": st.get("models_dir"),
+            "profile": st.get("profile"),
+            "last_successful_embed": last_embed,
+            "last_successful_index": last_index,
+            "unembedded_backlog": backlog,
+        }
+
+        if degraded:
+            try:
+                sys.stderr.write(
+                    f"vector lane: degraded ({reason})\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        if as_json:
+            # Exactly one compact JSON line, LF-terminated at the byte level:
+            # a Windows text-mode print() would translate the newline to
+            # CRLF and break the byte contract (issue #181 AC1 shape).
+            sys.stdout.buffer.write(
+                (json.dumps(result, sort_keys=True,
+                            separators=(",", ":")) + "\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+        else:
+            notice_state = ("created" if notice_created
+                            else "present" if notice_present else "absent")
+            print(
+                f"embedding lane: {vector_status}"
+                + (f" reason={reason}" if reason else "")
+                + f" backlog={backlog} notice={notice_state}")
+        return 0
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 # Curated pages are a filesystem surface.  Their read/list commands must not
 # resolve or open the SQLite store at all; refresh only needs a committed,
 # read-only snapshot of the already-existing store and delegates publication
@@ -3210,6 +3340,13 @@ def main():
     p_rep.add_argument("--json", dest="as_json", action="store_true",
                        help="emit one machine-readable JSON document")
 
+    p_eh = _add_parser(
+        "embedding-health",
+        help="print embedding lane health as JSON (issue #131)")
+    p_eh.add_argument("--json", dest="as_json", action="store_true",
+                      default=False,
+                      help="print embedding lane health as JSON")
+
     # Source's public error contract intentionally predates its argparse
     # metadata. Validate the source-only required values and context before
     # argparse can emit a usage block; every other parser keeps its legacy
@@ -3725,6 +3862,15 @@ def main():
         if args.as_json:
             _report_argv.append("--json")
         sys.exit(_report_main(_report_argv))
+
+    # `embedding-health` is the store-side lane diagnostic (issue #131). Like
+    # `report`/`hygiene` above it dispatches BEFORE
+    # connect()/_prepare_store()/_auto_near_miss_rekey(): it opens the store
+    # itself strictly read-only (no WAL-header rewrite), forces the
+    # load/checksum seam so a tampered model is reported truthfully, and
+    # creates the once-per-data-dir degraded sentinel when degraded.
+    if args.cmd == "embedding-health":
+        sys.exit(cmd_embedding_health(as_json=args.as_json))
 
     # Query rewriting is intentionally an early, read-only command.  Keeping
     # this branch before every connect/_prepare/migration path is what makes a

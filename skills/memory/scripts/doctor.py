@@ -4090,6 +4090,8 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
 
     total_live = with_emb = without_emb = live_dim = declared_dim = None
     meta_profile = None
+    last_embed = None
+    last_index = None
     store_ok = False
     if resolved_store.exists():
         try:
@@ -4127,6 +4129,26 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                     meta_profile = row4[0] if row4 else None
                 except sqlite3.Error:
                     pass
+                # Issue #131: shared lane vocabulary — the backlog count and
+                # the two last-successful watermarks join the health details
+                # so doctor, the store-side embedding-health command, and the
+                # canary lanes object all speak the same field names.
+                try:
+                    row5 = conn.execute(
+                        "SELECT MAX(embedded_at) FROM memory "
+                        "WHERE superseded_at IS NULL"
+                    ).fetchone()
+                    last_embed = row5[0] if row5 else None
+                except sqlite3.Error:
+                    last_embed = None
+                try:
+                    row6 = conn.execute(
+                        "SELECT value FROM meta "
+                        "WHERE key='last_successful_index'"
+                    ).fetchone()
+                    last_index = row6[0] if row6 else None
+                except sqlite3.Error:
+                    last_index = None
             finally:
                 conn.close()
             store_ok = True
@@ -4138,6 +4160,9 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         live_memories=total_live,
         rows_with_embedding=with_emb,
         rows_without_embedding=without_emb,
+        unembedded_backlog=without_emb,
+        last_successful_embed=last_embed,
+        last_successful_index=last_index,
         stored_dim=live_dim,
         declared_vec_dim=declared_dim,
         last_rebuilt_profile=meta_profile,
@@ -4640,9 +4665,124 @@ def build_report(
         "repo_root": _display_path(repo_root),
         "resolved_store": _display_path(resolved_store),
         "namespace": namespace,
+        "lanes": _report_lane_status(resolved_store),
         "checks": checks,
         "recommendations": recommendations,
         "training_staging_cleanup": staging_cleanup,
+    }
+
+
+def _report_lane_status(resolved_store: Path) -> dict:
+    """Compact five-lane status object for build_report (issue #131).
+
+    Same vocabulary and statuses as the store-side ``embedding-health``
+    command and the canary lanes object: each lane is
+    ``{"status": ..., "reason": ...}`` with the vector lane additionally
+    carrying the last-successful watermark and the backlog count. Advisory
+    only — lane statuses never influence the top-level fail count.
+    """
+    try:
+        import embeddings  # type: ignore
+        st = embeddings.availability_status() or {}
+    except Exception:
+        st = {"available": False, "reason": "imports_missing"}
+    reason = st.get("reason")
+    if reason == "ok":
+        reason = None
+
+    def _lane(status, lane_reason=None):
+        return {"status": status, "reason": lane_reason}
+
+    fts = entity = graph = temporal = _lane("not_applicable", "store-absent")
+    table_lanes: dict = {}
+    last_embed = None
+    last_index = None
+    backlog = None
+    conn = None
+    try:
+        if resolved_store.exists():
+            uri = resolved_store.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            try:
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_fts "
+                    "WHERE memory_fts MATCH 'zmem'").fetchone()
+                fts = _lane("ok")
+            except sqlite3.Error:
+                fts = _lane("error", "fts-probe-failed")
+            for name, table, lane_reason in (
+                    ("entity", "entity", "table-absent"),
+                    ("graph", "memory_link", "table-absent")):
+                try:
+                    row = conn.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name=?", (table,)).fetchone()
+                    if row:
+                        table_lanes[name] = _lane("ok")
+                    else:
+                        table_lanes[name] = _lane("not_applicable", lane_reason)
+                except sqlite3.Error:
+                    table_lanes[name] = _lane("error", "probe-failed")
+            entity = table_lanes["entity"]
+            graph = table_lanes["graph"]
+            try:
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory WHERE valid_from <= ? "
+                    "AND (valid_until = '' OR valid_until > ?)",
+                    (now, now)).fetchone()
+                temporal = _lane("ok")
+            except sqlite3.Error:
+                temporal = _lane("error", "probe-failed")
+            try:
+                row = conn.execute(
+                    "SELECT MAX(embedded_at) FROM memory "
+                    "WHERE superseded_at IS NULL").fetchone()
+                last_embed = row[0] if row else None
+            except sqlite3.Error:
+                last_embed = None
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM memory "
+                    "WHERE superseded_at IS NULL "
+                    "AND (embedding IS NULL OR length(embedding) = 0)"
+                ).fetchone()
+                backlog = int(row[0] or 0) if row else 0
+            except sqlite3.Error:
+                backlog = None
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta "
+                    "WHERE key='last_successful_index'").fetchone()
+                last_index = row[0] if row else None
+            except sqlite3.Error:
+                last_index = None
+    except (OSError, sqlite3.Error):
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    if not st.get("available"):
+        vector_status, vector_reason = "degraded", reason
+    elif last_embed is None:
+        vector_status, vector_reason = "not_applicable", "empty-vector-pool"
+    else:
+        vector_status, vector_reason = "active", None
+    return {
+        "fts": fts,
+        "vector": {
+            "status": vector_status,
+            "reason": vector_reason,
+            "last_successful_embed": last_embed,
+            "last_successful_index": last_index,
+            "unembedded_backlog": backlog,
+        },
+        "entity": entity,
+        "graph": graph,
+        "temporal": temporal,
     }
 
 

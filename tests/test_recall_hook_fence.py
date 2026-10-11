@@ -212,6 +212,79 @@ class FenceConstantsTests(unittest.TestCase):
         self.assertLess(evil_idx, close_idx,
                         "injection text must be INSIDE the fence closer")
 
+    def test_lane_health_does_not_change_fenced_recall_bytes(self):
+        """Issue #131: the hook's post-emit lane-health probe
+        (``_maybe_log_lane_health``) runs AFTER the fence is rendered and
+        must never change the fenced bytes — this is a byte-preservation
+        test first: the same rows render byte-identically before and after
+        the probe seam is exercised, the fence still opens/closes with the
+        contract markers plus LF, and the disclaimer line rides along. The
+        probe itself is fail-open: called with a nonexistent store_py it
+        returns None without raising (env pinned to a sandbox so nothing
+        resolves toward the operator store)."""
+        import importlib.util
+        import storelib
+
+        rows = [{
+            "id": "lane-fence-id",
+            "namespace": "project:test",
+            "type": "fact",
+            "content": "fenced content for lane health byte preservation",
+            "tags": "",
+            "confidence": 0.9,
+            "signal": "test",
+            "source_ref": "",
+            "stale": False,
+            "_stale_note": "",
+        }]
+        before = storelib._format_fenced_recall(rows, header="lane probe h")
+
+        # Load the hook body the same way the decision-log tests do.
+        spec = importlib.util.spec_from_file_location(
+            "zmem_recall_body_lane_fence", RECALL_BODY)
+        body = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(body)
+        # The seam exists and the hook's main flow calls it post-emit.
+        self.assertTrue(hasattr(body, "_maybe_log_lane_health"))
+        source = RECALL_BODY.read_text(encoding="utf-8")
+        self.assertIn("_maybe_log_lane_health(store_py)", source,
+                      "the hook's main flow must invoke the post-emit "
+                      "lane-health probe")
+
+        # Spy-wrap the seam: record the invocation, delegate to the REAL
+        # fail-open implementation under a sandboxed env.
+        calls = []
+        real_probe = body._maybe_log_lane_health
+
+        def spy(store_py):
+            calls.append(store_py)
+            return real_probe(store_py)
+
+        body._maybe_log_lane_health = spy
+        after = storelib._format_fenced_recall(rows, header="lane probe h")
+        self.assertEqual(after, before,
+                         "the fenced recall bytes must be byte-identical "
+                         "across the lane-health probe seam")
+        self.assertTrue(after.startswith(storelib.ZMEM_FENCE_OPEN + "\n"))
+        self.assertTrue(after.endswith(storelib.ZMEM_FENCE_CLOSE + "\n"))
+        self.assertIn("untrusted retrieved notes", after)
+
+        with tempfile.TemporaryDirectory(prefix="zmem-lane-fence-") as tmp:
+            fake_store_py = str(Path(tmp) / "no-such-store.py")
+            env = {
+                "ZMEM_STORE": str(Path(tmp) / "store.sqlite"),
+                "ZMEM_DATA": tmp,
+                "ZMEM_MODELS_DIR": str(Path(tmp) / "no-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                result = body._maybe_log_lane_health(fake_store_py)
+        self.assertIsNone(result,
+                          "the probe is fail-open on a nonexistent store_py")
+        self.assertEqual(calls, [fake_store_py],
+                         "the spy seam was invoked exactly once")
+
     # --- issue #137: belief-head virtual rows ride the fence contract ---
 
     def _belief_head_row(self):

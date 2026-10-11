@@ -308,6 +308,50 @@ def _log_inject_decision(
         pass
 
 
+def _maybe_log_lane_health(store_py: str) -> None:
+    """One bounded post-recall lane-health probe (issue #131).
+
+    Runs ``store.py embedding-health --json`` fail-open (bounded 5s) after the
+    recall envelope has been consumed, the decision line written, and the
+    rendered context emitted — the fence, the decision line, and the emitted
+    JSON stay byte-identical. The child inherits
+    ZMEM_DATA/ZMEM_STORE/ZMEM_MODELS_DIR/ZMEM_MODEL_AUTODOWNLOAD implicitly
+    from ``os.environ`` and runs in shallow mode (no model load: five of the
+    six degradation reasons are presence-only, and the write path's own load
+    covers the tampered case). Once the once-per-data-dir sentinel exists the
+    probe is skipped entirely — there is nothing left to record. Only when
+    THIS probe created the sentinel does a separate bounded ``lane_health``
+    line land in the decision log; the line deliberately carries no
+    ``zmem-hook`` token so decision-log parsers (which anchor on that token)
+    never see it.
+    """
+    try:
+        log_dir = _data_dir()
+        if os.path.isfile(os.path.join(log_dir, "embedding-degraded.notice")):
+            return
+        env = {k: v for k, v in os.environ.items()
+               if k != _PRIVATE_PRETOOL_STDIN_MARKER}
+        env["ZMEM_EMBEDDING_HEALTH_SHALLOW"] = "1"
+        proc = subprocess.run(
+            [sys.executable, store_py, "embedding-health", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=5.0, check=False, env=env)
+        if proc.returncode != 0:
+            return
+        parsed = json.loads(proc.stdout.decode("utf-8", "replace"))
+        if not isinstance(parsed, dict) or not parsed.get("notice_created"):
+            return
+        reason = _safe_label(parsed.get("reason"), 64)
+        log_path = os.path.join(log_dir, "zmem-decisions.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "[%d] lane_health=degraded reason=%s notice=created\n"
+                % (int(time.time()), reason))
+    except Exception:
+        pass
+
+
 def _maybe_log_drift(session_id: str) -> None:
     """Best-effort served-tree drift marker."""
     try:
@@ -756,6 +800,11 @@ def main() -> int:
         rewrite=rewrite_applied,
     )
     _emit(rendered, envelope.get("effective_ops"))
+    # Issue #131: bounded lane-health probe AFTER the context was emitted —
+    # output and the decision line above stay byte-identical; the only visible
+    # effect is the once-per-data-dir sentinel + one bounded decision-log line
+    # the first time a degraded data directory is observed (fail-open).
+    _maybe_log_lane_health(store_py)
     if mode == "precompact":
         _clear_delivery_state(store_py, session_id, "ledger-clear")
     return 0
