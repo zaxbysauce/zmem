@@ -650,8 +650,6 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
     # Apply the same pre-redaction bound as the writer. Strict transport must
     # never hand an arbitrarily large remote excerpt to the redactor.
     excerpt = excerpt[:EVIDENCE_INPUT_MAX_EXCERPT_CHARS]
-    redacted, _ = redact_text(excerpt)
-    final_excerpt = redacted[:EVIDENCE_MAX_EXCERPT_CHARS]
     if obj["ref_offset"] is not None and (
         isinstance(obj["ref_offset"], bool)
         or not isinstance(obj["ref_offset"], int)
@@ -663,10 +661,31 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
         )
     _strict_required_text(obj["ref_path"], "evidence ref_path")
     digest = obj["hash"]
+    if not isinstance(digest, str):
+        raise ValueError("evidence hash must be a string")
+    # Transport check, verbatim first — DELEGATION ROWS ONLY (issue #164).
+    # A flagged delegation excerpt intentionally carries 64-hex digests that
+    # re-redaction would rewrite, breaking the stored hash; a row whose
+    # excerpt validates as exactly the shape the flagged writer accepts
+    # (four keys, whitespace-free ids, lowercase 64-hex digests) proves it
+    # could have come from that writer, so its verbatim hash is accepted.
+    # Every other kind keeps the redact-then-verify transport normalization:
+    # a remote-authored self-hashed row must not bypass import redaction
+    # (sync files are remote-authored data).
+    if (digest == hashlib.sha256(
+            f"{obj['kind']}|{ts}|{excerpt}".encode("utf-8")).hexdigest()
+            and len(excerpt) <= EVIDENCE_MAX_EXCERPT_CHARS
+            and obj["kind"] == "delegation"
+            and _is_validated_delegation_excerpt(excerpt)):
+        obj = dict(obj)
+        obj["excerpt"] = excerpt
+        return obj
+    redacted, _ = redact_text(excerpt)
+    final_excerpt = redacted[:EVIDENCE_MAX_EXCERPT_CHARS]
     expected = hashlib.sha256(
         f"{obj['kind']}|{ts}|{final_excerpt}".encode("utf-8")
     ).hexdigest()
-    if not isinstance(digest, str) or digest != expected:
+    if digest != expected:
         raise ValueError("evidence hash does not match the final excerpt")
     # Apply the same redaction/cap at the import boundary.  A valid exported
     # row is unchanged; a secret-bearing row cannot bypass the writer policy.
@@ -674,6 +693,38 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
     obj["excerpt"] = final_excerpt
     obj["hash"] = expected
     return obj
+
+
+def _is_validated_delegation_excerpt(excerpt: str) -> bool:
+    """True when ``excerpt`` is exactly the shape the flagged delegation
+    writer (issue #164) accepts: a four-key JSON object whose session ids
+    are whitespace-free strings and whose digests are lowercase 64-hex.
+    Mirrors ``cli.cmd_evidence_write_flagged``'s validation (non-empty,
+    whitespace-free ids; lowercase 64-hex digests) so the strict
+    importer's verbatim path admits only rows that writer could produce."""
+    try:
+        # Strict pairs hook: the verbatim branch stores the RAW excerpt
+        # string, so a duplicate-key excerpt would smuggle text in earlier
+        # values past a last-wins parse.  The writer's own stdin parser
+        # rejects duplicates; the importer must too.
+        payload = json.loads(excerpt, object_pairs_hook=_strict_object_pairs)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict) or set(payload) != {
+        "child_session_id", "parent_session_id",
+        "result_sha256", "task_sha256",
+    }:
+        return False
+    for key in ("child_session_id", "parent_session_id"):
+        value = payload[key]
+        if not isinstance(value, str) or not value.strip()\
+                or re.search(r"\s", value):
+            return False
+    for key in ("result_sha256", "task_sha256"):
+        value = payload[key]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            return False
+    return True
 
 
 def _strict_association_row(obj: dict, lineno: int, table: str) -> dict:

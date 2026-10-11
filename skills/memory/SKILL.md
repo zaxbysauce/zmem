@@ -2484,19 +2484,27 @@ entities, keyed by normalized alias, with no cross-store id collisions.
 Evidence is bounded observation data, not instructions for the model. The
 additive `evidence`, `episode_evidence`, and `memory_evidence` tables use the
 closed lane/moment/kind sets and second-precision UTC timestamps.
-`evidence write` validates the payload before insert; it redacts first, caps the
+`evidence write` validates the payload before insert; it redacts first —
+except the flagged delegation mode (issue #164), whose validated digest-only
+payload skips redaction — caps the
 final excerpt at 400 Unicode characters, hashes `kind|ts|final_excerpt`, and
-leaves the transaction commit to its caller. The CLI writer commits its own
+leaves the transaction commit to its caller. The strict JSONL importer
+verifies a row's hash against its exported excerpt verbatim first, so
+redaction-exempt rows round-trip. The CLI writer commits its own
 one-row transaction. When the zmem provider is active (issue #163), the plugin natively registers
 `post_tool_call`, `pre_llm_call`, and `pre_verify`. The registered
 `post_tool_call` sends a bounded private payload through the existing local
 store bridge and fails open on malformed input, unavailable host support,
 queue saturation, or writer failure; `pre_llm_call` and `pre_verify` complete
 the #163 provider surface (transport recall with strict envelope validation,
-and the once-per-session reflect-before-stop nudge). All three fail open.
+and the once-per-session reflect-before-stop nudge). Since issue #164,
+`on_delegation` records each subagent delegation as one bounded, fail-open
+evidence write (task/result SHA-256 digests plus child/parent session ids).
+All of these fail open.
 
 ```text
 <interpreter> <store.py> evidence write < payload.json
+<interpreter> <store.py> evidence write --kind delegation --session-id PARENT --lane hermes-provider --moment subagent --ref-path delegation:PARENT:CHILD < payload.json  # issue #164; answers {"id": ..., "ok": true}
 <interpreter> <store.py> evidence list --namespace NS [--session-id SID] [--lane LANE] [--moment MOMENT] [--json]
 <interpreter> <store.py> evidence show --namespace NS --id UUID [--json]
 <interpreter> <store.py> evidence for MEMORY_ID --json
