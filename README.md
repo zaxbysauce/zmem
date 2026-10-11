@@ -188,15 +188,24 @@ returning that envelope with the same `context` alias plus the back-compat
 Schema v14 adds three additive evidence tables: `evidence`,
 `episode_evidence`, and `memory_evidence`. Evidence is bounded, untrusted
 observation data rather than model instructions. The writer validates the
-closed lane/moment/kind sets, requires a second-precision UTC timestamp,
-redacts before capping the excerpt at 400 characters, and stores
-`SHA256(kind|ts|final_excerpt)`. When the zmem provider is active (issue #163), the plugin natively registers
+closed lane/moment/kind sets, requires a second-precision UTC timestamp
+(the flagged delegation mode generates it inside the store process), caps the
+excerpt at 400 characters — redacting first, except for the flagged
+delegation mode (issue #164) whose validated digest-only payload skips
+redaction — and stores `SHA256(kind|ts|final_excerpt)`. The strict JSONL
+importer verifies each row's hash against its exported excerpt verbatim
+first (falling back to redact-then-verify), so redaction-exempt rows
+round-trip. When the zmem provider is active (issue #163), the plugin natively registers
 `post_tool_call`, `pre_llm_call`, and `pre_verify`: `post_tool_call` admits a
 bounded payload to a detached local writer and fails open on malformed or
 unavailable host data; `pre_llm_call` delivers passive recall through the
 #160 transport with strict envelope validation; `pre_verify` delivers the
-reflect-before-stop continue nudge once per session. Every callback fails
-open — each returns `{}` and never raises into Hermes.
+reflect-before-stop continue nudge once per session. Since issue #164 the
+provider also implements the `on_delegation` callback: each subagent
+delegation is recorded as one bounded, fail-open evidence write carrying the
+task/result SHA-256 digests plus the child and parent session ids — never
+the raw text. Every callback fails
+open — each returns `{}` (or `None`) and never raises into Hermes.
 
 Legacy unscoped CLI/operator reads use `evidence list --namespace NS` and
 `evidence show --namespace NS --id UUID`; on these commands, `--namespace` is a
@@ -205,7 +214,12 @@ namespace filter or authorization boundary on this legacy list/show path.
 `evidence list` filters by `--session-id`, `--lane`, and `--moment`; `evidence show`
 selects by `--id` only. The hidden unscoped helper used by the operator MCP
 bridge, `evidence associations --id UUID --json`, returns association rows.
-Use `evidence write` for the validated JSON stdin writer. The scoped store
+Use `evidence write` for the validated JSON stdin writer; with the
+issue-#164 flags (`evidence write --kind delegation --session-id PARENT
+--lane hermes-provider --moment subagent --ref-path delegation:PARENT:CHILD`)
+it takes the four-key compact delegation payload on stdin, validates both
+digests as lowercase 64-hex, and answers a JSON envelope on stdout. The
+scoped store
 lookup is `evidence scoped-show --namespace NS --id UUID [--json]`: it returns a
 row only when the evidence is associated with a memory in `NS`, and emits
 `namespace_not_allowed` for a missing, unassociated, or foreign ID.

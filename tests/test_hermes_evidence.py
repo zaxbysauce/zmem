@@ -191,12 +191,16 @@ class HermesEvidenceTest(unittest.TestCase):
 
         before = projection()
         provider = self._provider()
-        with _Seam(self.module, _ok_envelope_argv):
+        with _Seam(self.module, _ok_envelope_argv) as seam:
             ret = provider.on_delegation(
                 "Delegate the exact UTF-8 task.",
                 "Result with trailing space ",
                 child_session_id=_CHILD, parent_session_id=_PARENT)
         self.assertIsNone(ret)
+        # The seam is the provider's ONLY write path, so an implementation
+        # that routed a memory write through _run_store would surface here.
+        self.assertEqual(len(seam.calls), 1)
+        self.assertEqual(seam.calls[0]["argv"][:2], ["evidence", "write"])
         self.assertEqual(projection(), before)
 
     def test_evidence_writer_failure_is_swallowed(self):

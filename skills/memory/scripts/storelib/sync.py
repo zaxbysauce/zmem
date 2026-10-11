@@ -650,8 +650,6 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
     # Apply the same pre-redaction bound as the writer. Strict transport must
     # never hand an arbitrarily large remote excerpt to the redactor.
     excerpt = excerpt[:EVIDENCE_INPUT_MAX_EXCERPT_CHARS]
-    redacted, _ = redact_text(excerpt)
-    final_excerpt = redacted[:EVIDENCE_MAX_EXCERPT_CHARS]
     if obj["ref_offset"] is not None and (
         isinstance(obj["ref_offset"], bool)
         or not isinstance(obj["ref_offset"], int)
@@ -663,10 +661,28 @@ def _strict_evidence_row(obj: dict, lineno: int) -> dict:
         )
     _strict_required_text(obj["ref_path"], "evidence ref_path")
     digest = obj["hash"]
+    if not isinstance(digest, str):
+        raise ValueError("evidence hash must be a string")
+    # Transport check, verbatim first: a row whose stored hash already covers
+    # its exported excerpt is re-imported unchanged.  This keeps the
+    # redaction-exempt delegation writer (issue #164) round-trip stable — its
+    # excerpt intentionally carries 64-hex digests that re-redaction would
+    # rewrite, breaking the stored hash.  The redact-then-verify fallback
+    # below remains for rows that need the transport normalization; both
+    # paths prove the row was not tampered with in transit.
+    verbatim = hashlib.sha256(
+        f"{obj['kind']}|{ts}|{excerpt}".encode("utf-8")
+    ).hexdigest()
+    if digest == verbatim and len(excerpt) <= EVIDENCE_MAX_EXCERPT_CHARS:
+        obj = dict(obj)
+        obj["excerpt"] = excerpt
+        return obj
+    redacted, _ = redact_text(excerpt)
+    final_excerpt = redacted[:EVIDENCE_MAX_EXCERPT_CHARS]
     expected = hashlib.sha256(
         f"{obj['kind']}|{ts}|{final_excerpt}".encode("utf-8")
     ).hexdigest()
-    if not isinstance(digest, str) or digest != expected:
+    if digest != expected:
         raise ValueError("evidence hash does not match the final excerpt")
     # Apply the same redaction/cap at the import boundary.  A valid exported
     # row is unchanged; a secret-bearing row cannot bypass the writer policy.
