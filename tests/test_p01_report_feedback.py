@@ -203,6 +203,25 @@ class SilentAnswerTest(FeedbackCase):
                     doc["rows"][self.pid]["delivered"], 2,
                     "an oversized %s= must not cost the whole log" % field)
 
+    def test_oversized_tokens_field_does_not_drop_the_whole_log(self):
+        # The sibling fields were guarded but tokens= was not, and isdigit()
+        # does NOT cap length -- so a long digit string still raised out of a
+        # parser that documents itself as never raising, costing every consumer
+        # the whole log. Found by the independent reviewer, not by the first
+        # round of probes.
+        huge = "9" * 5000
+        self._write_log([
+            _line(1740002050, [self.pid], [self.pid], "sess-good", "pretool"),
+            ("[%d] zmem-hook status=injected reason=injected ids=%s all=%s "
+             "tokens=%s/%s sid=sess-bad moment=pretool"
+             % (1740002051, _ids_literal([self.pid]),
+                _ids_literal([self.pid]), huge, huge)),
+        ])
+        doc = self._report_json()
+        self.assertEqual(doc["decision_lines"], 2,
+                         "the oversized tokens= must not cost the valid line")
+        self.assertEqual(doc["rows"][self.pid]["delivered"], 2)
+
     def test_non_delivery_line_ids_are_not_counted_as_deliveries(self):
         # A legacy or mixed-version envelope can carry ids on a status=silent
         # line. Counting those reports deliveries that never happened, and

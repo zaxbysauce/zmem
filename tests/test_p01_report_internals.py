@@ -154,6 +154,26 @@ class StagingFailureTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_leftover_on_the_refusal_path_is_reported(self):
+        # A refusal has no `caveats` channel, so the success-path warning alone
+        # left a leftover unreported on the failure path -- the very case where
+        # a full copy of the operator's store is most likely to be stranded.
+        tmp = tempfile.mkdtemp(prefix="zmem-p01-refuseleak-")
+        store = Path(tmp) / "store.sqlite"
+        store.write_bytes(b"not a database" * 200)
+        Path(str(store) + "-wal").write_bytes(b"")   # force the staged path
+        original_rmtree = DR.shutil.rmtree
+        DR.shutil.rmtree = lambda *a, **kw: None      # removal silently fails
+        try:
+            with self.assertRaises(DR.ReportError) as ctx:
+                DR._stage_copy(store)
+        finally:
+            DR.shutil.rmtree = original_rmtree
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIn("could not be removed", str(ctx.exception),
+                      "a staging directory that survived cleanup must be "
+                      "carried on the refusal itself, not discarded")
+
     def test_discard_of_nothing_is_safe(self):
         self.assertIsNone(DR._discard_stage(None))
 

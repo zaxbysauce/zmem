@@ -513,11 +513,12 @@ a private staged copy of `store.sqlite` + `-wal` + `-journal` when there is; a
 plain read-only open would create sidecars and mutate `-shm` in place. A hot
 rollback `-journal` also forces the staged path on purpose: `immutable=1` ignores
 the journal entirely and would report the uncommitted pages of an in-flight
-transaction as real rows. The staging directory is created owner-only, is removed
-on every path including failures, and a directory that somehow survives removal is
-reported as a `caveats` warning rather than left silently. `-shm` is never
-copied — SQLite rebuilds it from the `-wal`, and copying it fails outright under
-a live writer on Windows.
+transaction as real rows. The staging directory is created owner-only and is
+removed on every path including failures; a directory that survives removal is
+never left silent — on a successful run it is appended to `caveats`, and on a
+refusal it is carried in the refusal message itself. `-shm` is never copied —
+SQLite rebuilds it from the `-wal`, and copying it fails outright under a live
+writer on Windows.
 #### Query context (prior-turn operation tokens) — issue #88 / #85 direction 2
 
 Decision-point prompts are prose with zero lexical overlap with the

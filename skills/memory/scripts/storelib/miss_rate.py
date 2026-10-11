@@ -308,8 +308,14 @@ def parse_bg_log(path) -> list:
             if _tok and "/" in _tok:
                 used_s, budget_s = _tok.split("/", 1)
                 if used_s.isdigit() and budget_s.isdigit():
-                    tok_used = int(used_s)
-                    tok_budget = int(budget_s)
+                    # isdigit() does NOT cap length and \d+ admits arbitrarily
+                    # long digit strings, so the conversion itself must be
+                    # guarded -- checking the SHAPE is not enough. Guarding here
+                    # keeps an oversized tokens= from raising out of a parser
+                    # that documents itself as never raising, which would cost
+                    # every consumer the entire log rather than one number.
+                    tok_used = _safe_int(used_s)
+                    tok_budget = _safe_int(budget_s)
             parsed_row = {
                 "ts": ts,
                 "status": status,

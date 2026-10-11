@@ -308,7 +308,7 @@ def _stage_copy(store_path: Path) -> tuple:
             raise ReportError("store snapshot failed integrity_check")
         _verify_readable(conn, "the store snapshot")
         return conn, stage
-    except BaseException:
+    except BaseException as exc:
         # Close BEFORE removing: on Windows an open handle makes rmtree fail
         # silently, leaking a full copy of the operator's store per attempt.
         if conn is not None:
@@ -316,7 +316,15 @@ def _stage_copy(store_path: Path) -> tuple:
                 conn.close()
             except sqlite3.Error:
                 pass
-        _discard_stage(stage)
+        leftover = _discard_stage(stage)
+        if leftover:
+            # A refusal has no `caveats` channel, so a staging directory that
+            # survived cleanup would otherwise be unreported -- a full copy of
+            # the operator's store sitting in temp with nothing on the console.
+            # Carry it on the refusal itself, so BOTH paths disclose a leak.
+            if isinstance(exc, ReportError):
+                raise ReportError("%s; %s" % (exc, leftover)) from exc
+            print("[zmem] report: %s" % leftover, file=sys.stderr)
         raise
 
 

@@ -2,6 +2,7 @@
   "algorithm": "sha256-crlf-norm",
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
   "digest": "5861eb018fa68149218f6a55e89ea70c3cebf186c8ef59633f6a30649f3064ad",
 =======
   "digest": "0ecf5ce9526906e1f8692aef7cc56627d15da312913498d273c48ec80dd9e187",
@@ -9,6 +10,9 @@
 =======
   "digest": "64d295dc1045f608c752b0597b44d93ee01b463abf5e18e47e5348930f36b043",
 >>>>>>> 45be57a (fix(report): resolve swarm-pr-review and PR-thread findings (issue #249))
+=======
+  "digest": "07c876a750a39a1ccc3ef95800ed18fa7a2f5d4e9824e3d4891fef861cf81da4",
+>>>>>>> 4ce8f4b (fix(report): close reviewer's HIGH and LOW on the feedback round)
   "files": {
     "hermes-plugin/__init__.py": "04822475587f5bd50ccb13c2253a508dabd2247ec046b3927acb69dcc03f86cc",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -70,6 +74,7 @@
     "skills/closeout/SKILL.md": "b43f4c9fc602917bd5f627560f1ab5abbfb3b34e60ad0d27f7a219a7492368ef",
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
     "skills/memory/SKILL.md": "53c18165ffd83a33fcd33993362747545e1c50c869bb197425fcd4056694e8dd",
 =======
     "skills/memory/SKILL.md": "43cf3c38534871ab828e334352583511aa1baa25a28dec0ea86e97fba9c4c330",
@@ -77,6 +82,9 @@
 =======
     "skills/memory/SKILL.md": "7976c5d90b836bd021bfa2c7aba61548422cc0a0e8be0e574e3a9e81d25d97d7",
 >>>>>>> 45be57a (fix(report): resolve swarm-pr-review and PR-thread findings (issue #249))
+=======
+    "skills/memory/SKILL.md": "111908c117283575899a2fdc0317c3d13ceef02b1698ad8404012c242e70068a",
+>>>>>>> 4ce8f4b (fix(report): close reviewer's HIGH and LOW on the feedback round)
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
@@ -107,7 +115,7 @@
     "skills/memory/scripts/storelib/consolidate.py": "6180c42e25dcd644aff2053a223d76eab56c5a8cf96f72ae96169f64f9396f75",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
-    "skills/memory/scripts/storelib/decision_report.py": "caff582c1b2867229e6a663430a410109c6a2b358fc3d7745c343beef3ef472b",
+    "skills/memory/scripts/storelib/decision_report.py": "7420a03a2e2f7e3e5f7ac724f0c30dc51b191fc78d785a24a105bfb9a5d289dc",
     "skills/memory/scripts/storelib/delivery_ledger.py": "836963630eb0dd11dba491547b4e40a90c0fee9d64cc3ce6cf6152ca3ecaadf7",
     "skills/memory/scripts/storelib/entity.py": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949",
     "skills/memory/scripts/storelib/episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",
@@ -120,7 +128,7 @@
     "skills/memory/scripts/storelib/links.py": "687826c8ec6cb207ac5f155d5e22a4f70bbb22dca8dbcd03826f03b7fdb57c11",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
     "skills/memory/scripts/storelib/mine.py": "9c28d6744de9b973de8573184ac24cce46cf9558fb75f314c6c5a55cefaf3315",
-    "skills/memory/scripts/storelib/miss_rate.py": "de55836ef05a7b6cd7f6e6caaf6030fd26fc326e0d9d51b4588bc8119811b208",
+    "skills/memory/scripts/storelib/miss_rate.py": "899c7d4eade7d171e900a953541ec52ed64c05bab6fe855b20f12934d413a15a",
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
     "skills/memory/scripts/storelib/opcmds.py": "5a38c9c7c94e5b14a11d62cfde11e1c920805abeb29a92a4421d8ca9a121791b",
     "skills/memory/scripts/storelib/ops_tokens.py": "91d27a9fb1ab012ffdcf0e19060d08f82f30ee654754871433acbad173991521",
