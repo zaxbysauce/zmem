@@ -4,6 +4,7 @@
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
   "digest": "5861eb018fa68149218f6a55e89ea70c3cebf186c8ef59633f6a30649f3064ad",
 =======
   "digest": "0ecf5ce9526906e1f8692aef7cc56627d15da312913498d273c48ec80dd9e187",
@@ -17,6 +18,9 @@
 =======
   "digest": "8993de5b9f80e36427e08e1eb31d5f4a415e6a9ff1a176c7f088ef886fe5baae",
 >>>>>>> d12e846 (docs(report): state the refusal-channel wording exactly (issue #249))
+=======
+  "digest": "4233f9098a8cd2f6b96b4f9a36a81afd4ce807fe76d0e7f558b15600482d8b5e",
+>>>>>>> f572909 (fix(report): correct the -journal mechanism claim (issue #249))
   "files": {
     "hermes-plugin/__init__.py": "04822475587f5bd50ccb13c2253a508dabd2247ec046b3927acb69dcc03f86cc",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -123,7 +127,7 @@
     "skills/memory/scripts/storelib/consolidate.py": "6180c42e25dcd644aff2053a223d76eab56c5a8cf96f72ae96169f64f9396f75",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
-    "skills/memory/scripts/storelib/decision_report.py": "7420a03a2e2f7e3e5f7ac724f0c30dc51b191fc78d785a24a105bfb9a5d289dc",
+    "skills/memory/scripts/storelib/decision_report.py": "453107144d11e8a41f68e0cdb2db9bd9cf78a231fb001ded42d62d562af9c2e1",
     "skills/memory/scripts/storelib/delivery_ledger.py": "836963630eb0dd11dba491547b4e40a90c0fee9d64cc3ce6cf6152ca3ecaadf7",
     "skills/memory/scripts/storelib/entity.py": "915fdbafdbe79f1643af751a19ed366e3e2bec3beddcef42e881122310527949",
     "skills/memory/scripts/storelib/episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",

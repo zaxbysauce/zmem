@@ -253,9 +253,16 @@ def _stage_copy(store_path: Path) -> tuple:
     """Copy the store family into a private temp dir and open the copy.
 
     ``-shm`` is intentionally not copied: it is derived state SQLite rebuilds
-    from the ``-wal``. ``-journal`` IS copied when present, so that SQLite
-    replays the rollback on the staged copy instead of this report reading
-    uncommitted pages as committed ones.
+    from the ``-wal``. ``-journal`` IS copied when present so the staged copy
+    carries the whole store family.
+
+    NOTE the mechanism, which is NOT "SQLite replays the rollback here": the
+    copy is opened ``?mode=ro``, and recovering a valid hot journal requires
+    write access, so SQLite REFUSES the read instead. That refusal is the
+    protection -- it is what stops this report reporting the uncommitted pages
+    of an in-flight transaction as committed rows. Verified by execution: a
+    real hot journal yields the contracted exit-2 refusal, never a partial
+    read. Do not "fix" the read-only open into a writable one.
 
     ``copyfile`` rather than ``copy2``: copy2 preserves the mode bits, so a
     read-only store produced a read-only staged copy that rmtree could not
@@ -397,13 +404,16 @@ def open_store_for_report(store_path: Path):
         # A hot rollback journal means a transaction was in flight when this
         # ran. immutable=1 would ignore the journal entirely and report the
         # UNCOMMITTED pages as real rows, so this deliberately does NOT take the
-        # direct path: staging copies the journal too and SQLite replays the
-        # rollback against the copy.
+        # direct path: staging carries the journal too. The staged copy is
+        # opened read-only, so SQLite refuses a valid hot journal rather than
+        # replaying it -- and the refusal is what keeps uncommitted pages out
+        # of the tier labels. Verified by execution against a real hot journal.
         caveats.append(
             "the store carried an in-flight rollback journal, so an unfinished "
-            "transaction was live; tier labels come from a private copy on "
-            "which that transaction was rolled back, and so may predate the "
-            "transaction rather than reflect it")
+            "transaction was live; the report reads a private copy of the whole "
+            "store family opened read-only, so that journal is honoured as a "
+            "refusal rather than replayed -- expect exit 2 rather than tier "
+            "labels from a store mid-transaction")
     conn, stage = _stage_copy(store_path)
     return conn, stage, caveats
 
