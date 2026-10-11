@@ -61,6 +61,7 @@ NAMESPACE = "project:p02ledger"
 SESSION = "sess-p02"
 PARENT = "keep the flange calibrated before every launch"
 NEIGHBOUR = "unrelated zebra migration patterns note"
+NEW_NEIGHBOUR = "unrelated okapi migration patterns note"
 QUERY = "flange calibrated launch"
 CALLS = 3
 
@@ -271,6 +272,32 @@ class LinkExpansionNeighbourTest(_LedgerBase):
             "precondition: the query-matched parent must be recorded in "
             "the delivery ledger, or this test proves nothing")
         self.assertEqual(self.nid in ids, True)
+
+    def test_delivered_parent_does_not_contribute_a_new_neighbour(self):
+        """A delivered parent must contribute no neighbours at all — including
+        a link edge added AFTER that parent was delivered.
+
+        This is the only assertion in the suite that pins F2 (the
+        ``exclude_ids`` seed skip in ``expand_recall_links``). Every other test
+        passes even with that seed filter removed, because F1 already
+        suppresses neighbours the session has actually seen. Here the new
+        neighbour N2 has never been delivered, so only the seed skip can
+        suppress it.
+        """
+        first = self._call()
+        self._assert_arrival_precondition(first)
+        self.assertIn(self.pid, self._ledger_ids(),
+                      "precondition: the parent must be delivered on call 1")
+
+        n2 = self._add_row(NEW_NEIGHBOUR)
+        self._run_cli("links", "--add", "--id", self.pid, "--id", n2,
+                      "--relation", "related")
+
+        second = self._call()
+        self.assertEqual(
+            f"[{n2}]" in (second.get("rendered") or ""), False,
+            "a link edge added after the parent was delivered must not "
+            "re-render its neighbour in the same session")
 
 
 if __name__ == "__main__":

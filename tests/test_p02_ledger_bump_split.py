@@ -22,10 +22,9 @@ import ast
 import unittest
 from pathlib import Path
 
-INJECT_PY = (
-    Path(__file__).resolve().parent.parent
-    / "skills" / "memory" / "scripts" / "storelib" / "inject.py"
-)
+STORELIB = Path(__file__).resolve().parent.parent / "skills" / "memory" / "scripts" / "storelib"
+INJECT_PY = STORELIB / "inject.py"
+RECALL_PY = STORELIB / "recall.py"
 
 
 def _selector_source() -> str:
@@ -228,17 +227,39 @@ class LedgerBumpSetsAreDistinctTest(unittest.TestCase):
                       "bump_rows is the popularity set and must apply the #136 filter")
 
     def test_plain_recall_path_does_not_own_the_ledger(self):
-        """recall_memory does not record deliveries. If a future edit hands it
-        either accounting set, the two sinks would fuse on a second path."""
-        tree = ast.parse(_selector_source())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "recall_memory":
-                for name in ("ledger_rows", "bump_rows"):
-                    self.assertFalse(
-                        _assignment_chain(node, name),
-                        f"recall_memory now assigns {name}; the delivery ledger "
-                        "stays owned by the passive selector only",
-                    )
+        """``recall_memory`` does not record deliveries.
+
+        A plain recall must never write the delivery ledger: if a future edit
+        hands ``recall_memory`` either accounting set, the two sinks would fuse
+        again on a second path. ``recall_memory`` lives in ``recall.py``, not
+        ``inject.py``, so this parses that module — an earlier draft scanned
+        ``inject.py``, where the function does not exist, and the assertion
+        never executed.
+        """
+        tree = ast.parse(RECALL_PY.read_text(encoding="utf-8"))
+        funcs = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef)
+                 and node.name == "recall_memory"]
+        self.assertEqual(
+            len(funcs), 1,
+            "recall_memory must be found exactly once in recall.py for this "
+            "guard to be meaningful")
+        for name in ("ledger_rows", "bump_rows"):
+            self.assertFalse(
+                _assignment_chain(funcs[0], name),
+                f"recall_memory now assigns {name}; the delivery ledger stays "
+                "owned by the passive selector only",
+            )
+        self.assertFalse(
+            any(isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "record"
+                and isinstance(node.func.value, ast.Name)
+                and "ledger" in node.func.value.id.lower()
+                for node in ast.walk(funcs[0])),
+            "recall_memory must not call a ledger record function; the plain "
+            "lane is not a delivery surface",
+        )
 
 
 def _assignment_chain(func: ast.FunctionDef, name: str) -> list[str]:
