@@ -175,7 +175,16 @@ class _LedgerBase(unittest.TestCase):
         self._assert_neighbour_arrival(rows[0])
 
     def _assert_neighbour_arrival(self, row: dict) -> None:
-        raise NotImplementedError
+        """Assert N arrived through the shape this class names.
+
+        Overridden by each concrete class. The base implementation fails
+        loudly rather than silently passing, so a new subclass that forgets
+        to declare its arrival shape cannot pass for the wrong reason.
+        """
+        raise AssertionError(
+            f"{type(self).__name__} must override _assert_neighbour_arrival "
+            "to pin the arrival shape its fixture produces"
+        )
 
 
 class GraphArmNeighbourTest(_LedgerBase):
