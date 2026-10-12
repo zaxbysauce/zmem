@@ -69,47 +69,49 @@ QUERY = "flange calibrated launch"
 CALLS = 3
 
 
-def _clean_env(tmp: Path) -> dict[str, str]:
-    """A hermetic subprocess env: throwaway store, model absent, ambient
-    zmem knobs stripped so an operator's environment cannot redirect the
-    fixture (ZMEM_STORE outranks ZMEM_DATA and would silently retarget the
-    operator's real ~/.zmem if it leaked through).
+# Every ZMEM_* knob the passive lane reads, derived from the literals in
+# inject.py / recall.py / links.py. Stripping these keeps an operator's
+# ambient environment from changing the fixture's shape (an ambient
+# ZMEM_INJECT_MARGIN=0.5 prunes the neighbour before it renders, which reads
+# as a code defect rather than a leaked knob). Extend this tuple when a knob
+# is added upstream; _clean_env strips it plus the three prefix families, so a
+# new knob cannot silently leak.
+_TUNED_KNOBS = frozenset({
+    # store / data resolution and session identity
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_ROOT",
+    "ZMEM_NAMESPACE", "ZMEM_HOST", "ZMEM_SESSION",
+    "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
+    "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+    # model / embeddings
+    "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_LLM",
+    # lane shape: budget, margins, floors, arms
+    "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_INJECT_MARGIN",
+    "ZMEM_CTX_BUDGET", "ZMEM_TIER_SLOTS", "ZMEM_MMR_LAMBDA",
+    "ZMEM_GRAPH_SEED", "ZMEM_LINK_THRESHOLD",
+    "ZMEM_VEC_NS_OVERFETCH_ENV", "ZMEM_VEC_NS_OVERFETCH_DEFAULT",
+    "ZMEM_CROSS_ENCODER", "ZMEM_CROSS_ENCODER_SHADOW",
+    "ZMEM_CAPTURE", "ZMEM_QUERY_CONTEXT",
+    # delivery ledger + cross-project
+    "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
+    "ZMEM_CROSS_PROJECT", "ZMEM_CROSS_PROJECT_READ",
+    "ZMEM_CROSS_PROJECT_WRITE", "ZMEM_CROSS_PROJECT_HAZARD_VERBS",
+    # clock + fence markers
+    "ZMEM_TEST_NOW", "ZMEM_FENCE_OPEN", "ZMEM_FENCE_CLOSE",
+    "ZMEM_UNTRUSTED_FENCE",
+})
 
-    The strip set is DERIVED from the knobs the lane under test actually
-    reads, not hand-curated: `_TUNED_KNOBS` below is the complete list the
-    review found live in inject.py/recall.py/links.py at this head. An
-    ambient value for any of them changes the fixture's shape, so leaking one
-    turns a product failure into a red test that looks like a code defect
-    (e.g. ZMEM_INJECT_MARGIN=0.5 prunes the neighbour before it renders).
-    Extending `_TUNED_KNOBS` is the supported way to keep this honest.
-    """
-    strip = {
-        # store / data resolution and session identity
-        "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_ROOT",
-        "ZMEM_NAMESPACE", "ZMEM_HOST", "ZMEM_SESSION",
-        "CLAUDE_SESSION_ID", "ZCODE_SESSION_ID",
-        "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
-        # model / embeddings
-        "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
-        "ZMEM_EMBED_PROFILE", "ZMEM_LINK_LLM",
-        # lane shape: budget, margins, floors, arms
-        "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_INJECT_MARGIN",
-        "ZMEM_CTX_BUDGET", "ZMEM_TIER_SLOTS", "ZMEM_MMR_LAMBDA",
-        "ZMEM_GRAPH_SEED", "ZMEM_LINK_THRESHOLD",
-        "ZMEM_VEC_NS_OVERFETCH_ENV", "ZMEM_VEC_NS_OVERFETCH_DEFAULT",
-        "ZMEM_CROSS_ENCODER", "ZMEM_CROSS_ENCODER_SHADOW",
-        "ZMEM_CAPTURE", "ZMEM_QUERY_CONTEXT",
-        # delivery ledger + cross-project
-        "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
-        "ZMEM_CROSS_PROJECT", "ZMEM_CROSS_PROJECT_READ",
-        "ZMEM_CROSS_PROJECT_WRITE", "ZMEM_CROSS_PROJECT_HAZARD_VERBS",
-        # clock + fence markers
-        "ZMEM_TEST_NOW", "ZMEM_FENCE_OPEN", "ZMEM_FENCE_CLOSE",
-        "ZMEM_UNTRUSTED_FENCE",
-        # every ZMEM_INJECT_FLOOR_* and ZMEM_ARM_CAP_* / ZMEM_UNFOLD_*
-        # family, matched by prefix below
-    } | {k for k in os.environ
-         if k.startswith(("ZMEM_INJECT_FLOOR_", "ZMEM_ARM_CAP_", "ZMEM_UNFOLD_"))}
+# Whole families, stripped by prefix so a new member cannot leak
+_KNOB_PREFIXES = ("ZMEM_INJECT_FLOOR_", "ZMEM_ARM_CAP_", "ZMEM_UNFOLD_")
+
+
+def _clean_env(tmp: Path) -> dict[str, str]:
+    """A hermetic subprocess env: throwaway store, model absent, and every
+    ambient zmem knob stripped so an operator's environment cannot redirect the
+    fixture (ZMEM_STORE outranks ZMEM_DATA and would silently retarget the
+    operator's real ~/.zmem if it leaked through)."""
+    strip = set(_TUNED_KNOBS) | {
+        k for k in os.environ if k.startswith(_KNOB_PREFIXES)}
     env = {k: v for k, v in os.environ.items() if k not in strip}
     env.update({
         "ZMEM_STORE": str(tmp / "store.sqlite"),
@@ -142,13 +144,10 @@ class _LedgerBase(unittest.TestCase):
         """Class hook between seeding and linking; default adds no tags, so
         the neighbour can only arrive through link expansion."""
 
-    def _run_cli(self, *args: str, extra_env: dict | None = None) -> str:
-        env = dict(self.env)
-        if extra_env:
-            env.update(extra_env)
+    def _run_cli(self, *args: str) -> str:
         proc = subprocess.run(
             [sys.executable, str(STORE_PY), *args],
-            capture_output=True, text=True, env=env, timeout=300,
+            capture_output=True, text=True, env=self.env, timeout=300,
         )
         self.assertEqual(
             proc.returncode, 0,
@@ -406,12 +405,15 @@ class LedgerAccountingBoundTest(_LedgerBase):
         """PRR-001R / #256: the rendered fence is the ceiling.
 
         A row carrying a credential shape is ADMITTED into the candidate pool
-        (so it appears in candidate_ids) but must never render and must never be
-        recorded. This is the only shape in which recording `rows` instead of
-        `rows_present_in(rows, rendered)` is observable: the token-budget cut
-        removes a row from `rows` before candidate_ids is captured, so the
-        budget shape cannot distinguish the two, whereas a withheld row is in the
-        pool and absent from the fence.
+        (so it appears in candidate_ids) but is withheld from the fence and must
+        never be recorded.
+
+        Scope, stated honestly: this pins the JOINT law (fence bound AND
+        withheld filter). It does not pin the fence bound alone -- by the time
+        the selector records, the withhold re-scan has already rebuilt `rows`, so
+        `rows` IS the rendered set and the two expressions are observationally
+        equivalent through the envelope. The fence bound alone is pinned by the
+        AST guardrail in test_p02_ledger_bump_split.py.
         """
         secret = self._add_row(SECRET_ROW)
         payload = self._call()

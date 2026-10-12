@@ -81,11 +81,20 @@ README.
   link expansion (issue #250):** `expand_recall_links` accepts an optional
   `exclude_ids` and skips excluded seed rows, threaded at the `recall_memory`
   call site in `recall.py`. On the passive lane those exclusions are the
-  session's delivered ids. The parameter defaults to `None`, so every other
-  caller — including the non-`recall_memory` ones — is unaffected, expansion
-  still runs when nothing is excluded, and a link-free store keeps
-  byte-identical output. `explain_recall` is deliberately untouched: it has no
-  exclusion surface by design (`--exclude` is rejected alongside `--explain`).
+  caller's own excludes merged with the session's delivered ids. The parameter
+  defaults to `None`, so every other caller — including the non-`recall_memory`
+  ones — is unaffected, and expansion still runs when nothing is excluded.
+  `explain_recall` is deliberately untouched: it has no exclusion surface by
+  design (`--exclude` is rejected alongside `--explain`).
+
+### Changed
+- **Operation feedback no longer rewards a supplementary neighbour (issue #250):**
+  every delivery-ledger entry now records whether the row was bump-eligible, so
+  `operation-feedback` cannot apply a verdict — or move a durable trust counter —
+  to a link-expansion neighbour that was never query-matched. The marker also gives
+  the `store.py report` breakdown from #249 a way to classify expansion rows. Entries
+  written before this release lack the field and read as eligible, which is the
+  correct reading for a ledger that only ever recorded query-matched rows.
 
 ## [0.92.0] - 2026-10-09
 
