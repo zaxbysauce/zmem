@@ -59,6 +59,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   withheld-secret guard runs before `record()`, and the cap and six-hour
   suppression window are untouched. What changes is the *set* of rows at rest,
   not how they are stored or reaped.
+- **A contested-link marker is no longer re-rendered on strong-token re-delivery
+  (issue #250).** Because a hazard neighbour reached through a `contradicts`
+  edge is now ledgered when it renders, it is suppressed on later events in the
+  session. If a later strong token re-delivers the *parent* through the
+  un-exclusion path, the parent re-renders but that already-delivered neighbour
+  does not, so the `[CONTESTED LINK]` marker is absent from the re-delivered
+  envelope; before this release the neighbour was never ledgered and re-rendered
+  with its marker every time. This follows from the session-permanent suppression
+  the same release introduces and is not worked around here — releasing those rows
+  would mean re-expanding from delivered parents, which is the behaviour the
+  suppression exists to prevent. Noted because the marker is a defence-in-depth
+  signal rather than cosmetic output.
+- **Cap pressure rises with the wider ledger (issue #250).** The parent plus its
+  rendered neighbours now share one sidecar, so the 256-entry cap is reached
+  sooner. All rows from one event carry the same `ts`, and eviction is stable in
+  that order, so under cap pressure the matched parent — inserted first — can be
+  evicted while its neighbour survives; the parent then re-renders with the
+  neighbour still suppressed. Reaching this needs more than 256 live entries
+  inside the six-hour window, so it is a tail condition rather than a routine one.
 
 
 
