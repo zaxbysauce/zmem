@@ -5,6 +5,47 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.93.0] - 2026-10-11
+
+### Fixed
+
+- **Fail-loud first run for degraded embeddings (issue #131).** A fresh
+  install that degrades to FTS5-only is now visible once per data
+  directory instead of only inside the writing process: the first
+  unembedded live capture writes the
+  `<data dir>/embedding-degraded.notice` sentinel (canonical reason /
+  models_dir / profile / timestamp bytes) from the write-path warning and
+  the four `_ensure_loaded` failure branches, fail-open.
+- New `store.py embedding-health --json` command: one compact sorted-key
+  JSON object (`reason`, `vector_status`, `notice_created`,
+  `notice_present`, `models_dir`, `profile`, `last_successful_embed`,
+  `last_successful_index`, `unembedded_backlog`), forces the
+  load/checksum seam so a tampered model reports truthfully, prints the
+  `vector lane: degraded (<reason>)` operator line to stderr, and exits 0
+  for every recognized degraded reason (exit 1 only for an unreadable
+  store). Read-only store access throughout.
+- The recall hook runs a bounded fail-open lane-health probe after
+  emitting context; the fence, the decision line, and the emitted JSON
+  stay byte-identical, and a separate `lane_health` decision-log line
+  (invisible to `zmem-hook`-anchored parsers) is written only when the
+  recall probe itself creates the sentinel — the write path may create it
+  first, in which case the probe writes no line.
+- The host canary prints a `{"lanes": {...}}` JSON line BEFORE its
+  byte-identical verdict line (the verdict stays the final stdout line;
+  the JSON line is not emitted on the skip/fail paths) and persists the
+  five-lane health object (`fts`/`vector`/`entity`/`graph`/`temporal`,
+  validated against `canary-schema.json`) in lane-mode result artifacts
+  (`canary/<lane>.json` via `--result-json`); the model env is
+  stripped and re-set (`<data dir>/models`, autodownload off) so ambient
+  values can never mask the vector lane.
+- `doctor.py` shares the reason vocabulary, reports
+  `unembedded_backlog` / `last_successful_embed` /
+  `last_successful_index`, and adds a top-level `lanes` object carrying
+  lane statuses and reasons — a degraded lane never fails doctor.
+- README documents the shared model cache resolution, a portable checksum
+  command, and the two remediation actions, and states that the default
+  Xenova URL is not byte-identical to the pinned SHA-256.
+
 Released versions are marked with a git tag (`vX.Y.Z`) and a GitHub Release.
 Installations discover new versions by comparing the `version` field in their
 plugin manifest against the marketplace entry — see the *Upgrade* section of the

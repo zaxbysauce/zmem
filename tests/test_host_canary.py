@@ -84,6 +84,22 @@ def load_canary_module():
     return mod
 
 
+def _embedding_deps_importable() -> bool:
+    """The same gate tests/test_model_fallback.py uses (redefined locally so
+    this suite never imports that module's env-pinning top level): the ACTIVE
+    vector lane is only reachable when onnxruntime/tokenizers/numpy import —
+    availability_status() short-circuits to imports_missing otherwise."""
+    for mod in ("onnxruntime", "tokenizers", "numpy"):
+        try:
+            __import__(mod)
+        except Exception:
+            return False
+    return True
+
+
+LANE_STATUSES = ("ok", "active", "degraded", "error", "not_applicable")
+
+
 def run_canary(*args, extra_env=None, timeout=600):
     env = dict(os.environ)
     env.update(extra_env or {})
@@ -464,6 +480,195 @@ class CanarySelfTestTest(unittest.TestCase):
             problems = mod._validate_result_object(rogue, schema)
             self.assertTrue(any("outside the allowed set" in p
                                 for p in problems), problems)
+            # Issue #131 (PR #306 review gap): the lanes health object
+            # branch. A correct five-lane object built from the schema's
+            # own enums.lane_names validates clean...
+            good_lanes = {name: {"status": "ok", "reason": None}
+                          for name in schema["enums"]["lane_names"]}
+            self.assertEqual(
+                mod._validate_result_object(golden(lanes=good_lanes), schema),
+                [], "a well-formed lanes object must validate clean")
+            # ...a wrong lane NAME set does not (one renamed lane).
+            bad_names = dict(good_lanes)
+            del bad_names["fts"]
+            bad_names["fulltext"] = {"status": "ok", "reason": None}
+            problems = mod._validate_result_object(
+                golden(lanes=bad_names), schema)
+            self.assertTrue(any("exactly the five lane names" in p
+                                for p in problems), problems)
+            # ...a bogus status value does not (outside lane_status).
+            bad_status = dict(good_lanes)
+            bad_status["vector"] = {"status": "healthy", "reason": None}
+            problems = mod._validate_result_object(
+                golden(lanes=bad_status), schema)
+            self.assertTrue(any("lanes.vector.status" in p
+                                for p in problems), problems)
+            # ...a non-string, non-null reason does not.
+            bad_reason = dict(good_lanes)
+            bad_reason["fts"] = {"status": "ok", "reason": 42}
+            problems = mod._validate_result_object(
+                golden(lanes=bad_reason), schema)
+            self.assertTrue(any("lanes.fts.reason must be a string or null"
+                                in p for p in problems), problems)
+            # ...and an explicit "lanes": null does not slip through as if
+            # the key were absent.
+            problems = mod._validate_result_object(golden(lanes=None), schema)
+            self.assertTrue(any("exactly the five lane names" in p
+                                for p in problems), problems)
+
+    # ------------------------------------------------------------------
+    # Issue #131: the lane-health JSON line printed after the verdict line.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _lanes_from_stdout(stdout: str) -> dict:
+        """Extract the single JSON lanes object from a self-test stdout."""
+        json_objs = []
+        for line in stdout.splitlines():
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                json_objs.append(obj)
+        if len(json_objs) != 1:
+            raise AssertionError(
+                "expected exactly one dict-shaped JSON stdout line, got %d: %r"
+                % (len(json_objs), stdout))
+        lanes = json_objs[0].get("lanes")
+        assert isinstance(lanes, dict), lanes
+        return lanes
+
+    def test_json_verdict_contains_lane_health(self):
+        """#131: the self-test keeps its byte-identical verdict line AND
+        appends exactly ONE JSON stdout line carrying the five-lane health
+        object (fts/vector/entity/graph/temporal), every lane status drawn
+        from the schema's lane_status vocabulary."""
+        d = self._data_dir("lanes")
+        proc = run_canary("--host", "claude", "--self-test", "--data-dir", str(d))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # The verdict line is byte-shape unchanged (parsers anchor on it).
+        self.assertRegex(proc.stdout,
+                         r"zmem-canary host=claude mode=self-test verdict=pass")
+        lanes = self._lanes_from_stdout(proc.stdout)
+        self.assertEqual(sorted(lanes),
+                         ["entity", "fts", "graph", "temporal", "vector"])
+        for name, lane in lanes.items():
+            with self.subTest(lane=name):
+                self.assertIn(lane["status"], LANE_STATUSES, lane)
+
+    def test_vector_lane_degraded_without_model(self):
+        """#131: with no model under the canary's own isolated models dir,
+        every host's self-test still exits 0 and reports the vector lane as
+        degraded with a non-empty reason slug (model_file_missing when the
+        embedding deps import; imports_missing in a bare CI interpreter)."""
+        for host in ("claude", "codex", "zcode", "hermes"):
+            with self.subTest(host=host):
+                d = self._data_dir("nodeg-" + host)
+                proc = run_canary("--host", host, "--self-test",
+                                  "--data-dir", str(d))
+                self.assertEqual(proc.returncode, 0,
+                                 proc.stdout + proc.stderr)
+                lanes = self._lanes_from_stdout(proc.stdout)
+                vector = lanes["vector"]
+                self.assertEqual(vector["status"], "degraded", vector)
+                self.assertTrue(
+                    isinstance(vector["reason"], str) and vector["reason"],
+                    "the degraded vector lane must name a reason: %r" % vector)
+
+    @unittest.skipUnless(
+        _embedding_deps_importable(),
+        "the ACTIVE vector lane needs importable onnxruntime/tokenizers/"
+        "numpy — lane_health applies the deep-checksum verdict, so the "
+        "model bytes must be checksum-pinned (the test patches the digest "
+        "to its seeded fixture bytes) before the lane can read active")
+    def test_vector_lane_active_with_verified_model(self):
+        """#131: after a self-test run creates the canary store, place a
+        checksum-pinned model pair under <data_dir>/models, seed the
+        watermark (embedded_at + meta last_successful_index) directly, and
+        probe lane_health IN-PROCESS: the vector lane reports active with
+        the exact payload pinned by tests/fixtures/embedding_health/
+        expected-active.json (digest-pinned; models_dir excluded because
+        the runtime resolves it)."""
+        import hashlib
+        import sqlite3
+
+        d = self._data_dir("active")
+        store = d / "store.sqlite"
+        proc = run_canary("--host", "claude", "--self-test", "--data-dir", str(d))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(store.is_file(), "self-test must have created the store")
+
+        # lane_health runs at the END of the self-test, so the model pair and
+        # the watermark can only be seeded AFTER the run — probe in-process.
+        models = d / "models"
+        models.mkdir(exist_ok=True)
+        (models / "minilm.onnx").write_bytes(b"fixture-active-model-bytes")
+        (models / "tokenizer.json").write_bytes(b"{}")
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute(
+                "UPDATE memory SET embedded_at='2026-09-10T00:00:00Z', "
+                "embedding=X'0000000000' WHERE superseded_at IS NULL")
+            conn.execute(
+                "INSERT INTO meta VALUES('last_successful_index',"
+                "'2026-09-10T00:00:00Z')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        mod = load_canary_module()
+        # lane_health applies the memoized deep-checksum verdict (the same
+        # probe doctor uses), so synthetic model bytes that do NOT match the
+        # pinned digest are correctly reported as model_checksum_mismatch.
+        # Pin the expected hash to the seeded bytes for the duration of the
+        # probe so the "active" lane under test is reachable at all — an
+        # unpatched run asserts `active` against a model the lane correctly
+        # refuses, which is green only on a CI box with no runtime installed.
+        embeddings_mod = sys.modules.get("embeddings")
+        if embeddings_mod is None:
+            import importlib
+            sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+            embeddings_mod = importlib.import_module("embeddings")
+        seeded_sha = hashlib.sha256(
+            (models / "minilm.onnx").read_bytes()).hexdigest()
+        pinned = embeddings_mod._MODEL_SHA256
+        embeddings_mod._MODEL_SHA256 = seeded_sha
+        # verify_checksum_cached memoizes POSITIVE verdicts on (mtime, size);
+        # a matching verdict for these exact bytes was never cached before, so
+        # the probe hashes them fresh against the patched pin.
+        try:
+            lanes = mod.lane_health(str(d), str(store))
+        finally:
+            embeddings_mod._MODEL_SHA256 = pinned
+        vector = lanes["vector"]
+        self.assertEqual(vector["status"], "active", lanes)
+
+        fixture = (REPO_ROOT / "tests" / "fixtures" / "embedding_health"
+                   / "expected-active.json")
+        raw = fixture.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "04f0465bd0c7a01e0f1807785dec0348216bb23bc497e3579e7eb0592c9bcc61",
+            "expected-active.json drifted — regenerate via "
+            "tests/fixtures/embedding_health/build_fixtures.py and update "
+            "the pinned digest deliberately")
+        expected = json.loads(raw)
+        # Field-by-field against the frozen fixture (models_dir excluded:
+        # the runtime command resolves it; the fixture pins the literal
+        # `fixture-models` sentinel for that one field).
+        self.assertEqual(expected["vector_status"], "active")
+        self.assertIsNone(expected["reason"])
+        self.assertEqual(
+            vector,
+            {
+                "status": expected["vector_status"],
+                "reason": expected["reason"],
+                "last_successful_embed": expected["last_successful_embed"],
+                "last_successful_index": expected["last_successful_index"],
+                "unembedded_backlog": expected["unembedded_backlog"],
+            },
+        )
 
 
 class CanaryHelperUnitTest(unittest.TestCase):

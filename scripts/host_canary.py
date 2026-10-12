@@ -83,6 +83,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -115,6 +116,14 @@ STRIP_VARS = (
     "PLUGIN_DATA",
     "CLAUDE_PLUGIN_ROOT",
     "ZCODE_PLUGIN_ROOT",
+    # Issue #131: the model env is canary state, not ambient state — an
+    # ambient ZMEM_MODELS_DIR/ZMEM_MODEL_AUTODOWNLOAD/ZMEM_EMBED_PROFILE must
+    # never steer (or download into) the canary's probe of the vector lane,
+    # nor run its lane children under an operator-chosen embedding profile.
+    "ZMEM_MODELS_DIR",
+    "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE",
+    "ZMEM_EMBEDDING_HEALTH_SHALLOW",
 )
 
 HOSTS = ("claude", "codex", "zcode", "hermes")
@@ -153,12 +162,204 @@ def build_child_env(host, plugin_root, data_dir):
     env = {k: v for k, v in os.environ.items() if k not in STRIP_VARS}
     env["ZMEM_STORE"] = str(Path(data_dir) / "store.sqlite")
     env["ZMEM_DATA"] = str(data_dir)
+    # Issue #131: isolate the model env the same way as the store env — strip
+    # (in STRIP_VARS) then set the canary's own values. <data_dir>/models is
+    # the location lane_health probes and where the active-model fixture
+    # places minilm.onnx; autodownload stays off so a canary never fetches.
+    env["ZMEM_MODELS_DIR"] = str(Path(data_dir) / "models")
+    env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env["ZMEM_EMBED_PROFILE"] = "minilm"
     detect = HOST_DETECT_ENV.get(host)
     if detect:
         env[detect] = str(plugin_root)
     else:
         env["ZMEM_HOST"] = host
     return env
+
+
+LANE_HEALTH_STATUSES = ("ok", "active", "degraded", "error", "not_applicable")
+LANE_HEALTH_NAMES = ("fts", "vector", "entity", "graph", "temporal")
+
+
+def _lane(status, reason=None, **extra):
+    out = {"status": status, "reason": reason}
+    out.update(extra)
+    return out
+
+
+def lane_health(data_dir, store_path):
+    """Issue #131: five-lane health object over the canary store, read-only.
+
+    Opens ONLY the canary store through a read-only SQLite URI (the same
+    mode=ro shape the store's own schema probe uses) — never a rw handle, so
+    a canary health read can never checkpoint or rewrite the store under a
+    live lane. The vector lane probes the canary's OWN isolated models dir
+    (<data_dir>/models — the value build_child_env gives children), not the
+    ambient env, by pinning ZMEM_MODELS_DIR/ZMEM_EMBED_PROFILE around the
+    side-effect-free availability probe and restoring both on exit.
+    """
+    lanes = {}
+    store = Path(store_path)
+    conn = None
+    readable = False
+    try:
+        if store.is_file() and store.stat().st_size > 0:
+            uri = store.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            readable = True
+    except (OSError, sqlite3.Error):
+        readable = False
+
+    def _probe(name, fn):
+        if not readable:
+            lanes[name] = _lane("not_applicable", "store-absent")
+            return
+        try:
+            lanes[name] = fn(conn)
+        except sqlite3.Error as exc:
+            lanes[name] = _lane("error", type(exc).__name__)
+
+    def _fts(conn):
+        conn.execute(
+            "SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'canary'"
+        ).fetchone()
+        return _lane("ok", None)
+
+    def _table_lane(table):
+        def _fn(conn):
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            if row:
+                return _lane("ok", None)
+            return _lane("not_applicable", "table-absent")
+        return _fn
+
+    def _temporal(conn):
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        conn.execute(
+            "SELECT COUNT(*) FROM memory WHERE valid_from <= ? "
+            "AND (valid_until = '' OR valid_until > ?)", (now, now)
+        ).fetchone()
+        return _lane("ok", None)
+
+    _probe("fts", _fts)
+    _probe("entity", _table_lane("entity"))
+    _probe("graph", _table_lane("memory_link"))
+    _probe("temporal", _temporal)
+
+    # Vector lane: availability against the canary's isolated models dir.
+    availability = {}
+    saved_models = os.environ.get("ZMEM_MODELS_DIR")
+    saved_profile = os.environ.get("ZMEM_EMBED_PROFILE")
+    try:
+        os.environ["ZMEM_MODELS_DIR"] = str(Path(data_dir) / "models")
+        os.environ["ZMEM_EMBED_PROFILE"] = "minilm"
+        try:
+            scripts_dir = REPO_ROOT / "skills" / "memory" / "scripts"
+            sys.path.insert(0, str(scripts_dir))
+            try:
+                import embeddings as _embeddings
+            finally:
+                sys.path.pop(0)
+            availability = _embeddings.availability_status() or {}
+            # Same deep-checksum probe doctor uses: presence-only availability
+            # reports "ok" for a present-but-tampered model, which would let
+            # the lane say "active" while store.py embedding-health says
+            # model_checksum_mismatch for the same data dir. Mismatches are
+            # never memoized, so tampering stays visible.
+            if (availability.get("available")
+                    and availability.get("models_dir")):
+                try:
+                    if _embeddings.verify_checksum_cached(
+                            Path(availability["models_dir"])
+                            / "minilm.onnx") is False:
+                        availability = dict(
+                            availability, available=False,
+                            reason="model_checksum_mismatch")
+                except Exception:
+                    pass
+        except Exception as exc:
+            availability = {"available": False, "reason": "imports_missing",
+                            "note": type(exc).__name__}
+    finally:
+        if saved_models is None:
+            os.environ.pop("ZMEM_MODELS_DIR", None)
+        else:
+            os.environ["ZMEM_MODELS_DIR"] = saved_models
+        if saved_profile is None:
+            os.environ.pop("ZMEM_EMBED_PROFILE", None)
+        else:
+            os.environ["ZMEM_EMBED_PROFILE"] = saved_profile
+
+    reason = availability.get("reason")
+    if reason == "ok":
+        reason = None
+    vector = None
+    last_embed = None
+    last_index = None
+    backlog = 0
+    if readable:
+        try:
+            row = conn.execute(
+                "SELECT MAX(embedded_at) AS le FROM memory "
+                "WHERE superseded_at IS NULL").fetchone()
+            last_embed = row["le"] if row else None
+        except sqlite3.Error:
+            last_embed = None
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM memory "
+                "WHERE superseded_at IS NULL "
+                "AND (embedding IS NULL OR length(embedding) = 0)").fetchone()
+            backlog = int(row[0] or 0) if row else 0
+        except sqlite3.Error:
+            backlog = 0
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='last_successful_index'"
+            ).fetchone()
+            last_index = row[0] if row else None
+        except sqlite3.Error:
+            last_index = None
+    if not availability.get("available"):
+        vector = _lane("degraded", reason)
+    elif not readable:
+        vector = _lane("error", "store-absent")
+    elif last_embed is None:
+        vector = _lane("not_applicable", "empty-vector-pool")
+    else:
+        vector = _lane("active", None)
+    vector["last_successful_embed"] = last_embed
+    vector["last_successful_index"] = last_index
+    vector["unembedded_backlog"] = backlog
+    lanes["vector"] = vector
+
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    return {name: lanes[name] for name in LANE_HEALTH_NAMES}
+
+
+def print_lane_health_json(data_dir, store_path):
+    """Emit the lanes object as exactly one compact JSON stdout line (#131).
+
+    Printed BEFORE the byte-identical verdict_line(), so the verdict stays the
+    FINAL stdout line (the documented output contract — consumers may read the
+    last line). The object is the same shape the lane-mode result artifact
+    carries under its ``lanes`` key.
+    """
+    try:
+        lanes = lane_health(data_dir, store_path)
+        sys.stdout.write(
+            json.dumps({"lanes": lanes}, sort_keys=True,
+                       separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 def import_host_module(plugin_root):
@@ -844,6 +1045,24 @@ def _validate_result_object(result, schema):
     if lane not in schema["lanes"]:
         bad("unknown lane %r" % lane)
         return problems
+    # Issue #131: the optional lanes health object — exactly the five lane
+    # names, each an object with a lane_status status and optional reason.
+    lanes_obj = result.get("lanes")
+    if "lanes" in result:
+        # Presence, not non-nullness: an explicit "lanes": null is not a valid
+        # lanes object and must not slip through as if the key were absent.
+        if (not isinstance(lanes_obj, dict)
+                or set(lanes_obj) != set(schema["enums"]["lane_names"])):
+            bad("lanes must carry exactly the five lane names")
+        else:
+            allowed_status = set(schema["enums"]["lane_status"])
+            for name, obj in lanes_obj.items():
+                if not isinstance(obj, dict) or obj.get(
+                        "status") not in allowed_status:
+                    bad("lanes.%s.status must be a lane_status value" % name)
+                elif obj.get("reason") is not None and not isinstance(
+                        obj.get("reason"), str):
+                    bad("lanes.%s.reason must be a string or null" % name)
     if result["host"] != schema["lane_host"][lane]:
         bad("host %r does not match lane %r" % (result["host"], lane))
     verdict = result["verdict"]
@@ -1001,6 +1220,23 @@ def _lane_finalize(lane, host, data_dir, result_path, before, after,
             notes = (notes + "; " if notes else "") + \
                 "symlink-escape-%s" % name
     result["notes"] = notes
+    # Issue #131: attach the five-lane health object BEFORE the artifact is
+    # written. main() used to setdefault it after the lane runners returned —
+    # i.e. after this function had already persisted the artifact — so no lane
+    # artifact ever carried `lanes` and the schema's optional key was dead on
+    # the artifact path (the CHANGELOG's "lane-mode result artifacts" claim).
+    if "lanes" not in result:
+        try:
+            result["lanes"] = lane_health(
+                data_dir, Path(data_dir) / "store.sqlite")
+        except Exception as exc:  # health is advisory; never fail a lane
+            # Deliberately leave `lanes` ABSENT rather than writing an empty
+            # object: the schema's rule requires exactly the five lane names,
+            # so `lanes: {}` would make --validate-result reject this artifact.
+            # An optional key is the honest representation of "not measured".
+            result["notes"] = "; ".join(
+                part for part in (notes, "lane-health-unavailable-%s"
+                                  % type(exc).__name__) if part)
     if result_path:
         write_result(result_path, result)
     return result
@@ -2465,6 +2701,12 @@ def main(argv=None):
         verdict_line(args.host, mode, "fail", "no-row-id", env["ZMEM_STORE"], row_id, drift)
         return EXIT_NO_ROW_ID
 
+    # Issue #131: print the lane-health JSON object BEFORE the verdict line,
+    # so the `zmem-canary ...` verdict stays the FINAL stdout line. The
+    # verdict line is the documented output contract (module docstring) and
+    # consumers may read the last line; appending after it silently changed
+    # that contract.
+    print_lane_health_json(data_dir, env["ZMEM_STORE"])
     verdict_line(args.host, mode, "pass", "-", env["ZMEM_STORE"], row_id, drift)
     return 0
 

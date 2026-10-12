@@ -213,6 +213,9 @@ KNOWN_SUBCMDS = [
     "rescan-secrets",
     # Issue #249: the decision-log repeat/composition report read command.
     "report",
+    # Issue #131: the embedding lane health read command (--json is a real
+    # flag; dispatched early, read-only against the store).
+    "embedding-health",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help
@@ -519,7 +522,8 @@ class CharacterizationTests(unittest.TestCase):
         # 51 -> 52: the convention-drift read command joined (issue #261).
         # 52 -> 53: the rescan-secrets command joined (issue #181).
         # 53 -> 54: the decision-log report read command joined (issue #249).
-        self.assertEqual(len(KNOWN_SUBCMDS), 54)
+        # 54 -> 55: the embedding lane health command joined (issue #131).
+        self.assertEqual(len(KNOWN_SUBCMDS), 55)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
@@ -535,7 +539,21 @@ class CharacterizationTests(unittest.TestCase):
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 54)
+        self.assertEqual(len(KNOWN_SUBCMDS), 55)
+
+    def test_embedding_health_help_surface(self):
+        """Issue #131: `embedding-health` joined the CLI surface with a
+        single real flag (--json, dest as_json) whose help text documents
+        the JSON output; the subcommand references itself in its usage
+        line like every other subcommand."""
+        r = _run_cli({}, "embedding-health", "--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("embedding-health", r.stdout)
+        self.assertIn("usage:", r.stdout)
+        self.assertIn("--json", r.stdout)
+        # The flag's semantics (dest as_json): the help line documents the
+        # JSON output contract.
+        self.assertIn("print embedding lane health as JSON", r.stdout)
 
     def test_page_help_surface(self):
         """Pin the nested issue #138 grammar and operator-facing help text."""

@@ -393,6 +393,7 @@ def _ensure_loaded():
     if current_profile_name() == "fake":
         return  # fake embeds never touch the session/tokenizer stack
     if not _check_available():
+        _maybe_notice_degraded()
         return
     import onnxruntime as ort
     from tokenizers import Tokenizer
@@ -416,6 +417,10 @@ def _ensure_loaded():
     except OSError:
         _model_available = False
         _model_checksum_ok = False
+        # Unreadable model file: availability_status() reports this as a
+        # checksum mismatch via the _model_checksum_ok=False ladder — pin the
+        # same slug here so the notice vocabulary stays single-sourced.
+        _maybe_notice_degraded("model_checksum_mismatch")
         return
     if actual_sha != _MODEL_SHA256:  # call-time attr: tests patch it
         _model_available = False
@@ -431,6 +436,7 @@ def _ensure_loaded():
             )
         except Exception:
             pass
+        _maybe_notice_degraded()
         return
     # Load the session + tokenizer. A corrupt/unreadable tokenizer.json (or any
     # load-time error) must fail OPEN to the degraded path, not propagate into
@@ -458,6 +464,7 @@ def _ensure_loaded():
             )
         except Exception:
             pass
+        _maybe_notice_degraded()
 
 
 def embed_text(text: str) -> bytes | None:
@@ -655,3 +662,131 @@ def availability_status() -> dict:
             "interpreter": sys.executable or "", "model_file": model_file,
             "tokenizer_file": tokenizer_file, "checksum_ok": _model_checksum_ok,
             "load_failed": _model_load_failed}
+
+
+# Issue #131: the degradation reasons that activate the once-per-data-dir
+# sentinel. These are exactly the non-'ok' availability_status() reasons that
+# describe a degraded vector lane. The `fake` profile is a deliberate test
+# setup (available=True) and never writes a notice.
+_DEGRADED_REASONS = frozenset({
+    "model_file_missing",
+    "model_checksum_mismatch",
+    "model_load_failed",
+    "imports_missing",
+    "tokenizer_missing",
+    "unknown_profile",
+})
+
+DEGRADED_NOTICE_NAME = "embedding-degraded.notice"
+
+
+def degraded_notice_dir(data_dir=None) -> Path:
+    """Resolve the directory that holds the degradation sentinel (issue #131).
+
+    ONE resolver shared by every surface — this writer, the store-side
+    ``embedding-health`` command, and the recall hook's skip check. They
+    previously each re-derived the "data dir" from the environment with
+    DIFFERENT precedence (ZMEM_DATA-first here, dirname(ZMEM_STORE)-first in
+    the hook), so a store/data divergence left the hook probing a directory
+    that never received the sentinel: the skip check never engaged and every
+    recall re-spawned the probe. Order: explicit argument, then ``ZMEM_DATA``,
+    then the parent of the resolved store path (which applies ``expanduser``,
+    so a ``~``-prefixed value resolves to the home dir instead of a literal
+    ``~`` directory under the process cwd).
+    """
+    if data_dir is not None:
+        return Path(data_dir)
+    env_data = os.environ.get("ZMEM_DATA")
+    if env_data:
+        return Path(os.path.expanduser(env_data))
+    import host  # lazy, like _resolve_models_dir's own host import
+    return Path(host.resolve_store_path()).parent
+
+
+def degraded_notice(reason: str, *, data_dir=None, now=None) -> bool:
+    """Create the once-per-data-dir embedding-degradation sentinel (#131).
+
+    Writes ``<data_dir>/embedding-degraded.notice`` with O_CREAT|O_EXCL so the
+    first degraded process in a data directory records the state exactly once;
+    every later process (any CLI, hook, or server) sees FileExistsError and
+    moves on. Returns True only when THIS call created the file; False when it
+    already exists or creation failed — a notice failure never breaks the
+    caller (fail-open, like every other seam in this module).
+
+    The data dir resolves through the shared ``degraded_notice_dir()`` helper
+    (argument, then ``ZMEM_DATA``, then the resolved store path's parent), so
+    the store-side health command and the recall hook look in the same place
+    this writes.
+    """
+    if reason not in _DEGRADED_REASONS:
+        raise ValueError("unknown embedding degradation reason")
+    data_dir = degraded_notice_dir(data_dir)
+    if now is None:
+        try:
+            # Function-local: storelib.schema imports this module at module
+            # scope, so a module-scope back-import would be circular.
+            from storelib.schema import now_iso
+            now = now_iso()
+        except Exception:
+            import time
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = (
+        f"reason={reason}\n"
+        f"models_dir={_resolve_models_dir()}\n"
+        f"profile={current_profile_name() or 'unknown'}\n"
+        f"timestamp={now}\n"
+    ).encode("utf-8")
+    notice_path = data_dir / DEGRADED_NOTICE_NAME
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        # O_BINARY: on Windows a text-mode fd would translate the LF payload
+        # to CRLF and break the notice's byte contract.
+        fd = os.open(
+            str(notice_path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+            0o644,
+        )
+    except OSError:
+        # FileExistsError is an OSError: an existing sentinel and an
+        # uncreatable one both return False — the creator bit is the signal.
+        return False
+    try:
+        # os.write may write short. Loop until the payload is complete, and on
+        # any failure REMOVE the O_EXCL-created file: a truncated or empty
+        # sentinel would otherwise consume the once-per-data-directory bit
+        # permanently (every later call sees FileExistsError and reports
+        # notice_present for a file with no content).
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(str(notice_path))
+        except OSError:
+            pass
+        return False
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return True
+
+
+def _maybe_notice_degraded(fallback_reason: str | None = None) -> None:
+    """Best-effort sentinel write on a first-live-load failure (#131).
+
+    Never raises: the degraded path is already the fail-open path, and a
+    notice failure must not turn a degraded-but-working store into a broken
+    one (pinned by test_notice_failure_does_not_break_fts_recall).
+    """
+    try:
+        st = availability_status()
+        reason = st.get("reason") or fallback_reason
+        if reason and reason != "ok":
+            degraded_notice(reason)
+    except Exception:
+        pass

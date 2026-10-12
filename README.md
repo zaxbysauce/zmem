@@ -1573,6 +1573,55 @@ environment. When embeddings are unavailable, ZMem prints a one-time-per-process
 warning naming the reason and the resolved models dir on the first unembedded
 capture, so silent drift does not recur.
 
+**First-run lane diagnosis (issue #131).** A fresh install that degrades to
+FTS5-only now says so, once per data directory, on four surfaces:
+
+- The first unembedded live capture writes the sentinel
+  `<data dir>/embedding-degraded.notice` (`reason=<slug>`, the resolved
+  `models_dir`, the active `profile`, and a `timestamp`) and prints the
+  degraded warning. Delete the file to re-arm the notice after fixing the
+  model.
+- `python skills/memory/scripts/store.py embedding-health --json` prints one
+  compact JSON object (`reason`, `vector_status`, `notice_created`,
+  `notice_present`, `models_dir`, `profile`, `last_successful_embed`,
+  `last_successful_index`, `unembedded_backlog`) and, when degraded, the
+  operator line `vector lane: degraded (<reason>)` on stderr. Every
+  recognized degraded reason exits 0 — a degraded vector lane is a supported
+  state; only an unreadable store exits 1.
+- `doctor.py` carries the same reason vocabulary, the backlog count, and a
+  top-level five-lane object (`fts`/`vector`/`entity`/`graph`/`temporal`,
+  each entry carrying a lane status and optional reason) — a degraded
+  lane never fails doctor.
+- The host canary prints a `{"lanes": {...}}` JSON line BEFORE its
+  verdict line on a passing self-test/compact/live run (it is not emitted
+  on the skip/fail paths), with the isolated model env
+  (`<data dir>/models`, `ZMEM_MODEL_AUTODOWNLOAD=0`) so an ambient value
+  can never mask the lane.
+
+Verify the shared cache and the checksum before installing a model:
+
+```bash
+# Resolve the shared cache path (the models CHILD of the store data dir):
+ls ~/.zmem/models            # i.e. <store data dir>/models
+# Print the SHA-256 of a candidate minilm.onnx (hashlib; portable):
+python -c "from hashlib import sha256; print(sha256(open('minilm.onnx','rb').read()).hexdigest())"
+# Or with coreutils / Windows:
+sha256sum minilm.onnx        # certutil -hashfile minilm.onnx SHA256
+```
+
+The digest must match the pinned SHA-256 in
+`skills/memory/scripts/embed_profiles.py` (`MINILM_SHA256`). Two remediation
+actions — either one restores the vector lane when the runtime deps import
+and the active profile is valid (`imports_missing` needs the embedding
+runtime installed; `unknown_profile` needs a valid `ZMEM_EMBED_PROFILE`):
+(1) install a checksum-matching `minilm.onnx` (plus `tokenizer.json`) at
+the resolved models dir; or (2) set `ZMEM_MODEL_URL` to a source whose
+bytes match the pinned SHA-256 together with `ZMEM_MODEL_AUTODOWNLOAD=1`.
+Note that the default Xenova export URL is NOT byte-identical to the
+pinned hash — different ONNX export toolchains produce different bytes
+for the same weights, which is exactly what the checksum refuses. No
+credential-bearing URLs are involved in any of these flows.
+
 ### Imported namespace remediation
 
 For imported rows whose namespace needs an operator-supplied correction, use an

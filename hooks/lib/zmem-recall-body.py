@@ -308,6 +308,98 @@ def _log_inject_decision(
         pass
 
 
+def _degraded_notice_dir() -> str:
+    """Directory the embedding-degradation sentinel lives in (issue #131).
+
+    Mirrors ``embeddings.degraded_notice_dir()`` — which this stdlib-only
+    adapter cannot import — so the skip check looks exactly where the store
+    side writes. The two previously diverged (this used the ZMEM_STORE
+    dirname, the writer preferred ZMEM_DATA), so a store/data divergence left
+    the probe spawning on every recall even though a sentinel existed.
+    ``expanduser`` matches the writer: a ``~``-prefixed ZMEM_DATA must not
+    become a literal ``~`` directory here.
+    """
+    env_data = os.environ.get("ZMEM_DATA", "")
+    if env_data:
+        return os.path.expanduser(env_data)
+    store = os.environ.get("ZMEM_STORE", "")
+    if store:
+        # expanduser, and dirname-or-cwd for a bare relative name: the writer
+        # goes through host.resolve_store_path(), which expandusers an
+        # explicit ZMEM_STORE and treats a bare name as cwd-relative, so both
+        # resolvers must land on the same directory in every shape.
+        return os.path.expanduser(os.path.dirname(store) or os.curdir)
+    return _data_dir()
+
+
+#: The lane-health probe's wall-clock ceiling. The launcher arms a 12s
+#: watchdog (hooks/timeout-budget.json launcher_watchdog_ms) around the WHOLE
+#: hook process, and the recall subprocess that runs before this probe is
+#: itself budgeted at store_recall_ms (8s). A 5s probe could therefore push
+#: the process past the watchdog, and the launcher answers a killed hook with
+#: an empty envelope — losing the recall context this hook exists to deliver.
+#: 2s leaves recall(8s) + probe(2s) + emit well inside the 12s budget while
+#: still giving the child (interpreter start + imports + a read-only probe)
+#: room to answer.
+_LANE_HEALTH_PROBE_TIMEOUT_S = 2.0
+
+
+def _maybe_log_lane_health(store_py: str) -> None:
+    """One bounded post-recall lane-health probe (issue #131).
+
+    Runs ``store.py embedding-health --json`` fail-open (bounded by
+    ``_LANE_HEALTH_PROBE_TIMEOUT_S``) after the recall envelope has been
+    consumed, the decision line written, and the rendered context emitted —
+    the fence, the decision line, and the emitted JSON stay byte-identical.
+    The child inherits ZMEM_DATA/ZMEM_STORE/ZMEM_MODELS_DIR/
+    ZMEM_MODEL_AUTODOWNLOAD implicitly from ``os.environ`` and runs in shallow
+    mode (no model load: five of the six degradation reasons are presence-only,
+    and the write path's own load covers the tampered case).
+
+    Two cheap skips keep the probe off the hot path in the cases where it
+    cannot produce anything: an absent store (the child would only report
+    "store unreadable" and exit 1), and an existing once-per-data-directory
+    sentinel (nothing left to record). Only when THIS probe created the
+    sentinel does a separate bounded ``lane_health`` line land in the decision
+    log; the line deliberately carries no ``zmem-hook`` token so decision-log
+    parsers (which anchor on that token) never see it.
+    """
+    try:
+        log_dir = _data_dir()
+        # The sentinel lives wherever the store side writes it, which is NOT
+        # necessarily the decision-log dir — resolve it with the shared order.
+        if os.path.isfile(os.path.join(_degraded_notice_dir(),
+                                       "embedding-degraded.notice")):
+            return
+        # Absent store: the child would spend a whole interpreter start only to
+        # report "store unreadable" and exit 1, on every recall, forever.
+        store_path = os.environ.get("ZMEM_STORE", "") or os.path.join(
+            log_dir, "store.sqlite")
+        if not os.path.isfile(store_path):
+            return
+        env = {k: v for k, v in os.environ.items()
+               if k != _PRIVATE_PRETOOL_STDIN_MARKER}
+        env["ZMEM_EMBEDDING_HEALTH_SHALLOW"] = "1"
+        proc = subprocess.run(
+            [sys.executable, store_py, "embedding-health", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=_LANE_HEALTH_PROBE_TIMEOUT_S, check=False, env=env)
+        if proc.returncode != 0:
+            return
+        parsed = json.loads(proc.stdout.decode("utf-8", "replace"))
+        if not isinstance(parsed, dict) or not parsed.get("notice_created"):
+            return
+        reason = _safe_label(parsed.get("reason"), 64)
+        log_path = os.path.join(log_dir, "zmem-decisions.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "[%d] lane_health=degraded reason=%s notice=created\n"
+                % (int(time.time()), reason))
+    except Exception:
+        pass
+
+
 def _maybe_log_drift(session_id: str) -> None:
     """Best-effort served-tree drift marker."""
     try:
@@ -756,6 +848,11 @@ def main() -> int:
         rewrite=rewrite_applied,
     )
     _emit(rendered, envelope.get("effective_ops"))
+    # Issue #131: bounded lane-health probe AFTER the context was emitted —
+    # output and the decision line above stay byte-identical; the only visible
+    # effect is the once-per-data-dir sentinel + one bounded decision-log line
+    # the first time a degraded data directory is observed (fail-open).
+    _maybe_log_lane_health(store_py)
     if mode == "precompact":
         _clear_delivery_state(store_py, session_id, "ledger-clear")
     return 0

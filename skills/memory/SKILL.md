@@ -1951,6 +1951,25 @@ rolls the whole batch back (exit 2, store untouched). The tombstoned
 predecessor keeps its plaintext (FTS-indexed, `--as-of` reachable) — run
 `purge` (below) on the reported ids for durable removal.
 
+### embedding-health — print embedding lane health as JSON (issue #131)
+```
+<interpreter> <store.py> embedding-health [--json]
+```
+Read-only vector-lane diagnostic. `--json` prints exactly one compact
+sorted-key JSON line (reason, vector_status, notice_created,
+notice_present, models_dir, profile, last_successful_embed,
+last_successful_index, unembedded_backlog) through a read-only store
+handle — the scanned store stays byte-identical. When the lane is
+degraded the command creates the once-per-data-dir sentinel
+(`<data dir>/embedding-degraded.notice`, canonical four lines:
+reason/models_dir/profile/timestamp) via an O_CREAT|O_EXCL write, prints
+`vector lane: degraded (<reason>)` to stderr, and still exits 0 — a
+degraded vector lane is a supported state; only an unreadable store
+exits 1. The sentinel is never rewritten (the O_EXCL write records the
+first degradation in a data directory exactly once), but the
+`vector lane: degraded (<reason>)` stderr line prints on EVERY degraded
+run.
+
 ### purge — durably remove a memory's content (issue #255)
 ```
 <interpreter> <store.py> purge --id <id> [--id <id2> ...] [--scrub-backups --out-dir DIR] [--json]
