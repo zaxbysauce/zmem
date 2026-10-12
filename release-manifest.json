@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f36c7251881c1645eff60e0ddd40f3f00fc41249777acad224eff1d56e346f59",
+  "digest": "eec02e17e8cf4c83d171fbffabfba7074ea3702b0a6cef9b6c2dab55a98e879d",
   "files": {
     "hermes-plugin/__init__.py": "04822475587f5bd50ccb13c2253a508dabd2247ec046b3927acb69dcc03f86cc",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -47,7 +47,7 @@
     "scripts/eval_runner.py": "6e9b355425644f38795068259a69bb9c1ca02cdd57509511824ac10ac721ce3a",
     "scripts/eval_self_corpus.py": "ead3aece0562da0fe588ea4d4994aa7ec8fece3ae4d0a7554766e9933e4e76e6",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
-    "scripts/host_canary.py": "bd82d5e5b684ba8c0a45616522ae162b421661238be1852dbc8b2b5ed6b86398",
+    "scripts/host_canary.py": "d7e39adc0eba0b3d559fbe4f3d5883b5413e98cbc247e79eaec2448c1e7f3616",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
     "scripts/ingest_harvest.py": "b8bc5cd4fbc42ff5b364a3090439dcf4f19c4196586cb9df8cdf69767972a1ea",
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",

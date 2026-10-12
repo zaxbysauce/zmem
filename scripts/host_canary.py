@@ -1230,9 +1230,13 @@ def _lane_finalize(lane, host, data_dir, result_path, before, after,
             result["lanes"] = lane_health(
                 data_dir, Path(data_dir) / "store.sqlite")
         except Exception as exc:  # health is advisory; never fail a lane
-            result["lanes"] = {}
-            result["notes"] = notes + "; lane-health-unavailable-%s" % (
-                type(exc).__name__,)
+            # Deliberately leave `lanes` ABSENT rather than writing an empty
+            # object: the schema's rule requires exactly the five lane names,
+            # so `lanes: {}` would make --validate-result reject this artifact.
+            # An optional key is the honest representation of "not measured".
+            result["notes"] = "; ".join(
+                part for part in (notes, "lane-health-unavailable-%s"
+                                  % type(exc).__name__) if part)
     if result_path:
         write_result(result_path, result)
     return result

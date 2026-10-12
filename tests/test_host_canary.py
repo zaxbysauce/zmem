@@ -579,11 +579,12 @@ class CanarySelfTestTest(unittest.TestCase):
     @unittest.skipUnless(
         _embedding_deps_importable(),
         "the ACTIVE vector lane needs importable onnxruntime/tokenizers/"
-        "numpy — availability_status() is presence-only, so with deps "
-        "importable ANY model-pair bytes mark the lane available")
+        "numpy — lane_health applies the deep-checksum verdict, so the "
+        "model bytes must be checksum-pinned (the test patches the digest "
+        "to its seeded fixture bytes) before the lane can read active")
     def test_vector_lane_active_with_verified_model(self):
         """#131: after a self-test run creates the canary store, place a
-        (presence-valid) model pair under <data_dir>/models, seed the
+        checksum-pinned model pair under <data_dir>/models, seed the
         watermark (embedded_at + meta last_successful_index) directly, and
         probe lane_health IN-PROCESS: the vector lane reports active with
         the exact payload pinned by tests/fixtures/embedding_health/
@@ -617,7 +618,29 @@ class CanarySelfTestTest(unittest.TestCase):
             conn.close()
 
         mod = load_canary_module()
-        lanes = mod.lane_health(str(d), str(store))
+        # lane_health applies the memoized deep-checksum verdict (the same
+        # probe doctor uses), so synthetic model bytes that do NOT match the
+        # pinned digest are correctly reported as model_checksum_mismatch.
+        # Pin the expected hash to the seeded bytes for the duration of the
+        # probe so the "active" lane under test is reachable at all — an
+        # unpatched run asserts `active` against a model the lane correctly
+        # refuses, which is green only on a CI box with no runtime installed.
+        embeddings_mod = sys.modules.get("embeddings")
+        if embeddings_mod is None:
+            import importlib
+            sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+            embeddings_mod = importlib.import_module("embeddings")
+        seeded_sha = hashlib.sha256(
+            (models / "minilm.onnx").read_bytes()).hexdigest()
+        pinned = embeddings_mod._MODEL_SHA256
+        embeddings_mod._MODEL_SHA256 = seeded_sha
+        # verify_checksum_cached memoizes POSITIVE verdicts on (mtime, size);
+        # a matching verdict for these exact bytes was never cached before, so
+        # the probe hashes them fresh against the patched pin.
+        try:
+            lanes = mod.lane_health(str(d), str(store))
+        finally:
+            embeddings_mod._MODEL_SHA256 = pinned
         vector = lanes["vector"]
         self.assertEqual(vector["status"], "active", lanes)
 
