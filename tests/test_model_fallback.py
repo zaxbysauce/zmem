@@ -842,6 +842,12 @@ class DegradedAddWarningTests(unittest.TestCase):
             "ZMEM_STORE": self.store_path,
             "ZMEM_MODELS_DIR": self.empty_models_dir,
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            # PR #306 hermeticity: an ambient ZMEM_EMBED_PROFILE (e.g. `fake`
+            # exported in a developer shell) makes the lane NON-degraded and
+            # silently flips this whole class's premise. Pin the default
+            # profile the way the canary's build_child_env does — precedent:
+            # tests/test_doctor.py's _report pops ZMEM_EMBED_PROFILE.
+            "ZMEM_EMBED_PROFILE": "minilm",
         }
         r = _run(["init"], self.env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1091,22 +1097,21 @@ class DegradedAddWarningTests(unittest.TestCase):
         # (no notice yet) must print the pinned JSON byte-for-byte. The
         # fixture pins `models_dir` as the literal `fixture-models`; the
         # runtime command prints the RESOLVED dir, so that ONE field is
-        # rewritten before the byte comparison. The fixture also pins
-        # `notice_created:true`; the runtime prints FALSE here by design:
+        # rewritten before the byte comparison. The fixture pins
+        # `notice_created:false` because it matches the runtime by design:
         # for a tampered model the command's FORCED _ensure_loaded() runs
         # first and its own _maybe_notice_degraded() seam is the process's
         # first notice creator — the explicit degraded_notice() call in
         # cmd_embedding_health then loses the O_EXCL race and reports
-        # created:false while notice_present stays true (verified against
-        # the implemented command; every other field is byte-pinned by the
-        # committed file, digest-pinned below).
+        # created:false while notice_present stays true (every field is
+        # byte-pinned by the committed file, digest-pinned below).
         fixture = (REPO_ROOT / "tests" / "fixtures" / "embedding_health"
                    / "expected-degraded.json")
         fixture_raw = fixture.read_bytes()
         import hashlib
         self.assertEqual(
             hashlib.sha256(fixture_raw).hexdigest(),
-            "cac417a84fcf656cfecba7a9bf15aed552573b1498e1fb3e597a29eba8a6d69e",
+            "2ffa904ee8e68bbac551ccd45c96e618e23253b4ddb48c73b029765e922f334f",
             "expected-degraded.json drifted — regenerate via "
             "tests/fixtures/embedding_health/build_fixtures.py and update "
             "the pinned digest deliberately")
@@ -1118,7 +1123,6 @@ class DegradedAddWarningTests(unittest.TestCase):
                          fresh.stderr.decode("utf-8", "replace"))
         expected_obj = json.loads(fixture_raw)
         expected_obj["models_dir"] = health_obj["models_dir"]
-        expected_obj["notice_created"] = False  # see comment above
         expected_line = (json.dumps(expected_obj, sort_keys=True,
                                     separators=(",", ":")) + "\n").encode("utf-8")
         self.assertEqual(fresh.stdout, expected_line,
@@ -1229,16 +1233,25 @@ class DegradedAddWarningTests(unittest.TestCase):
                          "validation must precede any filesystem access")
 
         # Divergent precedence: ZMEM_STORE=<a>/store.sqlite, ZMEM_DATA=<b>
-        # (a != b) -> the notice lands in <b>.
+        # (a != b) -> the notice lands in <b>. The sub-block runs IN-PROCESS
+        # (os.environ, not a subprocess env dict), so it must also pin the
+        # two model knobs the notice writer reads at call time: an ambient
+        # ZMEM_EMBED_PROFILE would change the profile line, and an unpinned
+        # ZMEM_MODELS_DIR could resolve toward the operator's shared cache
+        # (PR #306 hermeticity — the subprocess side is pinned in setUp).
         base = Path(tempfile.mkdtemp(prefix="zmem-notice-prec-"))
         a = base / "a"
         b = base / "b"
         a.mkdir()
         b.mkdir()
-        saved = {k: os.environ.get(k) for k in ("ZMEM_STORE", "ZMEM_DATA")}
+        pinned_models = base / "pinned-models"
+        saved = {k: os.environ.get(k) for k in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_EMBED_PROFILE")}
         try:
             os.environ["ZMEM_STORE"] = str(a / "store.sqlite")
             os.environ["ZMEM_DATA"] = str(b)
+            os.environ["ZMEM_MODELS_DIR"] = str(pinned_models)
+            os.environ.pop("ZMEM_EMBED_PROFILE", None)
             self.assertTrue(embeddings.degraded_notice("model_file_missing"))
             self.assertTrue(
                 (b / embeddings.DEGRADED_NOTICE_NAME).is_file(),

@@ -2105,12 +2105,19 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
         """The lanes.vector object reports the degradation reason, and the
         embeddings_health check's details carry the unembedded backlog —
         both against an isolated ZMEM_DATA with a nonexistent models dir
-        (never the operator store)."""
+        (never the operator store).
+
+        Hermetic (PR #306 CI-red fix): _report inherits the ambient HOME, so
+        on a fresh runner without ~/.claude/settings.json the unrelated
+        claude-native-memory check fails closed and would add a top-level
+        fail. CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 is that check's own
+        documented kill switch."""
         tmp = tempfile.mkdtemp(prefix="zmem-doctor131-")
         self.addCleanup(shutil.rmtree, tmp, True)
         rep = self._report({
             "ZMEM_MODELS_DIR": os.path.join(tmp, "no-such-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
         })
         lanes = rep.get("lanes") or {}
         self.assertEqual(sorted(lanes),
@@ -2133,7 +2140,13 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
         and the report stays ok. The fixture store is a REAL init'd store —
         the _report helper's empty-file fixture trips the unrelated
         schema-version check (no meta table), which would muddy the fail
-        count this test pins."""
+        count this test pins.
+
+        Hermetic (PR #306 CI-red fix): _report inherits the ambient HOME, so
+        on a fresh runner without ~/.claude/settings.json the unrelated
+        claude-native-memory check fails closed and summary.fail would be 1
+        (exactly why CI was red on both runners). CLAUDE_CODE_DISABLE_
+        AUTO_MEMORY=1 is that check's own documented kill switch."""
         tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor131b-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         env = dict(os.environ)
@@ -2142,6 +2155,7 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
             "ZMEM_DATA": str(tmp),
             "ZMEM_MODELS_DIR": str(tmp / "no-such-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
         })
         r = subprocess.run([sys.executable, str(STORE_PY), "init"],
                            capture_output=True, text=True, env=env)
@@ -2150,6 +2164,7 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
             "ZMEM_DATA": str(tmp),
             "ZMEM_MODELS_DIR": str(tmp / "no-such-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
         })
         self.assertEqual(rep["lanes"]["vector"]["status"], "degraded",
                          "precondition: the fixture lane IS degraded")

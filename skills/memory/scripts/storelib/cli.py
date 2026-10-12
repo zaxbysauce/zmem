@@ -962,7 +962,17 @@ def cmd_embedding_health(as_json: bool = False) -> int:
 
     try:
         conn = _connect_existing_store_readonly()
+        # sqlite3.connect is lazy: a non-SQLite (corrupt) file opens fine and
+        # fails on the first real read. Touch the store HERE so a corrupt file
+        # reaches the documented "store unreadable" exit 1 instead of being
+        # absorbed by the per-probe except handlers below and reported as a
+        # healthy lane with fabricated (null/0) metrics.
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
     except (FileNotFoundError, OSError, sqlite3.Error):
+        try:
+            conn.close()
+        except Exception:
+            pass
         print("[zmem] embedding-health: store unreadable", file=sys.stderr)
         return 1
 
@@ -993,17 +1003,20 @@ def cmd_embedding_health(as_json: bool = False) -> int:
                 notice_created = False
 
         notice_path = None
+        notice_present = False
         try:
-            env_data = os.environ.get("ZMEM_DATA")
-            if env_data:
-                notice_dir = Path(env_data)
-            else:
-                import host
-                notice_dir = Path(host.resolve_store_path()).parent
-            notice_path = notice_dir / _embeddings.DEGRADED_NOTICE_NAME
+            # One resolver, shared with embeddings.degraded_notice and the
+            # recall hook, so the notice is looked for where it is written
+            # (an env-order mismatch here silently desynced the hook's skip
+            # check from the writer).
+            notice_path = _embeddings.degraded_notice_dir() / (
+                _embeddings.DEGRADED_NOTICE_NAME)
+            notice_present = bool(notice_path.is_file())
         except Exception:
-            notice_path = None
-        notice_present = bool(notice_path and notice_path.is_file())
+            # Path.is_file() re-raises OSError for errnos outside pathlib's
+            # ignored set (e.g. EACCES on an unreadable data dir). A stat
+            # failure must degrade to "notice absent", never abort the command.
+            notice_present = False
 
         last_embed = None
         last_index = None

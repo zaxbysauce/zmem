@@ -48,12 +48,18 @@ VERIFIED_MODEL_JSON = (
 # Compact (no spaces), sorted keys, exactly one LF-terminated line. The
 # `models_dir` value is the literal sentinel `fixture-models` — see the
 # module docstring for how the consuming test substitutes the resolved dir.
+# `notice_created` is pinned FALSE because it matches the real runtime: for
+# a tampered model the command's FORCED `_ensure_loaded()` runs first and
+# its own `_maybe_notice_degraded()` seam is the process's first notice
+# creator — the explicit `degraded_notice()` call in cmd_embedding_health
+# then loses the O_EXCL race and reports created:false while
+# notice_present stays true (PR #306 review finding).
 EXPECTED_DEGRADED_JSON = (
     b'{"last_successful_embed":null,"last_successful_index":null,'
-    b'"models_dir":"fixture-models","notice_created":true,'
+    b'"models_dir":"fixture-models","notice_created":false,'
     b'"notice_present":true,"profile":"minilm",'
-    b'"reason":"model_checksum_mismatch","vector_status":"degraded",'
-    b'"unembedded_backlog":1}\n')
+    b'"reason":"model_checksum_mismatch","unembedded_backlog":1,'
+    b'"vector_status":"degraded"}\n')
 
 # The active-lane payload (a canary lane_health vector object rendered in
 # the same key set the store command prints).
@@ -62,7 +68,7 @@ EXPECTED_ACTIVE_JSON = (
     b'"last_successful_index":"2026-09-10T00:00:00Z",'
     b'"models_dir":"fixture-models","notice_created":false,'
     b'"notice_present":false,"profile":"minilm","reason":null,'
-    b'"vector_status":"active","unembedded_backlog":0}\n')
+    b'"unembedded_backlog":0,"vector_status":"active"}\n')
 
 FILES = (
     ("tampered-minilm.onnx", TAMPERED_MINILM_ONNX),
@@ -76,9 +82,9 @@ FILES = (
 # regeneration that changes them is visible in the diff of this file too).
 PINNED_SHA256 = {
     "expected-degraded.json":
-        "cac417a84fcf656cfecba7a9bf15aed552573b1498e1fb3e597a29eba8a6d69e",
+        "2ffa904ee8e68bbac551ccd45c96e618e23253b4ddb48c73b029765e922f334f",
     "expected-active.json":
-        "e1a4c7a67119d86a48b64cb561f7368c36097242112b15d95d285843e20a5ceb",
+        "04f0465bd0c7a01e0f1807785dec0348216bb23bc497e3579e7eb0592c9bcc61",
 }
 
 

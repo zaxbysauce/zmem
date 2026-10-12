@@ -67,6 +67,7 @@
   ],
   "enums": {
     "lane_status": ["ok", "active", "degraded", "error", "not_applicable"],
+    "lane_names": ["fts", "vector", "entity", "graph", "temporal"],
     "verdict": ["pass", "fail", "skip"],
     "compact_result": ["survived", "dropped", "unknown"],
     "hermes_mode": ["gateway", "provider", "compatibility"]
@@ -92,7 +93,8 @@
     ".drift-checked-",
     "backups/",
     ".capture-prompted-",
-    "core.md"
+    "core.md",
+    "embedding-degraded.notice"
   ],
   "rules": [
     "lane must be one of lanes; host must equal lane_host[lane]",
@@ -108,7 +110,7 @@
     "entry kind directory carries only kind; kind file carries size and sha256; kind symlink carries a POSIX-relative target",
     "hermes lanes: verdict in (pass, fail) requires callback_evidence to be a nonempty list of nonempty strings; skip exempts it",
     "hermes lanes: mode must be one of the hermes_mode enum values",
-    "lanes: when present, an object with exactly fts/vector/entity/graph/temporal keys, each an object with a lane_status status and optional string reason (issue #131)",
+    "lanes: when the key is PRESENT (a null value is NOT a valid lanes object), an object with exactly the enums.lane_names keys, each an object carrying a lane_status status and a reason that is a string or null (issue #131)",
     "claude-compact: compact_result is required and must be one of the compact_result enum values (unknown on every indeterminate path, including skip)",
     "zcode-duplicate: one_copy is required and must record the single-copy probe (verdict plus reason single-copy-pass on success)"
   ]

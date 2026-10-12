@@ -1,1 +1,1 @@
-{"last_successful_embed":null,"last_successful_index":null,"models_dir":"fixture-models","notice_created":true,"notice_present":true,"profile":"minilm","reason":"model_checksum_mismatch","vector_status":"degraded","unembedded_backlog":1}
+{"last_successful_embed":null,"last_successful_index":null,"models_dir":"fixture-models","notice_created":false,"notice_present":true,"profile":"minilm","reason":"model_checksum_mismatch","unembedded_backlog":1,"vector_status":"degraded"}

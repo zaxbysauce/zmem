@@ -117,10 +117,13 @@ STRIP_VARS = (
     "CLAUDE_PLUGIN_ROOT",
     "ZCODE_PLUGIN_ROOT",
     # Issue #131: the model env is canary state, not ambient state — an
-    # ambient ZMEM_MODELS_DIR/ZMEM_MODEL_AUTODOWNLOAD must never steer (or
-    # download into) the canary's probe of the vector lane.
+    # ambient ZMEM_MODELS_DIR/ZMEM_MODEL_AUTODOWNLOAD/ZMEM_EMBED_PROFILE must
+    # never steer (or download into) the canary's probe of the vector lane,
+    # nor run its lane children under an operator-chosen embedding profile.
     "ZMEM_MODELS_DIR",
     "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE",
+    "ZMEM_EMBEDDING_HEALTH_SHALLOW",
 )
 
 HOSTS = ("claude", "codex", "zcode", "hermes")
@@ -165,6 +168,7 @@ def build_child_env(host, plugin_root, data_dir):
     # places minilm.onnx; autodownload stays off so a canary never fetches.
     env["ZMEM_MODELS_DIR"] = str(Path(data_dir) / "models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env["ZMEM_EMBED_PROFILE"] = "minilm"
     detect = HOST_DETECT_ENV.get(host)
     if detect:
         env[detect] = str(plugin_root)
@@ -260,6 +264,22 @@ def lane_health(data_dir, store_path):
             finally:
                 sys.path.pop(0)
             availability = _embeddings.availability_status() or {}
+            # Same deep-checksum probe doctor uses: presence-only availability
+            # reports "ok" for a present-but-tampered model, which would let
+            # the lane say "active" while store.py embedding-health says
+            # model_checksum_mismatch for the same data dir. Mismatches are
+            # never memoized, so tampering stays visible.
+            if (availability.get("available")
+                    and availability.get("models_dir")):
+                try:
+                    if _embeddings.verify_checksum_cached(
+                            Path(availability["models_dir"])
+                            / "minilm.onnx") is False:
+                        availability = dict(
+                            availability, available=False,
+                            reason="model_checksum_mismatch")
+                except Exception:
+                    pass
         except Exception as exc:
             availability = {"available": False, "reason": "imports_missing",
                             "note": type(exc).__name__}
@@ -327,9 +347,10 @@ def lane_health(data_dir, store_path):
 def print_lane_health_json(data_dir, store_path):
     """Emit the lanes object as exactly one compact JSON stdout line (#131).
 
-    Printed AFTER the byte-identical verdict_line() so existing parsers that
-    anchor on the verdict line are unaffected; the object is the same shape
-    the lane-mode result artifact carries under its ``lanes`` key.
+    Printed BEFORE the byte-identical verdict_line(), so the verdict stays the
+    FINAL stdout line (the documented output contract — consumers may read the
+    last line). The object is the same shape the lane-mode result artifact
+    carries under its ``lanes`` key.
     """
     try:
         lanes = lane_health(data_dir, store_path)
@@ -1027,11 +1048,11 @@ def _validate_result_object(result, schema):
     # Issue #131: the optional lanes health object — exactly the five lane
     # names, each an object with a lane_status status and optional reason.
     lanes_obj = result.get("lanes")
-    if lanes_obj is not None:
-        if not isinstance(lanes_obj, dict) or set(lanes_obj) != set(
-                schema.get("enums", {}).get(
-                    "lane_names", ("fts", "vector", "entity", "graph",
-                                   "temporal"))):
+    if "lanes" in result:
+        # Presence, not non-nullness: an explicit "lanes": null is not a valid
+        # lanes object and must not slip through as if the key were absent.
+        if (not isinstance(lanes_obj, dict)
+                or set(lanes_obj) != set(schema["enums"]["lane_names"])):
             bad("lanes must carry exactly the five lane names")
         else:
             allowed_status = set(schema["enums"]["lane_status"])
@@ -1199,6 +1220,19 @@ def _lane_finalize(lane, host, data_dir, result_path, before, after,
             notes = (notes + "; " if notes else "") + \
                 "symlink-escape-%s" % name
     result["notes"] = notes
+    # Issue #131: attach the five-lane health object BEFORE the artifact is
+    # written. main() used to setdefault it after the lane runners returned —
+    # i.e. after this function had already persisted the artifact — so no lane
+    # artifact ever carried `lanes` and the schema's optional key was dead on
+    # the artifact path (the CHANGELOG's "lane-mode result artifacts" claim).
+    if "lanes" not in result:
+        try:
+            result["lanes"] = lane_health(
+                data_dir, Path(data_dir) / "store.sqlite")
+        except Exception as exc:  # health is advisory; never fail a lane
+            result["lanes"] = {}
+            result["notes"] = notes + "; lane-health-unavailable-%s" % (
+                type(exc).__name__,)
     if result_path:
         write_result(result_path, result)
     return result
@@ -2505,10 +2539,6 @@ def main(argv=None):
             result["store"] = "no-result-json"
         result["store"] = result.get("store") or str(
             Path(data_dir) / "store.sqlite")
-        # Issue #131: the lane result carries the five-lane health object
-        # (read-only probe of the canary store; validated against the schema).
-        result.setdefault("lanes", lane_health(
-            data_dir, Path(data_dir) / "store.sqlite"))
         _lane_verdict_line(result)
         return 0
 
@@ -2667,11 +2697,13 @@ def main(argv=None):
         verdict_line(args.host, mode, "fail", "no-row-id", env["ZMEM_STORE"], row_id, drift)
         return EXIT_NO_ROW_ID
 
-    verdict_line(args.host, mode, "pass", "-", env["ZMEM_STORE"], row_id, drift)
-    # Issue #131: after the byte-identical verdict line, print the lane-health
-    # JSON object (one compact line) so a degraded vector lane is visible in
-    # the same self-test output an operator already reads.
+    # Issue #131: print the lane-health JSON object BEFORE the verdict line,
+    # so the `zmem-canary ...` verdict stays the FINAL stdout line. The
+    # verdict line is the documented output contract (module docstring) and
+    # consumers may read the last line; appending after it silently changed
+    # that contract.
     print_lane_health_json(data_dir, env["ZMEM_STORE"])
+    verdict_line(args.host, mode, "pass", "-", env["ZMEM_STORE"], row_id, drift)
     return 0
 
 

@@ -27,18 +27,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The recall hook runs a bounded fail-open lane-health probe after
   emitting context; the fence, the decision line, and the emitted JSON
   stay byte-identical, and a separate `lane_health` decision-log line
-  (invisible to `zmem-hook`-anchored parsers) records the first
-  degradation observation per data directory.
-- The host canary prints a `{"lanes": {...}}` JSON line after its
-  byte-identical verdict line and carries the five-lane health object
-  (`fts`/`vector`/`entity`/`graph`/`temporal`, validated against
-  `canary-schema.json`) in lane-mode result artifacts; the model env is
+  (invisible to `zmem-hook`-anchored parsers) is written only when the
+  recall probe itself creates the sentinel — the write path may create it
+  first, in which case the probe writes no line.
+- The host canary prints a `{"lanes": {...}}` JSON line BEFORE its
+  byte-identical verdict line (the verdict stays the final stdout line;
+  the JSON line is not emitted on the skip/fail paths) and persists the
+  five-lane health object (`fts`/`vector`/`entity`/`graph`/`temporal`,
+  validated against `canary-schema.json`) in lane-mode result artifacts
+  (`canary/<lane>.json` via `--result-json`); the model env is
   stripped and re-set (`<data dir>/models`, autodownload off) so ambient
   values can never mask the vector lane.
 - `doctor.py` shares the reason vocabulary, reports
   `unembedded_backlog` / `last_successful_embed` /
-  `last_successful_index`, and adds a top-level `lanes` object at
-  info/warn severity — a degraded lane never fails doctor.
+  `last_successful_index`, and adds a top-level `lanes` object carrying
+  lane statuses and reasons — a degraded lane never fails doctor.
 - README documents the shared model cache resolution, a portable checksum
   command, and the two remediation actions, and states that the default
   Xenova URL is not byte-identical to the pinned SHA-256.

@@ -4100,7 +4100,12 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
             try:
                 row = conn.execute(
                     "SELECT COUNT(*), "
-                    "SUM(embedding IS NOT NULL), SUM(embedding IS NULL) "
+                    "SUM(embedding IS NOT NULL), "
+                    # Zero-length blobs count as unembedded here too: the
+                    # canary lane probe and store.py embedding-health both use
+                    # `embedding IS NULL OR length(embedding) = 0`, and a
+                    # shared field name must carry one shared predicate.
+                    "SUM(embedding IS NULL OR length(embedding) = 0) "
                     "FROM memory WHERE superseded_at IS NULL"
                 ).fetchone()
                 if row is not None:
@@ -4684,6 +4689,24 @@ def _report_lane_status(resolved_store: Path) -> dict:
     try:
         import embeddings  # type: ignore
         st = embeddings.availability_status() or {}
+        # availability_status() is presence-only by contract and already
+        # folds any CACHED load verdict into available=False. That left a
+        # present-but-never-loaded TAMPERED model reporting "ok" here while
+        # store.py embedding-health forced the seam and reported
+        # model_checksum_mismatch. Reuse the same deep checksum probe
+        # _check_embeddings uses (memoized on (mtime,size); mismatches are
+        # never cached) so all three lane surfaces agree on the one case that
+        # matters, without paying an ONNX load.
+        if (st.get("available") and st.get("profile") != "fake"
+                and st.get("models_dir")):
+            try:
+                from pathlib import Path as _PD
+                if embeddings.verify_checksum_cached(
+                        _PD(st["models_dir"]) / "minilm.onnx") is False:
+                    st = dict(st, available=False,
+                              reason="model_checksum_mismatch")
+            except Exception:
+                pass
     except Exception:
         st = {"available": False, "reason": "imports_missing"}
     reason = st.get("reason")

@@ -480,6 +480,41 @@ class CanarySelfTestTest(unittest.TestCase):
             problems = mod._validate_result_object(rogue, schema)
             self.assertTrue(any("outside the allowed set" in p
                                 for p in problems), problems)
+            # Issue #131 (PR #306 review gap): the lanes health object
+            # branch. A correct five-lane object built from the schema's
+            # own enums.lane_names validates clean...
+            good_lanes = {name: {"status": "ok", "reason": None}
+                          for name in schema["enums"]["lane_names"]}
+            self.assertEqual(
+                mod._validate_result_object(golden(lanes=good_lanes), schema),
+                [], "a well-formed lanes object must validate clean")
+            # ...a wrong lane NAME set does not (one renamed lane).
+            bad_names = dict(good_lanes)
+            del bad_names["fts"]
+            bad_names["fulltext"] = {"status": "ok", "reason": None}
+            problems = mod._validate_result_object(
+                golden(lanes=bad_names), schema)
+            self.assertTrue(any("exactly the five lane names" in p
+                                for p in problems), problems)
+            # ...a bogus status value does not (outside lane_status).
+            bad_status = dict(good_lanes)
+            bad_status["vector"] = {"status": "healthy", "reason": None}
+            problems = mod._validate_result_object(
+                golden(lanes=bad_status), schema)
+            self.assertTrue(any("lanes.vector.status" in p
+                                for p in problems), problems)
+            # ...a non-string, non-null reason does not.
+            bad_reason = dict(good_lanes)
+            bad_reason["fts"] = {"status": "ok", "reason": 42}
+            problems = mod._validate_result_object(
+                golden(lanes=bad_reason), schema)
+            self.assertTrue(any("lanes.fts.reason must be a string or null"
+                                in p for p in problems), problems)
+            # ...and an explicit "lanes": null does not slip through as if
+            # the key were absent.
+            problems = mod._validate_result_object(golden(lanes=None), schema)
+            self.assertTrue(any("exactly the five lane names" in p
+                                for p in problems), problems)
 
     # ------------------------------------------------------------------
     # Issue #131: the lane-health JSON line printed after the verdict line.
@@ -591,7 +626,7 @@ class CanarySelfTestTest(unittest.TestCase):
         raw = fixture.read_bytes()
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(),
-            "e1a4c7a67119d86a48b64cb561f7368c36097242112b15d95d285843e20a5ceb",
+            "04f0465bd0c7a01e0f1807785dec0348216bb23bc497e3579e7eb0592c9bcc61",
             "expected-active.json drifted — regenerate via "
             "tests/fixtures/embedding_health/build_fixtures.py and update "
             "the pinned digest deliberately")

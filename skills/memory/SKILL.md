@@ -1965,8 +1965,10 @@ degraded the command creates the once-per-data-dir sentinel
 reason/models_dir/profile/timestamp) via an O_CREAT|O_EXCL write, prints
 `vector lane: degraded (<reason>)` to stderr, and still exits 0 — a
 degraded vector lane is a supported state; only an unreadable store
-exits 1. Every later process sees the sentinel and stays silent, so the
-first degradation in a data directory is recorded exactly once.
+exits 1. The sentinel is never rewritten (the O_EXCL write records the
+first degradation in a data directory exactly once), but the
+`vector lane: degraded (<reason>)` stderr line prints on EVERY degraded
+run.
 
 ### purge — durably remove a memory's content (issue #255)
 ```

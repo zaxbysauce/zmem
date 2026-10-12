@@ -680,6 +680,29 @@ _DEGRADED_REASONS = frozenset({
 DEGRADED_NOTICE_NAME = "embedding-degraded.notice"
 
 
+def degraded_notice_dir(data_dir=None) -> Path:
+    """Resolve the directory that holds the degradation sentinel (issue #131).
+
+    ONE resolver shared by every surface — this writer, the store-side
+    ``embedding-health`` command, and the recall hook's skip check. They
+    previously each re-derived the "data dir" from the environment with
+    DIFFERENT precedence (ZMEM_DATA-first here, dirname(ZMEM_STORE)-first in
+    the hook), so a store/data divergence left the hook probing a directory
+    that never received the sentinel: the skip check never engaged and every
+    recall re-spawned the probe. Order: explicit argument, then ``ZMEM_DATA``,
+    then the parent of the resolved store path (which applies ``expanduser``,
+    so a ``~``-prefixed value resolves to the home dir instead of a literal
+    ``~`` directory under the process cwd).
+    """
+    if data_dir is not None:
+        return Path(data_dir)
+    env_data = os.environ.get("ZMEM_DATA")
+    if env_data:
+        return Path(os.path.expanduser(env_data))
+    import host  # lazy, like _resolve_models_dir's own host import
+    return Path(host.resolve_store_path()).parent
+
+
 def degraded_notice(reason: str, *, data_dir=None, now=None) -> bool:
     """Create the once-per-data-dir embedding-degradation sentinel (#131).
 
@@ -690,21 +713,14 @@ def degraded_notice(reason: str, *, data_dir=None, now=None) -> bool:
     already exists or creation failed — a notice failure never breaks the
     caller (fail-open, like every other seam in this module).
 
-    The data dir resolves as: the ``data_dir`` argument when supplied, else
-    ``ZMEM_DATA`` when set, else the parent of the resolved store path — the
-    same precedence the store-side health command and hooks rely on.
+    The data dir resolves through the shared ``degraded_notice_dir()`` helper
+    (argument, then ``ZMEM_DATA``, then the resolved store path's parent), so
+    the store-side health command and the recall hook look in the same place
+    this writes.
     """
     if reason not in _DEGRADED_REASONS:
         raise ValueError("unknown embedding degradation reason")
-    if data_dir is None:
-        env_data = os.environ.get("ZMEM_DATA")
-        if env_data:
-            data_dir = Path(env_data)
-        else:
-            import host  # lazy, like _resolve_models_dir's own host import
-            data_dir = Path(host.resolve_store_path()).parent
-    else:
-        data_dir = Path(data_dir)
+    data_dir = degraded_notice_dir(data_dir)
     if now is None:
         try:
             # Function-local: storelib.schema imports this module at module
@@ -720,12 +736,13 @@ def degraded_notice(reason: str, *, data_dir=None, now=None) -> bool:
         f"profile={current_profile_name() or 'unknown'}\n"
         f"timestamp={now}\n"
     ).encode("utf-8")
+    notice_path = data_dir / DEGRADED_NOTICE_NAME
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
         # O_BINARY: on Windows a text-mode fd would translate the LF payload
         # to CRLF and break the notice's byte contract.
         fd = os.open(
-            str(data_dir / DEGRADED_NOTICE_NAME),
+            str(notice_path),
             os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
             0o644,
         )
@@ -734,11 +751,28 @@ def degraded_notice(reason: str, *, data_dir=None, now=None) -> bool:
         # uncreatable one both return False — the creator bit is the signal.
         return False
     try:
-        os.write(fd, payload)
+        # os.write may write short. Loop until the payload is complete, and on
+        # any failure REMOVE the O_EXCL-created file: a truncated or empty
+        # sentinel would otherwise consume the once-per-data-directory bit
+        # permanently (every later call sees FileExistsError and reports
+        # notice_present for a file with no content).
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
     except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(str(notice_path))
+        except OSError:
+            pass
         return False
-    finally:
+    try:
         os.close(fd)
+    except OSError:
+        pass
     return True
 
 
