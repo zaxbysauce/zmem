@@ -5,6 +5,29 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.95.0] - 2026-10-12
+
+### Added
+- **Regression pins for the ops-token flag-tail guard (issue #251, Workstream
+  P PR 3):** new `tests/test_p03_ops_token_flag_tail.py` freezes the three
+  executable acceptance checks of #251 — the non-runner fallback never emits
+  a leading-dash token (`cd x && grep foo bar | head -5` derives no `-5`), a
+  flag-tailed command never strong-matches an unrelated delivered row, and a
+  row delivered at `user_prompt` stays suppressed when the same session
+  recalls at `pretool` (the PostToolBatch decision moment) with that command
+  as the query. The guard itself landed in 0.90.0 (issue #163, PRR-022)
+  with no test coverage; these pins close that regression gap.
+
+### Changed
+- **Interpreter-collapse asymmetry recorded as a decision (issue #251 AC4):**
+  plain `python script.py` invocations keep the script basename — it is the
+  operation-adjacent recall signal — and do NOT collapse to the bare
+  runner, while `python -c`/`python -m` reduce to `{python}` because their
+  payloads are flags and argument values the structural rule drops.
+  Documented in `storelib/ops_tokens.py` at the runner-branch rule it
+  belongs to; behaviour is unchanged (pinned by the companion test
+  `test_python_script_py_keeps_script_basename`).
+
 ## [0.94.0] - 2026-10-11
 
 

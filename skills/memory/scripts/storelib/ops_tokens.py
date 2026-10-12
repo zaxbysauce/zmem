@@ -225,6 +225,18 @@ def derive_ops_tokens(*events: str) -> List[str]:
             # credential prefixes — review PRR-91-002) are dropped even when
             # file-shaped: a literal `ghp_…` pasted into a command must not
             # land on disk or in a query.
+            #
+            # Interpreter invocation shape is a recorded DECISION, not an
+            # accident (issue #251 AC4): a plain `python script.py` keeps
+            # BOTH the runner and the i==0 script basename — the basename is
+            # the operation-adjacent recall signal (the same reason the
+            # non-runner branch keeps file-shaped basenames), and collapsing
+            # it to a bare `python` would lose that signal while re-admitting
+            # broadly. Only `python -c`/`python -m` shapes reduce to the
+            # bare runner, because their payloads are flags and argument
+            # values the structural rule above drops. Do not "simplify" the
+            # two shapes into one uniform collapse: that is a behaviour
+            # change requiring its own decision record and pin, not a cleanup.
             _push(head)
             for i, w in enumerate(words[1:5]):
                 # Preserve the shape of the raw argv token before
