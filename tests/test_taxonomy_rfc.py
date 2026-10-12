@@ -457,7 +457,46 @@ class TaxonomyReplayErrorTest(unittest.TestCase):
 class TaxonomyDiffScopeTest(unittest.TestCase):
     """AC6: the change touches only docs/, eval/, and tests/."""
 
+    def _ensure_origin_main(self) -> None:
+        """Materialize refs/remotes/origin/main when the checkout lacks it.
+
+        A pull_request-event checkout fetches only the PR merge ref, so
+        `git diff --numstat origin/main` would fail with `ambiguous argument
+        'origin/main'` (exit 128) on CI. The contract's own diff-scope command
+        still runs unchanged below; this only supplies its precondition, and
+        workflow edits are outside this test's allowed diff prefixes.
+        """
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "origin/main"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            timeout=60,
+        )
+        if probe.returncode == 0:
+            return
+        fetch = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+        self.assertEqual(
+            fetch.returncode,
+            0,
+            f"origin/main absent and fetch failed: {fetch.stderr}",
+        )
+
     def test_diff_scope_is_docs_eval_tests_only(self) -> None:
+        self._ensure_origin_main()
         proc = subprocess.run(
             ["git", "diff", "--numstat", "origin/main"],
             cwd=str(REPO_ROOT),
