@@ -495,10 +495,36 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
             f"origin/main absent and fetch failed: {fetch.stderr}",
         )
 
+    def _merge_base(self) -> str:
+        """Resolve merge-base(HEAD, origin/main) as the drift-proof comparison.
+
+        `git diff origin/main` (two dots) compares the main TREE against this
+        branch, so a sibling PR merging to main mid-flight makes unrelated
+        files appear in the diff and fails AC6 for changes this branch never
+        made. The merge-base is the point this branch actually diverged from;
+        diffing from it reports exactly this PR's changes under any amount of
+        base drift. The contract's own local recipe has the same fragility on
+        a busy repo, which is why the comparison ref is resolved here.
+        """
+        proc = subprocess.run(
+            ["git", "merge-base", "HEAD", "origin/main"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        merge_base = proc.stdout.strip()
+        self.assertRegex(merge_base, r"^[0-9a-f]{40}$")
+        return merge_base
+
     def test_diff_scope_is_docs_eval_tests_only(self) -> None:
         self._ensure_origin_main()
+        merge_base = self._merge_base()
         proc = subprocess.run(
-            ["git", "diff", "--numstat", "origin/main"],
+            ["git", "diff", "--numstat", merge_base, "HEAD"],
             cwd=str(REPO_ROOT),
             capture_output=True,
             text=True,
