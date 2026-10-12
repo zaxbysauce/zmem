@@ -505,20 +505,42 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
         diffing from it reports exactly this PR's changes under any amount of
         base drift. The contract's own local recipe has the same fragility on
         a busy repo, which is why the comparison ref is resolved here.
+
+        CI checkouts are shallow (actions/checkout fetch-depth 1), and
+        merge-base silently exits 1 with no stderr when the shared history is
+        truncated below the fork point. Deepen the repository in bounded
+        steps and retry until the ancestor exists (this repo's whole history
+        is a few hundred commits, so one or two steps always suffice); fail
+        closed with a diagnostic if it never resolves.
         """
-        proc = subprocess.run(
-            ["git", "merge-base", "HEAD", "origin/main"],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        merge_base = proc.stdout.strip()
-        self.assertRegex(merge_base, r"^[0-9a-f]{40}$")
-        return merge_base
+        last = ""
+        for _ in range(8):
+            proc = subprocess.run(
+                ["git", "merge-base", "HEAD", "origin/main"],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+            merge_base = proc.stdout.strip()
+            if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", merge_base):
+                return merge_base
+            last = (proc.stderr or proc.stdout).strip()
+            deepen = subprocess.run(
+                ["git", "fetch", "--no-tags", "--deepen", "250", "origin"],
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+            )
+            if deepen.returncode != 0:
+                last = f"merge-base failed ({last}); deepen failed ({deepen.stderr.strip()[:200]})"
+                break
+        self.fail(f"cannot resolve merge-base(HEAD, origin/main) even after deepening: {last[:300]}")
 
     def test_diff_scope_is_docs_eval_tests_only(self) -> None:
         self._ensure_origin_main()
