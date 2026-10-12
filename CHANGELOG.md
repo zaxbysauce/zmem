@@ -21,11 +21,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 - **Interpreter-collapse asymmetry recorded as a decision (issue #251 AC4):**
   plain `python script.py` invocations keep the script basename — it is the
-  operation-adjacent recall signal — and do NOT collapse to the bare
-  runner, while `python -c`/`python -m` reduce to `{python}` because their
-  payloads are flags and argument values the structural rule drops.
-  Documented in `storelib/ops_tokens.py` at the runner-branch rule it
-  belongs to; behaviour is unchanged (pinned by the companion test
+  operation-adjacent recall signal — while payloads such as
+  `python -c "print(1)"` or `python -m pytest tests/` reduce to the bare
+  runner. The asymmetry is emergent token-shape filtering (the
+  primary-subcommand / file-shaped rule in `storelib/ops_tokens.py`), not a
+  `-c`/`-m` special case: e.g. `python -m pkg.mod` keeps `pkg.mod` because
+  it is file-shaped. Documented at the runner-branch rule it belongs to;
+  behaviour is unchanged (pinned by the companion test
   `test_python_script_py_keeps_script_basename`).
 
 ## [0.94.0] - 2026-10-11
