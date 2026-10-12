@@ -986,7 +986,10 @@ the fenced render (`contested_link: true` in JSON). Expansion rows carry
 `link_relation` / `link_of` / `link_score` / `contested_link` keys; rows
 that matched the query themselves never carry them, and expansion rows
 never advance telemetry (popularity rewards query matches, not link
-neighbors — so expansion cannot distort later rankings). `--link-hops 0`
+neighbors — so expansion cannot distort later rankings). On the passive
+injection lane an already-delivered parent contributes no neighbours
+(`exclude_ids` seed skip, issue #250); the plain recall path is unaffected
+because its pre-filter has already removed those rows. `--link-hops 0`
 disables the walk; `--link-budget 0` is equivalent. `search` and `recent`
 never expand.
 

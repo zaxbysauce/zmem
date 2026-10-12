@@ -55,7 +55,7 @@ import re
 import sys
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 WINDOW_DEFAULT_S = 6 * 3600
 CAP_DEFAULT = 256
@@ -327,12 +327,21 @@ def delivered_ids(data_dir: str, session_id: str,
 
 
 def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
-           moment: str, now: Optional[float] = None) -> None:
+           moment: str, now: Optional[float] = None,
+           bump_eligible_ids: Optional[Iterable[str]] = None) -> None:
     """Record delivered rows (envelope result dicts) as ledger entries.
 
     Upsert by id (a re-delivery via the escalation path refreshes the entry),
     prune expired, cap oldest-last. Fail-open: any error leaves the previous
     state on disk untouched or absent — dedup degrades, delivery never breaks.
+
+    Issue #250: the recorded set widened to every RENDERED row, which is
+    larger than the set allowed to be rewarded (#136). ``bump_eligible_ids``
+    names the subset that was query-matched, so a downstream consumer can tell
+    the two apart from the entry itself instead of re-deriving arrival shape.
+    Omit it (the default) and every row is recorded as bump-eligible, which is
+    the correct meaning for a caller that only ever records query-matched rows
+    and keeps older ledger files readable.
     """
     if not rows:
         return
@@ -341,6 +350,7 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
         return
     if now is None:
         now = time.time()
+    eligible = None if bump_eligible_ids is None else set(bump_eligible_ids)
     try:
         with _delivery_state_lock(data_dir):
             if _delivery_state_ended(data_dir, session_id):
@@ -351,12 +361,21 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
                 rid = r.get("id") if isinstance(r, dict) else None
                 if not isinstance(rid, str) or not rid:
                     continue
-                by_id[rid] = {
+                entry = {
                     "id": rid,
                     "moment": str(moment or ""),
                     "ts": now,
                     "text": entry_text(r),
                 }
+                # Only stamp the marker when the caller supplied the subset.
+                # A caller that does not know which rows were query-matched
+                # keeps the legacy four-key entry shape (pinned by the #182
+                # training acceptance repro), and readers already treat an
+                # absent key as eligible -- the correct reading for a ledger
+                # that only ever recorded query-matched rows.
+                if eligible is not None:
+                    entry["bump_eligible"] = rid in eligible
+                by_id[rid] = entry
             merged = list(by_id.values())
             merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
             cap = _cap()

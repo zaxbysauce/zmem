@@ -5,6 +5,82 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.94.0] - 2026-10-11
+
+
+### Fixed
+- **The delivery ledger now records every row that was actually rendered
+  (issue #250, Workstream P PR 2):** passive injection renders link-expansion
+  neighbours and graph-only rows to the model, but the ledger only ever recorded
+  the popularity-bump list — which explicitly excludes both row kinds. A
+  neighbour pulled in by an already-delivered parent was therefore never
+  recognised as already-delivered and re-rendered on every subsequent event in
+  the session.
+- **One list was doing two unrelated jobs.** `present` in
+  `select_and_budget_for_injection` was filtered to drop `link_relation` and
+  `_graph_arrival_only` rows — correct for *popularity* under #136, which rewards
+  query-matched rows only — and that same filtered list was then handed to
+  `ledger.record` as the *delivery* set under #114, which counts anything
+  rendered. The two semantics were conflated, so rows exempted from the first
+  were silently exempted from the second.
+- **The accounting is now split at the source.** `ledger_rows` is every row
+  proven present in the rendered fence (bounded by `rows_present_in`, so a
+  budget-dropped or gate-rejected row is still never recorded) and feeds
+  `ledger.record`. `bump_rows` is `ledger_rows` minus expansion and graph-only
+  rows and feeds `_bump_telemetry`. Popularity accounting is unchanged; the
+  withheld-secret filter (#256) is applied first so one guard still covers both
+  consumers.
+
+### Changed
+- **An already-delivered parent no longer contributes its neighbours through
+  link expansion (issue #250):** `expand_recall_links` accepts an optional
+  `exclude_ids` and skips excluded seed rows, threaded at the `recall_memory`
+  call site in `recall.py`. On the passive lane those exclusions are the
+  caller's own excludes merged with the session's delivered ids. The parameter
+  defaults to `None`, so every other caller — including the non-`recall_memory`
+  ones — is unaffected, and expansion still runs when nothing is excluded.
+  `explain_recall` is deliberately untouched: it has no exclusion surface by
+  design (`--exclude` is rejected alongside `--explain`).
+
+
+- **Operation feedback no longer rewards a supplementary neighbour (issue #250):**
+  every delivery-ledger entry now records whether the row was bump-eligible, so
+  `operation-feedback` cannot apply a verdict — or move a durable trust counter —
+  to a link-expansion neighbour that was never query-matched. The marker also gives
+  a later `store.py report` change classify expansion rows from it. Entries
+  written before this release lack the field and read as eligible, which is the
+  correct reading for a ledger that only ever recorded query-matched rows.
+- **The delivery sidecar now stores neighbour text (issue #250).** Widening the
+  ledger from query-matched rows to every rendered row also widens what
+  `entry_text` persists: link-expansion and graph-only neighbours are now
+  recorded alongside their parent, up to the existing 400-character, lowercased
+  cap. The exposure properties are unchanged — the sidecar is `0600`, only rows
+  proven present in the rendered fence are written, the issue #256
+  withheld-secret guard runs before `record()`, and the cap and six-hour
+  suppression window are untouched. What changes is the *set* of rows at rest,
+  not how they are stored or reaped.
+- **A contested-link marker is no longer re-rendered on strong-token re-delivery
+  (issue #250).** Because a hazard neighbour reached through a `contradicts`
+  edge is now ledgered when it renders, it is suppressed on later events in the
+  session. If a later strong token re-delivers the *parent* through the
+  un-exclusion path, the parent re-renders but that already-delivered neighbour
+  does not, so the `[CONTESTED LINK]` marker is absent from the re-delivered
+  envelope; before this release the neighbour was never ledgered and re-rendered
+  with its marker every time. This follows from the session-permanent suppression
+  the same release introduces and is not worked around here — releasing those rows
+  would mean re-expanding from delivered parents, which is the behaviour the
+  suppression exists to prevent. Noted because the marker is a defence-in-depth
+  signal rather than cosmetic output.
+- **Cap pressure rises with the wider ledger (issue #250).** The parent plus its
+  rendered neighbours now share one sidecar, so the 256-entry cap is reached
+  sooner. All rows from one event carry the same `ts`, and eviction is stable in
+  that order, so under cap pressure the matched parent — inserted first — can be
+  evicted while its neighbour survives; the parent then re-renders with the
+  neighbour still suppressed. Reaching this needs more than 256 live entries
+  inside the six-hour window, so it is a tail condition rather than a routine one.
+
+
+
 ## [0.93.0] - 2026-10-11
 
 ### Fixed
