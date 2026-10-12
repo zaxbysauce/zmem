@@ -87,7 +87,7 @@ README.
   `explain_recall` is deliberately untouched: it has no exclusion surface by
   design (`--exclude` is rejected alongside `--explain`).
 
-### Changed
+
 - **Operation feedback no longer rewards a supplementary neighbour (issue #250):**
   every delivery-ledger entry now records whether the row was bump-eligible, so
   `operation-feedback` cannot apply a verdict — or move a durable trust counter —
@@ -152,7 +152,7 @@ README.
 - **`store.py source-ref-exists` (issue #163)**: new read-only, pre-connect probe for the provider verify path — `--source-ref REF` answers `{"exists":true|false}` (exit 0) for live `lesson` rows with `superseded_at IS NULL`, namespace-agnostic; an absent store answers `{"exists":false}` without creating or migrating anything. Distinct from `source-exists` (namespace-scoped, all types) and from `store.py source --id`.
 - **Doctor + manifest agreement (issue #163)**: `hermes-plugin/plugin.yaml` advertises the nine provider hooks (six legacy + the three new) and the doctor's `_HERMES_PROVIDER_HOOKS` allowlist contains exactly the same nine names.
 
-### Changed
+
 
 - **`store.py ops-append` contract flags (issue #163)**: the provider path passes `--namespace NS --session-id SESSION --tool TOOL --operation OP` (the former `--session`/`--op` spellings remain accepted as aliases; BREAKING: `--namespace` is now REQUIRED, so old invocations without it exit 2 with no stdout payload and must add the flag). A no-token derivation is now the declared successful no-op (`{"ok":true}`, exit 0, the writer is never invoked); a failed append prints `{"ok":false}` (exit 1) with stdout strictly machine-parseable. The `--namespace` value is validated non-empty and carried for the provider path (future fleet-parity routing); the ring itself stays keyed by session id.
 - **Post-append ring caps (issue #163)**: `append_ops_ring` now enforces BOTH bounds after the append — complete JSONL lines are dropped oldest-first until the ring holds at most 64 complete events AND at most 65536 UTF-8 bytes, rewritten atomically; 65 appends of any size can never leave 65 live events, and a torn trailing line is never retained. Readers are unaffected.

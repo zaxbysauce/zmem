@@ -361,14 +361,21 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
                 rid = r.get("id") if isinstance(r, dict) else None
                 if not isinstance(rid, str) or not rid:
                     continue
-                by_id[rid] = {
+                entry = {
                     "id": rid,
                     "moment": str(moment or ""),
                     "ts": now,
                     "text": entry_text(r),
-                    "bump_eligible": True if eligible is None else (
-                        rid in eligible),
                 }
+                # Only stamp the marker when the caller supplied the subset.
+                # A caller that does not know which rows were query-matched
+                # keeps the legacy four-key entry shape (pinned by the #182
+                # training acceptance repro), and readers already treat an
+                # absent key as eligible -- the correct reading for a ledger
+                # that only ever recorded query-matched rows.
+                if eligible is not None:
+                    entry["bump_eligible"] = rid in eligible
+                by_id[rid] = entry
             merged = list(by_id.values())
             merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
             cap = _cap()

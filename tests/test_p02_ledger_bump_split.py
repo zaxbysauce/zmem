@@ -11,7 +11,8 @@ A future refactor can collapse the two lists back together without breaking any
 existing fixture — the fixtures pin the outcome, not the structure. This guard
 fails on the structure, so the regression cannot be reintroduced quietly.
 
-Checks the source text of ``select_and_budget_for_injection`` only; it imports
+Reads the source of ``select_and_budget_for_injection`` (inject.py)
+and of ``recall_memory`` (recall.py); it imports
 no storelib module, so it cannot freeze a store path or touch the operator's
 ``~/.zmem``.
 """
