@@ -373,9 +373,10 @@ class TaxonomyRfcReplayTest(unittest.TestCase):
     def test_candidate_replays_match_committed_deltas(self) -> None:
         expected_doc = json.loads(EXPECTED_PATH.read_text(encoding="utf-8"))
         reference_replay = canonicalize(expected_doc)
-        # The delta directory must hold exactly the twelve named files: no
-        # missing delta, and no stray sibling (e.g. an orphaned generator
-        # temp file) can hide among them.
+        # The delta directory must hold exactly the twelve named .json files:
+        # no missing delta, and no stray extra .json sibling can hide among
+        # them (non-json siblings such as generator *.tmp files are outside
+        # this assertion's view).
         self.assertEqual(
             sorted(p.name for p in DELTA_DIR.glob("*.json")),
             sorted(f"{name}.json" for name in CANDIDATES),
