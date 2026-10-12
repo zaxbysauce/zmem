@@ -1364,9 +1364,8 @@ def select_and_budget_for_injection(
         #   ledger_rows  DELIVERED (#114): every row proven present in the
         #                rendered fence. Suppression depends on this being
         #                complete — the injection lane's exclusion input is the
-        #                caller's exclude_ids merged with delivered_ids
-        #                (inject.py:1096), and only delivered_ids can ever
-        #                contain a neighbour.
+        #                caller's exclude_ids merged with delivered_ids, and
+        #                only delivered_ids can ever contain a neighbour.
         #   bump_rows    POPULARITY (#136): query-matched rows only.
         #                Link-expansion and graph-only neighbours render but
         #                must not be rewarded, or a supplementary neighbour

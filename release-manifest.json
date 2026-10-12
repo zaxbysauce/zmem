@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "e8283dd0f67761fe7aa2c3f24fcf0cd06f6ab12afae5d931ee3f38bba1106be1",
+  "digest": "957f6cb5ea24ec137d8ed6310a89c13889de83979b5c95a666b78650b3c51f7a",
   "files": {
     "hermes-plugin/__init__.py": "04822475587f5bd50ccb13c2253a508dabd2247ec046b3927acb69dcc03f86cc",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -88,7 +88,7 @@
     "skills/memory/scripts/storelib/false_inject.py": "21bfc993a36454b8b89a3c32c5f6d404e2663177182094209d5b96c6e34e4211",
     "skills/memory/scripts/storelib/feedback.py": "3e961f40f21bcca13420984020a818d80047588fa19b37fe1f384e438f83dc9e",
     "skills/memory/scripts/storelib/hygiene.py": "50cb763f42bea675d0f57b5ca2d148ad5f534ac64ad13100670c6b340cc68f2e",
-    "skills/memory/scripts/storelib/inject.py": "c2af5af26fc0e1900d5ca485a8ef9814fdfb746d37a85f8af5ee2cf61661b9b8",
+    "skills/memory/scripts/storelib/inject.py": "562f5410743e9724f3dd3f550f3f6fde79bfb21f248b546e2cf08ef2c9b009e1",
     "skills/memory/scripts/storelib/links.py": "08c1ecace65f3d38272447f3bf2525fd2d0c709b5d92a68fc75011f063ffddad",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",
     "skills/memory/scripts/storelib/mine.py": "9c28d6744de9b973de8573184ac24cce46cf9558fb75f314c6c5a55cefaf3315",

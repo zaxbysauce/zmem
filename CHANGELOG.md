@@ -50,6 +50,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   a later `store.py report` change classify expansion rows from it. Entries
   written before this release lack the field and read as eligible, which is the
   correct reading for a ledger that only ever recorded query-matched rows.
+- **The delivery sidecar now stores neighbour text (issue #250).** Widening the
+  ledger from query-matched rows to every rendered row also widens what
+  `entry_text` persists: link-expansion and graph-only neighbours are now
+  recorded alongside their parent, up to the existing 400-character, lowercased
+  cap. The exposure properties are unchanged — the sidecar is `0600`, only rows
+  proven present in the rendered fence are written, the issue #256
+  withheld-secret guard runs before `record()`, and the cap and six-hour
+  suppression window are untouched. What changes is the *set* of rows at rest,
+  not how they are stored or reaped.
 
 
 
