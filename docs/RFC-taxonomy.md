@@ -28,12 +28,14 @@ Read-only inspection of the snapshot (a temp copy opened with sqlite3
   `valid_from` (70 nonempty), `valid_until` (15), `update_of` (3),
   `superseded_at` (15) carry the snapshot's two-step as-of release-policy
   transitions.
-- `entity`: 25 rows across the current five kinds — `project` (10), `other`
-  (10), `tool` (4), `person` (1) — with aliases in `entity_alias` (25 rows),
+- `entity`: 25 rows across four of the schema's five allowed kinds — `project`
+  (10), `other` (10), `tool` (4), `person` (1); the fifth allowed kind,
+  `preference`, has 0 rows — with aliases in `entity_alias` (25 rows),
   `contradicts` relations in `memory_link` (16 rows), and membership in
   `memory_entity` (180 rows).
-- `evidence`, `memory_evidence`, `episode`, `episode_evidence`: 0 rows — no
-  provenance chain or episode workload exists in this snapshot.
+- `evidence`, `memory_evidence`, `episode`, `episode_evidence`,
+  `episode_memory`: 0 rows — no provenance chain or episode workload exists
+  in this snapshot.
 - `decisions.log`: 8 ordered lane-by-moment injection decisions; the replay
   report is an 8-row delivery measurement, not a taxonomy workload. No as-of
   bucket, event query, runbook procedure, entity-card query, or observation
@@ -67,8 +69,8 @@ reject-versus-defer boundary stays auditable.
   table, all 16 `contradicts` relations in `memory_link`, all 180 membership
   links in `memory_entity`. Aliases and relationships are preserved by side
   tables today, so tags plus a side table are sufficient.
-- `host` — **reject**. 0 of the 25 entities is host-shaped; the existing five
-  kinds absorbed the whole snapshot workload with no residue and no
+- `host` — **reject**. 0 of the 25 entities is host-shaped; the existing
+  allowed kinds absorbed the whole snapshot workload with no residue and no
   preservation failure.
 - `service` — **reject**. 0 of the 25 entities is service-shaped; same
   sufficiency evidence.
@@ -80,8 +82,8 @@ reject-versus-defer boundary stays auditable.
   evidence.
 - `command` — **reject**. The command-like names `pytest`, `rg`, `fzf`, and
   `hyperfine` are `tool`-kind with exact canonical names and alias rows
-  preserved; no query needing a command-versus-tool distinction failed.
-  Classification preference is not preservation failure.
+  preserved under the existing classification; no preservation failure was
+  exercised. Classification preference is not preservation failure.
 - `error_class` — **reject**. 0 of the 25 entities is error-class-shaped;
   `prompt-injection-risk` and its peers are `other`-kind abstract concepts,
   preserved exactly.
@@ -96,10 +98,16 @@ covers exactly the twelve candidates the contract fixes.
 
 ## Evidence artifact
 
+The artifact below validates against `docs/rfc-schema.json` (Draft 2020-12;
+the repository test suite applies that schema through a bounded validator).
 The sole machine-readable decision object follows. Its `replay_command` for
 each candidate is the exact recorded command that projects the #155 evidence
 into `tests/fixtures/taxonomy/delta/<candidate>.json`; all twelve commands are
-deterministic and read-only with respect to the replay inputs.
+deterministic and read-only with respect to the replay inputs. The recorded
+commands are repo-relative and must be run from the repository root, and each
+`--out` names a committed fixture path — substitute a scratch path for
+`--out` to replay without touching the committed deltas, as the test suite
+does.
 
 ```json
 {
@@ -265,4 +273,3 @@ deterministic and read-only with respect to the replay inputs.
   ]
 }
 ```
-

@@ -5,8 +5,11 @@ Projects the #155 replay evidence (store snapshot + decision log + expected
 report) into one observed-delta JSON file per taxonomy candidate. The generator
 is deliberately hermetic: it never imports storelib, never opens SQLite, never
 loads a model, and never reads an environment-selected store. Every input is
-read as raw bytes; every failure is fail-closed with a single LF-terminated
-diagnostic line and exit 1, and no output file is replaced after any failure.
+read as raw bytes; every input or output failure is fail-closed with a single
+LF-terminated diagnostic line and exit 1, and no output file is replaced after
+any failure. Argparse usage errors (missing flags, unknown --candidate) follow
+the standard convention: exit 2 with argparse's usage text, per contract
+Design step 4.
 
 Contract: zaxbysauce/zmem issue #172, Design steps 3 and 4.
 """

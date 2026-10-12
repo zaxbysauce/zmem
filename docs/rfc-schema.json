@@ -12,6 +12,7 @@
     },
     "input_digest": {
       "type": "string",
+      "minLength": 1,
       "pattern": "^[0-9a-f]{64}$"
     },
     "candidates": {
@@ -67,6 +68,7 @@
           },
           "input_digest": {
             "type": "string",
+            "minLength": 1,
             "pattern": "^[0-9a-f]{64}$"
           },
           "observed_delta": {

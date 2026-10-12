@@ -65,6 +65,33 @@ HANDOFF = {
     "command": "#175",
     "error_class": "#175",
 }
+# The recorded decision split (4 defer / 8 reject / 0 accept) is the RFC's
+# product; pin it so a flipped decision cannot ship green.
+DECISION_EXPECTED = {
+    "state": "defer",
+    "event": "defer",
+    "observation": "defer",
+    "runbook": "defer",
+    "entity_card": "reject",
+    "host": "reject",
+    "service": "reject",
+    "model": "reject",
+    "repo": "reject",
+    "file": "reject",
+    "command": "reject",
+    "error_class": "reject",
+}
+COMPATIBILITY_LITERAL = "unchanged: no database schema or runtime behavior changes in #172"
+ROLLBACK_LITERAL = "delete the RFC and delta artifacts; no store rollback required"
+MIGRATION_NONE = "none in #172"
+# Paths whose presence in a diff marks it as issue-#172 work; the diff-scope
+# gate below enforces its rules only on diffs touching these.
+SIGNATURE_PATHS = (
+    "docs/RFC-taxonomy.md",
+    "docs/rfc-schema.json",
+    "tests/fixtures/taxonomy/",
+    "tests/test_taxonomy_rfc.py",
+)
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 MACHINE_TOKENS = ("json", "jsonc", "json5")
 PLACEHOLDER_MARKERS = ("placeholder", "todo", "tbd", "fixme", "dummy")
@@ -220,10 +247,13 @@ def _type_ok(instance: object, name: object) -> bool:
 
 
 def canonicalize(value: object) -> object:
-    """Test-own canonicalization, implemented independently of the generator.
+    """Test-own canonicalization: a separate copy, never imported from the generator.
 
-    Deliberately not imported from replay_candidate: a from-the-start wrong
-    generator canonicalizer must not be able to agree with itself here.
+    The generator module is deliberately not imported, so this check does not
+    depend on the generator's module wiring; the algorithm mirrors the
+    contract's canonicalization spec (recursive key sort; arrays sorted by
+    canonical JSON bytes), so it agrees with a spec-conformant generator by
+    construction, not by import.
     """
     if isinstance(value, dict):
         return {key: canonicalize(value[key]) for key in sorted(value)}
@@ -291,18 +321,38 @@ class TaxonomyRfcSchemaTest(unittest.TestCase):
     def test_candidate_set_and_handoffs_are_complete(self) -> None:
         candidates = self.artifact["candidates"]
         names = [entry["name"] for entry in candidates]
-        self.assertEqual(len(names), len(CANDIDATES))
+        self.assertEqual(
+            list(names),
+            list(CANDIDATES),
+            "candidates must appear in the contract's fixed order",
+        )
         self.assertEqual(len(set(names)), len(names), "duplicate candidate names")
-        self.assertEqual(set(names), set(CANDIDATES))
         for entry in candidates:
             self.assertIn(entry["decision"], DECISIONS)
+            self.assertEqual(
+                entry["decision"],
+                DECISION_EXPECTED[entry["name"]],
+                f"recorded decision for {entry['name']} changed",
+            )
             self.assertEqual(entry["handoff"], HANDOFF[entry["name"]])
+            self.assertEqual(entry["compatibility"], COMPATIBILITY_LITERAL)
+            self.assertEqual(entry["rollback"], ROLLBACK_LITERAL)
+            if entry["decision"] == "accept":
+                self.assertIn("no migration in #172", entry["migration"])
+            else:
+                self.assertEqual(entry["migration"], MIGRATION_NONE)
 
     def test_digest_matches_expected_snapshot(self) -> None:
         computed = hashlib.sha256(
             SNAPSHOT_PATH.read_bytes() + DECISIONS_PATH.read_bytes()
         ).hexdigest()
-        expected = json.loads(EXPECTED_PATH.read_text(encoding="utf-8"))["input_digest"]
+        expected_doc = json.loads(EXPECTED_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(
+            expected_doc["store_sha256"],
+            hashlib.sha256(SNAPSHOT_PATH.read_bytes()).hexdigest(),
+            "expected.json store_sha256 must match the committed snapshot bytes",
+        )
+        expected = expected_doc["input_digest"]
         self.assertEqual(computed, expected)
         self.assertRegex(computed, DIGEST_RE)
         self.assertEqual(self.artifact["input_digest"], computed)
@@ -313,19 +363,55 @@ class TaxonomyRfcSchemaTest(unittest.TestCase):
 class TaxonomyRfcReplayTest(unittest.TestCase):
     """AC3/AC5: replay reproduction, provenance, and read-only inputs."""
 
-    def _recorded_commands(self) -> list[tuple[str, list[str]]]:
+    def _recorded_commands(self) -> list[tuple[dict[str, object], list[str]]]:
         artifact = sole_json_block(RFC_PATH.read_text(encoding="utf-8"))
         recorded = []
         for entry in artifact["candidates"]:
-            recorded.append((entry["name"], shlex.split(entry["replay_command"])))
+            recorded.append((entry, shlex.split(entry["replay_command"])))
         return recorded
 
     def test_candidate_replays_match_committed_deltas(self) -> None:
         expected_doc = json.loads(EXPECTED_PATH.read_text(encoding="utf-8"))
         reference_replay = canonicalize(expected_doc)
-        for name, argv in self._recorded_commands():
+        # The delta directory must hold exactly the twelve named files: no
+        # missing delta, and no stray sibling (e.g. an orphaned generator
+        # temp file) can hide among them.
+        self.assertEqual(
+            sorted(p.name for p in DELTA_DIR.glob("*.json")),
+            sorted(f"{name}.json" for name in CANDIDATES),
+        )
+        for entry, argv in self._recorded_commands():
+            name = entry["name"]
             with self.subTest(candidate=name):
+                # The recorded command must be the exact contract command:
+                # one --candidate, one --out, the generator script, and the
+                # three #155 fixture paths — before --out is redirected.
+                self.assertEqual(argv[0], "python")
+                self.assertEqual(argv.count("--candidate"), 1)
+                self.assertEqual(argv.count("--out"), 1)
+                self.assertEqual(
+                    argv[1], "tests/fixtures/taxonomy/replay_candidate.py"
+                )
                 self.assertEqual(argv[argv.index("--candidate") + 1], name)
+                self.assertEqual(
+                    argv[argv.index("--snapshot") + 1], "tests/fixtures/replay/store.sqlite"
+                )
+                self.assertEqual(
+                    argv[argv.index("--decisions") + 1], "tests/fixtures/replay/decisions.log"
+                )
+                self.assertEqual(
+                    argv[argv.index("--expected") + 1], "tests/fixtures/replay/expected.json"
+                )
+                self.assertEqual(
+                    argv[argv.index("--out") + 1],
+                    f"tests/fixtures/taxonomy/delta/{name}.json",
+                )
+                # The RFC's own observed_delta pointer must name the artifact
+                # this test verifies.
+                self.assertEqual(
+                    entry["observed_delta"],
+                    f"tests/fixtures/taxonomy/delta/{name}.json",
+                )
                 scratch = Path(tempfile.mkdtemp(prefix=f"taxonomy-replay-{name}-"))
                 try:
                     out_path = scratch / f"{name}.json"
@@ -346,6 +432,15 @@ class TaxonomyRfcReplayTest(unittest.TestCase):
                     # canonicalized parsed expected.json, not a doctored copy.
                     delta = json.loads(committed.decode("utf-8"))
                     self.assertEqual(delta["observed_delta"]["replay"], reference_replay)
+                    # The delta's own fields carry the no-change contract.
+                    self.assertEqual(delta["candidate"], name)
+                    self.assertEqual(
+                        delta["input_digest"],
+                        expected_doc["input_digest"],
+                        f"delta root input_digest must equal the #155 digest ({name})",
+                    )
+                    self.assertEqual(delta["observed_delta"]["runtime_change"], "none")
+                    self.assertEqual(delta["observed_delta"]["schema_change"], "none")
                 finally:
                     shutil.rmtree(scratch, ignore_errors=True)
 
@@ -355,7 +450,8 @@ class TaxonomyRfcReplayTest(unittest.TestCase):
         scratch = Path(tempfile.mkdtemp(prefix="taxonomy-readonly-"))
         try:
             env = isolated_env(scratch)
-            for name, argv in self._recorded_commands():
+            for entry, argv in self._recorded_commands():
+                name = entry["name"]
                 argv = list(argv)
                 argv[0] = sys.executable
                 argv[argv.index("--out") + 1] = str(scratch / f"{name}.json")
@@ -483,6 +579,8 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
                 "+refs/heads/main:refs/remotes/origin/main",
             ],
             cwd=str(REPO_ROOT),
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -506,9 +604,9 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
         base drift. The contract's own local recipe has the same fragility on
         a busy repo, which is why the comparison ref is resolved here.
 
-        CI checkouts are shallow (actions/checkout fetch-depth 1), and
-        merge-base silently exits 1 with no stderr when the shared history is
-        truncated below the fork point. Deepen the repository in bounded
+        CI checkouts can be shallow (this repo's test job uses actions/checkout
+        fetch-depth 2; a truncated history below the fork point still makes
+        merge-base exit 1 with no stderr). Deepen the repository in bounded
         steps and retry until the ancestor exists (this repo's whole history
         is a few hundred commits, so one or two steps always suffice); fail
         closed with a diagnostic if it never resolves.
@@ -531,6 +629,8 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
             deepen = subprocess.run(
                 ["git", "fetch", "--no-tags", "--deepen", "250", "origin"],
                 cwd=str(REPO_ROOT),
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -545,6 +645,21 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
     def test_diff_scope_is_docs_eval_tests_only(self) -> None:
         self._ensure_origin_main()
         merge_base = self._merge_base()
+        head_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        self.assertEqual(head_proc.returncode, 0, head_proc.stderr)
+        if merge_base == head_proc.stdout.strip():
+            # HEAD is main itself (post-merge push CI): the PR diff is empty
+            # by definition and judging zero paths would be vacuous. This gate
+            # governs issue-#172 PR authoring, not main.
+            return
         proc = subprocess.run(
             ["git", "diff", "--numstat", merge_base, "HEAD"],
             cwd=str(REPO_ROOT),
@@ -564,6 +679,14 @@ class TaxonomyDiffScopeTest(unittest.TestCase):
             if " => " in path:  # rename: judge by the new path
                 path = path.split(" => ")[-1].strip("{}")
             changed.append(path)
+        # Enforce the docs/eval/tests scope only on diffs that touch the
+        # issue-#172 artifacts: later PRs that never touch this RFC must not
+        # be judged by this PR's scope rule. A diff touching any signature
+        # path is non-empty by construction, so the gate cannot pass vacuously.
+        if not any(path.startswith(SIGNATURE_PATHS) for path in changed):
+            return
+        self.assertTrue(changed, "signature-path diff produced no changed paths")
+        for path in changed:
             self.assertTrue(
                 path.startswith(allowed),
                 f"changed path outside docs/ eval/ tests/: {path}",
