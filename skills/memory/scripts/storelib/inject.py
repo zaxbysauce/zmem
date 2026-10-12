@@ -1399,7 +1399,13 @@ def select_and_budget_for_injection(
             except Exception:
                 pass
         try:
-            ledger.record(resolved_data, session_id, ledger_rows, moment)
+            # Issue #250: the recorded set is every RENDERED row, which is
+            # larger than the set #136 allows to be rewarded. Name the
+            # query-matched subset so a downstream consumer (operation
+            # feedback, the #249 report) can tell the two apart from the entry
+            # instead of re-deriving arrival shape.
+            ledger.record(resolved_data, session_id, ledger_rows, moment,
+                          bump_eligible_ids=[r["id"] for r in bump_rows])
         except Exception:
             # Rendering has already produced safe fenced text; a delivery
             # write failure is fail-open and must not discard that text.

@@ -41,12 +41,27 @@ def _selector_body() -> ast.FunctionDef:
     raise AssertionError("select_and_budget_for_injection not found in inject.py")
 
 
-def _subscript_name(node: ast.AST) -> str | None:
-    """Name of a Subscript target, e.g. ``ledger_rows[...]`` -> 'ledger_rows'."""
-    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-        return node.value.id
-    if isinstance(node, ast.Name):
-        return node.id
+def _assigned_name(node: ast.AST) -> str | None:
+    """Name a plain or ANNOTATED assignment binds.
+
+    A type annotation (``ledger_rows: list = ...``) is semantically the same
+    binding; treating only ``ast.Assign`` as an assignment made the guardrail
+    fail on a purely syntactic edit while missing nothing behavioural.
+    """
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        return (node.targets[0].id
+                if isinstance(node.targets[0], ast.Name) else None)
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    return None
+
+
+def _assigned_value(node: ast.AST) -> ast.AST | None:
+    """Right-hand side of a plain or annotated assignment."""
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        return node.value
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.value
     return None
 
 
@@ -76,14 +91,11 @@ def _rowset_names(func: ast.FunctionDef) -> set[str]:
     ``resolved_data`` or ``moment`` is never mistaken for the row set.
     """
     names: set[str] = set()
-    assigns = [
-        node for node in ast.walk(func)
-        if isinstance(node, ast.Assign) and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-    ]
+    assigns = [node for node in ast.walk(func)
+               if _assigned_name(node) is not None]
     for node in assigns:
-        target = node.targets[0].id
-        value = node.value
+        target = _assigned_name(node)
+        value = _assigned_value(node)
         if isinstance(value, ast.Call):
             if isinstance(value.func, ast.Attribute) \
                     and value.func.attr == "rows_present_in":

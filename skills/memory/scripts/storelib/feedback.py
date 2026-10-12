@@ -88,10 +88,22 @@ def _delivered_matcher_rows(data_dir: str, session_id: str,
     """Delivered rows shaped {id, session_id, timestamp, operation} from the
     session ledger: numeric ledger timestamps converted to the UTC format the
     matcher requires; operation is the entry's recorded operation when it has
-    one, else its matcher-fuel text."""
+    one, else its matcher-fuel text.
+
+    Issue #250: the ledger records every RENDERED row, which since that change
+    includes link-expansion neighbours and graph-only arrivals. Those rows
+    render but were never query-matched, and a verdict here moves a durable
+    trust counter, so they must not be matched — that is the #136 reward law
+    applied to the feedback path. `record` stamps `bump_eligible` per entry; an
+    entry without the key predates the marker and is treated as eligible, which
+    is the correct reading for a ledger that only ever recorded query-matched
+    rows.
+    """
     entries = delivery_ledger.delivered(data_dir, session_id, now=event_epoch)
     rows = []
     for entry in entries:
+        if entry.get("bump_eligible") is False:
+            continue
         operation = entry.get("operation") or entry.get("text") or ""
         if not operation:
             continue

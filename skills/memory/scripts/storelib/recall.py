@@ -2894,8 +2894,9 @@ def _recall_memory_impl(
         # Issue #250: an already-excluded seed contributes no neighbours. On
         # the passive lane those exclusions are the session's delivered ids,
         # so without this an already-delivered parent keeps re-pulling its
-        # neighbour through expansion. Empty on the plain path's own pre-filter
-        # only when nothing was excluded, which is what AC8 pins.
+        # neighbour through expansion. On the plain path the pre-filter above
+        # has already removed every excluded id from results, so seeds ==
+        # results there and this is a no-op regardless of what was excluded.
         results = results + expand_recall_links(
             conn, results, ns_list=ns_list, budget=link_budget, as_of=as_of,
             min_confidence=min_confidence, no_bump=no_bump,
