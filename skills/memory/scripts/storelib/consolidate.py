@@ -23,7 +23,7 @@ from pathlib import Path
 from storelib.entity import relink_memory
 from storelib.schema import _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
-from storelib.write import _merge_on_dedup, supersede_memory
+from storelib.write import _clear_expiry, _merge_on_dedup, supersede_memory
 
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
 
@@ -461,7 +461,11 @@ def _absorb_into_keeper(
 
     # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared
     # with write-time dedup semantics; no content change here.
-    _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"])
+    # v15 (#173 / AC7): ONE transaction timestamp — `tx_now` is computed once
+    # and passed to `_merge_on_dedup` AND used for the absorbed row's tombstone
+    # below, so a consolidate transaction never mixes clock reads.
+    tx_now = now_iso()
+    _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"], now=tx_now)
 
     # Worst-of taint propagation (issue #59, 4.7): consolidation folds the
     # absorbed row INTO the keeper permanently, so the keeper's taint becomes
@@ -479,7 +483,7 @@ def _absorb_into_keeper(
     # superseded_at, so a point-in-time --as-of (which drops the superseded
     # filter) still sees this row as dead at every T >= the tombstone (issue
     # #59, 4.4 as-of soundness).
-    tomb_at = now_iso()
+    tomb_at = tx_now
     conn.execute(
         "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
         (tomb_at, tomb_at, f"consolidated into {keeper_id}", absorbed["id"]),
@@ -488,6 +492,12 @@ def _absorb_into_keeper(
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
     except sqlite3.OperationalError:
         pass
+    # v15 (#173): the absorbed row's side-table record is removed in the SAME
+    # transaction as its tombstone — one of the cleanup sites (update,
+    # supersede, consolidate absorb, organize stale-summary, sync tombstone,
+    # plus the hard-DELETE paths in purge/import-store, which reach it through
+    # purge._ID_SIDE_TABLES).
+    _clear_expiry(conn, absorbed["id"])
 
     # v10 (issue #60): the keeper's content/tags may have grown above, so its
     # entity links are re-derived from the stored row. The ABSORBED row keeps

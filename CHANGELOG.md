@@ -5,6 +5,43 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.96.0] - 2026-10-13
+
+
+### Added
+- **The `state` memory type (issue #173, Workstream K PR 2):** a seventh
+  memory type for live, expiring operational facts — endpoints, deploy
+  settings, and latency metrics — that must fall out of recall once stale.
+  Each `state` row carries an injection-expiry class (`endpoint`, `setting`,
+  or `metric`) with a default TTL of 30, 90, or 14 days, overridable per
+  class through `ZMEM_STATE_ENDPOINT_DAYS`, `ZMEM_STATE_SETTING_DAYS`, and
+  `ZMEM_STATE_METRIC_DAYS`.
+- **The additive `memory_expiry` side table (schema 15):** the class and the
+  `inject_until` timestamp live in a one-row-per-memory side table rather than
+  in the `memory` table, so `PRAGMA table_info(memory)` is byte-identical to
+  v14 and an older client can still store and recall ordinary types on a v15
+  store (exactly one compatibility NOTICE, `schema_version` stays 15). Fresh
+  init and the v14→v15 migration both create the table and exactly one index,
+  `idx_memory_expiry_until`.
+- **Expiry flags on the writer and CLI:** `add_memory`/`update_memory` accept
+  keyword-only `expiry_class`/`inject_until`, and `store.py add`/`update`
+  accept `--expiry-class {endpoint,setting,metric}` and `--inject-until`.
+  Passing either flag to a non-state type is refused with the exact message
+  `--expiry-class and --inject-until require --type state` and exit 2.
+- **JSONL sync carries `memory_expiry` records:** the exporter emits each
+  side-table record immediately after its parent memory record; ingest
+  buffers them and applies them after all base rows, so a v14 file imports
+  with zero side rows and an identical reimport stays idempotent. Strict
+  ingest rejects malformed timestamps, unknown classes, bad UUIDs, missing or
+  non-state parents, and conflicting duplicates without committing partial
+  side-table state.
+
+### Changed
+- **Schema 14 → 15 (additive).** `update`, `supersede`, the consolidate
+  absorbed-row path, organize's stale-summary supersede, and the sync
+  tombstone path each delete the memory's `memory_expiry` row in the same
+  transaction, so no expiry row is ever orphaned by a tombstone.
+
 ## [0.95.0] - 2026-10-12
 
 ### Added

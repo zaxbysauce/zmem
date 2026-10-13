@@ -74,6 +74,13 @@ _ID_SIDE_TABLES = (
     ("memory_evidence", "memory_id"),
     ("belief_head_source", "source_id"),
     ("belief_head_evidence", "source_id"),
+    # v15 (#173): injection-expiry metadata, keyed by memory_id. A purged (or
+    # capture-refused staged) memory row would otherwise leave a dangling
+    # memory_expiry row -- invisible to every recall lane because the parent is
+    # gone, but still exported and re-validated against a re-created id. Both
+    # consumers of this tuple guard on _table_exists, so a pre-v15 store is
+    # unaffected.
+    ("memory_expiry", "memory_id"),
 )
 
 RETRACTED_META_PREFIX = "belief_retracted:"

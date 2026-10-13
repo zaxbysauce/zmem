@@ -538,7 +538,7 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         self.assertEqual(
             self.allowed_types,
             ("fact", "lesson", "convention", "preference",
-             "decision", "constraint"),
+             "decision", "constraint", "state"),
             "ALLOWED_TYPES must be exactly the v9 shipped set — dropping a "
             "shipped type is a schema regression",
         )

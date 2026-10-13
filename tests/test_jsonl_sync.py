@@ -100,7 +100,9 @@ class Store:
 
     def add(self, namespace: str, content: str, *, type_: str = "lesson",
             signal: str = "test", confidence: float | None = None,
-            tags: str = "", source_ref: str = "") -> str:
+            tags: str = "", source_ref: str = "",
+            expiry_class: str | None = None,
+            inject_until: str | None = None) -> str:
         args = ["add", "--namespace", namespace, "--type", type_,
                 "--content", content, "--signal", signal]
         if confidence is not None:
@@ -109,6 +111,10 @@ class Store:
             args += ["--tags", tags]
         if source_ref:
             args += ["--source-ref", source_ref]
+        if expiry_class is not None:
+            args += ["--expiry-class", expiry_class]
+        if inject_until is not None:
+            args += ["--inject-until", inject_until]
         r = self.run(*args)
         assert r.returncode == 0, r.stderr
         mid = self.find_id(namespace, content)
@@ -184,6 +190,15 @@ class _TwoStoreCase(unittest.TestCase):
             for row in rows:
                 f.write(json.dumps(row) + "\n")
         return path
+
+    @staticmethod
+    def _expiry_pairs(store: "Store") -> set:
+        """The (expiry_class, inject_until) pairs a store actually holds (issue #173)."""
+        try:
+            return {(r[0], r[1]) for r in store.query_all(
+                "SELECT expiry_class, inject_until FROM memory_expiry")}
+        except sqlite3.OperationalError:
+            return set()  # pre-v15 store: no side table
 
 
 def _sync_row(**overrides) -> dict:
@@ -271,6 +286,160 @@ class RoundTripTest(_TwoStoreCase):
 
         self.assertEqual(
             self.b.query_one("SELECT count(*) FROM memory WHERE namespace=?", (NS,))[0], 1)
+
+    # -- v15 (#173): memory_expiry side-table transport (AC5/AC6) ------------
+
+    def test_memory_expiry_round_trip_preserves_class_and_timestamp(self):
+        # Explicit --inject-until makes the wire bytes deterministic.
+        self.a.add(NS, "staging api base url", type_="state",
+                   expiry_class="endpoint", inject_until="2027-01-01T00:00:00Z")
+        self.a.add(NS, "build timeout seconds", type_="state",
+                   expiry_class="setting", inject_until="2027-02-01T00:00:00Z")
+        self.a.add(NS, "a plain fact with no expiry", type_="fact")
+
+        export_a = os.path.join(self.a.tmp, "export_a.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        rows = self._read_jsonl(export_a)
+        expiry_rows = [o for o in rows if o.get("kind") == "memory_expiry"]
+        self.assertEqual(len(expiry_rows), 2,
+                         f"expected 2 memory_expiry records, got {len(expiry_rows)}")
+        # AC5 wire shape: exactly these four keys, in the contract's order.
+        for o in expiry_rows:
+            self.assertEqual(
+                list(o.keys()), ["kind", "memory_id", "inject_until",
+                                 "expiry_class"],
+                "memory_expiry wire record must be the exact 4-key shape")
+        # Each expiry record immediately follows its parent memory record.
+        kinds = [o.get("kind") for o in rows]
+        for i, o in enumerate(rows):
+            if o.get("kind") == "memory_expiry":
+                self.assertEqual(rows[i - 1].get("kind"), "memory")
+                self.assertEqual(rows[i - 1]["id"], o["memory_id"])
+        self.assertEqual(kinds.count("memory_expiry"), kinds.count("memory") - 1,
+                         "only the 2 state rows carry an expiry record")
+
+        r = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 3)
+        self.assertEqual(counts["malformed"], 0)
+        self.assertEqual(
+            self._expiry_pairs(self.b),
+            {("endpoint", "2027-01-01T00:00:00Z"),
+             ("setting", "2027-02-01T00:00:00Z")},
+            "ingest must land both side rows with class and timestamp intact")
+
+        # Re-export from B must be line-identical to A's (raw, sorted).
+        export_b = os.path.join(self.b.tmp, "export_b.jsonl")
+        r = self.b.run("export-jsonl", "--out", export_b)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        raw_a = [l for l in Path(export_a).read_bytes().split(b"\n") if l.strip()]
+        raw_b = [l for l in Path(export_b).read_bytes().split(b"\n") if l.strip()]
+        self.assertEqual(sorted(raw_a), sorted(raw_b))
+
+    def test_memory_expiry_reimport_is_idempotent(self):
+        self.a.add(NS, "idempotent state row", type_="state",
+                   expiry_class="metric", inject_until="2027-03-01T00:00:00Z")
+        export_a = os.path.join(self.a.tmp, "export_a.jsonl")
+        self.a.run("export-jsonl", "--out", export_a)
+
+        r1 = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(self._summary_counts(r1.stdout)["added"], 1)
+        self.assertEqual(len(self._expiry_pairs(self.b)), 1)
+
+        # Identical reimport: no duplicate side row, still exit 0.
+        r2 = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(self._expiry_pairs(self.b),
+                         {("metric", "2027-03-01T00:00:00Z")},
+                         "identical reimport must not duplicate the side row")
+
+    def test_v14_jsonl_without_expiry_imports_with_zero_side_rows(self):
+        # A v14-shaped file: memory records only, no memory_expiry kind.
+        self.a.add(NS, "legacy fact one", type_="fact")
+        self.a.add(NS, "legacy fact two", type_="lesson")
+        export_a = os.path.join(self.a.tmp, "export_a.jsonl")
+        self.a.run("export-jsonl", "--out", export_a)
+        rows = self._read_jsonl(export_a)
+        self.assertTrue(all(o.get("kind") == "memory" for o in rows),
+                        "a v14 store exports memory records only")
+
+        r = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 2)
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "a v14 file must import with ZERO side-table rows")
+
+    def test_buffered_apply_lands_expiry_when_its_line_precedes_the_parent(self):
+        # AC5's buffered-apply proxy: rewrite the file so each expiry record
+        # comes BEFORE its parent memory record. Ingest must still land both
+        # side rows, because expiry records are applied after all base rows.
+        self.a.add(NS, "buffered state row", type_="state",
+                   expiry_class="endpoint", inject_until="2027-05-01T00:00:00Z")
+        export_a = os.path.join(self.a.tmp, "export_a.jsonl")
+        self.a.run("export-jsonl", "--out", export_a)
+
+        rows = self._read_jsonl(export_a)
+        reordered = []
+        for o in rows:
+            if o.get("kind") == "memory_expiry":
+                # emit the expiry record first, then its parent
+                reordered.append(o)
+                parent = next(p for p in rows
+                              if p.get("kind") == "memory"
+                              and p["id"] == o["memory_id"])
+                reordered.append(parent)
+            elif any(x.get("kind") == "memory_expiry"
+                     and x["memory_id"] == o.get("id") for x in rows):
+                continue  # parent already emitted above
+            else:
+                reordered.append(o)
+        reordered_path = os.path.join(self.b.tmp, "reordered.jsonl")
+        with open(reordered_path, "w", encoding="utf-8", newline="\n") as fh:
+            for o in reordered:
+                fh.write(json.dumps(o, ensure_ascii=False) + "\n")
+
+        r = self.b.run("ingest-jsonl", "--in", reordered_path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        self.assertEqual(self._expiry_pairs(self.b),
+                         {("endpoint", "2027-05-01T00:00:00Z")},
+                         "buffered apply must land the side row regardless of "
+                         "the expiry line's position relative to its parent")
+
+    def test_memory_expiry_rejects_bad_class_and_timestamp(self):
+        # AC6: strict ingest refuses a bad class and a non-UTC timestamp.
+        self.a.add(NS, "strict validation state row", type_="state",
+                   expiry_class="endpoint", inject_until="2027-01-01T00:00:00Z")
+        export_a = os.path.join(self.a.tmp, "export_a.jsonl")
+        self.a.run("export-jsonl", "--out", export_a)
+        rows = self._read_jsonl(export_a)
+        parent = next(o for o in rows if o.get("kind") == "memory")
+        good_expiry = next(o for o in rows if o.get("kind") == "memory_expiry")
+
+        def _write_bad(path, expiry_obj):
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(parent, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(expiry_obj, ensure_ascii=False) + "\n")
+
+        bad_class = os.path.join(self.b.tmp, "bad_class.jsonl")
+        _write_bad(bad_class, dict(good_expiry, expiry_class="bogus"))
+        r = self.b.run("ingest-jsonl", "--in", bad_class, "--strict")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("memory_expiry expiry_class must be one of endpoint, "
+                      "setting, metric", r.stderr)
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "a rejected import must not land a partial side row")
+
+        bad_ts = os.path.join(self.b.tmp, "bad_ts.jsonl")
+        _write_bad(bad_ts, dict(good_expiry, inject_until="2027-13-99 99:99:99"))
+        r = self.b.run("ingest-jsonl", "--in", bad_ts, "--strict")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("memory_expiry inject_until must be UTC ISO-8601", r.stderr)
+        self.assertEqual(self._expiry_pairs(self.b), set())
 
     def test_export_namespace_filter_excludes_other_namespaces(self):
         self.a.add(NS, "project scoped row", confidence=0.9)
@@ -372,6 +541,45 @@ class TombstonePropagationTest(_TwoStoreCase):
         # v13 (issue #65, 10.8): read --json emits the envelope.
         results = parsed["results"] if isinstance(parsed, dict) else parsed
         self.assertNotIn(mid, [x["id"] for x in results])
+
+    def test_imported_state_tombstone_deletes_expiry_row(self):
+        # Issue #173 AC7, end to end: B holds a LIVE state row plus its side
+        # record (both synced from A); A later tombstones the row and ships the
+        # tombstone downstream. B must drop the side row WITH the tombstone --
+        # no memory_expiry row may outlive its parent. (A's own --include-
+        # superseded export carries no side record for a dead parent: the
+        # writer deletes it at supersede time, so there is nothing to export.
+        # The orphan risk lives entirely on the IMPORT side, which is this
+        # test's subject.)
+        mid = self.a.add(NS, "state row rotated upstream", type_="state",
+                         expiry_class="endpoint",
+                         inject_until="2027-01-01T00:00:00Z")
+        export_a = os.path.join(self.a.tmp, "live_state.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._expiry_pairs(self.b),
+                         {("endpoint", "2027-01-01T00:00:00Z")},
+                         "B must hold the synced side row for the live parent")
+
+        # A tombstones the row, then ships the tombstone downstream.
+        r = self.a.run("supersede", "--id", mid, "--reason", "rotated upstream")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        export_a2 = os.path.join(self.a.tmp, "tombstone.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a2, "--include-superseded")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        r = self.b.run("ingest-jsonl", "--in", export_a2, "--allow-tombstones")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["tombstoned"], 1)
+        # B's row is now tombstoned (superseded_at set)...
+        self.assertIsNotNone(self.b.query_one(
+            "SELECT superseded_at FROM memory WHERE id=?", (mid,))[0])
+        # ...and its side row went with it in the same transaction.
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "the imported tombstone must delete B's side row in the "
+                         "same transaction -- no memory_expiry orphan may survive")
 
 
 # ---------------------------------------------------------------------------
@@ -1190,6 +1398,42 @@ class IngestValidationTest(_TwoStoreCase):
         self.assertIn("api_key", self.b.query_one(
             "SELECT content FROM memory WHERE id=?",
             ("88888888-0000-0000-0000-00000000000a",))[0])
+
+    def test_v14_jsonl_without_expiry_imports_without_rows(self):
+        # Issue #173 AC5: a v14-shaped file -- memory records only, no
+        # `memory_expiry` kind -- must import cleanly and leave the side table
+        # EMPTY on both ingest paths. Legacy is per-row best-effort; --strict is
+        # all-or-nothing. Neither may invent, infer, or refuse on the absence
+        # of a side record (a state row with no expiry record is legal: the
+        # contract never requires the wire pair to be inseparable).
+        legacy_path = self._write_jsonl(self.b, "v14_legacy.jsonl", [
+            _sync_row(id="90000000-0000-0000-0000-000000000001",
+                      type="state",
+                      content="legacy state row with no expiry record 0001"),
+            _sync_row(id="90000000-0000-0000-0000-000000000002",
+                      content="ordinary v14 fact with no expiry record 0002"),
+        ])
+        r = self.b.run("ingest-jsonl", "--in", legacy_path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 2)
+        self.assertEqual(counts["malformed"], 0)
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "a v14-shaped file must import with NO side-table rows "
+                         "(legacy path)")
+        self.assertEqual(self.b.query_one(
+            "SELECT count(*) FROM memory WHERE type='state'")[0], 1)
+
+        strict_path = self._write_jsonl(self.b, "v14_strict.jsonl", [
+            _sync_row(id="90000000-0000-0000-0000-000000000003",
+                      type="state",
+                      content="strict state row with no expiry record 0003"),
+        ])
+        r = self.b.run("ingest-jsonl", "--in", strict_path, "--strict")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "a v14-shaped file must import with NO side-table rows "
+                         "(--strict path)")
 
 
 # ---------------------------------------------------------------------------

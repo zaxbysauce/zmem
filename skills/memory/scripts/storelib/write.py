@@ -27,6 +27,111 @@ except ImportError:
 
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.links import TRUST_DELTA_SUPPORTS, adjust_trust, generate_links_on_write
+from storelib.state_expiry import (
+    STATE_EXPIRY_CLASSES,
+    compute_inject_until,
+    state_expiry_days,
+    validate_inject_until,
+)
+
+
+def _resolve_expiry(
+    type_: str, expiry_class: str | None, inject_until: str | None, tx_now: str
+) -> tuple[str | None, str | None]:
+    """Validate the v15 (#173) state-expiry arguments and compute the row pair.
+
+    Returns ``(expiry_class, inject_until)`` to store in the `memory_expiry`
+    side table, or ``(None, None)`` when the row is not a `state` row. Raises
+    the contract's exact `ValueError` strings BEFORE the first `INSERT`, so a
+    refused write never leaves a partial row. This is the only writer-level
+    type-conditional validation on this path (probe-verified: `add_memory`
+    itself does no `ALLOWED_TYPES` check).
+    """
+    if type_ == "state":
+        if expiry_class is None:
+            raise ValueError("state memories require expiry_class")
+        if expiry_class not in STATE_EXPIRY_CLASSES:
+            state_expiry_days(expiry_class)  # raises the exact class error
+        if inject_until is None:
+            return expiry_class, compute_inject_until(expiry_class, now=tx_now)
+        return expiry_class, validate_inject_until(inject_until)
+    if expiry_class is not None or inject_until is not None:
+        raise ValueError("non-state memories cannot set expiry_class or inject_until")
+    return None, None
+
+
+def _clear_expiry(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Drop the side-table row for a memory being tombstoned/absorbed.
+
+    Part of the #173 defect-class guardrail: EVERY writer that tombstones or
+    hard-removes a memory row calls this in the SAME transaction so a
+    `memory_expiry` row can never outlive its parent. `memory_vec` cleanup
+    stays separate (different lifecycle).
+    """
+    conn.execute("DELETE FROM memory_expiry WHERE memory_id=?", (memory_id,))
+
+
+def _resolve_update_expiry(
+    type_eff: str,
+    expiry_class: str | None,
+    inject_until: str | None,
+    old_expiry: sqlite3.Row | None,
+    tx_now: str,
+) -> tuple[str | None, str | None]:
+    """Resolve the v15 (#173) side-table pair for an `update_memory` replacement.
+
+    ``old_expiry`` is the OLD row's ``memory_expiry`` record (``None`` when it
+    had none). The transition matrix (AC7):
+
+    - non-state result with either expiry flag set → refuse (exact contract
+      string).
+    - non-state result with neither flag → ``(None, None)`` (the caller's
+      tombstone cleanup already removed any old side row).
+    - state result, no flags: inherit the old class+timestamp unchanged.
+      A state→state update whose old live row has NO ``memory_expiry`` record
+      raises the contract's exact
+      ``ValueError("state memories require an existing memory_expiry row")``
+      before the tombstone (issue #173 Execution step 10 lists this string
+      among "the direct writer messages are exact"; there is nothing to
+      inherit, and silently inventing a class would change the row's expiry
+      without the caller asking).
+    - state result, only ``expiry_class``: inherit no timestamp, resupply the
+      class TTL from the single transaction timestamp. A missing old side row
+      is fine here — the caller supplied the class, so there is something to
+      write (same rule as the non-state→state transition).
+    - state result, only ``inject_until``: inherit the old class, replace the
+      timestamp. With no old side row there is no class to inherit, so the
+      contract's ``state memories require expiry_class`` applies.
+    - state result, both: replace both (no old row needed); the supplied class
+      is still validated against `STATE_EXPIRY_CLASSES` before use, so an
+      explicit timestamp cannot smuggle an unknown class past the TTL path.
+    """
+    if type_eff == "state":
+        if expiry_class is None and inject_until is None:
+            if old_expiry is None:
+                raise ValueError("state memories require an existing memory_expiry row")
+            return old_expiry["expiry_class"], old_expiry["inject_until"]
+        if expiry_class is None:
+            # inject_until only: inherit the old class.
+            if old_expiry is None:
+                raise ValueError("state memories require expiry_class")
+            return (
+                old_expiry["expiry_class"],
+                validate_inject_until(inject_until),
+            )
+        # expiry_class supplied (with or without inject_until). The membership
+        # check must run even when `inject_until` bypasses TTL calculation —
+        # otherwise an explicit timestamp smuggles an unknown class straight
+        # into memory_expiry (issue #173 Execution step 10: a state-to-state
+        # update with a bad class raises the same exact message as an add).
+        if expiry_class not in STATE_EXPIRY_CLASSES:
+            state_expiry_days(expiry_class)  # raises the exact class error
+        if inject_until is None:
+            return expiry_class, compute_inject_until(expiry_class, now=tx_now)
+        return expiry_class, validate_inject_until(inject_until)
+    if expiry_class is not None or inject_until is not None:
+        raise ValueError("non-state memories cannot set expiry_class or inject_until")
+    return None, None
 
 
 def _link_threshold_now() -> float:
@@ -1175,6 +1280,9 @@ def add_memory(
     taint: str | None = None,
     link_attr_propagate: bool = True,
     evidence_ids: list[str] | tuple[str, ...] | None = None,
+    expiry_class: str | None = None,
+    inject_until: str | None = None,
+    now: str | None = None,
 ) -> WriteResult:
     # Capture the pre-policy length: value-span redaction GROWS text
     # ([REDACTED_SECRET] is longer than a short value), so an input that fit
@@ -1221,6 +1329,16 @@ def add_memory(
 
     _emit_capture_policy_warnings(warns, capture_mode=capture_mode)
 
+    # v15 (#173): one clock per writer transaction. `now` is a fixed UTC value
+    # supplied by tests; production passes None and gets a single `now_iso()`.
+    # Validation runs BEFORE the first INSERT (AC3) so a refused write leaves no
+    # partial row, and the same `tx_now` stamps every timestamp this transaction
+    # writes (AC7's single-timestamp invariant).
+    tx_now = now if now is not None else now_iso()
+    expiry_class_eff, inject_until_eff = _resolve_expiry(
+        type_, expiry_class, inject_until, tx_now
+    )
+
     started_tx = False
     try:
         if not conn.in_transaction:
@@ -1260,7 +1378,7 @@ def add_memory(
 
         if existing:
             # Merge: upgrade confidence/signal if the new add is stronger.
-            _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            _merge_on_dedup(conn, existing["id"], confidence, signal, tags, now=tx_now)
             # v11 (issue #61, 6.2): a polarity-AGREEING re-observation of the
             # same memory is corroboration — +0.05 trust, clamped [0,1].
             # Applied HERE (not inside _merge_on_dedup) because that helper is
@@ -1299,7 +1417,7 @@ def add_memory(
 
         mid = str(uuid.uuid4())
         shash = _source_hash(source_ref)
-        ts = now_iso()
+        ts = tx_now
         if not valid_from:
             valid_from = ts
 
@@ -1337,6 +1455,16 @@ def add_memory(
                 )
             except sqlite3.OperationalError:
                 pass  # vec0 table not available — embedding stored in memory table only
+        # v15 (#173): same-transaction side-table write. `expiry_class_eff` is
+        # non-None only for a valid state row (validation ran above, before the
+        # first INSERT), so this is guarded by presence rather than re-checking
+        # the type. REPLACE keeps an identical re-add idempotent.
+        if expiry_class_eff is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_expiry "
+                "(memory_id, inject_until, expiry_class) VALUES (?,?,?)",
+                (mid, inject_until_eff, expiry_class_eff),
+            )
         # v10 (issue #60, 5.2): deterministic entity extraction on every add.
         # Same transaction as the INSERT, so a failed link rolls back the row.
         link_memory_entities(
@@ -1416,7 +1544,8 @@ def _find_semantic_duplicate(
     return None, 0.0
 
 def _merge_on_dedup(
-    conn: sqlite3.Connection, mid: str, new_confidence: float, new_signal: str, new_tags: str
+    conn: sqlite3.Connection, mid: str, new_confidence: float, new_signal: str, new_tags: str,
+    *, now: str,
 ) -> None:
     """Merge a re-observed memory: upgrade confidence/signal/tags if stronger.
 
@@ -1427,6 +1556,13 @@ def _merge_on_dedup(
     row's counters (or max-ing them) would fabricate ladder eligibility for
     feedback that was never given. Same policy as the write-time dedup path:
     counters move only through the explicit `feedback` CLI.
+
+    v15 (#173): ``now`` is REQUIRED and is the caller's transaction clock —
+    this helper no longer calls ``now_iso()`` internally, so the
+    ``last_retrieved`` it writes is the same ``tx_now`` the surrounding
+    transaction stamps everywhere else (AC7's single-timestamp invariant). All
+    four call sites (add-dedup, update-dedup, consolidate absorb, sync ingest
+    fold) pass their own ``tx_now``.
     """
     row = conn.execute(
         "SELECT confidence, signal, tags FROM memory WHERE id=?", (mid,)
@@ -1448,7 +1584,7 @@ def _merge_on_dedup(
     conn.execute(
         "UPDATE memory SET confidence=?, signal=?, tags=?, "
         "last_retrieved=?, retrieval_count=retrieval_count+1 WHERE id=?",
-        (merged_conf, merged_signal, merged_tags, now_iso(), mid),
+        (merged_conf, merged_signal, merged_tags, now, mid),
     )
 
 def supersede_memory(
@@ -1560,6 +1696,13 @@ def supersede_memory(
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
         except sqlite3.OperationalError:
             pass  # vec0 table not available
+        # v15 (#173): a tombstoned row's side-table record must go with it, in
+        # the SAME transaction — a live `memory_expiry` row on a dead parent is
+        # exactly the orphan the defect-class guardrail targets. This is one of
+        # the cleanup sites (update, supersede, consolidate absorb, organize
+        # stale-summary, sync tombstone, plus the hard-DELETE paths in
+        # purge/import-store via purge._ID_SIDE_TABLES).
+        _clear_expiry(conn, mid)
         if started_tx:
             _commit(conn)
     except Exception:
@@ -1599,6 +1742,9 @@ def update_memory(
     expected_old_namespace: str | None = None,
     supersede_reason: str = "updated",
     evidence_ids: list[str] | tuple[str, ...] | None = None,
+    expiry_class: str | None = None,
+    inject_until: str | None = None,
+    now: str | None = None,
 ) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
@@ -1670,6 +1816,19 @@ def update_memory(
     conf_eff = confidence if confidence is not None else old["confidence"]
     sig_eff = signal if signal is not None else old["signal"]
 
+    # v15 (#173): one clock per transaction; the SAME `ts` stamps the old row's
+    # tombstone, the new row's valid_from/ingestion_ts, and the side-table row
+    # (AC7's single-timestamp invariant). Computed here so validation runs before
+    # the tombstone is written.
+    tx_now = now if now is not None else now_iso()
+    old_expiry = conn.execute(
+        "SELECT inject_until, expiry_class FROM memory_expiry WHERE memory_id=?",
+        (mid,),
+    ).fetchone()
+    expiry_class_eff, inject_until_eff = _resolve_update_expiry(
+        type_eff, expiry_class, inject_until, old_expiry, tx_now
+    )
+
     # Capture policy applies to the effective values (new content + any
     # inherited-or-overridden tags/source_ref) exactly as add_memory does —
     # and, as in add_memory, BEFORE the size check (PR-review PRR-C): in auto
@@ -1720,7 +1879,7 @@ def update_memory(
         # namespace — a concurrent rekey/delete in the read-to-write window
         # (the SELECT above runs before BEGIN IMMEDIATE) matches zero rows
         # and the backstop fails closed instead of tombstoning a foreign row.
-        ts = now_iso()
+        ts = tx_now
         if expected_old_namespace is not None:
             cur = conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
@@ -1746,6 +1905,12 @@ def update_memory(
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
         except sqlite3.OperationalError:
             pass  # vec0 table not available
+        # v15 (#173): the OLD row's side-table record is cleared with its
+        # tombstone, in the SAME transaction. The replacement row's record is
+        # written fresh below (a state→state update that inherits re-inserts the
+        # inherited pair), so the side table never holds a record keyed to a
+        # dead parent.
+        _clear_expiry(conn, mid)
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
@@ -1766,7 +1931,7 @@ def update_memory(
                 existing = None
         if existing:
             dup_id = existing["id"]
-            _merge_on_dedup(conn, dup_id, conf_eff, sig_eff, tags_eff)
+            _merge_on_dedup(conn, dup_id, conf_eff, sig_eff, tags_eff, now=tx_now)
             # v11 (issue #61, 6.2): polarity-agreeing dedup fold on update is
             # a corroborating re-observation — same +0.05 as add.
             adjust_trust(conn, dup_id, TRUST_DELTA_SUPPORTS)
@@ -1825,6 +1990,16 @@ def update_memory(
                 )
             except sqlite3.OperationalError:
                 pass  # vec0 table not available — embedding stored in memory table only
+        # v15 (#173): the replacement row's side-table record. `expiry_class_eff`
+        # is non-None only for a valid state result (resolved + validated above,
+        # before the tombstone), so state→non-state leaves the side table empty
+        # and state→state re-inserts the resolved pair under the new id.
+        if expiry_class_eff is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_expiry "
+                "(memory_id, inject_until, expiry_class) VALUES (?,?,?)",
+                (new_id, inject_until_eff, expiry_class_eff),
+            )
         # v10 (issue #60, 5.2): the update's replacement row runs the same
         # deterministic extractor as add. The tombstoned old row KEEPS its
         # links — --as-of recall reaches it through the entity lane's

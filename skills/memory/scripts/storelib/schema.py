@@ -31,7 +31,7 @@ try:
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
         normalize_content, TRUST_VIOLATION_FLOOR_DROP,
-        FORWARD_COMPAT_SCHEMA_VERSION,
+        FORWARD_COMPAT_SCHEMA_VERSION, STATE_EXPIRY_CLASSES,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
 except ImportError:
     sys.path.insert(0, os.path.dirname(__file__))
@@ -39,7 +39,7 @@ except ImportError:
         MAX_CONTENT_CHARS, ALLOWED_TYPES, ALLOWED_SIGNALS, ALLOWED_TAINTS,
         TAINT_RANK, TAINT_TRUSTED_SIGNALS, validate_taint, worse_taint,
         normalize_content, TRUST_VIOLATION_FLOOR_DROP,
-        FORWARD_COMPAT_SCHEMA_VERSION,
+        FORWARD_COMPAT_SCHEMA_VERSION, STATE_EXPIRY_CLASSES,
         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)  # type: ignore
 
 try:
@@ -1382,6 +1382,62 @@ _EVIDENCE_LOOKUP_INDEX_DDL = (
     "ON memory_evidence(evidence_id, memory_id)"
 )
 
+# v15 (issue #173): the additive `memory_expiry` side table. `memory_id` is the
+# PK (one expiry record per memory row) and REFERENCES memory(id) documents the
+# parent — but no code enables SQLite foreign keys, so the REFERENCES clause is
+# inert and the writer's explicit `DELETE FROM memory_expiry` cleanup is what
+# keeps the side table from orphaning on a tombstone. `idx_memory_expiry_until`
+# is the single index (#174's live-expiry gate scans by inject_until).
+_MEMORY_EXPIRY_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS memory_expiry (
+        memory_id TEXT PRIMARY KEY REFERENCES memory(id),
+        inject_until TEXT NOT NULL,
+        expiry_class TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_memory_expiry_until "
+    "ON memory_expiry(inject_until)",
+)
+
+
+def _migrate_v15(conn: sqlite3.Connection) -> None:
+    """Create the `memory_expiry` side table and advance the version atomically.
+
+    Mirrors `_migrate_v14`: one transaction so a failure at any DDL boundary
+    leaves the table set, index set, and version marker byte-for-byte unchanged
+    (AC6's rollback property — a VIEW named `memory_expiry` makes the CREATE
+    skip and the CREATE INDEX fail, exercising exactly this path). A savepoint
+    preserves an already-open caller transaction; normal migration owns and
+    commits its own. Second call is a no-op via the `ver < 15` guard.
+    """
+    savepoint = "zmem_v15_state_expiry"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _MEMORY_EXPIRY_SCHEMA_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "UPDATE meta SET value='15' WHERE key=?",
+            (SCHEMA_VERSION_KEY,),
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
 
 def _ensure_evidence_lookup_index(conn: sqlite3.Connection) -> None:
     """Add the evidence-first association index to existing v14 stores.
@@ -2188,6 +2244,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         # Keep its DDL out of init_db(): opening an existing v13 store must not
         # pre-create any v14 table before this atomic versioned transaction.
         _migrate_v14(conn)
+
+    if ver < 15:
+        # v15 (issue #173): `memory_expiry` is additive side storage, same
+        # discipline as v14 — DDL lives only here, never in init_db(), so a
+        # failed migration rolls back the table set, index set, and version
+        # marker together (AC6).
+        _migrate_v15(conn)
 
     # Version-independent evidence-first lookup index: this repairs existing
     # v14 stores without a version bump and is idempotent on every open.
