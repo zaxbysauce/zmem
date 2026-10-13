@@ -13,8 +13,9 @@ removes content:
   * compact the store (FTS ``'optimize'``, ``VACUUM``, WAL checkpoint) under
     the full maintenance lock ladder and byte-verify the result, failing
     loudly on any residue;
-  * scrub the ids and any needle-bearing entries from ``<data>/ops/*.ledger``
-    delivery ledgers;
+  * scrub the ids and any needle-bearing entries from the ``<data>/ops``
+    delivery-ledger surfaces (``*.ledger`` plus the issue-#252 JSONL
+    segments ``*.ledger.seg.*``);
   * record the ids in the ``purged_id`` deny-list so ``ingest-jsonl`` cannot
     re-insert them from a peer export;
   * optionally rewrite (never delete or truncate) backup snapshots, including
@@ -755,11 +756,15 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     """Drop purged/derived-deleted ids' entries and any needle-bearing entry
     from <data>/ops/*.ledger and the issue-#252 JSONL segments
     (*.ledger.seg.*); delete orphaned .ledger.tmp.* and .signals.tmp.*
-    partial writes. FAIL-CLOSED: an unreadable or unwritable ledger (or
-    segment FILE) raises (AC7 is unconditional); a file with no matching
-    entries is left untouched (a segment with only torn lines is cleaned)."""
+    partial writes. FAIL-CLOSED: an unwritable ledger — or an OSError while
+    reading a segment — raises (AC7 is unconditional); a segment that
+    vanished mid-scrub or whose bytes are not decodable is SKIPPED, exactly
+    like the reader skips those states (the byte-level residue verify still
+    scans skipped files); a file with no matching entries is left untouched
+    (a segment with only torn lines is cleaned)."""
     ops = data_dir / "ops"
-    stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0}
+    stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0,
+             "segments_skipped": 0}
     if not ops.is_dir():
         return stats
     for path in ops.glob("*.ledger.tmp.*"):
@@ -825,7 +830,24 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     # compaction/clear just unlinked — over-suppression in the benign
     # direction, reaped by the next sweep/compaction.
     for path in ops.glob("*.ledger.seg.*"):
-        raw = path.read_text(encoding="utf-8")
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Issue #252 review (P-008 round 2 / Copilot): compaction or a
+            # clear can unlink a segment between this glob and the read —
+            # the same benign race the tmp/signals reaps above tolerate.
+            # Skipping is consistent with the reader law (a removed
+            # segment can no longer serve rows) and keeps a concurrent
+            # writer from crashing the fail-closed purge.
+            continue
+        except UnicodeDecodeError:
+            # A crash-torn multi-byte sequence is the documented expected
+            # case for non-fsynced segments, and the reader skips exactly
+            # this state. Scrub follows the same law; the byte-level
+            # residue verify below still scans the file, so needle bytes
+            # cannot hide in a skipped segment (issue #252 review P-008).
+            stats["segments_skipped"] = stats.get("segments_skipped", 0) + 1
+            continue
         kept_lines: list[str] = []
         changed = False
         for line in raw.splitlines():
@@ -852,7 +874,10 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         if not changed:
             continue
         if not kept_lines:
-            path.unlink()
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass  # unlinked by compaction/clear mid-scrub — benign
         else:
             stem = path.name.split(".ledger.seg.")[0]
             tmp = ops / f"{stem}.ledger.tmp.{uuid.uuid4().hex}"
@@ -1110,11 +1135,18 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         drop_ids |= set(applied.get("retry_ids", []))
         drop_ids |= denylisted
         try:
-            # Round-3: the passive lane's ledger.record holds NO writer lease,
-            # so it is invisible to the live-writer refusal -- but record()
-            # fails OPEN on _delivery_state_lock contention, so holding that
-            # lock here makes any concurrent delivery write drop harmlessly
-            # instead of re-recording needle text after the scrub/scan.
+            # Issue #252 review (P-002): record() publishes segments with
+            # NO lock at all, so this lock no longer fences delivery
+            # writes — a hook render in flight during the scrub can land a
+            # needle-bearing segment after any single verify pass. The
+            # scrub+verify pair therefore re-runs until a pass finds no
+            # residue (bounded): the silent window shrinks from
+            # "seconds-wide render lifetime" to the final pass's listing,
+            # and residue that survives every pass still fails closed
+            # below. (Honest history: the base fence was already leaky —
+            # a record that timed out waiting and then acquired after the
+            # release wrote post-verify; review probes confirmed base
+            # exits 0 with needles on disk.)
             from storelib import delivery_ledger as _dl
             led: dict[str, int] = {"files_scrubbed": 0, "entries_dropped": 0,
                                "tmp_removed": 0}
@@ -1122,6 +1154,12 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             with _dl._delivery_state_lock(str(data_dir)):
                 led = scrub_ledgers(data_dir, drop_ids, needles)
                 lres = _verify_ledgers_clean(data_dir, needles)
+                for _ in range(2):
+                    if not lres:
+                        break
+                    more = scrub_ledgers(data_dir, drop_ids, needles)
+                    led = {k: led.get(k, 0) + more.get(k, 0) for k in led}
+                    lres = _verify_ledgers_clean(data_dir, needles)
         except (OSError, ValueError, RuntimeError) as e:
             print("[zmem] purge FAILED: ledger scrub failed (%s); the purge "
                   "is incomplete - inspect <data>/ops before re-running" % e,

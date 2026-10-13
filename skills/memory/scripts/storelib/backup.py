@@ -532,7 +532,8 @@ def cmd_sweep(marker_dir: str | None = None,
                 # carry no constant suffix, so they need a containment match
                 # alongside the endswith tuple.
                 if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals"))
-                        and ".ledger.seg." not in rname):
+                        and ".ledger.seg." not in rname
+                        and ".ledger.tmp." not in rname):
                     continue
                 rp = ops_dir / rname
                 try:

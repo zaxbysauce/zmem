@@ -21,18 +21,60 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   name) with no lock held, and a best-effort locked compaction merges
   segments into the base ledger; reads (`delivered()`/`delivered_ids()`)
   merge base + segments through one shared reducer, so compaction skipping
-  costs only a re-merge later, never a row. Upsert-by-id keeps
-  last-writer-wins on equal timestamps (segments read oldest-written
-  first), window pruning and the oldest-first `ZMEM_LEDGER_CAP` eviction
-  are preserved, and the terminal `end_delivery_state` marker re-check
-  removes a segment published against a fresh marker (no resurrection).
-  The purge scrub and the backup sweep learned the segment family
-  (needles/drop-ids die in segments too; orphans reaped); the legacy
+  costs only a re-merge later, never a row. Upsert-by-id: ts dominates, so
+  re-recording an id with an older `now` no longer overwrites a newer
+  entry (production callers never pass `now` — impact is limited to a
+  wall-clock step-back); on equal timestamps the latest-written segment
+  wins, though two segments landing inside one filesystem mtime tick
+  resolve the tie by their random uuid name (ids never change — only which
+  same-ts refresh's text/moment survives). Window pruning and the
+  oldest-first `ZMEM_LEDGER_CAP` eviction are preserved, and the terminal
+  `end_delivery_state` marker re-check removes a segment published against
+  a fresh marker (no resurrection). The purge scrub and the backup sweep
+  learned the segment family (needles/drop-ids die in segments too;
+  orphaned segments join the backup sweep's reaping, and publication
+  temporaries are reaped by the purge scrub); the legacy
   `park_pending`/`consume_pending` sidecars keep their old locked RMW with
-  a disclosed scope-out (no live callers). Acceptance checks frozen in
+  a disclosed scope-out (no live callers). Known caveats: a crash-torn
+  multi-byte tail makes a segment undecodable (readers and the scrub skip
+  it; purge's byte-level verify still scans it); an entry with a
+  corrupt `ts` (non-numeric, or an integer too large for a float) —
+  reachable only via out-of-band corruption of `<data>/ops` — is
+  retained, sorts oldest, and that session's reads keep completing (it
+  clears with `ledger-clear`/`delivery-clear`; a NaN `ts` — a Python-json
+  extension — is dropped by the window cutoff rather than retained); rolling back to 0.95.0 requires deleting `ops/*.ledger.seg.*`
+  first (0.95.0 neither sweeps nor scrubs segments, and its purge verify
+  fails closed on them). Acceptance checks frozen in
   `tests/test_p04_ledger_concurrent_writers.py` (thread + real-process
   concurrency at 200 ids, wedged-lock bounded delivery with a <1 s design
   bound), reducer/interleaving pins in `tests/test_p04_ledger_reducer.py`.
+
+### Fixed (review hardening, PR #316 round 2)
+- **Corrupt-entry tolerance:** every ts coercion in the reducer and the
+  base loader degrades corrupt values — non-numeric or an integer too
+  large for a float — like its siblings (one poisoned entry no longer
+  dead-ends that session's reads, compaction, or `record()`).
+- **Compaction bounds:** one pass merges at most 64 segments (in-lock hold
+  stays well under the stale-lock window) and skips the base rewrite when
+  no segment was readable.
+- **Windows sharing violations:** the base-ledger atomic write retries the
+  replace (a concurrent reader holding the file open fails it) and unlinks
+  its temp file on final failure; `record()`'s terminal-marker self-unlink
+  degrades to sweep cleanup instead of escaping.
+- **Visible clear failures:** `clear()` propagates lock-deadline errors
+  (matching `end_delivery_state`) — the PreCompact `ledger-clear` CLI now
+  exits 1 on contention instead of reporting `ok:true` with state intact.
+- **Single merged read:** the passive selector performs one
+  `delivered()` merge per moment (was two full merges).
+- **Purge quiesce honesty:** the scrub+verify pair re-runs until a pass
+  finds no residue, so a hook render in flight during a purge can no
+  longer silently land purged text after the verify; persistent residue
+  still fails closed (exit 5), and the stale "record fails open under the
+  lock" comment is replaced with the real lock-free-publication contract.
+- **Purge scrub race tolerance:** a segment removed mid-scrub (compaction/
+  clear) or with undecodable bytes is skipped — consistent with the reader
+  — instead of aborting the purge; the byte-level verify still scans
+  skipped files.
 
 ## [0.95.0] - 2026-10-12
 

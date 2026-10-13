@@ -112,6 +112,26 @@ _DELIVERY_END_MARKER_TTL_S = 120.0
 _LEDGER_SEG_INFIX = ".ledger.seg."
 _LEDGER_TMP_INFIX = ".ledger.tmp."
 
+# Issue #252 review (P-003/P-005): compaction merges at most this many
+# segments per lock hold, bounding the in-lock critical section (glob +
+# reads + fsync replace + unlinks) well below the stale-lock window; a
+# larger backlog drains across subsequent record() calls.
+_MAX_SEGMENTS_PER_COMPACT = 64
+
+
+def _entry_ts(entry: Dict[str, Any]) -> float:
+    """The entry's ts as a float, degrading corrupt values to 0.0.
+
+    ``_load_entries`` and ``_read_seg_file`` deliberately tolerate entries
+    whose ts is missing or non-numeric, so every sort/compare over merged
+    entries must tolerate them too (issue #252 review P-001: the reducer's
+    unguarded sort key once turned one corrupt entry into a dead read
+    lane)."""
+    try:
+        return float(entry.get("ts", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
 
 class DeliveryStateLockError(RuntimeError):
     """The process could not acquire the shared delivery-state lock."""
@@ -316,17 +336,14 @@ def _seg_paths(data_dir: str, session_id: str) -> List[str]:
 
 def _read_seg_file(path: str) -> Optional[List[Dict[str, Any]]]:
     """Parse one JSONL segment. Returns None when the file is unreadable
-    (caller skips it — a crashed writer must never break a read). A torn
-    tail line (segments are not fsynced) is skipped line-by-line; complete
-    lines before it stay usable because publication is atomic per whole
-    payload, so a torn tail only follows an OS-level crash mid-write."""
+    (caller skips it — a crashed writer must never break a read). Lines are
+    decoded per-line with ``errors="replace"`` (issue #252 review group D):
+    a crash-torn multi-byte tail corrupts only its own line, and the intact
+    lines before it stay usable — the torn line simply fails json.loads."""
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             raw = f.read()
-    except (OSError, ValueError):
-        # OSError: gone/inaccessible. ValueError (UnicodeDecodeError): a
-        # corrupt or non-UTF8 file — skip the whole segment; a crashed
-        # writer must never break a read.
+    except OSError:
         return None
     out: List[Dict[str, Any]] = []
     for line in raw.splitlines():
@@ -373,7 +390,7 @@ def _reduce_entries(base: List[Dict[str, Any]],
             try:
                 newer = (float(e.get("ts", 0) or 0)
                          >= float(cur.get("ts", 0) or 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 newer = True
             if newer:
                 by_id[eid] = e
@@ -382,11 +399,11 @@ def _reduce_entries(base: List[Dict[str, Any]],
     for e in by_id.values():
         try:
             fresh = float(e.get("ts", 0) or 0) >= cutoff
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             fresh = True
         if fresh:
             merged.append(e)
-    merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
+    merged.sort(key=_entry_ts)
     cap = _cap()
     if len(merged) > cap:
         merged = merged[-cap:]
@@ -405,6 +422,11 @@ def _publish_segment(data_dir: str, session_id: str,
     module's documented fail-open posture. No fsync: the ledger is a
     regenerable dedup cache, and a crash costs at most recent deliveries'
     dedup, never delivery itself.
+
+    json.dumps keeps its default ``ensure_ascii=True`` (issue #252 review
+    group A): escaped output is pure ASCII, so a lone surrogate or a raw
+    U+2028/U+2029 in row content can neither crash the encode nor be split
+    into two lines by the readers' ``splitlines``.
     """
     prefix = _seg_prefix(session_id)
     if not prefix:
@@ -414,8 +436,7 @@ def _publish_segment(data_dir: str, session_id: str,
         os.makedirs(ops, exist_ok=True)
     except OSError:
         return None
-    payload = "".join(json.dumps(e, ensure_ascii=False) + "\n"
-                      for e in entries)
+    payload = "".join(json.dumps(e) + "\n" for e in entries)
     stem = prefix[:-len(_LEDGER_SEG_INFIX)]
     for _ in range(2):
         seg = os.path.join(ops, prefix + uuid.uuid4().hex)
@@ -436,7 +457,7 @@ def _publish_segment(data_dir: str, session_id: str,
 
 
 def _try_compact(data_dir: str, session_id: str, now: float) -> None:
-    """Best-effort merge of all published segments into the base ledger.
+    """Best-effort merge of published segments into the base ledger.
 
     Best-effort in every direction: a lock deadline, an unreadable segment,
     or a base write failure leaves the segments on disk for the next call —
@@ -448,6 +469,14 @@ def _try_compact(data_dir: str, session_id: str, now: float) -> None:
     the paths read into the merge — never re-glob at unlink time, because a
     segment published after the glob (record() does not take this lock)
     must survive to the next pass.
+
+    Issue #252 review (P-003/P-005): one pass merges at most
+    ``_MAX_SEGMENTS_PER_COMPACT`` segments, so the in-lock hold stays far
+    below the stale-lock window even under a large backlog (a live holder
+    whose lock is broken mid-section would let a second compactor
+    last-writer-wins the base); a bigger backlog is drained by subsequent
+    record() calls. When the glob found segments but NONE were readable,
+    the base is left untouched (nothing to merge; no pointless replace).
     """
     try:
         with _delivery_state_lock(data_dir):
@@ -461,18 +490,25 @@ def _try_compact(data_dir: str, session_id: str, now: float) -> None:
             base = _load_entries(ledger_path(data_dir, session_id), now)
             seg_lists: List[List[Dict[str, Any]]] = []
             read_ok: List[str] = []
-            for p in segs:
+            for p in segs[:_MAX_SEGMENTS_PER_COMPACT]:
                 entries = _read_seg_file(p)
                 if entries is None:
                     continue
                 seg_lists.append(entries)
                 read_ok.append(p)
+            if not read_ok:
+                return
             merged = _reduce_entries(base, seg_lists, now)
             _atomic_write_json(ledger_path(data_dir, session_id),
                                {"entries": merged})
             for p in read_ok:
                 _unlink_delivery_path(p)
-    except (OSError, DeliveryStateLockError):
+    except (OSError, ValueError, TypeError, OverflowError,
+            DeliveryStateLockError):
+        # ValueError/TypeError/OverflowError: a corrupt ts reaching an
+        # unguarded coercion must degrade this pass to "segments linger"
+        # (issue #252 review P-001), never escape toward record()'s
+        # fail-open boundary.
         pass
 
 
@@ -516,7 +552,29 @@ def _atomic_write_json(path: str, obj: Any) -> None:
         json.dump(obj, f)
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # Issue #252 review (P-004): a concurrent reader holding `path` open
+    # (plain open() does not request FILE_SHARE_DELETE on Windows) fails
+    # the replace with a sharing violation — the same transient class
+    # host.release_lock retries. Bounded retries, then re-raise with the
+    # tmp unlinked so no *.tmp.* residue outlives the failure (AC6).
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        replaced = False
+        for _ in range(2):
+            time.sleep(0.01)
+            try:
+                os.replace(tmp, path)
+                replaced = True
+                break
+            except OSError:
+                continue
+        if not replaced:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -541,7 +599,7 @@ def _load_entries(path: Optional[str], now: float) -> List[Dict[str, Any]]:
             try:
                 if float(e.get("ts", 0) or 0) >= cutoff:
                     kept.append(e)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 kept.append(e)
     return kept
 
@@ -553,15 +611,20 @@ def delivered(data_dir: str, session_id: str,
     Issue #252: merges the base ledger with any live segments through the
     shared reducer, so rows recorded by concurrent writers whose compaction
     has not run yet are visible here. An unreadable segment is skipped
-    silently (fail-open read); this function performs zero writes."""
+    silently (fail-open read); this function performs zero writes. The
+    segments are read BEFORE the base (issue #252 review group B): a
+    compaction landing between the two reads writes the segment rows into
+    the base before unlinking them, so reading segments first means a row
+    is never missing from both snapshots at once (the pre-fix order could
+    transiently hide a row — over-delivery direction, now closed)."""
     if now is None:
         now = time.time()
-    base = _load_entries(ledger_path(data_dir, session_id), now)
     seg_lists: List[List[Dict[str, Any]]] = []
     for p in _seg_paths(data_dir, session_id):
         entries = _read_seg_file(p)
         if entries is not None:
             seg_lists.append(entries)
+    base = _load_entries(ledger_path(data_dir, session_id), now)
     return _reduce_entries(base, seg_lists, now)
 
 
@@ -636,7 +699,14 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
         return
     _try_compact(data_dir, session_id, now)
     if _delivery_state_ended(data_dir, session_id):
-        _unlink_delivery_path(seg)
+        # Self-unlink after a fresh terminal marker. Wrapped (issue #252
+        # review group G): a Windows sharing violation on the unlink must
+        # degrade to "the segment lingers for the sweep", never escape
+        # record()'s fail-open boundary.
+        try:
+            os.unlink(seg)
+        except OSError:
+            pass
 
 
 def clear(data_dir: str, session_id: str) -> None:
@@ -645,7 +715,14 @@ def clear(data_dir: str, session_id: str) -> None:
     since #252: a PreCompact clear that left un-compacted segments behind
     would keep rows suppressed deterministically, defeating re-admission.
     The legacy pending sidecar is NOT touched (clear's historical
-    contract; only the terminal path removes it)."""
+    contract; only the terminal path removes it).
+
+    Issue #252 review (P-006): a lock deadline here PROPAGATES as
+    ``DeliveryStateLockError`` — matching ``end_delivery_state`` — because
+    re-admission is a state mutation the caller acts on: reporting success
+    while base and segments survive is the silent over-suppression this
+    function exists to prevent. (OSError during the unlinks stays
+    swallowed: pre-existing partial-clear posture, tracked separately.)"""
     if not ledger_path(data_dir, session_id):
         return
     try:
@@ -653,7 +730,9 @@ def clear(data_dir: str, session_id: str) -> None:
             _unlink_delivery_path(ledger_path(data_dir, session_id))
             for p in _seg_paths(data_dir, session_id):
                 _unlink_delivery_path(p)
-    except (OSError, DeliveryStateLockError):
+    except DeliveryStateLockError:
+        raise
+    except OSError:
         pass
 
 
@@ -856,7 +935,7 @@ def _load_tasktext(path: Optional[str], now: float) -> List[Dict[str, Any]]:
             try:
                 if float(e.get("ts", 0) or 0) >= cutoff:
                     kept.append(e)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 kept.append(e)
     return kept
 
