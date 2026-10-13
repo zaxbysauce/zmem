@@ -225,6 +225,25 @@ def derive_ops_tokens(*events: str) -> List[str]:
             # credential prefixes — review PRR-91-002) are dropped even when
             # file-shaped: a literal `ghp_…` pasted into a command must not
             # land on disk or in a query.
+            #
+            # Interpreter-invocation asymmetry is EMERGENT token-shape
+            # filtering, not a two-shape collapse policy (issue #251 AC4):
+            # there is NO -c/-m special case. After a runner, a payload
+            # token survives iff it passes the allowlist AND is the i==0
+            # primary subcommand, a known hazardous subcommand, or
+            # file-shaped (the rule above). So `python script.py` keeps the
+            # script basename (i==0 — it is the operation-adjacent recall
+            # signal), while `python -c "print(1)"` reduces to the bare
+            # runner (-c takes the i==0 slot and hits the dash guard;
+            # print(1) fails the allowlist) and `python -m pytest tests/`
+            # reduces too (-m dashes out, pytest is a bare word at i>0,
+            # tests/ collapses to an empty basename in _clean_token) — yet
+            # `python -m pkg.mod` keeps `pkg.mod` because it is file-shaped.
+            # The DECISION recorded here: do not "simplify" the first shape
+            # into the second — collapsing `script.py` to a bare `python`
+            # would lose that recall signal and re-admit broadly; that is a
+            # behaviour change needing its own decision record and pin, not
+            # a cleanup.
             _push(head)
             for i, w in enumerate(words[1:5]):
                 # Preserve the shape of the raw argv token before
