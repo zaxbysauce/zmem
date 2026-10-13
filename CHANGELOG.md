@@ -15,8 +15,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   flag-tailed command never strong-matches an unrelated delivered row, and a
   row delivered at `user_prompt` stays suppressed when the same session
   recalls at `pretool` (the PostToolBatch decision moment) with that command
-  as the query. The guard itself landed in 0.90.0 (issue #163, PRR-022)
-  with no test coverage; these pins close that regression gap.
+  as the query. The guard itself landed in 0.90.0 (PR #300, commit
+  7f8600f, issue #163, PRR-022) — pinned before this PR only by the
+  generic basename case `edit notes -x.txt` in
+  `tests/test_hermes_hooks_feedback.py`; these pins add the issue's
+  flag-tail shapes and the pretool store round-trip, plus a secret-shape
+  pin for the same guard's other conjunct
+  (`tests/test_p03_ops_token_secret_pin.py`).
 
 ### Changed
 - **Interpreter-collapse asymmetry recorded as a decision (issue #251 AC4):**
@@ -24,11 +29,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   operation-adjacent recall signal — while payloads such as
   `python -c "print(1)"` or `python -m pytest tests/` reduce to the bare
   runner. The asymmetry is emergent token-shape filtering (the
-  primary-subcommand / file-shaped rule in `storelib/ops_tokens.py`), not a
-  `-c`/`-m` special case: e.g. `python -m pkg.mod` keeps `pkg.mod` because
-  it is file-shaped. Documented at the runner-branch rule it belongs to;
-  behaviour is unchanged (pinned by the companion test
-  `test_python_script_py_keeps_script_basename`).
+  primary-subcommand / hazardous-subcommand / file-shaped rule in
+  `storelib/ops_tokens.py`), not a `-c`/`-m` special case: e.g.
+  `python -m pkg.mod` keeps `pkg.mod` because it is file-shaped. Documented
+  at the runner-branch rule it belongs to; behaviour is unchanged (pinned by
+  the companion test `test_python_script_py_keeps_script_basename`,
+  including the `python -m pytest tests/` and `python -m pkg.mod`
+  shapes).
 
 ## [0.94.0] - 2026-10-11
 

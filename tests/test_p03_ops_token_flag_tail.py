@@ -14,11 +14,13 @@ ops-token non-runner fallback:
   command as the query.
 
 All three are PRESERVING at the trace base (8f2aeb1): the defect behind
-issue #251 was fixed by 7f8600f (PR #300 / issue #163, PRR-022) but shipped
-with no pin — these tests ARE the pin. Deleting the guard at
-``ops_tokens.py`` non-runner branch turns C1/C2/C3 red with exactly the
-issue's anchor signatures (tokens ``['-5']``, strong match True, delivered
-row re-admitted at pretool).
+issue #251 was fixed by 7f8600f (PR #300 / issue #163, PRR-022), which
+already pinned the guard only through the generic basename case
+(``edit notes -x.txt`` in tests/test_hermes_hooks_feedback.py) — these
+tests add the issue's flag-tail shapes and the pretool store round-trip.
+Deleting the guard at ``ops_tokens.py`` non-runner branch turns C1/C2/C3
+red with exactly the issue's anchor signatures (tokens ``['-5']``, strong
+match True, delivered row re-admitted at pretool).
 
 ``CMD`` is a POSIX-shaped STRING parsed as text; nothing runs in a shell, so
 the tests are host-independent (Windows CI included).
@@ -78,6 +80,10 @@ CMD = "cd x && grep foo bar | head -5"
 ROW = "grep foo output: pipe it through head -5 before pasting"
 # The unrelated row AC2 matches the CMD tokens against.
 UNRELATED_ROW = "pipe build output through head -5 before pasting it"
+# Feedback round (PRR-007/F-004): never-delivered control row seeded between
+# the two recalls; shares the CMD's lexical terms (grep/foo/bar/head) so the
+# pretool lane must render it, proving the lane is not blanket-empty.
+CONTROL = "grep foo bar control row pipeline head render at pretool"
 NS = "project:p03flag"
 SESSION = "sess-p03"
 
@@ -89,6 +95,11 @@ _STRIP_ENV = (
     "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
     "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_AUTO_REKEY",
     "ZMEM_PENDING_SIDECAR", "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP",
+    # Feedback round (PRR-004/F-005): C3's argv matches cli.py's
+    # private_pretool_shape exactly, so an ambient marker=1 would send the
+    # child into the stdin-read branch and hang it to the 180s timeout.
+    # Stripped like tests/test_pretool_inject.py does.
+    "ZMEM_PRIVATE_PRETOOL_STDIN",
 )
 
 
@@ -123,16 +134,25 @@ class NonRunnerFlagTailTest(unittest.TestCase):
             delivery_ledger.strong_token_match(UNRELATED_ROW, toks))
 
     def test_python_script_py_keeps_script_basename(self):
-        # AC4's recorded decision (ops_tokens.py comment + CHANGELOG): plain
-        # interpreter invocations stay UN-collapsed — the script basename is
-        # the operation-adjacent recall signal, while -c/-m collapse to the
-        # bare runner because their payloads are flags/values. This pin makes
-        # the documented decision drift-proof; changing the behaviour forces
-        # a conscious, documented change instead of silent re-collapse.
+        # AC4's recorded decision (ops_tokens.py comment + CHANGELOG): the
+        # interpreter asymmetry is EMERGENT token-shape filtering — there is
+        # NO -c/-m special case. `python script.py` keeps the basename (i==0
+        # is the operation-adjacent recall signal); `-c "print(1)"` reduces
+        # (the flag takes the i==0 slot and hits the dash guard, the payload
+        # fails the allowlist); `-m pytest tests/` reduces (bare word at
+        # i>0 plus an empty basename); `-m pkg.mod` KEEPS pkg.mod because it
+        # is file-shaped. This pin makes the recorded decision drift-proof:
+        # changing the behaviour forces a conscious, documented change
+        # instead of silent re-collapse.
         self.assertEqual(ops_tokens.derive_ops_tokens("python script.py"),
                          ["python", "script.py"])
         self.assertEqual(
             ops_tokens.derive_ops_tokens('python -c "print(1)"'), ["python"])
+        self.assertEqual(
+            ops_tokens.derive_ops_tokens("python -m pytest tests/"),
+            ["python"])
+        self.assertEqual(ops_tokens.derive_ops_tokens("python -m pkg.mod"),
+                         ["python", "pkg.mod"])
 
 
 class PretoolFlagReadmissionTest(unittest.TestCase):
@@ -149,7 +169,11 @@ class PretoolFlagReadmissionTest(unittest.TestCase):
              "--query", CMD, "--namespace", NS, "--no-hybrid", "--no-bump",
              "--for-injection", "--json", "--session-id", SESSION,
              "--moment", moment],
-            capture_output=True, text=True, env=self._env, timeout=180)
+            capture_output=True, text=True, env=self._env, timeout=180,
+            # Feedback round (PRR-004/F-005): never inherit stdin — even if
+            # the private-pretool marker leaked in, the child must not block
+            # on an open pipe.
+            stdin=subprocess.DEVNULL)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout)
 
@@ -158,11 +182,12 @@ class PretoolFlagReadmissionTest(unittest.TestCase):
             [sys.executable, str(SCRIPTS / "store.py"), "add",
              "--namespace", NS, "--type", "lesson", "--content", ROW,
              "--signal", "test", "--confidence", "0.9"],
-            capture_output=True, text=True, env=self._env, timeout=180)
+            capture_output=True, text=True, env=self._env, timeout=180,
+            stdin=subprocess.DEVNULL)
         self.assertEqual(r.returncode, 0, r.stderr)
 
-        def row_present(results) -> bool:
-            return any(ROW in (row.get("content") or "")
+        def row_present(results, needle=ROW) -> bool:
+            return any(needle in (row.get("content") or "")
                        for row in results or [])
 
         # Precondition (vacuity guard): the row must render on the first,
@@ -172,12 +197,29 @@ class PretoolFlagReadmissionTest(unittest.TestCase):
                         "precondition failed: row never rendered at "
                         "user_prompt; the suppression check would be vacuous")
 
+        # Feedback round (PRR-007/F-004): seed a NEVER-delivered control row
+        # between the two recalls so the pretool call has a positive control
+        # — a pretool lane that returns blanket-empty can no longer satisfy
+        # the negative assertion below.
+        rc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "add",
+             "--namespace", NS, "--type", "lesson", "--content", CONTROL,
+             "--signal", "test", "--confidence", "0.9"],
+            capture_output=True, text=True, env=self._env, timeout=180,
+            stdin=subprocess.DEVNULL)
+        self.assertEqual(rc.returncode, 0, rc.stderr)
+
         # The same session, same query, pretool moment (also the
         # PostToolBatch moment): the delivered row stays suppressed because
-        # the flag tail derives no token, so no strong-match carve-out runs.
+        # the flag tail derives no token, so no strong-match carve-out runs —
+        # while the not-yet-delivered control still renders.
         second = self._recall("pretool")
         self.assertFalse(row_present(second.get("results")),
                          "delivered row was re-admitted at pretool")
+        self.assertTrue(
+            row_present(second.get("results"), CONTROL),
+            "pretool positive control did not render; the lane may be "
+            "blanket-empty and the suppression assertion above vacuous")
 
 
 if __name__ == "__main__":
