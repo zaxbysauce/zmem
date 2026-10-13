@@ -5,6 +5,35 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.96.0] - 2026-10-13
+
+### Fixed
+- **Delivery-ledger writes are concurrency-safe (issue #252, Workstream P
+  PR 4):** `record()` no longer gates row durability on acquiring
+  `ops/.delivery-state.lock` within `_DELIVERY_LOCK_TIMEOUT_S` (0.25 s) —
+  under concurrent subagent writers (subagents share the parent's session
+  id, so simultaneous hook processes are the normal case) a missed deadline
+  raised `DeliveryStateLockError`, which the fail-open handler swallowed,
+  and delivered-id rows vanished silently (measured: 4 writers × 50
+  single-row records kept as few as 50 of 200). Each call now publishes its
+  rows as a complete JSONL segment (`<hash>.ledger.seg.<hex>`, staged
+  through the `*.ledger.tmp.*` family and `os.replace`d onto a uuid-fresh
+  name) with no lock held, and a best-effort locked compaction merges
+  segments into the base ledger; reads (`delivered()`/`delivered_ids()`)
+  merge base + segments through one shared reducer, so compaction skipping
+  costs only a re-merge later, never a row. Upsert-by-id keeps
+  last-writer-wins on equal timestamps (segments read oldest-written
+  first), window pruning and the oldest-first `ZMEM_LEDGER_CAP` eviction
+  are preserved, and the terminal `end_delivery_state` marker re-check
+  removes a segment published against a fresh marker (no resurrection).
+  The purge scrub and the backup sweep learned the segment family
+  (needles/drop-ids die in segments too; orphans reaped); the legacy
+  `park_pending`/`consume_pending` sidecars keep their old locked RMW with
+  a disclosed scope-out (no live callers). Acceptance checks frozen in
+  `tests/test_p04_ledger_concurrent_writers.py` (thread + real-process
+  concurrency at 200 ids, wedged-lock bounded delivery with a <1 s design
+  bound), reducer/interleaving pins in `tests/test_p04_ledger_reducer.py`.
+
 ## [0.95.0] - 2026-10-12
 
 ### Added

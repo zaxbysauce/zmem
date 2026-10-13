@@ -753,17 +753,26 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, 
 def scrub_ledgers(data_dir: Path, drop_ids: set[str],
                   needles: list[str]) -> dict[str, int]:
     """Drop purged/derived-deleted ids' entries and any needle-bearing entry
-    from <data>/ops/*.ledger; delete orphaned .ledger.tmp.* and
-    .signals.tmp.* partial writes. FAIL-CLOSED: an unreadable or unwritable
-    ledger raises (AC7 is unconditional); a file with no matching entries is
-    left untouched."""
+    from <data>/ops/*.ledger and the issue-#252 JSONL segments
+    (*.ledger.seg.*); delete orphaned .ledger.tmp.* and .signals.tmp.*
+    partial writes. FAIL-CLOSED: an unreadable or unwritable ledger (or
+    segment FILE) raises (AC7 is unconditional); a file with no matching
+    entries is left untouched (a segment with only torn lines is cleaned)."""
     ops = data_dir / "ops"
     stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0}
     if not ops.is_dir():
         return stats
     for path in ops.glob("*.ledger.tmp.*"):
-        path.unlink()
-        stats["tmp_removed"] += 1
+        # Issue #252: record()'s segment publication and the segment scrub
+        # below both stage through this tmp family, so a writer's os.replace
+        # can win the glob-to-unlink race. Same benign-race posture as the
+        # #258 signals family below: never an abort condition for the
+        # fail-closed LEDGER scrub that follows.
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
     # #258: the per-session signal-state sidecar writes through the same
     # uuid-suffixed tmp pattern; reap its crashed-write orphans alongside
     # the ledger ones so ops/ never leaks either family. Best-effort, unlike
@@ -802,6 +811,58 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         # write_text + replace regressed the file to umask perms).
         from storelib.delivery_ledger import _atomic_write_json
         _atomic_write_json(str(path), doc)
+        stats["files_scrubbed"] += 1
+    # Issue #252: the per-call JSONL segments (<hash>.ledger.seg.<hex>)
+    # carry the same scrub laws as the base ledger — drop_ids and folded
+    # needles die here too, or _verify_ledgers_clean's *.ledger* byte scan
+    # would fail every purge that touches a session with live segments.
+    # FAIL-CLOSED for the FILE (an unreadable segment raises, like the
+    # ledger branch); torn/malformed LINES are dropped per the reader law
+    # (segments are not fsynced — a crash-torn tail is legitimate). The
+    # rewrite stages through <hash>.ledger.tmp.<hex> so the orphan reap
+    # above covers a crashed scrub. Disclosed residual: the rewrite is not
+    # lock-protected, so it can re-create a segment a concurrent
+    # compaction/clear just unlinked — over-suppression in the benign
+    # direction, reaped by the next sweep/compaction.
+    for path in ops.glob("*.ledger.seg.*"):
+        raw = path.read_text(encoding="utf-8")
+        kept_lines: list[str] = []
+        changed = False
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                changed = True  # torn tail — drop it
+                continue
+            if not isinstance(e, dict):
+                changed = True
+                continue
+            if e.get("id") in drop_ids:
+                stats["entries_dropped"] += 1
+                changed = True
+                continue
+            text = _ascii_fold(str(e.get("text") or ""))
+            if any(_ascii_fold(n) in text for n in needles):
+                stats["entries_dropped"] += 1
+                changed = True
+                continue
+            kept_lines.append(line)
+        if not changed:
+            continue
+        if not kept_lines:
+            path.unlink()
+        else:
+            stem = path.name.split(".ledger.seg.")[0]
+            tmp = ops / f"{stem}.ledger.tmp.{uuid.uuid4().hex}"
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                         0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(line + "\n" for line in kept_lines))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(path))
         stats["files_scrubbed"] += 1
     return stats
 

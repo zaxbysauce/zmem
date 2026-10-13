@@ -20,20 +20,38 @@ parked fences. This module is the delivery-state substrate BOTH lanes share:
   longer produce or consume it: PreCompact clears the ledger and the
   following SessionStart uses the ordinary selector.
 
-Atomicity: every write is tmp-file + ``os.replace`` (the correction_queue
-pattern, inlined here — storelib never imports the scripts-layer module).
-Ledger/pending mutations and clears are serialized by the shared
-``ops/.delivery-state.lock``. Legacy helpers remain fail-open when that lock
-cannot be acquired; the terminal ``end_delivery_state`` path propagates the
-failure so the CLI cannot claim a cleanup that did not happen.
+Atomicity: every durable surface is tmp-file + ``os.replace`` (the
+correction_queue pattern, inlined here — storelib never imports the
+scripts-layer module). Issue #252: ``record()`` no longer takes any lock on
+its write path — each call publishes its rows as a complete JSONL *segment*
+(``<hash>.ledger.seg.<hex>``, staged through ``<hash>.ledger.tmp.<hex>``,
+the tmp family purge's orphan reap already covers), so a concurrent burst of
+subagent writers can never lose rows to a missed lock deadline. A
+best-effort locked compaction merges segments into the base ledger; when it
+cannot run, segments persist and every read merges them instead. Ledger
+clears, the legacy pending sidecar, and compaction remain serialized by the
+shared ``ops/.delivery-state.lock``; legacy helpers remain fail-open when
+that lock cannot be acquired, and the terminal ``end_delivery_state`` path
+still propagates the failure so the CLI cannot claim a cleanup that did not
+happen. Residual, stated plainly: a segment lost to a genuine filesystem
+failure (ENOSPC, unusable dir) is still lost — the fail-open posture this
+module has always had — and a segment published while a marker-less
+``clear()`` is mid-flight (after the clear's unlink glob) survives that
+clear, leaving already-delivered rows visible (over-suppression only; the
+6 h window prune self-heals it).
 
-Bounding: entries older than the suppression window are pruned on every load
-and the store is capped (oldest dropped) on every write, so a file can never
-grow without bound; the backup sweep reaps orphans (``.ledger`` and
-``.delivery-ended`` joined the swept ops suffixes). The file's mtime refreshes
-on every record() write, so a live session is never the oldest thing in the
-ops dir. Terminal markers suppress same-id writers for a bounded 120 seconds
-so a resumed session can reopen its ledger after the short race window.
+Bounding: entries older than the suppression window are pruned on every
+reduce and the store is capped (oldest dropped) on every reduce, so the
+merged view can never grow without bound; the backup sweep reaps orphans
+(``.ledger``, ``.ledger.seg.`` and ``.delivery-ended`` joined the swept ops
+names). Segment growth between successful compactions is bounded by the
+number of ``record()`` calls since the last one (one segment per call), and
+compaction is re-attempted on every record. The base ledger's mtime
+refreshes on every successful compaction; liveness of an actively-recording
+session is carried by its fresh segments, which keep ``delivered()``
+correct even while the base sits untouched. Terminal markers suppress
+same-id writers for a bounded 120 seconds so a resumed session can reopen
+its ledger after the short race window.
 
 The suppression window and cap are env-tunable (``ZMEM_DELIVER_WINDOW_S``,
 default 6 h; ``ZMEM_LEDGER_CAP``, default 256). Clearing: PreCompact uses
@@ -78,6 +96,21 @@ _DELIVERY_LOCK_TIMEOUT_S = 0.25
 _DELIVERY_LOCK_POLL_S = 0.005
 _DELIVERY_LOCK_STALE_S = 30.0
 _DELIVERY_END_MARKER_TTL_S = 120.0
+
+# Issue #252: per-call ledger segments. ``record()`` publishes one JSONL
+# segment (``<hash>.ledger.seg.<hex>``) per call with NO lock held — the
+# write path's durability no longer depends on acquiring
+# ``ops/.delivery-state.lock`` within any deadline — and a best-effort
+# locked compaction merges segments into the base ledger. Publication is
+# staged through ``<hash>.ledger.tmp.<hex>`` (the tmp family purge's orphan
+# reap already covers) and lands via ``os.replace`` onto a uuid-fresh name,
+# so a segment only ever exists COMPLETE: no reader or compactor can observe
+# a created-but-unwritten file, and no reader can hold the published name
+# open when it appears. Segments match the ``*.ledger*`` globs (purge
+# residue verify, canary evidence) but not the exact ``*.ledger`` glob the
+# JSON-document scrub targets.
+_LEDGER_SEG_INFIX = ".ledger.seg."
+_LEDGER_TMP_INFIX = ".ledger.tmp."
 
 
 class DeliveryStateLockError(RuntimeError):
@@ -234,6 +267,8 @@ def _unlink_delivery_path(path: Optional[str]) -> None:
 def _clear_delivery_sidecars_locked(data_dir: str, session_id: str) -> None:
     _unlink_delivery_path(ledger_path(data_dir, session_id))
     _unlink_delivery_path(pending_path(data_dir, session_id))
+    for p in _seg_paths(data_dir, session_id):
+        _unlink_delivery_path(p)
 
 
 def _write_delivery_ended_locked(data_dir: str, session_id: str) -> None:
@@ -241,6 +276,204 @@ def _write_delivery_ended_locked(data_dir: str, session_id: str) -> None:
         delivery_ended_path(data_dir, session_id),
         {"ended_at": time.time()},
     )
+
+
+def _seg_prefix(session_id: str) -> Optional[str]:
+    name = _hashed_name(session_id, "")
+    if not name:
+        return None
+    return name + _LEDGER_SEG_INFIX
+
+
+def _seg_paths(data_dir: str, session_id: str) -> List[str]:
+    """This session's live segment files, oldest-written first.
+
+    Sorted by ``(st_mtime_ns, name)`` so equal-ts upserts in the shared
+    reducer resolve to the LATEST-WRITTEN entry (the refresh law the
+    locked read-modify-write used to provide); the name is only a
+    deterministic tie-break for segments written within one clock tick.
+    """
+    prefix = _seg_prefix(session_id)
+    if not prefix:
+        return []
+    ops = os.path.join(data_dir, "ops")
+    try:
+        names = os.listdir(ops)
+    except OSError:
+        return []
+    hits = []
+    for n in names:
+        if not n.startswith(prefix):
+            continue
+        p = os.path.join(ops, n)
+        try:
+            hits.append((os.stat(p).st_mtime_ns, n, p))
+        except OSError:
+            continue  # published-and-replaced or swept between listdir and stat
+    hits.sort()
+    return [p for _, _, p in hits]
+
+
+def _read_seg_file(path: str) -> Optional[List[Dict[str, Any]]]:
+    """Parse one JSONL segment. Returns None when the file is unreadable
+    (caller skips it — a crashed writer must never break a read). A torn
+    tail line (segments are not fsynced) is skipped line-by-line; complete
+    lines before it stay usable because publication is atomic per whole
+    payload, so a torn tail only follows an OS-level crash mid-write."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except (OSError, ValueError):
+        # OSError: gone/inaccessible. ValueError (UnicodeDecodeError): a
+        # corrupt or non-UTF8 file — skip the whole segment; a crashed
+        # writer must never break a read.
+        return None
+    out: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and isinstance(e.get("id"), str):
+            out.append(e)
+    return out
+
+
+def _reduce_entries(base: List[Dict[str, Any]],
+                    seg_lists: List[List[Dict[str, Any]]],
+                    now: float) -> List[Dict[str, Any]]:
+    """The single merge implementation for the ledger view.
+
+    Upsert by id: a later entry replaces when its ts is >= the current one
+    (>= so an equal-ts refresh from a later-written segment wins, preserving
+    the last-writer-wins law the locked read-modify-write provided). Note
+    the drift from the old behavior, stated deliberately: ts dominates, so
+    re-recording an id with an OLDER ``now`` no longer overwrites the newer
+    entry. Then window-prune, stable-sort by ts (oldest first — insertion
+    order breaks ties exactly as the pre-#252 base file did), and cap
+    oldest-last. Both the read path and compaction call this, so the two
+    can never drift.
+    """
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for e in base:
+        eid = e.get("id")
+        if isinstance(eid, str) and eid:
+            by_id[eid] = e
+    for seg in seg_lists:
+        for e in seg:
+            eid = e.get("id")
+            if not isinstance(eid, str) or not eid:
+                continue
+            cur = by_id.get(eid)
+            if cur is None:
+                by_id[eid] = e
+                continue
+            try:
+                newer = (float(e.get("ts", 0) or 0)
+                         >= float(cur.get("ts", 0) or 0))
+            except (TypeError, ValueError):
+                newer = True
+            if newer:
+                by_id[eid] = e
+    cutoff = now - _window_s()
+    merged: List[Dict[str, Any]] = []
+    for e in by_id.values():
+        try:
+            fresh = float(e.get("ts", 0) or 0) >= cutoff
+        except (TypeError, ValueError):
+            fresh = True
+        if fresh:
+            merged.append(e)
+    merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
+    cap = _cap()
+    if len(merged) > cap:
+        merged = merged[-cap:]
+    return merged
+
+
+def _publish_segment(data_dir: str, session_id: str,
+                     entries: List[Dict[str, Any]]) -> Optional[str]:
+    """Atomically publish one call's rows as a complete JSONL segment.
+
+    Staged through ``<hash>.ledger.tmp.<hex>`` then ``os.replace``d onto a
+    uuid-fresh ``<hash>.ledger.seg.<hex>`` name (a name no reader can
+    already hold open, so the replace cannot hit a Windows sharing
+    violation). Two attempts, then fail-open — a genuine filesystem failure
+    (ENOSPC, unusable dir) loses this call's rows; that residual is the
+    module's documented fail-open posture. No fsync: the ledger is a
+    regenerable dedup cache, and a crash costs at most recent deliveries'
+    dedup, never delivery itself.
+    """
+    prefix = _seg_prefix(session_id)
+    if not prefix:
+        return None
+    ops = os.path.join(data_dir, "ops")
+    try:
+        os.makedirs(ops, exist_ok=True)
+    except OSError:
+        return None
+    payload = "".join(json.dumps(e, ensure_ascii=False) + "\n"
+                      for e in entries)
+    stem = prefix[:-len(_LEDGER_SEG_INFIX)]
+    for _ in range(2):
+        seg = os.path.join(ops, prefix + uuid.uuid4().hex)
+        tmp = os.path.join(ops, stem + _LEDGER_TMP_INFIX + uuid.uuid4().hex)
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(payload)
+            os.replace(tmp, seg)
+            return seg
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            time.sleep(0.002)
+    return None
+
+
+def _try_compact(data_dir: str, session_id: str, now: float) -> None:
+    """Best-effort merge of all published segments into the base ledger.
+
+    Best-effort in every direction: a lock deadline, an unreadable segment,
+    or a base write failure leaves the segments on disk for the next call —
+    correctness never depends on this running (reads merge segments). Under
+    the lock: a fresh terminal marker means the session ended — drop every
+    segment of this session instead of merging (defer to the terminal
+    clear; never resurrect). Otherwise glob ONCE, read the base plus
+    exactly those paths, reduce, atomic-write the base, and unlink STRICTLY
+    the paths read into the merge — never re-glob at unlink time, because a
+    segment published after the glob (record() does not take this lock)
+    must survive to the next pass.
+    """
+    try:
+        with _delivery_state_lock(data_dir):
+            if _delivery_state_ended(data_dir, session_id):
+                for p in _seg_paths(data_dir, session_id):
+                    _unlink_delivery_path(p)
+                return
+            segs = _seg_paths(data_dir, session_id)
+            if not segs:
+                return
+            base = _load_entries(ledger_path(data_dir, session_id), now)
+            seg_lists: List[List[Dict[str, Any]]] = []
+            read_ok: List[str] = []
+            for p in segs:
+                entries = _read_seg_file(p)
+                if entries is None:
+                    continue
+                seg_lists.append(entries)
+                read_ok.append(p)
+            merged = _reduce_entries(base, seg_lists, now)
+            _atomic_write_json(ledger_path(data_dir, session_id),
+                               {"entries": merged})
+            for p in read_ok:
+                _unlink_delivery_path(p)
+    except (OSError, DeliveryStateLockError):
+        pass
 
 
 def entry_text(row: Dict[str, Any]) -> str:
@@ -315,10 +548,21 @@ def _load_entries(path: Optional[str], now: float) -> List[Dict[str, Any]]:
 
 def delivered(data_dir: str, session_id: str,
               now: Optional[float] = None) -> List[Dict[str, Any]]:
-    """The session's in-window delivered entries (pruned view; no write)."""
+    """The session's in-window delivered entries (pruned view; no write).
+
+    Issue #252: merges the base ledger with any live segments through the
+    shared reducer, so rows recorded by concurrent writers whose compaction
+    has not run yet are visible here. An unreadable segment is skipped
+    silently (fail-open read); this function performs zero writes."""
     if now is None:
         now = time.time()
-    return _load_entries(ledger_path(data_dir, session_id), now)
+    base = _load_entries(ledger_path(data_dir, session_id), now)
+    seg_lists: List[List[Dict[str, Any]]] = []
+    for p in _seg_paths(data_dir, session_id):
+        entries = _read_seg_file(p)
+        if entries is not None:
+            seg_lists.append(entries)
+    return _reduce_entries(base, seg_lists, now)
 
 
 def delivered_ids(data_dir: str, session_id: str,
@@ -342,7 +586,21 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
     Omit it (the default) and every row is recorded as bump-eligible, which is
     the correct meaning for a caller that only ever records query-matched rows
     and keeps older ledger files readable.
-    """
+
+    Issue #252: the call's rows are published as one complete JSONL segment
+    with NO lock held, then a best-effort locked compaction merges segments
+    into the base ledger. Durability no longer depends on acquiring the
+    delivery-state lock within any deadline (the pre-#252 bounded wait
+    silently dropped rows under concurrent subagent writers); the only
+    residual loss channel is a genuine filesystem failure on the segment
+    publication itself (two attempts, then give up silently — the fail-open
+    posture this module documents). After the compaction attempt the
+    terminal marker is re-checked and the just-published segment is removed
+    if the session ended while we worked, so a terminal clear is never
+    undone. The marker-less ``clear()`` strips base and segments under the
+    lock (PreCompact re-admission), but a segment published mid-clear —
+    after its unlink glob — survives it: already-delivered rows stay
+    visible (over-suppression only; the 6 h window prune self-heals)."""
     if not rows:
         return
     path = ledger_path(data_dir, session_id)
@@ -351,48 +609,50 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
     if now is None:
         now = time.time()
     eligible = None if bump_eligible_ids is None else set(bump_eligible_ids)
-    try:
-        with _delivery_state_lock(data_dir):
-            if _delivery_state_ended(data_dir, session_id):
-                return
-            entries = _load_entries(path, now)
-            by_id = {e["id"]: e for e in entries}
-            for r in rows:
-                rid = r.get("id") if isinstance(r, dict) else None
-                if not isinstance(rid, str) or not rid:
-                    continue
-                entry = {
-                    "id": rid,
-                    "moment": str(moment or ""),
-                    "ts": now,
-                    "text": entry_text(r),
-                }
-                # Only stamp the marker when the caller supplied the subset.
-                # A caller that does not know which rows were query-matched
-                # keeps the legacy four-key entry shape (pinned by the #182
-                # training acceptance repro), and readers already treat an
-                # absent key as eligible -- the correct reading for a ledger
-                # that only ever recorded query-matched rows.
-                if eligible is not None:
-                    entry["bump_eligible"] = rid in eligible
-                by_id[rid] = entry
-            merged = list(by_id.values())
-            merged.sort(key=lambda e: float(e.get("ts", 0) or 0))
-            cap = _cap()
-            if len(merged) > cap:
-                merged = merged[-cap:]
-            _atomic_write_json(path, {"entries": merged})
-    except (OSError, DeliveryStateLockError):
-        pass
+    entries: List[Dict[str, Any]] = []
+    for r in rows:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if not isinstance(rid, str) or not rid:
+            continue
+        entry = {
+            "id": rid,
+            "moment": str(moment or ""),
+            "ts": now,
+            "text": entry_text(r),
+        }
+        # Only stamp the marker when the caller supplied the subset.
+        # A caller that does not know which rows were query-matched
+        # keeps the legacy four-key entry shape (pinned by the #182
+        # training acceptance repro), and readers already treat an
+        # absent key as eligible -- the correct reading for a ledger
+        # that only ever recorded query-matched rows.
+        if eligible is not None:
+            entry["bump_eligible"] = rid in eligible
+        entries.append(entry)
+    if not entries:
+        return
+    seg = _publish_segment(data_dir, session_id, entries)
+    if seg is None:
+        return
+    _try_compact(data_dir, session_id, now)
+    if _delivery_state_ended(data_dir, session_id):
+        _unlink_delivery_path(seg)
 
 
 def clear(data_dir: str, session_id: str) -> None:
-    """Remove the session's ledger (compaction / session end)."""
+    """Remove the session's ledger — base file AND any live segments
+    (compaction / PreCompact re-admission). Segments ARE ledger state
+    since #252: a PreCompact clear that left un-compacted segments behind
+    would keep rows suppressed deterministically, defeating re-admission.
+    The legacy pending sidecar is NOT touched (clear's historical
+    contract; only the terminal path removes it)."""
     if not ledger_path(data_dir, session_id):
         return
     try:
         with _delivery_state_lock(data_dir):
             _unlink_delivery_path(ledger_path(data_dir, session_id))
+            for p in _seg_paths(data_dir, session_id):
+                _unlink_delivery_path(p)
     except (OSError, DeliveryStateLockError):
         pass
 
@@ -405,7 +665,14 @@ def park_pending(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
     Unlike the pre-#117 ``open(path, "w")`` sidecar, N parked fences between
     two prompts ALL survive; a fence whose memory ids are all already parked
     is not appended twice (dedup by id, not by text).
-    """
+
+    Issue #252 scope note: this legacy sidecar keeps the locked
+    read-modify-write whose deadline-loss silently drops a parked fence —
+    the same loss class record() just shed. Deliberately out of #252's
+    scope ("make record() safe"): the #158 adapters no longer call this
+    (env-gated legacy callers only), so the race has no live trigger on
+    current hosts. Disclosed in the PR; do not silently re-derive it as
+    fixed."""
     path = pending_path(data_dir, session_id)
     if not path or not fence:
         return
@@ -500,7 +767,9 @@ def snapshot_for_compact(data_dir: str, session_id: str,
 
     Retained for older direct storelib callers. The #158 PreCompact adapter
     intentionally uses ``ledger-clear`` instead and never calls this helper.
-    """
+    Issue #252 note: this reads the BASE ledger only — rows still sitting in
+    unpublished segments (compaction skipped) are not snapshotted. Legacy-
+    only path, disclosed, not carried further."""
     path = compact_path(data_dir, session_id)
     if not path:
         return

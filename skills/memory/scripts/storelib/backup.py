@@ -528,7 +528,11 @@ def cmd_sweep(marker_dir: str | None = None,
             except OSError:
                 ring_names = []
             for rname in ring_names:
-                if not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals")):
+                # Issue #252: per-call ledger segments (<hash>.ledger.seg.<hex>)
+                # carry no constant suffix, so they need a containment match
+                # alongside the endswith tuple.
+                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals"))
+                        and ".ledger.seg." not in rname):
                     continue
                 rp = ops_dir / rname
                 try:
