@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "zmem taxonomy RFC decision artifact (issue #172)",
+  "description": "Machine-readable decision artifact for the Workstream K taxonomy RFC. The schema_version here is the RFC document version, not a database schema version.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "input_digest", "candidates"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "input_digest": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidates": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "claim",
+          "tags_or_side_tables_insufficient",
+          "replay_command",
+          "input_digest",
+          "observed_delta",
+          "migration",
+          "compatibility",
+          "rollback",
+          "decision",
+          "handoff"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "enum": [
+              "state",
+              "event",
+              "observation",
+              "runbook",
+              "entity_card",
+              "host",
+              "service",
+              "model",
+              "repo",
+              "file",
+              "command",
+              "error_class"
+            ]
+          },
+          "claim": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tags_or_side_tables_insufficient": {
+            "type": "string",
+            "minLength": 1
+          },
+          "replay_command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "input_digest": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "observed_delta": {
+            "type": "string",
+            "minLength": 1
+          },
+          "migration": {
+            "type": "string",
+            "minLength": 1
+          },
+          "compatibility": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rollback": {
+            "type": "string",
+            "minLength": 1
+          },
+          "decision": {
+            "type": "string",
+            "minLength": 1,
+            "enum": ["accept", "reject", "defer"]
+          },
+          "handoff": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}
