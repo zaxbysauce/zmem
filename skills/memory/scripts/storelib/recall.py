@@ -2449,7 +2449,7 @@ def _suppress_represented_by_head_ns(rows: list[dict],
 
 
 def expiry_pre_pool(acc: dict, exclude_ids: list[str] | None) -> list[dict]:
-    """Pre-expiry candidate rows, deduped by id (first arrival), ledger-cut.
+    """Pre-expiry candidate rows, deduped by id (last arrival wins), ledger-cut.
 
     Issue #174: the silent-reason diagnosis basis — the pool as it would
     have entered the gate absent expiry, minus the caller's exclusions.
@@ -3115,14 +3115,17 @@ def _recall_memory_impl(
         # delivered seed pulls must not resurrect an expired row).
         if expiry_active and expiry_acc is not None and _expanded:
             _annotate_expiry(conn, _expanded)
+            # R3-3: every arrival enters the pre-gate pool — live and
+            # expired alike — so candidate_ids keeps exactly what the
+            # pre-#174 lane reported plus the ids the gate removed.
+            expiry_acc["pre_ids"].extend(r["id"] for r in _expanded)
+            expiry_acc["pre_rows"].extend(_expanded)
             _live_exp, _removed = _expiry_filter(
                 _expanded, now_iso=expiry_now_iso)
             if _removed:
                 _live_ids = {r["id"] for r in _live_exp}
                 _gone = [r for r in _expanded if r["id"] not in _live_ids]
                 expiry_acc["expired_ids"].update(r["id"] for r in _gone)
-                expiry_acc["pre_ids"].extend(r["id"] for r in _gone)
-                expiry_acc["pre_rows"].extend(_gone)
             if any(r.get("inject_until") for r in _expanded):
                 expiry_acc["engaged"] = True
             _expanded = _live_exp
@@ -3181,13 +3184,14 @@ def _recall_memory_impl(
         if expiry_active and expiry_acc is not None and kept_cross:
             _annotate_expiry(conn, [item for _, item in kept_cross])
             now_e = _parse_iso_to_epoch(expiry_now_iso)
+            # R3-3: every kept cross arrival enters the pre-gate pool.
+            expiry_acc["pre_ids"].extend(item["id"] for _, item in kept_cross)
+            expiry_acc["pre_rows"].extend(item for _, item in kept_cross)
             gated: list = []
             for pair in kept_cross:
                 iu = pair[1].get("inject_until")
                 if iu and _parse_iso_to_epoch(iu) <= now_e:
                     expiry_acc["expired_ids"].add(pair[1]["id"])
-                    expiry_acc["pre_ids"].append(pair[1]["id"])
-                    expiry_acc["pre_rows"].append(pair[1])
                 else:
                     gated.append(pair)
             if any(item.get("inject_until") for _, item in kept_cross):
@@ -3254,14 +3258,16 @@ def _recall_memory_impl(
         # into the delivered fence either.
         if expiry_active and expiry_acc is not None and _merged:
             _annotate_expiry(conn, _merged)
+            # R3-3 (as with link arrivals): every arrival enters the
+            # pre-gate pool before the gate removes anything.
+            expiry_acc["pre_ids"].extend(r["id"] for r in _merged)
+            expiry_acc["pre_rows"].extend(_merged)
             _live_heads, _removed = _expiry_filter(
                 _merged, now_iso=expiry_now_iso)
             if _removed:
                 _live_ids = {r["id"] for r in _live_heads}
                 _gone = [r for r in _merged if r["id"] not in _live_ids]
                 expiry_acc["expired_ids"].update(r["id"] for r in _gone)
-                expiry_acc["pre_ids"].extend(r["id"] for r in _gone)
-                expiry_acc["pre_rows"].extend(_gone)
             if any(r.get("inject_until") for r in _merged):
                 expiry_acc["engaged"] = True
             _merged = _live_heads
@@ -4444,6 +4450,10 @@ def _recent_one_tier(
                 ))
             results = [results[i] for i in _order]
         _annotate_expiry(conn, results)
+        # The recent lane counts expired rows inside the pre-gate top-
+        # `limit` window (what this tier would have returned), not the
+        # whole fetched pool — the recall lane counts its whole scored
+        # pool; both equal the fixture pools every oracle pins.
         pre_rows = results[:limit]
         live, removed = _expiry_filter(results, now_iso=expiry_now_iso)
         expiry_acc["pre_ids"].extend(r["id"] for r in pre_rows)
@@ -4664,13 +4674,14 @@ def _recent_memory_impl(
         if expiry_active and expiry_acc is not None and cross_scored:
             _items = [row for _, row in cross_scored]
             _annotate_expiry(conn, _items)
+            # R3-3: every cross arrival enters the pre-gate pool.
+            expiry_acc["pre_ids"].extend(r["id"] for r in _items)
+            expiry_acc["pre_rows"].extend(_items)
             _live_items, _removed = _expiry_filter(_items, now_iso=expiry_now)
             if _removed:
                 _live_ids = {r["id"] for r in _live_items}
                 _gone = [r for r in _items if r["id"] not in _live_ids]
                 expiry_acc["expired_ids"].update(r["id"] for r in _gone)
-                expiry_acc["pre_ids"].extend(r["id"] for r in _gone)
-                expiry_acc["pre_rows"].extend(_gone)
                 cross_scored = [(sc, r) for sc, r in cross_scored
                                 if r["id"] in _live_ids]
             if any(r.get("inject_until") for r in _items):

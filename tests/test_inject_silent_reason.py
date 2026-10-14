@@ -317,7 +317,11 @@ class HookBodyReasonTest(unittest.TestCase):
 
 class ClassifierUnitTests(unittest.TestCase):
     """Direct unit pins for _classify_silent_reason (review PRR-89-007a/007c):
-    the spec's precedence order and the closed-set drift fallback."""
+    the spec's precedence order and the closed-set drift fallback.
+
+    Issue #174 review round re-home: the storelib twin's expiry-drained pins
+    also live here (the issue pins this class as their home); the store-side
+    classifier binds in setUpClass like the hook body above it."""
 
     @classmethod
     def setUpClass(cls):
@@ -326,6 +330,9 @@ class ClassifierUnitTests(unittest.TestCase):
             "zmem_recall_body_unit", BODY)
         cls.body = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.body)
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import inject
+        cls.inject = inject
 
     def test_order_budget_drop_beats_below_bar_and_omitted(self):
         self.assertEqual(
@@ -354,6 +361,43 @@ class ClassifierUnitTests(unittest.TestCase):
         self.assertEqual(
             self.body._classify_silent_reason([], omitted=2, allowed=()),
             "empty-pool")
+
+    def test_expired_requires_expiry_drained_pool(self):
+        """Issue #174: ``expired`` is keyed on the caller's expiry_drained
+        diagnosis — rows == [] (every rows-consuming branch fell through),
+        budget not emptied, nothing omitted, and the pre-expiry pool was
+        eligible after omission, relevance, and ledger. Without the flag the
+        same shape degrades to empty-pool; omitted and budget-drop keep
+        their precedence over it."""
+        classify = self.inject.classify_silent_reason
+        self.assertEqual(
+            classify([], omitted=0, budget_emptied=False, expiry_drained=True),
+            "expired")
+        self.assertEqual(
+            classify([], omitted=0, budget_emptied=False, expiry_drained=False),
+            "empty-pool",
+            "expiry_drained=False with an empty pool is empty-pool, never "
+            "expired")
+        self.assertEqual(
+            classify([], omitted=2, budget_emptied=False, expiry_drained=True),
+            "omitted",
+            "omitted keeps precedence over expired")
+        self.assertEqual(
+            classify([], omitted=0, budget_emptied=True, expiry_drained=True),
+            "budget-drop",
+            "budget-drop keeps precedence over expired")
+
+    def test_live_below_relevance_wins_over_expired(self):
+        """Issue #174: a LIVE trust-passing row that failed a relevance
+        floor names below-relevance even when expiry drained other rows —
+        the pool was not empty for relevance purposes, so expiry cannot
+        claim the silence."""
+        classify = self.inject.classify_silent_reason
+        self.assertEqual(
+            classify([{"id": "weak-live"}],
+                     lane_stats={"trust_passed": 1},
+                     expiry_drained=True),
+            "below-relevance")
 
 
 class StorelibClassifierContractTests(unittest.TestCase):
@@ -438,43 +482,6 @@ class StorelibClassifierContractTests(unittest.TestCase):
         classify = self.inject.classify_silent_reason
         self.assertEqual(classify([{"id": "candidate"}]), "below-bar")
         self.assertEqual(classify([]), "empty-pool")
-
-    def test_expired_requires_expiry_drained_pool(self):
-        """Issue #174: ``expired`` is keyed on the caller's expiry_drained
-        diagnosis — rows == [] (every rows-consuming branch fell through),
-        budget not emptied, nothing omitted, and the pre-expiry pool was
-        eligible after omission, relevance, and ledger. Without the flag the
-        same shape degrades to empty-pool; omitted and budget-drop keep
-        their precedence over it."""
-        classify = self.inject.classify_silent_reason
-        self.assertEqual(
-            classify([], omitted=0, budget_emptied=False, expiry_drained=True),
-            "expired")
-        self.assertEqual(
-            classify([], omitted=0, budget_emptied=False, expiry_drained=False),
-            "empty-pool",
-            "expiry_drained=False with an empty pool is empty-pool, never "
-            "expired")
-        self.assertEqual(
-            classify([], omitted=2, budget_emptied=False, expiry_drained=True),
-            "omitted",
-            "omitted keeps precedence over expired")
-        self.assertEqual(
-            classify([], omitted=0, budget_emptied=True, expiry_drained=True),
-            "budget-drop",
-            "budget-drop keeps precedence over expired")
-
-    def test_live_below_relevance_wins_over_expired(self):
-        """Issue #174: a LIVE trust-passing row that failed a relevance
-        floor names below-relevance even when expiry drained other rows —
-        the pool was not empty for relevance purposes, so expiry cannot
-        claim the silence."""
-        classify = self.inject.classify_silent_reason
-        self.assertEqual(
-            classify([{"id": "weak-live"}],
-                     lane_stats={"trust_passed": 1},
-                     expiry_drained=True),
-            "below-relevance")
 
 
 class HookBodyBareListEnvelopeTest(unittest.TestCase):
