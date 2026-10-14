@@ -13,8 +13,9 @@ removes content:
   * compact the store (FTS ``'optimize'``, ``VACUUM``, WAL checkpoint) under
     the full maintenance lock ladder and byte-verify the result, failing
     loudly on any residue;
-  * scrub the ids and any needle-bearing entries from ``<data>/ops/*.ledger``
-    delivery ledgers;
+  * scrub the ids and any needle-bearing entries from the ``<data>/ops``
+    delivery-ledger surfaces (``*.ledger`` plus the issue-#252 JSONL
+    segments ``*.ledger.seg.*``);
   * record the ids in the ``purged_id`` deny-list so ``ingest-jsonl`` cannot
     re-insert them from a peer export;
   * optionally rewrite (never delete or truncate) backup snapshots, including
@@ -760,17 +761,30 @@ def compact_and_verify(store_path: Path, needles: list[str]) -> tuple[dict[str, 
 def scrub_ledgers(data_dir: Path, drop_ids: set[str],
                   needles: list[str]) -> dict[str, int]:
     """Drop purged/derived-deleted ids' entries and any needle-bearing entry
-    from <data>/ops/*.ledger; delete orphaned .ledger.tmp.* and
-    .signals.tmp.* partial writes. FAIL-CLOSED: an unreadable or unwritable
-    ledger raises (AC7 is unconditional); a file with no matching entries is
-    left untouched."""
+    from <data>/ops/*.ledger and the issue-#252 JSONL segments
+    (*.ledger.seg.*); delete orphaned .ledger.tmp.* and .signals.tmp.*
+    partial writes. FAIL-CLOSED: an unwritable ledger — or an OSError while
+    reading a segment — raises (AC7 is unconditional); a segment that
+    vanished mid-scrub or whose bytes are not decodable is SKIPPED, exactly
+    like the reader skips those states (the byte-level residue verify still
+    scans skipped files); a file with no matching entries is left untouched
+    (a segment with only torn lines is cleaned)."""
     ops = data_dir / "ops"
-    stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0}
+    stats = {"files_scrubbed": 0, "entries_dropped": 0, "tmp_removed": 0,
+             "segments_skipped": 0}
     if not ops.is_dir():
         return stats
     for path in ops.glob("*.ledger.tmp.*"):
-        path.unlink()
-        stats["tmp_removed"] += 1
+        # Issue #252: record()'s segment publication and the segment scrub
+        # below both stage through this tmp family, so a writer's os.replace
+        # can win the glob-to-unlink race. Same benign-race posture as the
+        # #258 signals family below: never an abort condition for the
+        # fail-closed LEDGER scrub that follows.
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
     # #258: the per-session signal-state sidecar writes through the same
     # uuid-suffixed tmp pattern; reap its crashed-write orphans alongside
     # the ledger ones so ops/ never leaks either family. Best-effort, unlike
@@ -809,6 +823,78 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         # write_text + replace regressed the file to umask perms).
         from storelib.delivery_ledger import _atomic_write_json
         _atomic_write_json(str(path), doc)
+        stats["files_scrubbed"] += 1
+    # Issue #252: the per-call JSONL segments (<hash>.ledger.seg.<hex>)
+    # carry the same scrub laws as the base ledger — drop_ids and folded
+    # needles die here too, or _verify_ledgers_clean's *.ledger* byte scan
+    # would fail every purge that touches a session with live segments.
+    # FAIL-CLOSED for the FILE (an unreadable segment raises, like the
+    # ledger branch); torn/malformed LINES are dropped per the reader law
+    # (segments are not fsynced — a crash-torn tail is legitimate). The
+    # rewrite stages through <hash>.ledger.tmp.<hex> so the orphan reap
+    # above covers a crashed scrub. Disclosed residual: the rewrite is not
+    # lock-protected, so it can re-create a segment a concurrent
+    # compaction/clear just unlinked — over-suppression in the benign
+    # direction, reaped by the next sweep/compaction.
+    for path in ops.glob("*.ledger.seg.*"):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Issue #252 review (P-008 round 2 / Copilot): compaction or a
+            # clear can unlink a segment between this glob and the read —
+            # the same benign race the tmp/signals reaps above tolerate.
+            # Skipping is consistent with the reader law (a removed
+            # segment can no longer serve rows) and keeps a concurrent
+            # writer from crashing the fail-closed purge.
+            continue
+        except UnicodeDecodeError:
+            # A crash-torn multi-byte sequence is the documented expected
+            # case for non-fsynced segments, and the reader skips exactly
+            # this state. Scrub follows the same law; the byte-level
+            # residue verify below still scans the file, so needle bytes
+            # cannot hide in a skipped segment (issue #252 review P-008).
+            stats["segments_skipped"] = stats.get("segments_skipped", 0) + 1
+            continue
+        kept_lines: list[str] = []
+        changed = False
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                changed = True  # torn tail — drop it
+                continue
+            if not isinstance(e, dict):
+                changed = True
+                continue
+            if e.get("id") in drop_ids:
+                stats["entries_dropped"] += 1
+                changed = True
+                continue
+            text = _ascii_fold(str(e.get("text") or ""))
+            if any(_ascii_fold(n) in text for n in needles):
+                stats["entries_dropped"] += 1
+                changed = True
+                continue
+            kept_lines.append(line)
+        if not changed:
+            continue
+        if not kept_lines:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass  # unlinked by compaction/clear mid-scrub — benign
+        else:
+            stem = path.name.split(".ledger.seg.")[0]
+            tmp = ops / f"{stem}.ledger.tmp.{uuid.uuid4().hex}"
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                         0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(line + "\n" for line in kept_lines))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(path))
         stats["files_scrubbed"] += 1
     return stats
 
@@ -1056,11 +1142,18 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         drop_ids |= set(applied.get("retry_ids", []))
         drop_ids |= denylisted
         try:
-            # Round-3: the passive lane's ledger.record holds NO writer lease,
-            # so it is invisible to the live-writer refusal -- but record()
-            # fails OPEN on _delivery_state_lock contention, so holding that
-            # lock here makes any concurrent delivery write drop harmlessly
-            # instead of re-recording needle text after the scrub/scan.
+            # Issue #252 review (P-002): record() publishes segments with
+            # NO lock at all, so this lock no longer fences delivery
+            # writes — a hook render in flight during the scrub can land a
+            # needle-bearing segment after any single verify pass. The
+            # scrub+verify pair therefore re-runs until a pass finds no
+            # residue (bounded): the silent window shrinks from
+            # "seconds-wide render lifetime" to the final pass's listing,
+            # and residue that survives every pass still fails closed
+            # below. (Honest history: the base fence was already leaky —
+            # a record that timed out waiting and then acquired after the
+            # release wrote post-verify; review probes confirmed base
+            # exits 0 with needles on disk.)
             from storelib import delivery_ledger as _dl
             led: dict[str, int] = {"files_scrubbed": 0, "entries_dropped": 0,
                                "tmp_removed": 0}
@@ -1068,6 +1161,12 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             with _dl._delivery_state_lock(str(data_dir)):
                 led = scrub_ledgers(data_dir, drop_ids, needles)
                 lres = _verify_ledgers_clean(data_dir, needles)
+                for _ in range(2):
+                    if not lres:
+                        break
+                    more = scrub_ledgers(data_dir, drop_ids, needles)
+                    led = {k: led.get(k, 0) + more.get(k, 0) for k in led}
+                    lres = _verify_ledgers_clean(data_dir, needles)
         except (OSError, ValueError, RuntimeError) as e:
             print("[zmem] purge FAILED: ledger scrub failed (%s); the purge "
                   "is incomplete - inspect <data>/ops before re-running" % e,

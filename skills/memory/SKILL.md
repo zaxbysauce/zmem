@@ -649,7 +649,10 @@ alongside the tool result; pausing is `permissionDecision`-driven only) —
 issue #158 makes the store-owned selector the only passive path: delivered
 ids now live in a bounded per-session ledger
 (`<data>/ops/<sha256-of-session-id>.ledger`, atomic, window- and
-cap-bounded) that EVERY injection moment consults, so the same row is not
+cap-bounded — plus per-call `<hash>.ledger.seg.<hex>` JSONL segments that
+publish without a lock and are merged into the base by a best-effort
+compaction; reads always merge base + segments, issue #252) that EVERY
+injection moment consults, so the same row is not
 re-delivered within the window — with one deliberate exception: PreToolUse
 re-delivers when the operation tokens about to run strongly match the row
 (the session-start hazard still fires before the dangerous command). The
@@ -2035,7 +2038,8 @@ What one purge does:
   needle): typically an evidence row no memory references — the rescan that
   owns those is issue #181;
 - scrubs the ids (and any needle-bearing entry) from the `<data>/ops/*.ledger`
-  delivery ledgers and removes orphaned `.ledger.tmp.*` and
+  delivery ledgers **and the issue-#252 JSONL segments
+  (`<hash>.ledger.seg.<hex>`)**, and removes orphaned `.ledger.tmp.*` and
   `.signals.tmp.*` partial writes. The
   `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl`/`.signals` ops
   sidecars are NOT scrubbed (outside the ledger contract; `.signals`

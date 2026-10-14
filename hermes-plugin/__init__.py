@@ -3818,9 +3818,11 @@ class ZmemMemoryProvider(MemoryProvider):
                                  old_session_id])
             # Review PRR-006: sanitize both interpolated fields (raw sid ->
             # _decision_sid allowlist; raw stderr -> _sanitize_store_error)
-            # and surface the store's own cleared flag — the child reports
-            # ok:true even when the clear was refused by a lock, so ok alone
-            # is not a faithful witness of the side effect.
+            # and surface the store's own cleared flag. (Issue #252 review
+            # round 2: since clear() propagates lock refusals, the child
+            # now exits 1 on contention instead of reporting ok:true — the
+            # cleared-flag parse below stays as the faithful witness for
+            # older children.)
             cleared = None
             try:
                 cleared = json.loads(result.get("stdout") or "{}").get(
