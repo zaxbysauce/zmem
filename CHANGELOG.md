@@ -5,6 +5,59 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.98.0] - 2026-10-14
+
+### Added
+- **Live-expiry runtime (issue #174, Workstream K PR 3):** passive
+  injection recall and recent now gate on `memory_expiry.inject_until` —
+  a row whose injection timestamp is at or before "now" (compared by its
+  parsed true instant, never lexically) never enters delivered results,
+  candidate lanes, budgeting, surfaced/retrieval telemetry, or the
+  delivery ledger. Every passive arrival is gated (tier fetches, the
+  cross-project tier, link expansion, virtual belief heads) with a
+  `limit * 2` over-fetch so expired rows never consume a live slot. The
+  injection envelope reports the pre-expiry `candidate_ids` (arrival
+  order) and an integer `expired` count, keyed only when the gate engaged
+  — stores without state rows keep byte-identical envelopes. A fully
+  expired-but-eligible pool names the new `expired` silent reason
+  (producer-only: the vocabulary was reserved by #153).
+- **`[EXPIRED]` markers on explicit recall and search:** present-time
+  (no `--as-of`) explicit recall and search retain expired rows with the
+  literal `[EXPIRED] ` content prefix and an `expired: true` flag in JSON
+  and fenced output; historical `--as-of` views neither filter nor mark.
+- **`--for-injection` + `--as-of` refused (issue #174 Design step 5):**
+  `store.py recall/recent` reject the pair before the store is opened —
+  exact stderr `--for-injection cannot be combined with --as-of`, exit 2,
+  no SQLite side effect.
+- **`doctor --expiring 7d` (issue #174 Design step 6):** a read-only
+  report listing state rows with `now < inject_until <= now + N days`,
+  ordered by `inject_until, memory_id` (parsed instants), each with
+  memory id, namespace, a content preview, expiry class, and the raw
+  timestamp. Honors the `ZMEM_TEST_NOW` read clock. Invalid forms exit 2
+  with `--expiring must be a nonnegative decimal integer followed by d`.
+- **`store.py classify-state --dry-run [--json]` (issue #174 Design step
+  7-8):** a deterministic read-only classifier (endpoint / metric /
+  setting regex precedence) proposing `state` + expiry class for live
+  rows; JSON output is byte-stable (sorted keys, indent 2). The store is
+  opened through a read-only URI with `PRAGMA query_only=ON`; no writer
+  lease is acquired.
+
+### Fixed
+- **Fractional ISO-8601 parsing (issue #327, absorbed by #174):**
+  `storelib.schema._parse_iso_to_epoch` resolves fractional-second
+  timestamps (`…T23:59:59.5Z`) to their true epoch instead of collapsing
+  them to 0.0 — the live-expiry gate, recency scoring, and the doctor
+  horizon all order blessed fractional `inject_until` forms by their real
+  instant. The #173-era ratchet pin that deliberately held the 0.0 seam
+  flipped to the true-instant assertion.
+
+### Changed
+- **Passive-lane over-fetch is the contract's `limit * 2`** on the expiry
+  lane (issue #174 Design step 1), replacing the `max(limit*3, limit+5)`
+  FTS window and the `limit * 5` recent profile scan on that lane only;
+  explicit and historical lanes are unchanged. The cross-project tier
+  keeps its 16× formula (a recorded deviation: the ≥2× floor holds).
+
 ## [0.97.0] - 2026-10-14
 
 ### Added

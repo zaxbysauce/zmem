@@ -300,6 +300,7 @@ def build_injection_envelope(
     candidate_lanes: dict | None = None,
     budget_note: str | None = None,
     effective_ops: list[str] | None = None,
+    expired: int | None = None,
 ) -> dict:
     """Build the closed passive-injection envelope shared by adapters."""
     envelope = {
@@ -337,6 +338,12 @@ def build_injection_envelope(
     if (isinstance(effective_ops, list)
             and all(isinstance(item, str) for item in effective_ops)):
         envelope["effective_ops"] = list(effective_ops)
+    # Issue #174: the live-expiry count, keyed ONLY when the expiry gate
+    # engaged (the passive lane saw a memory_expiry side row) — every store
+    # without state rows keeps the exact pre-#174 envelope bytes, holding
+    # the committed #158/#183 parity wires byte-identical.
+    if expired is not None:
+        envelope["expired"] = expired
     return envelope
 
 
@@ -1128,6 +1135,8 @@ def _recall_one_tier(
     stable_ties: bool = False,
     moment: str | None = None,
     lane: str | None = None,
+    expiry_lane: bool = False,
+    expiry_acc: dict | None = None,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -1185,8 +1194,14 @@ def _recall_one_tier(
         params.extend(as_of_params)
         params.append(floor)
         # Fetch more candidates than the limit so the composite re-ranking has
-        # a larger pool to choose from (BM25 rank != final rank).
-        fetch_limit = max(limit * 3, limit + 5)
+        # a larger pool to choose from (BM25 rank != final rank). On the
+        # passive expiry lane (issue #174) the over-fetch is the contract's
+        # `limit * 2` — headroom for the live-expiry gate to drop expired
+        # rows without starving the final `limit` window.
+        if expiry_lane:
+            fetch_limit = limit * 2
+        else:
+            fetch_limit = max(limit * 3, limit + 5)
         params.append(fetch_limit)
         sql = f"""
             SELECT m.id, m.namespace, m.type, m.content, m.tags, m.source_ref,
@@ -1536,6 +1551,20 @@ def _recall_one_tier(
     # the post-limit set — the same rows-in/rows-out counts as before MMR
     # existed, so filter semantics are unchanged. lambda=1.0 degenerates to
     # the pure score order above (equal to --no-mmr).
+    # Issue #174: on the passive lane the expiry gate runs on the FULL scored
+    # pool BEFORE any cut (the MMR window above included), so an expired row
+    # never spends a live slot; the pre-gate top-`limit` window is captured
+    # for the candidate-ids/expired-count diagnostics (expiry_acc).
+    if expiry_lane and expiry_acc is not None:
+        scored = _gate_passive_expiry(
+            conn, scored, limit=limit,
+            now_iso=_epoch_to_inject_iso(now_epoch), acc=expiry_acc)
+        if mmr and limit > 1 and len(scored) > 1:
+            emb_map = _fetch_embeddings_for_ids(
+                conn, [item["id"] for _score, item in scored]
+            )
+            scored = _mmr_order(scored, limit, MMR_LAMBDA, norm_map, emb_map)
+        return scored[:limit]
     if mmr and limit > 1 and len(scored) > 1:
         emb_map = _fetch_embeddings_for_ids(
             conn, [item["id"] for _score, item in scored]
@@ -2293,6 +2322,94 @@ def _now_epoch() -> float:
     return time.time()
 
 
+def _epoch_to_inject_iso(epoch: float) -> str:
+    """Canonical UTC ``...Z`` string for an epoch (the inject_until shape)."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _annotate_expiry(conn: sqlite3.Connection, rows: list) -> None:
+    """Attach each row's live-expiry timestamp (issue #174).
+
+    Sets ``row["inject_until"]`` to the side-table value or None (a missing
+    ``memory_expiry`` row is live). One batched lookup per chunk of ids;
+    idempotent. Works on the dict rows the tier builders produce and on the
+    appended arrivals (link expansion, virtual heads) alike. The key is
+    diagnostic-only: every emit path strips it before the wire.
+    """
+    need = [r["id"] for r in rows if "inject_until" not in r]
+    if not need:
+        return
+    found: dict[str, str] = {}
+    for start in range(0, len(need), 500):
+        chunk = need[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        try:
+            for row in conn.execute(
+                f"SELECT memory_id, inject_until FROM memory_expiry "
+                f"WHERE memory_id IN ({placeholders})", chunk):
+                found[row["memory_id"]] = row["inject_until"]
+        except sqlite3.OperationalError:
+            # A pre-v15 store (or a torn read) has no side table: every row
+            # is live, exactly like a missing side row.
+            break
+    for r in rows:
+        r.setdefault("inject_until", found.get(r["id"]))
+
+
+def _expiry_filter(rows: list[dict], *, now_iso: str) -> tuple[list[dict], int]:
+    """Live-expiry gate (issue #174): drop rows whose inject_until elapsed.
+
+    ``inject_until <= now`` (parsed to a true instant, never a lexical
+    compare — #327: fractional forms must order by their real time) is
+    expired; a missing/None timestamp (no side-table row) is live. Returns
+    the surviving rows in fetch order and the exact removed count. Pure: no
+    store I/O, no mutation of the input list.
+    """
+    now_epoch = _parse_iso_to_epoch(now_iso)
+    live: list[dict] = []
+    removed = 0
+    for r in rows:
+        iu = r.get("inject_until")
+        if iu and _parse_iso_to_epoch(iu) <= now_epoch:
+            removed += 1
+        else:
+            live.append(r)
+    return live, removed
+
+
+def _gate_passive_expiry(
+    conn: sqlite3.Connection, scored: list, *, limit: int, now_iso: str,
+    acc: dict,
+) -> list:
+    """Annotate + gate ONE passive tier's scored ``(score, row)`` pool.
+
+    Captures what the tier WOULD have returned (the top-``limit`` window,
+    pre-gate) into ``acc`` — ids and rows in arrival order plus the removed
+    count and the engaged flag — then drops expired rows from the whole
+    scored pool so the subsequent ``[:limit]`` cut never spends a slot on
+    an expired row (issue #174 Design step 1; the ``limit * 2`` over-fetch
+    upstream keeps the live window full).
+    """
+    _annotate_expiry(conn, [row for _, row in scored])
+    pre_cut = scored[:limit]
+    pre_rows = [row for _, row in pre_cut]
+    now_epoch = _parse_iso_to_epoch(now_iso)
+    live: list = []
+    for pair in scored:
+        row = pair[1]
+        iu = row.get("inject_until")
+        if iu and _parse_iso_to_epoch(iu) <= now_epoch:
+            acc["expired_ids"].add(row["id"])
+        else:
+            live.append(pair)
+    acc["pre_ids"].extend(r["id"] for r in pre_rows)
+    acc["pre_rows"].extend(pre_rows)
+    if any(row.get("inject_until") for _, row in scored):
+        acc["engaged"] = True
+    return live
+
+
 def _stable_score_desc(rows: list[dict]) -> list[dict]:
     """Return a stable numeric-score-descending view without mutating rows.
 
@@ -2331,6 +2448,19 @@ def _suppress_represented_by_head_ns(rows: list[dict],
     return rows
 
 
+def expiry_pre_pool(acc: dict, exclude_ids: list[str] | None) -> list[dict]:
+    """Pre-expiry candidate rows, deduped by id (first arrival), ledger-cut.
+
+    Issue #174: the silent-reason diagnosis basis — the pool as it would
+    have entered the gate absent expiry, minus the caller's exclusions.
+    """
+    rows = list({r["id"]: r for r in acc["pre_rows"]}.values())
+    if exclude_ids:
+        _ex = set(exclude_ids)
+        rows = [r for r in rows if r["id"] not in _ex]
+    return rows
+
+
 def _recall_injection_details(
     rows: list[dict],
     *,
@@ -2345,8 +2475,15 @@ def _recall_injection_details(
     query: str = "",
     cross_rerank: bool = False,
     global_withheld: int = 0,
+    expiry_acc: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """Apply the one passive post-retrieval decision pipeline.
+
+    ``expiry_acc`` (issue #174): the passive lane's live-expiry accumulator
+    (pre-expiry ids/rows, distinct expired ids, engaged flag). Its presence
+    alone changes nothing; only an ENGAGED gate (a side-table row was
+    visible) switches candidate_ids to the pre-expiry arrival order and
+    keys the ``expired`` count into the details.
 
     ``recall_memory`` and ``recent_memory`` intentionally acquire candidates
     differently, but neither owns a distinct injection gate, exclusion pass,
@@ -2448,10 +2585,33 @@ def _recall_injection_details(
         if exclude_ids:
             excluded_set = set(exclude_ids)
             gate_pool = [r for r in candidate_rows if r["id"] not in excluded_set]
+        # Issue #174 (R2-1/R2-4): when the expiry gate ENGAGED (a side-table
+        # row was visible to the passive lane), the pre-expiry basis takes
+        # over the silent diagnostics — the classifier's post-ledger pool is
+        # the PRE-expiry pool (so already-delivered cannot shadow expired),
+        # and expiry_drained reports whether the pre-expiry pool was eligible
+        # after omission, relevance, and ledger. When the gate never engaged
+        # (no side rows anywhere — every pre-#174 store), the legacy
+        # derivation is byte-identical to 0.97.0.
+        expiry_drained = False
+        post_ledger_pool = gate_pool
+        if expiry_acc is not None and expiry_acc["engaged"]:
+            post_ledger_pool = expiry_pre_pool(expiry_acc, exclude_ids)
+            # Diagnosis only: would the pre-expiry pool have been eligible?
+            # Omission mirrors the impl's risk/untrusted drop; relevance is
+            # the same selective gate; the ledger exclusion is applied by
+            # expiry_pre_pool. Never mutates anything the live lane emits.
+            diag, _, _ = selective_inject_filter(
+                list(post_ledger_pool), with_stats=True)
+            diag = [r for r in diag
+                    if not (r.get("prompt_injection_risk")
+                            or r.get("taint") == "untrusted_web")]
+            expiry_drained = bool(diag) and not gate_pool
         reason = classify_silent_reason(
             gate_pool, omitted=omitted, budget_emptied=budget_emptied,
             lane_stats=gate_stats, candidate_ids=candidate_ids,
-            post_ledger_rows=gate_pool)
+            post_ledger_rows=post_ledger_pool,
+            expiry_drained=expiry_drained)
 
     details = {
         "results": selected_rows,
@@ -2493,6 +2653,15 @@ def _recall_injection_details(
     # its caller supplied an exclusion list; preserve that byte/shape contract.
     if exclude_ids:
         details["excluded"] = excluded_count
+    # Issue #174: the live-expiry diagnostics are keyed ONLY when the gate
+    # engaged (a memory_expiry side row was visible to the passive lane), so
+    # every store without state rows keeps the exact 0.97.0 envelope bytes —
+    # the committed #158/#183 parity wires stay byte-identical. Engaged
+    # envelopes report the pre-expiry candidate ids in arrival order plus
+    # the integer expired count (distinct expired ids).
+    if expiry_acc is not None and expiry_acc["engaged"]:
+        details["expired"] = len(expiry_acc["expired_ids"])
+        details["candidate_ids"] = list(dict.fromkeys(expiry_acc["pre_ids"]))
     if margin_observed is not None:
         details["margin"] = format(margin_observed, ".6f")
         details["margin_pruned_ids"] = margin_pruned_ids
@@ -2655,6 +2824,19 @@ def _recall_memory_impl(
                 "the model-absent literal path never touches"
             )
     now_epoch = _now_epoch()
+    # Issue #174: the passive present-time lane (for_injection, no as_of)
+    # runs the live-expiry gate. The accumulator captures, in arrival
+    # order, what each tier/arrival WOULD have contributed pre-gate — the
+    # pre-expiry candidate ids and rows plus the distinct expired ids and
+    # the engaged flag — so the envelope can report `expired` and the
+    # silent reason can name `expired` without expired rows ever entering
+    # results, budgeting, or telemetry. The historical (--as-of) and
+    # explicit (non-injection) lanes never gate.
+    expiry_active = bool(for_injection) and as_of is None
+    expiry_acc: dict | None = (
+        {"pre_ids": [], "pre_rows": [], "expired_ids": set(), "engaged": False}
+        if expiry_active else None)
+    expiry_now_iso = _epoch_to_inject_iso(now_epoch) if expiry_active else None
     if scopes is not None:
         # Tier labels and independent reservations are not consumable by the
         # passive injection collector yet.  Refuse direct API mixing before
@@ -2752,6 +2934,7 @@ def _recall_memory_impl(
                 min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
                 as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
                 moment=effective_moment, lane=lane,
+                expiry_lane=expiry_active, expiry_acc=expiry_acc,
             )
 
     global_scored: list[tuple[float, dict]] = []
@@ -2767,6 +2950,7 @@ def _recall_memory_impl(
                 min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
                 as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
                 moment=effective_moment, lane=lane,
+                expiry_lane=expiry_active, expiry_acc=expiry_acc,
             )
 
     # Issue #235: the user:global tier floor.  The selector threads the
@@ -2921,11 +3105,28 @@ def _recall_memory_impl(
         # neighbour through expansion. On the plain path the pre-filter above
         # has already removed every excluded id from results, so seeds ==
         # results there and this is a no-op regardless of what was excluded.
-        results = results + expand_recall_links(
+        _expanded = expand_recall_links(
             conn, results, ns_list=ns_list, budget=link_budget, as_of=as_of,
             min_confidence=min_confidence, no_bump=no_bump,
             exclude_ids=exclude_ids,
         )
+        # Issue #174: link-expansion arrivals pass the expiry gate at append
+        # time on the passive lane (every arrival is gated; the neighbors a
+        # delivered seed pulls must not resurrect an expired row).
+        if expiry_active and expiry_acc is not None and _expanded:
+            _annotate_expiry(conn, _expanded)
+            _live_exp, _removed = _expiry_filter(
+                _expanded, now_iso=expiry_now_iso)
+            if _removed:
+                _live_ids = {r["id"] for r in _live_exp}
+                _gone = [r for r in _expanded if r["id"] not in _live_ids]
+                expiry_acc["expired_ids"].update(r["id"] for r in _gone)
+                expiry_acc["pre_ids"].extend(r["id"] for r in _gone)
+                expiry_acc["pre_rows"].extend(_gone)
+            if any(r.get("inject_until") for r in _expanded):
+                expiry_acc["engaged"] = True
+            _expanded = _live_exp
+        results = results + _expanded
 
     # Issue #82: change-intent lineage unfold — EXPLICIT recall only. Runs
     # AFTER the bump_ids capture (extras are neighbors that did not match the
@@ -2973,6 +3174,25 @@ def _recall_memory_impl(
                 omitted += 1
                 continue
             kept_cross.append((_score, item))
+        # Issue #174 (recorded deviation: the cross tier keeps its 16x fetch
+        # formula; the >=2x floor holds): its arrivals are gated HERE, at the
+        # splice boundary, so an expired cross row never enters results —
+        # every passive-lane arrival passes the gate.
+        if expiry_active and expiry_acc is not None and kept_cross:
+            _annotate_expiry(conn, [item for _, item in kept_cross])
+            now_e = _parse_iso_to_epoch(expiry_now_iso)
+            gated: list = []
+            for pair in kept_cross:
+                iu = pair[1].get("inject_until")
+                if iu and _parse_iso_to_epoch(iu) <= now_e:
+                    expiry_acc["expired_ids"].add(pair[1]["id"])
+                    expiry_acc["pre_ids"].append(pair[1]["id"])
+                    expiry_acc["pre_rows"].append(pair[1])
+                else:
+                    gated.append(pair)
+            if any(item.get("inject_until") for _, item in kept_cross):
+                expiry_acc["engaged"] = True
+            kept_cross = gated
         cross_bump_ids = _splice_cross_rows(results, kept_cross)
         bump_ids = bump_ids + cross_bump_ids
 
@@ -3029,10 +3249,47 @@ def _recall_memory_impl(
                 omitted += 1
                 continue
             _merged.append(_b)
+        # Issue #174: virtual-head arrivals pass the expiry gate at append
+        # time on the passive lane — an expired belief head must not ride
+        # into the delivered fence either.
+        if expiry_active and expiry_acc is not None and _merged:
+            _annotate_expiry(conn, _merged)
+            _live_heads, _removed = _expiry_filter(
+                _merged, now_iso=expiry_now_iso)
+            if _removed:
+                _live_ids = {r["id"] for r in _live_heads}
+                _gone = [r for r in _merged if r["id"] not in _live_ids]
+                expiry_acc["expired_ids"].update(r["id"] for r in _gone)
+                expiry_acc["pre_ids"].extend(r["id"] for r in _gone)
+                expiry_acc["pre_rows"].extend(_gone)
+            if any(r.get("inject_until") for r in _merged):
+                expiry_acc["engaged"] = True
+            _merged = _live_heads
         results = results + _merged
         # Keep the flagged-row telemetry honest after the merge (F-002).
         injection_risk_count += sum(
             1 for r in _merged if r.get("prompt_injection_risk"))
+
+    # Issue #174 (Design step 4): present-time EXPLICIT recall (and search,
+    # which dispatches here with for_injection unset) marks expired rows
+    # instead of filtering them — content gains the literal "[EXPIRED] "
+    # prefix and the row gains expired: true. Historical views (--as-of) and
+    # every passive lane are untouched (no marker, no filter). Rows without
+    # a side-table record are never annotated.
+    if as_of is None and not for_injection and results:
+        _annotate_expiry(conn, results)
+        _mark_epoch = _parse_iso_to_epoch(_epoch_to_inject_iso(now_epoch))
+        for _r in results:
+            _iu = _r.get("inject_until")
+            if _iu and _parse_iso_to_epoch(_iu) <= _mark_epoch:
+                _r["expired"] = True
+                if not _r["content"].startswith("[EXPIRED] "):
+                    _r["content"] = "[EXPIRED] " + _r["content"]
+            # The annotation is diagnostic-only: the contract authorizes
+            # exactly `expired: true` + the content prefix on the wire, so
+            # the raw timestamp never appears in a result row (every
+            # pre-#174 envelope stays byte-identical).
+            _r.pop("inject_until", None)
 
     injection_details = None
     if for_injection:
@@ -3044,8 +3301,13 @@ def _recall_memory_impl(
             namespace=namespace, fence_id=fence_id,
             query=query, cross_rerank=cross_rerank,
             global_withheld=global_floor_withheld,
+            expiry_acc=expiry_acc,
         )
         results = injection_details["results"]
+        for _r in results:
+            # Diagnostic-only annotation (see the marker pass): never on
+            # the delivered wire.
+            _r.pop("inject_until", None)
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
         # were also QUERY-MATCHED — the pre-expansion bump set (same law as
         # ever: link neighbors render but never feed the counters;
@@ -4061,6 +4323,9 @@ def _recent_one_tier(
     stable_ties: bool = False,
     moment: str | None = None,
     lane: str | None = None,
+    expiry_lane: bool = False,
+    expiry_acc: dict | None = None,
+    expiry_now_iso: str | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories for ONE namespace set
     (a single recent tier). No FTS, no bump, no print — caller merges, bumps,
@@ -4090,7 +4355,16 @@ def _recent_one_tier(
     params.extend(as_of_params)
     live_clause = "" if as_of else "superseded_at IS NULL AND"
     params.append(limit)
-    if moment is not None:
+    if expiry_lane:
+        # Issue #174: the passive lane's source scan is the contract's
+        # `limit * 2` — headroom for the live-expiry gate — replacing both
+        # the moment-profile multiplier and the bare admin limit.
+        params[-1] = limit * 2
+        order_clause = ("ingestion_ts DESC, rowid DESC"
+                        if moment is not None else
+                        ("ingestion_ts DESC, id" if stable_ties
+                         else "ingestion_ts DESC"))
+    elif moment is not None:
         # Over-fetch before re-sorting so a profile can promote a row which
         # chronological SQL ordering would otherwise cut at the limit.
         params[-1] = limit * RECENT_PROFILE_SCAN_MULTIPLIER
@@ -4111,7 +4385,11 @@ def _recent_one_tier(
             ORDER BY {order_clause} LIMIT ?""",
         params,
     ).fetchall()
-    if moment is not None:
+    if moment is not None and not expiry_lane:
+        # Issue #174: the passive expiry lane must NOT pre-cut here — the
+        # gate below needs the full limit*2 pool so an expired row never
+        # spends a live slot (the gate re-orders and re-cuts itself). Every
+        # non-expiry caller keeps the exact pre-#174 behavior.
         rows = sorted(
             rows,
             key=lambda r: (
@@ -4149,6 +4427,35 @@ def _recent_one_tier(
             "prompt_injection_risk": _has_injection_risk_tag(r["tags"]),
             "_stale_note": stale_note,
         })
+    if expiry_lane and expiry_acc is not None:
+        # Issue #174: profile-order the FULL over-fetched pool, capture the
+        # pre-gate top-`limit` window, then gate and re-cut — an expired row
+        # never spends a live slot and never reaches the merge. The clock is
+        # the caller's single `_now_epoch()` read (expiry_now_iso).
+        if moment is not None:
+            # Profile-order via the index-aligned SQL rows (they carry
+            # ingestion_ts; the emitted dicts do not). Stable: equal profile
+            # scores keep the (ingestion_ts DESC, rowid DESC) fetch order.
+            _order = sorted(
+                range(len(results)),
+                key=lambda i: (
+                    -type_preference(rows[i]["type"], moment=moment, lane=lane),
+                    -_parse_iso_to_epoch(rows[i]["ingestion_ts"] or ""),
+                ))
+            results = [results[i] for i in _order]
+        _annotate_expiry(conn, results)
+        pre_rows = results[:limit]
+        live, removed = _expiry_filter(results, now_iso=expiry_now_iso)
+        expiry_acc["pre_ids"].extend(r["id"] for r in pre_rows)
+        expiry_acc["pre_rows"].extend(pre_rows)
+        if removed:
+            _pre_ids = {r["id"] for r in pre_rows}
+            _live_ids = {r["id"] for r in live}
+            expiry_acc["expired_ids"].update(
+                r["id"] for r in pre_rows if r["id"] not in _live_ids)
+        if any(r.get("inject_until") for r in results):
+            expiry_acc["engaged"] = True
+        return live[:limit]
     return results
 
 
@@ -4273,6 +4580,14 @@ def _recent_memory_impl(
     effective_moment = moment if moment is not None else _cross_moment
     scoped_slots = _tier_slots() if scopes is not None else None
     as_of = _normalize_as_of(as_of)
+    # Issue #174: the passive recent lane runs the same live-expiry gate as
+    # recall (one accumulator, one clock read; the historical --as-of lane
+    # never gates).
+    expiry_active = bool(for_injection) and as_of is None
+    expiry_acc = ({"pre_ids": [], "pre_rows": [], "expired_ids": set(),
+                   "engaged": False}
+                  if expiry_active else None)
+    expiry_now = _epoch_to_inject_iso(_now_epoch()) if expiry_active else None
     if scopes is not None:
         pools = _scoped_recent_pools(
             conn, scopes=scopes, include_global=include_global,
@@ -4290,6 +4605,8 @@ def _recent_memory_impl(
                 conn, ns_list=_expand_namespace_aliases(conn, namespace),
                 limit=limit, min_confidence=min_confidence, as_of=as_of,
                 moment=effective_moment, lane=lane,
+                expiry_lane=expiry_active, expiry_acc=expiry_acc,
+                expiry_now_iso=expiry_now,
             )
         else:
             # Unscoped: one tier, no namespace filter (searches everything).
@@ -4297,6 +4614,8 @@ def _recent_memory_impl(
                 conn, ns_list=None, limit=limit,
                 min_confidence=min_confidence, as_of=as_of,
                 moment=effective_moment, lane=lane,
+                expiry_lane=expiry_active, expiry_acc=expiry_acc,
+                expiry_now_iso=expiry_now,
             )
 
     # Global tier fold-in — same guard/rationale as recall_memory (see M2).
@@ -4306,6 +4625,8 @@ def _recent_memory_impl(
             conn, ns_list=_expand_namespace_aliases(conn, GLOBAL_NAMESPACE),
             limit=global_limit, min_confidence=min_confidence, as_of=as_of,
             moment=effective_moment, lane=lane,
+            expiry_lane=expiry_active, expiry_acc=expiry_acc,
+            expiry_now_iso=expiry_now,
         )
         # Merge project-first (hard floor) then global, dedup by id.
         seen: set[str] = {r["id"] for r in project_rows}
@@ -4340,6 +4661,20 @@ def _recent_memory_impl(
         # PR #207 review: mirror the recall lane's project -> cross -> global
         # tier order (and keep the mirror honest if this latent path ever
         # gains a query) instead of appending past the global rows.
+        if expiry_active and expiry_acc is not None and cross_scored:
+            _items = [row for _, row in cross_scored]
+            _annotate_expiry(conn, _items)
+            _live_items, _removed = _expiry_filter(_items, now_iso=expiry_now)
+            if _removed:
+                _live_ids = {r["id"] for r in _live_items}
+                _gone = [r for r in _items if r["id"] not in _live_ids]
+                expiry_acc["expired_ids"].update(r["id"] for r in _gone)
+                expiry_acc["pre_ids"].extend(r["id"] for r in _gone)
+                expiry_acc["pre_rows"].extend(_gone)
+                cross_scored = [(sc, r) for sc, r in cross_scored
+                                if r["id"] in _live_ids]
+            if any(r.get("inject_until") for r in _items):
+                expiry_acc["engaged"] = True
         _splice_cross_rows(results, cross_scored)
     omitted = 0
     if no_bump:
@@ -4365,8 +4700,11 @@ def _recent_memory_impl(
             injection_risk=injection_risk_count,
             budget_tokens=_injection_budget_tokens,
             namespace=namespace, fence_id=_fence_id or "",
+            expiry_acc=expiry_acc,
         )
         results = injection_details["results"]
+        for _r in results:
+            _r.pop("inject_until", None)
         if results:
             # no_telemetry (the eval harness) records nothing; the filters
             # above still ran.

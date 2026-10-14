@@ -699,12 +699,17 @@ class StateWriteTest(_StoreCase):
             state_expiry.compute_inject_until(
                 "endpoint", now="2026-09-10T00:00:00.123456789Z"),
             "2026-10-10T00:00:00.123456789Z")
-        # Documented seam for #174: the store's epoch parser (unchanged by
-        # #173) cannot read ANY fractional form — it returns 0.0. Pinning the
-        # behavior makes the follow-up obligation visible and drift-proof.
+        # #327 (absorbed by #174): the store's epoch parser now resolves
+        # fractional forms to their true instant — the old whole-second-only
+        # strptime returned 0.0 for every blessed fractional form. The pin
+        # flipped from 0.0 to the true epoch when #174 landed the live-expiry
+        # gate (the #173-era comment named #174 as the successor owner).
         from storelib.schema import _parse_iso_to_epoch
-        self.assertEqual(_parse_iso_to_epoch("2026-12-31T23:59:59.5Z"), 0.0)
-        self.assertNotEqual(_parse_iso_to_epoch("2026-12-31T23:59:59Z"), 0.0)
+        self.assertEqual(_parse_iso_to_epoch("2026-12-31T23:59:59.5Z"),
+                         1798761599.5)
+        self.assertEqual(_parse_iso_to_epoch("2026-12-31T23:59:59Z"),
+                         1798761599.0)
+        self.assertEqual(_parse_iso_to_epoch("not-a-timestamp"), 0.0)
 
     def test_env_ttl_overflow_and_non_ascii_are_refused(self):
         # #173 PR-review F10: (a) an oversized TTL must surface as ValueError

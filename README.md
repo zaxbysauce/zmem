@@ -1026,8 +1026,8 @@ closed lane vocabulary is `claude`, `codex`, `zcode`, `hermes-provider`, and
 `hermes-compat`. Runtime moments are `session_start`, `user_prompt`,
 `pretool`, `subagent`, and `precompact`. The exact silent-reason vocabulary is
 `empty-pool`, `omitted`, `below-bar`, `budget-drop`, `below-relevance`,
-`already-delivered`, and `expired`; `expired` is reserved for the expiry
-workstream and has no producer here. `reason=injected` is the successful
+`already-delivered`, and `expired`; `expired` names a pool that was eligible
+before the live-expiry gate drained it (issue #174). `reason=injected` is the successful
 decision, while `reason=disabled` is the separate passive-injection kill-switch
 marker.
 
@@ -1268,13 +1268,40 @@ an additive `memory_expiry` side table (`memory_id`, `inject_until`,
 | `metric`  | 14 days | `ZMEM_STATE_METRIC_DAYS` |
 
 An omitted `--inject-until` computes `now + TTL`; an explicit one must be UTC
-ISO-8601 (`...Z` or `+00:00`) and bypasses the TTL. The side table is
-injection-only — passive injection will later stop delivering an expired row
-(issue #174), but the row is never deleted and stays reachable through explicit
-`recall`/`search`. The TTL overrides are per-call reads, so an operator can
-tighten or widen a class without a rebuild. Export/import round-trips the
-records as a `memory_expiry` JSONL kind immediately following each parent
-memory record.
+ISO-8601 (`...Z` or `+00:00`, fractional seconds preserved) and bypasses the
+TTL. The side table is injection-only: since 0.98.0 (issue #174) **passive
+injection stops delivering an expired row** — `inject_until <= now`, compared
+by the parsed true instant — at an inclusive boundary, on `recall
+--for-injection`, `recent --for-injection`, and the Hermes prefetch lane
+alike. Expired rows never enter delivered results, candidate lanes, budget
+accounting, or surfaced/retrieval telemetry; the injection envelope keeps the
+pre-expiry `candidate_ids` (arrival order) and reports an integer `expired`
+count (keyed only when the gate engaged), and a fully-expired-but-eligible
+pool names the `expired` silent reason. The row itself is never deleted:
+explicit present-time `recall`/`search` keep returning it with an
+`[EXPIRED] ` content prefix and an `expired: true` flag, and `--as-of` views
+neither filter nor mark. `--for-injection` combined with `--as-of` is refused
+before the store is opened (exit 2). The TTL overrides are per-call reads, so
+an operator can tighten or widen a class without a rebuild. Export/import
+round-trips the records as a `memory_expiry` JSONL kind immediately following
+each parent memory record.
+
+Two read-only operators cover the horizon (issue #174):
+
+```bash
+# state rows whose inject_until falls within the next N days
+python skills/memory/scripts/doctor.py --store <store> --expiring 7d --format json
+
+# deterministic state-candidate classification (dry-run only; no writes)
+python skills/memory/scripts/store.py classify-state --dry-run --json
+```
+
+`doctor --expiring` lists `now < inject_until <= now + N days` ordered by
+`inject_until, memory_id` (parsed instants; honors `ZMEM_TEST_NOW`).
+`classify-state` proposes `state` + an expiry class (`endpoint` > `metric` >
+`setting` regex precedence) for every live row and is strictly read-only: the
+store is opened through a read-only URI with `PRAGMA query_only=ON` and no
+writer lease is acquired.
 
 The full command reference is in the `memory` skill (type `/memory` in ZCode).
 

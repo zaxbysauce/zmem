@@ -438,8 +438,9 @@ historical `moment=` field and before later additive tails (`arms=`,
 `codex`, `zcode`, `hermes-provider`, and `hermes-compat`; runtime moments are
 `session_start`, `user_prompt`, `pretool`, `subagent`, and `precompact`.
 Silent reasons are exactly `empty-pool`, `omitted`, `below-bar`, `budget-drop`,
-`below-relevance`, `already-delivered`, and `expired` (`expired` is reserved
-for the expiry workstream and has no producer here). `reason=injected` is a
+`below-relevance`, `already-delivered`, and `expired` (`expired` names a pool
+that was eligible before the live-expiry gate drained it — issue #174's
+producer; every other condition keeps its precedence). `reason=injected` is a
 successful decision and `reason=disabled` is the separate kill-switch marker.
 
 `already-delivered` is selected when pre-ledger candidate ids are nonempty but
@@ -1147,6 +1148,29 @@ should stop being injected, it never deletes the row or hides it from explicit
 `recall`/`search`. Passing either flag with a non-state type, or omitting
 `--expiry-class` on a state add, is refused exit 2. `update` carries the same
 two flags and the same rules.
+
+Since 0.98.0 (issue #174) the recorded expiry is ENFORCED on read: passive
+injection (`recall --for-injection`, `recent --for-injection`, the Hermes
+prefetch lane) never delivers a row whose `inject_until <= now` — the
+comparison is by parsed true instant (fractional seconds order by their real
+time), inclusive at the boundary. Expired rows never reach results, candidate
+lanes, budget accounting, or surfaced/retrieval telemetry; the envelope keeps
+the pre-expiry `candidate_ids` and reports an `expired` count (keyed only when
+the gate engaged), and a fully-expired-but-eligible pool names the `expired`
+silent reason. Present-time explicit `recall`/`search` return expired rows
+marked `[EXPIRED] ` with `expired: true` instead of filtering; `--as-of`
+neither filters nor marks. `--for-injection` + `--as-of` is refused exit 2
+before the store opens. Two read-only operators complete the surface:
+`doctor --expiring 7d` (rows with `now < inject_until <= now + N days`,
+parsed-instant ordered) and `store.py classify-state --dry-run [--json]`
+(deterministic endpoint/metric/setting proposal; read-only URI +
+`PRAGMA query_only=ON`, never a writer lease).
+
+**Fake-clock seam.** Reads honor `ZMEM_TEST_NOW` (the scoring clock
+`_now_epoch`): the expiry gate, the `[EXPIRED]` markers, and
+`doctor --expiring` are all deterministic under it. WRITES never do — the
+writer clock is `schema.now_iso()` alone (issue #173's contract), so a pinned
+`ZMEM_TEST_NOW` can only move read-time judgments, never a stored timestamp.
 Signal sets default confidence: test/compile=0.9, lint=0.85, reviewer/user=0.6
 (medium), none=0.2 — deliberately BELOW the 0.25 recall floor: an ungrounded
 lesson is the agent's self-opinion and never surfaces in default recall (still

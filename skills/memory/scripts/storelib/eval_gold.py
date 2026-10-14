@@ -342,8 +342,8 @@ def _injection_silent_reasons() -> tuple:
     import schema_meta as _sm  # lazy: keep module import cheap
 
     # Keep the partial-deployment fallback byte-identical to schema_meta and
-    # storelib.inject.  ``expired`` is reserved vocabulary; no producer is
-    # introduced here (issue #153 / #174 boundary).
+    # storelib.inject.  ``expired`` names a pool the live-expiry gate drained
+    # (producer since #174; the vocabulary was reserved by #153).
     return tuple(
         getattr(
             _sm,

@@ -358,7 +358,7 @@ INJECT_FLOOR_USER_GLOBAL_ENV = "ZMEM_INJECT_FLOOR_USER_GLOBAL"
 # Closed attribution vocabularies for passive injection decisions (issue #153,
 # Workstream G).  These are wire values, not presentation labels: every
 # producer, parser, and report must use the same order and spelling.  ``expired``
-# is reserved for the expiry workstream and intentionally has no producer here.
+# names an eligible pool drained by the live-expiry gate (issue #174).
 INJECT_LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
 INJECT_MOMENTS = ("session_start", "user_prompt", "pretool", "subagent",
                   "precompact")

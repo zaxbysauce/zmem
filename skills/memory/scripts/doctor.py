@@ -4554,6 +4554,8 @@ def build_report(
     cleanup_training_staging: bool = False,
     training_staging_max_age_hours: float = 24.0,
     confirm_no_training_export: bool = False,
+    now: str | None = None,
+    expiring: str | None = None,
 ) -> dict:
     staging_cleanup = None
     if cleanup_training_staging:
@@ -4662,7 +4664,7 @@ def build_report(
         if namespace_check["status"] == "pass"
         else None
     )
-    return {
+    report = {
         "doctor_version": 1,
         "ok": counts["fail"] == 0,
         "summary": counts,
@@ -4675,6 +4677,77 @@ def build_report(
         "recommendations": recommendations,
         "training_staging_cleanup": staging_cleanup,
     }
+    # Issue #174: `--expiring` — read-only listing of state rows whose
+    # inject_until falls inside (now, now + N days], ordered by
+    # (inject_until, memory_id). Keyed ONLY when the flag was given so
+    # every pre-#174 report stays byte-identical. The comparison is by
+    # PARSED INSTANT (#327): fractional inject_until forms order by their
+    # true time, never lexically — the SQL fetch carries no inject_until
+    # predicate at all and Python decides the window and the order.
+    if expiring is not None:
+        report["expiring_states"] = _expiring_states(
+            resolved_store, expiring, now)
+    return report
+
+
+def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
+    """Rows with now < inject_until <= now + N days, parsed-instant ordered.
+
+    Read-only (mode=ro); a missing store, a pre-v15 store without the side
+    table, or a zero-match horizon all yield []. A content preview is the
+    first 80 characters with newlines collapsed to spaces.
+    """
+    import re as _re
+    from storelib.schema import _parse_iso_to_epoch, now_iso
+
+    m = _re.fullmatch(r"(0|[1-9][0-9]*)d", horizon)
+    if not m:
+        # main() validates the form before build_report runs; a direct
+        # caller gets the same refusal.
+        raise ValueError(
+            "--expiring must be a nonnegative decimal integer followed by d")
+    days = int(m.group(1))
+    now_str = now if now is not None else now_iso()
+    now_e = _parse_iso_to_epoch(now_str)
+    if now_e <= 0:
+        return []
+    horizon_e = now_e + days * 86400.0
+    if not store_path.is_file():
+        return []
+    uri = store_path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    out: list[dict] = []
+    try:
+        conn.execute("PRAGMA query_only=1")
+        rows = conn.execute(
+            "SELECT me.memory_id, me.inject_until, me.expiry_class, "
+            "m.namespace, m.content, m.superseded_at "
+            "FROM memory_expiry me JOIN memory m ON m.id = me.memory_id"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    for row in rows:
+        if row["superseded_at"]:
+            continue
+        until_e = _parse_iso_to_epoch(row["inject_until"] or "")
+        if until_e <= 0 or not (now_e < until_e <= horizon_e):
+            continue
+        preview = " ".join((row["content"] or "").split())[:80]
+        out.append({
+            "memory_id": row["memory_id"],
+            "namespace": row["namespace"],
+            "content_preview": preview,
+            "expiry_class": row["expiry_class"],
+            "inject_until": row["inject_until"],
+            "_until_e": until_e,
+        })
+    out.sort(key=lambda r: (r["_until_e"], r["memory_id"]))
+    for r in out:
+        del r["_until_e"]
+    return out
 
 
 def _report_lane_status(resolved_store: Path) -> dict:
@@ -4865,6 +4938,13 @@ def main(argv: list[str] | None = None) -> int:
         "— take a snapshot and pass --store <snapshot path>",
     )
     ap.add_argument(
+        "--expiring",
+        dest="expiring",
+        type=str,
+        default=None,
+        help="show state rows expiring within N days, for example 7d",
+    )
+    ap.add_argument(
         "--miss-db",
         default=os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
         help="ZCode episodic db for the failure side of the miss-rate join "
@@ -4930,6 +5010,17 @@ def main(argv: list[str] | None = None) -> int:
                 "--confirm-no-training-export"
             )
 
+    expiring_horizon = None
+    if args.expiring is not None:
+        import re as _re_exp
+        if not _re_exp.fullmatch(r"(0|[1-9][0-9]*)d", args.expiring):
+            ap.error("--expiring must be a nonnegative decimal integer followed by d")
+        expiring_horizon = args.expiring
+    # Issue #174: doctor is read-only, so the TEST clock seam is a READ:
+    # ZMEM_TEST_NOW (the same pin recall honors) overrides the wall clock
+    # for the --expiring window when set; unset -> schema.now_iso().
+    _now_override = os.environ.get("ZMEM_TEST_NOW", "").strip() or None
+
     miss_rate_opts = None
     if args.miss_rate:
         miss_rate_opts = {
@@ -4952,6 +5043,8 @@ def main(argv: list[str] | None = None) -> int:
         cleanup_training_staging=args.cleanup_training_staging,
         training_staging_max_age_hours=args.training_staging_max_age_hours,
         confirm_no_training_export=args.confirm_no_training_export,
+        now=_now_override,
+        expiring=expiring_horizon,
     )
     human = _render_human(report)
     payload = json.dumps(report, indent=2, sort_keys=True)

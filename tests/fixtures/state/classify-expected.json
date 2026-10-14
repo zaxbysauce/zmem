@@ -1,0 +1,35 @@
+{
+  "changed": 3,
+  "count": 4,
+  "proposals": [
+    {
+      "current_type": "state",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "matched_rule": "endpoint",
+      "proposed_expiry_class": "endpoint",
+      "proposed_type": "state"
+    },
+    {
+      "current_type": "state",
+      "id": "00000000-0000-4000-8000-000000000002",
+      "matched_rule": "metric",
+      "proposed_expiry_class": "metric",
+      "proposed_type": "state"
+    },
+    {
+      "current_type": "state",
+      "id": "00000000-0000-4000-8000-000000000003",
+      "matched_rule": "setting",
+      "proposed_expiry_class": "setting",
+      "proposed_type": "state"
+    },
+    {
+      "current_type": "state",
+      "id": "00000000-0000-4000-8000-000000000004",
+      "matched_rule": "none",
+      "proposed_expiry_class": null,
+      "proposed_type": "state"
+    }
+  ],
+  "scanned": 4
+}

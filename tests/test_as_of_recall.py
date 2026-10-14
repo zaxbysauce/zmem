@@ -361,6 +361,122 @@ class AsOfBehaviorTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_expiry_is_bypassed_for_as_of(self):
+        """Issue #174 AC4: the --as-of history view bypasses the live-expiry
+        gate. The three committed expiry-input.jsonl rows (namespace
+        fixture:expiry-174 — the writer rejects that namespace but direct
+        INSERT is fine) are direct-INSERTed; recall --as-of T_ZERO --json
+        must return all three contents UNMARKED, and the canonical
+        [{content,id,namespace}...] projection sorted by id must be
+        BYTE-IDENTICAL to tests/fixtures/asof/expiry-golden.json
+        (json.dumps sort_keys indent 2).
+
+        ZMEM_TEST_NOW rides only inside the clock-sensitive READ subprocess
+        env (never ambient, never on a writer) per the store-test discipline.
+        """
+        import json
+        import sqlite3
+        import subprocess
+
+        from storelib.schema import migrate
+
+        conn = sqlite3.connect(self.store_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            migrate(conn)
+            for line in (REPO_ROOT / "tests" / "fixtures" / "asof" /
+                         "expiry-input.jsonl").read_text(
+                             encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                conn.execute(
+                    "INSERT INTO memory (id, namespace, type, content, tags, "
+                    "source_ref, source_hash, confidence, signal, valid_from, "
+                    "superseded_at, ingestion_ts, retrieval_count, "
+                    "last_retrieved, surfaced_count, last_surfaced, "
+                    "merged_from, content_norm, valid_until, update_of, "
+                    "taint, trust_score, applied_count, violated_count, "
+                    "embedding, embedding_model, embedded_at, consolidated_at, "
+                    "supersede_reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, NULL, ?, "
+                    "0, NULL, 0, NULL, NULL, '', '', '', 'trusted_internal', "
+                    "1.0, 0, 0, NULL, '', NULL, NULL, '')",
+                    (rec["id"], rec["namespace"], rec["type"], rec["content"],
+                     rec.get("tags", ""), rec.get("source_ref", ""),
+                     rec.get("confidence", 0.9), rec.get("signal", "grounded"),
+                     rec.get("valid_from", rec["ingestion_ts"]),
+                     rec["ingestion_ts"]),
+                )
+                conn.execute(
+                    "INSERT INTO memory_expiry (memory_id, inject_until, "
+                    "expiry_class) VALUES (?, ?, ?)",
+                    (rec["id"], rec["inject_until"], rec["expiry_class"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+        env = {
+            **{k: v for k, v in os.environ.items()
+               if k not in ("ZMEM_TEST_NOW", "ZMEM_DATA", "ZMEM_MODELS_DIR")},
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_MODELS_DIR": str(Path(self.tmp) / "no-such-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_TEST_NOW": "2026-09-10T00:00:00Z",
+        }
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS_DIR / "store.py"),
+                "recall",
+                "--query",
+                "expiry-row",
+                "--namespace",
+                "fixture:expiry-174",
+                "--as-of",
+                "2026-09-10T00:00:00Z",
+                "--json",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        envelope = json.loads(r.stdout)
+        rows = envelope.get("results", [])
+        self.assertEqual(
+            sorted(row.get("id") for row in rows),
+            sorted(
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                    "00000000-0000-4000-8000-000000000003",
+                ]
+            ),
+            f"as-of recall must surface all three fixture rows, got "
+            f"{[row.get('id') for row in rows]}",
+        )
+        for row in rows:
+            self.assertFalse(
+                (row.get("content") or "").startswith("[EXPIRED] "),
+                f"as-of view leaked the expiry marker onto {row.get('id')}: "
+                f"{row.get('content')!r}",
+            )
+        projection = [
+            {"content": row.get("content"), "id": row.get("id"),
+             "namespace": row.get("namespace")}
+            for row in sorted(rows, key=lambda row: row.get("id"))
+        ]
+        golden_path = (REPO_ROOT / "tests" / "fixtures" / "asof" /
+                       "expiry-golden.json")
+        self.assertEqual(
+            json.dumps(projection, sort_keys=True, indent=2).encode("utf-8"),
+            golden_path.read_bytes(),
+            "the canonical as-of projection must be byte-identical to the "
+            "committed expiry-golden.json",
+        )
+
     def test_superseded_row_valid_inside_window_gone_at_or_after_end(self):
         """Issue #59, 4.4: complete --as-of against valid_until. as_of must
         drop the hard ``superseded_at IS NULL`` live filter (a historically
@@ -468,6 +584,60 @@ class Iso8601ArgparseTests(unittest.TestCase):
         for bad in ["", "not-a-date", "2026-13-01T00:00:00Z"]:
             with self.assertRaises(argparse.ArgumentTypeError):
                 _iso8601(bad)
+
+    def test_for_injection_as_of_exits_two(self):
+        """Issue #174 AC5: --for-injection cannot be combined with --as-of.
+        Both recall and recent reject the pair with exit 2 and the pinned
+        stderr message BEFORE any store is opened — ZMEM_STORE points at a
+        NONEXISTENT path under a fresh tmp dir per command, and the store
+        file must not exist afterwards."""
+        import subprocess
+        import tempfile
+
+        message = "--for-injection cannot be combined with --as-of"
+        cases = [
+            ("recall", ["recall", "--query", "expiry-row",
+                        "--namespace", "fixture:expiry-174", "--for-injection",
+                        "--as-of", "2026-09-10T00:00:00Z", "--json"]),
+            ("recent", ["recent", "--for-injection",
+                        "--as-of", "2026-09-10T00:00:00Z",
+                        "--namespace", "fixture:expiry-174"]),
+        ]
+        for name, argv in cases:
+            with self.subTest(command=name):
+                tmp = tempfile.mkdtemp(prefix=f"zmem-asof-pair-{name}-")
+                try:
+                    store_file = Path(tmp) / "store.sqlite"
+                    env = {
+                        **{k: v for k, v in os.environ.items()
+                           if not k.startswith("ZMEM_")},
+                        "ZMEM_STORE": str(store_file),
+                        "ZMEM_DATA": tmp,
+                        "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                    }
+                    r = subprocess.run(
+                        [sys.executable, str(SCRIPTS_DIR / "store.py"), *argv],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    self.assertEqual(
+                        r.returncode, 2,
+                        f"{name} accepted the forbidden pair: rc="
+                        f"{r.returncode} (stdout={r.stdout.strip()[:120]})")
+                    self.assertIn(
+                        message, r.stderr,
+                        f"{name} stderr must contain {message!r}, got "
+                        f"{r.stderr.strip()[:300]!r}")
+                    self.assertFalse(
+                        store_file.exists(),
+                        f"{name} opened the store before rejecting the pair "
+                        f"({store_file} exists)")
+                finally:
+                    import shutil
+
+                    shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -439,6 +439,43 @@ class StorelibClassifierContractTests(unittest.TestCase):
         self.assertEqual(classify([{"id": "candidate"}]), "below-bar")
         self.assertEqual(classify([]), "empty-pool")
 
+    def test_expired_requires_expiry_drained_pool(self):
+        """Issue #174: ``expired`` is keyed on the caller's expiry_drained
+        diagnosis — rows == [] (every rows-consuming branch fell through),
+        budget not emptied, nothing omitted, and the pre-expiry pool was
+        eligible after omission, relevance, and ledger. Without the flag the
+        same shape degrades to empty-pool; omitted and budget-drop keep
+        their precedence over it."""
+        classify = self.inject.classify_silent_reason
+        self.assertEqual(
+            classify([], omitted=0, budget_emptied=False, expiry_drained=True),
+            "expired")
+        self.assertEqual(
+            classify([], omitted=0, budget_emptied=False, expiry_drained=False),
+            "empty-pool",
+            "expiry_drained=False with an empty pool is empty-pool, never "
+            "expired")
+        self.assertEqual(
+            classify([], omitted=2, budget_emptied=False, expiry_drained=True),
+            "omitted",
+            "omitted keeps precedence over expired")
+        self.assertEqual(
+            classify([], omitted=0, budget_emptied=True, expiry_drained=True),
+            "budget-drop",
+            "budget-drop keeps precedence over expired")
+
+    def test_live_below_relevance_wins_over_expired(self):
+        """Issue #174: a LIVE trust-passing row that failed a relevance
+        floor names below-relevance even when expiry drained other rows —
+        the pool was not empty for relevance purposes, so expiry cannot
+        claim the silence."""
+        classify = self.inject.classify_silent_reason
+        self.assertEqual(
+            classify([{"id": "weak-live"}],
+                     lane_stats={"trust_passed": 1},
+                     expiry_drained=True),
+            "below-relevance")
+
 
 class HookBodyBareListEnvelopeTest(unittest.TestCase):
     """A pre-v13 store.py that prints a BARE LIST (not the v13 envelope)

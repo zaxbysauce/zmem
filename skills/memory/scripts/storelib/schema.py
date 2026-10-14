@@ -2285,9 +2285,17 @@ def _normalize_content(s: str) -> str:
     return normalize_content(s)
 
 def _parse_iso_to_epoch(ts: str) -> float:
-    """Parse an ISO-8601 UTC timestamp to epoch seconds. Returns 0 on failure."""
+    """Parse an ISO-8601 UTC timestamp to epoch seconds. Returns 0 on failure.
+
+    Issue #327 (absorbed by #174): fractional-second forms
+    (``...T23:59:59.5Z``) are blessed by the #173 writer, which preserves
+    them verbatim, so they must resolve to their true instant — not
+    collapse to 0.0 the way the whole-second-only ``strptime`` did.
+    ``fromisoformat`` handles fractional digits and the trailing ``Z``
+    (3.11+); anything else still degrades to 0.0.
+    """
     try:
-        return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return 0.0
 

@@ -216,6 +216,8 @@ KNOWN_SUBCMDS = [
     # Issue #131: the embedding lane health read command (--json is a real
     # flag; dispatched early, read-only against the store).
     "embedding-health",
+    # Issue #174: the state classifier dry-run command.
+    "classify-state",
 ]
 
 # Subcommands whose argparse parser exposes ONLY the universal -h/--help
@@ -570,7 +572,8 @@ class CharacterizationTests(unittest.TestCase):
         # 52 -> 53: the rescan-secrets command joined (issue #181).
         # 53 -> 54: the decision-log report read command joined (issue #249).
         # 54 -> 55: the embedding lane health command joined (issue #131).
-        self.assertEqual(len(KNOWN_SUBCMDS), 55)
+        # 55 -> 56: the state classifier dry-run command joined (issue #174).
+        self.assertEqual(len(KNOWN_SUBCMDS), 56)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
@@ -586,7 +589,8 @@ class CharacterizationTests(unittest.TestCase):
             for flag in ("--belief-heads", "--llm-local"):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
-        self.assertEqual(len(KNOWN_SUBCMDS), 55)
+        # 55 -> 56: the state classifier dry-run command joined (issue #174).
+        self.assertEqual(len(KNOWN_SUBCMDS), 56)
 
     def test_embedding_health_help_surface(self):
         """Issue #131: `embedding-health` joined the CLI surface with a
@@ -703,6 +707,171 @@ class CharacterizationTests(unittest.TestCase):
             "kind key: stripping applied_count/violated_count/kind no longer "
             "reproduces the v11 freeze — update the freeze comment AND this "
             "assertion together (all three keys are stripped here)")
+
+
+class StateClassifierTest(unittest.TestCase):
+    """Issue #174 AC7: `store.py classify-state --dry-run --json` proposes
+    expiry classes for unclassed live state rows by content pattern.
+
+    Seeds a REAL v15 store from tests/fixtures/state/classify.json (the
+    records direct-INSERTed as 29-column memory rows, NO memory_expiry side
+    rows), runs the real CLI subprocess in an isolated env, and byte-compares
+    stdout with the committed classify-expected.json.
+
+    Isolation contract (store-test discipline): the four isolation vars are
+    pinned to a fresh nonexistent scratch BEFORE any storelib import
+    (sys.modules purge on setUp, the tests/test_as_of_recall.py pattern) and
+    restored in teardown. The command is read-only by contract; the
+    store-sha test proves it.
+    """
+
+    FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "state"
+    REQUIRED_MSG = "the following arguments are required: --dry-run"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-classify-174-")
+        self.store_path = Path(self.tmp) / "store.sqlite"
+        self._saved_env = os.environ.copy()
+        for key in list(os.environ):
+            if key.startswith("ZMEM_"):
+                os.environ.pop(key)
+        os.environ.update({
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_DATA": self.tmp,
+            "ZMEM_MODELS_DIR": str(Path(self.tmp) / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        for mod in list(sys.modules.keys()):
+            if mod == "store" or mod.startswith("storelib"):
+                del sys.modules[mod]
+        self._seed_classify_store()
+
+    def tearDown(self):
+        import shutil
+
+        os.environ.clear()
+        os.environ.update(self._saved_env)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for mod in list(sys.modules.keys()):
+            if mod == "store" or mod.startswith("storelib"):
+                del sys.modules[mod]
+
+    def _seed_classify_store(self) -> None:
+        """init_db+migrate a fresh v15 store, direct-INSERT the four
+        classify.json rows as 29-column memory rows, NO side rows."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib.schema as schema  # imported AFTER the env pin
+
+        import json as _json
+
+        conn = sqlite3.connect(str(self.store_path))
+        conn.row_factory = sqlite3.Row
+        schema.init_db(conn)
+        schema.migrate(conn)
+        try:
+            for line in (self.FIXTURE_DIR / "classify.json").read_text(
+                    encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = _json.loads(line)
+                conn.execute(
+                    "INSERT INTO memory (id, namespace, type, content, tags, "
+                    "source_ref, source_hash, confidence, signal, valid_from, "
+                    "superseded_at, ingestion_ts, retrieval_count, "
+                    "last_retrieved, surfaced_count, last_surfaced, "
+                    "merged_from, content_norm, valid_until, update_of, "
+                    "taint, trust_score, applied_count, violated_count, "
+                    "embedding, embedding_model, embedded_at, consolidated_at, "
+                    "supersede_reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, NULL, ?, "
+                    "0, NULL, 0, NULL, NULL, '', '', '', 'trusted_internal', "
+                    "1.0, 0, 0, NULL, '', NULL, NULL, '')",
+                    (rec["id"], rec["namespace"], rec["type"], rec["content"],
+                     rec.get("tags", ""), rec.get("source_ref", ""),
+                     rec.get("confidence", 0.9), rec.get("signal", "grounded"),
+                     rec.get("valid_from", rec["ingestion_ts"]),
+                     rec["ingestion_ts"]),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _run_classify(self, *args) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
+        env.update({
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_DATA": self.tmp,
+            "ZMEM_MODELS_DIR": str(Path(self.tmp) / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        return subprocess.run(
+            [PYTHON, str(STORE_PY), "classify-state", *args],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+
+    def test_classify_state_dry_run_is_exactly_four_rows(self):
+        import hashlib
+        import json as _json
+
+        sha_before = hashlib.sha256(
+            self.store_path.read_bytes()).hexdigest()
+        r = self._run_classify("--dry-run", "--json")
+        self.assertEqual(
+            r.returncode, 0,
+            f"classify-state --dry-run --json exited {r.returncode}: "
+            f"{r.stderr.strip()[:300]}")
+        # text=True reads with universal newlines, so a CRLF-writing child
+        # normalizes back to the fixture's LF bytes (the frozen-check
+        # discipline): stdout bytes == classify-expected.json bytes.
+        expected = (self.FIXTURE_DIR / "classify-expected.json").read_bytes()
+        self.assertEqual(
+            r.stdout.encode("utf-8"), expected,
+            f"classify-state stdout is not byte-identical to "
+            f"classify-expected.json; stdout head={r.stdout[:200]!r}")
+        payload = _json.loads(r.stdout)
+        self.assertEqual(payload.get("count"), 4,
+                         f"expected count==4, got {payload.get('count')!r}")
+        self.assertEqual(payload.get("scanned"), 4,
+                         f"expected scanned==4, got {payload.get('scanned')!r}")
+        self.assertEqual(payload.get("changed"), 3,
+                         f"expected changed==3, got {payload.get('changed')!r}")
+        # The dry run is read-only (the sha pin also lives in the sibling
+        # test; asserted here so the byte-compare and the no-write proof
+        # travel together).
+        self.assertEqual(
+            hashlib.sha256(self.store_path.read_bytes()).hexdigest(),
+            sha_before,
+            "classify-state --dry-run changed the store file")
+
+    def test_classify_state_does_not_change_store_sha(self):
+        import hashlib
+
+        sha_before = hashlib.sha256(
+            self.store_path.read_bytes()).hexdigest()
+        r = self._run_classify("--dry-run", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            hashlib.sha256(self.store_path.read_bytes()).hexdigest(),
+            sha_before,
+            "classify-state --dry-run changed the store file (dry-run must "
+            "be read-only)")
+        # The command refuses to run without --dry-run: argparse's
+        # required-argument error, exit 2, still no store mutation.
+        r2 = self._run_classify("--json")
+        self.assertEqual(
+            r2.returncode, 2,
+            f"classify-state without --dry-run must exit 2, got "
+            f"{r2.returncode}")
+        self.assertIn(
+            self.REQUIRED_MSG, r2.stderr,
+            f"stderr must contain {self.REQUIRED_MSG!r}, got "
+            f"{r2.stderr.strip()[:300]!r}")
+        self.assertEqual(
+            hashlib.sha256(self.store_path.read_bytes()).hexdigest(),
+            sha_before,
+            "the refused classify-state invocation changed the store file")
 
 
 if __name__ == "__main__":

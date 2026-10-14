@@ -1,0 +1,17 @@
+[
+  {
+    "content": "expiry-row-1",
+    "id": "00000000-0000-4000-8000-000000000001",
+    "namespace": "fixture:expiry-174"
+  },
+  {
+    "content": "expiry-row-2",
+    "id": "00000000-0000-4000-8000-000000000002",
+    "namespace": "fixture:expiry-174"
+  },
+  {
+    "content": "expiry-row-3",
+    "id": "00000000-0000-4000-8000-000000000003",
+    "namespace": "fixture:expiry-174"
+  }
+]
