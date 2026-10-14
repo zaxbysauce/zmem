@@ -42,6 +42,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   transaction, so no expiry row is ever orphaned by a tombstone.
 
 ## [0.96.0] - 2026-10-13
+
 ### Fixed
 - **Delivery-ledger writes are concurrency-safe (issue #252, Workstream P
   PR 4):** `record()` no longer gates row durability on acquiring

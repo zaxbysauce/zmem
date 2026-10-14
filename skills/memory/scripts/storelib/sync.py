@@ -1799,13 +1799,17 @@ def _strict_ingest_staged(
                 raise _missing_memory_evidence_endpoint(obj)
     # (#173 PR-review F05, dispositioned against the contract): a state
     # memory record WITHOUT an accompanying memory_expiry record is
-    # deliberately TOLERATED on ingest — Design step 6/AC5 require "a v14
+    # deliberately TOLERATED on ingest. AC5/Design step 6 require "a v14
     # JSONL file without these records imports successfully with an empty
-    # side table", and the pinned apply-time error
-    # "memory_expiry parent must be a live state row" (not a parse-time
-    # message) is the contract's mechanism for dangling expiry refs. An
-    # imported orphan is repairable (the writer's refusal names the escape:
-    # supply --expiry-class on the next update); no pre-pass branch is added.
+    # side table" (v14 files contain no state rows); nothing in the contract
+    # REQUIRES rejecting a crafted state-without-expiry record, so the
+    # tolerance is contract-silent rather than contract-mandated — and the
+    # pinned apply-time error "memory_expiry parent must be a live state
+    # row" (not a parse-time message) remains the contract's mechanism for
+    # dangling expiry refs. An imported orphan is repairable: an explicit
+    # update that supplies expiry flags installs a side row on the
+    # replacement; a plain content update is refused by the writer with
+    # "state memories require an existing memory_expiry row".
 
     savepoint = "zmem_strict_ingest"
     own_transaction = not conn.in_transaction
