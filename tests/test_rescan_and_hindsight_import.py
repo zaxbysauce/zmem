@@ -138,6 +138,18 @@ class RescanSecretsTests(_ScratchCase):
         fixture = SECRETS_FIXTURES / "store.sqlite"
         store = self.scratch / "store.sqlite"
         shutil.copyfile(fixture, store)
+        # The #181 fixture store is a v14-era sqlite; the v15 writer refuses
+        # an unmigrated store fail-closed (issue #173), naming this exact
+        # remediation. Migration is additive (memory rows untouched), so
+        # every assertion below still reads the fixture's original contents.
+        from storelib.schema import init_db, migrate
+
+        conn = sqlite3.connect(str(store))
+        try:
+            init_db(conn)
+            migrate(conn)
+        finally:
+            conn.close()
 
         proc = self._run(["rescan-secrets", "--apply"], self._env(store))
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -168,14 +168,37 @@ PER_MOMENT_TYPE_WEIGHTS = {
     "precompact": {"fact": 1.05, "lesson": 1.05, "convention": 1.00,
                    "preference": 1.00, "decision": 1.00, "constraint": 1.00},
 }
+
+# Issue #126's normalization mean is FROZEN over the six types that existed
+# when it shipped. Issue #173 adds `state` to ALLOWED_TYPES; letting a new
+# type into this set silently rescales EVERY existing type's multiplier
+# (~0.7% observed for `state`, whose neutral 1.0 product dilutes the mean) —
+# a passive-ranking behavior change no contract authorized. A type absent
+# from the profiles is normalized against this frozen mean exactly like any
+# unlisted type (neutral weight), which keeps `state` additive-only. This
+# tuple also keys PER_LANE_TYPE_WEIGHTS, so the committed #126 projection
+# gold (tests/fixtures/issue126/profile-expected.json) stays byte-stable.
+# Growing the mean to a future type is a deliberate, disclosed multiplier
+# change owned by that type's issue: extend this tuple THERE and regenerate
+# tests/fixtures/issue126/score-expected.json plus
+# tests/fixtures/injection-parity/* in the same PR.
+TYPE_PREFERENCE_MEAN_TYPES = (
+    "fact", "lesson", "convention", "preference", "decision", "constraint",
+)
+
 PER_LANE_TYPE_WEIGHTS: dict[str, dict[str, float]] = {
-    lane: {type_name: 1.0 for type_name in ALLOWED_TYPES} for lane in INJECT_LANES
+    lane: {type_name: 1.0 for type_name in TYPE_PREFERENCE_MEAN_TYPES}
+    for lane in INJECT_LANES
 }
 RECENT_PROFILE_SCAN_MULTIPLIER = 5
 
 
 def type_preference(type_name: str, *, moment: str, lane: str | None = None) -> float:
-    """Return the mean-normalized #126 moment/lane type multiplier."""
+    """Return the mean-normalized #126 moment/lane type multiplier.
+
+    The mean runs over ``TYPE_PREFERENCE_MEAN_TYPES`` (the frozen #126 set),
+    not the live ``ALLOWED_TYPES`` — see the tuple's comment.
+    """
     if moment not in INJECT_MOMENTS:
         raise ValueError(f"invalid injection moment: {moment}")
     if lane is not None and lane not in INJECT_LANES:
@@ -185,7 +208,8 @@ def type_preference(type_name: str, *, moment: str, lane: str | None = None) -> 
     moment_profile = PER_MOMENT_TYPE_WEIGHTS[moment]
     lane_profile = PER_LANE_TYPE_WEIGHTS.get(lane, {}) if lane is not None else {}
     products = [
-        moment_profile.get(t, 1.0) * lane_profile.get(t, 1.0) for t in ALLOWED_TYPES
+        moment_profile.get(t, 1.0) * lane_profile.get(t, 1.0)
+        for t in TYPE_PREFERENCE_MEAN_TYPES
     ]
     mean = sum(products) / len(products)
     return (moment_profile.get(type_name, 1.0) * lane_profile.get(type_name, 1.0)) / mean
