@@ -1411,6 +1411,15 @@ def add_memory(
                 )
             if started_tx:
                 _commit(conn)
+            # v15 (#173 PR-review F03): a dedup fold keeps the KEEPER's expiry
+            # metadata (the v12 corroboration-only precedent) — make the
+            # discard of the caller's resolved pair VISIBLE instead of silent.
+            if expiry_class_eff is not None:
+                print(
+                    f"[zmem] dedup: existing memory {existing['id']} kept its "
+                    "own expiry metadata; the supplied expiry_class/"
+                    "inject_until were not applied"
+                )
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
             return WriteResult(existing["id"], warnings=warns, deduped=True)
@@ -1818,16 +1827,13 @@ def update_memory(
 
     # v15 (#173): one clock per transaction; the SAME `ts` stamps the old row's
     # tombstone, the new row's valid_from/ingestion_ts, and the side-table row
-    # (AC7's single-timestamp invariant). Computed here so validation runs before
-    # the tombstone is written.
+    # (AC7's single-timestamp invariant). The old row's side record is read and
+    # the pair resolved INSIDE the write transaction (PR-review F21: the old
+    # pre-BEGIN read let a concurrent purge/supersede vanish the side row in
+    # the read-to-lock window and the inherit path would re-insert the stale
+    # pair); validation still runs before the tombstone is written, and the
+    # surrounding try/except rolls the transaction back on any refusal.
     tx_now = now if now is not None else now_iso()
-    old_expiry = conn.execute(
-        "SELECT inject_until, expiry_class FROM memory_expiry WHERE memory_id=?",
-        (mid,),
-    ).fetchone()
-    expiry_class_eff, inject_until_eff = _resolve_update_expiry(
-        type_eff, expiry_class, inject_until, old_expiry, tx_now
-    )
 
     # Capture policy applies to the effective values (new content + any
     # inherited-or-overridden tags/source_ref) exactly as add_memory does —
@@ -1869,6 +1875,17 @@ def update_memory(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+
+        # v15 (#173 PR-review F21): resolve the side-table pair against a
+        # snapshot taken UNDER the write lock, so a concurrent purge/supersede
+        # cannot vanish the old side row between the read and the tombstone.
+        old_expiry = conn.execute(
+            "SELECT inject_until, expiry_class FROM memory_expiry WHERE memory_id=?",
+            (mid,),
+        ).fetchone()
+        expiry_class_eff, inject_until_eff = _resolve_update_expiry(
+            type_eff, expiry_class, inject_until, old_expiry, tx_now
+        )
 
         normalized_evidence_ids = _validated_evidence_ids(conn, evidence_ids)
 
@@ -1929,6 +1946,32 @@ def update_memory(
                     "separate and link as contradicts"
                 )
                 existing = None
+        if existing:
+            dup_id = existing["id"]
+            # v15 (#173 PR-review F04): an EXPLICIT expiry request must not be
+            # silently destroyed by the dedup fold. State target: install the
+            # resolved pair (the update's explicit expiry intent wins, exactly
+            # as the non-dedup insert path would). Non-state target: skip the
+            # fold entirely (the same escape hatch as the polarity guard
+            # above) — the update falls through to the insert path, where the
+            # AC7 transition matrix installs the pair on a fresh state row.
+            if expiry_class is not None or inject_until is not None:
+                dup_type = conn.execute(
+                    "SELECT type FROM memory WHERE id=?", (dup_id,)
+                ).fetchone()["type"]
+                if dup_type == "state":
+                    conn.execute(
+                        "INSERT OR REPLACE INTO memory_expiry "
+                        "(memory_id, inject_until, expiry_class) VALUES (?,?,?)",
+                        (dup_id, inject_until_eff, expiry_class_eff),
+                    )
+                else:
+                    print(
+                        f"[zmem] dedup skipped: fold target {dup_id} is a "
+                        f"{dup_type} row; expiry flags need a state target — "
+                        "rows stay separate"
+                    )
+                    existing = None
         if existing:
             dup_id = existing["id"]
             _merge_on_dedup(conn, dup_id, conf_eff, sig_eff, tags_eff, now=tx_now)

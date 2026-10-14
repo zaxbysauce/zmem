@@ -388,6 +388,8 @@ def _absorb_into_keeper(
     conn: sqlite3.Connection,
     keeper: sqlite3.Row,
     absorbed: sqlite3.Row,
+    *,
+    now: str,
 ) -> dict:
     """Fold ONE absorbed near-duplicate row into its cluster keeper (issue #19).
 
@@ -461,10 +463,11 @@ def _absorb_into_keeper(
 
     # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared
     # with write-time dedup semantics; no content change here.
-    # v15 (#173 / AC7): ONE transaction timestamp — `tx_now` is computed once
-    # and passed to `_merge_on_dedup` AND used for the absorbed row's tombstone
-    # below, so a consolidate transaction never mixes clock reads.
-    tx_now = now_iso()
+    # v15 (#173 / AC7, PR-review F30): `now` IS the caller's single cluster
+    # transaction timestamp — this helper no longer reads the clock itself, so
+    # a multi-absorb cluster can never mix clock reads (previously each absorb
+    # plus the consolidated_at write read now_iso() independently).
+    tx_now = now
     _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"], now=tx_now)
 
     # Worst-of taint propagation (issue #59, 4.7): consolidation folds the
@@ -1415,10 +1418,14 @@ def consolidate(
         try:
             conn.execute("BEGIN")
             keeper_grew = False
+            # v15 (#173 PR-review F30): ONE clock for the whole cluster
+            # transaction — every absorb tombstone/merge and the
+            # consolidated_at stamp below share it (contract line 137/AC7).
+            cluster_now = now_iso()
             for nb_row, nb_sim in neighbors:
                 # Preserve absorbed content + record provenance + merge metadata
                 # + supersede (issue #19). consolidate-ONLY helper.
-                decision = _absorb_into_keeper(conn, seed, nb_row)
+                decision = _absorb_into_keeper(conn, seed, nb_row, now=cluster_now)
                 # Issue #62, 7.4 (c76 no-op-absorb blast radius): only a keeper
                 # whose content actually GREW this run is a valid compression
                 # candidate — a cluster that merged only already-represented /
@@ -1430,7 +1437,7 @@ def consolidate(
             # Mark the keeper as consolidated.
             conn.execute(
                 "UPDATE memory SET consolidated_at=? WHERE id=?",
-                (now_iso(), seed["id"]),
+                (cluster_now, seed["id"]),
             )
             # Issue #71 (consolidate-while-MCP-live row): use the shared
             # busy_retry-backed commit like every writer path — a live MCP

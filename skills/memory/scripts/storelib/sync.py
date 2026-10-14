@@ -288,7 +288,15 @@ def _cmd_export_jsonl_body(
             if x["memory_id"] in exported_ids:
                 expiry_map[x["memory_id"]] = x
     except sqlite3.OperationalError:
-        pass  # memory_expiry absent (pre-v15 store) — export without expiry records
+        # memory_expiry absent (pre-v15 store, or externally damaged v15):
+        # export without expiry records — but SAY so on stderr, matching the
+        # legacy ingest path's skip notice and the v14 evidence-schema
+        # precedent of never dropping metadata silently (#173 PR-review F14).
+        print(
+            "[zmem] export-jsonl: memory_expiry records skipped — side table "
+            "unavailable; state rows export without expiry metadata",
+            file=sys.stderr,
+        )
 
     lines = []
 
@@ -1190,8 +1198,11 @@ def _apply_expiry_record(conn: sqlite3.Connection, obj: dict) -> None:
       "memory_expiry conflicts with existing record".
 
     An existing record with IDENTICAL values is a no-op, which is what makes
-    reimporting the same file idempotent (AC5). Runs inside the caller's open
-    transaction: strict commits once at the end; legacy commits per record.
+    reimporting the same file idempotent (AC5). Returns ``"applied"`` when a
+    row was inserted and ``"identical"`` on the idempotent no-op, so callers
+    can count real writes separately from no-ops (#173 PR-review F29). Runs
+    inside the caller's open transaction: strict commits once at the end;
+    legacy commits per record.
     """
     mid = obj["memory_id"]
     existing = conn.execute(
@@ -1200,7 +1211,7 @@ def _apply_expiry_record(conn: sqlite3.Connection, obj: dict) -> None:
     if existing is not None:
         if (existing["inject_until"], existing["expiry_class"]) == (
                 obj["inject_until"], obj["expiry_class"]):
-            return  # identical reimport — idempotent no-op
+            return "identical"  # identical reimport — idempotent no-op
         raise ValueError("memory_expiry conflicts with existing record")
     parent = conn.execute(
         "SELECT type, superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
@@ -1212,6 +1223,7 @@ def _apply_expiry_record(conn: sqlite3.Connection, obj: dict) -> None:
         "VALUES (?,?,?)",
         (mid, obj["inject_until"], obj["expiry_class"]),
     )
+    return "applied"
 
 
 def _purged_ids(conn: sqlite3.Connection) -> set:
@@ -1702,6 +1714,10 @@ def _strict_ingest_staged(
     capture_mode: str | None,
 ) -> int:
     rows = _strict_staged_rows(spool)
+    # v15 (#173 PR-review F13/F29): observability for the expiry apply pass —
+    # purged parents soft-drop and identical reimports are no-ops, neither is
+    # an error, but the operator can see what happened.
+    expiry_applied = expiry_identical = expiry_purged_skipped = 0
     seen: dict[str, set] = {
         "memory": set(), "episode": set(), "evidence": set(),
         "episode_memory": set(), "episode_evidence": set(),
@@ -1781,6 +1797,15 @@ def _strict_ingest_staged(
                 raise _missing_memory_evidence_endpoint(obj)
             if obj["evidence_id"] not in available_evidence:
                 raise _missing_memory_evidence_endpoint(obj)
+    # (#173 PR-review F05, dispositioned against the contract): a state
+    # memory record WITHOUT an accompanying memory_expiry record is
+    # deliberately TOLERATED on ingest — Design step 6/AC5 require "a v14
+    # JSONL file without these records imports successfully with an empty
+    # side table", and the pinned apply-time error
+    # "memory_expiry parent must be a live state row" (not a parse-time
+    # message) is the contract's mechanism for dangling expiry refs. An
+    # imported orphan is repairable (the writer's refusal names the escape:
+    # supply --expiry-class on the next update); no pre-pass branch is added.
 
     savepoint = "zmem_strict_ingest"
     own_transaction = not conn.in_transaction
@@ -1941,7 +1966,17 @@ def _strict_ingest_staged(
         # file whose expiry line preceded its parent still lands here (AC5).
         for table, obj in rows:
             if table == "memory_expiry":
-                _apply_expiry_record(conn, obj)
+                if obj["memory_id"] in purged_ids:
+                    # issue #255 (#173 PR-review F13): a purged id's side
+                    # records drop silently, never a fatal import error —
+                    # the same soft-drop every other child-record junction
+                    # above applies.
+                    expiry_purged_skipped += 1
+                    continue
+                if _apply_expiry_record(conn, obj) == "identical":
+                    expiry_identical += 1
+                else:
+                    expiry_applied += 1
         if own_transaction:
             conn.commit()
         else:
@@ -1957,6 +1992,13 @@ def _strict_ingest_staged(
         raise
     for diagnostic in strict_diagnostics:
         sys.stderr.write(diagnostic)
+    if expiry_applied or expiry_identical or expiry_purged_skipped:
+        # stderr only: the stdout summary line keeps its byte contract.
+        print(
+            f"[zmem] ingest-jsonl: strict expiry_applied={expiry_applied} "
+            f"identical={expiry_identical} purged_skipped={expiry_purged_skipped}",
+            file=sys.stderr,
+        )
     print(f"[zmem] ingest-jsonl: strict rows={len(rows)} evidence={len(evidence_ids)}")
     return 0
 
@@ -2069,6 +2111,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     f = io.TextIOWrapper(staged_source, encoding="utf-8", newline="\n")
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
+    deduped_ids: set = set()
     capture_refused = 0
     quarantined = 0
     quarantine_failed = 0
@@ -2272,6 +2315,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 quarantine_failed += 1
             elif outcome == "deduped":
                 deduped += 1
+                deduped_ids.add(obj["id"])
             else:
                 skipped += 1
             # v11 (issue #61, sync): collect the row's validated outgoing
@@ -2428,14 +2472,23 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     # non-state parent, conflicting duplicate) is counted malformed and
     # reported, never aborting the rest of the file; "no partial commit" is a
     # strict-only property (AC6 tests it under --strict).
-    expiry_applied = expiry_malformed = 0
+    expiry_applied = expiry_malformed = expiry_skipped = 0
     if pending_expiry:
         try:
             for lineno, e in pending_expiry:
+                if e["memory_id"] in deduped_ids:
+                    # #173 PR-review F29: the parent folded into an existing
+                    # keeper (benign dedup), so its incoming id never landed
+                    # and this side record cannot apply — counted skipped,
+                    # never malformed.
+                    expiry_skipped += 1
+                    continue
                 try:
-                    _apply_expiry_record(conn, e)
-                    expiry_applied += 1
-                    _commit(conn)
+                    if _apply_expiry_record(conn, e) == "identical":
+                        expiry_skipped += 1
+                    else:
+                        expiry_applied += 1
+                        _commit(conn)
                 except ValueError as exc:
                     print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
                           f"{_sanitize_error_text(str(exc))}", file=sys.stderr)
@@ -2457,7 +2510,8 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
           f"deduped={deduped} skipped={skipped} malformed={malformed} "
           f"links_added={links_added} links_skipped={links_skipped} "
           f"episodes_added={episodes_added} episodes_skipped={episodes_skipped} "
-          f"expiry_applied={expiry_applied} expiry_malformed={expiry_malformed}")
+          f"expiry_applied={expiry_applied} expiry_malformed={expiry_malformed} "
+          f"expiry_skipped={expiry_skipped}")
     if decode_error is not None:
         return 2
     # Issue #180: a quarantine write failure is a fail-closed outcome — the

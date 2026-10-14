@@ -21,6 +21,7 @@ bytes without re-running the generator.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -134,13 +135,22 @@ def _digest(path: Path) -> str:
 
 
 def main() -> int:
+    # #173 PR-review F18: --out-dir lets the parity test regenerate into a
+    # SCRATCH directory (repo norm: timeout/evidence fixtures) instead of
+    # overwriting the committed bytes; default stays the committed dir.
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--out-dir", type=Path, default=HERE,
+                    help="directory to write expiry.jsonl/expected.json into "
+                         "(default: this committed fixture directory)")
+    out = ap.parse_args().out_dir
+    out.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="zmem-state-fixture-"))
     try:
         # 1. Seed a fresh v15 store and export the fixture input.
         a = _fresh_store(scratch, "seed")
         try:
             _seed(a)
-            _export(a, HERE / "expiry.jsonl")
+            _export(a, out / "expiry.jsonl")
         finally:
             a.close()
 
@@ -152,28 +162,28 @@ def main() -> int:
                 sys.path.insert(0, str(SCRIPTS))
             from storelib import sync
             rc = sync.cmd_ingest_jsonl_strict(
-                b, in_path=str(HERE / "expiry.jsonl"), source_ref=None)
+                b, in_path=str(out / "expiry.jsonl"), source_ref=None)
             if rc != 0:
                 raise SystemExit(f"ingest-jsonl --strict failed with rc={rc}")
-            _export(b, HERE / "expected.json")
+            _export(b, out / "expected.json")
         finally:
             b.close()
 
         # 3. Sanity: the two files carry the three expiry records, in id order.
         exp_rows = [json.loads(l) for l in
-                    (HERE / "expiry.jsonl").read_text(encoding="utf-8").splitlines()
+                    (out / "expiry.jsonl").read_text(encoding="utf-8").splitlines()
                     if l.strip()]
         assert [r["id"] for r in exp_rows if r.get("kind") == "memory"] == \
             [row[0] for row in ROWS], "memory ids are not in contract order"
         assert sum(1 for r in exp_rows if r.get("kind") == "memory_expiry") == 3
 
-        print("wrote tests/fixtures/state/expiry.jsonl "
+        print(f"wrote {out / 'expiry.jsonl'} "
               f"({len(exp_rows)} records)")
-        print("wrote tests/fixtures/state/expected.json "
-              f"({len([l for l in (HERE / 'expected.json').read_text(encoding='utf-8').splitlines() if l.strip()])} records)")
+        print(f"wrote {out / 'expected.json'} "
+              f"({len([l for l in (out / 'expected.json').read_text(encoding='utf-8').splitlines() if l.strip()])} records)")
         print()
-        print(f"sha256(expiry.jsonl)  = {_digest(HERE / 'expiry.jsonl')}")
-        print(f"sha256(expected.json) = {_digest(HERE / 'expected.json')}")
+        print(f"sha256(expiry.jsonl)  = {_digest(out / 'expiry.jsonl')}")
+        print(f"sha256(expected.json) = {_digest(out / 'expected.json')}")
         print()
         print("verify the committed bytes with:")
         print("  sha256sum tests/fixtures/state/expiry.jsonl")

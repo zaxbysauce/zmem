@@ -250,7 +250,6 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         # store. This is the additive-window contract at the new version
         # boundary — the same shape the v12-lineage test above pins one
         # boundary earlier.
-        import importlib
         import io
         import sqlite3
         from contextlib import redirect_stderr
@@ -295,6 +294,34 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         self.assertIn("store schema v15 is newer than this client's v14",
                       notice)
         self.assertIn("additive-only schema", notice)
+        # #173 PR-review F27 / contract step 11: the notice bytes are pinned
+        # EXACTLY (full line + one LF), and a second call under the same
+        # captured stream adds nothing — the one-shot guard proven at this
+        # 14/15 boundary, not just the older 12/13 one.
+        exact = (
+            "[zmem] NOTICE: store schema v15 is newer than this client's v14; "
+            "memory read/write continues (additive-only schema), but "
+            "newer-only features are unavailable until you update this plugin.\n"
+        )
+        with patch.object(schema, "SUPPORTED_SCHEMA_VERSION", 14), \
+             patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+            schema._schema_compat._warned = False
+            first_buf = io.StringIO()
+            with redirect_stderr(first_buf):
+                self.assertEqual(
+                    schema._schema_compat(15, "exact-bytes-probe"), "compat")
+            self.assertEqual(first_buf.getvalue(), exact,
+                             "the NOTICE must be byte-exact to the contract line")
+            # Within the SAME warned-cycle the block above opened, every
+            # subsequent call must add NOTHING (the one-shot guard).
+            second_buf = io.StringIO()
+            with redirect_stderr(second_buf):
+                self.assertEqual(
+                    schema._schema_compat(15, "second-call-probe"), "compat")
+                self.assertEqual(
+                    schema._schema_compat(15, "third-call-probe"), "compat")
+            self.assertEqual(second_buf.getvalue(), "",
+                             "subsequent calls must add no bytes")
         # The store remains v15 — an older client never downgrades it.
         ver = sqlite3.connect(os.environ["ZMEM_STORE"]).execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]

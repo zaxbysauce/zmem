@@ -16,6 +16,8 @@ BEFORE importing storelib (the operator store is never opened) and passes
 from __future__ import annotations
 
 import atexit
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -166,10 +168,14 @@ class _StoreCase(unittest.TestCase):
         # Re-free STORE_PATH off this test's sandbox and back onto whatever the
         # restored env resolves to, so the next module to import storelib (or
         # the next test class) does not inherit a dead temp path. Mirrors the
-        # convention in tests/test_schema_forward_compat.py.
+        # convention in tests/test_schema_forward_compat.py. sync is reloaded
+        # too (#173 PR-review F16): `from storelib.schema import STORE_PATH`
+        # copies the VALUE at sync's first import, and sync.py's quarantine
+        # path derives its root from that copy — reloading re-derives it.
         import importlib
 
         importlib.reload(schema)
+        importlib.reload(sync)
 
     # -- helpers ----------------------------------------------------------
     def side_row(self, memory_id: str):
@@ -376,17 +382,56 @@ class StateMigrationTest(_StoreCase):
         self.conn.execute("CREATE TABLE memory_expiry (poison INTEGER)")
         self.conn.commit()
         snapshot = lambda: sorted(  # noqa: E731
-            (r[0], r[1]) for r in self.conn.execute(
-                "SELECT type, name FROM sqlite_master "
+            (r[0], r[1], r[2]) for r in self.conn.execute(
+                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master "
                 "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"))
         before = snapshot()
         with self.assertRaises(sqlite3.OperationalError):
             schema.migrate(self.conn)
-        self.conn.rollback()
+        # #173 PR-review F15: assert in the state the code-under-test LEFT —
+        # before any test-side rollback could repair it (a migrate that lost
+        # its internal rollback would otherwise pass), and pin the sqlite_master
+        # SQL bytes, not just (type, name) (contract step 2).
         self.assertEqual(snapshot(), before,
                          "a failed v15 DDL must leave the schema byte-identical")
         self.assertEqual(self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "14")
+        self.conn.rollback()
+
+    def test_failed_migration_ddl_authorizer_rolls_back(self):
+        # #173 Tests item (contract-prescribed shape): a SQLite authorizer
+        # DENYing SQLITE_CREATE_TABLE makes the v15 DDL fail; version,
+        # table list and index list must be unchanged afterwards, with the
+        # authorizer cleared in finally.
+        self._force_v14_shape()
+        snapshot = lambda: sorted(  # noqa: E731
+            (r[0], r[1], r[2]) for r in self.conn.execute(
+                "SELECT type, name, COALESCE(sql, '') FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"))
+        before = snapshot()
+
+        def _deny(action, arg1, arg2, dbname, trigger):
+            if action == sqlite3.SQLITE_CREATE_TABLE:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        self.conn.set_authorizer(_deny)
+        try:
+            # Authorizer denial raises sqlite3.DatabaseError ("not
+            # authorized") — the parent of OperationalError, so this also
+            # tolerates the OperationalError shape other drivers produce.
+            with self.assertRaises(sqlite3.DatabaseError):
+                schema.migrate(self.conn)
+        finally:
+            self.conn.set_authorizer(None)
+        self.assertEqual(snapshot(), before,
+                         "a denied v15 DDL must leave the schema byte-identical")
+        self.assertEqual(self.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "14")
+        # The migration remains completable after the denial clears.
+        schema.migrate(self.conn)
+        self.assertEqual(self.conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "15")
 
 
 class StateWriteTest(_StoreCase):
@@ -485,6 +530,99 @@ class StateWriteTest(_StoreCase):
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) FROM memory_expiry").fetchone()[0], 1)
 
+    def test_state_update_dedup_installs_explicit_expiry_on_state_keeper(self):
+        # #173 PR-review F04: an EXPLICIT expiry request on a state->state
+        # update that folds into another live row must INSTALL the resolved
+        # pair on the fold target (previously the old side row was cleared
+        # and the resolved pair silently dropped).
+        keeper = self.add_state("fold target state row", cls="endpoint",
+                                now=NOW)
+        other = self.add_state("folding state row", cls="metric",
+                               inject_until="2027-06-01T00:00:00Z", now=NOW)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res, created = write.update_memory(
+                self.conn, mid=other, content="fold target state row",
+                expiry_class="metric", now="2026-09-11T00:00:00Z")
+        self.assertEqual(str(res), keeper)
+        self.assertFalse(created)
+        self.assertEqual(dict(self.side_row(keeper)),
+                         {"inject_until": "2026-09-25T00:00:00Z",
+                          "expiry_class": "metric"})
+        self.assertIsNone(self.side_row(other), "old row's side record cleared")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM memory_expiry").fetchone()[0], 1)
+
+    def test_state_update_dedup_skips_fold_for_non_state_target(self):
+        # #173 PR-review F04: explicit expiry flags + a NON-state fold target
+        # — the fold is skipped (polarity-guard precedent) and the update
+        # falls through to the insert path, where AC7 installs the pair on a
+        # fresh state row instead of losing the request.
+        fact_k = write.add_memory(self.conn, namespace=NS, type_="fact",
+                                  content="distinct fact target", signal="test",
+                                  now=NOW)
+        src = write.add_memory(self.conn, namespace=NS, type_="state",
+                               content="unrelated src content", signal="test",
+                               expiry_class="endpoint", now=NOW)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res, created = write.update_memory(
+                self.conn, mid=str(src), content="distinct fact target",
+                expiry_class="metric", now="2026-09-11T00:00:00Z")
+        out = buf.getvalue()
+        self.assertIn("dedup skipped", out)
+        self.assertTrue(created, "fold skipped => fresh row, not the fact")
+        self.assertNotEqual(str(res), str(fact_k))
+        row = self.side_row(str(res))
+        self.assertIsNotNone(row, "the explicit expiry request must survive")
+        self.assertEqual(row["expiry_class"], "metric")
+        self.assertEqual(row["inject_until"], "2026-09-25T00:00:00Z")
+        self.assertIsNone(self.side_row(str(fact_k)))
+
+    def test_state_add_dedup_discard_is_visible(self):
+        # #173 PR-review F03: a dedup fold keeps the KEEPER's expiry
+        # metadata; the discard of the caller's resolved pair must be VISIBLE
+        # on stdout, and both uncovered keeper cases behave as follows: a
+        # NON-state keeper stays non-state with no side row, an ORPHAN state
+        # keeper stays orphan.
+        # (a) non-state keeper:
+        fact = write.add_memory(self.conn, namespace=NS, type_="fact",
+                                content="shared content A", signal="test",
+                                now=NOW)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = write.add_memory(self.conn, namespace=NS, type_="state",
+                                   content="shared content A", signal="test",
+                                   expiry_class="metric",
+                                   inject_until="2027-01-01T00:00:00Z",
+                                   now="2026-09-11T00:00:00Z")
+        self.assertEqual(str(res), str(fact))
+        self.assertTrue(res.deduped)
+        self.assertIn("kept its own expiry metadata", buf.getvalue())
+        self.assertIsNone(self.side_row(str(fact)))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM memory_expiry").fetchone()[0], 0)
+        # (b) orphan state keeper (imported v14-style, no side row):
+        orphan_id = "00000000-0000-4000-8000-0000000000f1"
+        self.conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, tags, "
+            "source_ref, source_hash, confidence, signal, valid_from, "
+            "ingestion_ts, content_norm) VALUES (?,?,?,?,?,?,?,0.5,'test',?,?,?)",
+            (orphan_id, NS, "state", "shared content B", "", "fixture",
+             "", NOW, NOW, "shared content b"))
+        self.conn.commit()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = write.add_memory(self.conn, namespace=NS, type_="state",
+                                   content="shared content B", signal="test",
+                                   expiry_class="endpoint",
+                                   now="2026-09-11T00:00:00Z")
+        self.assertEqual(str(res), orphan_id)
+        self.assertTrue(res.deduped)
+        self.assertIn("kept its own expiry metadata", buf.getvalue())
+        self.assertIsNone(self.side_row(orphan_id),
+                          "the orphan stays orphan — visible, not silently fixed")
+
     def test_state_add_without_class_is_refused(self):
         with self.assertRaisesRegex(ValueError, "state memories require expiry_class"):
             write.add_memory(self.conn, namespace=NS, type_="state",
@@ -499,8 +637,97 @@ class StateWriteTest(_StoreCase):
                              content="bad timestamp row", signal="test",
                              expiry_class="endpoint",
                              inject_until="2026-11-12 09:00:00", now=NOW)
+        # #173 PR-review F26: full equality — the fragment assertion lost the
+        # "with Z or +00:00 offset" half of writer string #6.
+        with self.assertRaises(ValueError) as cm:
+            write.add_memory(self.conn, namespace=NS, type_="state",
+                             content="bad timestamp row 2", signal="test",
+                             expiry_class="endpoint",
+                             inject_until="2026-11-12 09:00:00", now=NOW)
+        self.assertEqual(
+            str(cm.exception),
+            "inject_until must be UTC ISO-8601 with Z or +00:00 offset")
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) FROM memory").fetchone()[0], 0)
+
+    def test_calendar_invalid_inject_until_is_refused(self):
+        # #173 PR-review F01: the shape-only regex accepted calendar-impossible
+        # values end-to-end (CLI rc=0, export emitted them, and the store's
+        # ISO parser later read them as epoch 0). Design step 3 requires
+        # MALFORMED values to raise the pinned message; full equality, both
+        # the writer surface and no-row-before-refusal.
+        for bad in ("2026-02-30T00:00:00Z",       # day out of month
+                    "2026-13-01T00:00:00Z",       # month 13
+                    "2026-01-01T25:61:61Z",       # hour/minute out of range
+                    "2026-02-30T00:00:00+00:00"):  # same via offset form
+            with self.assertRaises(ValueError) as cm:
+                write.add_memory(self.conn, namespace=NS, type_="state",
+                                 content=f"calendar row {bad}", signal="test",
+                                 expiry_class="endpoint",
+                                 inject_until=bad, now=NOW)
+            self.assertEqual(
+                str(cm.exception),
+                "inject_until must be UTC ISO-8601 with Z or +00:00 offset",
+                f"calendar-invalid {bad!r} must raise the pinned message")
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM memory").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM memory_expiry").fetchone()[0], 0)
+        # Sync path shares the choke point: the same values are refused by the
+        # wire validator with its own pinned stable error.
+        with self.assertRaisesRegex(
+                ValueError, "memory_expiry inject_until must be UTC ISO-8601"):
+            sync._validate_expiry_record(
+                {"memory_id": ENDPOINT_ID, "inject_until": "2026-02-30T00:00:00Z",
+                 "expiry_class": "endpoint"})
+
+    def test_fractional_inject_until_is_preserved_and_documented(self):
+        # #173 PR-review F02 ratchet: the contract blesses fractional forms,
+        # validate/compute must preserve them byte-identically, and this pins
+        # the CURRENT seam with the store's epoch parser so the #174 owner
+        # sees the obligation (the parser fix belongs to #174).
+        self.assertEqual(
+            state_expiry.validate_inject_until(
+                "2026-11-12T09:00:00.123456789+00:00"),
+            "2026-11-12T09:00:00.123456789Z")
+        mid = self.add_state("fractional expiry row", cls="metric",
+                             inject_until="2027-01-01T00:00:00.5Z")
+        self.assertEqual(self.side_row(mid)["inject_until"],
+                         "2027-01-01T00:00:00.5Z")
+        # TTL-derived values keep the base's fraction through the arithmetic.
+        self.assertEqual(
+            state_expiry.compute_inject_until(
+                "endpoint", now="2026-09-10T00:00:00.123456789Z"),
+            "2026-10-10T00:00:00.123456789Z")
+        # Documented seam for #174: the store's epoch parser (unchanged by
+        # #173) cannot read ANY fractional form — it returns 0.0. Pinning the
+        # behavior makes the follow-up obligation visible and drift-proof.
+        from storelib.schema import _parse_iso_to_epoch
+        self.assertEqual(_parse_iso_to_epoch("2026-12-31T23:59:59.5Z"), 0.0)
+        self.assertNotEqual(_parse_iso_to_epoch("2026-12-31T23:59:59Z"), 0.0)
+
+    def test_env_ttl_overflow_and_non_ascii_are_refused(self):
+        # #173 PR-review F10: (a) an oversized TTL must surface as ValueError
+        # (the CLI's except ValueError => [zmem] line, exit 2, no traceback),
+        # never OverflowError; (b) the env gate is ASCII-decimal only —
+        # non-ASCII digits are refused with the pinned message instead of
+        # being silently coerced (Arabic-Indic) or escaping to int()'s raw
+        # message that echoes the operator's env value (superscripts).
+        with patch.dict(os.environ, {"ZMEM_STATE_ENDPOINT_DAYS": "999999999"},
+                        clear=False):
+            with self.assertRaises(ValueError) as cm:
+                state_expiry.compute_inject_until("endpoint", now=NOW)
+            self.assertIn("out of range", str(cm.exception))
+        for bad in ("١٢٣", "²", "3.5"):
+            with patch.dict(os.environ, {"ZMEM_STATE_ENDPOINT_DAYS": bad},
+                            clear=False):
+                with self.assertRaises(ValueError) as cm:
+                    state_expiry.state_expiry_days("endpoint")
+                self.assertEqual(
+                    str(cm.exception),
+                    "invalid state expiry for class 'endpoint': "
+                    "ZMEM_STATE_ENDPOINT_DAYS must be a positive decimal integer",
+                    f"env {bad!r} must raise the pinned message")
 
     def test_explicit_inject_until_bypasses_ttl(self):
         mid = self.add_state("explicit expiry row", cls="metric",
@@ -623,7 +850,12 @@ class StateCleanupTest(_StoreCase):
         nb = self.conn.execute(
             "SELECT * FROM memory WHERE id=?", (absorb,)).fetchone()
         self.conn.execute("BEGIN")
-        consolidate._absorb_into_keeper(self.conn, seed, nb)
+        # `now` is keyword-required (#173 PR-review F30): the helper cannot
+        # read a clock of its own, so a multi-absorb cluster transaction can
+        # never mix timestamps — the caller (consolidate's cluster loop)
+        # computes one cluster_now and threads it here and into
+        # consolidated_at.
+        consolidate._absorb_into_keeper(self.conn, seed, nb, now=NOW)
         # _absorb_into_keeper never commits/rollbacks on its own (its
         # docstring); commit so the assertions below observe the in-txn work.
         self.conn.commit()
@@ -707,8 +939,11 @@ class StateSyncTest(_StoreCase):
         self.assertEqual(sync.cmd_export_jsonl(self.conn, out=str(out)), 0)
         rows = [json.loads(l) for l in
                 out.read_text(encoding="utf-8").splitlines() if l.strip()]
-        self.assertTrue(all(r["kind"] != "memory_expiry" for r in rows),
-                        "a v14 store has no side rows to export")
+        # #173 PR-review F17: anchor on a NON-empty export — `all()` over an
+        # empty list is True, so an exporter emitting nothing would have
+        # passed vacuously.
+        self.assertEqual([r["kind"] for r in rows], ["memory"],
+                         "the v14 fact row must export, without side records")
 
     def test_round_trip_preserves_class_and_timestamp(self):
         self.add_state("deploy-timeout", cls="setting",
@@ -760,6 +995,45 @@ class StateSyncTest(_StoreCase):
         self.assertEqual(got, {("endpoint", "2026-10-10T00:00:00Z"),
                                ("setting", "2026-12-09T00:00:00Z"),
                                ("metric", "2026-09-24T00:00:00Z")})
+
+    def test_state_fixture_digests_are_pinned_and_regenerate(self):
+        # #173 PR-review F18: tamper evidence + reproducibility, per the repo
+        # norm (timeout/evidence fixtures): (a) the committed bytes are pinned
+        # by SHA-256 constants here, not merely printed by the generator;
+        # (b) expected.json == expiry.jsonl is the contract's fixed-point
+        # round-trip property (import then export of the same wire bytes) —
+        # pinned as such; (c) the generator re-runs into a SCRATCH dir
+        # (--out-dir) and reproduces both files byte-for-byte.
+        import hashlib
+        import subprocess as sp
+        digests = {
+            "expiry.jsonl":
+                "78be9c59f42f268334c1fad15fa0533bfd0853ffdb391458979aed6044cef5bf",
+            "expected.json":
+                "78be9c59f42f268334c1fad15fa0533bfd0853ffdb391458979aed6044cef5bf",
+        }
+        for name, want in digests.items():
+            got = hashlib.sha256((FIXTURE_DIR / name).read_bytes()).hexdigest()
+            self.assertEqual(
+                got, want,
+                f"{name} digest drift — regenerate with make_fixture.py and "
+                "update the pinned constant deliberately")
+        # The two files are byte-identical BY DESIGN: the gold IS the
+        # committed input re-exported (fixed point of import∘export). Pin the
+        # property so a lockstep edit of one file without the other fails.
+        self.assertEqual((FIXTURE_DIR / "expiry.jsonl").read_bytes(),
+                         (FIXTURE_DIR / "expected.json").read_bytes())
+        # Scratch regeneration reproduces the committed bytes exactly.
+        out_dir = self.root / "regen-fixture"
+        proc = sp.run(
+            [sys.executable,
+             str(FIXTURE_DIR / "make_fixture.py"), "--out-dir", str(out_dir)],
+            capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for name in digests:
+            self.assertEqual((out_dir / name).read_bytes(),
+                             (FIXTURE_DIR / name).read_bytes(),
+                             f"generator must reproduce {name} byte-for-byte")
 
     def test_identical_reimport_is_idempotent(self):
         self.add_state("idempotent row", cls="endpoint",
@@ -861,6 +1135,295 @@ class StateSyncTest(_StoreCase):
                  "expiry_class": "endpoint"})
         row = self.side_row(mid)
         self.assertEqual(row["inject_until"], "2027-01-01T00:00:00Z")
+
+
+class ReviewFixTest(_StoreCase):
+    """swarm-pr-review feedback fixes (#173 PR #319): CLI refusal contracts
+    (F11), purged-parent soft-drop (F13), public-path stable errors (F25),
+    filtered-export orphan omission (F24), and the export skip notice (F14)."""
+
+    STORE_PY = ROOT / "skills" / "memory" / "scripts" / "store.py"
+
+    def _cli_env(self, scratch: Path, extra: dict | None = None) -> dict:
+        env = dict(os.environ)
+        for key in _ROUTE_ENV_KEYS:
+            env.pop(key, None)
+        env.update({
+            "ZMEM_STORE": str(scratch / "store.sqlite"),
+            "ZMEM_DATA": str(scratch),
+            "ZMEM_MODELS_DIR": str(scratch / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        if extra:
+            env.update(extra)
+        return env
+
+    def _run_cli(self, scratch: Path, *args, extra_env: dict | None = None):
+        import subprocess
+        return subprocess.run(
+            [sys.executable, str(self.STORE_PY), *args],
+            capture_output=True, text=True, timeout=180,
+            env=self._cli_env(scratch, extra_env),
+        )
+
+    def test_cli_refusals_emit_pinned_messages_exit_2_no_traceback(self):
+        # #173 PR-review F11: the CLI halves of the error contract that only
+        # the gitignored frozen check exercised before — every refusal prints
+        # `[zmem] <pinned message>` (or the exact parser error), exits 2, and
+        # never emits a traceback (Execution step 10).
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="zmem-173-cli-") as td:
+            scratch = Path(td)
+            self.assertEqual(self._run_cli(scratch, "init").returncode, 0)
+
+            cases = [
+                # (argv, expected stderr fragment)
+                (["add", "--namespace", NS, "--type", "state",
+                  "--content", "cli row", "--signal", "test"],
+                 "[zmem] state memories require expiry_class"),
+                (["add", "--namespace", NS, "--type", "fact",
+                  "--content", "cli row", "--signal", "test",
+                  "--expiry-class", "endpoint"],
+                 "--expiry-class and --inject-until require --type state"),
+                (["add", "--namespace", NS, "--type", "state",
+                  "--content", "cli row", "--signal", "test",
+                  "--expiry-class", "bogus"],
+                 "invalid choice: 'bogus'"),
+                (["add", "--namespace", NS, "--type", "state",
+                  "--content", "cli row", "--signal", "test",
+                  "--expiry-class", "endpoint",
+                  "--inject-until", "2026-11-12 09:00:00"],
+                 "[zmem] inject_until must be UTC ISO-8601 with Z or +00:00 offset"),
+                (["add", "--namespace", NS, "--type", "state",
+                  "--content", "cli row", "--signal", "test",
+                  "--expiry-class", "endpoint",
+                  "--inject-until", "2026-02-30T00:00:00Z"],
+                 "[zmem] inject_until must be UTC ISO-8601 with Z or +00:00 offset"),
+            ]
+            for argv, fragment in cases:
+                r = self._run_cli(scratch, *argv)
+                self.assertEqual(r.returncode, 2,
+                                 f"{argv}: rc={r.returncode} stderr={r.stderr!r}")
+                self.assertIn(fragment, r.stderr,
+                              f"{argv}: missing {fragment!r} in {r.stderr!r}")
+                self.assertNotIn("Traceback", r.stderr,
+                                 f"{argv}: traceback leaked to stderr")
+            # Env-driven TTL message, same contract (F10 CLI leg).
+            r = self._run_cli(
+                scratch, "add", "--namespace", NS, "--type", "state",
+                "--content", "cli row", "--signal", "test",
+                "--expiry-class", "endpoint",
+                extra_env={"ZMEM_STATE_ENDPOINT_DAYS": "abc"})
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn(
+                "[zmem] invalid state expiry for class 'endpoint': "
+                "ZMEM_STATE_ENDPOINT_DAYS must be a positive decimal integer",
+                r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            # Update on an orphan state row: the pinned missing-side-row
+            # message (crafted v14-shaped ingest manufactures the orphan —
+            # AC5 tolerance; the writer refusal is the guard, F05 disposition).
+            orphan = "00000000-0000-4000-8000-0000000000c1"
+            craft = scratch / "craft.jsonl"
+            craft.write_text(json.dumps({
+                "kind": "memory", "id": orphan, "namespace": NS,
+                "type": "state", "content": "orphan cli row", "tags": "",
+                "source_ref": "craft", "confidence": 0.5, "signal": "test",
+                "valid_from": NOW, "valid_until": "", "update_of": "",
+                "taint": "trusted_internal", "ingestion_ts": NOW,
+                "superseded_at": None, "supersede_reason": "", "merged_from": None,
+                "trust_score": 1.0, "applied_count": 0, "violated_count": 0,
+                "links": [],
+            }) + "\n", encoding="utf-8")
+            ing = self._run_cli(scratch, "ingest-jsonl", "--in", str(craft))
+            self.assertEqual(ing.returncode, 0, ing.stderr)
+            r = self._run_cli(
+                scratch, "update", "--id", orphan, "--content", "touched",
+                extra_env={"ZMEM_MODEL_AUTODOWNLOAD": "0"})
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn(
+                "[zmem] state memories require an existing memory_expiry row",
+                r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_purged_parent_expiry_record_soft_drops_in_strict(self):
+        # #173 PR-review F13: a purged parent's expiry record must soft-drop
+        # like every other issue-#255 junction — never a fatal import. The
+        # file is exported BEFORE the purge; the TARGET store carries the
+        # deny-list entry, so the parent row is skipped and its side record
+        # must drop silently while the unrelated rider row+expiry land.
+        import tempfile
+        keep = self.add_state("purged parent row", cls="endpoint",
+                              mid=ENDPOINT_ID)
+        rider_id = "00000000-0000-4000-8000-0000000000c9"
+        self.add_state("unrelated state row", cls="metric", mid=rider_id)
+        out = self.root / "purge-file.jsonl"
+        self.assertEqual(sync.cmd_export_jsonl(self.conn, out=str(out)), 0)
+        with tempfile.TemporaryDirectory(prefix="zmem-173-purge-") as td:
+            other = sqlite3.connect(Path(td) / "store.sqlite")
+            other.row_factory = sqlite3.Row
+            schema.init_db(other)
+            schema.migrate(other)
+            try:
+                other.execute(
+                    "INSERT INTO purged_id (id, purged_at) VALUES (?,?)",
+                    (keep, NOW))
+                other.commit()
+                self.assertEqual(
+                    sync.cmd_ingest_jsonl_strict(other, in_path=str(out),
+                                                 source_ref=None), 0)
+                n = other.execute(
+                    "SELECT COUNT(*) FROM memory_expiry").fetchone()[0]
+                self.assertEqual(
+                    n, 1,
+                    "only the rider's expiry may land; the purged parent's "
+                    "must soft-drop")
+                self.assertIsNone(other.execute(
+                    "SELECT 1 FROM memory WHERE id=?", (keep,)).fetchone())
+                self.assertIsNotNone(other.execute(
+                    "SELECT 1 FROM memory WHERE id=?", (rider_id,)).fetchone())
+            finally:
+                other.close()
+
+    def test_stable_errors_via_public_strict_ingest(self):
+        # #173 PR-review F25: the three stable errors that were asserted only
+        # through private helpers are now driven through
+        # cmd_ingest_jsonl_strict (the public path), proving the file-level
+        # no-partial-commit property for each.
+        import tempfile
+
+        def _write(name, records):
+            p = self.root / name
+            p.write_text("".join(json.dumps(r) + "\n" for r in records),
+                         encoding="utf-8")
+            return p
+
+        def _mem(mid, type_="state"):
+            return {"kind": "memory", "id": mid, "namespace": NS,
+                    "type": type_, "content": f"wire row {mid}", "tags": "",
+                    "source_ref": "wire", "confidence": 0.5, "signal": "test",
+                    "valid_from": NOW, "valid_until": "", "update_of": "",
+                    "taint": "trusted_internal", "ingestion_ts": NOW,
+                    "superseded_at": None, "supersede_reason": "",
+                    "merged_from": None, "trust_score": 1.0,
+                    "applied_count": 0, "violated_count": 0, "links": []}
+
+        def _exp(mid):
+            return {"kind": "memory_expiry", "memory_id": mid,
+                    "inject_until": "2027-01-01T00:00:00Z",
+                    "expiry_class": "endpoint"}
+
+        cases = [
+            ("bad-uuid.jsonl", [_mem(ENDPOINT_ID), _exp(ENDPOINT_ID),
+                                dict(_exp(ENDPOINT_ID),
+                                     memory_id=ENDPOINT_ID + "x")],
+             "field 'memory_id' must be a 36-char UUID-shaped string"),
+            ("missing-parent.jsonl", [_exp("00000000-0000-4000-8000-0000000000c2")],
+             "memory_expiry parent must be a live state row"),
+        ]
+        for name, records, message in cases:
+            with tempfile.TemporaryDirectory(prefix="zmem-173-wire-") as td:
+                other = sqlite3.connect(Path(td) / "store.sqlite")
+                other.row_factory = sqlite3.Row
+                schema.init_db(other)
+                schema.migrate(other)
+                try:
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = sync.cmd_ingest_jsonl_strict(
+                            other, in_path=_write(name, records),
+                            source_ref=None)
+                    self.assertEqual(rc, 2, f"{name}: rc={rc} stderr={err.getvalue()!r}")
+                    self.assertIn(message, err.getvalue())
+                    self.assertEqual(
+                        other.execute(
+                            "SELECT COUNT(*) FROM memory_expiry").fetchone()[0],
+                        0, f"{name}: no partial side-table commit")
+                finally:
+                    other.close()
+        # Conflicting duplicate: land a record, then re-ingest a differing one.
+        first = self.root / "conflict-first.jsonl"
+        first.write_text(
+            json.dumps(_mem(ENDPOINT_ID)) + "\n" + json.dumps(_exp(ENDPOINT_ID))
+            + "\n", encoding="utf-8")
+        second = self.root / "conflict-second.jsonl"
+        second.write_text(
+            json.dumps(dict(_exp(ENDPOINT_ID),
+                            inject_until="2028-06-01T00:00:00Z")) + "\n",
+            encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="zmem-173-conf-") as td:
+            other = sqlite3.connect(Path(td) / "store.sqlite")
+            other.row_factory = sqlite3.Row
+            schema.init_db(other)
+            schema.migrate(other)
+            try:
+                self.assertEqual(
+                    sync.cmd_ingest_jsonl_strict(other, in_path=first,
+                                                 source_ref=None), 0)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = sync.cmd_ingest_jsonl_strict(other, in_path=second,
+                                                      source_ref=None)
+                self.assertEqual(rc, 2, err.getvalue())
+                self.assertIn("memory_expiry conflicts with existing record",
+                              err.getvalue())
+                row = other.execute(
+                    "SELECT inject_until FROM memory_expiry WHERE memory_id=?",
+                    (ENDPOINT_ID,)).fetchone()
+                self.assertEqual(row["inject_until"], "2027-01-01T00:00:00Z",
+                                 "the original record must survive the refusal")
+            finally:
+                other.close()
+
+    def test_filtered_export_omits_orphan_side_records(self):
+        # #173 PR-review F24: "omit side-table records whose parent is not in
+        # the export" — exercised with a POPULATED map under a namespace
+        # filter, the path no test reached before.
+        ns_a = "project:filter-a"
+        ns_b = "project:filter-b"
+        a = self.add_state("filter row a", cls="endpoint")
+        self.conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, tags, "
+            "source_ref, source_hash, confidence, signal, valid_from, "
+            "ingestion_ts, content_norm) VALUES (?,?,?,?,?,?,?,0.5,'test',?,?,?)",
+            (ENDPOINT_ID, ns_b, "state", "filter row b", "", "wire", "",
+             NOW, NOW, "filter row b"))
+        self.conn.execute(
+            "INSERT INTO memory_expiry (memory_id, inject_until, expiry_class) "
+            "VALUES (?,?,?)", (ENDPOINT_ID, "2027-01-01T00:00:00Z", "metric"))
+        self.conn.execute("UPDATE memory SET namespace=? WHERE id=?",
+                          (ns_a, a))
+        self.conn.commit()
+        out = self.root / "filtered.jsonl"
+        self.assertEqual(
+            sync.cmd_export_jsonl(self.conn, out=str(out), namespace=ns_a), 0)
+        kinds = [json.loads(l)["kind"]
+                 for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual(kinds.count("memory_expiry"), 1,
+                         "only the in-scope parent's side record may ship")
+        self.assertEqual(kinds.count("memory"), 1)
+        self.assertNotIn(ENDPOINT_ID,
+                         [json.loads(l).get("memory_id")
+                          for l in out.read_text(encoding="utf-8").splitlines()
+                          if json.loads(l)["kind"] == "memory_expiry"])
+
+    def test_export_without_side_table_prints_skip_notice(self):
+        # #173 PR-review F14: a v15-stamped store whose side table is
+        # externally dropped exports WITHOUT expiry records but says so on
+        # stderr (the v14 evidence-schema precedent of never dropping
+        # metadata silently).
+        import contextlib as _ctx
+        self.add_state("notice row", cls="endpoint")
+        self.conn.execute("DROP TABLE memory_expiry")
+        self.conn.commit()
+        out = self.root / "notice.jsonl"
+        err = io.StringIO()
+        with _ctx.redirect_stderr(err):
+            self.assertEqual(sync.cmd_export_jsonl(self.conn, out=str(out)), 0)
+        self.assertIn("memory_expiry records skipped", err.getvalue())
+        kinds = [json.loads(l)["kind"]
+                 for l in out.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual(kinds, ["memory"])
 
 
 if __name__ == "__main__":

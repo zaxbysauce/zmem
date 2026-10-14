@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from schema_meta import STATE_EXPIRY_CLASSES, STATE_EXPIRY_ENV, STATE_EXPIRY_TTL_DAYS
 
@@ -52,7 +52,10 @@ def state_expiry_days(expiry_class: str) -> int:
     if raw is None or raw == "":
         return STATE_EXPIRY_TTL_DAYS[expiry_class]
     text = str(raw).strip()
-    if not text.isdigit() or int(text) < 1:
+    # ASCII-decimal only: `str.isdigit()` admits non-ASCII decimal digits
+    # (silently coerced by int()) and superscripts (which pass isdigit and
+    # then escape to int()'s raw message, echoing the operator's env value).
+    if not (text.isascii() and text.isdecimal()) or int(text) < 1:
         raise ValueError(
             f"invalid state expiry for class '{expiry_class}': {env} must be a "
             "positive decimal integer"
@@ -66,13 +69,26 @@ def validate_inject_until(value: str) -> str:
     Accepts ``YYYY-MM-DDTHH:MM:SSZ``, the same form with one or more fractional
     second digits, and either form with a ``+00:00`` offset. ``+00:00`` is
     rewritten to ``Z``; valid fractional seconds are preserved verbatim. A
-    date-only, naive (no offset), malformed, or non-UTC value is refused.
+    date-only, naive (no offset), malformed, or non-UTC value is refused —
+    "malformed" includes calendar-impossible components: the matched base is
+    parsed with ``datetime.fromisoformat`` so ``2026-02-30``/``2026-13-01``/
+    ``25:61:61`` are refused with the same pinned message rather than stored
+    verbatim (the shape-only regex alone accepted them; issue #173 Design
+    step 3 requires malformed values to raise).
     """
     if not isinstance(value, str):
         raise ValueError("inject_until must be UTC ISO-8601 with Z or +00:00 offset")
     match = _UTC_FRACTIONAL.match(value.strip())
     if match is None:
         raise ValueError("inject_until must be UTC ISO-8601 with Z or +00:00 offset")
+    try:
+        datetime.fromisoformat(match.group("base"))
+    except ValueError:
+        # Same pinned message as the shape refusals: the contract's error text
+        # does not distinguish malformed sub-shapes.
+        raise ValueError(
+            "inject_until must be UTC ISO-8601 with Z or +00:00 offset"
+        ) from None
     return f"{match.group('base')}{('.' + match.group('frac')) if match.group('frac') else ''}Z"
 
 
@@ -80,17 +96,26 @@ def compute_inject_until(expiry_class: str, *, now: str) -> str:
     """``now`` plus the class TTL, as a canonical UTC ``...Z`` string.
 
     ``now`` must already be normalized (``validate_inject_until``); the return
-    is the same canonical form. ``fromisoformat`` (not ``strptime``, whose
-    ``%Y-%m-%dT%H:%M:%SZ`` format string rejects the fractional seconds that
-    ``validate_inject_until`` accepts) parses the base to an aware datetime, the
-    TTL is added in UTC, and the result is re-serialized in canonical form.
-    ``timespec="auto"`` keeps fractional digits when the base carried them and
-    emits none when it did not, so a whole-second ``now`` (what ``now_iso()``
-    produces, and what the writer's single-timestamp contract pins) round-trips
-    byte-identically.
+    is the same canonical form. The TTL is added to the WHOLE-SECOND part and
+    the base's fractional digits (if any) are re-attached verbatim, so a
+    caller-supplied fraction survives byte-identically instead of being
+    truncated to datetime's microsecond precision (a whole-day addition never
+    interacts with sub-second digits). A TTL/``now`` combination that
+    overflows datetime range raises ``ValueError`` (never ``OverflowError``)
+    so the CLI's ``except ValueError`` handlers print ``[zmem] <message>`` and
+    exit 2 without a traceback (issue #173 Execution step 10).
     """
     base = validate_inject_until(now)
-    parsed = datetime.fromisoformat(base)
-    return (
-        parsed + timedelta(days=state_expiry_days(expiry_class))
-    ).isoformat(timespec="auto").replace("+00:00", "Z")
+    if "." in base:
+        whole, frac = base[:-1].split(".", 1)
+        suffix = f".{frac}Z"
+    else:
+        whole, suffix = base[:-1], "Z"
+    parsed = datetime.fromisoformat(whole)
+    try:
+        bumped = parsed + timedelta(days=state_expiry_days(expiry_class))
+    except OverflowError as exc:
+        raise ValueError(
+            f"computed inject_until for class '{expiry_class}' is out of range"
+        ) from exc
+    return bumped.strftime("%Y-%m-%dT%H:%M:%SZ")[:-1] + suffix
