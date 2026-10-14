@@ -793,6 +793,16 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     # (the writer os.replace won) is a benign race that must neither abort
     # the purge (the scrub is fail-closed for LEDGERS only) nor disturb a
     # live writer (review PRR-002).
+    # Issue #253: park_task_text stages through the same uuid-suffixed tmp
+    # pattern inside _atomic_write_json, and a launcher watchdog SIGKILL
+    # between os.open and os.replace orphans it permanently (neither this
+    # scrub nor the backup age sweep matches a name ending in bare hex).
+    for path in ops.glob("*.tasktext.tmp.*"):
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
     for path in ops.glob("*.signals.tmp.*"):
         try:
             path.unlink()
@@ -824,6 +834,39 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         from storelib.delivery_ledger import _atomic_write_json
         _atomic_write_json(str(path), doc)
         stats["files_scrubbed"] += 1
+    # Issue #253: the parked delegation stash (<hash>.tasktext) holds
+    # untrusted host prose and previously had NO operator deletion path —
+    # doctor never inventoried it, every clear preserved it (by design), and
+    # only the whole-ops-dir age sweep removed it. Give purge the same
+    # needle scrub so an operator can remove content the normal way. The
+    # entry shape is {agent_id, text, ts}, so only the folded-needle law
+    # applies (there are no memory ids to drop by). Entries left with no
+    # text are dropped; an emptied file is removed. Best-effort like the
+    # tmp reaps: an unreadable stash must not abort a fail-closed scrub.
+    for path in ops.glob("*.tasktext"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            entries = doc.get("entries")
+            if not isinstance(entries, list):
+                continue
+            kept = []
+            for e in entries:
+                if isinstance(e, dict):
+                    folded = _ascii_fold(str(e.get("text") or ""))
+                    if any(_ascii_fold(n) in folded for n in needles):
+                        stats["entries_dropped"] += 1
+                        continue
+                kept.append(e)
+            if len(kept) == len(entries):
+                continue
+            if kept:
+                doc["entries"] = kept
+                _atomic_write_json(str(path), doc)
+            else:
+                path.unlink()
+            stats["files_scrubbed"] += 1
+        except OSError:
+            pass
     # Issue #252: the per-call JSONL segments (<hash>.ledger.seg.<hex>)
     # carry the same scrub laws as the base ledger — drop_ids and folded
     # needles die here too, or _verify_ledgers_clean's *.ledger* byte scan

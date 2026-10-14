@@ -1342,7 +1342,7 @@ Notes:
   under `<ZMEM_DATA>/subagent-reflections/` that the parent's Stop hook
   surfaces and consumes. Subagent recall uses task/query text present in the event when
   available, else the delegating prompt parked store-side by the parent's
-  PreToolUse(Agent) call (issue #253), and falls back to the store-owned
+  PreToolUse(`Agent`/`Task`) call (issue #253), and falls back to the store-owned
   recent selector last. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
   userConfig option) if you want it elsewhere.
 - **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /

@@ -37,10 +37,12 @@ _HOOK_INPUT_MAX_BYTES = 256 * 1024
 # transport for raw tool input.
 _PRETOOL_INPUT_MAX_BYTES = _HOOK_INPUT_MAX_BYTES
 _PRIVATE_PRETOOL_STDIN_MARKER = "ZMEM_PRIVATE_PRETOOL_STDIN"
-# Issue #253: the delegating prompt rides the store argv (same surface as
-# --query free text) and is capped at the store-side park's TASK_TEXT_MAX so
-# the parked bytes and the argv bytes agree.
-_DELEGATION_PROMPT_MAX = 800
+# Issue #253: the delegating prompt rides the store argv (same surface as the
+# --query free text).  The bound is an ARGV bound, not the parked-byte size:
+# the store redacts first and only then caps at TASK_TEXT_MAX, so truncating
+# here would let a secret straddling the parked-size boundary persist as a
+# cleartext prefix.  4000 keeps argv far inside Windows' 32767-char limit.
+_DELEGATION_ARG_MAX = 4000
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
@@ -770,8 +772,9 @@ def main() -> int:
     # neither key is new to the parent's own pull: _query_for's pretool
     # branch already read `description` and always ignored `prompt`, so
     # this block changes nothing about what the parent itself receives.
-    if mode == "pretool" and _event_text(event, "tool_name", "tool") in (
-            "Agent", "Task"):
+    if (mode == "pretool"
+            and _event_text(event, "tool_name", "tool").lower() in (
+                "agent", "task")):
         _delegation = ""
         _tool_input = event.get("tool_input")
         if isinstance(_tool_input, dict):
@@ -781,8 +784,16 @@ def main() -> int:
                     _delegation = _value.strip()
                     break
         if _delegation:
+            # A NUL cannot survive argv: CPython raises ValueError before
+            # the spawn, which would cost the PARENT its whole recall rather
+            # than just this park. Drop control characters here.
+            _delegation = _delegation.replace("\x00", "")
+            # Transport more than the store's TASK_TEXT_MAX so the store can
+            # REDACT first and cap afterwards — truncating here would let a
+            # secret straddling the boundary persist as a cleartext prefix.
+            # The bound keeps argv well inside Windows' 32767-char limit.
             args.extend(_free_text_arg("--delegation-prompt",
-                                       _delegation[:_DELEGATION_PROMPT_MAX]))
+                                       _delegation[:_DELEGATION_ARG_MAX]))
     # Issue #98: forward the cross-project tier flag per its surface matrix.
     # ZMEM_CROSS_PROJECT unset arms pretool only (posttoolbatch included —
     # _decision_moment maps it to pretool); "0" disables every surface (the

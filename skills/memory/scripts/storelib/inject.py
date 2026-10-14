@@ -1117,23 +1117,18 @@ def select_and_budget_for_injection(
     # pull records its rendered rows under the session id the child SHARES
     # (SubagentStart carries the parent's id), and a subagent is a fresh
     # context — rows the parent context saw must not suppress the child's
-    # task-keyed recall. When the selector consumed a parked delegation
-    # (bridged_query), restrict the delivered-derived exclusions to rows
-    # recorded at the subagent moment, so sibling children still dedup
-    # against each other while parent-moment deliveries stop starving the
-    # child. Explicit exclude_ids always apply. An entry with a missing or
-    # empty "moment" (hand-crafted/ancient file) falls OUT of the bridged
-    # child's exclusions — over-delivery, never starvation; record() always
-    # stamps the moment (delivery_ledger.py), so this is unreachable from
-    # real entries. Non-bridged pulls keep the full delivered exclusion set
-    # byte-identical.
+    # task-keyed recall.  When the selector consumed a parked delegation
+    # (bridged_query), the pull drops its delivered-derived exclusions
+    # ENTIRELY: the fresh child re-reads rows the parent (or a sibling child)
+    # already rendered, which is over-delivery of already-seen rows rather
+    # than starvation.  That direction is deliberate — narrowing the set to
+    # subagent-moment rows would let the first bridged child suppress the
+    # rows the second one needs when their queries are related, which is the
+    # starvation this carve-out exists to prevent (see issue #331).  Explicit
+    # exclude_ids always apply, and non-bridged pulls keep the full
+    # delivered exclusion set byte-identical.
     if bridged_query:
-        delivered_ids = _ordered_unique(
-            e["id"] for e in delivered_entries
-            if isinstance(e, dict)
-            and isinstance(e.get("id"), str)
-            and e.get("moment") == "subagent"
-        )
+        delivered_ids = []
     # Explicit exclusions precede delivered ids, preserving first-seen order
     # and making duplicate ids deterministic across callers.
     exclusions = _ordered_unique(list(exclude_ids or []) + delivered_ids)
