@@ -1082,8 +1082,15 @@ def select_and_budget_for_injection(
 
     # Validation above intentionally precedes this first ledger call.
     try:
-        delivered_ids = list(ledger.delivered_ids(resolved_data, session_id))
+        # Issue #252 review (P-005/P-022): one merged read instead of two —
+        # delivered_ids is exactly the id projection of the reduce that
+        # delivered() returns, so this halves the hot-path cost and the two
+        # views can no longer disagree across a compaction landing between
+        # them.
         delivered_entries = list(ledger.delivered(resolved_data, session_id))
+        delivered_ids = [e["id"] for e in delivered_entries
+                         if isinstance(e, dict)
+                         and isinstance(e.get("id"), str)]
     except Exception:
         return _selector_silent(budget_tokens=budget)
     delivered_ids = _ordered_unique(delivered_ids)
