@@ -111,7 +111,7 @@ from storelib.schema import (
     _parse_iso_to_epoch,
     now_iso,
 )
-from storelib.write import AutoCaptureRuntimeError, CapturePolicyRefusal, add_memory, update_memory
+from storelib.write import AutoCaptureRuntimeError, CapturePolicyRefusal, _clear_expiry, add_memory, update_memory
 
 # Summaries are real rows. A signal=none row inherits SIGNAL_CONFIDENCE["none"]
 # (0.2) which sits BELOW the CONFIDENCE_FLOOR (0.25) — such a row is invisible
@@ -431,6 +431,11 @@ def _supersede_stale_summaries(
                 "WHERE id=?",
                 (tomb_at, tomb_at, row["id"]),
             )
+            # v15 (#173): the stale summary's side-table record goes with its
+            # tombstone, in the SAME transaction — one of the cleanup sites.
+            # `tomb_at` is computed once above, so this transaction
+            # writes a single timestamp (AC7).
+            _clear_expiry(conn, row["id"])
 
 
 def _cluster_topics(

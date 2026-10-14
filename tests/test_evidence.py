@@ -581,7 +581,7 @@ class EvidenceSchemaTest(_StoreCase):
         version = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", ("schema_version",)
         ).fetchone()[0]
-        self.assertEqual(version, "14")
+        self.assertEqual(version, "15")
         self.assertEqual(
             {r[0] for r in self.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -605,7 +605,7 @@ class EvidenceSchemaTest(_StoreCase):
             legacy.execute(
                 "SELECT value FROM meta WHERE key=?", ("schema_version",)
             ).fetchone()[0],
-            "14",
+            "15",
         )
         legacy.close()
 

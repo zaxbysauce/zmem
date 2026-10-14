@@ -70,6 +70,13 @@ _MAX_QUERY_CHARS = 1000
 _MAX_CONTENT_CHARS = 65536
 _ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
 _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
+# v15 (#173 PR-review F22): `add` may only create types this server can
+# express — `state` needs mandatory expiry params the tool does not take, so
+# it is advertised/validated against this serviceable subset. `update` keeps
+# the full set (content-only updates of pre-existing state rows inherit and
+# succeed). Fallback mirrors the six; the loader derives the subset from the
+# real ALLOWED_TYPES so the two can never silently diverge from schema_meta.
+_ALLOWED_TYPES_ADDABLE = ("fact", "lesson", "convention", "preference", "decision", "constraint")
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # Never invent a validator fallback. If the selected checkout cannot provide
 # the shared namespace validator, noncanonical namespaces fail closed.
@@ -320,6 +327,7 @@ def _load_store_constants() -> None:
     validator loading, matching the store.py subprocess it will execute.
     """
     global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
+    global _ALLOWED_TYPES_ADDABLE
     global _NAMESPACE_VALIDATOR
     global _INJECT_LANES
     global _INJECT_SILENT_REASONS, _INJECT_REASON_INJECTED
@@ -358,6 +366,10 @@ def _load_store_constants() -> None:
         types = getattr(mod, "ALLOWED_TYPES", None)
         if types:
             _ALLOWED_TYPES = tuple(types)
+            # v15 (#173 PR-review F22): derive the addable subset from the
+            # real type set — anything this server cannot express as a create
+            # (today: `state`) stays out of the add surface's validation.
+            _ALLOWED_TYPES_ADDABLE = tuple(t for t in types if t != "state")
         taints = getattr(mod, "ALLOWED_TAINTS", None)
         if taints:
             _ALLOWED_TAINTS = tuple(taints)
@@ -1520,9 +1532,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         mtype = (type or "").strip()
         body = (content or "").strip()
-        if mtype not in _ALLOWED_TYPES:
+        # v15 (#173 PR-review F22): creation is validated against the
+        # serviceable subset — `state` would otherwise pass this boundary and
+        # hard-fail in store.py (no expiry params on this tool).
+        if mtype not in _ALLOWED_TYPES_ADDABLE:
             return _error(
-                "type must be one of: " + ", ".join(_ALLOWED_TYPES)
+                "type must be one of: " + ", ".join(_ALLOWED_TYPES_ADDABLE)
             )
         if not body:
             return _error("content is required")

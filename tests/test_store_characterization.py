@@ -404,6 +404,53 @@ class CharacterizationTests(unittest.TestCase):
                 verify.close()
             self.assertEqual(columns.count("payload_sha256"), 1)
 
+    def test_memory_table_info_is_unchanged_after_v15(self):
+        """Issue #173 AC1 (additive-only guard).
+
+        The v15 `state` type + `memory_expiry` side table are ADDITIVE: the
+        `memory` table's own columns, types, NOT NULL flags, defaults and
+        primary-key positions must be byte-for-byte what a v14 store had. A
+        drift here would silently break every v14 maintenance client that runs
+        ordinary `INSERT INTO memory (...)` against a v15 store (the
+        additive-window contract AC4 pins), so this asserts the exact column
+        list rather than a count -- a rename or a type change is a real break,
+        not a reordering.
+        """
+        path = self.store
+        conn = sqlite3.connect(path)
+        try:
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            self.assertEqual(ver, "15",
+                             "the characterization fixture must be a v15 store")
+            rows = list(conn.execute("PRAGMA table_info(memory)"))
+        finally:
+            conn.close()
+        self.assertEqual(
+            [r[1] for r in rows],
+            ["id", "namespace", "type", "content", "tags", "source_ref",
+             "source_hash", "confidence", "signal", "valid_from",
+             "superseded_at", "ingestion_ts", "retrieval_count", "last_retrieved",
+             "surfaced_count", "last_surfaced", "merged_from", "content_norm",
+             "valid_until", "update_of", "taint", "trust_score", "applied_count",
+             "violated_count", "embedding", "embedding_model", "embedded_at",
+             "consolidated_at", "supersede_reason"],
+            "v15 must not add/drop/reorder/rename a memory column (AC1)")
+        # cid, name, type, notnull, dflt_value, pk -- pin the whole shape.
+        self.assertEqual(
+            [(r[2], r[3], r[5]) for r in rows],
+            [("TEXT", 0, 1), ("TEXT", 1, 0), ("TEXT", 1, 0), ("TEXT", 1, 0),
+             ("TEXT", 1, 0), ("TEXT", 1, 0), ("TEXT", 1, 0), ("REAL", 1, 0),
+             ("TEXT", 1, 0), ("TEXT", 1, 0), ("TEXT", 0, 0), ("TEXT", 1, 0),
+             ("INTEGER", 1, 0), ("TEXT", 0, 0), ("INTEGER", 1, 0), ("TEXT", 0, 0),
+             ("TEXT", 0, 0), ("TEXT", 0, 0), ("TEXT", 1, 0), ("TEXT", 1, 0),
+             ("TEXT", 1, 0), ("REAL", 1, 0), ("INTEGER", 1, 0), ("INTEGER", 1, 0),
+             ("BLOB", 0, 0), ("TEXT", 0, 0), ("TEXT", 0, 0), ("TEXT", 0, 0),
+             ("TEXT", 0, 0)],
+            "memory column types/NOT-NULL/pk drifted -- the additive v15 "
+            "migration must leave this table alone")
+
     def test_root_help_surface(self):
         r = _run_cli({}, "--help")
         self.assertEqual(r.returncode, 0, r.stderr)

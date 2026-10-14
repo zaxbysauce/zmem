@@ -527,7 +527,7 @@ class BeliefHeadTest(unittest.TestCase):
             self.assertNotIn("observation", schema_meta.allowed_types())
             self.assertEqual(schema_meta.ALLOWED_TYPES,
                              ("fact", "lesson", "convention", "preference",
-                              "decision", "constraint"))
+                              "decision", "constraint", "state"))
             # Accept branch, isolated per decision: the gate reader is the
             # seam allowed_types() must consult.
             with patch.object(schema_meta, "observation_gate_decision",
@@ -540,7 +540,7 @@ class BeliefHeadTest(unittest.TestCase):
                                  schema_meta.ALLOWED_TYPES)
             self.assertEqual(schema_meta.ALLOWED_TYPES,
                              ("fact", "lesson", "convention", "preference",
-                              "decision", "constraint"))
+                              "decision", "constraint", "state"))
             # Explicit-path decisions: accept, missing, malformed, unknown.
             with tempfile.TemporaryDirectory(
                     prefix="zmem-obs-gate-") as tmp:
@@ -615,12 +615,15 @@ class BeliefHeadTest(unittest.TestCase):
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
         self.assertEqual(version_after, version_poisoned)
-        self.assertEqual(version_after, "14")
+        # v15 (#173): a fresh store now migrates to 15; the load-bearing
+        # assertion is the version-unchanged pair above — this literal only
+        # pins "the fixture store sits at the current latest version".
+        self.assertEqual(version_after, "15")
         names = {r[1] for r in after}
         self.assertNotIn("belief_head_source", names,
                          "partial belief DDL survived a failed migration")
         self.assertNotIn("belief_head_evidence", names)
-        # And the pre-poison full store had the belief tables at v14.
+        # And the pre-poison full store had the belief tables at v15.
         self.assertIn("belief_head", {r[1] for r in tables_before})
 
     # ---- adapter payload bounds ----

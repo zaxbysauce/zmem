@@ -1244,7 +1244,37 @@ below (`py -3` on Windows). Common operations:
 
 # Tombstone a stale lesson (keeps history)
 <interpreter> <store.py> supersede --id <uuid> --reason "no longer applies"
+
+# Capture an expiring environment fact (v15 `state` type, issue #173)
+<interpreter> <store.py> add \
+  --namespace "project:myrepo" --type state \
+  --content "staging api base url is https://staging.example.com/v2" \
+  --tags "env,endpoint" --signal none --expiry-class endpoint
 ```
+
+### `state` rows and injection expiry (v15, issue #173)
+
+A `state` memory records a piece of the current environment — an endpoint, a
+setting, a metric — that is only worth injecting while it is CURRENT. It is a
+first-class type alongside `fact`/`lesson`/…, and it carries expiry metadata in
+an additive `memory_expiry` side table (`memory_id`, `inject_until`,
+`expiry_class`); the `memory` table itself is unchanged. `--type state` requires
+`--expiry-class`:
+
+| class | default TTL | env override |
+|---|---|---|
+| `endpoint` | 30 days | `ZMEM_STATE_ENDPOINT_DAYS` |
+| `setting` | 90 days | `ZMEM_STATE_SETTING_DAYS` |
+| `metric`  | 14 days | `ZMEM_STATE_METRIC_DAYS` |
+
+An omitted `--inject-until` computes `now + TTL`; an explicit one must be UTC
+ISO-8601 (`...Z` or `+00:00`) and bypasses the TTL. The side table is
+injection-only — passive injection will later stop delivering an expired row
+(issue #174), but the row is never deleted and stays reachable through explicit
+`recall`/`search`. The TTL overrides are per-call reads, so an operator can
+tighten or widen a class without a rebuild. Export/import round-trips the
+records as a `memory_expiry` JSONL kind immediately following each parent
+memory record.
 
 The full command reference is in the `memory` skill (type `/memory` in ZCode).
 

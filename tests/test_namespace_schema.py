@@ -538,7 +538,7 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         self.assertEqual(
             self.allowed_types,
             ("fact", "lesson", "convention", "preference",
-             "decision", "constraint"),
+             "decision", "constraint", "state"),
             "ALLOWED_TYPES must be exactly the v9 shipped set — dropping a "
             "shipped type is a schema regression",
         )
@@ -558,6 +558,38 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         hermes_src = HERMES_INIT.read_text(encoding="utf-8")
         self.assertIn('consts["ALLOWED_TYPES"]', hermes_src)
         self.assertIn('consts["ALLOWED_TAINTS"]', hermes_src)
+
+    def test_agent_add_surfaces_exclude_state_until_expiry_params_exist(self):
+        # #173 PR-review F22/F23: the hermes and MCP add surfaces advertise and
+        # write-validate only the types they can CREATE — `state` needs the
+        # expiry params neither surface takes, so it is pinned out of the add
+        # path, the schema enum, and the degraded fallback until the params are
+        # wired (follow-up issue). The pins tie the serviceable set to
+        # schema_meta: if a future type ships, the derived subset moves with
+        # it and these source pins keep the exclusion honest.
+        self.assertIn("state", self.allowed_types,
+                      "precondition: the exclusion exists because state is shipped")
+        serviceable = tuple(t for t in self.allowed_types if t != "state")
+        self.assertEqual(
+            serviceable,
+            ("fact", "lesson", "convention", "preference", "decision",
+             "constraint"))
+        hermes_src = HERMES_INIT.read_text(encoding="utf-8")
+        self.assertIn('_STATE_TYPES = frozenset({"state"})', hermes_src)
+        self.assertIn("_ADD_TYPE_ENUM = list(_ADDABLE_TYPES)", hermes_src)
+        self.assertIn("if mtype not in _ADDABLE_TYPES:", hermes_src)
+        # The degraded-mode fallback literal must be the serviceable subset —
+        # the split-brain guard (F23): degraded and loaded modes now agree.
+        self.assertIn(
+            '"ALLOWED_TYPES": ("fact", "lesson", "convention", '
+            '"preference", "decision", "constraint")',
+            hermes_src.replace("'", '"'))
+        mcp_src = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
+                   ).read_text(encoding="utf-8")
+        self.assertIn(
+            '_ALLOWED_TYPES_ADDABLE = tuple(t for t in types if t != "state")',
+            mcp_src)
+        self.assertIn("if mtype not in _ALLOWED_TYPES_ADDABLE:", mcp_src)
 
 
 if __name__ == "__main__":
