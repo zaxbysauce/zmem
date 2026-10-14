@@ -373,7 +373,7 @@ constants live in `schema_meta.py`.
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
 | `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
 | `INJECT_FLOOR_TRUST_DEFAULT` | 0.2 | `ZMEM_INJECT_FLOOR_TRUST` | Selective-inject gate (issue #115). Hard floor on `trust_score`: a row the contradiction ledger has driven below 0.2 (nine or more distinct `contradict` events) can no longer ride the passive lane; `compute_score` also multiplies every composite by `trust_score` (identity at the default 1.0, so uncontradicted rankings do not move — explicit recall/search keep retrieving the row, just ranked lower). When E-5 (#124) starts recording violations automatically, they must feed THIS ledger via trust deltas — `violated_count` never becomes a second independent gate input. |
-| `INJECT_FLOOR_USER_GLOBAL_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_USER_GLOBAL` | user:global tier floor on the passive injection lane (issue #235). On gated moments (`pretool`/`subagent` — the hooks' posttoolbatch maps to `pretool` store-side) a global-tier injection candidate whose MAX measured relevance lane sits below 0.5 is withheld and its reserved slot returns empty rather than being backfilled; the envelope reports the count as `global_withheld` (present only when a withhold happened). A global candidate with NO measured lane (query-less recent pulls) keeps the not-measured exemption — never withheld by this floor; when issue #253 restores task-keyed SubagentStart recall, the floor becomes effective on that surface naturally. `session_start`/`user_prompt`/`precompact` keep their current global composition. `0` disables (relevance values are >= 0, so nothing is ever below it). |
+| `INJECT_FLOOR_USER_GLOBAL_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_USER_GLOBAL` | user:global tier floor on the passive injection lane (issue #235). On gated moments (`pretool`/`subagent` — the hooks' posttoolbatch maps to `pretool` store-side) a global-tier injection candidate whose MAX measured relevance lane sits below 0.5 is withheld and its reserved slot returns empty rather than being backfilled; the envelope reports the count as `global_withheld` (present only when a withhold happened). A global candidate with NO measured lane (query-less recent pulls) keeps the not-measured exemption — never withheld by this floor; the user:global floor is armed on the subagent moment for every pull; a bridged task-keyed SubagentStart recall (issue #253) additionally gives that surface a measured relevance lane, while query-less pulls keep the not-measured exemption. `session_start`/`user_prompt`/`precompact` keep their current global composition. `0` disables (relevance values are >= 0, so nothing is ever below it). |
 
 The floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a passive-lane filter; the trust floor
@@ -638,9 +638,12 @@ On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;
 Claude: emitted — issue #117 retired the sidecar default in favor of the
 per-session delivery ledger), a
 PreToolUse hook (`zmem-pretool-recall.sh`, matcher
-`Edit|Write|MultiEdit|NotebookEdit|Bash|Agent` since 0.30.0 — issue #119;
-the Agent branch passes task text when present and otherwise uses the
-store-owned recent path)
+`Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue #119;
+the live registration in `hooks/hooks.claude.json` also carries `apply_patch`
+(added later; see #338 for the apply_patch dating).
+the Agent branch passes task text when the event carries it AND,
+when it does not, parks the delegating prompt store-side for the child's
+SubagentStart (issue #253), otherwise using the store-owned recent path)
 derives the recall query from the
 tool input ITSELF — the command or file path about to run — and injects
 matching hazard lessons before the tool executes. Pre-tool
@@ -694,10 +697,43 @@ with a live tool_name dump before changing the matcher.
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall — issue #119, probe 2026-09-10: neither
 host's SubagentStart payload carries task text, so the query ladder is
-payload-field-if-present → task/query text supplied by the event when
-available → the queryless recent selector). The former delegating
-PreToolUse(`Agent`) stash is retired; no zmem task-text sidecar is written or
-consumed. Claude's matcher remains
+payload-field-if-present → the delegating prompt parked store-side by the
+parent's PreToolUse(`Agent`) call when the event yielded nothing (issue
+#253) → the queryless recent selector last). The store-side bridge restores
+the #119 intent inside the #158 architecture: the hook body passes the
+delegating prompt to the store subprocess it already makes
+(`--delegation-prompt`, argv surface bounded at 4000 chars so the store can
+redact before capping the parked bytes at 800, never a storelib import in
+the adapter), the CLI parks it via `park_task_text`
+(secret-redacted through the canonical `redact_text`, advisory and
+fail-open; 16-entry cap, and a stale entry stops being CONSUMED after the
+6h window — but that prune is in-memory only, so the file survives
+session-end clears and the real bound on untrusted host prose on disk is
+the ops age sweep, `ZMEM_SENTINEL_SWEEP_DAYS`, default 7 days; `purge`
+scrubs the stash by needle and reaps orphaned `*.tasktext.tmp.*`;
+0600-at-open + atomic replace, with owner-only access on Windows resting
+on the operator-profile ACL rather than chmod), and the selector consumes it
+FIFO at the subagent moment only when the payload ladder produced no query —
+no agent id exists at park time on any probed host, so FIFO is the
+correlation rule and out-of-order arrival of truly concurrent children is
+the documented limitation; the accepted races are the parallel-park
+drop-not-swap, a parallel-consume overlap (two concurrent children can
+load the same head entry before either rewrite lands — both receive that
+delegation, one child's prompt is consumed by its sibling; degraded
+relevance only, never a crash), and the parked-against-consume overlap
+(a fresh park loses its entry to a concurrent rewrite). An ORPHANED park
+— a delegation whose child never starts (permission denied, cancelled,
+tool errored) — sits at the FIFO head and shifts EVERY later child's
+prompt by one for the rest of the window: no correlation id exists on the
+park side to expire it early. That trade is accepted (issue #329); the
+6h window and 16-entry cap bound how long the shift lasts, not how many
+children it affects. `ZMEM_QUERY_CONTEXT=0` or `ZMEM_INJECT=0`
+disables parking via the early exit. A bridged child is a fresh context:
+its pull drops the delivered-derived exclusions entirely, so the parent's
+pretool deliveries cannot starve it and a fresh child re-reads rows an
+earlier sibling already rendered (over-delivery of already-seen rows,
+never starvation — deliberately NOT narrowed to sibling-moment rows,
+which would let one sibling starve the next; issue #331). Claude's matcher remains
 `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue
 #119; `Task` is accepted as the pre-rename delegation tool name per community
 issue 29677, closed stale and not vendor-confirmed. Claude Code also registers
@@ -724,8 +760,9 @@ PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
 the Codex DELEGATION tool surface is UNVERIFIED by #119 (2026-09-10): the
 #95 dump covered only the shell and patch/apply tools and cannot say
 whether a delegation facility fires PreToolUse at all, so no matcher entry
-was added and Codex SubagentStart rides the transcript-tail/recent rungs
-(fresh delegation-tool dump deferred to the live-probe owner #96).
+was added and Codex SubagentStart rides the payload-field / recent rungs
+(there is no transcript-tail rung — that parser is retired; a fresh
+delegation-tool dump is deferred to the live-probe owner #96).
 Upstream drops `additionalContext` on PreCompact (decision control only,
 verified 2026-09-09 from codex-rs source), so zmem's Codex PreCompact
 entry exists to clear the delivery ledger before compaction;
@@ -1050,7 +1087,11 @@ The exact session-aware CLI forms are:
 
 The passive `recall` and `recent` commands accept the additive attribution
 flags `--session-id=<id>`, `--moment`, `--lane`, and repeatable `--ops-token` when
-called with `--for-injection --json`. An empty query dispatches to recent
+called with `--for-injection --json`, plus the payload flag
+`--delegation-prompt` (issue #253). `--delegation-prompt` is honored ONLY on
+`--moment pretool` with a session id, is secret-redacted before it touches the
+sidecar, and exists to park the delegating Agent/Task prompt for the subagent
+moment; every other moment ignores it. An empty query dispatches to recent
 selection. An omitted `--ops-token` list lets the store read the pre-tool ring;
 the ring is composed only for `pretool`, not for UserPromptSubmit or other
 moments. For passive `recall` and `recent`, a session id requires a moment, and
@@ -1061,9 +1102,13 @@ session's delivery ledger without opening SQLite. `delivery-clear
 cleanup, also without opening SQLite; both commands are idempotent when their
 target sidecars are absent.
 
-The old hook-owned pending, compact-summary, and task-text sidecars are no
-longer produced or consumed by these adapters. The D-2 #118 compaction-snapshot
-handoff is documented above. This reflects the ownership history: issue #117 superseded the pending sidecar
+The old hook-owned pending and compact-summary sidecars are no longer
+produced or consumed by these adapters (task-text parking returned in 0.98.0
+as a STORE-side bridge — issue #253: the pretool store call parks via
+`park_task_text`, the selector consumes at the subagent moment; the hook
+adapters themselves still never touch any sidecar). The D-2 #118
+compaction-snapshot handoff is documented above. This reflects the ownership
+history: issue #117 superseded the pending sidecar
 with the per-session delivery ledger, and #158 completes that retirement for the passive adapters.
 `ZMEM_PENDING_SIDECAR=1`
 remains only as a documented no-op for operators upgrading from the
@@ -2041,10 +2086,17 @@ What one purge does:
   delivery ledgers **and the issue-#252 JSONL segments
   (`<hash>.ledger.seg.<hex>`)**, and removes orphaned `.ledger.tmp.*` and
   `.signals.tmp.*` partial writes. The
-  `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl`/`.signals` ops
+  `.pending`/`.compact`/`.feedback.jsonl`/`.signals` ops
   sidecars are NOT scrubbed (outside the ledger contract; `.signals`
   carries only signal names/statuses/counts, and the finished file is
-  swept on the shared ops mtime policy) — treat them as residue surfaces;
+  swept on the shared ops mtime policy) — treat them as residue surfaces.
+  The `<hash>.tasktext` delegation stash IS in scope since issue #253: purge
+  needle-scrubs its entries (they carry untrusted host prose and have no
+  memory ids) and reaps orphaned `*.tasktext.tmp.*`. The residue verify
+  step still globs only `*.ledger*`, so a stash the scrub SKIPPED because
+  it was unreadable/torn (the reader tolerates those states by design) is
+  exempt from that pass and stays until the ops age sweep; see #336 for the
+  verify-glob trade-off;
 - records the ids in the `purged_id` deny-list so `ingest-jsonl` will not
   re-insert them from a peer export (child records referencing a purged id
   are skipped or blanked, never fatal);

@@ -37,6 +37,12 @@ _HOOK_INPUT_MAX_BYTES = 256 * 1024
 # transport for raw tool input.
 _PRETOOL_INPUT_MAX_BYTES = _HOOK_INPUT_MAX_BYTES
 _PRIVATE_PRETOOL_STDIN_MARKER = "ZMEM_PRIVATE_PRETOOL_STDIN"
+# Issue #253: the delegating prompt rides the store argv (same surface as the
+# --query free text).  The bound is an ARGV bound, not the parked-byte size:
+# the store redacts first and only then caps at TASK_TEXT_MAX, so truncating
+# here would let a secret straddling the parked-size boundary persist as a
+# cleartext prefix.  4000 keeps argv far inside Windows' 32767-char limit.
+_DELEGATION_ARG_MAX = 4000
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
@@ -756,6 +762,39 @@ def main() -> int:
             f"--session-id={session_id}", "--moment", moment, "--lane", lane]
     if command == "recall":
         args[1:1] = _free_text_arg("--query", query)
+    # Issue #253: a delegating PreToolUse(Agent/Task) parks its prompt
+    # store-side so the child's prompt-less SubagentStart (Claude Code's real
+    # payload carries no task text) gets a task-keyed recall query. The park
+    # happens inside the store subprocess this adapter already makes — the
+    # #158 boundary keeps this file free of storelib imports; only the raw
+    # text crosses on the same argv surface as --query. `prompt` is the only
+    # observable carrying the child's task (description fallback), and
+    # neither key is new to the parent's own pull: _query_for's pretool
+    # branch already read `description` and always ignored `prompt`, so
+    # this block changes nothing about what the parent itself receives.
+    if (mode == "pretool"
+            and _event_text(event, "tool_name", "tool").lower() in (
+                "agent", "task")):
+        _delegation = ""
+        _tool_input = event.get("tool_input")
+        if isinstance(_tool_input, dict):
+            for _key in ("prompt", "description"):
+                _value = _tool_input.get(_key)
+                if isinstance(_value, str) and _value.strip():
+                    _delegation = _value.strip()
+                    break
+        if _delegation:
+            # A NUL cannot survive argv: CPython raises ValueError before
+            # the spawn, which would cost the PARENT its whole recall rather
+            # than just this park. Drop it here (the only character argv
+            # forbids; other controls ride safely).
+            _delegation = _delegation.replace("\x00", "")
+            # Transport more than the store's TASK_TEXT_MAX so the store can
+            # REDACT first and cap afterwards — truncating here would let a
+            # secret straddling the boundary persist as a cleartext prefix.
+            # The bound keeps argv well inside Windows' 32767-char limit.
+            args.extend(_free_text_arg("--delegation-prompt",
+                                       _delegation[:_DELEGATION_ARG_MAX]))
     # Issue #98: forward the cross-project tier flag per its surface matrix.
     # ZMEM_CROSS_PROJECT unset arms pretool only (posttoolbatch included —
     # _decision_moment maps it to pretool); "0" disables every surface (the

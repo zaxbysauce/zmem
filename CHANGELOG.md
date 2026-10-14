@@ -5,6 +5,80 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.98.0] - 2026-10-14
+
+### Fixed
+- **Task-keyed SubagentStart recall restored on Claude Code (issue #253,
+  Workstream P PR 5):** a delegated child once again starts with the memory
+  relevant to ITS task. The #119 mechanism (park the delegating Agent
+  prompt at PreToolUse, consume it as the SubagentStart recall query) was
+  retired by the #158/#200 passive-injection consolidation and never
+  re-derived — on Claude Code, whose SubagentStart payload carries no task
+  text (`session_id, transcript_path, cwd, prompt_id, agent_id, agent_type,
+  hook_event_name`), every child fell back to the query-less recent lane
+  regardless of its dispatched task, and at 0.96.0 the child could get
+  nothing at all (the parent's own query-less pretool pull recorded the
+  recent window as delivered under the SHARED session id and the child's
+  pull excluded all of it). The bridge now lives entirely store-side,
+  inside the #158 architecture: the hook body extracts the delegating
+  prompt for PreToolUse(`Agent`/`Task`) events (`prompt`, description
+  fallback, per-field checks, NUL stripped, case-insensitive tool match) and
+  passes it on the store subprocess it already makes — bounded at 4000 chars
+  on that argv surface so the STORE can redact first and cap the parked bytes
+  at `TASK_TEXT_MAX` (800) afterwards (`--delegation-prompt` on `recall`/`recent`
+  — same argv surface as `--query`, still no storelib import in the
+  adapter); the CLI parks it via the previously-stranded
+  `park_task_text` (the issue's stranded-dead-code AC: both functions are
+  production-called again); the store-owned selector consumes it via
+  `consume_task_text` at the `subagent` moment ONLY when the payload ladder
+  yielded no query, so hosts that DO send task text keep event-field
+  precedence. Parked text is secret-redacted through the canonical
+  `redact_text` before touching disk (the #191 F-001 posture, restored at
+  the store layer; advisory, fail-open, pattern/token-shaped only). The
+  entry cap is 16 and a stale entry stops being CONSUMED after the 6h
+  window, but that prune is in-memory only: the file survives session-end
+  clears and is reaped by the ops sweep on its own age policy
+  (`ZMEM_SENTINEL_SWEEP_DAYS`, default 7 days) — the real bound on
+  untrusted host prose on disk is that sweep, not the 6h window. The
+  sidecar is created 0600-at-open and atomically replaced; on Windows a
+  plain chmod only toggles the readonly attribute, so owner-only access
+  there rests on the operator-profile ACL (accepted residual). `purge`
+  gained the matching operator path for the stash: it needle-scrubs
+  `.tasktext` entries and reaps orphaned `*.tasktext.tmp.*` (the residue
+  verify pass still globs only `*.ledger*`, so an unreadable stash stays
+  until the age sweep — #336). Correlation under concurrent dispatches is
+  FIFO — no probed host supplies an agent id at park time — with the
+  documented limitations: out-of-order SubagentStart arrival swaps two
+  children's prompts, two parallel parks race read-modify-write with the
+  empirically-proven drop-not-swap outcome, and two concurrent consumes
+  can both load the same head entry (both children receive that
+  delegation; degraded relevance only), and an orphaned park — a
+  delegation whose child never starts (permission denied, cancelled,
+  tool errored) — sits at the FIFO head and shifts EVERY later
+  child's prompt by one for the rest of the window, because no
+  correlation id exists on the park side to expire it. That trade is
+  accepted: an off-by-one task-keyed recall is degraded relevance,
+  never a wrong action, and the alternative (age-expiring queued
+  entries) would drop live entries during a large fan-out. See
+  #329. A bridged child is a fresh
+  context: the parent's pretool deliveries can no longer starve it (the
+  #117 sibling-shares-session_id shape). The read-side carve-out is gated
+  on the consume, so query-less pulls WITHOUT a bridge are byte-identical;
+  a BRIDGED pull suppresses no delivered-derived exclusions at all — a
+  fresh child re-reads rows its parent or a sibling already rendered
+  (over-delivery of already-seen rows, never starvation; deliberately NOT
+  narrowed to sibling-moment rows, which would let one sibling starve the
+  next — see #331).
+  `ZMEM_INJECT=0` or `ZMEM_QUERY_CONTEXT=0` disables parking via the
+  existing pre-stdin early exit. With a bridged query the subagent surface
+  now has a measured relevance lane, so the #235 user:global floor applies
+  there (query-less pulls keep the not-measured exemption). The
+  `test_subagent_tasktext.py` suite no longer pins the degraded contract:
+  its secret-shape test became `test_agent_pretool_parks_redacted_tasktext`
+  (the parked bytes must not contain the raw secret), and the frozen
+  acceptance checks live in `tests/test_p05_subagent_task_bridge.py`
+  (prompt-less child recall, no-stranded-code scan, FIFO routing).
+
 ## [0.97.0] - 2026-10-14
 
 ### Added

@@ -9,8 +9,8 @@ backfilled. The envelope reports the withhold as ``global_withheld``.
 
 Explicit query-less rule (issue #235 comment): a global candidate with NO
 measured lane keeps the relevance gate's ``not measured`` exemption — the
-floor never withholds it. Claude Code SubagentStart is query-less until
-issue #253 restores task-keyed recall; emptying that surface's global tier
+floor never withholds it. Claude Code SubagentStart is query-less
+unless a delegation is parked (issue #253); emptying that surface's global tier
 would contradict the issue's own AC2.
 
 Every CLI check drives the exact argv shape hooks/lib/zmem-recall-body.py

@@ -953,17 +953,38 @@ def park_task_text(data_dir: str, session_id: str, text: str,
     sidecar): two parallel Agent calls in one session race the
     read-modify-write. Empirically the loser is DROPPED OUTRIGHT (not
     swapped, as an earlier revision of this docstring claimed) — the next
-    child finds no entry and falls through to the transcript-tail rung.
+    child finds no entry and falls through to the query-less recent lane.
     Degraded relevance, never a crash or store corruption; a file lock
     would add a failure mode to a fail-open hot path for a rare,
-    non-corrupting race. A cancelled delegation also leaves its entry at
-    the FIFO head until the window prune — the next child may consume
-    stale text (accepted, bounded by the 6h window / 16-entry cap)."""
+    non-corrupting race. The same race exists park-against-consume: a
+    concurrent child can rewrite the list between a park's read and its
+    replace, so a freshly parked delegation is lost outright.
+
+    An ORPHANED park is the other unbounded case: a delegation whose child
+    never starts (permission denied, cancelled, tool errored) leaves its
+    entry at the FIFO head, and because no correlation id exists on the
+    park side there is nothing to expire it early — every later child in
+    the window then consumes the PREVIOUS delegation's text, an off-by-one
+    shift for the rest of the session. Accepted deliberately (issue #329):
+    the effect is degraded task relevance, never a wrong action, and the
+    alternative (age-expiring queued entries) would drop live entries
+    during a large fan-out. The 6h window / 16-entry cap bound how long
+    the shift persists, NOT how many children it affects."""
     path = tasktext_path(data_dir, session_id)
     if not path or not text or not text.strip():
         return
     if now is None:
         now = time.time()
+    # Issue #253 (restoring the #191 F-001 posture store-side): the parked
+    # text is untrusted host prose. Route it through THE canonical
+    # secret-redaction helper before it touches disk — advisory
+    # (token-shaped secrets only), fail-open. Lazy import: write.py pulls
+    # entity/links/schema at module load.
+    try:
+        from storelib.write import redact_text
+        text = redact_text(text)[0]
+    except Exception:
+        pass
     entries = _load_tasktext(path, now)
     entries.append({
         "agent_id": str(agent_id or ""),
@@ -985,7 +1006,16 @@ def consume_task_text(data_dir: str, session_id: str,
     OLDEST unconsumed entry (host dispatch order: serially-spawned children
     start in the order they were delegated; out-of-order arrival of truly
     concurrent children is the documented FIFO limitation). Removes the
-    consumed entry; returns "" when nothing is stashed. Fail-open."""
+    consumed entry; returns "" when nothing is stashed. Fail-open. An
+    orphaned earlier park shifts this by one (see park_task_text); there
+    is no rung after the stash but the query-less recent lane.
+
+    Accepted race (#253 review, mirror of the park-side F-002 posture):
+    two children whose SubagentStarts fire concurrently can both load the
+    same head entry before either rewrite lands, so both receive that
+    delegation and the other child's prompt is consumed by its sibling —
+    degraded relevance for one child, never a crash or store corruption; a
+    lock would add a failure mode to this fail-open hot path."""
     path = tasktext_path(data_dir, session_id)
     if not path:
         return ""
@@ -1005,7 +1035,24 @@ def consume_task_text(data_dir: str, session_id: str,
         if entries:
             _atomic_write_json(path, {"entries": entries})
         else:
-            os.unlink(path)
+            # Same transient class the replace path retries: on Windows a
+            # concurrent reader holding the file open (plain open() does not
+            # request FILE_SHARE_DELETE) fails the delete with a sharing
+            # violation. Without the retry the consumed head stays on disk
+            # and the NEXT child re-reads the same delegation — so a
+            # surviving file is exactly the harm case, not a harmless
+            # leftover.
+            for _attempt in range(2):
+                try:
+                    os.unlink(path)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    if _attempt:
+                        pass
+                    else:
+                        time.sleep(0.01)
     except OSError:
         pass
     return text
