@@ -22,8 +22,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   pull excluded all of it). The bridge now lives entirely store-side,
   inside the #158 architecture: the hook body extracts the delegating
   prompt for PreToolUse(`Agent`/`Task`) events (`prompt`, description
-  fallback, per-field checks, 800-char cap) and passes it on the store
-  subprocess it already makes (`--delegation-prompt` on `recall`/`recent`
+  fallback, per-field checks, NUL stripped, case-insensitive tool match) and
+  passes it on the store subprocess it already makes — bounded at 4000 chars
+  on that argv surface so the STORE can redact first and cap the parked bytes
+  at `TASK_TEXT_MAX` (800) afterwards (`--delegation-prompt` on `recall`/`recent`
   — same argv surface as `--query`, still no storelib import in the
   adapter); the CLI parks it via the previously-stranded
   `park_task_text` (the issue's stranded-dead-code AC: both functions are

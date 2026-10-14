@@ -1039,9 +1039,9 @@ def consume_task_text(data_dir: str, session_id: str,
             # concurrent reader holding the file open (plain open() does not
             # request FILE_SHARE_DELETE) fails the delete with a sharing
             # violation. Without the retry the consumed head stays on disk
-            # and the NEXT child re-reads the same delegation. A surviving
-            # file is harmless — the empty-entry prune below is harmless too —
-            # but the stale head is not.
+            # and the NEXT child re-reads the same delegation — so a
+            # surviving file is exactly the harm case, not a harmless
+            # leftover.
             for _attempt in range(2):
                 try:
                     os.unlink(path)

@@ -638,7 +638,9 @@ On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;
 Claude: emitted — issue #117 retired the sidecar default in favor of the
 per-session delivery ledger), a
 PreToolUse hook (`zmem-pretool-recall.sh`, matcher
-`Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch|Agent|Task` since 0.31.0 — issue #119;
+`Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue #119;
+the live registration in `hooks/hooks.claude.json` also carries `apply_patch`
+(added later; see #338 for the apply_patch dating).
 the Agent branch passes task text when the event carries it AND,
 when it does not, parks the delegating prompt store-side for the child's
 SubagentStart (issue #253), otherwise using the store-owned recent path)
@@ -700,8 +702,9 @@ parent's PreToolUse(`Agent`) call when the event yielded nothing (issue
 #253) → the queryless recent selector last). The store-side bridge restores
 the #119 intent inside the #158 architecture: the hook body passes the
 delegating prompt to the store subprocess it already makes
-(`--delegation-prompt`, argv surface, capped at 800 chars, never a storelib
-import in the adapter), the CLI parks it via `park_task_text`
+(`--delegation-prompt`, argv surface bounded at 4000 chars so the store can
+redact before capping the parked bytes at 800, never a storelib import in
+the adapter), the CLI parks it via `park_task_text`
 (secret-redacted through the canonical `redact_text`, advisory and
 fail-open; 16-entry cap, and a stale entry stops being CONSUMED after the
 6h window — but that prune is in-memory only, so the file survives
@@ -757,8 +760,9 @@ PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
 the Codex DELEGATION tool surface is UNVERIFIED by #119 (2026-09-10): the
 #95 dump covered only the shell and patch/apply tools and cannot say
 whether a delegation facility fires PreToolUse at all, so no matcher entry
-was added and Codex SubagentStart rides the transcript-tail/recent rungs
-(fresh delegation-tool dump deferred to the live-probe owner #96).
+was added and Codex SubagentStart rides the payload-field / recent rungs
+(there is no transcript-tail rung — that parser is retired; a fresh
+delegation-tool dump is deferred to the live-probe owner #96).
 Upstream drops `additionalContext` on PreCompact (decision control only,
 verified 2026-09-09 from codex-rs source), so zmem's Codex PreCompact
 entry exists to clear the delivery ledger before compaction;
@@ -1099,7 +1103,7 @@ cleanup, also without opening SQLite; both commands are idempotent when their
 target sidecars are absent.
 
 The old hook-owned pending and compact-summary sidecars are no longer
-produced or consumed by these adapters (task-text parking returned in 0.97.0
+produced or consumed by these adapters (task-text parking returned in 0.98.0
 as a STORE-side bridge — issue #253: the pretool store call parks via
 `park_task_text`, the selector consumes at the subagent moment; the hook
 adapters themselves still never touch any sidecar). The D-2 #118

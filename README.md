@@ -68,7 +68,7 @@ ledger-only PreCompact path; the equals form supports ids beginning with `-`.
 Neither command opens SQLite. The former
 hook-owned pending and compact-summary sidecars, plus the
 UserPromptSubmit operation tail, are intentionally retired; task-text
-parking returned in 0.97.0 as a STORE-side bridge (issue #253) — the
+parking returned in 0.98.0 as a STORE-side bridge (issue #253) — the
 delegating prompt rides the pretool store subprocess and is consumed by
 the store-owned selector at SubagentStart, never by hook-owned sidecar
 code. The MCP server's

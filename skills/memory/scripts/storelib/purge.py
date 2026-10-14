@@ -33,7 +33,9 @@ import json
 import os
 import re
 import sqlite3
-from storelib.delivery_ledger import _atomic_write_json  # noqa: E402  (issue #253: shared with the #253 tasktext scrub below)
+# Issue #253: shared by the ledger and tasktext scrubs below (both must
+# reach it whether or not a sibling branch ran first).
+from storelib.delivery_ledger import _atomic_write_json
 import sys
 import uuid
 from pathlib import Path
@@ -846,7 +848,7 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     for path in ops.glob("*.tasktext"):
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
-            entries = doc.get("entries")
+            entries = doc.get("entries") if isinstance(doc, dict) else None
             if not isinstance(entries, list):
                 continue
             kept = []
@@ -865,7 +867,14 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
             else:
                 path.unlink()
             stats["files_scrubbed"] += 1
-        except OSError:
+        # A stash written by an older build, hand-edited, or torn by a crash
+        # must not take the fail-closed LEDGER scrub down with it — the
+        # reader (_load_tasktext) tolerates exactly these states, so the
+        # scrub must too. ValueError covers JSONDecodeError; AttributeError
+        # covers a non-dict payload. Note JSONDecodeError IS a ValueError,
+        # which the outer ledger handler treats as a scrub failure, so it
+        # has to be caught here rather than allowed to escape.
+        except (OSError, ValueError, AttributeError):
             pass
     # Issue #252: the per-call JSONL segments (<hash>.ledger.seg.<hex>)
     # carry the same scrub laws as the base ledger — drop_ids and folded

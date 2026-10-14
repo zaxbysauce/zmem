@@ -786,7 +786,8 @@ def main() -> int:
         if _delegation:
             # A NUL cannot survive argv: CPython raises ValueError before
             # the spawn, which would cost the PARENT its whole recall rather
-            # than just this park. Drop control characters here.
+            # than just this park. Drop it here (the only character argv
+            # forbids; other controls ride safely).
             _delegation = _delegation.replace("\x00", "")
             # Transport more than the store's TASK_TEXT_MAX so the store can
             # REDACT first and cap afterwards — truncating here would let a
