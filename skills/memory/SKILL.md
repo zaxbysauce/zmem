@@ -706,9 +706,12 @@ fail-open, 6h window / 16-entry cap / swept), and the selector consumes it
 FIFO at the subagent moment only when the payload ladder produced no query —
 no agent id exists at park time on any probed host, so FIFO is the
 correlation rule and out-of-order arrival of truly concurrent children is
-the documented limitation (a parallel-park race drops the loser outright;
-`ZMEM_QUERY_CONTEXT=0` or `ZMEM_INJECT=0` disables parking via the early
-exit). A bridged child is a fresh context: its recall suppresses only rows
+the documented limitation; the accepted races are the parallel-park
+drop-not-swap and a parallel-consume overlap (two concurrent children can
+load the same head entry before either rewrite lands — both receive that
+delegation, one child's prompt is consumed by its sibling; degraded
+relevance only, never a crash). `ZMEM_QUERY_CONTEXT=0` or `ZMEM_INJECT=0`
+disables parking via the early exit). A bridged child is a fresh context: its recall suppresses only rows
 already delivered at the subagent moment, so the parent's pretool
 deliveries cannot starve it. Claude's matcher remains
 `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue
@@ -1074,9 +1077,13 @@ session's delivery ledger without opening SQLite. `delivery-clear
 cleanup, also without opening SQLite; both commands are idempotent when their
 target sidecars are absent.
 
-The old hook-owned pending, compact-summary, and task-text sidecars are no
-longer produced or consumed by these adapters. The D-2 #118 compaction-snapshot
-handoff is documented above. This reflects the ownership history: issue #117 superseded the pending sidecar
+The old hook-owned pending and compact-summary sidecars are no longer
+produced or consumed by these adapters (task-text parking returned in 0.97.0
+as a STORE-side bridge — issue #253: the pretool store call parks via
+`park_task_text`, the selector consumes at the subagent moment; the hook
+adapters themselves still never touch any sidecar). The D-2 #118
+compaction-snapshot handoff is documented above. This reflects the ownership
+history: issue #117 superseded the pending sidecar
 with the per-session delivery ledger, and #158 completes that retirement for the passive adapters.
 `ZMEM_PENDING_SIDECAR=1`
 remains only as a documented no-op for operators upgrading from the

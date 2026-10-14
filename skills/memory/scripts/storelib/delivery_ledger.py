@@ -995,7 +995,14 @@ def consume_task_text(data_dir: str, session_id: str,
     OLDEST unconsumed entry (host dispatch order: serially-spawned children
     start in the order they were delegated; out-of-order arrival of truly
     concurrent children is the documented FIFO limitation). Removes the
-    consumed entry; returns "" when nothing is stashed. Fail-open."""
+    consumed entry; returns "" when nothing is stashed. Fail-open.
+
+    Accepted race (#253 review, mirror of the park-side F-002 posture):
+    two children whose SubagentStarts fire concurrently can both load the
+    same head entry before either rewrite lands, so both receive that
+    delegation and the other child's prompt is consumed by its sibling —
+    degraded relevance for one child, never a crash or store corruption; a
+    lock would add a failure mode to this fail-open hot path."""
     path = tasktext_path(data_dir, session_id)
     if not path:
         return ""

@@ -766,9 +766,10 @@ def main() -> int:
     # happens inside the store subprocess this adapter already makes — the
     # #158 boundary keeps this file free of storelib imports; only the raw
     # text crosses on the same argv surface as --query. `prompt` is the only
-    # observable carrying the child's task (description fallback), and the
-    # pretool branch of _query_for deliberately ignores both, so the parent's
-    # own pull is unchanged.
+    # observable carrying the child's task (description fallback), and
+    # neither key is new to the parent's own pull: _query_for's pretool
+    # branch already read `description` and always ignored `prompt`, so
+    # this block changes nothing about what the parent itself receives.
     if mode == "pretool" and _event_text(event, "tool_name", "tool") in (
             "Agent", "Task"):
         _delegation = ""

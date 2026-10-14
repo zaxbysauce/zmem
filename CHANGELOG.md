@@ -36,8 +36,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   owner-only atomic write). Correlation under concurrent dispatches is
   FIFO — no probed host supplies an agent id at park time — with the
   documented limitations: out-of-order SubagentStart arrival swaps two
-  children's prompts, and two parallel parks race read-modify-write with
-  the empirically-proven drop-not-swap outcome. A bridged child is a fresh
+  children's prompts, two parallel parks race read-modify-write with the
+  empirically-proven drop-not-swap outcome, and two concurrent consumes
+  can both load the same head entry (both children receive that
+  delegation; degraded relevance only). A bridged child is a fresh
   context: its recall suppresses only rows already delivered at the
   subagent moment, so the parent's pretool deliveries can no longer starve
   it (the #117 sibling-shares-session_id shape, read-side carve-out gated
