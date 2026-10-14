@@ -373,7 +373,7 @@ constants live in `schema_meta.py`.
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
 | `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
 | `INJECT_FLOOR_TRUST_DEFAULT` | 0.2 | `ZMEM_INJECT_FLOOR_TRUST` | Selective-inject gate (issue #115). Hard floor on `trust_score`: a row the contradiction ledger has driven below 0.2 (nine or more distinct `contradict` events) can no longer ride the passive lane; `compute_score` also multiplies every composite by `trust_score` (identity at the default 1.0, so uncontradicted rankings do not move — explicit recall/search keep retrieving the row, just ranked lower). When E-5 (#124) starts recording violations automatically, they must feed THIS ledger via trust deltas — `violated_count` never becomes a second independent gate input. |
-| `INJECT_FLOOR_USER_GLOBAL_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_USER_GLOBAL` | user:global tier floor on the passive injection lane (issue #235). On gated moments (`pretool`/`subagent` — the hooks' posttoolbatch maps to `pretool` store-side) a global-tier injection candidate whose MAX measured relevance lane sits below 0.5 is withheld and its reserved slot returns empty rather than being backfilled; the envelope reports the count as `global_withheld` (present only when a withhold happened). A global candidate with NO measured lane (query-less recent pulls) keeps the not-measured exemption — never withheld by this floor; when issue #253 restores task-keyed SubagentStart recall, the floor becomes effective on that surface naturally. `session_start`/`user_prompt`/`precompact` keep their current global composition. `0` disables (relevance values are >= 0, so nothing is ever below it). |
+| `INJECT_FLOOR_USER_GLOBAL_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_USER_GLOBAL` | user:global tier floor on the passive injection lane (issue #235). On gated moments (`pretool`/`subagent` — the hooks' posttoolbatch maps to `pretool` store-side) a global-tier injection candidate whose MAX measured relevance lane sits below 0.5 is withheld and its reserved slot returns empty rather than being backfilled; the envelope reports the count as `global_withheld` (present only when a withhold happened). A global candidate with NO measured lane (query-less recent pulls) keeps the not-measured exemption — never withheld by this floor; a bridged task-keyed SubagentStart recall (issue #253) has a measured lane, so the floor is effective on that surface. `session_start`/`user_prompt`/`precompact` keep their current global composition. `0` disables (relevance values are >= 0, so nothing is ever below it). |
 
 The floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a passive-lane filter; the trust floor
@@ -694,10 +694,23 @@ with a live tool_name dump before changing the matcher.
 Inject surface parity (host facts, not aspirations): Claude Code registers
 SubagentStart (task-text recall — issue #119, probe 2026-09-10: neither
 host's SubagentStart payload carries task text, so the query ladder is
-payload-field-if-present → task/query text supplied by the event when
-available → the queryless recent selector). The former delegating
-PreToolUse(`Agent`) stash is retired; no zmem task-text sidecar is written or
-consumed. Claude's matcher remains
+payload-field-if-present → the delegating prompt parked store-side by the
+parent's PreToolUse(`Agent`) call when the event yielded nothing (issue
+#253) → the queryless recent selector last). The store-side bridge restores
+the #119 intent inside the #158 architecture: the hook body passes the
+delegating prompt to the store subprocess it already makes
+(`--delegation-prompt`, argv surface, capped at 800 chars, never a storelib
+import in the adapter), the CLI parks it via `park_task_text`
+(secret-redacted through the canonical `redact_text`, advisory and
+fail-open, 6h window / 16-entry cap / swept), and the selector consumes it
+FIFO at the subagent moment only when the payload ladder produced no query —
+no agent id exists at park time on any probed host, so FIFO is the
+correlation rule and out-of-order arrival of truly concurrent children is
+the documented limitation (a parallel-park race drops the loser outright;
+`ZMEM_QUERY_CONTEXT=0` or `ZMEM_INJECT=0` disables parking via the early
+exit). A bridged child is a fresh context: its recall suppresses only rows
+already delivered at the subagent moment, so the parent's pretool
+deliveries cannot starve it. Claude's matcher remains
 `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue
 #119; `Task` is accepted as the pre-rename delegation tool name per community
 issue 29677, closed stale and not vendor-confirmed. Claude Code also registers

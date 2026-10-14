@@ -37,6 +37,10 @@ _HOOK_INPUT_MAX_BYTES = 256 * 1024
 # transport for raw tool input.
 _PRETOOL_INPUT_MAX_BYTES = _HOOK_INPUT_MAX_BYTES
 _PRIVATE_PRETOOL_STDIN_MARKER = "ZMEM_PRIVATE_PRETOOL_STDIN"
+# Issue #253: the delegating prompt rides the store argv (same surface as
+# --query free text) and is capped at the store-side park's TASK_TEXT_MAX so
+# the parked bytes and the argv bytes agree.
+_DELEGATION_PROMPT_MAX = 800
 
 # Issue #153: decision-line attribution is deliberately small and
 # dependency-free.  The schema module is the canonical source for the
@@ -756,6 +760,28 @@ def main() -> int:
             f"--session-id={session_id}", "--moment", moment, "--lane", lane]
     if command == "recall":
         args[1:1] = _free_text_arg("--query", query)
+    # Issue #253: a delegating PreToolUse(Agent/Task) parks its prompt
+    # store-side so the child's prompt-less SubagentStart (Claude Code's real
+    # payload carries no task text) gets a task-keyed recall query. The park
+    # happens inside the store subprocess this adapter already makes — the
+    # #158 boundary keeps this file free of storelib imports; only the raw
+    # text crosses on the same argv surface as --query. `prompt` is the only
+    # observable carrying the child's task (description fallback), and the
+    # pretool branch of _query_for deliberately ignores both, so the parent's
+    # own pull is unchanged.
+    if mode == "pretool" and _event_text(event, "tool_name", "tool") in (
+            "Agent", "Task"):
+        _delegation = ""
+        _tool_input = event.get("tool_input")
+        if isinstance(_tool_input, dict):
+            for _key in ("prompt", "description"):
+                _value = _tool_input.get(_key)
+                if isinstance(_value, str) and _value.strip():
+                    _delegation = _value.strip()
+                    break
+        if _delegation:
+            args.extend(_free_text_arg("--delegation-prompt",
+                                       _delegation[:_DELEGATION_PROMPT_MAX]))
     # Issue #98: forward the cross-project tier flag per its surface matrix.
     # ZMEM_CROSS_PROJECT unset arms pretool only (posttoolbatch included —
     # _decision_moment maps it to pretool); "0" disables every surface (the

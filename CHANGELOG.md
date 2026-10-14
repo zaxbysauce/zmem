@@ -5,6 +5,53 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.97.0] - 2026-10-13
+
+### Fixed
+- **Task-keyed SubagentStart recall restored on Claude Code (issue #253,
+  Workstream P PR 5):** a delegated child once again starts with the memory
+  relevant to ITS task. The #119 mechanism (park the delegating Agent
+  prompt at PreToolUse, consume it as the SubagentStart recall query) was
+  retired by the #158/#200 passive-injection consolidation and never
+  re-derived — on Claude Code, whose SubagentStart payload carries no task
+  text (`session_id, transcript_path, cwd, prompt_id, agent_id, agent_type,
+  hook_event_name`), every child fell back to the query-less recent lane
+  regardless of its dispatched task, and at 0.96.0 the child could get
+  nothing at all (the parent's own query-less pretool pull recorded the
+  recent window as delivered under the SHARED session id and the child's
+  pull excluded all of it). The bridge now lives entirely store-side,
+  inside the #158 architecture: the hook body extracts the delegating
+  prompt for PreToolUse(`Agent`/`Task`) events (`prompt`, description
+  fallback, per-field checks, 800-char cap) and passes it on the store
+  subprocess it already makes (`--delegation-prompt` on `recall`/`recent`
+  — same argv surface as `--query`, still no storelib import in the
+  adapter); the CLI parks it via the previously-stranded
+  `park_task_text` (the issue's stranded-dead-code AC: both functions are
+  production-called again); the store-owned selector consumes it via
+  `consume_task_text` at the `subagent` moment ONLY when the payload ladder
+  yielded no query, so hosts that DO send task text keep event-field
+  precedence. Parked text is secret-redacted through the canonical
+  `redact_text` before touching disk (the #191 F-001 posture, restored at
+  the store layer; advisory, fail-open; 6h window / 16-entry cap / swept,
+  owner-only atomic write). Correlation under concurrent dispatches is
+  FIFO — no probed host supplies an agent id at park time — with the
+  documented limitations: out-of-order SubagentStart arrival swaps two
+  children's prompts, and two parallel parks race read-modify-write with
+  the empirically-proven drop-not-swap outcome. A bridged child is a fresh
+  context: its recall suppresses only rows already delivered at the
+  subagent moment, so the parent's pretool deliveries can no longer starve
+  it (the #117 sibling-shares-session_id shape, read-side carve-out gated
+  on the consume; query-less pulls without a bridge are byte-identical).
+  `ZMEM_INJECT=0` or `ZMEM_QUERY_CONTEXT=0` disables parking via the
+  existing pre-stdin early exit. With a bridged query the subagent surface
+  now has a measured relevance lane, so the #235 user:global floor applies
+  there (query-less pulls keep the not-measured exemption). The
+  `test_subagent_tasktext.py` suite no longer pins the degraded contract:
+  its secret-shape test became `test_agent_pretool_parks_redacted_tasktext`
+  (the parked bytes must not contain the raw secret), and the frozen
+  acceptance checks live in `tests/test_p05_subagent_task_bridge.py`
+  (prompt-less child recall, no-stranded-code scan, FIFO routing).
+
 ## [0.96.0] - 2026-10-13
 
 ### Fixed

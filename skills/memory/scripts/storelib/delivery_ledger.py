@@ -964,6 +964,16 @@ def park_task_text(data_dir: str, session_id: str, text: str,
         return
     if now is None:
         now = time.time()
+    # Issue #253 (restoring the #191 F-001 posture store-side): the parked
+    # text is untrusted host prose. Route it through THE canonical
+    # secret-redaction helper before it touches disk — advisory
+    # (token-shaped secrets only), fail-open. Lazy import: write.py pulls
+    # entity/links/schema at module load.
+    try:
+        from storelib.write import redact_text
+        text = redact_text(text)[0]
+    except Exception:
+        pass
     entries = _load_tasktext(path, now)
     entries.append({
         "agent_id": str(agent_id or ""),

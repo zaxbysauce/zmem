@@ -970,6 +970,21 @@ def select_and_budget_for_injection(
     # surface: when it yields operation tokens those outrank the older ring.
     # Explicitly supplied [] otherwise intentionally suppresses ring reads.
     effective_query = query or ""
+    # Issue #253: a prompt-less SubagentStart (Claude Code's real payload)
+    # takes the delegating prompt parked store-side at PreToolUse(Agent) as
+    # its recall query — event fields keep structural precedence (the
+    # consume only fires when the payload ladder produced nothing). Fail-open
+    # and moment-scoped: every other moment and every caller that arrives
+    # with a query is byte-identical.
+    bridged_query = False
+    if moment == "subagent" and not effective_query.strip():
+        try:
+            bridged = ledger.consume_task_text(resolved_data, session_id)
+            if isinstance(bridged, str) and bridged.strip():
+                effective_query = bridged[:500]
+                bridged_query = True
+        except Exception:
+            pass
     effective_ops = list(ops_tokens) if ops_tokens is not None else []
     checkpoint = ""
     query_context_enabled = True
@@ -1098,6 +1113,27 @@ def select_and_budget_for_injection(
         e.get("id"): e for e in delivered_entries
         if isinstance(e, dict) and isinstance(e.get("id"), str)
     }
+    # Issue #253, bridged-consume carve-out: the delegating parent's pretool
+    # pull records its rendered rows under the session id the child SHARES
+    # (SubagentStart carries the parent's id), and a subagent is a fresh
+    # context — rows the parent context saw must not suppress the child's
+    # task-keyed recall. When the selector consumed a parked delegation
+    # (bridged_query), restrict the delivered-derived exclusions to rows
+    # recorded at the subagent moment, so sibling children still dedup
+    # against each other while parent-moment deliveries stop starving the
+    # child. Explicit exclude_ids always apply. An entry with a missing or
+    # empty "moment" (hand-crafted/ancient file) falls OUT of the bridged
+    # child's exclusions — over-delivery, never starvation; record() always
+    # stamps the moment (delivery_ledger.py), so this is unreachable from
+    # real entries. Non-bridged pulls keep the full delivered exclusion set
+    # byte-identical.
+    if bridged_query:
+        delivered_ids = _ordered_unique(
+            e["id"] for e in delivered_entries
+            if isinstance(e, dict)
+            and isinstance(e.get("id"), str)
+            and e.get("moment") == "subagent"
+        )
     # Explicit exclusions precede delivered ids, preserving first-seen order
     # and making duplicate ids deterministic across callers.
     exclusions = _ordered_unique(list(exclude_ids or []) + delivered_ids)
