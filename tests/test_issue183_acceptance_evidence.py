@@ -88,7 +88,7 @@ class Issue183AcceptanceEvidenceTest(unittest.TestCase):
                     )
                 }
             conn.close()
-            self.assertEqual(version, "14")
+            self.assertEqual(version, "15")
             self.assertTrue(
                 {"evidence", "episode_evidence", "memory_evidence"}.issubset(tables)
             )

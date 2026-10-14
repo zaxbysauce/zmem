@@ -86,10 +86,10 @@ class EpisodeIsolationTest(unittest.TestCase):
 
     # -- schema ---------------------------------------------------------------
 
-    def test_fresh_store_is_v14_with_episode_tables(self):
+    def test_fresh_store_is_v15_with_episode_tables(self):
         self._init()
         self.assertEqual(self._schema_version(), str(SUPPORTED_SCHEMA_VERSION))
-        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 14)
+        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 15)
         conn = sqlite3.connect(self.store)
         try:
             names = {r[0] for r in conn.execute(
@@ -128,11 +128,11 @@ class EpisodeIsolationTest(unittest.TestCase):
         )
         conn.commit()
         conn.close()
-        # First writable command migrates through v13 and v14 (additive episode
-        # and evidence DDL; no memory data rewrite).
+        # First writable command migrates through v13, v14 and v15 (additive
+        # episode, evidence and state-expiry DDL; no memory data rewrite).
         r = _run(["stats"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._schema_version(), "14")
+        self.assertEqual(self._schema_version(), "15")
         conn = sqlite3.connect(self.store)
         try:
             row = conn.execute(
@@ -150,7 +150,7 @@ class EpisodeIsolationTest(unittest.TestCase):
         # Idempotent re-run: same version, no error.
         r = _run(["stats"])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._schema_version(), "14")
+        self.assertEqual(self._schema_version(), "15")
 
     def test_episode_add_cross_namespace_warns_but_attaches(self):
         # A-02 (review round 2): cross-namespace attach is allowed but

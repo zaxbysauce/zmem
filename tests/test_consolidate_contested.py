@@ -567,11 +567,11 @@ class CosineContestedTest(unittest.TestCase):
         real = self.mod._absorb_into_keeper
         calls = {"n": 0}
 
-        def _flaky(conn, keeper, absorbed):
+        def _flaky(conn, keeper, absorbed, *, now):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("injected first-cluster failure")
-            return real(conn, keeper, absorbed)
+            return real(conn, keeper, absorbed, now=now)
 
         stub = mock.Mock()
         stub.is_available.return_value = True

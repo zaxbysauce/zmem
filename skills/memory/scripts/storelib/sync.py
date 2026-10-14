@@ -24,7 +24,8 @@ from pathlib import Path
 import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
+from storelib.state_expiry import validate_inject_until
 from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
@@ -274,6 +275,29 @@ def _cmd_export_jsonl_body(
     except sqlite3.OperationalError:
         pass  # memory_link absent (pre-v11 store never migrated) — export without links
 
+    # v15 (issue #173): the memory_expiry side-table records, grouped per
+    # memory_id. Only records whose parent is IN the export are emitted (the
+    # contract's "omit side-table records whose parent is not in the export" —
+    # a namespace-filtered or live-only export drops the orphan with its
+    # parent); a pre-v15 store has no side table and exports without records.
+    expiry_map: dict = {}
+    try:
+        for x in conn.execute(
+            "SELECT memory_id, inject_until, expiry_class FROM memory_expiry"
+        ).fetchall():
+            if x["memory_id"] in exported_ids:
+                expiry_map[x["memory_id"]] = x
+    except sqlite3.OperationalError:
+        # memory_expiry absent (pre-v15 store, or externally damaged v15):
+        # export without expiry records — but SAY so on stderr, matching the
+        # legacy ingest path's skip notice and the v14 evidence-schema
+        # precedent of never dropping metadata silently (#173 PR-review F14).
+        print(
+            "[zmem] export-jsonl: memory_expiry records skipped — side table "
+            "unavailable; state rows export without expiry metadata",
+            file=sys.stderr,
+        )
+
     lines = []
 
     def _emit(obj: dict, *, compact: bool = False) -> None:
@@ -328,6 +352,19 @@ def _cmd_export_jsonl_body(
             "links": link_map.get(r["id"], []),
         }
         _emit(obj)
+        # v15 (issue #173): the memory_expiry record travels IMMEDIATELY after
+        # its parent memory record, inside the same ingestion_ts/id parent
+        # order. Key order is the contract's exact wire shape. A tombstoned
+        # state row has no side record (every cleanup site deletes it), so a
+        # --include-superseded export cannot emit an orphan.
+        x = expiry_map.get(r["id"])
+        if x is not None:
+            _emit({
+                "kind": "memory_expiry",
+                "memory_id": x["memory_id"],
+                "inject_until": x["inject_until"],
+                "expiry_class": x["expiry_class"],
+            })
 
     # v13 (issue #65, 10.7): episodes round-trip in the same stream. Only
     # memberships whose episode AND member memory are BOTH in the exported set
@@ -1115,6 +1152,80 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
         "_links": validated_links,
     }
 
+
+def _validate_expiry_record(obj: dict, lineno: int | None = None) -> dict:
+    """Validate + normalize ONE remote-authored `memory_expiry` JSONL record
+    (issue #173, schema v15).
+
+    Parse-time only: UUID-shaped ``memory_id``, a UTC ISO-8601 ``inject_until``
+    (``Z`` with optional fractional seconds, or ``+00:00`` normalized to the
+    canonical ``Z`` form), and a known ``expiry_class``. Parent liveness and
+    duplicate conflicts need the store and are checked at APPLY time by
+    :func:`_apply_expiry_record`, so a reordered file whose parent line comes
+    later still lands (the buffered-apply contract, AC5).
+
+    Raises ValueError with the contract's stable strings; the caller counts
+    the line malformed (legacy) or rejects the whole import (strict).
+    """
+    memory_id = obj.get("memory_id")
+    if not isinstance(memory_id, str) or not _INGEST_ID_RE.match(memory_id):
+        raise ValueError("field 'memory_id' must be a 36-char UUID-shaped string")
+    inject_until = obj.get("inject_until")
+    if not isinstance(inject_until, str):
+        raise ValueError("memory_expiry inject_until must be UTC ISO-8601")
+    try:
+        inject_until = validate_inject_until(inject_until)
+    except ValueError:
+        raise ValueError("memory_expiry inject_until must be UTC ISO-8601")
+    expiry_class = obj.get("expiry_class")
+    if not isinstance(expiry_class, str) or expiry_class not in STATE_EXPIRY_CLASSES:
+        raise ValueError(
+            "memory_expiry expiry_class must be one of "
+            + ", ".join(STATE_EXPIRY_CLASSES)
+        )
+    return {"kind": "memory_expiry", "memory_id": memory_id,
+            "inject_until": inject_until, "expiry_class": expiry_class}
+
+
+def _apply_expiry_record(conn: sqlite3.Connection, obj: dict) -> None:
+    """Apply ONE validated `memory_expiry` record to the store (issue #173).
+
+    Store-time checks, all raising ValueError with the contract's stable strings:
+
+    - the parent must be a LIVE ``state`` row (``type='state'`` and
+      ``superseded_at IS NULL``) — "memory_expiry parent must be a live state row";
+    - an existing record with DIFFERENT values is a conflict —
+      "memory_expiry conflicts with existing record".
+
+    An existing record with IDENTICAL values is a no-op, which is what makes
+    reimporting the same file idempotent (AC5). Returns ``"applied"`` when a
+    row was inserted and ``"identical"`` on the idempotent no-op, so callers
+    can count real writes separately from no-ops (#173 PR-review F29). Runs
+    inside the caller's open transaction: strict commits once at the end;
+    legacy commits per record.
+    """
+    mid = obj["memory_id"]
+    existing = conn.execute(
+        "SELECT inject_until, expiry_class FROM memory_expiry WHERE memory_id=?",
+        (mid,)).fetchone()
+    if existing is not None:
+        if (existing["inject_until"], existing["expiry_class"]) == (
+                obj["inject_until"], obj["expiry_class"]):
+            return "identical"  # identical reimport — idempotent no-op
+        raise ValueError("memory_expiry conflicts with existing record")
+    parent = conn.execute(
+        "SELECT type, superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
+    if (parent is None or parent["type"] != "state"
+            or parent["superseded_at"] is not None):
+        raise ValueError("memory_expiry parent must be a live state row")
+    conn.execute(
+        "INSERT INTO memory_expiry (memory_id, inject_until, expiry_class) "
+        "VALUES (?,?,?)",
+        (mid, obj["inject_until"], obj["expiry_class"]),
+    )
+    return "applied"
+
+
 def _purged_ids(conn: sqlite3.Connection) -> set:
     """Ids removed by `purge` (issue #255). Empty when the additive
     purged_id table does not exist yet (pre-#255 store / old snapshot)."""
@@ -1169,6 +1280,10 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
     type_ = obj["type"]
     content = obj["content"]
     tags = obj["tags"]
+    # v15 (#173): one clock for this row's transaction. `ingestion_ts` is a
+    # wire value (may be the ORIGINATING store's), so the ingest clock is a
+    # separate single read threaded through the dedup fold and any tombstone.
+    tx_now = now_iso()
     source_ref = obj["source_ref"]
     signal = obj["signal"]
     confidence = obj["confidence"]
@@ -1384,7 +1499,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                       file=sys.stderr)
                 existing = None
         if existing:
-            _merge_on_dedup(conn, existing["id"], confidence, signal, tags)
+            _merge_on_dedup(conn, existing["id"], confidence, signal, tags, now=tx_now)
             # PR-review PRR-H (issue #59 review round): the surviving keeper
             # also absorbs the INCOMING row's taint — worst-of its own and the
             # synced row's — mirroring add_memory/update_memory. A remote
@@ -1572,6 +1687,15 @@ def _strict_staged_rows(spool: tempfile.SpooledTemporaryFile) -> list[tuple[str,
                 memory = _validate_sync_row(obj, lineno)
                 memory["_source_lineno"] = lineno
                 rows.append(("memory", memory))
+            elif kind == "memory_expiry":
+                # v15 (issue #173): staged AFTER base-memory validation; the
+                # record's fields are normalized here (canonical Z) but parent
+                # liveness and duplicate conflicts are checked at apply time,
+                # inside the one strict transaction, so they roll back the
+                # whole import (AC6) and a reordered file still lands (AC5).
+                expiry = _validate_expiry_record(obj, lineno)
+                expiry["_source_lineno"] = lineno
+                rows.append(("memory_expiry", expiry))
             else:
                 raise ValueError(f"unknown kind {kind!r}")
     finally:
@@ -1590,14 +1714,23 @@ def _strict_ingest_staged(
     capture_mode: str | None,
 ) -> int:
     rows = _strict_staged_rows(spool)
+    # v15 (#173 PR-review F13/F29): observability for the expiry apply pass —
+    # purged parents soft-drop and identical reimports are no-ops, neither is
+    # an error, but the operator can see what happened.
+    expiry_applied = expiry_identical = expiry_purged_skipped = 0
     seen: dict[str, set] = {
         "memory": set(), "episode": set(), "evidence": set(),
         "episode_memory": set(), "episode_evidence": set(),
-        "memory_evidence": set(),
+        "memory_evidence": set(), "memory_expiry": set(),
     }
     memory_ids = {obj["id"] for table, obj in rows if table == "memory"}
     episode_ids = {obj["id"] for table, obj in rows if table == "episode"}
     evidence_ids = {obj["id"] for table, obj in rows if table == "evidence"}
+    # v15 (#173): an in-file duplicate expiry record is conflict-AWARE — an
+    # identical repeat is idempotent (dropped here, no-op at apply), while a
+    # differing repeat raises the contract's stable conflict string. Keyed by
+    # memory_id with the normalized values as the identity.
+    expiry_values: dict[str, tuple] = {}
     for table, obj in rows:
         if table == "memory":
             key = obj["id"]
@@ -1611,6 +1744,16 @@ def _strict_ingest_staged(
             key = (obj["episode_id"], obj["evidence_id"])
         elif table == "memory_evidence":
             key = (obj["memory_id"], obj["evidence_id"])
+        elif table == "memory_expiry":
+            ident = (obj["inject_until"], obj["expiry_class"])
+            prior = expiry_values.get(obj["memory_id"])
+            if prior is not None:
+                if prior != ident:
+                    raise ValueError(
+                        "memory_expiry conflicts with existing record")
+                continue  # identical in-file repeat — idempotent, drop it
+            expiry_values[obj["memory_id"]] = ident
+            key = obj["memory_id"]
         else:
             raise ValueError(f"unknown strict table {table!r}")
         if key in seen[table]:
@@ -1654,6 +1797,19 @@ def _strict_ingest_staged(
                 raise _missing_memory_evidence_endpoint(obj)
             if obj["evidence_id"] not in available_evidence:
                 raise _missing_memory_evidence_endpoint(obj)
+    # (#173 PR-review F05, dispositioned against the contract): a state
+    # memory record WITHOUT an accompanying memory_expiry record is
+    # deliberately TOLERATED on ingest. AC5/Design step 6 require "a v14
+    # JSONL file without these records imports successfully with an empty
+    # side table" (v14 files contain no state rows); nothing in the contract
+    # REQUIRES rejecting a crafted state-without-expiry record, so the
+    # tolerance is contract-silent rather than contract-mandated — and the
+    # pinned apply-time error "memory_expiry parent must be a live state
+    # row" (not a parse-time message) remains the contract's mechanism for
+    # dangling expiry refs. An imported orphan is repairable: an explicit
+    # update that supplies expiry flags installs a side row on the
+    # replacement; a plain content update is refused by the writer with
+    # "state memories require an existing memory_expiry row".
 
     savepoint = "zmem_strict_ingest"
     own_transaction = not conn.in_transaction
@@ -1806,6 +1962,25 @@ def _strict_ingest_staged(
                     "(memory_id, evidence_id) VALUES (?, ?)",
                     (obj["memory_id"], obj["evidence_id"]),
                 )
+        # v15 (#173): apply the buffered memory_expiry records AFTER every
+        # base memory row has landed, inside the SAME strict transaction — a
+        # rejected apply (conflicting duplicate vs the store, non-state or
+        # missing parent) raises and rolls back the FULL import, memory rows
+        # and side rows together (AC6's no-partial-commit surface). A reordered
+        # file whose expiry line preceded its parent still lands here (AC5).
+        for table, obj in rows:
+            if table == "memory_expiry":
+                if obj["memory_id"] in purged_ids:
+                    # issue #255 (#173 PR-review F13): a purged id's side
+                    # records drop silently, never a fatal import error —
+                    # the same soft-drop every other child-record junction
+                    # above applies.
+                    expiry_purged_skipped += 1
+                    continue
+                if _apply_expiry_record(conn, obj) == "identical":
+                    expiry_identical += 1
+                else:
+                    expiry_applied += 1
         if own_transaction:
             conn.commit()
         else:
@@ -1821,6 +1996,13 @@ def _strict_ingest_staged(
         raise
     for diagnostic in strict_diagnostics:
         sys.stderr.write(diagnostic)
+    if expiry_applied or expiry_identical or expiry_purged_skipped:
+        # stderr only: the stdout summary line keeps its byte contract.
+        print(
+            f"[zmem] ingest-jsonl: strict expiry_applied={expiry_applied} "
+            f"identical={expiry_identical} purged_skipped={expiry_purged_skipped}",
+            file=sys.stderr,
+        )
     print(f"[zmem] ingest-jsonl: strict rows={len(rows)} evidence={len(evidence_ids)}")
     return 0
 
@@ -1933,6 +2115,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     f = io.TextIOWrapper(staged_source, encoding="utf-8", newline="\n")
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
+    deduped_ids: set = set()
     capture_refused = 0
     quarantined = 0
     quarantine_failed = 0
@@ -1949,6 +2132,15 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     # memory are counted malformed with a line number, never applied.
     pending_episodes: list = []
     pending_memberships: list = []
+    # v15 (issue #173): memory_expiry records are BUFFERED and applied AFTER
+    # every memory row lands, so file order cannot matter — a third-party file
+    # may place the expiry line before its parent (AC5's reorder proxy). An
+    # invalid record is counted malformed at parse time (per-line guard); a
+    # store-time rejection (non-state/missing parent, conflicting duplicate) is
+    # counted malformed at apply time without aborting the rest of the file —
+    # legacy commits per record, so "no partial commit" is a strict-only
+    # property (AC6 tests it under --strict).
+    pending_expiry: list = []
     try:
         # Stream the file line by line instead of reading it whole into
         # memory first -- a giant hostile file would otherwise exhaust RAM
@@ -2059,6 +2251,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     _validate_membership_row(obj, lineno)
                     pending_memberships.append((lineno, obj))
                     continue
+                if _kind == "memory_expiry":
+                    # v15 (issue #173): validate now (per-line guard counts a
+                    # bad record malformed), apply later (buffered, after every
+                    # memory row has landed).
+                    pending_expiry.append(
+                        (lineno, _validate_expiry_record(obj, lineno)))
+                    continue
                 if _kind != "memory":
                     raise ValueError(f"unknown kind {_kind!r}")
                 obj = _validate_sync_row(obj, lineno)
@@ -2120,6 +2319,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 quarantine_failed += 1
             elif outcome == "deduped":
                 deduped += 1
+                deduped_ids.add(obj["id"])
             else:
                 skipped += 1
             # v11 (issue #61, sync): collect the row's validated outgoing
@@ -2270,12 +2470,52 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                   file=sys.stderr)
             malformed += len(pending_episodes) + len(pending_memberships)
 
+    # v15 (issue #173): apply buffered memory_expiry records AFTER every memory
+    # row has landed (buffering makes file order irrelevant — AC5's reorder
+    # proxy). Legacy commits per record, so a store-time rejection (missing or
+    # non-state parent, conflicting duplicate) is counted malformed and
+    # reported, never aborting the rest of the file; "no partial commit" is a
+    # strict-only property (AC6 tests it under --strict).
+    expiry_applied = expiry_malformed = expiry_skipped = 0
+    if pending_expiry:
+        try:
+            for lineno, e in pending_expiry:
+                if e["memory_id"] in deduped_ids:
+                    # #173 PR-review F29: the parent folded into an existing
+                    # keeper (benign dedup), so its incoming id never landed
+                    # and this side record cannot apply — counted skipped,
+                    # never malformed.
+                    expiry_skipped += 1
+                    continue
+                try:
+                    if _apply_expiry_record(conn, e) == "identical":
+                        expiry_skipped += 1
+                    else:
+                        expiry_applied += 1
+                        _commit(conn)
+                except ValueError as exc:
+                    print(f"[zmem] ingest-jsonl: malformed line {lineno}: "
+                          f"{_sanitize_error_text(str(exc))}", file=sys.stderr)
+                    expiry_malformed += 1
+                    malformed += 1
+        except sqlite3.OperationalError as e:
+            # memory_expiry absent (pre-v15 store never migrated): every
+            # expiry record in the file is counted malformed, reported once.
+            print(f"[zmem] ingest-jsonl: memory_expiry records skipped — "
+                  f"side table unavailable ({_sanitize_error_text(str(e))}); "
+                  "re-ingest after a writable open migrates this store to v15",
+                  file=sys.stderr)
+            malformed += len(pending_expiry)
+            expiry_malformed += len(pending_expiry)
+
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "
           f"quarantined={quarantined} quarantine_failed={quarantine_failed} "
           f"deduped={deduped} skipped={skipped} malformed={malformed} "
           f"links_added={links_added} links_skipped={links_skipped} "
-          f"episodes_added={episodes_added} episodes_skipped={episodes_skipped}")
+          f"episodes_added={episodes_added} episodes_skipped={episodes_skipped} "
+          f"expiry_applied={expiry_applied} expiry_malformed={expiry_malformed} "
+          f"expiry_skipped={expiry_skipped}")
     if decode_error is not None:
         return 2
     # Issue #180: a quarantine write failure is a fail-closed outcome — the

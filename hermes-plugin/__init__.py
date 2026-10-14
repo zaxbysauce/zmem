@@ -1206,7 +1206,23 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
 # per call so a test that repoints ZMEM_HOME picks up the move; in steady state
 # (no mid-process ZMEM_HOME change) the two are identical.
 _SCHEMA_CONSTANTS = _store_constants()
-_ADD_TYPE_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TYPES"])
+# v15 (#173 PR-review F22): the advertised `type` enum must only list what this
+# surface can actually WRITE. The `state` type requires the mandatory
+# `--expiry-class`/`--inject-until` flags, which the hermes add tool does not
+# expose, so advertising `state` sells agents a write that always hard-fails
+# (`state memories require expiry_class`). Advertise only the writable types
+# until the expiry params are plumbed through (follow-up issue). The enum is
+# derived from the real ALLOWED_TYPES (minus `state`) rather than a fifth
+# hand-maintained literal, so a future type is advertised only if this surface
+# can write it; `_ADDABLE_TYPES` (below) is the runtime-write check twin.
+# `state` is excluded here (not read from schema_meta) because the degraded
+# fallback must stay usable when schema_meta is unreadable; the ratchet test
+# pins this set to schema_meta.ALLOWED_TYPES minus state.
+_STATE_TYPES = frozenset({"state"})
+_ADDABLE_TYPES = tuple(
+    t for t in _SCHEMA_CONSTANTS["ALLOWED_TYPES"] if t not in _STATE_TYPES
+)
+_ADD_TYPE_ENUM = list(_ADDABLE_TYPES)
 _ADD_SIGNAL_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_SIGNALS"])
 _ADD_TAINT_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TAINTS"])
 
@@ -3396,9 +3412,13 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error("Missing required parameter: type")
         if not content:
             return _tool_error("Missing required parameter: content")
-        if mtype not in consts["ALLOWED_TYPES"]:
+        # v15 (#173 PR-review F22): runtime-write check twin of the advertised
+        # enum — `state` cannot be created here (no expiry params), so refuse
+        # it with the same shape as any unknown type instead of forwarding a
+        # guaranteed store-level failure.
+        if mtype not in _ADDABLE_TYPES:
             return _tool_error(
-                "type must be one of: " + ", ".join(consts["ALLOWED_TYPES"])
+                "type must be one of: " + ", ".join(_ADDABLE_TYPES)
             )
         # Reject oversize content at the boundary with a clean message, mirroring
         # the MCP path — without this the local Hermes path forwarded raw,

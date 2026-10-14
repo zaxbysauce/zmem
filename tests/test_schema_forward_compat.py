@@ -24,6 +24,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -133,14 +134,14 @@ class SchemaCompatGateTest(unittest.TestCase):
                 version = conn.execute(
                     "SELECT value FROM meta WHERE key='schema_version'"
                 ).fetchone()[0]
-                self.assertEqual(version, "14")
+                self.assertEqual(version, "15")
             finally:
                 conn.close()
         importlib.reload(self.schema)
-        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 14)
-        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 14)
-        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 14)
-        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 14)
+        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 15)
+        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 15)
+        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 
 class OlderClientOnNewerStoreTest(unittest.TestCase):
@@ -216,10 +217,10 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         row = conn.execute(
             "SELECT content FROM memory WHERE id=?", (str(res),)).fetchone()
         self.assertIn("simulated v12-lineage", row["content"])
-        # And the store stays at 14 (the older client must NOT downgrade it).
+        # And the store stays at 15 (the older client must NOT downgrade it).
         ver = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        self.assertEqual(ver, "14")
+        self.assertEqual(ver, "15")
         conn.close()
 
     def test_cli_refusal_message_is_actionable(self):
@@ -241,6 +242,90 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
     def schema_supported():
         from schema_meta import SUPPORTED_SCHEMA_VERSION
         return SUPPORTED_SCHEMA_VERSION
+
+    def test_maintenance_v14_client_stores_and_recalls_on_v15_store(self):
+        # Issue #173 AC4: a MAINTENANCE release of the v14 line (SUPPORTED=14,
+        # FORWARD=15) opens the current v15 store, prints exactly one NOTICE,
+        # reads and writes ordinary (non-state) rows, and never downgrades the
+        # store. This is the additive-window contract at the new version
+        # boundary — the same shape the v12-lineage test above pins one
+        # boundary earlier.
+        import io
+        import sqlite3
+        from contextlib import redirect_stderr
+        import schema_meta
+        schema = self._schema
+        with patch.object(schema, "SUPPORTED_SCHEMA_VERSION", 14), \
+             patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15), \
+             patch.object(schema_meta, "SUPPORTED_SCHEMA_VERSION", 14), \
+             patch.object(schema_meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+            schema._schema_compat._warned = False
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                conn = schema.connect()
+                schema._prepare_store(conn)
+                from storelib.write import WriteResult, add_memory
+                from storelib.recall import recall_memory
+                res = add_memory(
+                    conn, namespace="project:fwd", type_="fact",
+                    content="row stored by a simulated v14 maintenance client",
+                    signal="test",
+                )
+                self.assertIsInstance(res, WriteResult)
+                self.assertEqual(len(res), 36)
+                self.assertFalse(res.deduped)
+                row = conn.execute(
+                    "SELECT content FROM memory WHERE id=?",
+                    (str(res),)).fetchone()
+                self.assertIn("v14 maintenance client", row["content"])
+                # An ordinary pre-existing type can be RECALLED too — the
+                # additive window is read/write, not read-only.
+                rows = recall_memory(
+                    conn, query="maintenance client", namespace="project:fwd")
+                self.assertTrue(
+                    any(str(r["id"]) == str(res) for r in rows),
+                    "the v14 maintenance client must be able to recall the row "
+                    "it just wrote on a v15 store")
+                conn.close()
+            notice = buf.getvalue()
+        # Exactly ONE notice, and it names the v15-vs-v14 gap.
+        self.assertEqual(notice.count("NOTICE"), 1,
+                         f"expected exactly one NOTICE, got: {notice!r}")
+        self.assertIn("store schema v15 is newer than this client's v14",
+                      notice)
+        self.assertIn("additive-only schema", notice)
+        # #173 PR-review F27 / contract step 11: the notice bytes are pinned
+        # EXACTLY (full line + one LF), and a second call under the same
+        # captured stream adds nothing — the one-shot guard proven at this
+        # 14/15 boundary, not just the older 12/13 one.
+        exact = (
+            "[zmem] NOTICE: store schema v15 is newer than this client's v14; "
+            "memory read/write continues (additive-only schema), but "
+            "newer-only features are unavailable until you update this plugin.\n"
+        )
+        with patch.object(schema, "SUPPORTED_SCHEMA_VERSION", 14), \
+             patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+            schema._schema_compat._warned = False
+            first_buf = io.StringIO()
+            with redirect_stderr(first_buf):
+                self.assertEqual(
+                    schema._schema_compat(15, "exact-bytes-probe"), "compat")
+            self.assertEqual(first_buf.getvalue(), exact,
+                             "the NOTICE must be byte-exact to the contract line")
+            # Within the SAME warned-cycle the block above opened, every
+            # subsequent call must add NOTHING (the one-shot guard).
+            second_buf = io.StringIO()
+            with redirect_stderr(second_buf):
+                self.assertEqual(
+                    schema._schema_compat(15, "second-call-probe"), "compat")
+                self.assertEqual(
+                    schema._schema_compat(15, "third-call-probe"), "compat")
+            self.assertEqual(second_buf.getvalue(), "",
+                             "subsequent calls must add no bytes")
+        # The store remains v15 — an older client never downgrades it.
+        ver = sqlite3.connect(os.environ["ZMEM_STORE"]).execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+        self.assertEqual(ver, "15")
 
 
 class DoctorCompatGradingTest(unittest.TestCase):

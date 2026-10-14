@@ -54,7 +54,7 @@ from storelib.rekey import (MapError, apply_namespace_map, assert_store_schema_c
                             embedding_census, load_vec_extension,
                             load_vec_extension_if_available, open_readonly_store, parse_namespace_map,
                             preview_namespace_map)
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, now_iso, SUPPORTED_SCHEMA_VERSION
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STATE_EXPIRY_CLASSES, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, now_iso, SUPPORTED_SCHEMA_VERSION
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.dataset import (
     cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
@@ -1970,6 +1970,11 @@ def main():
                             "as JSON on stdout instead of the human lines "
                             "(issue #65, 10.8 — consumed by the MCP/Hermes add "
                             "surfaces; stderr advisory lines are unchanged)")
+    p_add.add_argument("--expiry-class", type=str, dest="expiry_class", default=None,
+                       choices=list(STATE_EXPIRY_CLASSES),
+                       help="state expiry class: endpoint, setting, or metric")
+    p_add.add_argument("--inject-until", type=str, dest="inject_until", default=None,
+                       help="explicit UTC ISO8601 injection expiry timestamp")
 
     p_recall = _add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
@@ -2347,6 +2352,11 @@ def main():
                             "warnings) as JSON on stdout instead of the human lines "
                             "(issue #65, 10.8 — consumed by the MCP/Hermes update "
                             "surfaces; stderr advisory lines are unchanged)")
+    p_upd.add_argument("--expiry-class", type=str, dest="expiry_class", default=None,
+                       choices=list(STATE_EXPIRY_CLASSES),
+                       help="state expiry class: endpoint, setting, or metric")
+    p_upd.add_argument("--inject-until", type=str, dest="inject_until", default=None,
+                       help="explicit UTC ISO8601 injection expiry timestamp")
 
     p_get = _add_parser(
         "get",
@@ -3477,6 +3487,14 @@ def main():
                     ]
 
     args = ap.parse_args(parse_argv)
+
+    # v15 (#173): cross-field refusal. argparse `type=` sees only its own
+    # value, so the state-only coupling is enforced here as a post-parse hook
+    # (usage + message to stderr, exit 2 — matching argparse's own contract).
+    if (args.cmd in ("add", "update")
+            and (args.expiry_class is not None or args.inject_until is not None)
+            and getattr(args, "type", None) != "state"):
+        ap.error("--expiry-class and --inject-until require --type state")
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
     # supplied --batch but ordinary reembed retains its historical default.
@@ -4642,6 +4660,8 @@ def main():
                         taint=args.taint,
                         capture_mode=args.capture_mode,
                         evidence_ids=args.evidence_ids,
+                        expiry_class=args.expiry_class,
+                        inject_until=args.inject_until,
                     )
                 finally:
                     if _human_out is not None:
@@ -4766,6 +4786,8 @@ def main():
                         expected_old_namespace=args.expected_old_namespace,
                         supersede_reason=args.reason,
                         evidence_ids=args.evidence_ids,
+                        expiry_class=args.expiry_class,
+                        inject_until=args.inject_until,
                     )
                 finally:
                     if _human_out is not None:

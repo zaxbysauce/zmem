@@ -66,7 +66,7 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v14
+- schema compatibility against current v15
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
@@ -1138,13 +1138,36 @@ to the legacy for-injection envelope without the ledger key.
 ```
 <interpreter> <store.py> add \
   --namespace "project:<basename>" \
-  --type <fact|lesson|convention|preference|decision|constraint> \
+  --type <fact|lesson|convention|preference|decision|constraint|state> \
   --content "<the knowledge, specific and actionable>" \
   --tags "comma,separated" \
   --signal <test|compile|lint|reviewer|user|none> \
   [--taint <trusted_internal|untrusted_tool|untrusted_web>] \
-  [--source-ref "file:<path>" | "session:<id>" | "db:<table>:<rowid>"]
+  [--source-ref "file:<path>" | "session:<id>" | "db:<table>:<rowid>"] \
+  [--expiry-class <endpoint|setting|metric>] \
+  [--inject-until <UTC ISO8601, e.g. 2026-11-12T09:00:00Z>]
 ```
+
+**`state` and injection expiry (v15, issue #173).** A `state` row records a
+piece of the operating environment — an endpoint URL, a setting, a metric —
+that is only worth injecting while it is CURRENT, unlike a lesson or fact that
+stays true. `--type state` requires `--expiry-class`, one of:
+
+| class | default TTL | env override |
+|---|---|---|
+| `endpoint` | 30 days | `ZMEM_STATE_ENDPOINT_DAYS` |
+| `setting` | 90 days | `ZMEM_STATE_SETTING_DAYS` |
+| `metric`  | 14 days | `ZMEM_STATE_METRIC_DAYS` |
+
+The override must be a positive decimal integer. With no `--inject-until`, the
+expiry is computed as `now + TTL` and stored in the additive `memory_expiry`
+side table (`memory_id`, `inject_until`, `expiry_class`); an explicit
+`--inject-until` must be UTC ISO-8601 (`...Z` or `+00:00`, normalized to `Z`)
+and bypasses the TTL. The side table is INJECTION-ONLY: it records when a row
+should stop being injected, it never deletes the row or hides it from explicit
+`recall`/`search`. Passing either flag with a non-state type, or omitting
+`--expiry-class` on a state add, is refused exit 2. `update` carries the same
+two flags and the same rules.
 Signal sets default confidence: test/compile=0.9, lint=0.85, reviewer/user=0.6
 (medium), none=0.2 — deliberately BELOW the 0.25 recall floor: an ungrounded
 lesson is the agent's self-opinion and never surfaces in default recall (still
@@ -1187,6 +1210,7 @@ Legacy rows already stranded under a near-miss namespace
 <interpreter> <store.py> update --id <full-uuid> --content "<new content>" \
   [--namespace NS] [--type ...] [--tags ...] [--source-ref ...] [--confidence F]
   [--signal ...] [--taint ...] [--capture-mode manual|reviewed|auto]
+  [--expiry-class <endpoint|setting|metric>] [--inject-until <UTC ISO8601>]
 <interpreter> <store.py> invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
 ```
 - **`update`** is append-only knowledge revision: it creates a NEW live row with the

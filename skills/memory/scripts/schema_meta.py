@@ -99,7 +99,11 @@ def normalize_content(s: str) -> str:
 # (`evidence`, `episode_evidence`, and `memory_evidence`). Their migration
 # creates all three tables and advances the version in one transaction;
 # init_db() deliberately does not pre-create them on an existing v13 store.
-SUPPORTED_SCHEMA_VERSION = 14
+# v15 (issue #173): additive `memory_expiry` side table plus the `state`
+# memory type. Same discipline — the DDL lives only in the versioned
+# `_migrate_v15` branch so opening an existing v14 store cannot pre-create the
+# table outside that transaction (see storelib/schema.py `_migrate_v15`).
+SUPPORTED_SCHEMA_VERSION = 15
 
 # Forward-compat window (issue #65 follow-up): a client refuses a store whose
 # schema_version exceeds its SUPPORTED_SCHEMA_VERSION. For ADDITIVE-ONLY bumps
@@ -111,7 +115,7 @@ SUPPORTED_SCHEMA_VERSION = 14
 # SUPPORTED and FORWARD_COMPAT the client prints a one-time stderr NOTICE and
 # proceeds; above FORWARD_COMPAT it still refuses (ZMEM_ALLOW_NEWER_SCHEMA=1
 # overrides, at the operator's own risk).
-FORWARD_COMPAT_SCHEMA_VERSION = 14
+FORWARD_COMPAT_SCHEMA_VERSION = 15
 
 # v12 (issue #64): one-time trust_score reduction applied when a row's
 # violated_count crosses to 2 (the promote ladder's "violated" tier). Clamped
@@ -143,7 +147,24 @@ CROSS_PROJECT_HAZARD_VERBS_ENV = "ZMEM_CROSS_PROJECT_HAZARD_VERBS"
 
 # Memory `type` enum. All write surfaces validate against this tuple.
 # v9 (#59): `decision` and `constraint` are first-class shipped types.
-ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
+# v15 (#173): `state` carries injection-expiry metadata in the `memory_expiry`
+# side table. It rides in the BASE tuple unconditionally (not via the #137
+# `allowed_types()` observation seam) — its gate is the taxonomy decision,
+# already resolved, so `allowed_types()` returns it on both branches.
+ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint", "state")
+
+# v15 (#173): `state` rows declare HOW they expire (class) and WHEN
+# (inject_until, stored in `memory_expiry`). Three classes, each a default TTL
+# in days and an operator env override. The env var NAME is what the validation
+# error names (state_expiry.state_expiry_days reads it); a missing variable
+# falls back to the default, a non-positive or non-decimal value is refused.
+STATE_EXPIRY_CLASSES = ("endpoint", "setting", "metric")
+STATE_EXPIRY_TTL_DAYS = {"endpoint": 30, "setting": 90, "metric": 14}
+STATE_EXPIRY_ENV = {
+    "endpoint": "ZMEM_STATE_ENDPOINT_DAYS",
+    "setting": "ZMEM_STATE_SETTING_DAYS",
+    "metric": "ZMEM_STATE_METRIC_DAYS",
+}
 
 # Types the token-budget admission policy PROTECTS from dropping (issue #65,
 # 10.9): decision/constraint rows are never dropped to stay under

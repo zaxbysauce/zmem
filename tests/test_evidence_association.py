@@ -748,10 +748,14 @@ class SchemaInvariantTest(unittest.TestCase):
             sys.path.insert(0, str(ROOT / "skills" / "memory" / "scripts"))
             import schema_meta
             from storelib import schema
-            self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 14)
-            self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 14)
-            self.assertEqual(schema.SUPPORTED_SCHEMA_VERSION, 14)
-            self.assertEqual(schema.FORWARD_COMPAT_SCHEMA_VERSION, 14)
+            # v14 -> v15 (issue #173): the version moved with the contract-
+            # mandated additive `state`/`memory_expiry` release; the invariant
+            # THIS test guards is the column pin above (before == after), which
+            # is untouched.
+            self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 15)
+            self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+            self.assertEqual(schema.SUPPORTED_SCHEMA_VERSION, 15)
+            self.assertEqual(schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 
 class CliEvidenceAssociationTest(unittest.TestCase):

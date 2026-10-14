@@ -187,6 +187,43 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
             fact_score, 0.722857142857, places=12, msg="AC1 exact fact score"
         )
 
+    def test_state_normalizes_against_frozen_six_type_mean(self):
+        """Issue #173 additivity pin: `state` joined ALLOWED_TYPES but must
+        NOT join the #126 normalization mean — every pre-#173 multiplier and
+        the committed #126 projection gold stay byte-identical (the frozen-
+        mean guard that replaced the silent ~0.7% global rescale). `state`
+        normalizes exactly like any unlisted type: neutral 1.0 product over
+        the frozen six-type mean."""
+        from schema_meta import ALLOWED_TYPES
+
+        self.assertIn("state", ALLOWED_TYPES)
+        self.assertNotIn("state", recall_mod.TYPE_PREFERENCE_MEAN_TYPES)
+        self.assertEqual(
+            tuple(t for t in ALLOWED_TYPES if t != "state"),
+            recall_mod.TYPE_PREFERENCE_MEAN_TYPES,
+            "the frozen #126 mean set must be exactly today's types minus state",
+        )
+        # Lane profiles key the frozen set too, keeping the committed
+        # tests/fixtures/issue126/profile-expected.json gold byte-stable.
+        for lane, profile in recall_mod.PER_LANE_TYPE_WEIGHTS.items():
+            self.assertEqual(
+                set(profile),
+                set(recall_mod.TYPE_PREFERENCE_MEAN_TYPES),
+                f"lane {lane} profile must not gain types silently",
+            )
+        for m in ("session_start", "user_prompt", "pretool", "subagent",
+                  "precompact"):
+            products = [
+                recall_mod.PER_MOMENT_TYPE_WEIGHTS[m].get(t, 1.0)
+                for t in recall_mod.TYPE_PREFERENCE_MEAN_TYPES
+            ]
+            expected = 1.0 / (sum(products) / len(products))
+            self.assertAlmostEqual(
+                recall_mod.type_preference("state", moment=m), expected,
+                places=15,
+                msg=f"state multiplier at {m} must use the frozen mean",
+            )
+
     def test_runtime_moment_and_lane_validation(self):
         """AC2: five runtime moments x five lanes accepted; exact ValueError
         messages for the four invalid inputs (hyphenated moments leak the

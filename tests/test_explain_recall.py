@@ -575,8 +575,12 @@ class ExplainSafetyTests(ExplainFixtureBase):
     def test_no_schema_bump_rode_along(self):
         sys.path.insert(0, str(SCRIPTS_DIR))
         import schema_meta  # noqa: E402
-        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 14)
-        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 14)
+        # v14 -> v15 (issue #173): the schema moved for the contract-mandated
+        # `state` + `memory_expiry` release, NOT for explain-recall work — this
+        # floor's job is that the NEXT explain-recall change does not move it
+        # again without an explicit, disclosed bump here.
+        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 15)
+        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 
 if __name__ == "__main__":

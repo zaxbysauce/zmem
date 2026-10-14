@@ -344,6 +344,14 @@ class PurgeSideTablesTest(_PurgeBase):
             ("INSERT INTO memory_link (src_id, dst_id, relation, score, "
              "created_at) VALUES (?, ?, 'related', 0.9, ?)",
              (other, third, now)),
+            # v15 (#173): injection-expiry side row naming the target, plus a
+            # survivor's expiry row as the negative control that must stay.
+            ("INSERT INTO memory_expiry (memory_id, inject_until, "
+             "expiry_class) VALUES (?, '2027-01-01T00:00:00Z', 'endpoint')",
+             (target,)),
+            ("INSERT INTO memory_expiry (memory_id, inject_until, "
+             "expiry_class) VALUES (?, '2027-02-01T00:00:00Z', 'setting')",
+             (other,)),
         )
 
         r = self._purge(target)
@@ -362,12 +370,21 @@ class PurgeSideTablesTest(_PurgeBase):
                         "WHERE source_id=?", (target,))
             + self.qone("SELECT COUNT(*) FROM belief_head_evidence "
                         "WHERE source_id=?", (target,))
-            + self.qone("SELECT COUNT(*) FROM episode "
-                        "WHERE summary_memory_id=?", (target,))
-            + self.qone("SELECT COUNT(*) FROM entity WHERE id='ent-q01'")
-            + self.qone("SELECT COUNT(*) FROM entity_alias "
-                        "WHERE entity_id='ent-q01'")
+                    + self.qone("SELECT COUNT(*) FROM episode "
+                                "WHERE summary_memory_id=?", (target,))
+                    + self.qone("SELECT COUNT(*) FROM entity WHERE id='ent-q01'")
+                    + self.qone("SELECT COUNT(*) FROM entity_alias "
+                                "WHERE entity_id='ent-q01'")
+                    + self.qone("SELECT COUNT(*) FROM memory_expiry "
+                                "WHERE memory_id=?", (target,))
         )
+        # Negative control: the SURVIVOR's expiry row must be untouched, so a
+        # purge that swept the whole side table (rather than only rows naming
+        # the purged id) still fails here.
+        survivor_expiry = self.qone(
+            "SELECT COUNT(*) FROM memory_expiry WHERE memory_id=?", (other,))
+        self.assertEqual(survivor_expiry, 1,
+                         "a purge must not touch a survivor's expiry row")
         otherlink = self.qone(
             "SELECT COUNT(*) FROM memory_link WHERE src_id=? AND dst_id=?",
             (other, third))

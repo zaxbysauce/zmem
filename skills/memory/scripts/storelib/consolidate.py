@@ -23,7 +23,7 @@ from pathlib import Path
 from storelib.entity import relink_memory
 from storelib.schema import _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
-from storelib.write import _merge_on_dedup, supersede_memory
+from storelib.write import _clear_expiry, _merge_on_dedup, supersede_memory
 
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
 
@@ -388,6 +388,8 @@ def _absorb_into_keeper(
     conn: sqlite3.Connection,
     keeper: sqlite3.Row,
     absorbed: sqlite3.Row,
+    *,
+    now: str,
 ) -> dict:
     """Fold ONE absorbed near-duplicate row into its cluster keeper (issue #19).
 
@@ -461,7 +463,12 @@ def _absorb_into_keeper(
 
     # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared
     # with write-time dedup semantics; no content change here.
-    _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"])
+    # v15 (#173 / AC7, PR-review F30): `now` IS the caller's single cluster
+    # transaction timestamp — this helper no longer reads the clock itself, so
+    # a multi-absorb cluster can never mix clock reads (previously each absorb
+    # plus the consolidated_at write read now_iso() independently).
+    tx_now = now
+    _merge_on_dedup(conn, keeper_id, absorbed["confidence"], absorbed["signal"], absorbed["tags"], now=tx_now)
 
     # Worst-of taint propagation (issue #59, 4.7): consolidation folds the
     # absorbed row INTO the keeper permanently, so the keeper's taint becomes
@@ -479,7 +486,7 @@ def _absorb_into_keeper(
     # superseded_at, so a point-in-time --as-of (which drops the superseded
     # filter) still sees this row as dead at every T >= the tombstone (issue
     # #59, 4.4 as-of soundness).
-    tomb_at = now_iso()
+    tomb_at = tx_now
     conn.execute(
         "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
         (tomb_at, tomb_at, f"consolidated into {keeper_id}", absorbed["id"]),
@@ -488,6 +495,12 @@ def _absorb_into_keeper(
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
     except sqlite3.OperationalError:
         pass
+    # v15 (#173): the absorbed row's side-table record is removed in the SAME
+    # transaction as its tombstone — one of the cleanup sites (update,
+    # supersede, consolidate absorb, organize stale-summary, sync tombstone,
+    # plus the hard-DELETE paths in purge/import-store, which reach it through
+    # purge._ID_SIDE_TABLES).
+    _clear_expiry(conn, absorbed["id"])
 
     # v10 (issue #60): the keeper's content/tags may have grown above, so its
     # entity links are re-derived from the stored row. The ABSORBED row keeps
@@ -1405,10 +1418,14 @@ def consolidate(
         try:
             conn.execute("BEGIN")
             keeper_grew = False
+            # v15 (#173 PR-review F30): ONE clock for the whole cluster
+            # transaction — every absorb tombstone/merge and the
+            # consolidated_at stamp below share it (contract line 137/AC7).
+            cluster_now = now_iso()
             for nb_row, nb_sim in neighbors:
                 # Preserve absorbed content + record provenance + merge metadata
                 # + supersede (issue #19). consolidate-ONLY helper.
-                decision = _absorb_into_keeper(conn, seed, nb_row)
+                decision = _absorb_into_keeper(conn, seed, nb_row, now=cluster_now)
                 # Issue #62, 7.4 (c76 no-op-absorb blast radius): only a keeper
                 # whose content actually GREW this run is a valid compression
                 # candidate — a cluster that merged only already-represented /
@@ -1420,7 +1437,7 @@ def consolidate(
             # Mark the keeper as consolidated.
             conn.execute(
                 "UPDATE memory SET consolidated_at=? WHERE id=?",
-                (now_iso(), seed["id"]),
+                (cluster_now, seed["id"]),
             )
             # Issue #71 (consolidate-while-MCP-live row): use the shared
             # busy_retry-backed commit like every writer path — a live MCP
