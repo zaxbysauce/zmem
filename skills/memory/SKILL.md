@@ -711,7 +711,8 @@ drop-not-swap and a parallel-consume overlap (two concurrent children can
 load the same head entry before either rewrite lands — both receive that
 delegation, one child's prompt is consumed by its sibling; degraded
 relevance only, never a crash). `ZMEM_QUERY_CONTEXT=0` or `ZMEM_INJECT=0`
-disables parking via the early exit). A bridged child is a fresh context: its recall suppresses only rows
+disables parking via the early exit. A bridged child is a fresh context:
+its recall suppresses only rows
 already delivered at the subagent moment, so the parent's pretool
 deliveries cannot starve it. Claude's matcher remains
 `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task` since 0.31.0 — issue
