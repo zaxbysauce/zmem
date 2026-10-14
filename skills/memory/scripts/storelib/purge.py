@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sqlite3
+from storelib.delivery_ledger import _atomic_write_json  # noqa: E402  (issue #253: shared with the #253 tasktext scrub below)
 import sys
 import uuid
 from pathlib import Path
@@ -831,7 +832,6 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
         # PRR-001: reuse the delivery-ledger atomic writer so the scrubbed
         # ledger keeps its 0600-at-open + fsync + chmod contract (a plain
         # write_text + replace regressed the file to umask perms).
-        from storelib.delivery_ledger import _atomic_write_json
         _atomic_write_json(str(path), doc)
         stats["files_scrubbed"] += 1
     # Issue #253: the parked delegation stash (<hash>.tasktext) holds
