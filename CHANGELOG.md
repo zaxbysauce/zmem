@@ -42,7 +42,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   untrusted host prose on disk is that sweep, not the 6h window. The
   sidecar is created 0600-at-open and atomically replaced; on Windows a
   plain chmod only toggles the readonly attribute, so owner-only access
-  there rests on the operator-profile ACL (accepted residual). Correlation under concurrent dispatches is
+  there rests on the operator-profile ACL (accepted residual). `purge`
+  gained the matching operator path for the stash: it needle-scrubs
+  `.tasktext` entries and reaps orphaned `*.tasktext.tmp.*` (the residue
+  verify pass still globs only `*.ledger*`, so an unreadable stash stays
+  until the age sweep — #336). Correlation under concurrent dispatches is
   FIFO — no probed host supplies an agent id at park time — with the
   documented limitations: out-of-order SubagentStart arrival swaps two
   children's prompts, two parallel parks race read-modify-write with the

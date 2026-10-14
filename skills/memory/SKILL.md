@@ -2086,10 +2086,17 @@ What one purge does:
   delivery ledgers **and the issue-#252 JSONL segments
   (`<hash>.ledger.seg.<hex>`)**, and removes orphaned `.ledger.tmp.*` and
   `.signals.tmp.*` partial writes. The
-  `.pending`/`.tasktext`/`.compact`/`.feedback.jsonl`/`.signals` ops
+  `.pending`/`.compact`/`.feedback.jsonl`/`.signals` ops
   sidecars are NOT scrubbed (outside the ledger contract; `.signals`
   carries only signal names/statuses/counts, and the finished file is
-  swept on the shared ops mtime policy) — treat them as residue surfaces;
+  swept on the shared ops mtime policy) — treat them as residue surfaces.
+  The `<hash>.tasktext` delegation stash IS in scope since issue #253: purge
+  needle-scrubs its entries (they carry untrusted host prose and have no
+  memory ids) and reaps orphaned `*.tasktext.tmp.*`. The residue verify
+  step still globs only `*.ledger*`, so a stash the scrub SKIPPED because
+  it was unreadable/torn (the reader tolerates those states by design) is
+  exempt from that pass and stays until the ops age sweep; see #336 for the
+  verify-glob trade-off;
 - records the ids in the `purged_id` deny-list so `ingest-jsonl` will not
   re-insert them from a peer export (child records referencing a purged id
   are skipped or blanked, never fatal);
