@@ -55,6 +55,14 @@ INJECTION_ENVELOPE_OPTIONAL = frozenset({
     "effective_ops",
     # Issue #235: present only when the user:global tier floor withheld.
     "global_withheld",
+    # Issue #174: present only when the live-expiry gate ENGAGED (the
+    # passive lane saw at least one memory_expiry side row). Registering
+    # the key here is mandatory, not cosmetic — the Hermes prefetch and
+    # provider validators reject ANY envelope key outside required|optional,
+    # so an unregistered key silently blackouts recall on every store that
+    # adopts the expiry feature, including with `expired: 0`. Mirrored in
+    # hermes-plugin/__init__.py's degraded fallback set.
+    "expired",
 })
 
 def _capture_envelope_enabled() -> bool:
@@ -977,6 +985,21 @@ def select_and_budget_for_injection(
     # surface: when it yields operation tokens those outrank the older ring.
     # Explicitly supplied [] otherwise intentionally suppresses ring reads.
     effective_query = query or ""
+    # Issue #253: a prompt-less SubagentStart (Claude Code's real payload)
+    # takes the delegating prompt parked store-side at PreToolUse(Agent) as
+    # its recall query — event fields keep structural precedence (the
+    # consume only fires when the payload ladder produced nothing). Fail-open
+    # and moment-scoped: every other moment and every caller that arrives
+    # with a query is byte-identical.
+    bridged_query = False
+    if moment == "subagent" and not effective_query.strip():
+        try:
+            bridged = ledger.consume_task_text(resolved_data, session_id)
+            if isinstance(bridged, str) and bridged.strip():
+                effective_query = bridged[:500]
+                bridged_query = True
+        except Exception:
+            pass
     effective_ops = list(ops_tokens) if ops_tokens is not None else []
     checkpoint = ""
     query_context_enabled = True
@@ -1105,6 +1128,22 @@ def select_and_budget_for_injection(
         e.get("id"): e for e in delivered_entries
         if isinstance(e, dict) and isinstance(e.get("id"), str)
     }
+    # Issue #253, bridged-consume carve-out: the delegating parent's pretool
+    # pull records its rendered rows under the session id the child SHARES
+    # (SubagentStart carries the parent's id), and a subagent is a fresh
+    # context — rows the parent context saw must not suppress the child's
+    # task-keyed recall.  When the selector consumed a parked delegation
+    # (bridged_query), the pull drops its delivered-derived exclusions
+    # ENTIRELY: the fresh child re-reads rows the parent (or a sibling child)
+    # already rendered, which is over-delivery of already-seen rows rather
+    # than starvation.  That direction is deliberate — narrowing the set to
+    # subagent-moment rows would let the first bridged child suppress the
+    # rows the second one needs when their queries are related, which is the
+    # starvation this carve-out exists to prevent (see issue #331).  Explicit
+    # exclude_ids always apply, and non-bridged pulls keep the full
+    # delivered exclusion set byte-identical.
+    if bridged_query:
+        delivered_ids = []
     # Explicit exclusions precede delivered ids, preserving first-seen order
     # and making duplicate ids deterministic across callers.
     exclusions = _ordered_unique(list(exclude_ids or []) + delivered_ids)

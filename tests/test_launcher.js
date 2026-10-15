@@ -1251,12 +1251,15 @@ console.log("\n[10] Phase 7 unit: buildCanonicalEnv exports agent transcript + i
     eq("EVENT_MAP subagent-reflect → SubagentStop", launch.EVENT_MAP["subagent-reflect"], "SubagentStop");
 }
 
-console.log("\n[9c] Issue #158: Agent PreToolUse stays silent without sidecars");
+console.log("\n[9c] Issue #158/#253: Agent PreToolUse stays silent, parks store-side");
 
 {
     // PreToolUse on the delegation tool remains silent for the parent. The
-    // child receives its delegated prompt through its own SubagentStart event;
-    // no retired task-text/compact/pending sidecar is written here.
+    // child receives its delegated prompt through its own SubagentStart
+    // event; since #253 the delegating prompt IS parked store-side (the
+    // pretool store call writes the hashed .tasktext sidecar for the
+    // subagent-moment selector to consume), while the retired .pending and
+    // .compact sidecars stay absent.
     const payload = JSON.stringify({
         session_id: "sess-p3-agent-stash", cwd: PROJ, hook_event_name: "PreToolUse",
         tool_name: "Agent",
@@ -1278,8 +1281,18 @@ console.log("\n[9c] Issue #158: Agent PreToolUse stays silent without sidecars")
         ? fs.readdirSync(path.join(DATA, "ops"))
             .filter((f) => /\.(tasktext|pending|compact)$/.test(f))
         : [];
-    ok("agent pretool: retired sidecars absent", sidecars9.length === 0,
-        "found: " + JSON.stringify(sidecars9));
+    const tasktext9 = sidecars9.filter((f) => /\.tasktext$/.test(f));
+    const retired9 = sidecars9.filter((f) => /\.(pending|compact)$/.test(f));
+    ok("agent pretool: delegation parked store-side (.tasktext)",
+        tasktext9.length === 1, "found: " + JSON.stringify(sidecars9));
+    ok("agent pretool: retired .pending/.compact sidecars absent",
+        retired9.length === 0, "found: " + JSON.stringify(retired9));
+    const parked9 = tasktext9.length === 1
+        ? fs.readFileSync(path.join(DATA, "ops", tasktext9[0]), "utf8")
+        : "";
+    ok("agent pretool: parked tasktext carries the delegating prompt",
+        parked9.includes("launcher-test: fix the merge-queue ratchet flake lane."),
+        "parked: " + JSON.stringify(parked9.slice(0, 120)));
 }
 
 console.log("\n[10b] Issue #158: SessionStart source export + retired postcompact sidecar");

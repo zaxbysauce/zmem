@@ -1377,6 +1377,11 @@ class V15DoctorChecksTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor-v15-"))
         self.store_path = self.tmp / "store.sqlite"
+        # Scratch HOME for the spawned doctor subprocess (PRR-002): its
+        # claude-native-memory check reads the real ~/.claude/settings.json
+        # and fails closed when auto-memory is not explicitly disabled.
+        self.home = self.tmp / "home"
+        self.home.mkdir(parents=True, exist_ok=True)
         self._saved_env = os.environ.copy()
         for key in list(os.environ):
             if key.startswith("ZMEM_"):
@@ -1489,6 +1494,19 @@ class V15DoctorChecksTest(unittest.TestCase):
                if not k.startswith("ZMEM_")
                and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
         env.update({
+            # Hermetic (PR #341 swarm-pr-review PRR-002 — the review round's
+            # CI-red root cause): doctor's exit code is the GLOBAL report
+            # verdict, and its pre-existing claude-native-memory check reads
+            # ~/.claude/settings.json and FAILS CLOSED when auto-memory is
+            # not explicitly disabled. Inheriting the real HOME made this
+            # assertion pass on a dev box and fail on every clean runner
+            # (both matrix legs, both runs). Pin HOME/USERPROFILE at a
+            # scratch dir and set that check's own documented kill switch,
+            # exactly as every sibling doctor-spawning helper in this file
+            # already does (see _base_env and the PR #306 hermeticity fix).
+            "HOME": str(self.home),
+            "USERPROFILE": str(self.home),
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
             "ZMEM_STORE": str(self.store_path),
             "ZMEM_DATA": str(self.tmp),
             "ZMEM_MODELS_DIR": str(self.tmp / "missing-models"),

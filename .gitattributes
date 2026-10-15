@@ -60,5 +60,8 @@ tests/fixtures/hindsight/*.jsonl text eol=lf
 # export with read_bytes() (StateSyncTest::test_state_expiry_fixture_round_trips).
 # Keep both LF-stable under Windows autocrlf so committed bytes match the
 # generator output on every host.
-tests/fixtures/state/*.jsonl text eol=lf
+tests/fixtures/state/*.jsonl
+# PR #341 review (PRR-023): the new byte-contract fixture is only
+# comparable byte-for-byte if its line endings are pinned.
+tests/fixtures/asof/*.jsonl text eol=lf
 tests/fixtures/state/*.json text eol=lf

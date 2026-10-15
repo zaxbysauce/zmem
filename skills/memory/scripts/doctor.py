@@ -3854,6 +3854,19 @@ def _render_human(report: dict) -> str:
     lines.append("")
     for check in report["checks"]:
         lines.append(f"[{check['status'].upper()}] {check['id']}: {check['summary']}")
+    # PR #341 review (PRR-012): --expiring was computed but never rendered,
+    # and --format defaults to `human`, so the documented invocation printed
+    # nothing about expiring rows. Render the section here.
+    expiring_states = report.get("expiring_states")
+    if expiring_states is not None:
+        lines.append("")
+        lines.append(f"Expiring within horizon: {len(expiring_states)}")
+        for row in expiring_states:
+            lines.append(
+                f"- {row['inject_until']} {row['memory_id']} "
+                f"({row['expiry_class']}) {row['namespace']} "
+                f"{row['content_preview']}"
+            )
     if report["recommendations"]:
         lines.append("")
         lines.append("Next steps:")
@@ -4707,6 +4720,15 @@ def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
         raise ValueError(
             "--expiring must be a nonnegative decimal integer followed by d")
     days = int(m.group(1))
+    # PR #341 review (PRR-015): the regex accepts unbounded magnitudes and
+    # `days * 86400.0` raises OverflowError for a >=305-digit value, outside
+    # every guarded block — a traceback where the CLI promised a clean exit 2.
+    # Bound the day count to a range that still exceeds any real retention
+    # horizon (100 years) while keeping the arithmetic finite.
+    if days > 36500:
+        raise ValueError(
+            "--expiring must be a nonnegative decimal integer followed by d "
+            "(at most 36500d)")
     now_str = now if now is not None else now_iso()
     now_e = _parse_iso_to_epoch(now_str)
     if now_e <= 0:
@@ -5013,7 +5035,11 @@ def main(argv: list[str] | None = None) -> int:
     expiring_horizon = None
     if args.expiring is not None:
         import re as _re_exp
-        if not _re_exp.fullmatch(r"(0|[1-9][0-9]*)d", args.expiring):
+        _m_exp = _re_exp.fullmatch(r"(0|[1-9][0-9]*)d", args.expiring)
+        # PR #341 review (PRR-015): bound the magnitude here too, so an
+        # absurd value is refused by argparse (exit 2) instead of reaching
+        # the horizon arithmetic and raising OverflowError.
+        if not _m_exp or int(_m_exp.group(1)) > 36500:
             ap.error("--expiring must be a nonnegative decimal integer followed by d")
         expiring_horizon = args.expiring
     # Issue #174: doctor is read-only, so the TEST clock seam is a READ:

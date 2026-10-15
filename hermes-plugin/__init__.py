@@ -3250,7 +3250,13 @@ class ZmemMemoryProvider(MemoryProvider):
         return (frozenset(_ENVELOPE_REQUIRED_FALLBACK),
                 frozenset(("injection_risk", "candidate_lanes",
                            "budget_note", "effective_ops",
-                           "secret_withheld", "global_withheld")))
+                           "secret_withheld", "global_withheld",
+                           # Issue #174: the live-expiry count, keyed only
+                           # when the passive gate engaged. Keep this
+                           # fallback in step with
+                           # storelib.inject.INJECTION_ENVELOPE_OPTIONAL —
+                           # a key missing from BOTH sets blackouts recall.
+                           "expired")))
 
     def pre_verify(self, **kwargs: Any) -> Dict[str, Any]:
         """Reflect-before-stop probe (issue #163): when the session captured

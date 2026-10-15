@@ -10,14 +10,20 @@
 # session would. This is the "recall into subagents" half of box-wide memory
 # (PLAN.md §5).
 #
-# WHY `recent`, not `recall`: SubagentStart carried NO task/prompt text when
-# this hook was written (payload keys: session_id, transcript_path, cwd,
-# prompt_id, agent_id, agent_type, hook_event_name — Phase 7 empirical dump).
-# Issue #90 / #85 D: hosts that DO include the delegated prompt in the event
-# now get task-text recall (mode "subagent" probes prompt/task/description
-# and falls back to this same query-less recent pull when none is present),
-# so a "fix CI" subagent queries the ratchet lessons instead of whatever
-# recently landed.
+# WHY `recent` is the FALLBACK, not the primary: SubagentStart carried NO
+# task/prompt text when this hook was written (payload keys: session_id,
+# transcript_path, cwd, prompt_id, agent_id, agent_type, hook_event_name —
+# Phase 7 empirical dump). Issue #90 / #85 D: hosts that DO include the
+# delegated prompt in the event get task-text recall (mode "subagent" probes
+# prompt/task/description first). Issue #253: on Claude Code — whose payload
+# never carries task text — the parent's PreToolUse(Agent) call parks the
+# delegating prompt STORE-SIDE (`--delegation-prompt` on the store
+# subprocess the pretool body already makes), and the store-side selector
+# consumes it as this moment's recall query when the event payload yielded
+# nothing (FIFO across concurrent dispatches; secret-redacted at park). Only
+# when both rungs are empty does the query-less recent pull fire, so a "fix
+# CI" subagent queries the ratchet lessons instead of whatever recently
+# landed.
 # (agent_type is passed through to the shared body, which renders it in
 # the header — preserving the pre-#58 header contract.)
 #

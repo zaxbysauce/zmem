@@ -272,5 +272,80 @@ class PurgeKeeperResidueContractTest(unittest.TestCase):
         self.assertIsNotNone(self._content(target))
 
 
+class PurgeTasktextScrubTest(unittest.TestCase):
+    """Issue #253: the parked delegation stash gained an operator path.
+
+    purge needle-scrubs ``<hash>.tasktext`` entries and reaps orphaned
+    ``*.tasktext.tmp.*``. Three properties are load-bearing and each one
+    broke during the fix rounds, so each is pinned here rather than left to
+    a probe:
+
+    1. a well-formed stash is scrubbed (needle dropped, neighbours kept);
+    2. an UNREADABLE stash (torn JSON, non-dict payload, entries-less doc)
+       is skipped WITHOUT aborting the fail-closed ledger scrub that follows
+       — this was a real CRITICAL: JSONDecodeError is a ValueError, which
+       the outer handler reports as "ledger scrub failed" (skipping the
+       segment scrub), and AttributeError escaped it entirely;
+    3. a crashed-write tmp orphan is reaped.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-purge-tasktext-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"
+                                / "storelib"))
+        from storelib.delivery_ledger import park_task_text, tasktext_path
+        from storelib.purge import scrub_ledgers
+        self._park = park_task_text
+        self._path = tasktext_path
+        self._scrub = scrub_ledgers
+        self.stash = Path(tasktext_path(str(self.tmp), "s1"))
+
+    def _ops(self, name, payload):
+        ops = self.tmp / "ops"
+        ops.mkdir(parents=True, exist_ok=True)
+        target = ops / name
+        target.write_text(payload, encoding="utf-8")
+        return target
+
+    def test_wellformed_stash_is_scrubbed_and_neighbours_survive(self):
+        self._park(str(self.tmp), "s1", "deploy the needle-token now")
+        self._park(str(self.tmp), "s1", "keep this unrelated task text")
+        stats = self._scrub(self.tmp, set(), ["needle-token"])
+        self.assertEqual(stats["entries_dropped"], 1)
+        self.assertEqual(stats["files_scrubbed"], 1)
+        text = self.stash.read_text(encoding="utf-8")
+        self.assertNotIn("needle-token", text)
+        self.assertIn("keep this unrelated task text", text)
+
+    def test_unreadable_stash_never_aborts_the_scrub(self):
+        # Each shape is one the READER tolerates by design, so the scrub
+        # must tolerate it too. A raise here is the CRITICAL regression.
+        for name, payload in (
+            ("torn.tasktext", "{not json"),
+            ("list.tasktext", "[1, 2, 3]"),
+            ("noentries.tasktext", '{"other": 1}'),
+            ("notentries.tasktext", '{"entries": "nope"}'),
+        ):
+            with self.subTest(shape=name):
+                self._ops(name, payload)
+                stats = self._scrub(self.tmp, set(), ["needle-token"])
+                self.assertEqual(stats.get("files_scrubbed"), 0)
+
+    def test_tmp_orphan_is_reaped(self):
+        orphan = self._ops("abc.tasktext.tmp.deadbeef", "{}")
+        self.assertTrue(orphan.exists())
+        stats = self._scrub(self.tmp, set(), [])
+        self.assertFalse(orphan.exists(), "crashed-write tmp must be reaped")
+        self.assertEqual(stats["tmp_removed"], 1)
+
+    def test_empty_stash_file_is_removed_when_fully_scrubbed(self):
+        self._park(str(self.tmp), "s1", "only the needle-token here")
+        self._scrub(self.tmp, set(), ["needle-token"])
+        self.assertFalse(self.stash.exists(),
+                         "an emptied stash is removed, not left as {}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

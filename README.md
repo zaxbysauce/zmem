@@ -66,8 +66,12 @@ cleanup of both the ledger and pending sidecars. Use
 `<interpreter> <store.py> ledger-clear --session-id=<id>` for the reusable,
 ledger-only PreCompact path; the equals form supports ids beginning with `-`.
 Neither command opens SQLite. The former
-hook-owned pending, compact-summary, and task-text sidecars, plus the
-UserPromptSubmit operation tail, are intentionally retired. The MCP server's
+hook-owned pending and compact-summary sidecars, plus the
+UserPromptSubmit operation tail, are intentionally retired; task-text
+parking returned in 0.98.0 as a STORE-side bridge (issue #253) — the
+delegating prompt rides the pretool store subprocess and is consumed by
+the store-owned selector at SubagentStart, never by hook-owned sidecar
+code. The MCP server's
 passive surface now rides the same selector — see *Query-aware passive
 prefetch* below. This selector path remains schema-neutral; schema-v14 evidence
 storage is documented below.
@@ -1298,8 +1302,10 @@ python skills/memory/scripts/store.py classify-state --dry-run --json
 
 `doctor --expiring` lists `now < inject_until <= now + N days` ordered by
 `inject_until, memory_id` (parsed instants; honors `ZMEM_TEST_NOW`).
-`classify-state` proposes `state` + an expiry class (`endpoint` > `metric` >
-`setting` regex precedence) for every live row and is strictly read-only: the
+`classify-state` scans every live row and proposes `state` + an expiry
+class (`endpoint` > `metric` > `setting` regex precedence) for the rows that
+match a rule; a non-matching row keeps its current type with a null class
+and `matched_rule: none`. It is strictly read-only: the
 store is opened through a read-only URI with `PRAGMA query_only=ON` and no
 writer lease is acquired.
 
@@ -1364,8 +1370,9 @@ Notes:
   its `<result>` deliverable on Claude Code) — it writes a hand-off sidecar
   under `<ZMEM_DATA>/subagent-reflections/` that the parent's Stop hook
   surfaces and consumes. Subagent recall uses task/query text present in the event when
-  available and otherwise falls back to the store-owned recent selector; the
-  former hook-owned task-text stash is retired. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
+  available, else the delegating prompt parked store-side by the parent's
+  PreToolUse(`Agent`/`Task`) call (issue #253), and falls back to the store-owned
+  recent selector last. Override with the `ZMEM_DATA` env var (or the CC plugin's `storeDirectory`
   userConfig option) if you want it elsewhere.
 - **Legacy per-plugin data dirs** (`${ZCODE_PLUGIN_DATA}` /
   `${CLAUDE_PLUGIN_DATA}`) still work as a fallback if `ZMEM_DATA` isn't set

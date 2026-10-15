@@ -1,11 +1,14 @@
-"""Subagent recall through the event-payload lane (issue #158).
+"""Subagent recall through the event-payload lane (issues #158, #253).
 
-Proves the current launcher contract through the REAL chain:
+Proves the launcher contract through the REAL chain:
 - SubagentStart reads a prompt/task description from its event payload and
   passes it to the store-owned selector;
-- a queryless SubagentStart uses the store's recent lane;
-- passive adapters do not create or consume the retired task-text, pending,
-  or compact sidecars.
+- a prompt-less SubagentStart takes the delegating prompt parked store-side
+  by the parent's PreToolUse(Agent) call (issue #253; FIFO, secret-redacted
+  at park), and falls back to the store's recent lane when no delegation is
+  parked;
+- a SubagentStart never parks or persists prompt text itself; passive
+  adapters do not create or consume the retired pending/compact sidecars.
 
 All stores are throwaway temp stores. Runs standalone:
 python tests/test_subagent_tasktext.py
@@ -277,9 +280,10 @@ class TaskTextSequenceTest(unittest.TestCase):
         self.assertIn(MARKER_B, ctx_b)
 
     def test_event_payload_does_not_create_tasktext_sidecar(self):
-        # The adapter no longer parks task text locally. The prompt crosses
-        # the subprocess boundary as a query and must not be persisted in a
-        # sidecar, including when it contains secret-shaped text.
+        # A SubagentStart never parks: the store-side park (issue #253) is a
+        # PreToolUse(Agent) surface. A prompt crossing the subagent event —
+        # including secret-shaped text — stays transient query material and
+        # must not be persisted in a sidecar.
         env = dict(self._env, **_FLOOR)
         p = self._subagent_start(
             "agent-secret",
@@ -287,6 +291,22 @@ class TaskTextSequenceTest(unittest.TestCase):
             env=env)
         self.assertEqual(p.returncode, 0)
         self.assertFalse(_ops_path(self._tmp, self.SID, ".tasktext").exists())
+
+    def test_agent_pretool_parks_redacted_tasktext(self):
+        # Issue #253: the delegating PreToolUse(Agent) DOES park store-side
+        # now, so the secret-shape guarantee moved from "no sidecar" to
+        # "the parked bytes are redacted" — the #191 F-001 posture restored
+        # inside park_task_text via storelib.write.redact_text.
+        env = dict(self._env, **_FLOOR)
+        p = self._agent_pretool(
+            "fix the AKIAIOSFODNN7EXAMPLE leak in the merge queue")
+        self.assertEqual(p.returncode, 0)
+        stash = _ops_path(self._tmp, self.SID, ".tasktext")
+        self.assertTrue(stash.exists(),
+                        "delegating pretool must park the task text")
+        parked = stash.read_text(encoding="utf-8")
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", parked)
+        self.assertIn("[REDACTED_SECRET]", parked)
 
     def test_event_description_drives_subagent_query(self):
         env = dict(self._env, **_FLOOR)

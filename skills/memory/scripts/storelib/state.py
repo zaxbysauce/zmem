@@ -43,6 +43,13 @@ def classify_state_candidates(
     counters. A match proposes ``state`` and its class; no match keeps the
     row's current type with ``proposed_expiry_class=None`` and
     ``matched_rule="none"``. Writes nothing, commits nothing.
+
+    ``changed`` counts rows whose content/tags MATCHED a rule — the
+    issue-#174 contract's definition (its frozen golden pins
+    ``changed=3`` over a fixture whose rows are all already ``state``),
+    so it is deliberately NOT a count of type transitions; a row that is
+    already ``state`` and matches still counts. The per-row
+    ``current_type``/``proposed_type`` pair carries that distinction.
     """
     if not dry_run:
         raise ValueError("classify_state_candidates requires dry_run=True")

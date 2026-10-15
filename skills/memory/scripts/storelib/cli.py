@@ -756,6 +756,26 @@ def _read_one_json_object() -> dict[str, object]:
     return value
 
 
+def _park_delegation_prompt(args: argparse.Namespace) -> None:
+    """Issue #253: park the PreToolUse(Agent/Task) delegating prompt.
+
+    The hook adapter passes the delegating prompt on the passive store call
+    it already makes (``--delegation-prompt``); the park itself lives
+    store-side so the adapter never imports storelib (#158 boundary).
+    Honored only on the pretool moment with a session id; fail-open — a
+    failed park degrades to the query-less lane, never breaks the recall.
+    """
+    text = getattr(args, "delegation_prompt", "") or ""
+    if (not text.strip() or getattr(args, "moment", None) != "pretool"
+            or not getattr(args, "session_id", None)):
+        return
+    try:
+        from storelib import delivery_ledger as _dl
+        _dl.park_task_text(_injection_data_dir(None), args.session_id, text)
+    except Exception:
+        pass
+
+
 def _read_private_pretool_object() -> dict[str, object] | None:
     """Best-effort private hook payload; never make recall fail for it.
 
@@ -2086,6 +2106,12 @@ def main():
     p_recall.add_argument("--lane", dest="lane", type=str,
                           choices=INJECTION_LANES, default=None,
                           help="Injection lane")
+    p_recall.add_argument(
+        "--delegation-prompt", dest="delegation_prompt", type=str, default="",
+        help="PreToolUse(Agent/Task) delegating prompt (issue #253): park it "
+             "store-side for the child's SubagentStart recall query. Only "
+             "honored on --moment pretool with --session-id; the text is "
+             "secret-redacted before it touches disk (advisory, fail-open).")
     p_recall.add_argument("--ops-token", dest="ops_token", action="append",
                           type=str, default=[],
                           help="Operation token from the pretool ring "
@@ -2145,6 +2171,12 @@ def main():
     p_recent.add_argument("--lane", dest="lane", type=str,
                           choices=INJECTION_LANES, default=None,
                           help="Injection lane")
+    p_recent.add_argument(
+        "--delegation-prompt", dest="delegation_prompt", type=str, default="",
+        help="PreToolUse(Agent/Task) delegating prompt (issue #253): park it "
+             "store-side for the child's SubagentStart recall query. Only "
+             "honored on --moment pretool with --session-id; the text is "
+             "secret-redacted before it touches disk (advisory, fail-open).")
     p_recent.add_argument("--ops-token", dest="ops_token", action="append",
                           type=str, default=[],
                           help="Operation token from the pretool ring "
@@ -3698,13 +3730,26 @@ def main():
         try:
             _cs_conn = _connect_existing_store_readonly()
             try:
+                # PR #341 review (PRR-013): every sibling read-only
+                # early-dispatch surface certifies the store schema on the
+                # SAME handle before answering (rekey --dry-run at :3544,
+                # rescan-secrets at :3560, reembed --check). Without it this
+                # command would scan a store whose schema_version is newer
+                # than this build understands.
+                assert_store_schema_compatible(_cs_conn, STORE_PATH)
                 _result = _state_mod.classify_state_candidates(
                     _cs_conn, dry_run=True)
             finally:
                 _cs_conn.close()
             if args.json:
-                sys.stdout.write(json.dumps(
-                    _result, sort_keys=True, indent=2, ensure_ascii=False))
+                # PR #341 review (PRR-010): byte-identity contract — write
+                # through sys.stdout.buffer so Windows text mode cannot turn
+                # the LF into CRLF (the rescan-secrets / embedding-health
+                # precedent). The frozen golden is byte-compared.
+                sys.stdout.buffer.write(
+                    json.dumps(_result, sort_keys=True, indent=2,
+                               ensure_ascii=False).encode("utf-8"))
+                sys.stdout.buffer.flush()
             else:
                 for _prop in _result["proposals"]:
                     print("{id} {current}->{proposed} class={klass} rule={rule}".format(
@@ -4837,6 +4882,7 @@ def main():
                 sys.exit(2)
         elif args.cmd == "recall":
             if args.for_injection and args.json and args.session_id:
+                _park_delegation_prompt(args)
                 try:
                     payload = select_and_budget_for_injection(
                         conn,
@@ -4940,6 +4986,7 @@ def main():
                     _cross_explicit=args.include_cross_project)
         elif args.cmd == "recent":
             if args.for_injection and args.json and args.session_id:
+                _park_delegation_prompt(args)
                 try:
                     payload = select_and_budget_for_injection(
                         conn,
