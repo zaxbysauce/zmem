@@ -1080,9 +1080,14 @@ def rows_present_in(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any
         rid = str(row.get("id", ""))
         if not rid:
             continue
+        # The CONTESTED arm accepts the named marker (issue #254):
+        # `[CONTESTED LINK: <link_of>]`. The id is a uuid single token by
+        # construction (links.py sets it from a result-row id; write.py mints
+        # uuid4), which is what keeps the `: <one token>` shape closed —
+        # prose containing spaces or brackets still cannot pose as a marker.
         marker = re.compile(
             r"(?m)^(?: \[(?:PREVIOUSLY|INJECTION RISK|UNTRUSTED TOOL|"
-            r"UNTRUSTED WEB|CONTESTED LINK)\])*-\s+"
+            r"UNTRUSTED WEB|CONTESTED LINK(?:: [^\]\s]+)?)\])*-\s+"
             r"(?:\[tier=(?:project|domain|fleet_host|cross_project|"
             r"user_global|unknown)\]\s+)?\["
             + re.escape(rid) + r"\](?:\s|$)"

@@ -2051,7 +2051,8 @@ def main():
                                "ONE hop from each recalled memory and append up to "
                                "--link-budget neighbor rows (contradicts neighbors "
                                "only if they survive the confidence floor, tagged "
-                               "[CONTESTED LINK]). Default 1; 0 disables expansion.")
+                               "[CONTESTED LINK: <id>] naming the row they "
+                               "contradict). Default 1; 0 disables expansion.")
     p_recall.add_argument("--link-budget", type=nonnegative_int, default=2,
                           help="max extra rows appended by 1-hop link expansion "
                                "(default 2; 0 disables expansion — equivalent to "

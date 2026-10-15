@@ -5,6 +5,28 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.100.0] - 2026-10-15
+### Fixed
+- **The `[CONTESTED LINK]` marker names the opposing row (issue #254,
+  Workstream P PR 6 of 6):** when 1-hop link expansion pulls in a neighbour
+  that contradicts the row it was expanded from, the fenced bullet now reads
+  `[CONTESTED LINK: <id>]` with the contradicted parent's id — the `link_of`
+  already carried on the row — so a reader can go look at the opposing
+  memory (`store.py get --id`) instead of re-querying the store to find it.
+  Render-only: row selection, admission gating and suppression are
+  untouched, the losing row still renders exactly as often as before
+  (#115/#137), and the #183 passive-wire byte pin is unchanged. The two
+  consumers that mirror the marker text moved in lockstep: budget admission
+  (`inject.fence_row_cost`) charges the named marker so the fence cannot
+  overrun `ZMEM_INJECT_TOKEN_BUDGET` by the id, and the delivery ledger's
+  `rows_present_in` whitelist accepts both the bare and the named shape (a
+  closed single-token form — arbitrary prose still cannot count as
+  delivery), keeping contested expansion rows in ledger accounting now that
+  every rendered row is recorded (#250). Defensive fallback: a contested row
+  without `link_of` renders the bare marker. Docs/help updated; the two
+  literal-pin tests (`test_memory_links` contested render, `test_doc_drift`
+  needles) were repinned deliberately.
+
 ## [0.99.0] - 2026-10-15
 
 ### Added
@@ -59,7 +81,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   FTS window and the `limit * 5` recent profile scan on that lane only;
   explicit and historical lanes are unchanged. The cross-project tier
   keeps its 16× formula (a recorded deviation: the ≥2× floor holds).
-
 ## [0.98.0] - 2026-10-14
 
 ### Fixed

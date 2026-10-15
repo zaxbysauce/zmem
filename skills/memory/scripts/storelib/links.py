@@ -72,7 +72,8 @@ _TRUST_EVENT_DELTAS = {
 LINK_THRESHOLD = _env_float("ZMEM_LINK_THRESHOLD", 0.75)
 
 # Relations walked by recall's 1-hop expansion. `contradicts` participates
-# too — gated by the confidence floor and tagged [CONTESTED LINK] at emit.
+# too — gated by the confidence floor and tagged [CONTESTED LINK: <parent
+# id>] at emit (issue #254 names the opposing row).
 _EXPANSION_RELATIONS = ("related", "supports", "contradicts")
 
 
@@ -99,7 +100,7 @@ def _parse_iso_utc(value: object) -> datetime | None:
 
 # Issue #136: relations the graph-SEED arm may follow from an entity-anchored
 # seed node. `contradicts` is deliberately absent — a contradiction is an
-# explanatory edge (post-result [CONTESTED LINK] expansion), never a
+# explanatory edge (post-result [CONTESTED LINK: <id>] expansion), never a
 # candidate-rescue edge: surfacing a contradicted row as a fresh candidate
 # would rescue exactly the rows the trust floor exists to suppress. `extends`
 # is also out (not in the issue's seed list); `updates`/`derives` are typed

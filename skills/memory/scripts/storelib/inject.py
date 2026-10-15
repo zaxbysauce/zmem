@@ -164,7 +164,14 @@ def _row_markers(row: dict[str, Any]) -> list:
     elif taint == "untrusted_web":
         markers.append("[UNTRUSTED WEB]")
     if row.get("contested_link"):
-        markers.append("[CONTESTED LINK]")
+        # Mirrors recall._format_fenced_recall's contested marker (issue
+        # #254): the id is the row's own `link_of`, charged exactly as
+        # rendered. Keep byte-identical to the renderer or admission
+        # under-counts the fence.
+        opponent = row.get("link_of")
+        markers.append(
+            "[CONTESTED LINK: %s]" % opponent if opponent
+            else "[CONTESTED LINK]")
     if row.get("withheld_for_secret"):
         markers.append("[WITHHELD: SECRET]")
     return markers

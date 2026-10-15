@@ -2140,8 +2140,15 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # expansion are surfaced as CONTESTED so the reader sees immediately
         # that another memory refutes this one. Only expansion rows ever
         # carry `contested_link`, so non-expansion output is unchanged.
+        # Issue #254: the marker names the opposing row — the `link_of`
+        # already carried on the row, no lookup. The bare form is a defensive
+        # fallback for rows without `link_of`; inject._row_markers and
+        # delivery_ledger.rows_present_in mirror both shapes.
         if r.get("contested_link"):
-            _markers.append("[CONTESTED LINK]")
+            _opponent = r.get("link_of")
+            _markers.append(
+                "[CONTESTED LINK: %s]" % _opponent if _opponent
+                else "[CONTESTED LINK]")
         # Issue #256: a row withheld for a credential shape renders its id and
         # type only — never content, source_ref, tags, or entity names. The
         # key is new, so non-withheld rows render byte-identically (#183 pin).
@@ -3057,7 +3064,7 @@ def _recall_memory_impl(
     # no_bump filter (expansion candidates get the same injection/untrusted
     # drop), BEFORE entity cards so cards cover expansion rows too. Walks
     # related/supports one hop (contradicts gated by the confidence floor and
-    # tagged [CONTESTED LINK]), appends up to link_budget rows not already in
+    # tagged [CONTESTED LINK: <parent id>]), appends up to link_budget rows not already in
     # the result set. link_hops=0 or link_budget=0 disables it. Expansion rows
     # (and ONLY expansion rows) carry link_relation/link_of/link_score/
     # contested_link, so a link-free store keeps byte-identical output.
