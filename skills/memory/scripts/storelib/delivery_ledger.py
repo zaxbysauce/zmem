@@ -1081,7 +1081,7 @@ def rows_present_in(rows: List[Dict[str, Any]], text: str) -> List[Dict[str, Any
         if not rid:
             continue
         # The CONTESTED arm accepts the named marker (issue #254):
-        # `[CONTESTED LINK: <link_of>]`. The `: <one token>` shape is closed
+        # `[CONTESTED LINK: <id>]`. The `: <one token>` shape is closed
         # by construction on the RENDER side, not by the id's provenance:
         # inject.contested_marker emits the named form only for a single
         # token free of whitespace, brackets and angle brackets, and the

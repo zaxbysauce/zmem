@@ -22,6 +22,7 @@ operator store.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -39,6 +40,7 @@ STORE_PY = SCRIPTS_DIR / "store.py"
 # STORE_PATH at first import from ambient env — an unpinned import would
 # point at the operator's real ~/.zmem store).
 _TMP = tempfile.mkdtemp(prefix="zmem-p06-pin-")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
 os.environ["ZMEM_STORE"] = str(Path(_TMP) / "store.sqlite")
 os.environ["ZMEM_DATA"] = _TMP
 os.environ["ZMEM_MODELS_DIR"] = str(Path(_TMP) / "no-models")
@@ -78,14 +80,25 @@ CHILD_ROW = dict(
 
 
 def _clean_env(store_path: str) -> dict:
+    """A hermetic child env for the CLI legs.
+
+    Scrubs every recall-lane knob the renderer reads at call time, so an
+    ambient operator setting (a tiny token budget, an unfold depth, an arm
+    cap, a pinned test clock) cannot break the exact-count assertions —
+    the sibling helpers scrub the same family.
+    """
     env = dict(os.environ)
     env["ZMEM_STORE"] = store_path
     env["ZMEM_MODELS_DIR"] = str(Path(store_path).parent / "no-models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-    env.pop("ZMEM_DATA", None)
-    env.pop("ZMEM_BACKUP_DIR", None)
-    env.pop("ZMEM_MMR_LAMBDA", None)
-    env.pop("ZMEM_LINK_THRESHOLD", None)
+    for k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_MMR_LAMBDA",
+              "ZMEM_LINK_THRESHOLD", "ZMEM_INJECT_TOKEN_BUDGET",
+              "ZMEM_INJECT", "ZMEM_INJECT_FLOOR_TRUST", "ZMEM_TEST_NOW",
+              "ZMEM_CROSS_PROJECT", "ZMEM_UNFOLD_TOP_K", "ZMEM_UNFOLD_MAX_HOPS",
+              "ZMEM_UNFOLD_BUDGET", "ZMEM_ARM_CAP_FTS", "ZMEM_ARM_CAP_ENTITY",
+              "ZMEM_ARM_CAP_GRAPH", "ZMEM_ARM_CAP_TEMPORAL",
+              "ZMEM_GRAPH_SEED", "ZMEM_NAMESPACE"):
+        env.pop(k, None)
     return env
 
 

@@ -766,7 +766,7 @@ class RecallExpansionTest(_Store):
 
     def test_contested_neighbor_floor_and_tag(self):
         """A contradicts neighbor surfaces ONLY above the confidence floor,
-        tagged contested_link (JSON) / [CONTESTED LINK: <parent id>]
+        tagged contested_link (JSON) / [CONTESTED LINK: <id>]
         (fenced text — issue #254 names the opposing row).
 
         PRR-002 (swarm PR review): the assertions are RANK-AGNOSTIC and
