@@ -379,7 +379,8 @@ The floors are intentional. Do not silently unify them. The
 selective-inject gate (3.8) is a passive-lane filter; the trust floor
 applies symmetrically to link-expansion neighbors that ride the passive
 lane (a once-contradicted neighbor at trust 0.9 still renders with its
-`[CONTESTED LINK]` marker).
+`[CONTESTED LINK: <id>]` marker naming the other end of the
+contradiction).
 
 #### Score-margin gate (issue #182)
 
@@ -1022,8 +1023,15 @@ each recalled memory's `related`/`supports` links are walked one hop and
 up to `--link-budget` (default 2) extra neighbor rows are appended — a
 memory that never matched the query but is associative-neighbor of a
 match still surfaces. `contradicts` neighbors are included only when
-they survive the confidence floor and are tagged `[CONTESTED LINK]` in
-the fenced render (`contested_link: true` in JSON). Expansion rows carry
+they survive the confidence floor and are tagged `[CONTESTED LINK: <id>]`
+in the fenced render — the id names the opposing row, the parent the
+neighbour was expanded from (`contested_link: true` + `link_of` in JSON;
+issue #254). `contradicts` edges are stored in both directions, so the
+named id is one end of the contradiction, not a fixed direction; when
+the id is not a single safe token the bare `[CONTESTED LINK]` renders
+instead, and a named row that a floor or the token budget dropped from
+the fence can appear in a marker without its own bullet. Expansion rows
+carry
 `link_relation` / `link_of` / `link_score` / `contested_link` keys; rows
 that matched the query themselves never carry them, and expansion rows
 never advance telemetry (popularity rewards query matches, not link
@@ -3209,7 +3217,8 @@ to `--link-budget` (default 2) neighbors are appended to the result set
 namespace set, and always respecting the `--as-of` predicate — a neighbor
 invalid at the requested instant does not surface). `contradicts`
 neighbors must additionally survive the confidence floor and are tagged
-`[CONTESTED LINK]`. Expansion is bounded (one indexed lookup per result
+`[CONTESTED LINK: <id>]` naming the other end of the contradiction.
+Expansion is bounded (one indexed lookup per result
 row, budget-capped) — no PageRank or graph propagation of any kind.
 
 **MMR diversity (v10, issue #60 5.5)**: after the composite sort, and before

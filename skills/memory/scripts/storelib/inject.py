@@ -164,10 +164,39 @@ def _row_markers(row: dict[str, Any]) -> list:
     elif taint == "untrusted_web":
         markers.append("[UNTRUSTED WEB]")
     if row.get("contested_link"):
-        markers.append("[CONTESTED LINK]")
+        # Issue #254: shared with recall._format_fenced_recall so the
+        # admission charge and the rendered bytes cannot drift.
+        markers.append(contested_marker(row))
     if row.get("withheld_for_secret"):
         markers.append("[WITHHELD: SECRET]")
     return markers
+
+
+# Characters that would break the marker's closed single-token shape
+# (delivery_ledger.rows_present_in's `CONTESTED LINK(?:: [^\]\s]+)?` arm)
+# or the fence's bracket/delimiter grammar. An id carrying any of them
+# renders the bare marker instead, so a malformed id can never desync a
+# rendered row out of ledger accounting (the #250 re-delivery harm class).
+_MARKER_UNSAFE_CHARS = " \t\r\n]<>"
+
+
+def contested_marker(row: dict[str, Any]) -> str:
+    """The contested-link marker for a row, naming the opposing row.
+
+    Issue #254: the named form carries the row's own `link_of` — no lookup.
+    The id is rendered only when it is a single token free of the unsafe
+    characters above; anything else (missing, empty, non-string, spaced,
+    bracketed) renders the bare `[CONTESTED LINK]`. The renderer
+    (recall._format_fenced_recall) and this mirror call this one function,
+    so the two sites are byte-identical by construction.
+    """
+    opponent = row.get("link_of")
+    if not opponent:
+        return "[CONTESTED LINK]"
+    token = opponent if isinstance(opponent, str) else str(opponent)
+    if not token or any(c in _MARKER_UNSAFE_CHARS for c in token):
+        return "[CONTESTED LINK]"
+    return "[CONTESTED LINK: %s]" % token
 
 
 def fence_row_cost(row: dict[str, Any], *,

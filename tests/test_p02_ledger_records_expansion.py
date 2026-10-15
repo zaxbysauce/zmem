@@ -128,6 +128,13 @@ def _clean_env(tmp: Path) -> dict[str, str]:
 class _LedgerBase(unittest.TestCase):
     """Two linked rows in a throwaway store; N queried through one session."""
 
+    #: The relation the fixture links P and N with; subclasses override.
+    RELATION = "related"
+
+    #: Extra argv for the link command (contradicts/supports require a
+    #: --reason — they adjust trust_score).
+    LINK_EXTRA: tuple = ()
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="zmem-p02-ledger-"))
         self.env = _clean_env(self.tmp)
@@ -135,7 +142,7 @@ class _LedgerBase(unittest.TestCase):
         self.nid = self._add_row(NEIGHBOUR)
         self._apply_class_fixture()
         self._run_cli("links", "--add", "--id", self.pid, "--id", self.nid,
-                      "--relation", "related")
+                      "--relation", self.RELATION, *self.LINK_EXTRA)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -479,6 +486,70 @@ class LedgerAccountingBoundTest(_LedgerBase):
                          "surfaced-bumped (#136)")
         self.assertEqual(self._surfaced_count(self.pid), 1,
                          "the query-matched parent is bumped exactly once")
+
+
+class ContestedNeighbourLedgerTest(_LedgerBase):
+    """The #250 rendered-row law holds for the CONTESTED arrival shape too
+    (issue #254): a contradicts neighbour that renders is delivered, must be
+    recorded in the session ledger, and its fence marker names the parent.
+
+    This is the end-to-end proof the marker change needs: the suite above
+    only ever links ``--relation related``, so before this class nothing
+    drove a contradicts expansion row through the ledger WRITE path.
+    """
+
+    RELATION = "contradicts"
+    LINK_EXTRA = ("--reason", "p06 contested-marker fixture")
+
+    def _assert_neighbour_arrival(self, row: dict) -> None:
+        self.assertEqual(
+            row.get("link_relation"), "contradicts",
+            f"precondition: the fixture must deliver the neighbour as a "
+            f"contradicts expansion row: {row!r}")
+        self.assertTrue(
+            row.get("contested_link"),
+            f"precondition: a contradicts expansion row must carry "
+            f"contested_link: {row!r}")
+        self.assertEqual(
+            row.get("link_of"), self.pid,
+            f"precondition: the contested row must name the parent it was "
+            f"expanded from: {row!r}")
+
+    def test_contested_neighbour_marker_names_the_parent(self):
+        """The rendered fence names the contradicted parent on the
+        contested bullet, so a reader can retrieve the opposing row."""
+        payload = self._call()
+        self._assert_arrival_precondition(payload)
+        rendered = payload.get("rendered") or ""
+        self.assertIn(
+            "[CONTESTED LINK: %s]" % self.pid, rendered,
+            "the contested bullet must name the parent row it contradicts")
+
+    def test_contested_neighbour_recorded_in_ledger(self):
+        """A rendered contested neighbour is DELIVERED, so it must appear in
+        the session ledger alongside its query-matched parent — otherwise
+        nothing suppresses its re-delivery on the next event (#250 law)."""
+        payload = self._call()
+        self._assert_arrival_precondition(payload)
+        ids = self._ledger_ids()
+        self.assertIn(
+            self.pid, ids,
+            "precondition: the query-matched parent must be recorded, or "
+            "this test proves nothing")
+        self.assertEqual(
+            self.nid in ids, True,
+            "a rendered contradicts expansion row must be recorded in the "
+            "delivery ledger like any other rendered row")
+
+    def test_contested_neighbour_renders_once_across_three_calls(self):
+        """Once ledgered, the contested neighbour must not re-deliver on
+        later calls in the same session."""
+        payloads = [self._call() for _ in range(CALLS)]
+        self._assert_arrival_precondition(payloads[0])
+        rendered_calls = sum(
+            1 for payload in payloads
+            if f"[{self.nid}]" in (payload.get("rendered") or ""))
+        self.assertEqual(rendered_calls, 1)
 
 
 if __name__ == "__main__":

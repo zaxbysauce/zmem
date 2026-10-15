@@ -766,7 +766,8 @@ class RecallExpansionTest(_Store):
 
     def test_contested_neighbor_floor_and_tag(self):
         """A contradicts neighbor surfaces ONLY above the confidence floor,
-        tagged contested_link (JSON) / [CONTESTED LINK] (fenced text).
+        tagged contested_link (JSON) / [CONTESTED LINK: <id>]
+        (fenced text — issue #254 names the opposing row).
 
         PRR-002 (swarm PR review): the assertions are RANK-AGNOSTIC and
         UNCONDITIONAL — execution showed the `never` row reliably wins the
@@ -793,10 +794,15 @@ class RecallExpansionTest(_Store):
                         "contested_link=true")
         self.assertEqual(extra["link_relation"], "contradicts")
         self.assertEqual(extra["link_of"], main["id"])
-        # Fenced render tags the contested neighbor — unconditionally.
+        # Fenced render tags the contested neighbor — unconditionally — and
+        # (issue #254) the marker names the opposing row's id, exactly.
         r = self.run_store("recall", "--query", "cache ttl rate limiter",
                            "--namespace", "project:links", "--limit", "1")
-        self.assertIn("[CONTESTED LINK]", r.stdout, r.stdout)
+        contested_lines = [ln for ln in r.stdout.splitlines()
+                           if "CONTESTED LINK" in ln]
+        self.assertEqual(len(contested_lines), 1, r.stdout)
+        self.assertIn("[CONTESTED LINK: %s]" % main["id"],
+                      contested_lines[0])
         # Below the floor, the contradicts neighbor is dropped from expansion
         # — whichever row was the contested extra. If the floor gate broke,
         # it would resurface as the (now-main) partner's contested extra.

@@ -5,6 +5,40 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.100.0] - 2026-10-15
+### Fixed
+- **The `[CONTESTED LINK]` marker names the opposing row (issue #254,
+  Workstream P PR 6 of 6):** when 1-hop link expansion pulls in a neighbour
+  that contradicts the row it was expanded from, the fenced bullet now reads
+  `[CONTESTED LINK: <id>]` naming the other end of that contradiction — the
+  `link_of` already carried on the row — so a reader can go look at the
+  opposing memory (`store.py get --id`) instead of re-querying the store to
+  find it. Render-only: row selection and suppression are untouched, the
+  losing row still renders exactly as often as before (#115/#137), and the
+  #183 passive-wire byte pin is unchanged. The two consumers that mirror the
+  marker text moved in lockstep through one shared function
+  (`inject.contested_marker`), so the rendered bytes and the admission charge
+  cannot drift: budget admission (`inject.fence_row_cost`) charges the named
+  marker so the fence cannot overrun `ZMEM_INJECT_TOKEN_BUDGET` by the id,
+  and the delivery ledger's `rows_present_in` whitelist accepts both the bare
+  and the named shape (a closed single-token form — prose containing spaces
+  or brackets still cannot count as delivery), keeping contested expansion
+  rows in ledger accounting now that every rendered row is recorded (#250).
+  The named id renders only when it is a single token free of whitespace,
+  brackets and angle brackets; any other value renders the bare marker, so a
+  malformed id can never desync a rendered row out of ledger accounting.
+  Boundary note: the named marker adds ~9-14 tokens per contested row, so at
+  a binding `ZMEM_INJECT_TOKEN_BUDGET` a contested row can now be dropped or
+  content-truncated by the same admission policy that governs every other
+  row. The named id is the expansion seed, and `contradicts` edges are stored
+  in both directions, so it names one end of the contradiction (the row the
+  neighbour was expanded from); if that row was itself dropped by a floor or
+  the budget, the fence can name an id it does not show. Known gap: the
+  Hermes degraded-mode fence emits no provenance markers at all (pre-existing,
+  outside this change's three sites). Docs/help updated; the two literal-pin
+  tests (`test_memory_links` contested render, `test_doc_drift` needles) were
+  repinned deliberately.
+
 ## [0.99.0] - 2026-10-15
 
 ### Added
@@ -59,7 +93,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   FTS window and the `limit * 5` recent profile scan on that lane only;
   explicit and historical lanes are unchanged. The cross-project tier
   keeps its 16× formula (a recorded deviation: the ≥2× floor holds).
-
 ## [0.98.0] - 2026-10-14
 
 ### Fixed

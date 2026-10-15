@@ -312,19 +312,20 @@ class SkillDocDriftTest(unittest.TestCase):
         text = SKILL_MD.read_text(encoding="utf-8")
         for needle in ("--link-hops", "--link-budget",
                        "ZMEM_LINK_THRESHOLD", "contradict",
-                       "trust_score", "[CONTESTED LINK]"):
+                       "trust_score", "[CONTESTED LINK: <id>]"):
             self.assertIn(needle, text,
                           f"SKILL.md must document {needle} (issue #61 surface)")
 
     def test_retrieval_section_mentions_link_expansion(self):
         """Issue #61, 6.3: the retrieval section must document 1-hop link
         expansion so an agent reading only SKILL.md can interpret the extra
-        recall rows and the [CONTESTED LINK] tag."""
+        recall rows and the [CONTESTED LINK: <id>] tag (issue #254 names
+        the opposing row)."""
         section = self._retrieval_section()
         self.assertIn("Link expansion", section,
                       "the retrieval section must mention link expansion "
                       "(issue #61 6.3)")
-        self.assertIn("[CONTESTED LINK]", section)
+        self.assertIn("[CONTESTED LINK: <id>]", section)
 
     def test_linking_is_deterministic_and_llm_free(self):
         """Link generation is deterministic by design and ships no LLM knob
