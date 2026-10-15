@@ -417,8 +417,15 @@ class AsOfBehaviorTests(unittest.TestCase):
             conn.close()
 
         env = {
+            # PR #341 review (PRR-022): strip every ZMEM_* by PREFIX, like
+            # every sibling helper in this PR (the forbidden-pair leg below,
+            # and tests/test_doctor.py:1494). An explicit three-name list
+            # let ambient tuning knobs (ZMEM_INJECT_FLOOR_*, ZMEM_TIER_SLOTS,
+            # ZMEM_CROSS_PROJECT, ...) reach the child and move the exact
+            # golden comparison. Plugin-data vars are dropped too.
             **{k: v for k, v in os.environ.items()
-               if k not in ("ZMEM_TEST_NOW", "ZMEM_DATA", "ZMEM_MODELS_DIR")},
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")},
             "ZMEM_STORE": str(self.store_path),
             "ZMEM_MODELS_DIR": str(Path(self.tmp) / "no-such-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",

@@ -2296,14 +2296,13 @@ def _parse_iso_to_epoch(ts: str) -> float:
     restoring a contract this widening would otherwise have broken:
 
     1. TOTAL FUNCTION: every failure mode (non-str, malformed string,
-       out-of-range date, non-str type) degrades to 0.0. The old
-       ``strptime`` form raised TypeError on non-str input; the new
-       ``fromisoformat`` form raises AttributeError, and
-       ``datetime.timestamp()`` raises OSError [Errno 22] on Windows for
-       pre-1970 dates — none of which the old guard caught. This helper is
-       called from ~15 sites repo-wide (backup, organize, pages, sync's
-       skew clamp, every recall lane), almost none of them the expiry
-       feature, so a raised exception here aborts unrelated commands.
+       out-of-range date) degrades to 0.0. The old ``strptime`` form raised
+       TypeError on non-str input; the new ``fromisoformat`` form raises
+       AttributeError on non-str and ValueError only on unparseable
+       strings — neither was in the old guard. This helper is called from
+       ~15 sites repo-wide (backup, organize, pages, sync's skew clamp,
+       every recall lane), almost none of them the expiry feature, so a
+       raised exception here aborts unrelated commands.
     2. NAIVE VALUES READ AS UTC: ``datetime.timestamp()`` on a naive
        datetime resolves in the HOST's local timezone, which would make
        every consumer machine-TZ dependent. ``recall._now_epoch`` already

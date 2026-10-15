@@ -468,6 +468,33 @@ class LiveExpiryTest(unittest.TestCase):
             f"expected expired==3 (the pre-gate top-limit window is the three "
             f"expired rows), got {env.get('expired', None)!r}")
 
+    def test_parse_iso_to_epoch_is_a_total_function(self):
+        """PR #341 review (PRR-004/005/026): the parser must never RAISE and
+        must be timezone-deterministic.
+
+        The #327 widening replaced a whole-second-only ``strptime`` with
+        ``fromisoformat``, which silently changed the accepted input domain
+        (naive / date-only / space-separated / offset forms) and, for naive
+        input, resolved it in the HOST's local timezone. It also stopped
+        being a total function for non-str input. This pins both halves:
+        every failure degrades to 0.0, and a naive stamp reads as UTC.
+        """
+        if str(SCRIPTS_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib.schema import _parse_iso_to_epoch as p
+        # Non-str and empty inputs degrade (never AttributeError/TypeError).
+        for bad in (None, 12345, 3.5, b"2026-01-01", "", "nope", "2026-13-45"):
+            self.assertEqual(p(bad), 0.0, f"input {bad!r} must degrade to 0.0")
+        # Naive reads as UTC, NOT local time — the exact UTC instant.
+        self.assertEqual(p("2026-01-01T00:00:00"), 1767225600.0)
+        # Aware forms and fractional seconds keep their true instant.
+        self.assertEqual(p("2026-09-10T00:00:00Z"), 1788998400.0)
+        self.assertEqual(p("2026-09-10T00:00:00.5Z"), 1788998400.5)
+        self.assertEqual(p("2026-09-10T05:00:00+05:00"), 1788998400.0)
+        # Pre-1970 and far-future forms resolve instead of raising OSError.
+        self.assertLess(p("1000-01-01"), 0)
+        self.assertGreater(p("9999-12-31T23:59:59"), 0)
+
     def test_fractional_inject_until_gates_by_true_instant(self):
         """#327 (absorbed by #174): fractional inject_until timestamps gate
         by their TRUE instant, not by whole-second truncation — a
