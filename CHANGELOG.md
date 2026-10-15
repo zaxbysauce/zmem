@@ -5,6 +5,42 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.101.0] - 2026-10-15
+
+### Added
+- **Schema 16 — entity kinds v2 (issue #175, Workstream K PR 4,
+  UPGRADE-REQUIRED):** the entity `kind` vocabulary expands from five to
+  exactly twelve kinds (`person`, `project`, `tool`, `preference`, `host`,
+  `service`, `model`, `repo`, `file`, `command`, `error_class`, `other`),
+  shared through `schema_meta.ENTITY_KINDS` and enforced by the `entity`
+  table's SQL CHECK. The v15→v16 migration rebuilds the constrained table
+  atomically (create `entity_v16`, copy every row, drop, recreate `entity`
+  with the new CHECK, copy back, re-ensure the two dependent indexes,
+  `PRAGMA foreign_key_check` before commit) and
+  preserves every `entity`, `entity_alias`, and `memory_entity` row —
+  verified against the committed canonical fixture
+  `tests/fixtures/entity/migration-expected.json` (counts + SHA-256, pre and
+  post). A failed rebuild rolls back completely, leaving version 15, the
+  original table, and all rows unchanged (pinned by an authorizer-based
+  rollback test).
+- **Compatibility contract:** `SUPPORTED_SCHEMA_VERSION` is 16 while
+  `FORWARD_COMPAT_SCHEMA_VERSION` deliberately stays 15 — a changed SQL
+  constraint is not additive, so clients older than this release REFUSE a
+  migrated v16 store with the existing actionable message;
+  `ZMEM_ALLOW_NEWER_SCHEMA=1` proceeds (warns once, never downgrades or
+  migrates). A store above the client's SUPPORTED version is never migrated
+  by that client, even inside the compat window.
+- **#172 taxonomy decision recorded:** `entity_card` is rejected — the
+  memory type does not exist and `ALLOWED_TYPES` is unchanged by this
+  release (`state`, resolved by #173, remains).
+- **Fixtures and tests:** deterministic migration fixture trio
+  (`migration-input.jsonl`, `generate_migration_expected.py`,
+  `migration-expected.json`) with uuid5-canonicalized entity ids; the ten
+  contract-named tests across `test_entity` / `test_schema_forward_compat` /
+  `test_jsonl_sync`, the pre-v10 v2-kind backfill guardrail, the
+  entity.py diff-scope guard (classifier work stays in #176), and a new
+  docs-contract module pinning the README/SKILL v16 documentation.
+
 ## [0.100.0] - 2026-10-15
 ### Fixed
 - **The `[CONTESTED LINK]` marker names the opposing row (issue #254,

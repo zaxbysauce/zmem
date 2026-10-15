@@ -34,7 +34,7 @@ PYTHON = sys.executable
 # that goes stale on every bump (the pattern the v10 PR left behind for its
 # own two ratchets).
 sys.path.insert(0, str(SCRIPTS_DIR))
-from schema_meta import SUPPORTED_SCHEMA_VERSION  # noqa: E402
+from schema_meta import ENTITY_KINDS, SUPPORTED_SCHEMA_VERSION  # noqa: E402
 
 
 def _base_env(store_path: str) -> dict:
@@ -97,6 +97,27 @@ class _Store(unittest.TestCase):
 
 
 class SchemaTest(_Store):
+    def test_v16_entity_kind_check_accepts_all_twelve(self):
+        self.add("row to build the store")
+        conn = self.db()
+        ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='entity'"
+        ).fetchone()[0]
+        self.assertEqual(set(V2_KINDS), set(V2_KIND_PAIRS),
+                         "schema_meta.ENTITY_KINDS drifted from the v2 "
+                         "twelve-kind contract (issue #175)")
+        for kind in V2_KIND_PAIRS:
+            self.assertIn(f"'{kind}'", ddl,
+                          f"fresh entity CHECK must name the v2 kind {kind!r}")
+        for kind in V2_KINDS:
+            conn.execute(
+                "INSERT INTO entity (id, kind, canonical_name, created_at, "
+                "updated_at) VALUES (?,?,?,?,?)",
+                (f"probe-{kind}", kind, kind, FIXED_TS, FIXED_TS),
+            )
+        conn.rollback()
+
+
     def test_v10_tables_and_constraints(self):
         self.run_store("init")
         conn = self.db()
@@ -486,7 +507,53 @@ class MutationSitesTest(_Store):
                          f"export rows must not carry entity fields: {entity_keys}")
 
 
-class MigrationTest(_Store):
+GENERATOR = REPO_ROOT / "tests" / "fixtures" / "entity" / "generate_migration_expected.py"
+EXPECTED = REPO_ROOT / "tests" / "fixtures" / "entity" / "migration-expected.json"
+FIXED_TS = "2026-09-10T00:00:00Z"
+
+# The v2 vocabulary is pinned against schema_meta's shared tuple (not a
+# local literal) so a regression of ENTITY_KINDS itself flips this suite RED.
+V2_KINDS = ENTITY_KINDS
+V2_KIND_PAIRS = ("person", "project", "tool", "preference", "host", "service",
+                 "model", "repo", "file", "command", "error_class", "other")
+
+
+class V16SchemaTestMixin:
+    """Shared helpers for the issue #175 v16 tests (seed/dump via the
+    committed generator subprocess; store-building never runs in-process, so
+    STORE_PATH freezes can never cross-contaminate)."""
+
+    def seed_v15(self):
+        """Seed the canonical v15 fixture store; returns (store, pre-state)."""
+        scratch = Path(self.tmp)
+        inp = scratch / "migration-input.jsonl"
+        state = scratch / "pre-state.json"
+        store = scratch / "v15-store.sqlite"
+        r = subprocess.run(
+            [PYTHON, str(GENERATOR), "--input", str(inp), "--out", str(state),
+             "--store", str(store), "--phase", "seed"],
+            capture_output=True, text=True, env=self.env, timeout=300,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return store, json.loads(
+            state.read_text(encoding="utf-8"))["pre"]
+
+    def dump_state(self, store):
+        out = Path(self.tmp) / "post-state.json"
+        r = subprocess.run(
+            [PYTHON, str(GENERATOR), "--out", str(out), "--store", str(store),
+             "--phase", "dump"],
+            capture_output=True, text=True, env=self.env, timeout=120,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(out.read_text(encoding="utf-8"))["post"]
+
+    def migrate_via_cli(self, store):
+        """Any writable command migrates the store (the house trigger)."""
+        return self.run_store("stats", env=_base_env(str(store)))
+
+
+class MigrationTest(V16SchemaTestMixin, _Store):
     def test_v9_store_migrates_and_backfills(self):
         self.add("use `ripgrep` for search")
         self.add("plain tagged row", "--tags", "python")
@@ -525,6 +592,210 @@ class MigrationTest(_Store):
         self.assertEqual(conn.execute("SELECT count(*) FROM entity").fetchone()[0], n_ent)
         self.assertEqual(conn.execute("SELECT count(*) FROM memory_entity").fetchone()[0], n_link)
 
+
+    def test_v15_to_v16_preserves_entity_alias_and_memory_entity_counts_and_sha(self):
+        store, pre = self.seed_v15()
+        self.migrate_via_cli(store)
+        post = self.dump_state(store)
+        expected = json.loads(EXPECTED.read_text(encoding="utf-8"))
+        # Issue contract: the characterization runs PRAGMA foreign_key_check
+        # after the committed migration AND (below) on the second no-op one.
+        conn = sqlite3.connect(str(store))
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_key_check").fetchall(), [],
+                "foreign_key_check must be empty after the committed migration")
+        finally:
+            conn.close()
+        # Preservation: every count and canonical SHA survives the rebuild.
+        for table in ("entity", "entity_alias", "memory_entity"):
+            self.assertEqual(
+                post["tables"][table]["count"], pre["tables"][table]["count"],
+                f"{table} row count changed across the v16 rebuild")
+            self.assertEqual(
+                post["tables"][table]["sha256"], pre["tables"][table]["sha256"],
+                f"{table} canonical SHA changed across the v16 rebuild")
+            self.assertEqual(post["tables"][table]["rows"],
+                             pre["tables"][table]["rows"])
+        # Fixture identity: the regeneration matches the committed canonical
+        # expected file (pre AND post).
+        self.assertEqual(pre, expected["pre"])
+        self.assertEqual(post, expected["post"])
+        self.assertEqual(post["schema_version"], 16)
+
+    def test_v16_migration_is_idempotent(self):
+        store, _pre = self.seed_v15()
+        self.migrate_via_cli(store)
+        first = self.dump_state(store)
+        self.migrate_via_cli(store)
+        second = self.dump_state(store)
+        self.assertEqual(first, second, "second migration changed state")
+        self.assertEqual(second["schema_version"], 16)
+        conn = sqlite3.connect(str(store))
+        try:
+            self.assertEqual(
+                conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            conn.close()
+
+    def test_failed_v16_rebuild_rolls_back(self):
+        store, pre = self.seed_v15()
+        conn = sqlite3.connect(str(store))
+        conn.row_factory = sqlite3.Row
+        try:
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            self.assertEqual(version, "15")
+            schema_bytes = sorted(
+                (r["type"], r["name"], r["sql"]) for r in conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE type IN ('table', 'index')"
+                )
+            )
+            n_entity = conn.execute(
+                "SELECT count(*) FROM entity").fetchone()[0]
+        finally:
+            conn.close()
+
+        # Deny DROP TABLE inside the rebuild: the migration must roll the
+        # whole transaction back and leave v15 untouched.
+        os.environ["ZMEM_STORE"] = str(store)
+        os.environ["ZMEM_DATA"] = str(Path(self.tmp))
+        os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
+        from storelib import schema as schema_mod
+        conn = sqlite3.connect(str(store))
+        conn.row_factory = sqlite3.Row
+        try:
+            def _deny_drop(action, arg1, arg2, db, trigger):
+                if action == sqlite3.SQLITE_DROP_TABLE:
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            conn.set_authorizer(_deny_drop)
+            with self.assertRaises(sqlite3.DatabaseError):
+                schema_mod.migrate(conn)
+        finally:
+            conn.set_authorizer(None)
+            conn.close()
+
+        conn = sqlite3.connect(str(store))
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0], "15", "failed rebuild must leave version 15")
+            after_bytes = sorted(
+                (r["type"], r["name"], r["sql"]) for r in conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE type IN ('table', 'index')"
+                )
+            )
+            self.assertEqual(after_bytes, schema_bytes,
+                             "failed rebuild must leave table/index DDL "
+                             "byte-identical")
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM entity").fetchone()[0],
+                n_entity, "failed rebuild must leave rows unchanged")
+        finally:
+            conn.close()
+
+    def test_pre_v10_store_with_v2_kind_tag_backfills(self):
+        """Finding-3 guardrail (plan-critic round 1): the v10 backfill runs
+        with the SHARED 12-kind vocabulary, so a v2-kind tag on a legacy
+        store must backfill — not brick the migration on the old CHECK.
+
+        The migration is driven by DIRECT migrate() on a raw connection:
+        every CLI path re-creates the entity table via init_db() before the
+        versioned blocks run, which would mask the v10 DDL entirely (its
+        twelve-kind shape is the backstop for exactly this direct caller)."""
+        self.add("legacy row with v2 tag", "--tags", "host:acme-prod")
+        conn = self.db()
+        conn.execute("DROP TABLE memory_entity")
+        conn.execute("DROP TABLE entity_alias")
+        conn.execute("DROP TABLE entity")
+        conn.execute("UPDATE meta SET value='9' WHERE key='schema_version'")
+        conn.commit()
+        conn.close()
+
+        os.environ["ZMEM_STORE"] = str(self.store)
+        os.environ["ZMEM_DATA"] = str(Path(self.tmp))
+        os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
+        from storelib import schema as schema_mod
+        conn = sqlite3.connect(str(self.store))
+        conn.row_factory = sqlite3.Row
+        try:
+            schema_mod.migrate(conn)
+        finally:
+            conn.close()
+
+        conn = self.db()
+        try:
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION))
+            kinds = {r[0] for r in conn.execute("SELECT kind FROM entity")}
+            self.assertIn("host", kinds,
+                          "v2-kind tag must backfill on a legacy store")
+        finally:
+            conn.close()
+
+
+class ConstraintTest(_Store):
+    """v16 SQL CHECK enforcement (issue #175 AC5)."""
+
+    def test_bogus_v16_entity_kind_is_rejected_by_sql(self):
+        self.add("row to build the store")
+        conn = self.db()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO entity (id, kind, canonical_name, created_at, "
+                "updated_at) VALUES (?,?,?,?,?)",
+                ("bogus-kind-probe", "bogus_v16", "bogus", FIXED_TS, FIXED_TS),
+            )
+
+
+class ClassifierScopeTest(_Store):
+    """Issue #175 AC7: the classifier source is #176's, not this PR's."""
+
+    ENTITY_PY = "skills/memory/scripts/storelib/entity.py"
+
+    def test_v16_change_does_not_modify_entity_classifier_source(self):
+        # Resolve origin/main with the PR-checkout-hardened sequence from the
+        # PR #308 diff-scope tests: verify the ref (fetch when absent), then
+        # a bounded deepen-retry around merge-base for shallow checkouts.
+        def git(*args, check=True):
+            r = subprocess.run(["git", *args], capture_output=True, text=True,
+                               cwd=str(REPO_ROOT), timeout=120)
+            if check and r.returncode != 0:
+                raise AssertionError(f"git {' '.join(args)}: {r.stderr}")
+            return r
+
+        ref = git("rev-parse", "--verify", "--quiet",
+                  "refs/remotes/origin/main", check=False)
+        if ref.returncode != 0:
+            git("fetch", "--no-tags", "origin",
+                "+refs/heads/main:refs/remotes/origin/main")
+        base = None
+        for _ in range(8):
+            r = git("merge-base", "HEAD", "origin/main", check=False)
+            if r.returncode == 0:
+                base = r.stdout.strip()
+                break
+            git("fetch", "--no-tags", "--deepen", "250", "origin", check=False)
+        self.assertIsNotNone(
+            base, "merge-base with origin/main unreachable after deepening")
+        changed = git("diff", "--name-only", base, "HEAD",
+                      "--", self.ENTITY_PY).stdout
+        self.assertEqual(
+            changed.strip(), "",
+            f"{self.ENTITY_PY} must not be modified by the schema-16 PR "
+            "(classifier changes belong to #176)")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -66,7 +66,7 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v15
+- schema compatibility against current v16
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
@@ -831,6 +831,26 @@ release of an older client line may raise it to an ADDITIVE-ONLY newer schema
 and recalling memories — with a one-time stderr NOTICE — until it updates.
 Above the ceiling the refusal names the update, and
 `ZMEM_ALLOW_NEWER_SCHEMA=1` overrides at the operator's own risk.
+
+#### Schema 16 — entity kinds v2 (issue #175, UPGRADE-REQUIRED)
+
+Schema v16 widens the `entity` kind vocabulary from five to exactly twelve
+kinds, enforced by a SQL CHECK: `person`, `project`, `tool`, `preference`,
+`host`, `service`, `model`, `repo`, `file`, `command`, `error_class`,
+`other` (schema_meta `ENTITY_KINDS`; the deterministic extractor admits each
+kind as a `kind:Name` tag prefix). The v15→v16 migration REBUILDS the
+`entity` table (create `entity_v16` with the new CHECK, copy every row, drop the old
+table, recreate `entity` with the new CHECK, copy back) in one BEGIN
+IMMEDIATE transaction with `PRAGMA foreign_key_check` before commit; every
+`entity`, `entity_alias`, and `memory_entity` row
+survives unchanged. This is NOT an additive bump: a changed SQL constraint is
+outside the forward-compat window, so `SUPPORTED_SCHEMA_VERSION` is 16 while
+`FORWARD_COMPAT_SCHEMA_VERSION` deliberately stays 15 — every client older
+than the v16 release REFUSES a migrated v16 store (the actionable refusal
+names `ZMEM_ALLOW_NEWER_SCHEMA=1`, the explicit operator override that
+proceeds at the operator's own risk and never downgrades or migrates the
+store). The #172 taxonomy decision for `entity_card` is REJECT: that memory
+type does not exist and `ALLOWED_TYPES` is unchanged by this release.
 
 #### Injection token budget (issues #65 10.9, #116)
 

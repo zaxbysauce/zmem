@@ -210,8 +210,10 @@ class StateSchemaTest(_StoreCase):
         ver = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
-        self.assertEqual(ver, "15")
-        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 15)
+        self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION))
+        # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2); the
+        # forward ceiling deliberately stays 15.
+        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 16)
         self.assertEqual(FORWARD_COMPAT_SCHEMA_VERSION, 15)
         self.assertIn("state", ALLOWED_TYPES)
         tabs = [r[0] for r in self.conn.execute(
@@ -347,7 +349,8 @@ class StateMigrationTest(_StoreCase):
         schema.migrate(self.conn)
 
         self.assertEqual(self.conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "15")
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+            str(SUPPORTED_SCHEMA_VERSION))
         after_cols = [(r[1], r[2], r[3], r[4]) for r in self.conn.execute(
             "PRAGMA table_info(memory)")]
         self.assertEqual(before_cols, after_cols,
@@ -372,7 +375,8 @@ class StateMigrationTest(_StoreCase):
         # A second migrate is a no-op.
         schema.migrate(self.conn)
         self.assertEqual(self.conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "15")
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+            str(SUPPORTED_SCHEMA_VERSION))
 
     def test_failed_memory_expiry_ddl_rolls_back(self):
         # Force the store back to v14, then poison the side-table NAME with an
@@ -431,7 +435,8 @@ class StateMigrationTest(_StoreCase):
         # The migration remains completable after the denial clears.
         schema.migrate(self.conn)
         self.assertEqual(self.conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "15")
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+            str(SUPPORTED_SCHEMA_VERSION))
 
 
 class StateWriteTest(_StoreCase):

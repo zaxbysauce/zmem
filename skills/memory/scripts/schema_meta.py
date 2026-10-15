@@ -103,7 +103,13 @@ def normalize_content(s: str) -> str:
 # memory type. Same discipline — the DDL lives only in the versioned
 # `_migrate_v15` branch so opening an existing v14 store cannot pre-create the
 # table outside that transaction (see storelib/schema.py `_migrate_v15`).
-SUPPORTED_SCHEMA_VERSION = 15
+# v16 (issue #175): entity kinds v2 — the `entity` table's CHECK widens from
+# five to the twelve v2 kinds via a constrained-table rebuild (entity_v16
+# copy/drop/rename in `_migrate_v16`). NOT additive: a changed SQL constraint
+# is not covered by the forward-compat window, so FORWARD stays at 15 and a
+# v15 client refuses a v16 store until it upgrades (ZMEM_ALLOW_NEWER_SCHEMA=1
+# is the operator override).
+SUPPORTED_SCHEMA_VERSION = 16
 
 # Forward-compat window (issue #65 follow-up): a client refuses a store whose
 # schema_version exceeds its SUPPORTED_SCHEMA_VERSION. For ADDITIVE-ONLY bumps
@@ -196,12 +202,20 @@ ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # better one when two line items meet (update re-creation, consolidate absorb).
 TAINT_RANK = {"trusted_internal": 0, "untrusted_tool": 1, "untrusted_web": 2}
 
-# Entity `kind` enum (issue #60, 5.1). Deliberately small: five kinds cover
-# the deterministic extractor's output without an LLM. `person` is NEVER
-# auto-detected — it can only be created via an explicit `entity:person:Name`
-# tag, and no code path auto-merges person entities (entity-merge is manual,
-# --confirm-gated, and refuses kind mismatches).
-ENTITY_KINDS = ("person", "project", "tool", "preference", "other")
+# Entity `kind` enum (issue #60, 5.1; v2 expansion issue #175). Deliberately
+# small and deterministic — no LLM in the extraction path. The v2 vocabulary
+# keeps the five original kinds in place and order, then adds the seven kinds
+# the taxonomy RFC measured (host, service, model, repo, file, command,
+# error_class) before the `other` fallback. `person` is NEVER auto-detected —
+# it can only be created via an explicit `entity:person:Name` tag, and no code
+# path auto-merges person entities (entity-merge is manual, --confirm-gated,
+# and refuses kind mismatches). Deterministic classification rules for the new
+# kinds belong to issue #176; this tuple is only the shared vocabulary.
+ENTITY_KINDS = (
+    "person", "project", "tool", "preference",
+    "host", "service", "model", "repo", "file",
+    "command", "error_class", "other",
+)
 
 # Signals that make a NEW write default to trusted_internal (human-authored /
 # closeout / grounded evidence). Any other signal (`none` — an agent's

@@ -579,7 +579,9 @@ class ExplainSafetyTests(ExplainFixtureBase):
         # `state` + `memory_expiry` release, NOT for explain-recall work — this
         # floor's job is that the NEXT explain-recall change does not move it
         # again without an explicit, disclosed bump here.
-        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 15)
+        # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2); the
+        # forward ceiling deliberately stays 15 for the constrained rebuild.
+        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 16)
         self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 
