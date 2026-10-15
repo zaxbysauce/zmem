@@ -26,7 +26,8 @@ from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
                              apply_score_margin, apply_token_budget, budget_note,
-                             classify_silent_reason, estimate_tokens,
+                             classify_silent_reason, contested_marker,
+                             estimate_tokens,
                              fence_row_cost, inject_score_margin,
                              inject_token_budget,
                              selective_inject_filter)
@@ -2141,14 +2142,14 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # that another memory refutes this one. Only expansion rows ever
         # carry `contested_link`, so non-expansion output is unchanged.
         # Issue #254: the marker names the opposing row — the `link_of`
-        # already carried on the row, no lookup. The bare form is a defensive
-        # fallback for rows without `link_of`; inject._row_markers and
-        # delivery_ledger.rows_present_in mirror both shapes.
+        # already carried on the row, no lookup. The named id renders only
+        # when it is a single safe token; otherwise the bare marker renders,
+        # so a malformed id can never desync the row out of delivery
+        # accounting (inject.contested_marker is shared with the admission
+        # mirror and delivery_ledger.rows_present_in recognizes both
+        # shapes).
         if r.get("contested_link"):
-            _opponent = r.get("link_of")
-            _markers.append(
-                "[CONTESTED LINK: %s]" % _opponent if _opponent
-                else "[CONTESTED LINK]")
+            _markers.append(contested_marker(r))
         # Issue #256: a row withheld for a credential shape renders its id and
         # type only — never content, source_ref, tags, or entity names. The
         # key is new, so non-withheld rows render byte-identically (#183 pin).
@@ -3064,7 +3065,7 @@ def _recall_memory_impl(
     # no_bump filter (expansion candidates get the same injection/untrusted
     # drop), BEFORE entity cards so cards cover expansion rows too. Walks
     # related/supports one hop (contradicts gated by the confidence floor and
-    # tagged [CONTESTED LINK: <parent id>]), appends up to link_budget rows not already in
+    # tagged [CONTESTED LINK: <id>]), appends up to link_budget rows not already in
     # the result set. link_hops=0 or link_budget=0 disables it. Expansion rows
     # (and ONLY expansion rows) carry link_relation/link_of/link_score/
     # contested_link, so a link-free store keeps byte-identical output.

@@ -72,8 +72,8 @@ _TRUST_EVENT_DELTAS = {
 LINK_THRESHOLD = _env_float("ZMEM_LINK_THRESHOLD", 0.75)
 
 # Relations walked by recall's 1-hop expansion. `contradicts` participates
-# too — gated by the confidence floor and tagged [CONTESTED LINK: <parent
-# id>] at emit (issue #254 names the opposing row).
+# too — gated by the confidence floor and tagged [CONTESTED LINK: <id>] at emit
+# (issue #254 names the opposing row).
 _EXPANSION_RELATIONS = ("related", "supports", "contradicts")
 
 
