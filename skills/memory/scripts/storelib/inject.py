@@ -55,6 +55,14 @@ INJECTION_ENVELOPE_OPTIONAL = frozenset({
     "effective_ops",
     # Issue #235: present only when the user:global tier floor withheld.
     "global_withheld",
+    # Issue #174: present only when the live-expiry gate ENGAGED (the
+    # passive lane saw at least one memory_expiry side row). Registering
+    # the key here is mandatory, not cosmetic — the Hermes prefetch and
+    # provider validators reject ANY envelope key outside required|optional,
+    # so an unregistered key silently blackouts recall on every store that
+    # adopts the expiry feature, including with `expired: 0`. Mirrored in
+    # hermes-plugin/__init__.py's degraded fallback set.
+    "expired",
 })
 
 def _capture_envelope_enabled() -> bool:
@@ -808,6 +816,7 @@ def classify_silent_reason(
     *,
     candidate_ids: Optional[list[str]] = None,
     post_ledger_rows: Optional[list] = None,
+    expiry_drained: bool = False,
 ) -> str:
     """Name WHY a silent inject is silent (issue #87; store-side twin).
 
@@ -846,6 +855,12 @@ def classify_silent_reason(
         reason = "below-relevance"
     elif rows:
         reason = "below-bar"
+    elif omitted == 0 and expiry_drained:
+        # Issue #174: rows == [] here (every rows-consuming branch fell
+        # through), the budget did not empty the pool, nothing was omitted,
+        # and the caller's diagnosis says the PRE-expiry pool was eligible
+        # after omission, relevance, and ledger — expiry alone drained it.
+        reason = "expired"
     elif omitted > 0:
         reason = "omitted"
     else:
@@ -1467,6 +1482,10 @@ def select_and_budget_for_injection(
             global_withheld=parsed.get("global_withheld"),
             candidate_lanes=parsed.get("candidate_lanes"),
             budget_note=parsed.get("budget_note") if rows else None,
+            # Issue #174 (R3-4): forward the live-expiry count keyed-only-
+            # when-engaged — the store lane keys it only when it saw a
+            # memory_expiry side row, and None keeps the wire unchanged.
+            expired=parsed.get("expired"),
         )
     except Exception:
         return _selector_silent(budget_tokens=budget, excluded=exclusions)

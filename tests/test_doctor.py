@@ -1351,6 +1351,211 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
         self.assertEqual(check["details"]["memberships"], 0, check)
 
 
+class V15DoctorChecksTest(unittest.TestCase):
+    """v15 (issue #174): doctor's read-only ``--expiring <Nd>`` listing.
+
+    Builds a REAL v15 store (storelib.schema init_db+migrate) with the three
+    committed expiry-input.jsonl rows direct-INSERTed (namespace
+    fixture:expiry-174 — the writer rejects fixture:* but direct INSERT is
+    fine) and drives doctor both in-process (build_report with
+    store_override/now/expiring) and through the CLI subprocess.
+
+    Isolation contract (store-test discipline): the four isolation vars are
+    pinned to a fresh nonexistent scratch BEFORE any storelib import
+    (sys.modules purge on setUp, the tests/test_as_of_recall.py pattern),
+    restored in teardown; ZMEM_TEST_NOW rides only inside the clock-sensitive
+    CLI subprocess env, never ambient.
+    """
+
+    NS_FIXTURE = "fixture:expiry-174"
+    ROW3_ID = "00000000-0000-4000-8000-000000000003"
+    ROW4_ID = "00000000-0000-4000-8000-000000000004"
+    T_ZERO = "2026-09-10T00:00:00Z"
+    T_PLUS_1 = "2026-09-10T00:00:01Z"
+    FIXTURE_INPUT = REPO_ROOT / "tests" / "fixtures" / "asof" / "expiry-input.jsonl"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor-v15-"))
+        self.store_path = self.tmp / "store.sqlite"
+        # Scratch HOME for the spawned doctor subprocess (PRR-002): its
+        # claude-native-memory check reads the real ~/.claude/settings.json
+        # and fails closed when auto-memory is not explicitly disabled.
+        self.home = self.tmp / "home"
+        self.home.mkdir(parents=True, exist_ok=True)
+        self._saved_env = os.environ.copy()
+        for key in list(os.environ):
+            if key.startswith("ZMEM_"):
+                os.environ.pop(key)
+        os.environ.update({
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_DATA": str(self.tmp),
+            "ZMEM_MODELS_DIR": str(self.tmp / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        for mod in list(sys.modules.keys()):
+            if mod == "store" or mod.startswith("storelib"):
+                del sys.modules[mod]
+        self._build_fixture_store()
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved_env)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for mod in list(sys.modules.keys()):
+            if mod == "store" or mod.startswith("storelib"):
+                del sys.modules[mod]
+
+    def _build_fixture_store(self) -> None:
+        """init_db+migrate a fresh v15 store and direct-INSERT the three
+        expiry-input rows."""
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import storelib.schema as schema  # imported AFTER the env pin
+
+        conn = sqlite3.connect(str(self.store_path))
+        conn.row_factory = sqlite3.Row
+        schema.init_db(conn)
+        schema.migrate(conn)
+        try:
+            for line in self.FIXTURE_INPUT.read_text(
+                    encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                self._insert_row(conn, rec["id"], rec["content"],
+                                 rec["ingestion_ts"])
+                conn.execute(
+                    "INSERT INTO memory_expiry (memory_id, inject_until, "
+                    "expiry_class) VALUES (?, ?, ?)",
+                    (rec["id"], rec["inject_until"], rec["expiry_class"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _insert_row(conn, mid: str, content: str, ingestion_ts: str) -> None:
+        conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, tags, "
+            "source_ref, source_hash, confidence, signal, valid_from, "
+            "superseded_at, ingestion_ts, retrieval_count, last_retrieved, "
+            "surfaced_count, last_surfaced, merged_from, content_norm, "
+            "valid_until, update_of, taint, trust_score, applied_count, "
+            "violated_count, embedding, embedding_model, embedded_at, "
+            "consolidated_at, supersede_reason) "
+            "VALUES (?, ?, 'state', ?, '', '', '', 0.9, 'grounded', ?, NULL, "
+            "?, 0, NULL, 0, NULL, NULL, '', '', '', 'trusted_internal', "
+            "1.0, 0, 0, NULL, '', NULL, NULL, '')",
+            (mid, V15DoctorChecksTest.NS_FIXTURE, content, ingestion_ts,
+             ingestion_ts),
+        )
+
+    def _report(self, now: str, expiring: str = "7d") -> dict:
+        import doctor  # noqa: E402  (scripts dir is on sys.path)
+
+        return doctor.build_report(
+            Path("."), Path("."), store_override=self.store_path,
+            now=now, expiring=expiring)
+
+    def test_expiring_7d_lists_only_future_rows_within_horizon(self):
+        """At the fixed clock only row3 (inject_until 00:00:01Z, strictly
+        after now, inside now+7d) qualifies; rows 1+2 are <= now and an
+        expired row is never 'expiring' (the >-at-the-lower-edge law)."""
+        report = self._report(self.T_ZERO)
+        states = report.get("expiring_states")
+        self.assertIsInstance(states, list,
+                              f"report lacks an expiring_states list (keys: "
+                              f"{sorted(report)[:20]})")
+        self.assertEqual(
+            len(states), 1,
+            f"expected exactly one in-horizon row (row3), got "
+            f"{len(states)}: {states}")
+        entry = states[0]
+        self.assertEqual(entry.get("memory_id"), self.ROW3_ID)
+        self.assertEqual(entry.get("inject_until"), self.T_PLUS_1)
+        self.assertEqual(entry.get("namespace"), self.NS_FIXTURE)
+        self.assertEqual(entry.get("content_preview"), "expiry-row-3")
+        self.assertEqual(entry.get("expiry_class"), "setting")
+        # Ordering fields exist on every row (the (inject_until, memory_id)
+        # sort key needs them).
+        for field in ("memory_id", "namespace", "content_preview",
+                      "expiry_class", "inject_until"):
+            self.assertIn(field, entry,
+                          f"expiring_states rows must carry {field!r}")
+
+    def test_expiring_is_read_only(self):
+        """The sqlite file is byte-identical before and after both the
+        in-process build_report call and a --format json CLI subprocess
+        (with the clock pinned inside the subprocess env only)."""
+        import hashlib
+
+        sha_before = hashlib.sha256(
+            self.store_path.read_bytes()).hexdigest()
+        self._report(self.T_ZERO)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
+        env.update({
+            # Hermetic (PR #341 swarm-pr-review PRR-002 — the review round's
+            # CI-red root cause): doctor's exit code is the GLOBAL report
+            # verdict, and its pre-existing claude-native-memory check reads
+            # ~/.claude/settings.json and FAILS CLOSED when auto-memory is
+            # not explicitly disabled. Inheriting the real HOME made this
+            # assertion pass on a dev box and fail on every clean runner
+            # (both matrix legs, both runs). Pin HOME/USERPROFILE at a
+            # scratch dir and set that check's own documented kill switch,
+            # exactly as every sibling doctor-spawning helper in this file
+            # already does (see _base_env and the PR #306 hermeticity fix).
+            "HOME": str(self.home),
+            "USERPROFILE": str(self.home),
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            "ZMEM_STORE": str(self.store_path),
+            "ZMEM_DATA": str(self.tmp),
+            "ZMEM_MODELS_DIR": str(self.tmp / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_TEST_NOW": self.T_ZERO,
+        })
+        result = subprocess.run(
+            [PYTHON, str(DOCTOR_PY), "--store", str(self.store_path),
+             "--format", "json", "--expiring", "7d"],
+            capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("expiring_states", json.loads(result.stdout))
+        sha_after = hashlib.sha256(
+            self.store_path.read_bytes()).hexdigest()
+        self.assertEqual(
+            sha_after, sha_before,
+            "doctor --expiring mutated the store file (must be read-only)")
+
+    def test_expiring_fractional_inject_until_orders_by_true_instant(self):
+        """#327: a fractional inject_until (00:00:00.5Z) is in the horizon
+        window at now=00:00:00Z (the true instant .5 > 0) and OUT of it at
+        00:00:01Z — parsed-instant comparison, never lexical."""
+        conn = sqlite3.connect(str(self.store_path))
+        try:
+            self._insert_row(conn, self.ROW4_ID, "fractional-row",
+                             self.T_ZERO)
+            conn.execute(
+                "INSERT INTO memory_expiry (memory_id, inject_until, "
+                "expiry_class) VALUES (?, ?, ?)",
+                (self.ROW4_ID, "2026-09-10T00:00:00.5Z", "endpoint"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        states_before = self._report(self.T_ZERO).get("expiring_states") or []
+        self.assertIn(
+            self.ROW4_ID, [e.get("memory_id") for e in states_before],
+            f"the fractional 00:00:00.5Z row must be listed at "
+            f"now={self.T_ZERO} (true instant is after now): {states_before}")
+
+        states_after = self._report(self.T_PLUS_1).get("expiring_states") or []
+        self.assertNotIn(
+            self.ROW4_ID, [e.get("memory_id") for e in states_after],
+            f"the fractional 00:00:00.5Z row must NOT be listed at "
+            f"now={self.T_PLUS_1}: {states_after}")
+
+
 class DoctorUnitFailOpenTest(unittest.TestCase):
     """Import-level fail-open tests that cannot be driven through the CLI
     subprocess (PR feedback PRR-027)."""

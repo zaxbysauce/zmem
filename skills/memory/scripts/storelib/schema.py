@@ -2285,10 +2285,44 @@ def _normalize_content(s: str) -> str:
     return normalize_content(s)
 
 def _parse_iso_to_epoch(ts: str) -> float:
-    """Parse an ISO-8601 UTC timestamp to epoch seconds. Returns 0 on failure."""
+    """Parse an ISO-8601 UTC timestamp to epoch seconds. Returns 0 on failure.
+
+    Issue #327 (absorbed by #174): fractional-second forms
+    (``...T23:59:59.5Z``) are blessed by the #173 writer, which preserves
+    them verbatim, so they must resolve to their true instant — not
+    collapse to 0.0 the way the whole-second-only ``strptime`` did.
+
+    PR #341 review (PRR-004/005/026) — three hardening rules, each
+    restoring a contract this widening would otherwise have broken:
+
+    1. TOTAL FUNCTION: every failure mode (non-str, malformed string,
+       out-of-range date) degrades to 0.0. The old ``strptime`` form raised
+       TypeError on non-str input; the new ``fromisoformat`` form raises
+       AttributeError on non-str and ValueError only on unparseable
+       strings — neither was in the old guard. This helper is called from
+       ~15 sites repo-wide (backup, organize, pages, sync's skew clamp,
+       every recall lane), almost none of them the expiry feature, so a
+       raised exception here aborts unrelated commands.
+    2. NAIVE VALUES READ AS UTC: ``datetime.timestamp()`` on a naive
+       datetime resolves in the HOST's local timezone, which would make
+       every consumer machine-TZ dependent. ``recall._now_epoch`` already
+       pins naive to UTC; this helper now matches that convention.
+    3. NON-TZ-BEARING FORMS are still accepted for the instant value, but
+       (2) makes them deterministic rather than local.
+    """
+    if not isinstance(ts, str):
+        return 0.0
     try:
-        return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
-    except (ValueError, TypeError):
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OSError, OverflowError, ValueError):
+        # Pre-1970 / far-future dates raise on Windows (Errno 22) and can
+        # overflow on any platform; both mean "no usable instant".
         return 0.0
 
 def _as_of_temporal_predicate(as_of: str | None, alias: str = "") -> tuple[str, list]:

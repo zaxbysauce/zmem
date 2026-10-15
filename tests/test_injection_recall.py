@@ -13,8 +13,10 @@ Three contracts:
 from __future__ import annotations
 
 import inspect
+import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -107,6 +109,326 @@ class InjectionFilterSourceTests(unittest.TestCase):
             "_classify_injection must re-run the patterns for "
             "defense in depth (issue #58, 3.4)",
         )
+
+    # ------------------------------------------------------------------
+    # Issue #174: the passive lane's live-expiry gate (behavioral pins).
+    #
+    # Isolation contract (store-test discipline): ZMEM_STORE/ZMEM_DATA/
+    # ZMEM_MODELS_DIR point at a fresh nonexistent scratch and
+    # ZMEM_MODEL_AUTODOWNLOAD=0 BEFORE any storelib import (sys.modules
+    # purge on setUp, the tests/test_as_of_recall.py:26-81 pattern);
+    # ZMEM_TEST_NOW exists ONLY inside the env of a clock-sensitive READ
+    # subprocess, never ambient and never on the writer. Envelope-content
+    # assertions only (the selector's blanket except turns failures into
+    # silent envelopes).
+    # ------------------------------------------------------------------
+
+    NS_FIXTURE = "fixture:expiry-174"
+    ROW1_ID = "00000000-0000-4000-8000-000000000001"
+    ROW2_ID = "00000000-0000-4000-8000-000000000002"
+    ROW3_ID = "00000000-0000-4000-8000-000000000003"
+    ROW1_CONTENT = "expiry-row-1"
+    ROW2_CONTENT = "expiry-row-2"
+    ROW3_CONTENT = "expiry-row-3"
+    T_MINUS_1 = "2026-09-09T23:59:59Z"
+    T_ZERO = "2026-09-10T00:00:00Z"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-174-gate-")
+        self.scratch = Path(self.tmp)
+        self._saved_env = os.environ.copy()
+        for key in list(os.environ):
+            if key.startswith("ZMEM_"):
+                os.environ.pop(key)
+        os.environ.update({
+            "ZMEM_STORE": str(self.scratch / "store.sqlite"),
+            "ZMEM_DATA": str(self.scratch),
+            "ZMEM_MODELS_DIR": str(self.scratch / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        for mod in list(sys.modules.keys()):
+            if mod == "store" or mod.startswith("storelib"):
+                del sys.modules[mod]
+
+    def tearDown(self):
+        import shutil
+
+        os.environ.clear()
+        os.environ.update(self._saved_env)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for mod in list(sys.modules.keys()):
+            if mod == "store" or mod.startswith("storelib"):
+                del sys.modules[mod]
+
+    def _sub_env(self, store_dir: Path, now: str | None = None) -> dict:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")}
+        env.update({
+            "ZMEM_STORE": str(store_dir / "store.sqlite"),
+            "ZMEM_DATA": str(store_dir),
+            "ZMEM_MODELS_DIR": str(store_dir / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        if now is not None:
+            env["ZMEM_TEST_NOW"] = now
+        return env
+
+    def _run_cli(self, store_dir: Path, *args, now: str | None = None):
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "store.py"), *args],
+            capture_output=True, text=True, timeout=180,
+            env=self._sub_env(store_dir, now=now),
+        )
+
+    def _cli_add_state(self, store_dir: Path, namespace: str, content: str,
+                       expiry_class: str, inject_until: str) -> str:
+        """Seed one state row through the REAL CLI writer (no ZMEM_TEST_NOW
+        ever reaches the writer; --signal test clears the trust bar)."""
+        r = self._run_cli(
+            store_dir, "add", "--type", "state", "--namespace", namespace,
+            "--content", content, "--tags", "", "--signal", "test",
+            "--confidence", "0.9", "--expiry-class", expiry_class,
+            "--inject-until", inject_until, "--json")
+        self.assertEqual(r.returncode, 0,
+                         f"CLI add failed for {content!r}: {r.stderr[:300]}")
+        payload = json.loads(r.stdout)
+        self.assertEqual(payload.get("result"), "stored")
+        return payload["id"]
+
+    def _seed_fixture_store(self, store_dir: Path) -> None:
+        """Direct-INSERT the three committed expiry-input.jsonl rows
+        (namespace fixture:expiry-174 — the writer rejects fixture:* but
+        direct INSERT is fine; memory_fts is external-content so the rows
+        are searchable as-is)."""
+        if str(SCRIPTS_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib.schema as schema  # imported AFTER the env pin
+
+        fixture = (REPO_ROOT / "tests" / "fixtures" / "asof" /
+                   "expiry-input.jsonl")
+        conn = sqlite3.connect(str(store_dir / "store.sqlite"))
+        conn.row_factory = sqlite3.Row
+        schema.init_db(conn)
+        schema.migrate(conn)
+        try:
+            for line in fixture.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                conn.execute(
+                    "INSERT INTO memory (id, namespace, type, content, tags, "
+                    "source_ref, source_hash, confidence, signal, valid_from, "
+                    "superseded_at, ingestion_ts, retrieval_count, "
+                    "last_retrieved, surfaced_count, last_surfaced, "
+                    "merged_from, content_norm, valid_until, update_of, "
+                    "taint, trust_score, applied_count, violated_count, "
+                    "embedding, embedding_model, embedded_at, consolidated_at, "
+                    "supersede_reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, NULL, ?, "
+                    "0, NULL, 0, NULL, NULL, '', '', '', 'trusted_internal', "
+                    "1.0, 0, 0, NULL, '', NULL, NULL, '')",
+                    (rec["id"], rec["namespace"], rec["type"], rec["content"],
+                     rec.get("tags", ""), rec.get("source_ref", ""),
+                     rec.get("confidence", 0.9),
+                     rec.get("signal", "grounded"),
+                     rec.get("valid_from", rec["ingestion_ts"]),
+                     rec["ingestion_ts"]),
+                )
+                conn.execute(
+                    "INSERT INTO memory_expiry (memory_id, inject_until, "
+                    "expiry_class) VALUES (?, ?, ?)",
+                    (rec["id"], rec["inject_until"], rec["expiry_class"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _envelope(self, r) -> dict:
+        self.assertEqual(r.returncode, 0,
+                         f"expected exit 0, got {r.returncode}; "
+                         f"stderr={r.stderr.strip()[:300]}")
+        try:
+            return json.loads(r.stdout)
+        except json.JSONDecodeError:
+            self.fail(f"stdout is not JSON: {r.stdout[:300]}")
+
+    def test_candidate_ids_precede_expiry_filter(self):
+        """AC3: candidate_ids is the PRE-expiry fetch set. Behavioral: with
+        rows 1+2 expired at T_ZERO, the envelope's candidate_ids carry ALL
+        THREE ids while results deliver only the live row. The source ratchet
+        below pins the override's home so a refactor cannot silently capture
+        candidate_ids after the gate."""
+        import inspect
+        import uuid
+
+        import storelib.recall as recall_mod
+        src = inspect.getsource(recall_mod._recall_injection_details)
+        self.assertIn(
+            'expiry_acc is not None and expiry_acc["engaged"]',
+            src,
+            "_recall_injection_details must keep the pre-expiry candidate "
+            "override gated on the engaged flag (issue #174 AC3)")
+
+        ns = "project:expiry-gate-174"
+        d = self.scratch / "candidates"
+        d.mkdir()
+        id1 = self._cli_add_state(d, ns, self.ROW1_CONTENT, "endpoint",
+                                  self.T_ZERO)
+        id2 = self._cli_add_state(d, ns, self.ROW2_CONTENT, "metric",
+                                  self.T_MINUS_1)
+        id3 = self._cli_add_state(d, ns, self.ROW3_CONTENT, "setting",
+                                  "2026-09-10T00:00:01Z")
+        env = self._envelope(self._run_cli(
+            d, "recall", "--query", "expiry-row", "--namespace", ns,
+            "--for-injection", "--json",
+            "--session-id", f"gate-a-{uuid.uuid4().hex}",
+            "--moment", "user_prompt", "--lane", "zcode", now=self.T_ZERO))
+        cand = env.get("candidate_ids")
+        self.assertIsInstance(cand, list)
+        self.assertEqual(
+            sorted(cand), sorted([id1, id2, id3]),
+            f"candidate_ids must be the pre-expiry set of all three ids "
+            f"(including the two expired), got {cand!r}")
+        got_ids = [row.get("id") for row in env.get("results", [])]
+        self.assertEqual(
+            got_ids, [id3],
+            f"results must deliver only the live row {[id3]}, got {got_ids}")
+
+    def test_expired_count_is_pre_gate_count(self):
+        """AC3: the expired key counts PRE-gate expired candidates, not the
+        delivered complement — 2 at T_ZERO (rows 1+2 expired) alongside ONE
+        delivered row, and 1 at 23:59:59Z alongside TWO delivered rows."""
+        import uuid
+
+        ns = "project:expiry-count-174"
+        d = self.scratch / "counts"
+        d.mkdir()
+        self._cli_add_state(d, ns, self.ROW1_CONTENT, "endpoint", self.T_ZERO)
+        self._cli_add_state(d, ns, self.ROW2_CONTENT, "metric", self.T_MINUS_1)
+        self._cli_add_state(d, ns, self.ROW3_CONTENT, "setting",
+                            "2026-09-10T00:00:01Z")
+        for now, n_expired, n_results in ((self.T_ZERO, 2, 1),
+                                          (self.T_MINUS_1, 1, 2)):
+            env = self._envelope(self._run_cli(
+                d, "recall", "--query", "expiry-row", "--namespace", ns,
+                "--for-injection", "--json",
+                "--session-id", f"gate-b-{uuid.uuid4().hex}",
+                "--moment", "user_prompt", "--lane", "zcode", now=now))
+            self.assertEqual(
+                env.get("expired", None), n_expired,
+                f"expired at {now}: expected {n_expired}, got "
+                f"{env.get('expired', None)!r}")
+            self.assertEqual(
+                len(env.get("results", [])), n_results,
+                f"results length at {now}: expected {n_results}, got "
+                f"{len(env.get('results', []))} — expired must be the "
+                f"pre-gate count, independent of the delivered count")
+
+    def test_prefetch_excludes_expired_rows(self):
+        """AC3/AC1 Hermes prefetch leg: on the fixture store at T_ZERO the
+        two expired rows are absent from results AND the rendered fence,
+        expired==2 exact, and their surfaced telemetry stays untouched
+        (surfaced_count==0, last_surfaced IS NULL) after the run."""
+        d = self.scratch / "prefetch"
+        d.mkdir()
+        self._seed_fixture_store(d)
+        env = self._envelope(self._run_cli(
+            d, "recall", "--query", "expiry-row",
+            "--namespace", self.NS_FIXTURE, "--for-injection", "--json",
+            "--session-id", "fixture-session-174", "--moment", "user_prompt",
+            "--lane", "hermes-provider", now=self.T_ZERO))
+        self.assertEqual(env.get("expired", None), 2,
+                         f"expected expired==2 exactly, got "
+                         f"{env.get('expired', None)!r}")
+        rendered = env.get("rendered") or ""
+        result_ids = [row.get("id") for row in env.get("results", [])]
+        for dead_id, dead_content in ((self.ROW1_ID, self.ROW1_CONTENT),
+                                      (self.ROW2_ID, self.ROW2_CONTENT)):
+            self.assertNotIn(dead_id, result_ids,
+                             f"expired id {dead_id} present in results")
+            self.assertNotIn(
+                dead_content, rendered,
+                f"expired content {dead_content!r} present in the rendered "
+                f"fence")
+        conn = sqlite3.connect(str(d / "store.sqlite"))
+        conn.row_factory = sqlite3.Row
+        try:
+            for dead_id in (self.ROW1_ID, self.ROW2_ID):
+                row = conn.execute(
+                    "SELECT surfaced_count, last_surfaced FROM memory "
+                    "WHERE id = ?", (dead_id,)).fetchone()
+                self.assertIsNotNone(row, f"seeded row {dead_id} missing")
+                self.assertEqual(
+                    row["surfaced_count"], 0,
+                    f"expired row {dead_id} has surfaced_count="
+                    f"{row['surfaced_count']} after the prefetch (expected 0)")
+                self.assertIsNone(
+                    row["last_surfaced"],
+                    f"expired row {dead_id} has last_surfaced="
+                    f"{row['last_surfaced']!r} after the prefetch")
+        finally:
+            conn.close()
+
+    def test_candidate_ids_keep_live_link_arrivals_when_engaged(self):
+        """Issue #174 review round (R3-3): on an ENGAGED lane, candidate_ids
+        captures ALL pre-gate arrivals — including a LIVE link-expansion
+        neighbor. Row A matches the query; row B shares no query term and
+        arrives ONLY through the A->B ``related`` edge; both must sit in
+        candidate_ids AND deliver (B must not vanish from candidate_ids just
+        because the gate engaged). Both rows carry far-future inject_until
+        so the gate engages while nothing expires."""
+        import uuid
+
+        if str(SCRIPTS_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib.links as links  # the memory_link edge helper
+
+        ns = "project:expiry-link-174"
+        d = self.scratch / "link-arrival"
+        d.mkdir()
+        a_id = self._cli_add_state(
+            d, ns, "alpha link-seed endpoint host", "endpoint",
+            "2027-01-01T00:00:00Z")
+        b_id = self._cli_add_state(
+            d, ns, "bravo companion note zebra quixotic", "setting",
+            "2027-01-01T00:00:00Z")
+        # One directed edge A->B, relation 'related' (walked one hop by
+        # expand_recall_links; created through the links.py helper so the
+        # row shape matches production — same namespace, no self-link).
+        conn = sqlite3.connect(str(d / "store.sqlite"))
+        conn.row_factory = sqlite3.Row
+        try:
+            self.assertTrue(
+                links.add_link(conn, a_id, b_id, "related", 0.9),
+                "the A->B related edge must be newly inserted")
+            conn.commit()
+        finally:
+            conn.close()
+
+        env = self._envelope(self._run_cli(
+            d, "recall", "--query", "alpha link-seed", "--namespace", ns,
+            "--for-injection", "--json",
+            "--session-id", f"gate-link-{uuid.uuid4().hex}",
+            "--moment", "user_prompt", "--lane", "zcode", now=self.T_ZERO))
+        cand = env.get("candidate_ids") or []
+        self.assertIn(
+            a_id, cand,
+            f"the query-matched seed row A must be in candidate_ids: {cand}")
+        self.assertIn(
+            b_id, cand,
+            f"the LIVE link arrival B must stay in candidate_ids on the "
+            f"engaged lane (pre-gate arrivals are never dropped from the "
+            f"candidate set): {cand}")
+        contents = [row.get("content", "") for row in env.get("results", [])]
+        self.assertIn("alpha link-seed endpoint host", contents,
+                      f"row A must deliver: {contents}")
+        self.assertIn("bravo companion note zebra quixotic", contents,
+                      f"the live link arrival B must deliver: {contents}")
+        self.assertEqual(
+            env.get("expired", None), 0,
+            f"nothing expires at {self.T_ZERO} (both inject_untils are "
+            f"2027-01-01); expected expired==0, got "
+            f"{env.get('expired', None)!r}")
 
 
 class InjectionFilterBehaviorTests(unittest.TestCase):

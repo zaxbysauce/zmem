@@ -1940,6 +1940,16 @@ def main():
 
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    p_classify_state = _add_parser(
+        "classify-state",
+        help="propose state + expiry-class for live rows (dry-run only)")
+    p_classify_state.add_argument("--dry-run", dest="dry_run", action="store_true",
+                                  required=True,
+                                  help="classify state candidates without writing")
+    p_classify_state.add_argument("--json", dest="json", action="store_true",
+                                  default=False,
+                                  help="emit the sorted proposal as JSON")
+
     _add_parser("init", help="create the store if absent (idempotent)")
 
     p_add = _add_parser("add", help="add a memory")
@@ -3704,6 +3714,56 @@ def main():
             ap.error("--moment is required with --session-id")
         if getattr(args, "moment", None) and not getattr(args, "session_id", None):
             ap.error("--session-id is required with --moment")
+        # Issue #174: the passive lane is structurally present-time — the
+        # expiry gate keys off the live clock, so a historical as-of view of
+        # injection candidates is undefined. Refuse the pair BEFORE any
+        # store preparation (same law as the pair checks above: no
+        # connect(), no SQLite file side effect).
+        if getattr(args, "for_injection", False) and getattr(args, "as_of", None) is not None:
+            ap.error("--for-injection cannot be combined with --as-of")
+
+    # Issue #174: classify-state is a DRY-RUN read-only surface — branch
+    # BEFORE the normal writer-lease path (no connect(), no migration, no
+    # lease), open the resolved store read-only, and fail closed.
+    if args.cmd == "classify-state":
+        import storelib.state as _state_mod
+        try:
+            _cs_conn = _connect_existing_store_readonly()
+            try:
+                # PR #341 review (PRR-013): every sibling read-only
+                # early-dispatch surface certifies the store schema on the
+                # SAME handle before answering (rekey --dry-run at :3544,
+                # rescan-secrets at :3560, reembed --check). Without it this
+                # command would scan a store whose schema_version is newer
+                # than this build understands.
+                assert_store_schema_compatible(_cs_conn, STORE_PATH)
+                _result = _state_mod.classify_state_candidates(
+                    _cs_conn, dry_run=True)
+            finally:
+                _cs_conn.close()
+            if args.json:
+                # PR #341 review (PRR-010): byte-identity contract — write
+                # through sys.stdout.buffer so Windows text mode cannot turn
+                # the LF into CRLF (the rescan-secrets / embedding-health
+                # precedent). The frozen golden is byte-compared.
+                sys.stdout.buffer.write(
+                    json.dumps(_result, sort_keys=True, indent=2,
+                               ensure_ascii=False).encode("utf-8"))
+                sys.stdout.buffer.flush()
+            else:
+                for _prop in _result["proposals"]:
+                    print("{id} {current}->{proposed} class={klass} rule={rule}".format(
+                        id=_prop["id"], current=_prop["current_type"],
+                        proposed=_prop["proposed_type"],
+                        klass=_prop["proposed_expiry_class"],
+                        rule=_prop["matched_rule"]))
+                print(f"scanned={_result['scanned']}")
+                print(f"changed={_result['changed']}")
+        except Exception as _exc:  # fail closed, no partial stdout
+            print(f"[zmem] classify-state: {type(_exc).__name__}: {_exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     # `failures` is store-independent (it reads a transcript JSONL or the ZCode
     # episodic db, never the ZMem store) and must be fail-open: branch BEFORE
