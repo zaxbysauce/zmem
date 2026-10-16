@@ -64,6 +64,7 @@ tests/fixtures/state/*.jsonl text eol=lf
 # PR #341 review (PRR-023): the new byte-contract fixture is only
 # comparable byte-for-byte if its line endings are pinned.
 tests/fixtures/asof/*.jsonl text eol=lf
+tests/fixtures/entity/*.jsonl text eol=lf
 tests/fixtures/state/*.json text eol=lf
 
 # Issue #280: the fleet parity fixture family is a byte-contract input

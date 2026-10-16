@@ -51,6 +51,9 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
 PYTHON = sys.executable
 
+sys.path.insert(0, str(SCRIPTS_DIR))
+from schema_meta import SUPPORTED_SCHEMA_VERSION  # noqa: E402
+
 RECORD = os.environ.get("ZMEM_CHAR_RECORD") == "1"
 
 # Width-insensitive whitespace / time / path normalizers used by _norm and
@@ -424,8 +427,9 @@ class CharacterizationTests(unittest.TestCase):
             ver = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()[0]
-            self.assertEqual(ver, "15",
-                             "the characterization fixture must be a v15 store")
+            self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION),
+                             "the characterization fixture must sit at the "
+                             "current shipped version")
             rows = list(conn.execute("PRAGMA table_info(memory)"))
         finally:
             conn.close()

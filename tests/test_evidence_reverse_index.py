@@ -25,7 +25,9 @@ class EvidenceReverseIndexTest(unittest.TestCase):
                 version_before = conn.execute(
                     "SELECT value FROM meta WHERE key='schema_version'"
                 ).fetchone()[0]
-                self.assertEqual(version_before, "15")
+                import schema_meta
+                self.assertEqual(
+                    version_before, str(schema_meta.SUPPORTED_SCHEMA_VERSION))
 
                 conn.execute("DROP INDEX memory_evidence_evidence_memory_idx")
                 conn.commit()

@@ -752,9 +752,11 @@ class SchemaInvariantTest(unittest.TestCase):
             # mandated additive `state`/`memory_expiry` release; the invariant
             # THIS test guards is the column pin above (before == after), which
             # is untouched.
-            self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 15)
+            # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2);
+            # FORWARD deliberately stays 15 — the rebuild is not additive.
+            self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 16)
             self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
-            self.assertEqual(schema.SUPPORTED_SCHEMA_VERSION, 15)
+            self.assertEqual(schema.SUPPORTED_SCHEMA_VERSION, 16)
             self.assertEqual(schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 

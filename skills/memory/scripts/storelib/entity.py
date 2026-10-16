@@ -86,8 +86,17 @@ _BACKTICK_RE = re.compile(r"`([^`\n]+)`")
 
 # Explicit tag, in content OR tags: `entity:Name` or `entity:<kind>:Name`.
 # The lookbehind rejects suffixed identifiers (`myentity:x`) and URLs.
+#
+# The kind alternation is DERIVED from schema_meta.ENTITY_KINDS rather than
+# written out (issue #175 feedback PRR-002/SPEC-4). Hardcoding the vocabulary
+# here made this regex drift from the shared tuple the moment the v2 kinds
+# shipped: `entity:host:web01` then failed to match the optional kind group, so
+# the NAME group consumed the kind word and the match collapsed to
+# ('other', 'host') — and because entity_alias.alias_norm is globally UNIQUE,
+# every `entity:host:*` tag in the store folded into ONE wrong-kind singleton
+# with the real names discarded. One source, one regex.
 _ENTITY_TAG_RE = re.compile(
-    r"(?<![A-Za-z0-9_:])entity:(?:(person|project|tool|preference|other):)?"
+    r"(?<![A-Za-z0-9_:])entity:(?:(" + "|".join(ENTITY_KINDS) + r"):)?"
     r"([A-Za-z0-9_][A-Za-z0-9_.\-]*)",
     re.IGNORECASE,
 )
