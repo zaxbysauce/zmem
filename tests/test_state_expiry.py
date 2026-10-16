@@ -206,7 +206,7 @@ class _StoreCase(unittest.TestCase):
 class StateSchemaTest(_StoreCase):
     """AC1: fresh v15 surface, the type, and the pure TTL/validation helpers."""
 
-    def test_fresh_store_is_v15_with_memory_expiry(self):
+    def test_fresh_store_is_v16_with_memory_expiry(self):
         ver = self.conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]

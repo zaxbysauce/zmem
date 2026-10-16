@@ -3266,7 +3266,9 @@ def main():
         help="list entities (kind, canonical name, aliases, link count)")
     p_entity_list.add_argument("--kind", default=None, choices=list(ENTITY_KINDS),
                                help="filter to one entity kind "
-                                    "(person/project/tool/preference/other)")
+                                    "(person, project, tool, preference, host, "
+                                    "service, model, repo, file, command, "
+                                    "error_class, other)")
     p_entity_list.add_argument("--json", action="store_true",
                                help="emit [{id, kind, name, aliases, links}] "
                                     "(default: human list)")

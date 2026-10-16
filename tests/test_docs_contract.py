@@ -26,8 +26,12 @@ class Schema16DocsContractTest(unittest.TestCase):
         text = README.read_text(encoding="utf-8")
         self.assertIn("Schema 16", text)
         self.assertIn("UPGRADE-REQUIRED", text)
+        # Anchor to the QUOTED kind list, not a bare substring: `file`,
+        # `command`, `model`, `repo`, `service` and `tool` are ordinary
+        # English tokens that occur throughout README for unrelated reasons
+        # (PR #355 review TST-6).
         for kind in V2_KINDS:
-            self.assertIn(kind, text,
+            self.assertIn(f"`{kind}`", text,
                           f"README must name the v2 entity kind {kind!r}")
         self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA", text)
         self.assertRegex(
@@ -41,7 +45,7 @@ class Schema16DocsContractTest(unittest.TestCase):
         self.assertIn("Schema 16", text)
         self.assertIn("entity kinds v2", text)
         for kind in V2_KINDS:
-            self.assertIn(kind, text,
+            self.assertIn(f"`{kind}`", text,
                           f"SKILL.md must name the v2 entity kind {kind!r}")
         self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA=1", text)
         self.assertRegex(

@@ -619,9 +619,51 @@ class MigrationTest(V16SchemaTestMixin, _Store):
                              pre["tables"][table]["rows"])
         # Fixture identity: the regeneration matches the committed canonical
         # expected file (pre AND post).
+        # PRR-028: the artifact records its input digest; pin it too, so a
+        # hand-edited or CRLF-materialised input file cannot pass unnoticed.
+        input_file = REPO_ROOT / "tests" / "fixtures" / "entity" / "migration-input.jsonl"
+        import hashlib as _hashlib
+        self.assertEqual(
+            expected["input_sha256"],
+            _hashlib.sha256(input_file.read_bytes()).hexdigest(),
+            "migration-input.jsonl drifted from the digest recorded in "
+            "migration-expected.json")
         self.assertEqual(pre, expected["pre"])
         self.assertEqual(post, expected["post"])
         self.assertEqual(post["schema_version"], 16)
+
+        # PR #355 review PRR-007: the fixture's five legacy rows cannot prove
+        # the MIGRATED table carries the new vocabulary — on a real v15 store
+        # the legacy five-kind CHECK makes a v2-kind row unrepresentable (a
+        # v15 client stored `host:acme-prod` as ONE `other` token), so the
+        # widening is only observable AFTER the rebuild. Assert it here: a
+        # migrated table still carrying the five-kind CHECK fails this.
+        conn = sqlite3.connect(str(store))
+        conn.row_factory = sqlite3.Row
+        try:
+            for kind in V2_KIND_PAIRS:
+                conn.execute(
+                    "INSERT INTO entity (id, kind, canonical_name, created_at,"
+                    " updated_at) VALUES (?,?,?,?,?)",
+                    (f"post-migrate-{kind}", kind, kind, FIXED_TS, FIXED_TS),
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+
+        # PR #355 critic FINDING-7: a migrated store must REJECT a bogus kind
+        # too, or a CHECK-removed mutant of the recreate DDL survives.
+        conn = sqlite3.connect(str(store))
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO entity (id, kind, canonical_name, created_at,"
+                    " updated_at) VALUES (?,?,?,?,?)",
+                    ("bogus-post-migrate", "bogus_v16", "bogus",
+                     FIXED_TS, FIXED_TS),
+                )
+        finally:
+            conn.close()
 
     def test_v16_migration_is_idempotent(self):
         store, _pre = self.seed_v15()
@@ -665,6 +707,22 @@ class MigrationTest(V16SchemaTestMixin, _Store):
         os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
+        # PR #355 review PRR-015: these are process-global; restore them
+        # so a later in-process test in this process is not redirected.
+        _saved_env = {
+            k: os.environ.get(k) for k in (
+                "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_ALLOW_NEWER_SCHEMA")
+        }
+
+        def _restore_env():
+            for _k, _v in _saved_env.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+
+        self.addCleanup(_restore_env)
         from storelib import schema as schema_mod
         conn = sqlite3.connect(str(store))
         conn.row_factory = sqlite3.Row
@@ -674,8 +732,13 @@ class MigrationTest(V16SchemaTestMixin, _Store):
                     return sqlite3.SQLITE_DENY
                 return sqlite3.SQLITE_OK
             conn.set_authorizer(_deny_drop)
-            with self.assertRaises(sqlite3.DatabaseError):
+            with self.assertRaises(sqlite3.DatabaseError) as caught:
                 schema_mod.migrate(conn)
+            # TST-1: prove the authorizer fired (not some incidental error)
+            # and that the transaction actually closed.
+            self.assertIn("not authorized", str(caught.exception).lower())
+            self.assertFalse(conn.in_transaction,
+                             "the failed rebuild must leave no open transaction")
         finally:
             conn.set_authorizer(None)
             conn.close()
@@ -725,6 +788,20 @@ class MigrationTest(V16SchemaTestMixin, _Store):
         os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
+        _saved_env2 = {
+            k: os.environ.get(k) for k in (
+                "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_ALLOW_NEWER_SCHEMA")
+        }
+
+        def _restore_env2():
+            for _k, _v in _saved_env2.items():
+                if _v is None:
+                    os.environ.pop(_k, None)
+                else:
+                    os.environ[_k] = _v
+
+        self.addCleanup(_restore_env2)
         from storelib import schema as schema_mod
         conn = sqlite3.connect(str(self.store))
         conn.row_factory = sqlite3.Row
@@ -766,36 +843,52 @@ class ClassifierScopeTest(_Store):
     ENTITY_PY = "skills/memory/scripts/storelib/entity.py"
 
     def test_v16_change_does_not_modify_entity_classifier_source(self):
-        # Resolve origin/main with the PR-checkout-hardened sequence from the
-        # PR #308 diff-scope tests: verify the ref (fetch when absent), then
-        # a bounded deepen-retry around merge-base for shallow checkouts.
-        def git(*args, check=True):
-            r = subprocess.run(["git", *args], capture_output=True, text=True,
-                               cwd=str(REPO_ROOT), timeout=120)
-            if check and r.returncode != 0:
-                raise AssertionError(f"git {' '.join(args)}: {r.stderr}")
-            return r
+        """PR #355 feedback PRR-002: the scope ratchet is narrowed from
+        "entity.py is byte-unchanged" to "the CLASSIFIER is unchanged".
 
-        ref = git("rev-parse", "--verify", "--quiet",
-                  "refs/remotes/origin/main", check=False)
-        if ref.returncode != 0:
-            git("fetch", "--no-tags", "origin",
-                "+refs/heads/main:refs/remotes/origin/main")
-        base = None
-        for _ in range(8):
-            r = git("merge-base", "HEAD", "origin/main", check=False)
-            if r.returncode == 0:
-                base = r.stdout.strip()
-                break
-            git("fetch", "--no-tags", "--deepen", "250", "origin", check=False)
-        self.assertIsNotNone(
-            base, "merge-base with origin/main unreachable after deepening")
-        changed = git("diff", "--name-only", base, "HEAD",
-                      "--", self.ENTITY_PY).stdout
-        self.assertEqual(
-            changed.strip(), "",
-            f"{self.ENTITY_PY} must not be modified by the schema-16 PR "
-            "(classifier changes belong to #176)")
+        The v2 vocabulary shipped with `_ENTITY_TAG_RE` still hardcoding the
+        five-kind alternation, so `entity:host:web01` misparsed to
+        ('other', 'host') and — because entity_alias.alias_norm is globally
+        UNIQUE — every `entity:host:*` tag collapsed into ONE wrong-kind
+        singleton with the real names discarded. Deriving that alternation from
+        schema_meta.ENTITY_KINDS is a vocabulary-admission fix forced by THIS
+        PR, not a classification-policy change; #176 still owns the policy.
+
+        So this ratchet pins the classifier's decision order and kind-conflict
+        policy (which #176 will change) instead of the file's bytes.
+        """
+        import storelib.entity as entity_mod
+
+        # The extraction ORDER and the first-seen-kind-wins conflict policy
+        # are #176's to change; they must be identical here.
+        src = Path(entity_mod.__file__).read_text(encoding="utf-8")
+        for anchor in (
+            "def extract_entities(",
+            "# 1) Explicit entity: tags",
+            "# 2) project:<suffix> namespace.",
+            "# 3) Remaining tag tokens",
+            "# 4) Backtick-quoted spans in content",
+            "# 5) CamelCase identifiers",
+            "# Dedup by alias_norm, first-seen order",
+            "FIRST-SEEN KIND WINS",
+        ):
+            self.assertIn(anchor, src,
+                          f"classifier structure changed in entity.py: {anchor!r}")
+
+        # The tag grammar must be DERIVED from the shared vocabulary, never a
+        # hand-written copy (this is the defect the feedback round fixed).
+        self.assertIn('"|".join(ENTITY_KINDS)', src,
+                      "the entity: tag regex must derive its kind alternation "
+                      "from schema_meta.ENTITY_KINDS")
+        pairs = entity_mod.extract_entities("", "entity:host:web01", "")
+        self.assertEqual(pairs, [("host", "web01")],
+                         "every v2 kind must round-trip through the "
+                         "entity:<kind>:<name> grammar")
+        for kind in V2_KIND_PAIRS:
+            self.assertEqual(
+                entity_mod.extract_entities("", f"entity:{kind}:name1", ""),
+                [(kind, "name1")],
+                f"{kind!r} must survive the entity:<kind>:<name> grammar")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

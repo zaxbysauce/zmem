@@ -33,6 +33,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **#172 taxonomy decision recorded:** `entity_card` is rejected — the
   memory type does not exist and `ALLOWED_TYPES` is unchanged by this
   release (`state`, resolved by #173, remains).
+- **Entity identity re-keying after upgrade (read before upgrading):** a
+  store written before v16 stored a tag like `host:acme-prod` as a single
+  `other`-kind entity whose alias is the WHOLE token, because `host` was not
+  yet a known kind. v16 preserves those rows verbatim, but the next time such
+  a memory is re-linked (a dedup tag-union merge, a namespace re-key, or an
+  organize/consolidate pass) the tag is re-read under the new vocabulary and
+  the alias becomes just `acme-prod`. That is the correct classification, and
+  the pre-upgrade `other`-kind entity is then left with no links. The memory
+  itself is never lost and content/FTS recall is unaffected — only the
+  entity-lane grouping changes. This is inherent to widening a kind vocabulary
+  (issue #176's classifiers will narrow the same behaviour further); it is
+  disclosed here so operators who query the entity lane after upgrading are
+  not surprised by the split.
+
 - **Fixtures and tests:** deterministic migration fixture trio
   (`migration-input.jsonl`, `generate_migration_expected.py`,
   `migration-expected.json`) with uuid5-canonicalized entity ids; the ten

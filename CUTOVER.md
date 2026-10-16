@@ -75,6 +75,14 @@ against an un-migrated store until they pull this version; a pre-v13 client
 that opens an already-migrated v13 store refuses it (the standard
 newer-schema guard), so do not roll back after the first v13 write.
 
+**Schema 16 (issue #175) is the first UPGRADE-REQUIRED bump.** The entity
+kind vocabulary widened, so `entity` was rebuilt with a new SQL CHECK. A
+constraint change is not additive, so `FORWARD_COMPAT_SCHEMA_VERSION` stays
+at 15 and every client older than the v16 release **refuses** a migrated v16
+store. Update every client that shares a store BEFORE the first v16 client
+opens it; `ZMEM_ALLOW_NEWER_SCHEMA=1` proceeds at the operator's own risk and
+never migrates or downgrades the store.
+
 ## 3. Disable native memory explicitly
 
 zmem should not auto-edit host config. Disable native memory yourself before

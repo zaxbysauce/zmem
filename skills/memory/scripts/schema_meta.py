@@ -105,7 +105,7 @@ def normalize_content(s: str) -> str:
 # table outside that transaction (see storelib/schema.py `_migrate_v15`).
 # v16 (issue #175): entity kinds v2 — the `entity` table's CHECK widens from
 # five to the twelve v2 kinds via a constrained-table rebuild (entity_v16
-# copy/drop/rename in `_migrate_v16`). NOT additive: a changed SQL constraint
+# copy/drop/recreate in `_migrate_v16`). NOT additive: a changed SQL constraint
 # is not covered by the forward-compat window, so FORWARD stays at 15 and a
 # v15 client refuses a v16 store until it upgrades (ZMEM_ALLOW_NEWER_SCHEMA=1
 # is the operator override).

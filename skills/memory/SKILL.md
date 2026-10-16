@@ -2904,7 +2904,7 @@ over live, undeclared, or outcome-selected inputs are not baselines.
 
 ### entity-list — inspect entity identity (v10, issue #60)
 ```
-<interpreter> <store.py> entity-list [--kind person|project|tool|preference|other] [--json]
+<interpreter> <store.py> entity-list [--kind person|project|tool|preference|host|service|model|repo|file|command|error_class|other] [--json]
 ```
 Lists the entities the deterministic extractor minted: id, kind, canonical
 name, all normalized aliases, and how many memories link to each. `--kind`
