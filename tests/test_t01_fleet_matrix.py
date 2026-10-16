@@ -185,6 +185,17 @@ def test_matrix_pins_supported_versions():
             f"expected the issue-#280 pinned floor {pinned!r}"
         )
 
+    # FLEET.md's opencode sentence is normative: no adapter ships (#66), so
+    # EVERY opencode row stays capability_gap until that lands — including
+    # the explicit-tool rows whose hook_event is None.
+    for i, row in enumerate(rows):
+        if row.get("harness") == "opencode":
+            assert row.get("status") == "capability_gap", (
+                f"row {i} (opencode/{row.get('moment')}) claims "
+                f"{row.get('status')!r}; OpenCode ships no adapter (issue "
+                f"#66) so every row must stay capability_gap"
+            )
+
     for harness in SUPPORTED_HARNESSES:
         for event in sorted(union_events):
             rows_for_pair = pair_rows.get((harness, event))
