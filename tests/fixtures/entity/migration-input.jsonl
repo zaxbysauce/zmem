@@ -1,0 +1,5 @@
+{"content":"person Alice","id":"00000000-0000-4000-8000-000000000001","ingestion_ts":"2026-09-10T00:00:00Z","namespace":"fixture:entity-175","tags":"person:Alice","type":"fact"}
+{"content":"project Acme","id":"00000000-0000-4000-8000-000000000002","ingestion_ts":"2026-09-10T00:00:00Z","namespace":"fixture:entity-175","tags":"project:Acme","type":"fact"}
+{"content":"tool ripgrep","id":"00000000-0000-4000-8000-000000000003","ingestion_ts":"2026-09-10T00:00:00Z","namespace":"fixture:entity-175","tags":"tool:ripgrep","type":"fact"}
+{"content":"preference concise","id":"00000000-0000-4000-8000-000000000004","ingestion_ts":"2026-09-10T00:00:00Z","namespace":"fixture:entity-175","tags":"preference:concise","type":"fact"}
+{"content":"other fallback","id":"00000000-0000-4000-8000-000000000005","ingestion_ts":"2026-09-10T00:00:00Z","namespace":"fixture:entity-175","tags":"other:fallback","type":"fact"}

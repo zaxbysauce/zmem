@@ -226,6 +226,51 @@ def _sync_row(**overrides) -> dict:
 # round trip + id-idempotency
 # ---------------------------------------------------------------------------
 class RoundTripTest(_TwoStoreCase):
+    def test_v16_derived_entities_rebuild_from_memory_fixture(self):
+        """Issue #175 AC6: derived entities rebuild from the committed
+        migration-input fixture on a second store, and a v2-kind tag survives
+        the round trip. Memory JSONL stays the source of truth — entities are
+        store-local derived data, never carried in the file."""
+        fixture = REPO_ROOT / "tests" / "fixtures" / "entity" / "migration-input.jsonl"
+        # One extra v2-kind row rides along to prove the expanded vocabulary
+        # round-trips (the fixture itself predates the v2 kinds by design).
+        rows = [json.loads(line) for line in
+                fixture.read_text(encoding="utf-8").splitlines()]
+        rows.append(_sync_row(
+            id="00000000-0000-4000-8000-0000000002ff",
+            content="backup host for the fixture round trip",
+            tags="host:backup-host"))
+        src = self._write_jsonl(self.a, "fixture-input.jsonl", rows)
+        r = self.a.run("ingest-jsonl", "--in", src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"],
+                         len(rows), r.stderr)
+
+        export_a = os.path.join(self.a.tmp, "export_a.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        exported = self._read_jsonl(export_a)
+        self.assertEqual(len(exported), len(rows))
+        for row in exported:
+            self.assertNotIn("entities", row)
+
+        r = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], len(rows))
+
+        # Exact comparison: full (kind, canonical_name) sets must agree.
+        def kinds_names(store):
+            return sorted(
+                (row[0], row[1]) for row in store.query_all(
+                    "SELECT kind, canonical_name FROM entity"))
+        self.assertEqual(kinds_names(self.a), kinds_names(self.b),
+                         "two stores must derive the same entity set from the "
+                         "same memory fixture")
+        host = self.b.query_one(
+            "SELECT e.canonical_name FROM entity e WHERE e.kind='host'")
+        self.assertIsNotNone(host, "the v2-kind tag must survive the trip")
+        self.assertEqual(host[0], "backup-host")
+
     def test_export_ingest_reexport_identical_live_set(self):
         self.a.add(NS, "always run pytest --tb=short before committing", confidence=0.9)
         self.a.add(NS, "prefer small, reviewable commits", signal="user", confidence=0.6)
@@ -1130,6 +1175,54 @@ class IngestValidationTest(_TwoStoreCase):
     """ingest-jsonl writes straight into the table, bypassing add_memory() and
     argparse. Every one of these is a field a sync file could set to something
     the local writers can never produce."""
+
+    def test_v16_entity_kind_enum_is_used(self):
+        """Issue #175 AC6: the shared 12-kind ENTITY_KINDS vocabulary is what
+        ingest consumes — a NEW v2 kind tag (host) derives a real entity link,
+        and a row typed `entity_card` (the #172 decision REJECTED that type, so
+        ALLOWED_TYPES keeps it absent) fails validation line-numbered on the
+        default legacy ingest surface before its row commits, while the valid
+        rows land. No entity-record format exists in the JSONL."""
+        rows = [
+            _sync_row(id="00000000-0000-4000-8000-000000000201",
+                      content="acme-prod is the deployment host",
+                      tags="host:acme-prod"),
+            dict(_sync_row(id="00000000-0000-4000-8000-000000000202",
+                           content="an entity_card row must be refused"),
+                 type="entity_card"),
+        ]
+        path = self._write_jsonl(self.b, "v16-kinds.jsonl", rows)
+
+        r = self.b.run("ingest-jsonl", "--in", path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1,
+                         "the valid v2-kind row must land")
+        self.assertEqual(counts["malformed"], 1,
+                         "the entity_card row must be counted malformed")
+        self.assertIn("malformed line 2", r.stderr,
+                      "the rejection must be line-numbered")
+        # The offending row never committed; the valid row did.
+        self.assertIsNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?",
+            ("00000000-0000-4000-8000-000000000202",)))
+        self.assertIsNotNone(self.b.query_one(
+            "SELECT id FROM memory WHERE id=?",
+            ("00000000-0000-4000-8000-000000000201",)))
+        # The expanded enum IS used by the derived path: a host-kind entity
+        # exists and is linked to the ingested row.
+        linked = self.b.query_all(
+            "SELECT e.kind FROM entity e JOIN memory_entity me "
+            "ON me.entity_id = e.id WHERE me.memory_id=?",
+            ("00000000-0000-4000-8000-000000000201",))
+        self.assertTrue(linked, "the v2-kind tag must derive an entity link")
+        kinds = {row[0] for row in linked}
+        self.assertIn("host", kinds,
+                      f"expected a host-kind entity, got {kinds!r}")
+        # And the JSONL itself carries no entity fields (the v10 decision).
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                self.assertNotIn("entities", line)
 
     def test_string_and_nan_confidence_fall_back_and_recall_and_pack_survive(self):
         """THE regression for HIGH-1/HIGH-2.

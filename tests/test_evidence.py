@@ -581,7 +581,8 @@ class EvidenceSchemaTest(_StoreCase):
         version = self.conn.execute(
             "SELECT value FROM meta WHERE key=?", ("schema_version",)
         ).fetchone()[0]
-        self.assertEqual(version, "15")
+        import schema_meta
+        self.assertEqual(version, str(schema_meta.SUPPORTED_SCHEMA_VERSION))
         self.assertEqual(
             {r[0] for r in self.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -601,11 +602,13 @@ class EvidenceSchemaTest(_StoreCase):
             )},
         )
         schema.migrate(legacy)
+        # The migration walk ends at the CURRENT shipped version (v16 since
+        # the entity-kinds rebuild, issue #175).
         self.assertEqual(
             legacy.execute(
                 "SELECT value FROM meta WHERE key=?", ("schema_version",)
             ).fetchone()[0],
-            "15",
+            str(schema_meta.SUPPORTED_SCHEMA_VERSION),
         )
         legacy.close()
 

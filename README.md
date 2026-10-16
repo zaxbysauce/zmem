@@ -1311,6 +1311,25 @@ writer lease is acquired.
 
 The full command reference is in the `memory` skill (type `/memory` in ZCode).
 
+### Schema 16 — entity kinds v2 (issue #175, UPGRADE-REQUIRED)
+
+Schema 16 expands the entity `kind` vocabulary to exactly twelve kinds —
+`person`, `project`, `tool`, `preference`, `host`, `service`, `model`,
+`repo`, `file`, `command`, `error_class`, `other` — enforced by the `entity`
+table's SQL CHECK. Migrating a v15 store to v16 REBUILDS that table (the
+CHECK cannot be altered in place) in one atomic transaction; every entity,
+alias, and memory link row is preserved, verified against the committed
+canonical fixture (`tests/fixtures/entity/migration-expected.json`).
+
+This schema change is UPGRADE-REQUIRED, not additive: `SUPPORTED_SCHEMA_VERSION`
+becomes 16 while `FORWARD_COMPAT_SCHEMA_VERSION` stays 15, so every client
+older than the schema-16 release refuses a migrated store with an actionable
+message. Upgrade every zmem installation that shares the store (plugin
+marketplace update), or set `ZMEM_ALLOW_NEWER_SCHEMA=1` to proceed at the
+operator's own risk — the override never downgrades or migrates the store.
+The #172 taxonomy decision for the proposed `entity_card` memory type is
+reject: it is not part of this release and `ALLOWED_TYPES` is unchanged.
+
 ## Bootstrap / cold start
 
 zmem installs empty and learns going forward (live capture, issue #47). If you

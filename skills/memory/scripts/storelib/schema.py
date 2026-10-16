@@ -1028,7 +1028,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS entity (
             id             TEXT PRIMARY KEY,
             kind           TEXT NOT NULL
-                CHECK (kind IN ('person','project','tool','preference','other')),
+                CHECK (kind IN ('person','project','tool','preference','host','service',
+                                'model','repo','file','command','error_class','other')),
             canonical_name TEXT NOT NULL,
             created_at     TEXT NOT NULL,
             updated_at     TEXT NOT NULL
@@ -1422,6 +1423,160 @@ def _migrate_v15(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
         conn.execute(
             "UPDATE meta SET value='15' WHERE key=?",
+            (SCHEMA_VERSION_KEY,),
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
+# The v16 rebuilt `entity` shape (issue #175): the twelve-value v2 kind CHECK
+# over the same five columns. Used by init_db's fresh DDL (inline literal) and
+# by _migrate_v16's recreate step so both sites carry the identical CHECK.
+_ENTITY_V16_DDL_RECREATED = """
+    CREATE TABLE entity (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN (
+        'person','project','tool','preference','host','service',
+        'model','repo','file','command','error_class','other'
+      )),
+      canonical_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    """
+
+
+def _fk_violation_keys(conn: sqlite3.Connection) -> set:
+    """Set of (table, rowid, parent, fkid) tuples from PRAGMA foreign_key_check.
+
+    Used to tell a violation the v16 rebuild CAUSED from one that was already
+    in the store (issue #175 feedback MIG-1/PRR-004). The pragma reports
+    violations regardless of `PRAGMA foreign_keys` (it inspects declared
+    constraints directly), so it is a sound baseline even though no zmem code
+    enables FK enforcement at runtime.
+    """
+    return {tuple(row) for row in conn.execute("PRAGMA foreign_key_check")}
+
+
+def _migrate_v16(conn: sqlite3.Connection) -> None:
+    """Rebuild `entity` with the twelve-value v2 kind CHECK (issue #175).
+
+    Unlike v14/v15 this bump is NOT additive: the `entity` table's CHECK
+    constraint changes, so the table is rebuilt — create `entity_v16` with the
+    v2 vocabulary, copy every row, drop the old table, RECREATE `entity` with
+    the new CHECK, copy the rows back, and re-ensure the two dependent-table
+    indexes. (Recreate, not `ALTER TABLE ... RENAME`: RENAME re-parses every
+    trigger and view in the schema and aborts on any column-inconsistent one
+    elsewhere in the store. PR #355 feedback, executed on a hand-planted v11
+    fixture.) Dependent rows in `entity_alias` and `memory_entity` are never
+    touched: their entity_id values are preserved verbatim by the copy.
+
+    One BEGIN IMMEDIATE transaction (or a savepoint when a caller transaction
+    is open — the house `_ensure_*` pattern) owns the whole sequence. Any DDL,
+    copy, check, or commit failure rolls back and leaves schema version 15,
+    the original table, and every row unchanged.
+
+    PRAGMA foreign_key_check is run BEFORE the rebuild to take a baseline and
+    again after it; only violations the rebuild itself introduced block the
+    version bump, and the error names the offending table. Failing on any
+    violation at all (the first cut of this migration) meant a store that
+    already carried an unrelated dangling reference — routine after an
+    evidence retention sweep outlives a `training_capture_completion` row —
+    could never migrate, and every writable command failed forever with an
+    error that blamed the entity rebuild. Issue #175 feedback MIG-1/PRR-004.
+
+    No count or hash bookkeeping runs here — the preservation proof lives in
+    tests/test_entity.py against the committed fixture.
+    """
+    savepoint = "zmem_v16_entity_kinds"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        # A legacy `entity` carrying columns this migration does not copy
+        # would be silently truncated by the fixed column list below. Fail
+        # loudly instead (PR #355 review PRR-032).
+        legacy_cols = {str(r[1]) for r in conn.execute(
+            "PRAGMA table_info(entity)"
+        ).fetchall()}
+        expected_cols = {
+            "id", "kind", "canonical_name", "created_at", "updated_at",
+        }
+        if legacy_cols - expected_cols:
+            raise RuntimeError(
+                "zmem: entity table carries unexpected column(s) "
+                f"{sorted(legacy_cols - expected_cols)}; refusing the v16 "
+                "rebuild rather than dropping data"
+            )
+        # Baseline: violations already present are NOT this migration's doing
+        # and must not brick the upgrade (see the docstring).
+        fk_before = _fk_violation_keys(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_v16 (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL CHECK (kind IN (
+                'person','project','tool','preference','host','service',
+                'model','repo','file','command','error_class','other'
+              )),
+              canonical_name TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO entity_v16 (id, kind, canonical_name, created_at, "
+            "updated_at) SELECT id, kind, canonical_name, created_at, "
+            "updated_at FROM entity"
+        )
+        conn.execute("DROP TABLE entity")
+        # Recreate-then-copy-back instead of ALTER TABLE RENAME: RENAME
+        # re-parses EVERY trigger/view in the schema and raises on any
+        # column-inconsistent trigger elsewhere in the store (observed on a
+        # hand-planted v11 CI fixture whose memory_ai references new.tags on
+        # a tags-less memory table — an unrelated trigger killing an
+        # unrelated rebuild). CREATE TABLE re-parses nothing; the end state
+        # carries the same rows and the same CHECK constraint the rename
+        # would have produced.
+        conn.execute(_ENTITY_V16_DDL_RECREATED)
+        conn.execute(
+            "INSERT INTO entity (id, kind, canonical_name, created_at, "
+            "updated_at) SELECT id, kind, canonical_name, created_at, "
+            "updated_at FROM entity_v16"
+        )
+        conn.execute("DROP TABLE entity_v16")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entity_alias_entity "
+            "ON entity_alias(entity_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_entity_entity "
+            "ON memory_entity(entity_id)"
+        )
+        new_violations = _fk_violation_keys(conn) - fk_before
+        if new_violations:
+            named = sorted({str(v[0]) for v in new_violations})
+            raise RuntimeError(
+                f"zmem: v16 entity rebuild introduced {len(new_violations)} "
+                f"foreign-key violation(s) in table(s) {', '.join(named)}; "
+                "refusing to advance schema_version to 16"
+            )
+        conn.execute(
+            "UPDATE meta SET value='16' WHERE key=?",
             (SCHEMA_VERSION_KEY,),
         )
         if own_transaction:
@@ -1875,6 +2030,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     # Single source of refusal messaging: _schema_compat raises the
     # actionable RuntimeError (update hint / env override) on refuse.
     _schema_compat(ver, "store")
+    if ver > SUPPORTED_SCHEMA_VERSION:
+        # A store above this client's SUPPORTED version is NEVER this client's
+        # to migrate, even when _schema_compat admitted it (forward-compat
+        # window, or ZMEM_ALLOW_NEWER_SCHEMA=1): "proceed" means read/write on
+        # the additive parts, not advance the store to a version whose
+        # semantics the client does not carry (issue #175 makes this load-
+        # bearing — the v16 entity rebuild is a constraint change, and the
+        # simulated-older-client compat tests pin that the marker does not
+        # move under an older-lineage client).
+        return
 
     if ver < 2:
         # v2: ranking-support indexes + FTS trigger fix (stop write amplification).
@@ -2112,7 +2277,8 @@ def migrate(conn: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS entity (
                 id             TEXT PRIMARY KEY,
                 kind           TEXT NOT NULL
-                    CHECK (kind IN ('person','project','tool','preference','other')),
+                    CHECK (kind IN ('person','project','tool','preference','host','service',
+                                    'model','repo','file','command','error_class','other')),
                 canonical_name TEXT NOT NULL,
                 created_at     TEXT NOT NULL,
                 updated_at     TEXT NOT NULL
@@ -2251,6 +2417,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         # failed migration rolls back the table set, index set, and version
         # marker together (AC6).
         _migrate_v15(conn)
+
+    if ver < 16:
+        # v16 (issue #175): entity kinds v2 — a CONSTRAINED-TABLE rebuild, not
+        # an additive bump. The v15 forward-compat window deliberately does not
+        # cover it (a changed CHECK is not valid on an older client's SQL), so
+        # v15 clients refuse a v16 store and this branch is the only path to 16.
+        _migrate_v16(conn)
 
     # Version-independent evidence-first lookup index: this repairs existing
     # v14 stores without a version bump and is idempotent on every open.

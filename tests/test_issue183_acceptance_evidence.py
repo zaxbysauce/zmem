@@ -88,7 +88,9 @@ class Issue183AcceptanceEvidenceTest(unittest.TestCase):
                     )
                 }
             conn.close()
-            self.assertEqual(version, "15")
+            sys.path.insert(0, str(ROOT / "skills" / "memory" / "scripts"))
+            import schema_meta
+            self.assertEqual(version, str(schema_meta.SUPPORTED_SCHEMA_VERSION))
             self.assertTrue(
                 {"evidence", "episode_evidence", "memory_evidence"}.issubset(tables)
             )

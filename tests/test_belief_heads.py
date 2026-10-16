@@ -615,10 +615,12 @@ class BeliefHeadTest(unittest.TestCase):
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
         self.assertEqual(version_after, version_poisoned)
-        # v15 (#173): a fresh store now migrates to 15; the load-bearing
-        # assertion is the version-unchanged pair above — this literal only
-        # pins "the fixture store sits at the current latest version".
-        self.assertEqual(version_after, "15")
+        # v15 (#173): a fresh store now migrates to the current version;
+        # the load-bearing assertion is the version-unchanged pair above —
+        # this pin only asserts "the fixture store sits at the current latest
+        # version" (dynamic since the v16 bump, issue #175).
+        import schema_meta as _schema_meta
+        self.assertEqual(version_after, str(_schema_meta.SUPPORTED_SCHEMA_VERSION))
         names = {r[1] for r in after}
         self.assertNotIn("belief_head_source", names,
                          "partial belief DDL survived a failed migration")
