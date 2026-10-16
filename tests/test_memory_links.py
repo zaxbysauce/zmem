@@ -687,9 +687,13 @@ class RecallExpansionTest(_Store):
             hashlib.sha256(recall_first_raw).hexdigest(),
             "b553698456c5a29e47bda99de0e1d739b1d86a219e0a3529a1be6cad9bda17f9",
         )
+        # Issue #176: the explain envelope gained entity_kind_weights (the
+        # effective per-kind entity-lane RRF weights), so the byte golden
+        # moved from c2d71075... to the value below. The hash is stable only
+        # under DEFAULT weights — ZMEM_ENTITY_KIND_WEIGHTS changes it.
         self.assertEqual(
             hashlib.sha256(explain_first_raw).hexdigest(),
-            "c2d7107515fd7c6df1367fc92d45357486c2d4dbc3eb4cf7f3e8d5d03b7e5ab4",
+            "59e311d25224593037bb2f56ba5b71fa44d979afedbca0c68862835fd2f3cbaf",
         )
         self.assertEqual(self._expansion_ids(recall_first), expected["present"])
         self.assertEqual(self._expansion_ids(recall_second), expected["present"])

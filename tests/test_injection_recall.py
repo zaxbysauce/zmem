@@ -711,5 +711,176 @@ class Issue82PatternTests(unittest.TestCase):
 
 
 
+class EntityWeightTest(unittest.TestCase):
+    """Issue #176: ZMEM_ENTITY_KIND_WEIGHTS parsing and entity-lane-only
+    RRF weighting. Parser and _rrf_fuse are probed in-process; the recall
+    wiring backstop drives the real CLI in a subprocess."""
+
+    def setUp(self):
+        self._saved = os.environ.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._saved is None:
+            os.environ.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
+        else:
+            os.environ["ZMEM_ENTITY_KIND_WEIGHTS"] = self._saved
+
+    def _parse(self, env_value=None):
+        import contextlib
+        import io
+        from storelib.entity import parse_entity_kind_weights
+        if env_value is None:
+            os.environ.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
+        else:
+            os.environ["ZMEM_ENTITY_KIND_WEIGHTS"] = env_value
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            weights = parse_entity_kind_weights()
+        return weights, err.getvalue()
+
+    def test_default_weights_are_one_except_other_point_six(self):
+        from schema_meta import ENTITY_KINDS
+        weights, err = self._parse()
+        self.assertEqual(weights,
+                         {k: (0.6 if k == "other" else 1.0) for k in ENTITY_KINDS})
+        self.assertEqual(err.strip(), "",
+                         "a missing variable must not warn")
+
+    def test_valid_json_overrides_known_kinds(self):
+        weights, err = self._parse(json.dumps({"host": 2.5, "other": 0.1}))
+        self.assertEqual(weights["host"], 2.5)
+        self.assertEqual(weights["other"], 0.1)
+        self.assertEqual(weights["service"], 1.0)
+        self.assertEqual(err.strip(), "")
+
+    def test_malformed_unknown_and_nonpositive_weights_fall_back_and_warn(self):
+        from schema_meta import ENTITY_KINDS
+        defaults = {k: (0.6 if k == "other" else 1.0) for k in ENTITY_KINDS}
+        invalid = [
+            "{",                          # not JSON
+            "[1, 2]",                     # not an object
+            json.dumps({"bogus": 1.0}),   # unknown key
+            json.dumps({"host": "fast"}),  # nonnumeric
+            '{"host": NaN}',              # NaN literal (json.loads accepts)
+            '{"host": Infinity}',         # infinity literal
+            json.dumps({"host": 0}),      # zero
+            json.dumps({"host": -1.5}),   # negative
+        ]
+        for value in invalid:
+            weights, err = self._parse(value)
+            self.assertEqual(weights, defaults,
+                             f"invalid {value!r} must return the COMPLETE defaults")
+            lines = [ln for ln in err.splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 1,
+                             f"invalid {value!r} must warn exactly once, "
+                             f"got: {err!r}")
+
+    def test_rrf_entity_weight_changes_only_entity_lane(self):
+        from storelib.recall import _rrf_fuse
+        base = _rrf_fuse(["A", "B"], [], ["C"], graph_ids=["G"])
+        for w in (None, {}, {"A": 1.0, "C": 1.0, "G": 1.0}):
+            self.assertEqual(
+                _rrf_fuse(["A", "B"], [], ["C"], graph_ids=["G"],
+                          entity_weight_by_memory=w), base)
+        # The knob bites through the entity lane alone (tie -> promote).
+        self.assertEqual(_rrf_fuse(["A"], [], ["B"]), ["A", "B"])
+        self.assertEqual(
+            _rrf_fuse(["A"], [], ["B"], entity_weight_by_memory={"B": 2.0}),
+            ["B", "A"])
+        # bm25-only ids are immune to a weight keyed on them.
+        self.assertEqual(
+            _rrf_fuse(["C"], [], ["D"],
+                      entity_weight_by_memory={"C": 0.01}), ["C", "D"])
+        # graph-only ids are immune: G must stay ahead of A2 (bm25 rank 2).
+        self.assertEqual(
+            _rrf_fuse(["A", "A2"], [], [], graph_ids=["G"],
+                      entity_weight_by_memory={"G": 0.01}),
+            ["A", "G", "A2"])
+
+    def test_weighted_entity_lane_changes_recall_order_end_to_end(self):
+        """Load-bearing wiring backstop (issue #176 plan unit 7): the weight
+        map is built in the recall entity path and passed at the production
+        _rrf_fuse call site inside _recall_one_tier. A is the weaker lexical
+        row (diluted tag text, fts rank 2) whose `entity:zzzalpha` tag gives
+        it an OTHER-matched entity-lane arrival; B is the stronger lexical
+        row (triple occurrence, fts rank 1) with no matched alias. At the
+        default other=0.6 A's fts+entity slices fuse it ABOVE B; damping
+        `other` to 0.001 drops A's entity slice below B's lexical rank and
+        flips the two fused positions. The observable is the row's fused
+        position (_lanes["rrf_rank"] under collect_lanes) — exactly what the
+        weights scale; the rendered row order is composite-scored downstream
+        of fusion and is deliberately not the assertion target."""
+        with tempfile.TemporaryDirectory(prefix="zmem-ew-") as tmp:
+            store = Path(tmp) / "store.sqlite"
+            env = dict(os.environ)
+            env.update({
+                "ZMEM_STORE": str(store),
+                "ZMEM_MODELS_DIR": str(Path(tmp) / "no-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_EMBED_PROFILE": "fake",
+            })
+            env.pop("ZMEM_DATA", None)
+            env.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
+            for content, tags in (
+                ("completely unrelated prose about pottery and glaze",
+                 "entity:zzzalpha filler tokens lower the tag field term density"),
+                ("zzzalpha zzzalpha zzzalpha the keyword appears repeatedly here", ""),
+            ):
+                r = subprocess.run(
+                    [sys.executable, str(SCRIPTS_DIR / "store.py"), "add",
+                     "--namespace", "project:ew", "--type", "lesson",
+                     "--content", content, "--tags", tags, "--signal", "user"],
+                    env=env, capture_output=True, text=True, timeout=120)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+            # In-process tier drive on a DIRECT connection (the storelib
+            # import must never resolve the ambient store; env is pinned and
+            # any prior in-process storelib import is purged first).
+            os.environ["ZMEM_STORE"] = str(store)
+            os.environ["ZMEM_MODELS_DIR"] = str(Path(tmp) / "no-models")
+            os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+            self.addCleanup(os.environ.pop, "ZMEM_ENTITY_KIND_WEIGHTS", None)
+            for mod in [m for m in list(sys.modules)
+                        if m == "storelib" or m.startswith("storelib.")]:
+                del sys.modules[mod]
+            from storelib.recall import _recall_one_tier
+
+            conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                ids = {r["content"][:20]: r["id"] for r in conn.execute(
+                    "SELECT id, content FROM memory WHERE namespace='project:ew'")}
+                entity_row = (
+                    "completely unrelated prose about pottery and glaze"[:20])
+                fts_row = (
+                    "zzzalpha zzzalpha zzzalpha the keyword appears "
+                    "repeatedly here"[:20])
+
+                def _rrf_rank(weight_env):
+                    if weight_env is None:
+                        os.environ.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
+                    else:
+                        os.environ["ZMEM_ENTITY_KIND_WEIGHTS"] = weight_env
+                    scored = _recall_one_tier(
+                        conn, query="zzzalpha", ns_list=["project:ew"], limit=5,
+                        min_confidence=None, hybrid=False, now_epoch=0,
+                        collect_lanes=True,
+                    )
+                    lanes = {row["id"]: row["_lanes"] for _s, row in scored}
+                    return (lanes[ids[entity_row]]["rrf_rank"],
+                            lanes[ids[fts_row]]["rrf_rank"])
+
+                self.assertEqual(_rrf_rank(None), (1, 2),
+                                 "default weights: the 0.6-weighted entity "
+                                 "slice must fuse A above the fts-only row")
+                self.assertEqual(_rrf_rank(json.dumps({"other": 0.001})), (2, 1),
+                                 "an other-weight override must reach the "
+                                 "production _rrf_fuse call site and flip "
+                                 "ranks")
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

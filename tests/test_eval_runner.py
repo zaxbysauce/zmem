@@ -205,6 +205,18 @@ class TestRunnerEndToEnd(EvalRunnerTestBase):
         self.assertEqual(self.report["metrics"]["as_of_items"], 6)
         self.assertEqual(self.report["metrics"]["injection_items"], 5)
 
+    def test_entity_bucket_per_item_hits_unchanged(self):
+        """Issue #176 (AC7 per-item pin): default entity-kind weights
+        (other=0.6) must not change any single item's outcome of the pinned
+        gold run — the per-item companion of the 46/48 MRR pin, so a weight
+        change that unhits one item cannot hide inside the aggregate."""
+        per_item = self.report["per_item"]
+        self.assertTrue(per_item)
+        misses = [it["id"] for it in per_item if not it.get("hit")]
+        self.assertEqual(misses, [],
+                         "default entity-kind weights must not unhit any "
+                         "gold item")
+
     def test_runs_are_byte_stable(self):
         r = subprocess.run(
             [PYTHON, str(RUNNER), "--store", self.store],
@@ -461,6 +473,32 @@ class TestAdapters(unittest.TestCase):
         garbage.write_text("{not json at all", encoding="utf-8")
         r, _out = self._convert("longmemeval", str(garbage), "nope.jsonl")
         self.assertEqual(r.returncode, 2)
+
+
+class EvalReplayTest(unittest.TestCase):
+    """Issue #176 (AC7): the #155 replay oracle must stay byte-identical
+    under the entity-classifier and entity-lane-weight change. The exact
+    fixture invocation (with the evaluator's REQUIRED --days and --json-out;
+    without --json-out the evaluator emits no report bytes to stdout)."""
+
+    def test_replay_matches_committed_expected(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-replay-") as tmp:
+            out = Path(tmp) / "replay-actual.json"
+            r = subprocess.run(
+                [PYTHON, str(REPO_ROOT / "scripts" / "eval_replay.py"),
+                 "--store", str(FIXTURES / "replay" / "store.sqlite"),
+                 "--log", str(FIXTURES / "replay" / "decisions.log"),
+                 "--days", "30",
+                 "--compare-baseline",
+                 str(REPO_ROOT / "eval" / "baseline-replay.json"),
+                 "--fail-under", "precision_delta=0",
+                 "--json-out", str(out)],
+                capture_output=True, timeout=600)
+            self.assertEqual(r.returncode, 0, r.stderr.decode(errors="replace"))
+            expected = (FIXTURES / "replay" / "expected.json").read_bytes()
+            self.assertEqual(out.read_bytes(), expected,
+                             "the replay report must equal the committed "
+                             "oracle byte-for-byte")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,37 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.102.0] - 2026-10-16
+
+### Added
+
+- `store.py reclassify-entities --dry-run|--apply [--json]` (issue #176,
+  Workstream K PR 5): deterministic reclassification of stored `other`
+  entities. A pure-string classifier (`classify_entity_kind` — no LLM, no
+  shell, no network, no DNS, no filesystem) assigns kinds by precedence
+  host -> service -> model -> repo -> file -> command -> error_class ->
+  other; only rows currently kinded `other` are considered, entity ids,
+  aliases and memory links are preserved, apply runs in one transaction
+  under the writer lease, and dry-run is byte-identical, read-only, and
+  lease-free. Write-time extraction now classifies unqualified values
+  (plain tag tokens, untyped `entity:Name`, CamelCase identifiers) instead
+  of defaulting them to `other`.
+- Per-kind entity-lane RRF weights (issue #176): `ZMEM_ENTITY_KIND_WEIGHTS`
+  (one JSON object; defaults 1.0 for every kind except `other=0.6`) scales
+  ONLY the entity lane's fusion contribution — reduced over the kinds of
+  the query-matched entities; BM25, vector, and graph contributions are
+  unchanged; invalid configuration logs exactly one warning and uses the
+  complete defaults; `recall --explain` reports the effective weights under
+  `entity_kind_weights`. `ops_tokens.RUNNER_HEADS` is now public (sorted,
+  membership-only; extraction unchanged).
+- Fixtures for the classifier and reclassification surfaces (issue #176):
+  `tests/fixtures/entity/classify.json` (30 fixed strings),
+  `reclassify.json` (fixed seed rows), `reclassify-expected.json` (the
+  canonical dry-run/apply envelope oracle),
+  `operator-snapshot.json` (the 24,826/26,511 motivating measurement plus
+  the fixture apply outcome), and the deterministic generator
+  `make_reclassify_fixture.py`.
+
 ## [0.101.0] - 2026-10-15
 
 ### Added

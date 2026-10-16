@@ -42,12 +42,16 @@ identically on every host.)
 
 from __future__ import annotations
 
+import json
+import math
+import os
 import re
 import sqlite3
 import sys
 import uuid
 
 from schema_meta import ENTITY_KINDS
+from storelib.ops_tokens import RUNNER_HEADS
 from storelib.schema import _as_of_temporal_predicate, _normalize_content, now_iso
 
 # The single link role shipped in v10. The column exists so phase 6 (links)
@@ -146,9 +150,12 @@ def extract_entities(
     blob = f"{tags or ''}\n{content or ''}"
 
     # 1) Explicit entity: tags (tags field first, then content) — the only
-    #    source that can mint a `person` or `preference` entity.
+    #    source that can mint a `person` or `preference` entity. Issue #176:
+    #    a TYPED tag is authoritative and is never re-classified; an untyped
+    #    `entity:Name` carries no kind, so the value is classified.
     for m in _ENTITY_TAG_RE.finditer(blob):
-        kind = (m.group(1) or "other").lower()
+        typed = (m.group(1) or "").lower()
+        kind = typed if typed else classify_entity_kind(m.group(2))
         _offer(kind, m.group(2))
 
     # 2) project:<suffix> namespace.
@@ -157,7 +164,9 @@ def extract_entities(
         _offer("project", ns.split(":", 1)[1])
 
     # 3) Remaining tag tokens: `kind:Name` maps to that kind; a plain token
-    #    is an `other` entity. (The explicit entity: form was consumed above.)
+    #    is classified (issue #176 — previously always `other`; an explicit
+    #    typed prefix here stays authoritative). (The explicit entity: form
+    #    was consumed above.)
     for tok in re.split(r"[,;\s]+", tags or ""):
         if not tok or tok.lower().startswith("entity:"):
             continue
@@ -166,15 +175,17 @@ def extract_entities(
             if prefix.lower() in ENTITY_KINDS and rest:
                 _offer(prefix.lower(), rest)
                 continue
-        _offer("other", tok)
+        _offer(classify_entity_kind(tok), tok)
 
     # 4) Backtick-quoted spans in content → tool entities.
     for m in _BACKTICK_RE.finditer(content or ""):
         _offer("tool", m.group(1))
 
-    # 5) CamelCase identifiers (2+ humps) in content → other.
+    # 5) CamelCase identifiers (2+ humps) in content → classified (issue
+    #    #176 — previously always `other`; CamelCase error names such as
+    #    ValueError now kind correctly).
     for m in _CAMELCASE_RE.finditer(content or ""):
-        _offer("other", m.group(0))
+        _offer(classify_entity_kind(m.group(0)), m.group(0))
 
     # Dedup by alias_norm, first-seen order (also makes the kind-conflict
     # policy concrete: the first source in the order above wins).
@@ -187,6 +198,318 @@ def extract_entities(
         seen.add(a)
         out.append((kind, name))
     return out
+
+
+# --- Issue #176: deterministic entity-kind classification -------------------
+#
+# The classifier is a PURE function of the name string: no LLM, no shell, no
+# network, no DNS, no filesystem — the same input always yields the same
+# member of ENTITY_KINDS. Rules are applied to the STRIPPED, CASEFOLDED value
+# in the issue's fixed precedence (host -> service -> model -> repo -> file
+# -> command -> error_class -> other); every pattern below is written against
+# the folded string.
+
+_CLASSIFIER_MODEL_PREFIXES = (
+    "gpt-", "claude-", "llama-", "mistral-", "gemma-", "text-embedding-",
+    "embedding-",
+)
+_CLASSIFIER_SOURCE_SUFFIXES = (
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".rs", ".go",
+    ".java", ".rb", ".sh", ".bash", ".ps1", ".sql", ".c", ".h", ".cpp",
+    ".hpp", ".cs", ".swift", ".kt", ".php", ".pl", ".lua", ".toml",
+    ".yaml", ".yml", ".json", ".xml", ".html", ".css",
+)
+_CLASSIFIER_DOC_SUFFIXES = (
+    ".md", ".txt", ".rst", ".markdown", ".json", ".yaml", ".yml", ".toml",
+    ".ini", ".cfg", ".conf", ".log", ".csv",
+)
+_CLASSIFIER_BASENAMES = frozenset({
+    "readme", "makefile", "license", "changelog", "contributing", "notice",
+    "authors",
+})
+
+# host: strict IPv4 (four dotted octets, each 0-255), 3+-label DNS names, or
+# the one-dot "hyphen in first label + alphabetic final label" shape. The
+# digit-leading-final-label rejection reroutes model-shaped names (gpt-5.3,
+# claude-3.5sonnet) away from host so the model prefix rule can take them.
+_CLASSIFIER_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_CLASSIFIER_HOST_MULTI_RE = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+){2,}$")
+_CLASSIFIER_HOST_ONEDOT_RE = re.compile(
+    r"^[a-z0-9-]*-[a-z0-9-]*\.[a-z][a-z0-9-]*$"
+)
+# service: a host-ish label with a 1-5 digit port, or a WHOLE-WORD service
+# noun (word-bounded: "databaseexception" must fall through to error_class,
+# while the hyphen in "the-database" is a boundary).
+_CLASSIFIER_SERVICE_PORT_RE = re.compile(r"^[a-z0-9_.-]+:[0-9]{1,5}$")
+_CLASSIFIER_SERVICE_WORD_RE = re.compile(
+    r"\b(?:service|server|daemon|database)\b"
+)
+# repo: the two github.com URL forms plus the generic owner/repo shape.
+# Generic labels are DOT-FREE so "src/main.py" cannot match repo (it is a
+# file) and "gitlab.com/org/repo" matches none of the three forms.
+_CLASSIFIER_REPO_GH_RE = re.compile(r"^github\.com/[a-z0-9_.-]+/[a-z0-9_.-]+$")
+_CLASSIFIER_REPO_URL_RE = re.compile(
+    r"^https?://github\.com/[a-z0-9_.-]+/[a-z0-9_.-]+/?$"
+)
+_CLASSIFIER_REPO_OWNER_RE = re.compile(r"^[a-z0-9_-]+/[a-z0-9_-]+$")
+# file: a drive prefix (Windows) — a PREFIX match, not fullmatch — or a
+# slash-rooted POSIX path.
+_CLASSIFIER_FILE_WIN_RE = re.compile(r"^[a-z]:[\\/]")
+# error_class: suffix rule on the folded value (case-insensitive by
+# construction); "Errors" fails the end anchor and stays other.
+_CLASSIFIER_ERROR_RE = re.compile(r"^[a-z_][a-z0-9_]*(?:error|exception)$")
+
+
+def _classify_ipv4(v: str) -> bool:
+    if not _CLASSIFIER_IPV4_RE.fullmatch(v):
+        return False
+    return all(0 <= int(o) <= 255 for o in v.split("."))
+
+
+def classify_entity_kind(name: str) -> str:
+    """Deterministically classify one entity NAME into an ENTITY_KINDS member.
+
+    Pure string function (regex + membership only — no LLM, shell, network,
+    DNS, or filesystem access). The issue #176 precedence, applied to the
+    stripped casefolded value:
+
+    1. host — localhost, strict IPv4, 3+-label DNS names (final label not
+       digit-leading, no edge-hyphen labels), or one-dot names whose first
+       label contains a hyphen and whose final label starts alphabetic.
+    2. service — ``label:port`` (1-5 digits) or a whole-word
+       service/server/daemon/database noun.
+    3. model — literal prefix gpt-/claude-/llama-/mistral-/gemma-/
+       text-embedding-/embedding- (the issue's verbatim "beginning with").
+    4. repo — github.com/org/repo, its https form, or dot-free owner/repo.
+    5. file — drive-rooted Windows path, slash-rooted POSIX path, a string
+       containing ``/`` with a recognized source suffix, or a README-like
+       doc/data basename.
+    6. command — first whitespace token is an ``ops_tokens.RUNNER_HEADS``
+       runner verb.
+    7. error_class — ``[A-Za-z_][A-Za-z0-9_]*(Error|Exception)``,
+       case-insensitively.
+    8. otherwise other.
+    """
+    v = (name or "").strip().casefold()
+    if not v:
+        return "other"
+    # 1) host
+    if v == "localhost" or _classify_ipv4(v):
+        return "host"
+    if _CLASSIFIER_HOST_MULTI_RE.fullmatch(v):
+        labels = v.split(".")
+        if (all(labels) and not labels[-1][:1].isdigit()
+                and not any(l.startswith("-") or l.endswith("-")
+                            for l in labels)):
+            return "host"
+    if _CLASSIFIER_HOST_ONEDOT_RE.fullmatch(v):
+        return "host"
+    # 2) service
+    if _CLASSIFIER_SERVICE_PORT_RE.fullmatch(v) or _CLASSIFIER_SERVICE_WORD_RE.search(v):
+        return "service"
+    # 3) model
+    if v.startswith(_CLASSIFIER_MODEL_PREFIXES):
+        return "model"
+    # 4) repo
+    if (_CLASSIFIER_REPO_GH_RE.fullmatch(v)
+            or _CLASSIFIER_REPO_URL_RE.fullmatch(v)
+            or _CLASSIFIER_REPO_OWNER_RE.fullmatch(v)):
+        return "repo"
+    # 5) file
+    if _CLASSIFIER_FILE_WIN_RE.match(v) or v.startswith("/"):
+        return "file"
+    if "/" in v and v.endswith(_CLASSIFIER_SOURCE_SUFFIXES):
+        return "file"
+    if "/" not in v and (v.endswith(_CLASSIFIER_DOC_SUFFIXES)
+                         or v in _CLASSIFIER_BASENAMES):
+        return "file"
+    # 6) command
+    head = v.split()[0] if v.split() else ""
+    if head in RUNNER_HEADS:
+        return "command"
+    # 7) error_class
+    if _CLASSIFIER_ERROR_RE.fullmatch(v):
+        return "error_class"
+    return "other"
+
+
+def _default_entity_kind_weights() -> dict[str, float]:
+    weights = {k: 1.0 for k in ENTITY_KINDS}
+    weights["other"] = 0.6
+    return weights
+
+
+def parse_entity_kind_weights() -> dict[str, float]:
+    """Parse ZMEM_ENTITY_KIND_WEIGHTS into a per-kind weight map.
+
+    Defaults: 1.0 for every ENTITY_KINDS member except ``other`` = 0.6. A
+    missing variable returns the defaults SILENTLY. Any invalid
+    configuration — non-JSON, non-object, unknown key, nonnumeric value,
+    NaN/infinity, zero, or negative — logs EXACTLY ONE warning line to
+    stderr and returns the COMPLETE defaults (no partial overrides). This
+    parser never raises: recall reads it on every invocation and malformed
+    operator configuration must degrade, not crash.
+    """
+    raw = os.environ.get("ZMEM_ENTITY_KIND_WEIGHTS")
+    if raw is None:
+        return _default_entity_kind_weights()
+
+    def _fallback(reason: str) -> dict[str, float]:
+        # One warning line, complete defaults, nothing partially applied.
+        print(f"[zmem] entity-kind weights: {reason}; using defaults",
+              file=sys.stderr)
+        return _default_entity_kind_weights()
+
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is not valid JSON")
+    if not isinstance(obj, dict):
+        return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is not a JSON object")
+    for key, value in obj.items():
+        if key not in ENTITY_KINDS:
+            return _fallback(f"unknown entity kind {key!r}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _fallback(f"weight for {key!r} is not a number")
+        if not math.isfinite(float(value)):
+            return _fallback(f"weight for {key!r} is not finite")
+        if float(value) <= 0:
+            return _fallback(f"weight for {key!r} must be positive")
+    weights = _default_entity_kind_weights()
+    for key, value in obj.items():
+        weights[key] = float(value)
+    return weights
+
+
+def _other_link_share(conn: sqlite3.Connection,
+                      kind_by_id: dict[str, str]) -> float:
+    """Share of memory_entity rows linked to an `other` entity (0.0 when
+    the table is empty — an empty denominator is no evidence of anything)."""
+    rows = conn.execute(
+        "SELECT me.entity_id FROM memory_entity me "
+        "JOIN entity e ON e.id = me.entity_id"
+    ).fetchall()
+    if not rows:
+        return 0.0
+    other = sum(1 for r in rows if kind_by_id.get(r[0]) == "other")
+    return other / len(rows)
+
+
+def reclassify_entities(
+    conn: sqlite3.Connection, *, dry_run: bool = True,
+) -> dict:
+    """Propose (dry_run=True) or apply (dry_run=False) kind classification
+    for every entity row currently kinded `other` (issue #176).
+
+    Non-`other` rows are NEVER considered or modified — an entity's kind is
+    authoritative once it is not `other` (the same first-seen-kind-wins
+    policy as `_upsert_entity`; manual reconciliation stays `entity-merge`).
+    Proposals come from `classify_entity_kind` only, and every changed kind
+    is validated against ENTITY_KINDS before any write.
+
+    Returns ``{"dry_run": bool, "scanned": N, "changed": N, "changes":
+    [{"id","name","old_kind","new_kind"}...] ordered by entity id,
+    "before_other_link_share": float, "after_other_link_share": float}``
+    where the shares are computed over ALL memory_entity rows (before: the
+    current kinds; after: the kinds projected through the proposal — for
+    apply, the post-UPDATE kinds).
+
+    dry_run=True performs NO UPDATE and NEVER commits (read-only). apply
+    updates only the changed rows' ``entity.kind`` in ONE transaction and
+    commits once; any invalid proposal or SQL error rolls the whole apply
+    back. Entity ids, entity_alias rows, and memory_entity rows are never
+    touched.
+    """
+    if dry_run:
+        # Read-only: a deferred transaction we always roll back. Nothing
+        # writes, so this is belt-and-braces isolation for the caller.
+        started = not conn.in_transaction
+        if started:
+            conn.execute("BEGIN")
+        try:
+            return _reclassify_scan(conn, apply_changes=False)
+        finally:
+            if started and conn.in_transaction:
+                conn.rollback()
+    # apply path: one write transaction, committed once, rolled back whole.
+    proposal = _reclassify_scan(conn, apply_changes=False)
+    changes = proposal["changes"]
+    started = not conn.in_transaction
+    try:
+        if started:
+            conn.execute("BEGIN IMMEDIATE")
+        # Re-verify every target is still `other` under the write lock —
+        # a concurrent writer between scan and apply must fail closed, not
+        # silently re-kind a row someone else already kinded.
+        for c in changes:
+            row = conn.execute(
+                "SELECT kind FROM entity WHERE id=?", (c["id"],)
+            ).fetchone()
+            if row is None or row[0] != "other":
+                raise ValueError(
+                    f"reclassify-entities: entity {c['id']} is no longer "
+                    "kind 'other' (changed since the proposal)"
+                )
+        conn.executemany(
+            "UPDATE entity SET kind=? WHERE id=?",
+            [(c["new_kind"], c["id"]) for c in changes],
+        )
+        result = _reclassify_scan(conn, apply_changes=True,
+                                  proposed=proposal)
+        if started:
+            conn.commit()
+        return result
+    except Exception:
+        if started and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _reclassify_scan(conn: sqlite3.Connection, *, apply_changes: bool,
+                     proposed: dict | None = None) -> dict:
+    """Shared scan for both reclassify modes (runs inside the caller's
+    transaction). With ``proposed`` (the apply path's pre-UPDATE proposal)
+    the after-share reflects the proposal, matching what dry-run reported."""
+    if apply_changes and proposed is not None:
+        # The UPDATE already ran; rebuild the envelope from the proposal so
+        # apply reports exactly what dry-run proposed. The before-share is
+        # the current post-UPDATE view folded BACKWARDS through the
+        # proposal; the after-share is the current view itself.
+        changes = proposed["changes"]
+        scanned = proposed["scanned"]
+        kind_by_id = dict(conn.execute("SELECT id, kind FROM entity").fetchall())
+        after = _other_link_share(conn, kind_by_id)
+        for c in changes:
+            kind_by_id[c["id"]] = "other"
+        before = _other_link_share(conn, kind_by_id)
+        return {
+            "dry_run": False, "scanned": scanned, "changed": len(changes),
+            "changes": changes,
+            "before_other_link_share": before,
+            "after_other_link_share": after,
+        }
+    rows = conn.execute(
+        "SELECT id, canonical_name FROM entity WHERE kind='other' ORDER BY id"
+    ).fetchall()
+    changes = []
+    for r in rows:
+        new_kind = classify_entity_kind(r["canonical_name"])
+        if new_kind != "other" and new_kind in ENTITY_KINDS:
+            changes.append({
+                "id": r["id"], "name": r["canonical_name"],
+                "old_kind": "other", "new_kind": new_kind,
+            })
+    kind_by_id = dict(conn.execute("SELECT id, kind FROM entity").fetchall())
+    before = _other_link_share(conn, kind_by_id)
+    for c in changes:
+        kind_by_id[c["id"]] = c["new_kind"]
+    after = _other_link_share(conn, kind_by_id)
+    return {
+        "dry_run": True, "scanned": len(rows), "changed": len(changes),
+        "changes": changes,
+        "before_other_link_share": before,
+        "after_other_link_share": after,
+    }
 
 
 def _upsert_entity(conn: sqlite3.Connection, kind: str, name: str) -> str | None:
@@ -343,9 +666,16 @@ def entity_match_ids(
     ns_list: list[str] | None = None,
     as_of: str | None = None,
     limit: int = 5,
+    matched_kinds: dict[str, set[str]] | None = None,
 ) -> tuple[list[str], dict[str, float]]:
     """The entity lane of recall (issue #60, 5.3): match the QUERY against
     stored aliases and return live memory ids ranked for RRF fusion.
+
+    Issue #176: when ``matched_kinds`` is a dict, it is filled with
+    ``{memory_id: {kinds of the QUERY-MATCHED entities}}`` — the basis the
+    per-kind entity-lane weights are reduced over (only the evidence that
+    fired is weighted; the in-place fill keeps the historical 2-tuple
+    return shape for every existing caller).
 
     Matching uses the SAME extractor as the write path (backtick / CamelCase /
     explicit ``entity:`` forms in the query) PLUS plain query tokens matched
@@ -388,6 +718,8 @@ def entity_match_ids(
             ).fetchall()
         ]
     except sqlite3.OperationalError:
+        if matched_kinds is not None:
+            matched_kinds.clear()  # fail-open leaves the fill dict empty
         return [], {}  # pre-v10 store edge (tables absent) — fail open
     if not eids:
         return [], {}
@@ -406,15 +738,26 @@ def entity_match_ids(
     try:
         rows = conn.execute(
             f"SELECT me.memory_id AS mid, COUNT(DISTINCT me.entity_id) AS n, "
-            f"MAX(m.ingestion_ts) AS latest "
+            f"MAX(m.ingestion_ts) AS latest, "
+            f"GROUP_CONCAT(DISTINCT e.kind) AS matched_kind_list "
             f"FROM memory_entity me JOIN memory m ON m.id = me.memory_id "
+            f"JOIN entity e ON e.id = me.entity_id "
             f"WHERE me.entity_id IN ({eph}) {ns_clause} {live_clause} "
             f"{as_of_clause} "
             f"GROUP BY me.memory_id ORDER BY n DESC, latest DESC, mid LIMIT ?",
             params,
         ).fetchall()
     except sqlite3.OperationalError:
+        if matched_kinds is not None:
+            matched_kinds.clear()  # fail-open leaves the fill dict empty
         return [], {}
+    if matched_kinds is not None:
+        # Issue #176: kinds are [_a-z0-9] tokens, so ',' is a safe split.
+        matched_kinds.clear()
+        for r in rows:
+            matched_kinds[r["mid"]] = {
+                k for k in (r["matched_kind_list"] or "").split(",") if k
+            }
     total = float(len(eids))
     rel_map = {r["mid"]: min(1.0, r["n"] / total) if total else 0.0 for r in rows}
     return [r["mid"] for r in rows], rel_map
@@ -580,4 +923,36 @@ def cmd_entity_merge(
           f"(moved {len(from_aliases) - len(alias_collisions)} alias(es), "
           f"{len(from_links) - len(link_collisions)} link(s); "
           f"{len(alias_collisions)} alias collision(s) kept on target)")
+    return 0
+
+
+def cmd_reclassify_entities(
+    conn: sqlite3.Connection, *, apply_mode: bool, as_json: bool = False
+) -> int:
+    """`store.py reclassify-entities --dry-run|--apply [--json]` (issue #176).
+
+    The CLI dispatch (cli.py) owns the connection policy: dry-run arrives on
+    a strict read-only connection acquired BEFORE the shared store lifecycle;
+    apply arrives on an rw connection under the writer lease. This function
+    only runs the reclassifier and renders the result.
+
+    --json prints the canonical envelope — exactly
+    ``{"scanned","changed","before_other_link_share",
+    "after_other_link_share","changes"}`` (no ``dry_run`` key) — as LF-only
+    bytes through ``sys.stdout.buffer`` so dry-run and apply print IDENTICAL
+    bytes on every platform (a Windows text-mode print would emit CRLF and
+    break the committed-fixture byte contract). Human output prints one line
+    per proposed change followed by ``scanned=N changed=N``.
+    """
+    result = reclassify_entities(conn, dry_run=not apply_mode)
+    envelope = {k: v for k, v in result.items() if k != "dry_run"}
+    if as_json:
+        payload = json.dumps(envelope, indent=2, sort_keys=True) + "\n"
+        sys.stdout.buffer.write(payload.encode("utf-8"))
+        sys.stdout.buffer.flush()
+        return 0
+    for c in envelope["changes"]:
+        print(f"[zmem] reclassify: {c['id']} {c['name']!r} "
+              f"other -> {c['new_kind']}")
+    print(f"scanned={envelope['scanned']} changed={envelope['changed']}")
     return 0

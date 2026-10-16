@@ -2935,6 +2935,54 @@ entities for the same thing (e.g. `rg` and `ripgrep`); find both ids with
 the alias `rg` resolves to the surviving entity and recall's third list
 returns all its linked memories.
 
+### reclassify-entities — rekind stored `other` entities (issue #176)
+```
+<interpreter> <store.py> reclassify-entities --dry-run|--apply [--json]
+```
+Runs the DETERMINISTIC classifier (pure string rules — no LLM, no shell, no
+network, no DNS, no filesystem; precedence host → service → model → repo →
+file → command → error_class → other over the case-folded name) over every
+entity row currently kinded `other` and proposes or applies new kinds.
+Exactly one of `--dry-run`/`--apply` is required (both or neither exits 2).
+Non-`other` rows are never touched; entity ids, aliases, and memory links
+are preserved; `--apply` writes in ONE transaction under the writer lease
+and rolls back completely on error. `--dry-run` runs before the lease on a
+read-only connection, changes zero database bytes, and prints the same
+canonical JSON as apply: `{"scanned", "changed", "before_other_link_share",
+"after_other_link_share", "changes":[{id,name,old_kind,new_kind}]}` with
+changes ordered by entity id.
+
+At write time the same classifier assigns kinds to unqualified extracted
+values (plain tag tokens, untyped `entity:Name`, CamelCase identifiers);
+explicit typed tags, the `project:` namespace rule, and backtick→`tool`
+stay authoritative.
+
+**Per-kind entity-lane weights.** Recall multiplies each memory's entity-lane
+RRF contribution by the max weight across the kinds of the entities the
+QUERY matched (`ZMEM_ENTITY_KIND_WEIGHTS`, one JSON object such as
+`{"other":0.6,"host":1.0}`; defaults 1.0 for every kind except
+`other=0.6`; an invalid value logs one warning and uses the complete
+defaults — recall never crashes on the knob). BM25, vector, and graph
+contributions are unchanged; `recall --explain` reports the effective
+weights under `entity_kind_weights`.
+
+**Operator snapshot block.** `tests/fixtures/entity/operator-snapshot.json`
+records the motivating measurement and the fixture apply's fixed outcome:
+
+```json
+{"as_of": "2026-09-10", "memory_entity_links": 26511, "other_links": 24826,
+ "fixture": {"memory_entity_rows": 3, "before_other_link_share": 1.0,
+             "after_other_link_share": 0.0, "changed": 4}}
+```
+
+The 24,826-of-26,511 `other` share (0.9366…) is why `other` defaults below
+1.0; the `fixture` block is the committed proof the reclassification moves
+the fixture store's other-link share from 1.0 to 0.0 in one apply. Regenerate
+the three fixed fixtures with
+`python tests/fixtures/entity/make_reclassify_fixture.py` (deterministic;
+it never writes the reviewed `reclassify-expected.json` — that file comes
+from the exact dry-run command against the seeded fixture store).
+
 ### links — inspect (or curate) a memory's associative links (v11, issue #61)
 ```
 <interpreter> <store.py> links --id <uuid> [--json]           # list every edge

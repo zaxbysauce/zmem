@@ -1330,6 +1330,62 @@ operator's own risk — the override never downgrades or migrates the store.
 The #172 taxonomy decision for the proposed `entity_card` memory type is
 reject: it is not part of this release and `ALLOWED_TYPES` is unchanged.
 
+### Entity classification, reclassification and lane weights (issue #176)
+
+Since 0.102.0 a DETERMINISTIC classifier assigns kinds to entity values that
+carry no explicit kind. It is a pure string function — no LLM, no shell, no
+network, no DNS, no filesystem access — applied to the stripped, case-folded
+name with this precedence (first match wins):
+
+1. **host** — `localhost`; strict IPv4 (four 0–255 octets); DNS names with
+   at least two dots (final label not digit-leading); one-dot names whose
+   first label contains a hyphen and whose final label starts with a letter
+   (`build-host-1.example`, `db-host.internal`).
+2. **service** — `label:port` (`postgres:5432`) or a whole-word
+   service/server/daemon/database noun (`api-service`, `the-database`).
+3. **model** — literal prefixes `gpt-`, `claude-`, `llama-`, `mistral-`,
+   `gemma-`, `text-embedding-`, `embedding-`.
+4. **repo** — `github.com/org/repo`, its `https://` form, or a dot-free
+   `owner/repo` (`openai/zmem`).
+5. **file** — a drive-rooted Windows path, a slash-rooted POSIX path, any
+   `/`-containing string with a recognized source suffix
+   (`src/main.py`, `/var/log/app.log`), or a README-like doc basename.
+6. **command** — the first token is a known runner verb
+   (`git status`, `python -m unittest`, `docker build .`).
+7. **error_class** — `[A-Za-z_][A-Za-z0-9_]*(Error|Exception)`
+   (`ValueError`, `DatabaseException`).
+8. otherwise **other**.
+
+At write time the classifier applies wherever an extracted value would
+otherwise land as `other` (plain tag tokens, untyped `entity:Name` tags,
+CamelCase identifiers); explicit TYPED tags (`entity:host:web01`), the
+`project:` namespace rule, and backtick→`tool` stay authoritative.
+
+Stored `other` rows are rekinded with the operator command:
+
+```bash
+<interpreter> <store.py> reclassify-entities --dry-run --json   # propose (read-only)
+<interpreter> <store.py> reclassify-entities --apply --json     # apply under the writer lease
+```
+
+Exactly one of `--dry-run`/`--apply` is required (both or neither exits 2).
+Only rows currently kinded `other` are ever considered; entity ids, aliases
+and memory links are preserved; apply runs in one transaction and rolls back
+completely on any error. Dry-run runs before the writer lease on a read-only
+connection and changes zero database bytes; its JSON is byte-identical to
+apply's (the canonical envelope `{"scanned","changed",
+"before_other_link_share","after_other_link_share","changes"}`).
+
+Recall's entity lane is weighted per kind through `ZMEM_ENTITY_KIND_WEIGHTS`
+(one JSON object, e.g. `{"other":0.6,"host":1.0}`; defaults are `1.0` for
+every kind except `other=0.6`). The weight scales ONLY the entity lane's RRF
+contribution — BM25, vector, and graph contributions are unchanged — and is
+reduced over the kinds of the entities the QUERY matched, so an `other`-only
+alias match ranks below a typed match. An invalid object (bad JSON, unknown
+key, nonnumeric/NaN/infinite/zero/negative value) logs exactly one warning
+and uses the complete defaults; recall never crashes on a malformed knob.
+`recall --explain` reports the effective weights under `entity_kind_weights`.
+
 ## Bootstrap / cold start
 
 zmem installs empty and learns going forward (live capture, issue #47). If you

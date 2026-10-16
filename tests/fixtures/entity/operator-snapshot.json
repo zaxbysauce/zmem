@@ -1,0 +1,14 @@
+{
+  "as_of": "2026-09-10",
+  "source": "maintainer store audit v3 (issue #176 evidence)",
+  "memory_entity_links": 26511,
+  "other_links": 24826,
+  "other_link_share": 0.9364414771227038,
+  "fixture": {
+    "entity_rows": 5,
+    "memory_entity_rows": 3,
+    "before_other_link_share": 1.0,
+    "after_other_link_share": 0.0,
+    "changed": 4
+  }
+}

@@ -69,6 +69,13 @@ _RUNNER_HEADS = frozenset({
     "robocopy", "rsync", "curl",
 })
 
+# Issue #176: the public, DETERMINISTIC view of the runner-head vocabulary
+# for the entity classifier's `command` kind (membership tests only). The
+# frozenset above stays the single source — this alias is sorted so the
+# tuple is stable across processes despite frozenset iteration order;
+# token extraction is unchanged.
+RUNNER_HEADS: tuple[str, ...] = tuple(sorted(_RUNNER_HEADS))
+
 # Hazardous git/gh subcommands — always kept when following a runner head
 # (push, reset, stash, rebase, merge...). These are the #85 incident verbs.
 _HAZARDOUS_SUBS = frozenset({
