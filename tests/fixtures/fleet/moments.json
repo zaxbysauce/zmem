@@ -1,0 +1,115 @@
+{
+  "fleet_fixture_version": 1,
+  "issue": 280,
+  "contract": "One canonical recorded payload per DISTINCT moment value declared by docs/fleet-capability-matrix.json (13 launcher verbs + 3 hermes callbacks + 2 explicit moments = 18; none excluded). T-04/T-08 assert local vs remote envelope equality against these same payloads. Values are deterministic (fixed session id suffix 0280, fixed namespace, fixed paths) so seeded-store builds are reproducible byte-for-byte on every machine.",
+  "moments": [
+    {
+      "moment": "session-start",
+      "harness_event": "SessionStart",
+      "payload": {"hook_event": "SessionStart", "source": "startup", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js session-start constructor cases over the tests/fixtures/launcher/claude/session-start.json stub; envelope shape cross-checked against tests/fixtures/canary/exec-form-input.json (issue #96 canary lanes)"
+    },
+    {
+      "moment": "recall",
+      "harness_event": "UserPromptSubmit",
+      "payload": {"hook_event": "UserPromptSubmit", "prompt": "Fleet fixture recall prompt: how does the delivery ledger dedupe?", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js recall constructor cases over tests/fixtures/launcher/claude/recall.json"
+    },
+    {
+      "moment": "capture-correction",
+      "harness_event": "UserPromptSubmit",
+      "payload": {"hook_event": "UserPromptSubmit", "prompt": "Actually use the fleet broker endpoint, not the local store", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js capture-correction cases over tests/fixtures/launcher/claude/capture-correction.json"
+    },
+    {
+      "moment": "pretool-recall",
+      "harness_event": "PreToolUse",
+      "payload": {"hook_event": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "python scripts/release_gate.py"}, "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js pretool-recall constructor cases over tests/fixtures/launcher/claude/pretool-recall.json"
+    },
+    {
+      "moment": "convention-capture",
+      "harness_event": "PostToolUse",
+      "payload": {"hook_event": "PostToolUse", "tool_name": "Edit", "tool_input": {"file_path": "C:\\fleet-fixture\\project\\src\\app.py"}, "tool_output": "The file has been edited", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js convention-capture cases over tests/fixtures/launcher/claude/convention-capture.json"
+    },
+    {
+      "moment": "capture-failure",
+      "harness_event": "PostToolUseFailure",
+      "payload": {"hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "py -3 build.py"}, "tool_error": "exit 1: fleet fixture failure", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js capture-failure cases over tests/fixtures/launcher/claude/capture-failure.json"
+    },
+    {
+      "moment": "posttoolbatch-recall",
+      "harness_event": "PostToolBatch",
+      "payload": {"hook_event": "PostToolBatch", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js posttoolbatch-recall cases over tests/fixtures/launcher/claude/posttoolbatch-recall.json"
+    },
+    {
+      "moment": "reflect",
+      "harness_event": "Stop",
+      "payload": {"hook_event": "Stop", "stop_hook_active": false, "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js reflect cases over tests/fixtures/launcher/claude/reflect.json"
+    },
+    {
+      "moment": "subagent-recall",
+      "harness_event": "SubagentStart",
+      "payload": {"hook_event": "SubagentStart", "agent_type": "coder", "task": "Fleet fixture subagent task", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js subagent-recall constructor cases (agent transcript/task text) over tests/fixtures/launcher/claude/subagent-recall.json"
+    },
+    {
+      "moment": "subagent-reflect",
+      "harness_event": "SubagentStop",
+      "payload": {"hook_event": "SubagentStop", "agent_type": "coder", "task": "Fleet fixture subagent task", "result": "Fleet fixture subagent result", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js subagent-reflect cases over tests/fixtures/launcher/claude/subagent-reflect.json; delegation shape cross-checked against tests/fixtures/hermes/native_cases.json"
+    },
+    {
+      "moment": "precompact",
+      "harness_event": "PreCompact",
+      "payload": {"hook_event": "PreCompact", "trigger": "manual", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js precompact cases over tests/fixtures/launcher/claude/precompact.json"
+    },
+    {
+      "moment": "postcompact",
+      "harness_event": "PostCompact",
+      "payload": {"hook_event": "PostCompact", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js postcompact cases over tests/fixtures/launcher/claude/postcompact.json"
+    },
+    {
+      "moment": "session-end",
+      "harness_event": "SessionEnd",
+      "payload": {"hook_event": "SessionEnd", "reason": "clear", "session_id": "00000000-0000-4000-8000-000000000280", "transcript_path": "C:\\fleet-fixture\\transcript.jsonl", "cwd": "C:\\fleet-fixture\\project", "namespace": "project:fixture-280"},
+      "source": "harvested from tests/test_launcher.js session-end cases over tests/fixtures/launcher/claude/session-end.json"
+    },
+    {
+      "moment": "pre-llm-call",
+      "harness_event": "pre_llm_call",
+      "payload": {"session_id": "00000000-0000-4000-8000-000000000280", "message": "Fleet fixture hermes pre-llm-call message"},
+      "source": "harvested from tests/fixtures/hermes/pre_llm_call.input.json and the pre_llm_call cases of tests/fixtures/hermes/native_cases.json (issue #165 native suite, built by tests/fixtures/hermes/build_native_fixture.py)"
+    },
+    {
+      "moment": "post-tool-call",
+      "harness_event": "post_tool_call",
+      "payload": {"session_id": "00000000-0000-4000-8000-000000000280", "tool_name": "Bash", "tool_input": {"command": "py -3 build.py"}, "tool_output": "fleet fixture tool output"},
+      "source": "harvested from the post_tool_call cases of tests/fixtures/hermes/native_cases.json (hermes-plugin/__init__.py post_tool_call payload contract)"
+    },
+    {
+      "moment": "pre-verify",
+      "harness_event": "pre_verify",
+      "payload": {"session_id": "00000000-0000-4000-8000-000000000280"},
+      "source": "harvested from the reflect-before-stop probe contract in hermes-plugin/__init__.py pre_verify (issue #163), pinned by tests/test_hermes_native.py"
+    },
+    {
+      "moment": "explicit-recall",
+      "harness_event": null,
+      "payload": {"argv": ["recall", "--query", "fleet fixture explicit recall", "--namespace", "project:fixture-280", "--json"], "cwd": "C:\\fleet-fixture\\project"},
+      "source": "harvested from the skills/memory/scripts/store.py recall CLI surface (the explicit-tool lane every harness shares)"
+    },
+    {
+      "moment": "explicit-write",
+      "harness_event": null,
+      "payload": {"argv": ["add", "--namespace", "project:fixture-280", "--type", "lesson", "--content", "Fleet fixture explicit write row", "--source-ref", "fleet-fixture:explicit-write"], "cwd": "C:\\fleet-fixture\\project"},
+      "source": "harvested from the skills/memory/scripts/store.py add CLI surface (the explicit-tool lane every harness shares)"
+    }
+  ]
+}
