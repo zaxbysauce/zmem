@@ -65,3 +65,8 @@ tests/fixtures/state/*.jsonl text eol=lf
 # comparable byte-for-byte if its line endings are pinned.
 tests/fixtures/asof/*.jsonl text eol=lf
 tests/fixtures/state/*.json text eol=lf
+
+# Issue #280: the fleet parity fixture family is a byte-contract input
+# (T-04/T-08 replay it verbatim); *.jsonl is not covered by the global
+# *.json rule, so pin it explicitly.
+tests/fixtures/fleet/*.jsonl text eol=lf

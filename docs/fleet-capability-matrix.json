@@ -1,6 +1,106 @@
 {
   "matrix_version": 1,
+  "generator": "docs/generate-fleet-matrix.py",
+  "generator_note": "PRODUCED by the generator named above; run it with --check to verify. Wiring is derived from hooks/hooks.*.json and the hermes register_hook calls on every run.",
   "rows": [
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "capture-correction",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "capture-correction",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "capture-failure",
+      "hook_event": "PostToolUseFailure",
+      "status": "registered",
+      "launcher": "capture-failure",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "convention-capture",
+      "hook_event": "PostToolUse",
+      "status": "registered",
+      "launcher": "convention-capture",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
     {
       "harness": "claude",
       "min_version": "2.1.283",
@@ -25,7 +125,8 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Registered (hooks.claude.json wires PostCompact) but a deliberate no-op per issue #158: hooks/zmem-postcompact.sh prints {} and exits, and the verb is absent from TRANSLATED_HOOKS. No output channel exists until a later Workstream T PR adds one."
     },
     {
       "harness": "claude",
@@ -59,75 +160,7 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "claude",
-      "min_version": "2.1.283",
-      "moment": "convention-capture",
-      "hook_event": "PostToolUse",
-      "status": "registered",
-      "launcher": "convention-capture",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "claude",
-      "min_version": "2.1.283",
-      "moment": "capture-failure",
-      "hook_event": "PostToolUseFailure",
-      "status": "registered",
-      "launcher": "capture-failure",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
     },
     {
       "harness": "claude",
@@ -153,7 +186,7 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
     },
     {
       "harness": "claude",
@@ -195,7 +228,83 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "reflect",
+      "hook_event": "Stop",
+      "status": "registered",
+      "launcher": "reflect",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
     },
     {
       "harness": "claude",
@@ -236,6 +345,10 @@
           "locality": "client_local"
         },
         {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
           "name": "cwd",
           "locality": "client_local"
         },
@@ -263,37 +376,7 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "claude",
-      "min_version": "2.1.283",
-      "moment": "reflect",
-      "hook_event": "Stop",
-      "status": "registered",
-      "launcher": "reflect",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
     },
     {
       "harness": "claude",
@@ -331,7 +414,7 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
     },
     {
       "harness": "claude",
@@ -366,17 +449,17 @@
     {
       "harness": "claude",
       "min_version": "2.1.283",
-      "moment": "capture-correction",
-      "hook_event": "UserPromptSubmit",
-      "status": "registered",
-      "launcher": "capture-correction",
+      "moment": "post-tool-call",
+      "hook_event": "post_tool_call",
+      "status": "capability_gap",
+      "launcher": null,
       "inputs": [
         {
-          "name": "transcript",
+          "name": "tool_input",
           "locality": "client_local"
         },
         {
-          "name": "cwd",
+          "name": "tool_output",
           "locality": "client_local"
         },
         {
@@ -391,15 +474,16 @@
       "hub_ops": [
         "ingest"
       ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Hermes memory-provider callback (register_hook \"post_tool_call\"), not a hooks/*.json manifest event."
     },
     {
       "harness": "claude",
       "min_version": "2.1.283",
-      "moment": "recall",
-      "hook_event": "UserPromptSubmit",
-      "status": "registered",
-      "launcher": "recall",
+      "moment": "pre-llm-call",
+      "hook_event": "pre_llm_call",
+      "status": "capability_gap",
+      "launcher": null,
       "inputs": [
         {
           "name": "transcript",
@@ -410,7 +494,7 @@
           "locality": "client_local"
         },
         {
-          "name": "cwd",
+          "name": "namespace",
           "locality": "client_local"
         },
         {
@@ -433,1366 +517,19 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_llm_call\"), not a hooks/*.json manifest event."
     },
     {
       "harness": "claude",
       "min_version": "2.1.283",
-      "moment": "explicit-recall",
-      "hook_event": null,
-      "status": "registered",
-      "launcher": "store.py recall",
-      "inputs": [
-        {
-          "name": "query",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason “hub-unreachable”.",
-      "notes": null
-    },
-    {
-      "harness": "claude",
-      "min_version": "2.1.283",
-      "moment": "explicit-write",
-      "hook_event": null,
-      "status": "registered",
-      "launcher": "store.py add",
-      "inputs": [
-        {
-          "name": "memory payload",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": null
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "postcompact",
-      "hook_event": "PostCompact",
+      "moment": "pre-verify",
+      "hook_event": "pre_verify",
       "status": "capability_gap",
       "launcher": null,
       "inputs": [
         {
           "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "posttoolbatch-recall",
-      "hook_event": "PostToolBatch",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "capture-failure",
-      "hook_event": "PostToolUse",
-      "status": "registered",
-      "launcher": "capture-failure",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Codex has no PostToolUseFailure event; failure capture rides PostToolUse."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "convention-capture",
-      "hook_event": "PostToolUse",
-      "status": "registered",
-      "launcher": "convention-capture",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "capture-failure",
-      "hook_event": "PostToolUseFailure",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Failure capture is delivered; it rides PostToolUse (see the registered capture-failure row), so this gap row records the missing EVENT, not a missing behaviour."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "precompact",
-      "hook_event": "PreCompact",
-      "status": "registered",
-      "launcher": "precompact",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "pretool-recall",
-      "hook_event": "PreToolUse",
-      "status": "registered",
-      "launcher": "pretool-recall",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "session-end",
-      "hook_event": "SessionEnd",
-      "status": "registered",
-      "launcher": "session-end",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "flush"
-      ],
-      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "session-start",
-      "hook_event": "SessionStart",
-      "status": "registered",
-      "launcher": "session-start",
-      "inputs": [
-        {
-          "name": "Tier 0 files",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”.",
-      "notes": "openai/codex#15266: SessionStart + UserPromptSubmit first-prompt double-fire is handled unconditionally by ledger/reservation dedupe, never by version gating."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "reflect",
-      "hook_event": "Stop",
-      "status": "registered",
-      "launcher": "reflect",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "subagent-recall",
-      "hook_event": "SubagentStart",
-      "status": "registered",
-      "launcher": "subagent-recall",
-      "inputs": [
-        {
-          "name": "agent transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "subagent-reflect",
-      "hook_event": "SubagentStop",
-      "status": "registered",
-      "launcher": "subagent-reflect",
-      "inputs": [
-        {
-          "name": "agent transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "capture-correction",
-      "hook_event": "UserPromptSubmit",
-      "status": "registered",
-      "launcher": "capture-correction",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "recall",
-      "hook_event": "UserPromptSubmit",
-      "status": "registered",
-      "launcher": "recall",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”.",
-      "notes": "openai/codex#15266: SessionStart + UserPromptSubmit first-prompt double-fire is handled unconditionally by ledger/reservation dedupe, never by version gating."
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "explicit-recall",
-      "hook_event": null,
-      "status": "registered",
-      "launcher": "store.py recall",
-      "inputs": [
-        {
-          "name": "query",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason “hub-unreachable”.",
-      "notes": null
-    },
-    {
-      "harness": "codex",
-      "min_version": "0.160.0",
-      "moment": "explicit-write",
-      "hook_event": null,
-      "status": "registered",
-      "launcher": "store.py add",
-      "inputs": [
-        {
-          "name": "memory payload",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": null
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "postcompact",
-      "hook_event": "PostCompact",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "posttoolbatch-recall",
-      "hook_event": "PostToolBatch",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "convention-capture",
-      "hook_event": "PostToolUse",
-      "status": "registered",
-      "launcher": "convention-capture",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "capture-failure",
-      "hook_event": "PostToolUseFailure",
-      "status": "registered",
-      "launcher": "capture-failure",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "precompact",
-      "hook_event": "PreCompact",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "pretool-recall",
-      "hook_event": "PreToolUse",
-      "status": "registered",
-      "launcher": "pretool-recall",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "session-end",
-      "hook_event": "SessionEnd",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "flush"
-      ],
-      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "session-start",
-      "hook_event": "SessionStart",
-      "status": "registered",
-      "launcher": "session-start",
-      "inputs": [
-        {
-          "name": "Tier 0 files",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "reflect",
-      "hook_event": "Stop",
-      "status": "registered",
-      "launcher": "reflect",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "subagent-recall",
-      "hook_event": "SubagentStart",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "agent transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "subagent-reflect",
-      "hook_event": "SubagentStop",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "agent transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "capture-correction",
-      "hook_event": "UserPromptSubmit",
-      "status": "registered",
-      "launcher": "capture-correction",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "recall",
-      "hook_event": "UserPromptSubmit",
-      "status": "registered",
-      "launcher": "recall",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "explicit-recall",
-      "hook_event": null,
-      "status": "registered",
-      "launcher": "store.py recall",
-      "inputs": [
-        {
-          "name": "query",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason “hub-unreachable”.",
-      "notes": null
-    },
-    {
-      "harness": "zcode",
-      "min_version": "3.15.3",
-      "moment": "explicit-write",
-      "hook_event": null,
-      "status": "registered",
-      "launcher": "store.py add",
-      "inputs": [
-        {
-          "name": "memory payload",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": null
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "postcompact",
-      "hook_event": "PostCompact",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "posttoolbatch-recall",
-      "hook_event": "PostToolBatch",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "convention-capture",
-      "hook_event": "PostToolUse",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "capture-failure",
-      "hook_event": "PostToolUseFailure",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "precompact",
-      "hook_event": "PreCompact",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "pretool-recall",
-      "hook_event": "PreToolUse",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "session-end",
-      "hook_event": "SessionEnd",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "flush"
-      ],
-      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "session-start",
-      "hook_event": "SessionStart",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "Tier 0 files",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "reflect",
-      "hook_event": "Stop",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
           "locality": "client_local"
         },
         {
@@ -1808,7 +545,1720 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
-      "notes": "Native Hermes reflect-before-stop rides the registered pre_verify callback moment."
+      "notes": "Hermes memory-provider callback (register_hook \"pre_verify\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "explicit-recall",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py recall",
+      "inputs": [
+        {
+          "name": "query",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "explicit-write",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py add",
+      "inputs": [
+        {
+          "name": "memory payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "capture-correction",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "capture-correction",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "capture-failure",
+      "hook_event": "PostToolUse",
+      "status": "registered",
+      "launcher": "capture-failure",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "convention-capture",
+      "hook_event": "PostToolUse",
+      "status": "registered",
+      "launcher": "convention-capture",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "postcompact",
+      "hook_event": "PostCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "posttoolbatch-recall",
+      "hook_event": "PostToolBatch",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "precompact",
+      "hook_event": "PreCompact",
+      "status": "registered",
+      "launcher": "precompact",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "pretool-recall",
+      "hook_event": "PreToolUse",
+      "status": "registered",
+      "launcher": "pretool-recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "openai/codex#15266: SessionStart + UserPromptSubmit first-prompt double-fire is handled unconditionally by ledger/reservation dedupe, never by version gating."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "reflect",
+      "hook_event": "Stop",
+      "status": "registered",
+      "launcher": "reflect",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "session-end",
+      "hook_event": "SessionEnd",
+      "status": "registered",
+      "launcher": "session-end",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "flush"
+      ],
+      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "session-start",
+      "hook_event": "SessionStart",
+      "status": "registered",
+      "launcher": "session-start",
+      "inputs": [
+        {
+          "name": "Tier 0 files",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "openai/codex#15266: SessionStart + UserPromptSubmit first-prompt double-fire is handled unconditionally by ledger/reservation dedupe, never by version gating."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "subagent-recall",
+      "hook_event": "SubagentStart",
+      "status": "registered",
+      "launcher": "subagent-recall",
+      "inputs": [
+        {
+          "name": "agent transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "subagent-reflect",
+      "hook_event": "SubagentStop",
+      "status": "registered",
+      "launcher": "subagent-reflect",
+      "inputs": [
+        {
+          "name": "agent transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "capture-failure",
+      "hook_event": "PostToolUseFailure",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Codex has no PostToolUseFailure event; failure capture is delivered and rides PostToolUse (see the registered capture-failure row), so this capability_gap row records the missing EVENT, not a missing behaviour."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "post-tool-call",
+      "hook_event": "post_tool_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Hermes memory-provider callback (register_hook \"post_tool_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "pre-llm-call",
+      "hook_event": "pre_llm_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_llm_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "pre-verify",
+      "hook_event": "pre_verify",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_verify\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "explicit-recall",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py recall",
+      "inputs": [
+        {
+          "name": "query",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "explicit-write",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py add",
+      "inputs": [
+        {
+          "name": "memory payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "capture-correction",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "capture-correction",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "capture-failure",
+      "hook_event": "PostToolUseFailure",
+      "status": "registered",
+      "launcher": "capture-failure",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "convention-capture",
+      "hook_event": "PostToolUse",
+      "status": "registered",
+      "launcher": "convention-capture",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "postcompact",
+      "hook_event": "PostCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "posttoolbatch-recall",
+      "hook_event": "PostToolBatch",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "precompact",
+      "hook_event": "PreCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "pretool-recall",
+      "hook_event": "PreToolUse",
+      "status": "registered",
+      "launcher": "pretool-recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "reflect",
+      "hook_event": "Stop",
+      "status": "registered",
+      "launcher": "reflect",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "session-end",
+      "hook_event": "SessionEnd",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "flush"
+      ],
+      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "session-start",
+      "hook_event": "SessionStart",
+      "status": "registered",
+      "launcher": "session-start",
+      "inputs": [
+        {
+          "name": "Tier 0 files",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "subagent-recall",
+      "hook_event": "SubagentStart",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "agent transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "subagent-reflect",
+      "hook_event": "SubagentStop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "agent transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "post-tool-call",
+      "hook_event": "post_tool_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Hermes memory-provider callback (register_hook \"post_tool_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "pre-llm-call",
+      "hook_event": "pre_llm_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_llm_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "pre-verify",
+      "hook_event": "pre_verify",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_verify\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "explicit-recall",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py recall",
+      "inputs": [
+        {
+          "name": "query",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "explicit-write",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py add",
+      "inputs": [
+        {
+          "name": "memory payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "capture-correction",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "capture-failure",
+      "hook_event": "PostToolUseFailure",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "convention-capture",
+      "hook_event": "PostToolUse",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "postcompact",
+      "hook_event": "PostCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "posttoolbatch-recall",
+      "hook_event": "PostToolBatch",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "precompact",
+      "hook_event": "PreCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "pretool-recall",
+      "hook_event": "PreToolUse",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "reflect",
+      "hook_event": "Stop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "session-end",
+      "hook_event": "SessionEnd",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "flush"
+      ],
+      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "session-start",
+      "hook_event": "SessionStart",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "Tier 0 files",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
     },
     {
       "harness": "hermes",
@@ -1846,7 +2296,7 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\"."
     },
     {
       "harness": "hermes",
@@ -1877,87 +2327,6 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "recall",
-      "hook_event": "UserPromptSubmit",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "hermes",
-      "min_version": "0.21.1",
-      "moment": "pre-llm-call",
-      "hook_event": "pre_llm_call",
-      "status": "registered",
-      "launcher": "pre_llm_call",
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”.",
-      "notes": "Hermes memory-provider callback (not a hooks/*.json manifest event)."
     },
     {
       "harness": "hermes",
@@ -1988,7 +2357,50 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Hermes memory-provider callback (not a hooks/*.json manifest event)."
+      "notes": "Hermes memory-provider callback (register_hook \"post_tool_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "pre-llm-call",
+      "hook_event": "pre_llm_call",
+      "status": "registered",
+      "launcher": "pre_llm_call",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_llm_call\"), not a hooks/*.json manifest event."
     },
     {
       "harness": "hermes",
@@ -2015,7 +2427,7 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
-      "notes": "Hermes memory-provider callback (not a hooks/*.json manifest event)."
+      "notes": "Hermes memory-provider callback (register_hook \"pre_verify\"), not a hooks/*.json manifest event."
     },
     {
       "harness": "hermes",
@@ -2030,6 +2442,14 @@
           "locality": "client_local"
         },
         {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
           "name": "rows",
           "locality": "hub_authoritative"
         },
@@ -2045,8 +2465,7 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason “hub-unreachable”.",
-      "notes": null
+      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\"."
     },
     {
       "harness": "hermes",
@@ -2061,98 +2480,11 @@
           "locality": "client_local"
         },
         {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": null
-    },
-    {
-      "harness": "opencode",
-      "min_version": "1.18.30",
-      "moment": "postcompact",
-      "hook_event": "PostCompact",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
+          "name": "git remote",
           "locality": "client_local"
         },
         {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "opencode",
-      "min_version": "1.18.30",
-      "moment": "posttoolbatch-recall",
-      "hook_event": "PostToolBatch",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "opencode",
-      "min_version": "1.18.30",
-      "moment": "convention-capture",
-      "hook_event": "PostToolUse",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_input",
-          "locality": "client_local"
-        },
-        {
-          "name": "tool_output",
+          "name": "namespace",
           "locality": "client_local"
         },
         {
@@ -2168,6 +2500,37 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "capture-correction",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2201,7 +2564,105 @@
       "hub_ops": [
         "ingest"
       ],
-      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "convention-capture",
+      "hook_event": "PostToolUse",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "postcompact",
+      "hook_event": "PostCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "posttoolbatch-recall",
+      "hook_event": "PostToolBatch",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2227,7 +2688,8 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2269,7 +2731,86 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "reflect",
+      "hook_event": "Stop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2291,7 +2832,8 @@
       "hub_ops": [
         "flush"
       ],
-      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown."
+      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2307,6 +2849,10 @@
         },
         {
           "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
           "locality": "client_local"
         },
         {
@@ -2337,37 +2883,8 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "opencode",
-      "min_version": "1.18.30",
-      "moment": "reflect",
-      "hook_event": "Stop",
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "transcript",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "ingest"
-      ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2405,7 +2922,8 @@
       "hub_ops": [
         "select"
       ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2435,91 +2953,23 @@
       "hub_ops": [
         "ingest"
       ],
-      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally."
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     },
     {
       "harness": "opencode",
       "min_version": "1.18.30",
-      "moment": "recall",
-      "hook_event": "UserPromptSubmit",
+      "moment": "post-tool-call",
+      "hook_event": "post_tool_call",
       "status": "capability_gap",
       "launcher": null,
       "inputs": [
         {
-          "name": "transcript",
+          "name": "tool_input",
           "locality": "client_local"
         },
         {
-          "name": "git remote",
-          "locality": "client_local"
-        },
-        {
-          "name": "cwd",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "ledger",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason “hub-unreachable”."
-    },
-    {
-      "harness": "opencode",
-      "min_version": "1.18.30",
-      "moment": "explicit-recall",
-      "hook_event": null,
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "query",
-          "locality": "client_local"
-        },
-        {
-          "name": "rows",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "embeddings",
-          "locality": "hub_authoritative"
-        },
-        {
-          "name": "policy",
-          "locality": "hub_authoritative"
-        }
-      ],
-      "hub_ops": [
-        "select"
-      ],
-      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason “hub-unreachable”.",
-      "notes": "OpenCode has no adapter yet (issue #66)."
-    },
-    {
-      "harness": "opencode",
-      "min_version": "1.18.30",
-      "moment": "explicit-write",
-      "hook_event": null,
-      "status": "capability_gap",
-      "launcher": null,
-      "inputs": [
-        {
-          "name": "memory payload",
+          "name": "tool_output",
           "locality": "client_local"
         },
         {
@@ -2535,7 +2985,151 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "OpenCode has no adapter yet (issue #66)."
+      "notes": "Hermes memory-provider callback (register_hook \"post_tool_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "pre-llm-call",
+      "hook_event": "pre_llm_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_llm_call\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "pre-verify",
+      "hook_event": "pre_verify",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Hermes memory-provider callback (register_hook \"pre_verify\"), not a hooks/*.json manifest event."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "explicit-recall",
+      "hook_event": null,
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "query",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "explicit-write",
+      "hook_event": null,
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "memory payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
     }
   ]
 }
