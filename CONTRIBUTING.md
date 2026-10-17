@@ -2,7 +2,7 @@
 
 How to file issues. This repository originated the workstream convention; the per-AC check binding below is the codified upgrade of that practice.
 
-<!-- CANONICAL-VERSION: ZaxbyHub/opencode-swarm@e5278b2522 (PR #3185). Verbatim-copy core; repo notes are repo-specific. Update by re-copying from the canonical and bumping this stamp. -->
+<!-- CANONICAL-VERSION: ZaxbyHub/opencode-swarm@78a4c546bb (PR #3185, follow-up section from PRs #3371 and #3377). Verbatim-copy core; repo notes are repo-specific. Update by re-copying from the canonical and bumping this stamp. -->
 
 
 The issue-format contract below is the canonical version (see the stamp). The "Repo notes" section at the end is specific to this repository.
@@ -96,6 +96,43 @@ The core is the required minimum. For issues whose fix has real design surface, 
 - [ ] No vacuous checks; argv runnable from repo root; expect describes the base leg
 - [ ] Program issues: title `[Workstream <letter>] PR n of m`, Sequence section, one issue = one PR
 - [ ] Any NON-EXECUTABLE criterion carries a closed-enum reason and named substitute evidence (not a forced check)
+- [ ] Follow-up issues: passed the necessity gate below, collated into at most two issues per source PR (more needs the maintainer's go-ahead, Priority items excepted), titled `Follow-up from PR #N: <theme>`
+
+### Filing follow-up issues
+
+This section covers work found during a PR review or a PR-feedback round that the PR does not fix. Agents and contributors handle it the same way. Issue-tracer closeouts keep their own full-resolution contract (the issue-tracer skill's `references/full-resolution-contract.md`): a separable concern there is fixed or filed with the user's acknowledgment, and this section does not waive any of its clauses. Collation and the title convention below still apply to issues filed from a trace. Anything the PR introduced is fixed in the PR, not routed here; a small pre-existing item inside the PR's files and scope is fixed only with the maintainer's go-ahead. Nothing is silently dropped. Equally, not every leftover becomes an issue: most review findings are never acted on, and filing all of them turns review noise into backlog noise.
+
+**1. Give every unfixed item exactly one disposition.**
+
+| Disposition | When |
+|---|---|
+| `ABSORB` | An open issue already covers it. Comment on that issue with the new evidence instead of opening a new one. |
+| `FILE` | It passes the necessity gate (step 2) and is Priority, or the maintainer approved it. |
+| `RECORD` | It fails gate 1 or gate 2, or the maintainer declined it. Add a row to the PR body's "Considered, not filed" table (inside `## Summary`) with: the item, the reason, which gate test failed, and a re-evaluation trigger. This is a complete closure. |
+| `ASK` | It needs a product or maintainer decision, it fails only gate 3, or it is an Improvement item awaiting approval. Ask before filing anything; a decline makes it `RECORD` (quote it); an approval makes a gate-3 or Improvement item `FILE`, lands a gate-4 fix in the PR, and sends an unverified item back to investigation. |
+
+`ASK` takes precedence over fixing in the PR when the fix itself needs a product or compatibility decision. `ABSORB` takes precedence over `RECORD` when an open issue already covers the item.
+
+**2. Apply the necessity gate.** `FILE` only when all four hold, or when the maintainer approves an `ASK` proposal. Failing gate 1 or 2 is `RECORD`, except that an unverified item claiming a wedge, fail-open gate, security, or data-loss consequence is `ASK`. Failing only gate 3 makes the item an Improvement proposal (`ASK`). Failing gate 4 means `ABSORB` (already tracked) or `ASK` to fix it in the PR (fixable here), never `RECORD` without the maintainer's decline. A wedge, fail-open gate, security, or data-loss consequence satisfies gate 3.
+
+1. **Verified.** An executed probe or an exact `path:line` source trace proves it on the current head. An `INFERENCE` is never filed.
+2. **Consequential.** There is a concrete, reachable trigger with a correctness, safety or security, data-loss, or workflow-blocking consequence. Coverage gaps, docs, wording, and "could harden" items fail unless they hide a real defect.
+3. **Material.** It is on a hot path, invalidates a gate or contract, or blocks planned work.
+4. **Untracked and not fixable here.** No open issue covers it, and it cannot be fixed in the PR without leaving the PR's files or scope.
+
+**3. Collate the survivors.**
+
+- All `FILE` items from one PR go into one issue titled `Follow-up from PR #<N>: <theme>`, in the executable-contract format above, with at least one acceptance criterion per item, each bound to its own check.
+- Split into a second issue only when the items genuinely need separate PRs. A HIGH-severity item (fail-open gate, security, data loss) may stand alone.
+- More than two follow-up issues from one PR needs the maintainer's go-ahead before filing (Priority items excepted). A standalone HIGH item counts toward the two. Priority items over the budget are still filed, and the overflow is reported.
+
+**4. Respect the two tiers.**
+
+- **Priority** items (a wedge, fail-open gate, security, or data loss) are filed after the closeout review, once the push is published.
+- **Improvement** items that pass the gate are proposed as a list in the final response to the maintainer and filed only once the maintainer approves.
+- Findings about how the review or feedback round was conducted, such as an incomplete ledger or a missed disposition, are `RECORD` unless they block a workflow. This never covers defects in any code, skill text, or gate, changed by the PR or not: PR-introduced ones are fixed in the PR, and a fail-open gate is Priority.
+
+**5. Keep the record true.** A disposition is planned before the closeout review and executed after the push. The published record states it only after it is true on the live artifact: the issue is filed, the comment is posted, or the table row is in the PR body. The swarm-pr-feedback ledger form of this rule is the swarm-pr-feedback skill's `references/followup-dispositions.md`.
 
 ### Repo notes (zmem)
 
