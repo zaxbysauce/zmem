@@ -222,3 +222,12 @@ only); T-03 (issue #282) and T-09 (issue #288) add it to the rows they
 implement, and the durable-queue replay's idempotency key is T-09's
 `applied_ops` table (issue #288) — until then, treat duplicate-delivery
 trust inflation as the known gap the follow-up issue tracks.
+
+
+## Peer ingest trust mode (issue #282)
+
+Every machine importing rows it did not author runs
+`ingest-jsonl --trust untrusted-peer --allow-namespace <ns...>
+--capture-mode auto` (add `--attribute-host <this box>` to stamp local
+attribution). Trust claims inside the rows are clamped, namespaces are
+gated, and evidence records from peers are refused; see docs/CLOUD.md.

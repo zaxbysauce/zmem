@@ -2980,6 +2980,33 @@ def main():
         help="require all-or-nothing validation even without a parseable "
              "evidence discriminator",
     )
+    p_ingest_jsonl.add_argument(
+        "--trust", default="authoritative",
+        choices=["authoritative", "untrusted-peer"],
+        help="issue #282: peer mode clamps every trust-bearing field a row "
+             "could self-declare (taint, signal grounding, confidence, "
+             "trust_score, usage counters) to peer ceilings, stamps "
+             "caller-derived attribution/provenance, and gates EVERY record "
+             "kind against --allow-namespace. Default 'authoritative' keeps "
+             "the own-export behavior byte-identical.",
+    )
+    p_ingest_jsonl.add_argument(
+        "--allow-namespace", dest="allow_namespace", action="append",
+        default=[], metavar="NS",
+        help="peer mode only: namespaces this file may write (repeatable). "
+             "Every record kind is gated: memory and episode rows by their "
+             "own namespace; memberships/expiry by their endpoints' resolved "
+             "namespaces; evidence records are refused outright. Refusals "
+             "are counted in the legacy summary's namespace_refused field "
+             "(strict mode: fatal).",
+    )
+    p_ingest_jsonl.add_argument(
+        "--attribute-host", dest="attribute_host", default=None,
+        help="peer mode only: stamp host:<value> on every ingested row's "
+             "tags (client-carried host:/agent: tags are stripped); without "
+             "--source-ref each row's source_ref is stamped peer:<value> "
+             "(an explicit --source-ref overrides the stamp).",
+    )
 
     # Workstream E (issue #134): governed dataset artifact commands. The
     # exact flag contracts are pinned by the issue and the frozen
@@ -5542,10 +5569,56 @@ def main():
             sys.exit(rc)
         elif args.cmd == "ingest-jsonl":
             _warn_reserved_source_ref(args.source_ref)
+            if args.trust == "untrusted-peer" and args.allow_tombstones:
+                p_ingest_jsonl.error(
+                    "--allow-tombstones cannot be combined with "
+                    "--trust untrusted-peer: a peer file is never "
+                    "authoritative over local row lifetimes (issue #282)")
+            if args.attribute_host and args.trust != "untrusted-peer":
+                p_ingest_jsonl.error(
+                    "--attribute-host only applies to "
+                    "--trust untrusted-peer (issue #282)")
+            if args.trust == "untrusted-peer" and not args.allow_namespace:
+                p_ingest_jsonl.error(
+                    "--trust untrusted-peer requires at least one "
+                    "--allow-namespace (a peer file must be scoped; refusing "
+                    "everything silently is not an import)")
+            if args.trust == "untrusted-peer":
+                for _ns in args.allow_namespace:
+                    _v = (_ns or "").strip()
+                    if (not _v or ":" not in _v
+                            or any(ord(c) < 32 for c in _v)):
+                        p_ingest_jsonl.error(
+                            f"--allow-namespace values must be non-empty "
+                            f"scoped namespaces, got {_ns!r}")
+                    _prefix = _v.split(":", 1)[0]
+                    _rest = _v.split(":", 1)[1]
+                    if _prefix not in ("project", "user", "fleet", "host",
+                                       "agent", "domain") or not _rest:
+                        p_ingest_jsonl.error(
+                            f"--allow-namespace value {_ns!r} is not a valid "
+                            "namespace shape")
+                    if (_prefix in ("fleet", "host", "agent", "domain")
+                            and ":" in _rest):
+                        p_ingest_jsonl.error(
+                            f"--allow-namespace value {_ns!r}: scoped "
+                            "namespace kinds take a colon-free name")
+                from storelib.sync import IngestTrustPolicy
+                _trust_policy = IngestTrustPolicy(
+                    allowed_namespaces=args.allow_namespace,
+                    attribute_host=args.attribute_host,
+                )
+            else:
+                if args.allow_namespace:
+                    p_ingest_jsonl.error(
+                        "--allow-namespace only applies to "
+                        "--trust untrusted-peer (issue #282)")
+                _trust_policy = None
             ingest = cmd_ingest_jsonl_strict if args.strict else cmd_ingest_jsonl
             rc = ingest(conn, in_path=args.in_path, source_ref=args.source_ref,
                         allow_tombstones=args.allow_tombstones,
-                        capture_mode=args.capture_mode)
+                        capture_mode=args.capture_mode,
+                        trust_policy=_trust_policy)
             sys.exit(rc)
         elif args.cmd == "entity-list":
             sys.exit(cmd_entity_list(conn, kind=args.kind, as_json=args.json))

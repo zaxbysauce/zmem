@@ -577,6 +577,25 @@ same care you give the store itself. Treat a compromise of the sync repo as a
 compromise of the store, and rebuild rather than "clean up" — see the
 `--allow-tombstones` rule below for which direction of ingest is trusted.
 
+#### Ingesting a file you do not fully trust (issue #282)
+
+Any ingest whose sender is NOT authoritative over this store — another
+machine's outbox, a peer exchange — must run:
+
+```
+ingest-jsonl --in FILE --trust untrusted-peer \
+  --allow-namespace <your namespaces...> [--attribute-host <this box>] \
+  --capture-mode auto
+```
+
+Peer mode clamps every trust-bearing field the rows self-declare (taint,
+signal grounding, confidence, trust_score, usage counters), stamps
+caller-derived attribution and provenance, gates EVERY record kind against
+the allow-list (evidence records are refused outright), and refuses
+tombstone authority. A corrupt row still never aborts the file (legacy
+lane); `--strict` makes violations fatal. Your own export/rebuild keeps the
+default `--trust authoritative` path byte-identical.
+
 ### The pattern
 
 - **Local side** (the box that owns the real `~/.zmem` store) periodically
