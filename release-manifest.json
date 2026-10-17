@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "ec2d6daa4d077cf9ca4ded2d9751933d609baec6437c7216806b12b75a73d4af",
+  "digest": "36afc08ad688d5f81675ecb7817ef00391ef665037858cbd7edf3908a86303a9",
   "files": {
     "hermes-plugin/__init__.py": "e12a4d65f018b7290a8286de704fc392165d4849c7c903d90511416a94607a03",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -81,7 +81,7 @@
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
     "skills/memory/scripts/storelib/decision_report.py": "453107144d11e8a41f68e0cdb2db9bd9cf78a231fb001ded42d62d562af9c2e1",
     "skills/memory/scripts/storelib/delivery_ledger.py": "7ed877382fff6292a16c3200e6b7ff67b499628e69b337823ff086cfd7432f5f",
-    "skills/memory/scripts/storelib/entity.py": "4d15782640dbcccd5de1bbb9ae0ead40e5fdc70cf6c6cb9c1a0582ad42226d51",
+    "skills/memory/scripts/storelib/entity.py": "71a693497a2241d3802e5b3c4bf518b4e1776cb47962ad77444ea1a6438a10ce",
     "skills/memory/scripts/storelib/episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",
     "skills/memory/scripts/storelib/eval_gold.py": "8a1127f3aa39c2c6a7ba900c0c11098762d0bc63ed9285c182989a0afa55cd6d",
     "skills/memory/scripts/storelib/evidence.py": "7ab43164a8fde71de1430810d3982c970945d69185b3f364a1c7d1c69afa7d92",

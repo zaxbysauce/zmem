@@ -248,7 +248,7 @@ _CLASSIFIER_HOST_MULTI_RE = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+){2,}$")
 # arriving through the sync/ingest `tags` field, which is NOT length-capped)
 # quadratic: measured 7.6 s at 64 KB, extrapolating to minutes at the 1 MiB
 # ingest line cap. The rewrite accepts exactly the same language (pinned by
-   # ReDosRegressionTest.test_rewrite_is_semantically_identical_on_edge_cases)
+# ReDosRegressionTest.test_rewrite_is_semantically_identical_on_edge_cases)
 # and is ~800x faster on that shape.
 _CLASSIFIER_HOST_ONEDOT_RE = re.compile(
     r"^[a-z0-9]*(?:-[a-z0-9]*)+\.[a-z][a-z0-9-]*$"

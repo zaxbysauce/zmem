@@ -1191,10 +1191,28 @@ class ReDosRegressionTest(unittest.TestCase):
     field, which is NOT length-capped) spent 7.6 s inside
     `_CLASSIFIER_HOST_ONEDOT_RE` at 64 KB. The pattern is now written
     `[a-z0-9]*(?:-[a-z0-9]*)+` so every repetition must start with a literal
-    hyphen and the split point is unambiguous. This asserts the SHAPE
-    (scaling + a generous ceiling), not a wall-clock number, so it is stable
-    on loaded CI runners.
+    hyphen and the split point is unambiguous. The scaling RATIO (doubling
+    the input must not more than quadruple the time) is the primary
+    assertion and is machine-independent; the absolute ceiling is a very
+    generous backstop with ~1000x headroom over the linear cost, so a
+    quadratic engine cannot pass it on any runner.
     """
+
+    def test_ipv4_octets_are_ascii_strict(self):
+        """Issue #176 review: the octet class is `[0-9]`, not `\\d`.
+
+        Python's `\\d` matches Unicode decimal digits, so an Arabic-Indic
+        dotted quad used to classify as `host` even though the docstring
+        promises STRICT octets. No ASCII input changes; this pins the
+        tightening so a revert to `\\d` fails.
+        """
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib.entity import classify_entity_kind
+        self.assertEqual(classify_entity_kind("127.0.0.1"), "host")
+        self.assertEqual(classify_entity_kind("255.255.255.255"), "host")
+        # Arabic-Indic (U+0660-0669) and fullwidth (U+FF10-FF19) digits.
+        self.assertEqual(classify_entity_kind("١٢٧.٠.٠.١"), "other")
+        self.assertEqual(classify_entity_kind("１２７.０.０.１"), "other")
 
     def test_host_one_dot_pattern_is_linear_on_hostile_input(self):
         import time
