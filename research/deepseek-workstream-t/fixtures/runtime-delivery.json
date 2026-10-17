@@ -1,0 +1,190 @@
+{
+  "normalization": "Message ids are assigned per case in first-observed order; no timing fields are retained.",
+  "raw_pre_append_decision": {
+    "kind": "enter",
+    "startsRequestSeries": null,
+    "keys": [
+      "kind",
+      "messages"
+    ]
+  },
+  "current_step": [
+    [
+      {
+        "role": "system",
+        "content": [
+          {
+            "type": "text",
+            "text": "You are an AI agent powered by DeepSeek Harness."
+          }
+        ],
+        "source": {
+          "kind": "system-prompt"
+        },
+        "id": "message-1"
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "Probe current-step delivery"
+          }
+        ],
+        "source": {
+          "kind": "user"
+        },
+        "role": "user",
+        "id": "message-2"
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "SYNTHETIC_ZMEM_CONTEXT: use a bounded request deadline."
+          }
+        ],
+        "source": {
+          "kind": "zmem-prep"
+        },
+        "role": "user",
+        "id": "message-3"
+      }
+    ]
+  ],
+  "event_types": [
+    {
+      "session": "prep-current-step",
+      "type": "agent/inbox/spliced"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "turn/start"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "agent/inbox/spliced"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "step/start"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "system/message"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "user/message"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "user/message"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "request/header"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "request/context"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "assistant/message"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "step/end"
+    },
+    {
+      "session": "prep-current-step",
+      "type": "turn/end"
+    }
+  ],
+  "queued_context": [
+    [
+      {
+        "role": "system",
+        "content": [
+          {
+            "type": "text",
+            "text": "You are an AI agent powered by DeepSeek Harness."
+          }
+        ],
+        "source": {
+          "kind": "system-prompt"
+        },
+        "id": "message-1"
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "Probe queued delivery"
+          }
+        ],
+        "source": {
+          "kind": "user"
+        },
+        "role": "user",
+        "id": "message-2"
+      }
+    ],
+    [
+      {
+        "role": "system",
+        "content": [
+          {
+            "type": "text",
+            "text": "You are an AI agent powered by DeepSeek Harness."
+          }
+        ],
+        "source": {
+          "kind": "system-prompt"
+        },
+        "id": "message-1"
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "Probe queued delivery"
+          }
+        ],
+        "source": {
+          "kind": "user"
+        },
+        "role": "user",
+        "id": "message-2"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "done"
+          }
+        ],
+        "source": {
+          "kind": "model",
+          "provider": "prep",
+          "model": "scripted"
+        },
+        "id": "message-3"
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "SYNTHETIC_ZMEM_CONTEXT: use a bounded request deadline."
+          }
+        ],
+        "source": {
+          "kind": "zmem-prep"
+        },
+        "role": "user",
+        "id": "message-4"
+      }
+    ]
+  ]
+}

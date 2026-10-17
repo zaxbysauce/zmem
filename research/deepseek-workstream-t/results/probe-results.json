@@ -1,0 +1,45 @@
+{
+  "schema": "zmem-deepseek-preparation-v1",
+  "node": "v24.16.0",
+  "runtime": "0.2.1-rc.2",
+  "source_commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+  "model": "scripted-in-process-no-network",
+  "results": [
+    {
+      "id": "current-step",
+      "passed": true,
+      "requests": 1,
+      "context_in_first_request": true,
+      "context_logged": true
+    },
+    {
+      "id": "inject-inside-pre-step",
+      "passed": true,
+      "requests": 2,
+      "context_in_first_request": false,
+      "context_in_second_request": true
+    },
+    {
+      "id": "rejection",
+      "passed": true,
+      "requests": 0,
+      "user_messages_logged": 0,
+      "controlled_inner_rejections": 1
+    },
+    {
+      "id": "cancel-before-admission",
+      "passed": true,
+      "requests": 0,
+      "user_messages_logged": 0
+    },
+    {
+      "id": "two-agent-isolation",
+      "passed": true,
+      "requests": 2,
+      "cross_agent_context": false
+    }
+  ],
+  "limitations": [
+    "No real provider, desktop/web carrier, broker, ZMem selector, persisted resume/fork, or compaction backend was exercised."
+  ]
+}
