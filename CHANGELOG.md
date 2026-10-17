@@ -5,6 +5,50 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.103.0] - 2026-10-17
+
+### Added
+- **Request-scoped principals — per-machine token map, revocation and
+  server-derived attribution (issue #281, Workstream T PR 2 of 12):** the
+  MCP server gains a fleet auth mode. `ZMEM_MCP_TOKENS_FILE` names a JSON
+  map of one credential per machine (`token -> {principal, host, harness,
+  namespaces?, capabilities?, revoked?}`); the map takes precedence over
+  `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE` (which keep their exact legacy
+  behavior — one startup principal, byte-identical semantics). The verifier
+  resolves the PRESENTED token by SHA-256 digest (no entry-identity timing
+  leak) to an `AccessToken` whose `client_id` is the principal id, and every
+  namespace guard in `mcp_server.py` (recall/search/recent/session_start,
+  evidence_for/evidence_show, add/update/supersede/invalidate, prefetch,
+  the implicit user:global union, and the ops-token filter) now resolves the
+  CALLER's principal per request via the SDK's request-auth context —
+  never a startup-resolved config. Unknown or missing request principals in
+  map mode fail CLOSED (deny-all, stable `namespace_not_allowed`).
+- **Revocation without restart:** a token marked `"revoked": true` (or
+  removed) stops verifying on the next request after a map reload — file
+  mtime change, checked at most once per second, plus SIGHUP on platforms
+  that have it. A reload whose file is unreadable or invalid keeps the
+  previous map and logs `zmem_mcp_principal_map_reload_failed` (a corrupt
+  rewrite defers pending revocations until a valid rewrite lands). A
+  malformed, empty, or duplicate-principal-id map is a hard startup error
+  (exit 2), matching the never-silently-un-scope rule.
+- **Server-derived write attribution:** in map mode, `add` and `update`
+  strip client-supplied `host:`/`agent:` tags and stamp the presented
+  principal's `host:<id>` / `agent:<harness>` on every stored row; `update`
+  merges the stamp onto inherited tags (benign tags survive, stale
+  attribution is replaced). Legacy-mode writes are byte-identical to before.
+- **Capabilities (parse-only forward compat):** a map entry may declare
+  `capabilities: [read|passive|write|mutate|admin]` (absent = the legacy
+  behavior of that token kind); values are validated and minted into the
+  access token's scopes. Enforcement is owned by the authorization-aware
+  selection PR (#283) and the op queue (#288) — no gate consumes scopes in
+  this release (disclosed in the issue #281 trace).
+- **Tests:** `tests/test_t02_principal.py` — request-principal guard
+  discrimination across two disjoint-scope tokens (both directions),
+  mtime-triggered revocation on the live verifier, add/update attribution
+  stamping with client host:/agent: stripping and inherited-tag merge;
+  legacy single-token behavior stays pinned by the existing
+  `tests/test_mcp_auth.py` matrix.
+
 ## [0.102.0] - 2026-10-16
 
 ### Changed

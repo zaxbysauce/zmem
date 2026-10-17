@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -46,9 +47,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from auth import (  # noqa: E402
     NAMESPACE_NOT_ALLOWED,
     NamespaceDenied,
-    StaticTokenVerifier,
-    TokenConfig,
-    load_token_config,
+    Principal,
+    deny_all_principal,
+    resolve_token_auth,
 )
 from bind_guard import enforce_bind_host, resolve_tls_kwargs  # noqa: E402
 
@@ -1156,14 +1157,101 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     from mcp.server.auth.settings import AuthSettings
     from mcp.server.fastmcp import FastMCP
 
-    # v13 (issue #65, 10.2): the ONE configured token + its optional namespace
-    # allow-list. Enforcement happens at the tool layer (below) closing over
-    # this config — exact under the single-static-token model: any request
-    # that passed verify_token used THIS token, so config.namespaces IS the
-    # caller's scope.
-    token_config = load_token_config()
-    verifier = StaticTokenVerifier(token_config.token)
+    # Workstream T (issue #281): request-scoped principals, two auth modes.
+    # - MAP mode (ZMEM_MCP_TOKENS_FILE): one credential per machine. The
+    #   verifier resolves the PRESENTED token to its principal (an
+    #   AccessToken whose client_id is the principal id); the SDK middleware
+    #   carries it per request; every guard below resolves the caller's
+    #   principal via current_principal() — never a startup-resolved config.
+    #   Revocation is a map edit (mtime change, checked at most once per
+    #   second; SIGHUP where the platform has it) — no restart needed.
+    # - LEGACY mode (ZMEM_MCP_TOKEN / ZMEM_MCP_TOKEN_FILE, v13 issue #65):
+    #   exactly one startup principal; behaviorally identical to the
+    #   single-static-token model this server shipped before.
+    verifier, principal_map, startup_principal = resolve_token_auth()
     resource_url = _build_resource_url(host, port, use_tls=use_tls)
+    if principal_map is not None and hasattr(signal, "SIGHUP"):
+
+        def _reload_principal_map(signum, frame):  # noqa: ANN001
+            principal_map.force_reload()
+
+        try:
+            signal.signal(signal.SIGHUP, _reload_principal_map)
+        except (ValueError, OSError):
+            logger.info("zmem: SIGHUP principal-map reload not registered")
+
+    def current_principal() -> Principal:
+        """Resolve the CALLER's principal for this request (issue #281).
+
+        MAP mode: the SDK middleware verified the presented token and
+        AuthContextMiddleware carries the principal-id-keyed AccessToken;
+        resolve by that id and fail CLOSED (deny-all principal) when the
+        request context or the id is unknown — never a startup-config
+        fallback. LEGACY mode: the single startup principal (pre-request
+        harness calls and no-context transports keep today's behavior).
+        """
+        if principal_map is None:
+            return startup_principal
+        access_token = None
+        try:
+            from mcp.server.auth.middleware.auth_context import (
+                get_access_token,
+            )
+            access_token = get_access_token()
+        except Exception:
+            access_token = None
+        if access_token is None:
+            return deny_all_principal()
+        resolved = principal_map.by_principal_id(
+            getattr(access_token, "client_id", None)
+        )
+        return resolved if resolved is not None else deny_all_principal()
+
+    _ATTRIBUTION_TAG_PREFIXES = ("host:", "agent:")
+
+    def _attribution_tags(principal: Principal) -> list:
+        """Server-derived row attribution (issue #281, AC3): empty for
+        legacy-mode principals (no host/harness) so legacy writes stay
+        byte-identical to before."""
+        stamps = []
+        if principal.host:
+            stamps.append(f"host:{principal.host}")
+        if principal.harness:
+            stamps.append(f"agent:{principal.harness}")
+        return stamps
+
+    def _apply_add_attribution(raw_tags, principal: Principal):
+        """add(): strip client host:/agent: tags, append the principal's
+        stamp (map mode only; legacy passes through untouched)."""
+        stamps = _attribution_tags(principal)
+        if not stamps:
+            return raw_tags
+        cleaned = [
+            t.strip() for t in (raw_tags or "").split(",")
+            if t.strip()
+            and not t.strip().startswith(_ATTRIBUTION_TAG_PREFIXES)
+        ]
+        return ",".join(cleaned + stamps)
+
+    def _merge_update_tags(client_tags, inherited_tags, principal: Principal):
+        """update(): stamp the replacement row (issue #281, AC3).
+
+        tags=None (inheritance) merges with the target row's tags — benign
+        inherited tags survive, stale host:/agent: tags are replaced by the
+        stamp. Client-supplied tags keep the documented override semantics
+        for benign tags (replace) with the stamp appended after the strip.
+        Legacy mode passes client_tags through untouched.
+        """
+        stamps = _attribution_tags(principal)
+        if not stamps:
+            return client_tags
+        base = client_tags if client_tags is not None else (inherited_tags or "")
+        cleaned = [
+            t.strip() for t in base.split(",")
+            if t.strip()
+            and not t.strip().startswith(_ATTRIBUTION_TAG_PREFIXES)
+        ]
+        return ",".join(cleaned + stamps)
 
     def _guard_namespace(
         namespace: Optional[str], *, default: Optional[str] = None
@@ -1176,13 +1264,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         a namespace span the whole store — cannot be proven in-scope).
         Unscoped operator tokens allow everything (pre-v13 behavior).
         """
-        if not token_config.scoped:
+        caller = current_principal()
+        if not caller.scoped:
             return None
         ns = (namespace or "").strip()
         if not ns or ns == "*":
             ns = (default or "").strip()
         try:
-            token_config.check_namespace(ns if ns else None)
+            caller.check_namespace(ns if ns else None)
             return None
         except NamespaceDenied:
             return {
@@ -1198,9 +1287,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     def _include_global_allowed() -> bool:
         """Scoped tokens only get the implicit user:global union when
         user:global is itself in the allow-list (reads never broaden scope)."""
-        if not token_config.scoped:
+        caller = current_principal()
+        if not caller.scoped:
             return True
-        return "user:global" in (token_config.namespaces or frozenset())
+        return "user:global" in (caller.namespaces or frozenset())
 
     def _scoped_evidence_denial(
         namespace: Optional[str], detail: str
@@ -1368,10 +1458,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         page_limit = _evidence_page_limit(limit)
         if page_limit is None:
             return _error(f"limit must be between 1 and {_EVIDENCE_PAGE_MAX}")
+        caller = current_principal()
         scoped_detail = "memory is not associated with an allowed namespace"
-        if token_config.scoped:
+        if caller.scoped:
             result_args = ["evidence", "scoped-for", "--memory-id", mid]
-            for allowed_namespace in sorted(token_config.namespaces or ()):
+            for allowed_namespace in sorted(caller.namespaces or ()):
                 result_args += ["--namespace", allowed_namespace]
             result_args += ["--limit", str(page_limit)]
             if after_id:
@@ -1391,7 +1482,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             result_args += ["--json"]
         result = await _run_store_async(result_args)
         if not result["ok"]:
-            if token_config.scoped:
+            if caller.scoped:
                 if _is_expected_scoped_evidence_denial(result):
                     return _scoped_evidence_denial(None, scoped_detail)
                 return _scoped_evidence_operational_denial(
@@ -1402,20 +1493,20 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             payload = json.loads(result["stdout"])
             namespace = str(payload.get("namespace") or "")
         except (json.JSONDecodeError, AttributeError):
-            if token_config.scoped:
+            if caller.scoped:
                 return _scoped_evidence_operational_denial(
                     None, scoped_detail, result=result, invalid_response=True
                 )
             return _error("invalid evidence response")
         if not isinstance(payload, dict):
-            if token_config.scoped:
+            if caller.scoped:
                 return _scoped_evidence_operational_denial(
                     None, scoped_detail, result=result, invalid_response=True
                 )
             return _error("invalid evidence response")
         denied = _guard_namespace(namespace)
         if denied:
-            if token_config.scoped:
+            if caller.scoped:
                 return _scoped_evidence_operational_denial(
                     None, scoped_detail, result=result, namespace_mismatch=True
                 )
@@ -1460,10 +1551,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if cursor_error:
             return _error(cursor_error)
         assert cursor_args is not None
+        caller = current_principal()
         denied = _guard_namespace(scoped_namespace)
         if denied:
             return denied
-        if token_config.scoped:
+        if caller.scoped:
             assert scoped_namespace is not None
             scoped_detail = "evidence id is not associated with the requested namespace"
             result = await _run_store_async([
@@ -1493,14 +1585,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         try:
             payload = json.loads(result["stdout"])
         except (json.JSONDecodeError, TypeError):
-            if token_config.scoped:
+            if caller.scoped:
                 return _scoped_evidence_operational_denial(
                     scoped_namespace, scoped_detail, result=result,
                     invalid_response=True,
                 )
             return _error("invalid evidence response")
         if not isinstance(payload, dict):
-            if token_config.scoped:
+            if caller.scoped:
                 return _scoped_evidence_operational_denial(
                     scoped_namespace, scoped_detail, result=result,
                     invalid_response=True,
@@ -1588,6 +1680,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error(
                 "taint must be one of: " + ", ".join(_ALLOWED_TAINTS)
             )
+        caller = current_principal()
         args = [
             "add",
             "--namespace", ns,
@@ -1608,8 +1701,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # structured objects.
             "--json",
         ]
-        if tags:
-            args += ["--tags", str(tags)]
+        effective_tags = _apply_add_attribution(tags, caller)
+        if effective_tags:
+            args += ["--tags", effective_tags]
         if source_ref:
             args += ["--source-ref", str(source_ref)]
         # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
@@ -1685,7 +1779,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if not mid:
             return _error("id is required")
         ns_pin = None
-        if token_config.scoped:
+        caller = current_principal()
+        if caller.scoped:
             gr = await _run_store_async(["get", "--id", mid])
             if not gr["ok"]:
                 return _error(
@@ -1742,7 +1837,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         optional override that re-keys the replacement row to another
         namespace (issue #65, 10.3 — parity with the CLI ``update
         --namespace``; a scoped token must be allowed for the TARGET
-        namespace; for scoped tokens without an override the tool reads the
+        namespace; under the per-machine token map (issue #281) explicit
+        tags replace inherited benign tags as documented, but the server
+        always strips client host:/agent: tags and stamps the presented
+        principal's attribution; for scoped tokens without an override the tool reads the
         target's namespace first and PINS it on the update call, so a
         concurrent rekey between the two subprocesses cannot land the
         replacement row outside the token's allow-list). Point-in-time recall before the update returns the OLD
@@ -1765,6 +1863,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             )
         ns_override = (str(namespace or "")).strip()
         ns_pin = None
+        caller = current_principal()
+        stamps = _attribution_tags(caller)
+        target_tags = None
         if ns_override:
             if not _valid_mcp_namespace(ns_override):
                 return _error(
@@ -1775,7 +1876,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             denied = _guard_namespace(ns_override)
             if denied:
                 return denied
-        elif token_config.scoped:
+        elif caller.scoped:
             # Reviewer round: without an override the replacement row
             # INHERITS the target's namespace — a scoped token must not be
             # able to rewrite a row that lives in a foreign namespace. Read
@@ -1788,10 +1889,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     or f"memory id {mid} not found or already superseded"
                 )
             try:
-                target_ns = (json.loads((gr["stdout"] or "").strip())
-                             .get("namespace") or "")
+                _target = json.loads((gr["stdout"] or "").strip())
+                target_ns = _target.get("namespace") or ""
+                target_tags = _target.get("tags") or ""
             except (json.JSONDecodeError, AttributeError):
                 target_ns = ""
+                target_tags = ""
             denied = _guard_namespace(target_ns)
             if denied:
                 return denied
@@ -1836,8 +1939,29 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     "type must be one of: " + ", ".join(_ALLOWED_TYPES)
                 )
             args += ["--type", mt]
-        if tags:
-            args += ["--tags", str(tags)]
+        # Issue #281 AC3: in map mode an unscoped principal with an
+        # inherited-tags update (tags=None) still needs the target row's
+        # current tags to merge the server-side stamp onto (the scoped
+        # branch already read them). Disclosed read-then-write race: a
+        # concurrent fold between this get and the update can drop
+        # concurrently-added BENIGN tags from the replacement row; the
+        # attribution stamp always lands and host:/agent: are always
+        # stripped (see the issue #281 trace, plan-critic F12).
+        if stamps and target_tags is None and tags is None:
+            gr_tags = await _run_store_async(["get", "--id", mid])
+            if gr_tags["ok"]:
+                try:
+                    target_tags = (
+                        json.loads((gr_tags["stdout"] or "").strip())
+                        .get("tags") or ""
+                    )
+                except (json.JSONDecodeError, AttributeError):
+                    target_tags = ""
+            else:
+                target_tags = ""
+        effective_tags = _merge_update_tags(tags, target_tags, caller)
+        if effective_tags:
+            args += ["--tags", effective_tags]
         if source_ref:
             args += ["--source-ref", str(source_ref)]
         if signal:
@@ -1893,7 +2017,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "longer true (issue #59, 4.3)"
             )
         ns_pin = None
-        if token_config.scoped:
+        caller = current_principal()
+        if caller.scoped:
             gr = await _run_store_async(["get", "--id", mid])
             if not gr["ok"]:
                 return _error(
@@ -2020,7 +2145,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # therefore let a project-scoped token admit rows from foreign
         # projects (issue #236). Keep that operator-only capability for
         # unscoped tokens, and fail closed for every scoped token.
-        effective_ops_tokens = [] if token_config.scoped else (ops_tokens or [])
+        effective_ops_tokens = (
+            [] if current_principal().scoped else (ops_tokens or [])
+        )
         for _tok in effective_ops_tokens:
             args += ["--ops-token", _tok]
         r = await _run_store_async(args)
