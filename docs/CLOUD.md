@@ -32,7 +32,7 @@ purposes. Do **not** silently point it at a second physical store. Either:
 - keep one canonical store on the machine and use a local broker that owns it
   while Codex calls into that broker.
 
-This doc still assumes **single-machine phase 1**: one canonical physical
+This doc still assumes **single-machine phase 1** (for fleet deployments see the parity contract in [`docs/FLEET.md`](FLEET.md), which supersedes this assumption): one canonical physical
 store path on one machine. The tiers below are hand-off/sync mechanisms, not a
 license to let each host invent its own store path.
 

@@ -1498,14 +1498,14 @@ The store is local-first, so a session with no filesystem access to this box
 — a Claude Code cloud session, Claude Code Remote (CCR), a GitHub Action —
 can't reach it directly. Three supported tiers cover that, from a read-only
 committed snapshot up to a full sync-repo read/write loop: see
-[`docs/CLOUD.md`](docs/CLOUD.md).
+[`docs/CLOUD.md`](docs/CLOUD.md); the fleet parity contract is [`docs/FLEET.md`](docs/FLEET.md).
 
 ## Security notes
 
 - The store is a **local plaintext SQLite file**. Do not store secrets, credentials,
   or PII in it. The write-time secret scanner is an advisory heuristic (regex +
   entropy), **not a guarantee**.
-- All memory stays on your machine. No telemetry, no cloud calls.
+- All memory stays on your machine. No telemetry, no cloud calls. (Fleet deployments are the documented exception: a hub broker is authoritative for rows, embeddings, ledger and policy — see [`docs/FLEET.md`](docs/FLEET.md).)
 - Remote harvests, sync outboxes, and any future broker inputs are **untrusted
   until reviewed**. Only promote or ingest reviewed content into the shared
   store.
