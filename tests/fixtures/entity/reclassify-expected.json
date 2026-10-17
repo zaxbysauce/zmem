@@ -1,0 +1,32 @@
+{
+  "after_other_link_share": 0.0,
+  "before_other_link_share": 1.0,
+  "changed": 4,
+  "changes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "api.example.com",
+      "new_kind": "host",
+      "old_kind": "other"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "postgres:5432",
+      "new_kind": "service",
+      "old_kind": "other"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "name": "gpt-5.3",
+      "new_kind": "model",
+      "old_kind": "other"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "name": "owner/repo",
+      "new_kind": "repo",
+      "old_kind": "other"
+    }
+  ],
+  "scanned": 5
+}

@@ -18,7 +18,12 @@ import uuid
 import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from storelib.entity import entities_for_memory, entities_for_memories, entity_match_ids
+from storelib.entity import (
+    entities_for_memory,
+    entities_for_memories,
+    entity_match_ids,
+    parse_entity_kind_weights,
+)
 from storelib.evidence import evidence_ids_for_memories_bounded
 from storelib.links import expand_recall_links, graph_seed_ids
 from storelib import beliefs as _beliefs
@@ -593,6 +598,7 @@ def _rrf_fuse(
     k: int = 60,
     *,
     graph_ids: list[str] | None = None,
+    entity_weight_by_memory: dict[str, float] | None = None,
 ) -> list[str]:
     """Reciprocal Rank Fusion: combine ranked lists by 1/(k+rank).
 
@@ -612,14 +618,20 @@ def _rrf_fuse(
     It is keyword-only so ``k`` keeps its original fourth positional slot —
     a positional graph list would silently rebind a caller's ``k``
     (review round).
+
+    Issue #176: ``entity_weight_by_memory`` scales ONLY the entity lane —
+    each entity-arrived id adds ``weights.get(id, 1.0) / (k + rank)``. The
+    bm25, vector, and graph loops are untouched, and a missing mapping (or
+    None) preserves the historical arithmetic exactly.
     """
+    weights = entity_weight_by_memory or {}
     scores: dict[str, float] = {}
     for rank, mid in enumerate(bm25_ids, 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     for rank, mid in enumerate(vec_ids, 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     for rank, mid in enumerate(entity_ids or [], 1):
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+        scores[mid] = scores.get(mid, 0.0) + weights.get(mid, 1.0) / (k + rank)
     for rank, mid in enumerate(graph_ids or [], 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     return sorted(scores, key=scores.get, reverse=True)
@@ -1235,13 +1247,33 @@ def _recall_one_tier(
     # alias ⇒ empty list ⇒ the other lanes fuse exactly as before.
     entity_ids: list[str] = []
     entity_rel_map: dict[str, float] = {}  # memory_id -> matched/total entities
+    entity_weight_map: dict[str, float] = {}  # memory_id -> per-kind RRF weight
     query_emb: bytes | None = None
     if terms:
         if hybrid and _embeddings and _embeddings.is_available():
             query_emb = _embeddings.embed_text(query)
+        matched_kinds: dict[str, set[str]] = {}
         entity_ids, entity_rel_map = entity_match_ids(
             conn, query, ns_list=ns_list, as_of=as_of, limit=limit,
+            matched_kinds=matched_kinds,
         )
+        if entity_ids:
+            # Issue #176: per-kind entity-lane weights. Read the env knob per
+            # tier invocation (the house ZMEM_* contract — never cached at
+            # import); the parser itself never raises. A memory's weight is
+            # the MAX weight across the kinds of the entities the QUERY
+            # matched — only the evidence that fired is weighted, so a
+            # memory also matched through a typed alias keeps full weight
+            # while an `other`-only match is damped (defaults: other=0.6).
+            # Reducing over LINKED kinds instead would be vacuous: every
+            # project-namespace memory carries the namespace project entity
+            # (weight 1.0) and could never be damped.
+            kind_weights = parse_entity_kind_weights()
+            entity_weight_map = {
+                mid: max((kind_weights.get(k, 1.0) for k in kinds),
+                         default=1.0)
+                for mid, kinds in matched_kinds.items()
+            }
     vec_ids: list[str] = []
     if hybrid and _embeddings and _embeddings.is_available() and terms:
         if query_emb is None:
@@ -1347,7 +1379,8 @@ def _recall_one_tier(
         vec_fused = vec_ids[:caps["vec"]]
         ent_fused = entity_ids[:caps["entity"]]
         fused_ids = _rrf_fuse(fts_ids, vec_fused, ent_fused,
-                              graph_ids=graph_ids, k=60)
+                              graph_ids=graph_ids, k=60,
+                              entity_weight_by_memory=entity_weight_map)
         # Issue #136 review round: rows whose ONLY arrival is the graph arm
         # (not also surfaced by a query-measuring arm) are link-rescued
         # neighbors in the #114 sense — they render but never feed the
@@ -4231,6 +4264,11 @@ def explain_recall(
         # expression, from the same helpers the lane uses so the two cannot
         # drift.
         "query_shape": _explain_query_shape(query),
+        # Issue #176: the effective per-kind entity-lane weights actually
+        # used by this recall's RRF fusion (ZMEM_ENTITY_KIND_WEIGHTS after
+        # validation; explain-only — ordinary human recall output never
+        # carries weights).
+        "entity_kind_weights": parse_entity_kind_weights(),
         "target": target,
         # The effective settings that materially shape the verdicts: a
         # below_limit/namespace verdict is only interpretable next to the

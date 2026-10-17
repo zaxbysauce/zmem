@@ -24,7 +24,12 @@ from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SEC
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib import beliefs as _beliefs
 from storelib.organize import organize
-from storelib.entity import ENTITY_KINDS, cmd_entity_list, cmd_entity_merge
+from storelib.entity import (
+    ENTITY_KINDS,
+    cmd_entity_list,
+    cmd_entity_merge,
+    cmd_reclassify_entities,
+)
 from storelib.evidence import (
     EVIDENCE_ASSOCIATION_PAGE_MAX,
     EVIDENCE_KINDS,
@@ -3291,6 +3296,25 @@ def main():
                                      "changes silently); person-to-person "
                                      "merges are allowed but only ever manual.")
 
+    # Issue #176 (Workstream K PR 5): deterministic reclassification of
+    # stored `other` entities. Exactly one mode flag is required; the
+    # dispatch (below, early) keeps dry-run read-only and apply under the
+    # writer lease.
+    p_reclassify = _add_parser(
+        "reclassify-entities",
+        help="propose or apply deterministic kinds for entities currently "
+             "kinded 'other' (classifier only; ids, aliases and links are "
+             "preserved)")
+    p_reclassify.add_argument("--dry-run", dest="dry_run",
+                              action="store_true", default=False,
+                              help="propose classifications without writing")
+    p_reclassify.add_argument("--apply", dest="apply",
+                              action="store_true", default=False,
+                              help="apply proposed classifications")
+    p_reclassify.add_argument("--json", dest="json",
+                              action="store_true", default=False,
+                              help="emit the sorted proposal as JSON")
+
     # v11 (issue #61, 6.5): associative-link inspection + curation. List mode
     # mirrors the `get` not-found contract; --add is the CLI insertion path
     # for the typed relations (updates/extends/derives) and curated supports.
@@ -3645,6 +3669,47 @@ def main():
             if scan_conn is not None:
                 scan_conn.close()
             _release_writer_lease(scan_lease)
+
+    # Issue #176 (Workstream K PR 5): reclassify-entities dispatches EARLY on
+    # both arms, before the shared connect()/_prepare_store lifecycle (the
+    # rescan-secrets precedent), for the same two reasons: dry-run's
+    # zero-database-bytes contract cannot survive _prepare_store's
+    # PRAGMA journal_mode=WAL header rewrite of a DELETE-mode store, and a
+    # missing store must refuse loudly instead of being silently created
+    # empty. Dry-run opens strictly read-only and never touches the writer
+    # lease; --apply takes the writer lease and one rw connection, and
+    # reclassify_entities performs the whole update in one transaction.
+    if args.cmd == "reclassify-entities":
+        if args.dry_run == args.apply:  # both flags or neither
+            ap.error("exactly one of --dry-run or --apply is required")
+        rc_lease = None
+        rc_conn = None
+        try:
+            _wait_for_maintenance_clear("reclassify-entities")
+            if _schema_host is not None:
+                # House UNC/network/OneDrive gate (rekey/rescan early-block
+                # precedent): --apply is a write surface like any other.
+                _schema_host.assert_local_fs(STORE_PATH.resolve().parent)
+            if args.apply:
+                rc_lease = _acquire_writer_lease("reclassify-entities")
+                rc_conn = _connect_existing_store()
+            else:
+                # Read-only handle: on a WAL store, an rw connection's
+                # last-close checkpoint can rewrite the main database file —
+                # dry-run must never hold one (rescan-secrets review).
+                rc_conn = _connect_existing_store_readonly()
+            assert_store_schema_compatible(rc_conn, STORE_PATH)
+            sys.exit(cmd_reclassify_entities(
+                rc_conn, apply_mode=args.apply, as_json=args.json))
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(f"[zmem] reclassify-entities: {exc}", file=sys.stderr)
+            sys.exit(2)
+        finally:
+            if rc_conn is not None:
+                rc_conn.close()
+            _release_writer_lease(rc_lease)
 
     if args.cmd == "reembed" and args.check:
         check_conn = None

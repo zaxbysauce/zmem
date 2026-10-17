@@ -1,0 +1,122 @@
+[
+  {
+    "name": "localhost",
+    "expected": "host"
+  },
+  {
+    "name": "127.0.0.1",
+    "expected": "host"
+  },
+  {
+    "name": "api.example.com",
+    "expected": "host"
+  },
+  {
+    "name": "build-host-1.example",
+    "expected": "host"
+  },
+  {
+    "name": "db-host.internal",
+    "expected": "host"
+  },
+  {
+    "name": "postgres:5432",
+    "expected": "service"
+  },
+  {
+    "name": "api-service",
+    "expected": "service"
+  },
+  {
+    "name": "cache-server",
+    "expected": "service"
+  },
+  {
+    "name": "job-daemon",
+    "expected": "service"
+  },
+  {
+    "name": "gpt-5.3",
+    "expected": "model"
+  },
+  {
+    "name": "claude-3-5-sonnet",
+    "expected": "model"
+  },
+  {
+    "name": "llama-3",
+    "expected": "model"
+  },
+  {
+    "name": "text-embedding-3-small",
+    "expected": "model"
+  },
+  {
+    "name": "owner/repo",
+    "expected": "repo"
+  },
+  {
+    "name": "github.com/openai/codex",
+    "expected": "repo"
+  },
+  {
+    "name": "openai/zmem",
+    "expected": "repo"
+  },
+  {
+    "name": "https://github.com/org/repo",
+    "expected": "repo"
+  },
+  {
+    "name": "C:\\work\\main.py",
+    "expected": "file"
+  },
+  {
+    "name": "/var/log/app.log",
+    "expected": "file"
+  },
+  {
+    "name": "src/main.py",
+    "expected": "file"
+  },
+  {
+    "name": "README.md",
+    "expected": "file"
+  },
+  {
+    "name": "git status",
+    "expected": "command"
+  },
+  {
+    "name": "python -m unittest",
+    "expected": "command"
+  },
+  {
+    "name": "npm test",
+    "expected": "command"
+  },
+  {
+    "name": "docker build .",
+    "expected": "command"
+  },
+  {
+    "name": "ValueError",
+    "expected": "error_class"
+  },
+  {
+    "name": "TimeoutError",
+    "expected": "error_class"
+  },
+  {
+    "name": "DatabaseException",
+    "expected": "error_class"
+  },
+  {
+    "name": "Brett",
+    "expected": "other"
+  },
+  {
+    "name": "alpha",
+    "expected": "other"
+  }
+]
