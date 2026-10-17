@@ -1380,7 +1380,8 @@ Recall's entity lane is weighted per kind through `ZMEM_ENTITY_KIND_WEIGHTS`
 (one JSON object, e.g. `{"other":0.6,"host":1.0}`; defaults are `1.0` for
 every kind except `other=0.6`). The weight scales ONLY the entity lane's RRF
 contribution — BM25, vector, and graph contributions are unchanged — and is
-reduced over the kinds of the entities the QUERY matched, so an `other`-only
+the MAX weight across the kinds of the entities the QUERY matched, so an
+`other`-only
 alias match ranks below a typed match. An invalid object (bad JSON, unknown
 key, nonnumeric/NaN/infinite/zero/negative value) logs exactly one warning
 and uses the complete defaults; recall never crashes on a malformed knob.

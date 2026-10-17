@@ -2975,7 +2975,8 @@ records the motivating measurement and the fixture apply's fixed outcome:
              "after_other_link_share": 0.0, "changed": 4}}
 ```
 
-The 24,826-of-26,511 `other` share (0.9366…) is why `other` defaults below
+The 24,826-of-26,511 `other` share (0.9364…, exactly 24826/26511) is why
+`other` defaults below
 1.0; the `fixture` block is the committed proof the reclassification moves
 the fixture store's other-link share from 1.0 to 0.0 in one apply. Regenerate
 the three fixed fixtures with
@@ -3315,7 +3316,12 @@ section above for the full contract).
 **Entity extraction at write time is deterministic** (no LLM): explicit
 `entity:Name` / `entity:<kind>:Name` tags, the `project:<suffix>` namespace
 suffix, `--tags` tokens (`kind:Name` or plain), backtick-quoted spans in
-content (kind `tool`), and CamelCase identifiers (2+ humps, kind `other`).
+content (kind `tool`), and CamelCase identifiers (2+ humps). Every
+source that carries NO explicit kind — untyped `entity:Name`, plain
+`--tags` tokens, CamelCase identifiers — is resolved by the
+deterministic classifier (`reclassify-entities` documents its
+precedence); a typed `entity:<kind>:Name`/`kind:Name` tag and the
+backtick-`tool` rule stay authoritative.
 Stopwords (`the`, `and`, `use`, …) and path/URL-shaped tokens are never
 entities; `person` entities exist only via an explicit `entity:person:`
 tag. The first kind seen for an alias wins; reconcile with `entity-merge`.

@@ -7,6 +7,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [0.102.0] - 2026-10-16
 
+### Changed
+
+- **Upgrade impact — recall ordering may shift.** The entity lane of recall
+  now carries a per-kind weight that defaults to `0.6` for `other` and `1.0`
+  for every other kind, so a memory reachable only through an `other`-kinded
+  alias contributes `0.6 * 1/(k+rank)` instead of `1/(k+rank)` and can fall
+  below lexical/vector candidates. Set
+  `ZMEM_ENTITY_KIND_WEIGHTS='{"other":1.0}'` to restore the exact
+  pre-0.102.0 ordering. The scale is read fresh on every recall and
+  `recall --explain` reports the effective map under `entity_kind_weights`.
+- Entity values that carry NO explicit kind (plain `--tags` tokens, untyped
+  `entity:Name`, CamelCase identifiers) are now classified into the v2 kinds
+  at write time instead of always landing as `other`. Explicit typed tags
+  (`entity:<kind>:Name`), the `project:` namespace rule, and the
+  backtick→`tool` rule are unchanged and remain authoritative. Stored rows
+  keep their existing kind; `store.py reclassify-entities` is the opt-in
+  path for re-kinding them.
+
 ### Added
 
 - `store.py reclassify-entities --dry-run|--apply [--json]` (issue #176,
@@ -22,7 +40,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   of defaulting them to `other`.
 - Per-kind entity-lane RRF weights (issue #176): `ZMEM_ENTITY_KIND_WEIGHTS`
   (one JSON object; defaults 1.0 for every kind except `other=0.6`) scales
-  ONLY the entity lane's fusion contribution — reduced over the kinds of
+  ONLY the entity lane's fusion contribution — the MAX weight across the kinds of
   the query-matched entities; BM25, vector, and graph contributions are
   unchanged; invalid configuration logs exactly one warning and uses the
   complete defaults; `recall --explain` reports the effective weights under

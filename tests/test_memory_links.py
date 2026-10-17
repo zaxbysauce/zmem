@@ -50,6 +50,9 @@ def _base_env(store_path: str) -> dict:
     env.pop("ZMEM_BACKUP_DIR", None)
     env.pop("ZMEM_MMR_LAMBDA", None)
     env.pop("ZMEM_LINK_THRESHOLD", None)
+    # Issue #176 review: the explain byte golden below assumes DEFAULT
+    # entity-kind weights; an ambient override rewrites the envelope bytes.
+    env.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
     return env
 
 

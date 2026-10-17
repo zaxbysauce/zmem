@@ -716,15 +716,39 @@ class EntityWeightTest(unittest.TestCase):
     RRF weighting. Parser and _rrf_fuse are probed in-process; the recall
     wiring backstop drives the real CLI in a subprocess."""
 
+    # Issue #176 review: the end-to-end test below pins scratch store/model
+    # env vars and purges sys.modules; both must be restored or they leak into
+    # every later test in this process.
+    _LEAK_KEYS = ("ZMEM_ENTITY_KIND_WEIGHTS", "ZMEM_STORE", "ZMEM_DATA",
+                  "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD")
+
     def setUp(self):
-        self._saved = os.environ.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
+        self._saved = {k: os.environ.get(k) for k in self._LEAK_KEYS}
+        self._saved_modules = {k: v for k, v in sys.modules.items()
+                               if k == "storelib" or k.startswith("storelib.")}
+        for key in self._LEAK_KEYS:
+            os.environ.pop(key, None)
+        # Issue #176 review: the malformed-config warning is one-shot per
+        # (process, raw value), so a test asserting a per-call count must
+        # reset that latch or a repeat value would legitimately warn zero
+        # times and read as a failure.
+        try:
+            import storelib.entity as _entity_mod
+            _entity_mod._WEIGHTS_WARNED.clear()
+        except ImportError:
+            pass
         self.addCleanup(self._restore)
 
     def _restore(self):
-        if self._saved is None:
-            os.environ.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
-        else:
-            os.environ["ZMEM_ENTITY_KIND_WEIGHTS"] = self._saved
+        for key in self._LEAK_KEYS:
+            if self._saved.get(key) is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = self._saved[key]
+        for mod in [m for m in list(sys.modules)
+                    if m == "storelib" or m.startswith("storelib.")]:
+            del sys.modules[mod]
+        sys.modules.update(self._saved_modules)
 
     def _parse(self, env_value=None):
         import contextlib
@@ -754,6 +778,46 @@ class EntityWeightTest(unittest.TestCase):
         self.assertEqual(weights["service"], 1.0)
         self.assertEqual(err.strip(), "")
 
+    def test_malformed_weight_warns_once_per_process(self):
+        """Issue #176 review: AC5/CHANGELOG say a bad knob logs EXACTLY ONE
+        warning. The parser runs once per recall TIER and again for
+        --explain, so an unguarded print emitted 2-3 identical lines per
+        command. Drive the real CLI and count stderr lines."""
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix="zmem-ew-warn-") as tmp:
+            env = dict(os.environ)
+            env.update({
+                "ZMEM_STORE": str(Path(tmp) / "store.sqlite"),
+                "ZMEM_MODELS_DIR": str(Path(tmp) / "no-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_EMBED_PROFILE": "fake",
+                "ZMEM_ENTITY_KIND_WEIGHTS": "{bad",
+            })
+            env.pop("ZMEM_DATA", None)
+            init = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "store.py"), "init"],
+                env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(init.returncode, 0, init.stderr)
+            subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "store.py"), "add",
+                 "--namespace", "project:ew", "--type", "lesson",
+                 "--content", "zzzalpha keyword row for the warn probe",
+                 "--tags", "zzzalpha", "--signal", "user"],
+                env=env, capture_output=True, text=True, timeout=120)
+            for extra in ([], ["--explain"]):
+                r = subprocess.run(
+                    [sys.executable, str(SCRIPTS_DIR / "store.py"),
+                     "recall", "--query", "zzzalpha", "--namespace",
+                     "project:ew", "--json", "--limit", "1", "--no-hybrid",
+                     "--no-mmr", *extra],
+                    env=env, capture_output=True, text=True, timeout=120)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                lines = [ln for ln in r.stderr.splitlines()
+                         if "entity-kind weights" in ln]
+                self.assertEqual(len(lines), 1,
+                                 f"exactly one warning expected for "
+                                 f"{extra or ['plain recall']}, got {lines}")
+
     def test_malformed_unknown_and_nonpositive_weights_fall_back_and_warn(self):
         from schema_meta import ENTITY_KINDS
         defaults = {k: (0.6 if k == "other" else 1.0) for k in ENTITY_KINDS}
@@ -766,6 +830,14 @@ class EntityWeightTest(unittest.TestCase):
             '{"host": Infinity}',         # infinity literal
             json.dumps({"host": 0}),      # zero
             json.dumps({"host": -1.5}),   # negative
+            json.dumps({"host": True}),   # JSON boolean is not a number
+            # Issue #176 review: these two escaped the naive `except
+            # ValueError` and raised INTO recall, falsifying the documented
+            # "never raises" contract — a 400-digit integer literal makes
+            # float() raise OverflowError, deeply nested JSON makes
+            # json.loads raise RecursionError.
+            '{"host": ' + "1" * 400 + "}",   # OverflowError
+            "[" * 20_000,                     # RecursionError
         ]
         for value in invalid:
             weights, err = self._parse(value)

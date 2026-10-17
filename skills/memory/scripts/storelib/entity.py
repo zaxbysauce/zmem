@@ -20,14 +20,20 @@ parses but does nothing would violate the repo's no-unwired-code release rule.
 
 Extraction sources → kinds (deterministic mapping, first-seen kind wins):
 
+A source carrying an explicit kind is AUTHORITATIVE and is never
+re-classified. A source carrying NO explicit kind is resolved by the
+deterministic ``classify_entity_kind`` (host/service/model/repo/file/
+command/error_class/other, in that precedence).
+
     source                                   kind
     ---------------------------------------------------------------
-    ``entity:Name`` / ``entity:<kind>:Name``  other / the named kind
+    ``entity:<kind>:Name`` (typed)           the named kind
+    ``entity:Name`` (untyped)                classify_entity_kind(Name)
     ``project:<suffix>`` namespace            project
     ``--tags`` token ``<kind>:<Name>``        the named kind
-    ``--tags`` plain token                    other
+    ``--tags`` plain token                    classify_entity_kind(token)
     backtick-quoted span in content           tool
-    CamelCase identifier (2+ humps) in content other
+    CamelCase identifier (2+ humps) in content classify_entity_kind(name)
 
 ``person`` entities are NEVER auto-detected: they can only be created via an
 explicit ``entity:person:Name`` tag, and nothing auto-merges entities of any
@@ -232,10 +238,20 @@ _CLASSIFIER_BASENAMES = frozenset({
 # the one-dot "hyphen in first label + alphabetic final label" shape. The
 # digit-leading-final-label rejection reroutes model-shaped names (gpt-5.3,
 # claude-3.5sonnet) away from host so the model prefix rule can take them.
-_CLASSIFIER_IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_CLASSIFIER_IPV4_RE = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
 _CLASSIFIER_HOST_MULTI_RE = re.compile(r"^[a-z0-9-]+(?:\.[a-z0-9-]+){2,}$")
+# The one-label form is written as `alnum* (- alnum*)+` so each repetition
+# MUST begin with a literal hyphen: the split point is therefore unambiguous
+# and the engine backtracks linearly. The previous `[a-z0-9-]*-[a-z0-9-]*`
+# form had two overlapping classes with the hyphen in an optional position,
+# which made a hyphen-dense NON-MATCHING input (e.g. a long `a-a-a-` token
+# arriving through the sync/ingest `tags` field, which is NOT length-capped)
+# quadratic: measured 7.6 s at 64 KB, extrapolating to minutes at the 1 MiB
+# ingest line cap. The rewrite accepts exactly the same language (pinned by
+   # ReDosRegressionTest.test_rewrite_is_semantically_identical_on_edge_cases)
+# and is ~800x faster on that shape.
 _CLASSIFIER_HOST_ONEDOT_RE = re.compile(
-    r"^[a-z0-9-]*-[a-z0-9-]*\.[a-z][a-z0-9-]*$"
+    r"^[a-z0-9]*(?:-[a-z0-9]*)+\.[a-z][a-z0-9-]*$"
 )
 # service: a host-ish label with a 1-5 digit port, or a WHOLE-WORD service
 # noun (word-bounded: "databaseexception" must fall through to error_class,
@@ -339,6 +355,12 @@ def _default_entity_kind_weights() -> dict[str, float]:
     return weights
 
 
+# Values of ZMEM_ENTITY_KIND_WEIGHTS already warned about in THIS process, so
+# one bad knob produces one stderr line per command instead of one per recall
+# tier (recall parses the knob once per tier plus once for --explain).
+_WEIGHTS_WARNED: set[str] = set()
+
+
 def parse_entity_kind_weights() -> dict[str, float]:
     """Parse ZMEM_ENTITY_KIND_WEIGHTS into a per-kind weight map.
 
@@ -346,39 +368,58 @@ def parse_entity_kind_weights() -> dict[str, float]:
     missing variable returns the defaults SILENTLY. Any invalid
     configuration — non-JSON, non-object, unknown key, nonnumeric value,
     NaN/infinity, zero, or negative — logs EXACTLY ONE warning line to
-    stderr and returns the COMPLETE defaults (no partial overrides). This
-    parser never raises: recall reads it on every invocation and malformed
-    operator configuration must degrade, not crash.
+    stderr PER PROCESS PER DISTINCT BAD VALUE (recall parses once per tier
+    plus once more for --explain, so an unguarded print repeated the
+    identical line 2-3 times per command), and returns the COMPLETE
+    defaults (no partial overrides).
+
+    This parser NEVER raises: recall reads it on every tier of every
+    invocation and malformed operator configuration must degrade, not
+    crash. Two escape classes the naive `except ValueError` missed are
+    handled explicitly - ``RecursionError`` from ``json.loads`` on deeply
+    nested JSON, and ``OverflowError`` from ``float()`` on an integer
+    literal too large for a C double - and the whole body is wrapped so no
+    future edit can reintroduce an escape into recall.
     """
     raw = os.environ.get("ZMEM_ENTITY_KIND_WEIGHTS")
     if raw is None:
         return _default_entity_kind_weights()
 
     def _fallback(reason: str) -> dict[str, float]:
-        # One warning line, complete defaults, nothing partially applied.
-        print(f"[zmem] entity-kind weights: {reason}; using defaults",
-              file=sys.stderr)
+        # One warning line per (process, raw value), then complete defaults.
+        global _WEIGHTS_WARNED
+        if raw not in _WEIGHTS_WARNED:
+            _WEIGHTS_WARNED.add(raw)
+            print(f"[zmem] entity-kind weights: {reason}; using defaults",
+                  file=sys.stderr)
         return _default_entity_kind_weights()
 
     try:
-        obj = json.loads(raw)
-    except ValueError:
-        return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is not valid JSON")
-    if not isinstance(obj, dict):
-        return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is not a JSON object")
-    for key, value in obj.items():
-        if key not in ENTITY_KINDS:
-            return _fallback(f"unknown entity kind {key!r}")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return _fallback(f"weight for {key!r} is not a number")
-        if not math.isfinite(float(value)):
-            return _fallback(f"weight for {key!r} is not finite")
-        if float(value) <= 0:
-            return _fallback(f"weight for {key!r} must be positive")
-    weights = _default_entity_kind_weights()
-    for key, value in obj.items():
-        weights[key] = float(value)
-    return weights
+        try:
+            obj = json.loads(raw)
+        except RecursionError:
+            return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is nested too deeply")
+        except ValueError:
+            return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is not valid JSON")
+        if not isinstance(obj, dict):
+            return _fallback("ZMEM_ENTITY_KIND_WEIGHTS is not a JSON object")
+        for key, value in obj.items():
+            if key not in ENTITY_KINDS:
+                return _fallback(f"unknown entity kind {key!r}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return _fallback(f"weight for {key!r} is not a number")
+            number = float(value)  # OverflowError on a huge int literal
+            if not math.isfinite(number):
+                return _fallback(f"weight for {key!r} is not finite")
+            if number <= 0:
+                return _fallback(f"weight for {key!r} must be positive")
+        weights = _default_entity_kind_weights()
+        for key, value in obj.items():
+            weights[key] = float(value)
+        return weights
+    except Exception as exc:  # noqa: BLE001 - the never-raise contract
+        return _fallback(f"ZMEM_ENTITY_KIND_WEIGHTS could not be read "
+                         f"({type(exc).__name__})")
 
 
 def _other_link_share(conn: sqlite3.Connection,

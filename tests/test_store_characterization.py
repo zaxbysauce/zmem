@@ -580,6 +580,7 @@ class CharacterizationTests(unittest.TestCase):
         # 53 -> 54: the decision-log report read command joined (issue #249).
         # 54 -> 55: the embedding lane health command joined (issue #131).
         # 55 -> 56: the state classifier dry-run command joined (issue #174).
+        # 56 -> 57: the entity reclassification command joined (issue #176).
         self.assertEqual(len(KNOWN_SUBCMDS), 57)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
@@ -597,6 +598,7 @@ class CharacterizationTests(unittest.TestCase):
                 self.assertIn(flag, r.stdout,
                               f"{cmd} --help must expose {flag} (issue #137)")
         # 55 -> 56: the state classifier dry-run command joined (issue #174).
+        # 56 -> 57: the entity reclassification command joined (issue #176).
         self.assertEqual(len(KNOWN_SUBCMDS), 57)
 
     def test_embedding_health_help_surface(self):

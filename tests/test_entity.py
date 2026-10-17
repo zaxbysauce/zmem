@@ -45,6 +45,9 @@ def _base_env(store_path: str) -> dict:
     env.pop("ZMEM_DATA", None)
     env.pop("ZMEM_BACKUP_DIR", None)
     env.pop("ZMEM_MMR_LAMBDA", None)
+    # Issue #176 review: the byte-oracle assertions below assume DEFAULT
+    # entity-kind weights; an ambient override would silently rewrite them.
+    env.pop("ZMEM_ENTITY_KIND_WEIGHTS", None)
     return env
 
 
@@ -56,6 +59,22 @@ class _Store(unittest.TestCase):
         self.store = str(Path(self.tmp) / "store.sqlite")
         self.env = _base_env(self.store)
         self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def run_store_bytes(self, *args, env=None, check=True):
+        """Raw-bytes capture for byte-oracle assertions. `text=True` applies
+        universal-newline decoding, which rewrites a CRLF-terminated payload
+        to LF BEFORE any comparison, so the LF-only byte contract could not
+        fail its own test (issue #176 review)."""
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), *args],
+            capture_output=True, env=env or self.env, timeout=120,
+        )
+        if check and r.returncode != 0:
+            self.fail(
+                f"store.py {' '.join(args)} exited {r.returncode}\n"
+                f"stdout: {r.stdout[:500]!r}\nstderr: {r.stderr[:500]!r}"
+            )
+        return r
 
     def run_store(self, *args, env=None, check=True):
         r = subprocess.run(
@@ -985,11 +1004,16 @@ class ReclassifyTest(_Store):
     def test_dry_run_matches_expected_without_sqlite_change(self):
         self._seed()
         before = Path(self.store).read_bytes()
-        r = self.run_store("reclassify-entities", "--dry-run", "--json")
+        # Raw bytes: a text=True capture would universal-newline-decode CRLF
+        # to LF BEFORE the comparison, so the LF-only byte contract could
+        # never fail this test (issue #176 review).
+        r = self.run_store_bytes("reclassify-entities", "--dry-run", "--json")
         self.assertEqual(Path(self.store).read_bytes(), before,
                          "dry-run must change zero database bytes")
         expected = self.EXPECTED.read_bytes()
-        self.assertEqual(r.stdout.encode("utf-8"), expected,
+        self.assertNotIn(b"\r", r.stdout,
+                         "the envelope must be LF-only bytes")
+        self.assertEqual(r.stdout, expected,
                          "dry-run JSON must equal reclassify-expected.json")
         leases = list(Path(self.tmp).rglob("*.lease"))
         self.assertEqual(leases, [], "dry-run must not leave a writer lease")
@@ -998,9 +1022,11 @@ class ReclassifyTest(_Store):
         self._seed()
         conn = self.db()
         before = self._snapshot(conn)
-        r = self.run_store("reclassify-entities", "--apply", "--json")
+        r = self.run_store_bytes("reclassify-entities", "--apply", "--json")
         expected = self.EXPECTED.read_bytes()
-        self.assertEqual(r.stdout.encode("utf-8"), expected,
+        self.assertNotIn(b"\r", r.stdout,
+                         "the envelope must be LF-only bytes")
+        self.assertEqual(r.stdout, expected,
                          "apply JSON must byte-equal the dry-run oracle")
         after = self._snapshot(conn)
         kinds = {row[0]: row[1] for row in after["entity"]}
@@ -1088,6 +1114,125 @@ class ReclassifyCliTest(_Store):
         writers.unlink()
         r2 = self.run_store("reclassify-entities", "--dry-run")
         self.assertEqual(r2.returncode, 0, r2.stderr)
+
+
+    def test_dry_run_never_acquires_the_writer_lease(self):
+        """Issue #176 review: AC4 says "dry-run acquires no writer lease".
+
+        The post-hoc `rglob("*.lease") == []` assertions cannot prove it —
+        acquire-then-release in the CLI's `finally` leaves the same empty
+        directory, and a mutation hoisting `_acquire_writer_lease` above the
+        `if args.apply:` branch passed the whole suite. Discriminating
+        probe: block the lease DIRECTORY with a regular file so an arm that
+        tries to acquire MUST fail. Dry-run must still succeed (it never
+        touches the directory) while apply on the same store fails loudly.
+        """
+        self._seed_one()
+        writers = Path(self.tmp) / ".zmem-writers"
+        writers.write_text("lease-dir blocker", encoding="utf-8")
+        dry = self.run_store("reclassify-entities", "--dry-run")
+        self.assertEqual(dry.returncode, 0,
+                         "dry-run must not need the lease directory: "
+                         f"{dry.stderr}")
+        self.assertIn("scanned=1 changed=1", dry.stdout)
+        applied = self.run_store("reclassify-entities", "--apply", check=False)
+        self.assertNotEqual(applied.returncode, 0,
+                            "apply MUST try to acquire the lease")
+        writers.unlink()
+
+
+class WriteTimeClassificationTest(_Store):
+    """Issue #176 review: the WRITE-TIME classification path is behavior and
+    needs an end-to-end pin.
+
+    The only classifier test called `classify_entity_kind` directly, so a
+    mutation reverting all three `extract_entities` classify sites to
+    `"other"` kept the suite green (42/42 here plus 4 sibling modules).
+    These drive the real `store.py add` and assert the STORED kinds.
+    """
+
+    def _kinds(self):
+        return {e["name"]: e["kind"] for e in
+                json.loads(self.run_store("entity-list", "--json").stdout)}
+
+    def test_plain_tags_are_classified_at_write_time(self):
+        self.run_store("init")
+        # A slash-bearing tag never becomes an entity at all (`_eligible_name`
+        # refuses path shapes), so this asserts only slash-free ones.
+        self.add("seed", "--tags", "python,postgres:5432,api.example.com")
+        kinds = self._kinds()
+        self.assertEqual(kinds.get("python"), "command")
+        self.assertEqual(kinds.get("postgres:5432"), "service")
+        self.assertEqual(kinds.get("api.example.com"), "host")
+
+    def test_untyped_entity_tag_is_classified_and_typed_tag_wins(self):
+        self.run_store("init")
+        # Untyped `entity:Name` carries no kind -> classified (host).
+        self.add("seed a", "--tags", "entity:api.example.com")
+        # A TYPED tag is authoritative: `Brett` classifies to `other`, but
+        # `entity:person:Brett` must stay `person`.
+        self.add("seed b", "--tags", "entity:person:Brett")
+        kinds = self._kinds()
+        self.assertEqual(kinds.get("api.example.com"), "host")
+        self.assertEqual(kinds.get("Brett"), "person")
+
+    def test_camelcase_identifier_in_content_is_classified(self):
+        self.run_store("init")
+        self.add("boom ValueError while handling TimeoutError here")
+        kinds = self._kinds()
+        self.assertEqual(kinds.get("ValueError"), "error_class")
+        self.assertEqual(kinds.get("TimeoutError"), "error_class")
+
+
+class ReDosRegressionTest(unittest.TestCase):
+    """Issue #176 review: the classifier must not backtrack quadratically.
+
+    A hostile hyphen-dense name (reachable through the sync/ingest `tags`
+    field, which is NOT length-capped) spent 7.6 s inside
+    `_CLASSIFIER_HOST_ONEDOT_RE` at 64 KB. The pattern is now written
+    `[a-z0-9]*(?:-[a-z0-9]*)+` so every repetition must start with a literal
+    hyphen and the split point is unambiguous. This asserts the SHAPE
+    (scaling + a generous ceiling), not a wall-clock number, so it is stable
+    on loaded CI runners.
+    """
+
+    def test_host_one_dot_pattern_is_linear_on_hostile_input(self):
+        import time
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib.entity import _CLASSIFIER_HOST_ONEDOT_RE
+        small = time.perf_counter()
+        _CLASSIFIER_HOST_ONEDOT_RE.fullmatch("a-" * 64_000 + ".")
+        mid = time.perf_counter()
+        _CLASSIFIER_HOST_ONEDOT_RE.fullmatch("a-" * 128_000 + ".")
+        large = time.perf_counter()
+        t_small, t_large = mid - small, large - mid
+        # A quadratic engine more than quadruples per doubling AND cannot
+        # finish 256 KB in seconds (it measured ~7.6 s at only 64 KB).
+        self.assertLess(t_large, 2.0,
+                        f"host pattern looks super-linear: "
+                        f"{t_small:.4f}s@128KB -> {t_large:.4f}s@256KB")
+        self.assertLess(t_large / max(t_small, 1e-6), 4.0,
+                        f"doubling input more than quadrupled the time "
+                        f"({t_small:.4f}s -> {t_large:.4f}s)")
+
+    def test_rewrite_is_semantically_identical_on_edge_cases(self):
+        """The rewrite changes SPEED only, never the accepted language.
+
+        The oracle is the pre-rewrite pattern reproduced verbatim below.
+        """
+        import re
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib.entity import _CLASSIFIER_HOST_ONEDOT_RE
+        legacy = re.compile(r"^[a-z0-9-]*-[a-z0-9-]*\.[a-z][a-z0-9-]*$")
+        for value in ("build-host-1.example", "db-host.internal",
+                      "my-script.py", "app-config.json", "a--b.com",
+                      "a-.com", "-a.com", "a.b-c.com", "a.1b", "a.9",
+                      "ab.cd", "a-b", "", ".com", "a.", "a-b-c-d.e", "x-y.z-",
+                      "9-9.9a", "A-B.c", "a-b.c.d", "---.a"):
+            self.assertEqual(
+                bool(_CLASSIFIER_HOST_ONEDOT_RE.fullmatch(value)),
+                bool(legacy.fullmatch(value)),
+                f"rewrite changed the accepted language for {value!r}")
 
 
 if __name__ == "__main__":
