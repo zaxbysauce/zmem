@@ -1,0 +1,188 @@
+{
+  "schema": "hy-zmem-experiments-v1",
+  "synthetic_only": true,
+  "production_code_modified": false,
+  "model_benchmark": false,
+  "observations": [
+    {
+      "case": "distinct-task-identical-baseline",
+      "mode": "model-absent-exact",
+      "guarded": false,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41,task:issue42",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "same-task-identical-baseline",
+      "mode": "model-absent-exact",
+      "guarded": false,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "unknown-subject-baseline",
+      "mode": "model-absent-exact",
+      "guarded": false,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "different-namespaces-baseline",
+      "mode": "model-absent-exact",
+      "guarded": false,
+      "live_rows": 2,
+      "same_id": false,
+      "evidence_count_on_returned_row": 1,
+      "returned_tags": "task:issue42",
+      "guard_rejections": 0,
+      "original_source_retained": false
+    },
+    {
+      "case": "distinct-task-semantic-policy-baseline",
+      "mode": "controlled-semantic-candidate",
+      "guarded": false,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41,task:issue42",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "same-task-semantic-policy-baseline",
+      "mode": "controlled-semantic-candidate",
+      "guarded": false,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "distinct-task-identical-guard",
+      "mode": "model-absent-exact",
+      "guarded": true,
+      "live_rows": 2,
+      "same_id": false,
+      "evidence_count_on_returned_row": 1,
+      "returned_tags": "task:issue42",
+      "guard_rejections": 1,
+      "original_source_retained": false
+    },
+    {
+      "case": "same-task-identical-guard",
+      "mode": "model-absent-exact",
+      "guarded": true,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "unknown-subject-guard",
+      "mode": "model-absent-exact",
+      "guarded": true,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "different-namespaces-guard",
+      "mode": "model-absent-exact",
+      "guarded": true,
+      "live_rows": 2,
+      "same_id": false,
+      "evidence_count_on_returned_row": 1,
+      "returned_tags": "task:issue42",
+      "guard_rejections": 0,
+      "original_source_retained": false
+    },
+    {
+      "case": "distinct-task-semantic-policy-guard",
+      "mode": "controlled-semantic-candidate",
+      "guarded": true,
+      "live_rows": 2,
+      "same_id": false,
+      "evidence_count_on_returned_row": 1,
+      "returned_tags": "task:issue42",
+      "guard_rejections": 1,
+      "original_source_retained": false
+    },
+    {
+      "case": "same-task-semantic-policy-guard",
+      "mode": "controlled-semantic-candidate",
+      "guarded": true,
+      "live_rows": 1,
+      "same_id": true,
+      "evidence_count_on_returned_row": 2,
+      "returned_tags": "task:issue41",
+      "guard_rejections": 0,
+      "original_source_retained": true
+    },
+    {
+      "case": "evidence-to-lesson-lineage",
+      "old_evidence_preserved": true,
+      "replacement_evidence_separate": true,
+      "lesson_original_evidence": true,
+      "replacement_update_of": true,
+      "old_episode_membership_retained": true,
+      "replacement_automatically_in_episode": false,
+      "existing_episode_add_restores_current_task_join": true,
+      "lesson_signal_unchanged": true,
+      "lesson_confidence_unchanged": true
+    },
+    {
+      "case": "task-retraction",
+      "lesson_still_live": true,
+      "lesson_original_evidence_preserved": true,
+      "original_evidence_still_resolvable": true
+    },
+    {
+      "case": "existing-opt-in-curator-seam",
+      "report": {
+        "refreshed": 1,
+        "created": 1,
+        "updated": 0,
+        "actions_applied": 0
+      },
+      "adapter_calls": [
+        {
+          "keys": [
+            "head_id",
+            "head_state",
+            "section_evidence_ids",
+            "section_source_ids",
+            "source_rows"
+          ],
+          "source_rows": 1
+        }
+      ],
+      "real_model_called": false,
+      "memory_rows": 1
+    }
+  ],
+  "probe_sha256": "05ad26efd74f7eaab2eaea5b1a9a78ce00f861677715f3043623f0d3757f789c",
+  "source_sha256": {
+    "skills\\memory\\scripts\\storelib\\write.py": "90b2992c6ff1bcfc9a92661533965bd0468f5c1bc280bab169d291983075725e",
+    "skills\\memory\\scripts\\storelib\\evidence.py": "c4f0eaac82806f1052ea3c5bb9a8ce3aa0e32c67d61852d42f5ba4b52e3417ae",
+    "skills\\memory\\scripts\\storelib\\episodes.py": "e22bfff4ce4c6176af6c744d3c4d00195b0d99ff3579c8643676e354152d94cb",
+    "skills\\memory\\scripts\\storelib\\beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4"
+  }
+}

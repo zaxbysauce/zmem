@@ -1,0 +1,98 @@
+{
+  "schema": "hy-zmem-real-semantic-v1",
+  "model": "cached-minilm-onnx",
+  "model_sha256": "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5",
+  "index": "native sqlite-vec",
+  "threads": [
+    2,
+    1
+  ],
+  "synthetic_pairs": true,
+  "observations": [
+    {
+      "case": "task-closeout",
+      "guarded": false,
+      "cosine": 0.948711,
+      "same_id": true,
+      "live_rows": 1
+    },
+    {
+      "case": "issue-number",
+      "guarded": false,
+      "cosine": 0.976841,
+      "same_id": true,
+      "live_rows": 1
+    },
+    {
+      "case": "same-task-paraphrase",
+      "guarded": false,
+      "cosine": 0.763633,
+      "same_id": false,
+      "live_rows": 2
+    },
+    {
+      "case": "different-files",
+      "guarded": false,
+      "cosine": 0.90025,
+      "same_id": true,
+      "live_rows": 1
+    },
+    {
+      "case": "same-general-lesson",
+      "guarded": false,
+      "cosine": 1.0,
+      "same_id": true,
+      "live_rows": 1
+    },
+    {
+      "case": "unknown-subject",
+      "guarded": false,
+      "cosine": 1.0,
+      "same_id": true,
+      "live_rows": 1
+    },
+    {
+      "case": "task-closeout",
+      "guarded": true,
+      "cosine": 0.948711,
+      "same_id": false,
+      "live_rows": 2
+    },
+    {
+      "case": "issue-number",
+      "guarded": true,
+      "cosine": 0.976841,
+      "same_id": false,
+      "live_rows": 2
+    },
+    {
+      "case": "same-task-paraphrase",
+      "guarded": true,
+      "cosine": 0.763633,
+      "same_id": false,
+      "live_rows": 2
+    },
+    {
+      "case": "different-files",
+      "guarded": true,
+      "cosine": 0.90025,
+      "same_id": false,
+      "live_rows": 2
+    },
+    {
+      "case": "same-general-lesson",
+      "guarded": true,
+      "cosine": 1.0,
+      "same_id": true,
+      "live_rows": 1
+    },
+    {
+      "case": "unknown-subject",
+      "guarded": true,
+      "cosine": 1.0,
+      "same_id": true,
+      "live_rows": 1
+    }
+  ],
+  "limitation": "Small constructed corpus; not held-out quality or prevalence measurement. Guard uses explicit oracle subjects, not extraction heuristics."
+}

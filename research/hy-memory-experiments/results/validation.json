@@ -1,0 +1,10 @@
+{
+  "validated": true,
+  "native_pairs": 6,
+  "policy_observations": 15,
+  "native_and_exact_decisions_equal": true,
+  "production_source_hashes_verified": true,
+  "probe_sha256": "05ad26efd74f7eaab2eaea5b1a9a78ce00f861677715f3043623f0d3757f789c",
+  "real_semantic_driver_sha256": "90987ee15670f6a51e3ea5c5b26dd6f9a542e0e48c4505a7eedd9b8b58fe7bf3",
+  "independent_critic": "HOST_MEMORY_GUARD-no-verdict"
+}
