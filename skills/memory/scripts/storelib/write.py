@@ -1607,7 +1607,11 @@ def add_memory(
                 "(memory_id, inject_until, expiry_class) VALUES (?,?,?)",
                 (mid, inject_until_eff, expiry_class_eff),
             )
-        # v17 (#178): same-transaction occurrence write. `occurrence_eff` is
+        # v17 (#178): same-transaction occurrence write. INSERT OR REPLACE is a
+        # sanctioned deviation from the issue's literal duplicate-key exit-2
+        # clause: the v15 memory_expiry precedent — a fresh add mints a new
+        # memory id so a duplicate PK only arises on an idempotent re-add,
+        # which must succeed, not exit 2. `occurrence_eff` is
         # non-None only for a valid event row (validation ran above, before
         # the first INSERT). REPLACE keeps an identical re-add idempotent.
         if occurrence_eff is not None:

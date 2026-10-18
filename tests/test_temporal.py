@@ -26,6 +26,8 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 import os
 import sys
+import subprocess
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -709,6 +711,112 @@ class TemporalArmTest(unittest.TestCase):
             self.assertEqual(off["arms"]["temporal"]["post"], 0)
         finally:
             os.environ.pop("ZMEM_ARM_CAP_TEMPORAL", None)
+
+
+
+class ScopedPromptTimestampTest(unittest.TestCase):
+    """Reviewer round-2 Critical: the scoped recall/explain paths honor
+    --prompt-timestamp (a divergent ZMEM_TEST_NOW must NOT win)."""
+
+    def test_scoped_recall_and_explain_honor_prompt_timestamp(self):
+        import subprocess
+        scratch = tempfile.mkdtemp(prefix="zmem-178-scoped-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        env = dict(os.environ)
+        for key in ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                    "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW"):
+            env.pop(key, None)
+        env.update({
+            "ZMEM_DATA": scratch,
+            "ZMEM_STORE": os.path.join(scratch, "store.sqlite"),
+            "ZMEM_MODELS_DIR": os.path.join(scratch, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            # Divergent clock: "last week" from THIS instant does NOT
+            # overlap the seeded 2026-09-01..03 window.
+            "ZMEM_TEST_NOW": "2026-10-18T12:00:00Z",
+        })
+        def run_cli(args):
+            return subprocess.run(
+                [sys.executable, str(STORE_PY), *args],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", env=env, timeout=120, check=False,
+                cwd=str(REPO_ROOT))
+        run_cli(["init"])
+        add = run_cli([
+            "add", "--type", "event",
+            "--namespace", "project:asof",
+            "--content", "outage during last week at the scoped cluster",
+            "--confidence", "0.9", "--signal", "user",
+            "--occurred-start", "2026-09-01T08:00:00Z",
+            "--occurred-end", "2026-09-03T08:00:00Z",
+            "--mentioned-at", "2026-09-03T09:00:00Z"])
+        self.assertEqual(add.returncode, 0, add.stderr)
+        scoped_args = [
+            "recall", "--query", "last week outage scoped cluster",
+            "--namespace", "project:asof",
+            "--prompt-timestamp", "2026-09-10T12:00:00Z",
+            "--json"]
+        result = run_cli(scoped_args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads(result.stdout)
+        arms = doc.get("arms", {})
+        self.assertGreaterEqual(
+            arms.get("temporal", {}).get("pre", 0), 1,
+            f"scoped recall dropped --prompt-timestamp: {arms}")
+        explain = run_cli(["recall", *scoped_args[1:], "--explain"])
+        self.assertEqual(explain.returncode, 0, explain.stderr)
+        edoc = json.loads(explain.stdout)
+        earms = (edoc.get("explain", {}) or {}).get("arms", edoc.get("arms", {}))
+        self.assertGreaterEqual(
+            (earms.get("temporal", {}) or {}).get("pre", 0), 1,
+            f"scoped explain dropped --prompt-timestamp: {earms}")
+
+
+class GraphTemporalOverlapTest(unittest.TestCase):
+    """Reviewer round-2: a row arriving via BOTH graph and temporal is not
+    graph-arrival-only (bump-eligible, not link-rescued)."""
+
+    def test_graph_and_temporal_row_is_not_graph_arrival_only(self):
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib.schema import connect, _prepare_store
+        from storelib.write import add_memory
+        import storelib.recall as recall_mod
+        scratch = tempfile.mkdtemp(prefix="zmem-178-overlap-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        os.environ["ZMEM_STORE"] = os.path.join(scratch, "store.sqlite")
+        os.environ["ZMEM_DATA"] = scratch
+        for key in ("ZMEM_TEST_NOW",):
+            os.environ.pop(key, None)
+        conn = connect()
+        _prepare_store(conn)
+        # Seed a seed row + an overlapping event row sharing its entity so
+        # the graph arm rescues the event while the temporal arm also
+        # selects it.
+        add_memory(conn, namespace="project:overlap",
+                   type_="fact", content="the alpha clustermaintenance ledger",
+                   tags="entity:project:alpha", confidence=0.9,
+                   signal="user", now="2026-09-01T00:00:00Z")
+        add_memory(conn, namespace="project:overlap",
+                   type_="event",
+                   content="outage during last week on the alpha cluster",
+                   tags="entity:project:alpha", confidence=0.9,
+                   signal="user", now="2026-09-05T00:00:00Z",
+                   occurred_start="2026-09-01T08:00:00Z",
+                   occurred_end="2026-09-03T08:00:00Z")
+        rows = recall_mod.recall_memory(
+            conn, query="alpha cluster last week outage",
+            namespace="project:overlap", limit=5,
+            prompt_timestamp="2026-09-10T12:00:00Z",
+            no_telemetry=True)
+        self.assertTrue(rows, "no rows recalled")
+        overlap = [r for r in rows
+                   if "outage during last week" in (r.get("content") or "")]
+        self.assertTrue(overlap, "the graph+temporal event row is absent")
+        row = overlap[0]
+        self.assertNotIn(
+            "graph", (row.get("_graph_arrival_only"), row.get("arrival")),
+            f"row misclassified graph-arrival-only: {row.get('_graph_arrival_only')}")
+        conn.close()
 
 
 if __name__ == "__main__":

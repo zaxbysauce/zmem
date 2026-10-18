@@ -2049,6 +2049,7 @@ def _scoped_tier_pools(
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of, mmr=mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=collect_lanes,
             stable_ties=True, moment=moment, lane=lane,
+            prompt_timestamp=prompt_timestamp,
         )
         for _score, item in scored:
             item["tier"] = tier
@@ -2064,7 +2065,7 @@ def _scoped_tier_pools(
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=False, weights=weights, arm_stats=arm_stats,
             collect_lanes=collect_lanes, stable_ties=True, moment=moment,
-            lane=lane,
+            lane=lane, prompt_timestamp=prompt_timestamp,
         )
         admitted: list[tuple[float, dict]] = []
         for score, item in candidates:
@@ -3135,7 +3136,7 @@ def _recall_memory_impl(
             min_confidence=min_confidence, hybrid=hybrid,
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
             weights=weights, arm_stats=arms, moment=effective_moment,
-            lane=lane,
+            lane=lane, prompt_timestamp=prompt_timestamp,
         )
         # Expansion and belief surfaces must stay inside the selected scoped
         # namespace union; foreign candidates enter only through the explicit
@@ -3892,6 +3893,7 @@ def _explain_run_pipeline(
             slots=slots, min_confidence=min_confidence, hybrid=hybrid,
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=True,
+            prompt_timestamp=prompt_timestamp,
         )
         # Issue #179: same suppression pass as recall_memory's scoped merge
         # so explain's presented set is the same fence.
