@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f9f00bb5ed11cdb385a38ffbb4d7c53ef6537df5fa82685541b7f071920b1aa5",
+  "digest": "eb7932d60111ed036c4fd2c5c2027dce7f5eaf5158b4c5d4da2f31516499db81",
   "files": {
     "hermes-plugin/__init__.py": "4b0a6c2521c87fbfcdcec7fe1515de6093492a2563ea272aec8df01931741498",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -103,7 +103,7 @@
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
     "skills/memory/scripts/storelib/purge.py": "0e5f1db8a55401d5aa6b3109fee964280baffc48474b167de482173a427a3543",
     "skills/memory/scripts/storelib/query_ambiguity.py": "7c22244534e72977a05de600b7601a0652a471c705f29fcde27b47dcc65aa325",
-    "skills/memory/scripts/storelib/recall.py": "78236a17bd44bcb3f9002aec607ec7e79d0741fc459b7643df182664b5e755ac",
+    "skills/memory/scripts/storelib/recall.py": "63bb5cf802ca059e60b1b6fd5db86a96add8d7d5f359e55f169dfc3cb214c679",
     "skills/memory/scripts/storelib/rekey.py": "ed7e38f9660c2aa3aa6b2251e133f06d574bd87f3bd23c714fd585472ec6dfb3",
     "skills/memory/scripts/storelib/retain.py": "6b950fc9f8613206c2c2c688faf8b652bddd8d4d0d2f9752eadc3f58c443e111",
     "skills/memory/scripts/storelib/schema.py": "59ec017281da20ee2cdaac2b68d22f4d5235fe4ae5af34a1000203fa82179b49",
@@ -116,7 +116,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "3eeee7cb36e95970798116422446288545416721cde774db9b0b2c3b2ddacb6d",
+    "skills/memory/scripts/storelib/write.py": "d48a6ed369789806e20b1c70a344e351fce272a5af39506ac83caed1dad623d6",
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },
