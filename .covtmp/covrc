@@ -1,5 +1,0 @@
-[run]
-parallel = true
-source = skills/memory/scripts
-[report]
-skip_empty = true

@@ -885,13 +885,16 @@ def apply_trust_policy(row: dict, policy, *, caller_source_ref=None,
     # claim; stamp the peer origin (the ORIGINAL ref was already run through
     # warn_reserved_source_ref and the capture-policy evaluation upstream).
     # A caller-supplied --source-ref is trusted input and WINS (review F4).
-    if (caller_source_ref is None
-            and row.get("source_ref") is not None
-            and not row["source_ref"].startswith(
-                _PEER_SOURCE_STAMP + ":")):
-        row["source_ref"] = (
+    # Issue #282 review blocker: the old "skip when the row already says
+    # peer:" carve-out let the ROW choose the attribution. Stamping is
+    # idempotent, so nothing is preserved by skipping; the caller-supplied
+    # --source-ref still wins by existing semantics.
+    if caller_source_ref is None:
+        _stamped = (
             f"{_PEER_SOURCE_STAMP}:{policy.attribute_host or 'unknown'}")
-        changed = True
+        if row.get("source_ref") != _stamped:
+            row["source_ref"] = _stamped
+            changed = True
     return changed
 
 
@@ -1582,10 +1585,15 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             _emb_sync.warn_fake_active()
         except Exception:
             pass  # banner must never break ingest (mirror write.py guard)
-        if preserve_ids:
+        if preserve_ids or obj.get("_peer_no_dedup"):
             # Strict evidence transfers are identity-preserving.  Content
             # dedup is a useful legacy best-effort policy, but it would drop a
             # supplied memory UUID that an evidence association references.
+            # Issue #282 review blocker: a peer-mode row must not fold into a
+            # PRE-EXISTING LOCAL keeper either — the merge reads the keeper and
+            # writes to it (max-confidence lift, tag union, retrieval_count
+            # bump), which no field clamp can undo. The row lands as its own
+            # live row instead.
             existing, _sim, emb = None, None, None
         else:
             existing, _sim, emb = _detect_duplicate(conn, content, namespace,
@@ -1829,6 +1837,9 @@ def _strict_ingest_staged(
         # contract; namespace_refused/trust_clamped counters are legacy-only).
         staged_mem_ns = {o["id"]: o.get("namespace") for t, o in rows
                          if t == "memory"}
+        # Issue #282 review: ids this file AUTHORED — the authorship boundary
+        # for destructive side records (memory_expiry).
+        strict_peer_authored = set(staged_mem_ns)
         staged_ep_ns = {o["id"]: o.get("namespace") for t, o in rows
                         if t == "episode"}
         for table, obj in rows:
@@ -1844,14 +1855,18 @@ def _strict_ingest_staged(
                     "namespace_not_allowed: peer files may not carry "
                     f"{table} records")
             elif table == "memory_expiry":
-                prow = conn.execute(
-                    "SELECT namespace FROM memory WHERE id=?",
-                    (obj["memory_id"],)).fetchone()
-                ns = prow[0] if prow else staged_mem_ns.get(obj["memory_id"])
-                if ns is not None and not trust_policy.namespace_allowed(ns):
+                # Issue #282 review blocker (both lanes): the namespace gate
+                # alone let a peer retire a PRE-EXISTING LOCAL state row. The
+                # parent must be a row THIS import authored — an allow-listed
+                # namespace necessarily holds local rows, so namespace
+                # permission is not the boundary. strict_peer_authored is the
+                # staged set (the strict lane applies rows atomically later).
+                if obj["memory_id"] not in strict_peer_authored:
                     raise ValueError(
-                        "namespace_not_allowed: memory_expiry targets "
-                        f"row {obj['memory_id']} in refused namespace {ns!r}")
+                        "namespace_not_allowed: memory_expiry targets row "
+                        f"{obj['memory_id']}, which this peer file does not "
+                        "author — a peer is never authoritative over a "
+                        "pre-existing local row's lifetime")
             elif table == "episode_memory":
                 for tid, nsmap, tbl in (
                         (obj["episode_id"], staged_ep_ns, "episode"),
@@ -2339,6 +2354,10 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     deduped_ids: set = set()
     namespace_refused = trust_clamped = 0
     _peer_resolvable = None
+    # Issue #282 review: ids this import AUTHORED (memory rows) — the
+    # authorship boundary for destructive/structural side records.
+    _peer_authored = set()
+    peer_ingest_state = {"landed": set()}
     capture_refused = 0
     quarantined = 0
     quarantine_failed = 0
@@ -2518,7 +2537,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 # F7: a peer is not authoritative over tombstone-shaped
                 # history either — drop superseded rows uniformly.
                 if obj.get("superseded_at"):
-                    skipped += 1
+                    # Issue #282 review blocker: folding these into generic
+                    # `skipped` erased the tombstones_refused authority-probe
+                    # signal docs/CLOUD.md tells operators to watch.
+                    tombstones_refused += 1
+                    if first_refused_id is None:
+                        first_refused_id = obj["id"]
                     continue
                 # F15: warn on the ORIGINAL row-carried ref (PRR-004 mirror)
                 # BEFORE any peer stamp could mask it; with --source-ref the
@@ -2547,13 +2571,21 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 # the peer stamp can never mask a refusal, mirroring
                 # _ingest_row's quarantine contract (the ledger entry keeps
                 # the PRE-policy row — the original is what was refused).
+                # Issue #282 review blocker: _ingest_row applies the capture
+                # policy ONLY to genuinely new rows (its local-existence
+                # short-circuit runs first), so evaluating here for an
+                # already-present id quarantined a no-op and appended a
+                # duplicate ledger line on EVERY replay (review probe: 1->2->3).
+                _existing_row = conn.execute(
+                    "SELECT 1 FROM memory WHERE id=?", (obj["id"],)).fetchone()
                 try:
-                    apply_capture_policy(
-                        content=obj.get("content") or "",
-                        source_ref=obj.get("source_ref") or "",
-                        tags=obj.get("tags") or "",
-                        capture_mode=capture_mode,
-                    )
+                    if _existing_row is None:
+                        apply_capture_policy(
+                            content=obj.get("content") or "",
+                            source_ref=obj.get("source_ref") or "",
+                            tags=obj.get("tags") or "",
+                            capture_mode=capture_mode,
+                        )
                 except CapturePolicyRefusal as exc:
                     if (exc.reason in QUARANTINE_REASONS
                             and _normalize_capture_mode(capture_mode) == "auto"):
@@ -2567,6 +2599,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     else:
                         capture_refused += 1
                     continue
+                # Issue #282 review blocker: a peer row must not fold into
+                # a pre-existing LOCAL keeper — the merge READS the keeper
+                # and WRITES to it (max-confidence lift, tag union,
+                # retrieval_count bump), and no field clamp can undo those.
+                # Authorship, not namespace, is the boundary.
+                obj["_peer_no_dedup"] = True
                 if apply_trust_policy(obj, trust_policy,
                                       caller_source_ref=source_ref,
                                       resolvable_ids=_peer_resolvable):
@@ -2593,6 +2631,11 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
 
             if outcome == "added":
                 added += 1
+                if trust_policy is not None:
+                    # Authorship record for the side-record gates below: a peer
+                    # is never authoritative over a row it did not author.
+                    _peer_authored.add(obj["id"])
+                    peer_ingest_state["landed"].add(obj["id"])
             elif outcome == "tombstoned":
                 tombstoned += 1
             elif outcome == "tombstone_refused":
@@ -2828,13 +2871,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         try:
             for lineno, e in pending_expiry:
                 if trust_policy is not None:
-                    # Issue #282 F11: gate by the parent's RESOLVED namespace
-                    # (absent parents keep the existing malformed accounting).
-                    prow = conn.execute(
-                        "SELECT namespace FROM memory WHERE id=?",
-                        (e["memory_id"],)).fetchone()
-                    if prow is not None and not trust_policy.namespace_allowed(
-                            prow[0]):
+                    # Issue #282 review blocker: a namespace gate alone let a
+                    # peer retire a PRE-EXISTING LOCAL state row — an
+                    # allow-listed namespace necessarily holds local rows, so
+                    # namespace permission is NOT the boundary. A peer is
+                    # never authoritative over a row it did not author.
+                    if (e["memory_id"] not in peer_ingest_state["landed"]):
                         namespace_refused += 1
                         continue
                 if e["memory_id"] in deduped_ids:

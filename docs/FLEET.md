@@ -163,8 +163,10 @@ it, so a matrix-only edit fails CI), never a silent edit.
 The hub trusts authenticated per-machine principals (T-02) and clamps
 caller-claimed trust, taint, signal, and confidence at the ingest boundary
 (T-03); one authorization-aware selection policy serves local and remote
-recall alike (T-04). None of those controls ships yet — this contract
-states the target, and T-02/T-03/T-04 own the implementation.
+recall alike (T-04). T-02 (per-machine principals) and T-03 (the
+ingest-side trust boundary: `--trust untrusted-peer`, the namespace
+allow-list, caller-derived attribution) shipped in 0.103.0 and 0.104.0;
+T-04 owns the rest.
 
 Hook payloads, transcripts, and tool output are untrusted data on every
 path. Capture payloads are redacted before they leave the machine:
@@ -218,8 +220,9 @@ envelope equality can be asserted against the same recorded payloads and
 seed rows; their contract, provenance policy, and replay preconditions are
 in that directory's README. The write half of the contract has no
 authorization input yet (the `policy` input appears on selection rows
-only); T-03 (issue #282) and T-09 (issue #288) add it to the rows they
-implement, and the durable-queue replay's idempotency key is T-09's
+only); T-03 (issue #282) shipped that row input in 0.104.0 — the ingest
+mode gates every record kind against `--allow-namespace` — while T-09
+(issue #288) still owns the queue-side rows, and the durable-queue replay's idempotency key is T-09's
 `applied_ops` table (issue #288) — until then, treat duplicate-delivery
 trust inflation as the known gap the follow-up issue tracks.
 

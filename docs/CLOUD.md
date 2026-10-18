@@ -723,7 +723,7 @@ those ids*, not about convenience:
 |---|---|---|
 | Local store ← your own export (rebuild, restore, box-to-box move) | `--allow-tombstones` | The file is authoritative for those ids; a supersession you made must propagate. |
 | Cloud store ← `sync/memory.jsonl` (your box's export) | `--allow-tombstones` | Same: your box owns those ids, the cloud copy is downstream. |
-| Local store ← `outbox/*.jsonl` (cloud/remote session output) | **no flag** | A remote session is not authoritative over your local rows. Tombstoning is the one irreversible thing an outbox could ask for. |
+| Local store ← `outbox/*.jsonl` (cloud/remote session output) | **`--trust untrusted-peer`** (required; see "Ingesting a file you do not fully trust" above) | A remote session is not authoritative over your local rows, so peer mode clamps the row's trust claims, gates every record kind against `--allow-namespace`, and refuses tombstone authority outright (`--allow-tombstones` is a usage error with peer mode). |
 
 Without the flag, such a row is left alone and counted in the summary as
 `tombstones_refused=N`, with a single stderr note naming the first refused
