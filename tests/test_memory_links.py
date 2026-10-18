@@ -692,7 +692,7 @@ class RecallExpansionTest(_Store):
         # additive: head-minus-arms deep-equals the pre-#178 envelope.
         self.assertEqual(
             hashlib.sha256(recall_first_raw).hexdigest(),
-            "23825bdb2a9b1b5e75d6bea8a105294009fbffdfd681d3ca07de02e2e2a9f9ff",
+            "77a3b0c1354f92da226a098f71946efc4ee895f25103ca0dc2d29e8bc79f9c8b",
         )
         # Issue #176: the explain envelope gained entity_kind_weights (the
         # effective per-kind entity-lane RRF weights), so the byte golden
@@ -702,7 +702,7 @@ class RecallExpansionTest(_Store):
         # (sole delta vs the previous golden), moving it to e8e66a58....
         self.assertEqual(
             hashlib.sha256(explain_first_raw).hexdigest(),
-            "e8e66a580b1887c7541cc089b3bbb7758bfef305d00057e710bc0b3068bb2276",
+            "9d0d165deb300978cf5557961d8f25c0bade286d66e8794408613cb033a7691d",
         )
         self.assertEqual(self._expansion_ids(recall_first), expected["present"])
         self.assertEqual(self._expansion_ids(recall_second), expected["present"])

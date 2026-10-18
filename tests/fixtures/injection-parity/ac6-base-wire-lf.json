@@ -24,6 +24,7 @@
       "_rel_ent": null,
       "_rel_graph": null,
       "_graph_arrival_only": false,
+      "_temporal_arrival_only": false,
       "trust_score": 1.0,
       "entities": []
     },
@@ -51,6 +52,7 @@
       "_rel_ent": null,
       "_rel_graph": null,
       "_graph_arrival_only": false,
+      "_temporal_arrival_only": false,
       "trust_score": 1.0,
       "entities": []
     }

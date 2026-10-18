@@ -169,7 +169,7 @@ DATA_SHA = {
     # envelope keys, same scalars, every row identical) — no `_score`,
     # ordering, or content change. stats/list/export_jsonl are
     # byte-identical to their prior freezes.
-    "recall": "aeab528266c665833a4a5ba081b8567840da6eb72abb74162c9e8d8d1fe21255",
+    "recall": "b1913cd1b6ba8eab0f46a91c68b2a69f079f2457649e699958e13a98573df047",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

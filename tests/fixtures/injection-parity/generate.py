@@ -41,6 +41,7 @@ def _expected_row(memory_id: str, content: str) -> dict:
     """Return the literal row projection frozen by issue #158."""
     return {
         "_graph_arrival_only": False,
+        "_temporal_arrival_only": False,
         "_rel_cos": None,
         "_rel_ent": None,
         "_rel_graph": None,
