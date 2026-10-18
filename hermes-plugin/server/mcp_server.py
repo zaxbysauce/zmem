@@ -1952,9 +1952,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             if not gr_tags["ok"]:
                 # Fail closed rather than writing the replacement row with
                 # the stamp only — a transient store failure must not
-                # silently discard the target row's benign tags.
+                # silently discard the target row's benign tags. The store's
+                # own not-found detail is surfaced when it gives one.
+                _detail = _sanitize_store_error(gr_tags)
                 return _error(
-                    "could not read the target row's tags for attribution; "
+                    _detail
+                    or "could not read the target row's tags for attribution; "
                     "retry the update"
                 )
             try:

@@ -180,17 +180,41 @@ class RevocationResolutionTest(_MapCase):
                           "a revoked principal must not resolve by id")
         self.assertIsNone(pm.lookup_token(TOKEN))
 
-    def test_rewind_and_same_tick_rewrites_reload(self):
+    def test_rewind_rewrite_reloads_through_maybe_reload(self):
+        """A rewind must reload via the DETECTION path, not force_reload.
+
+        The fix lives in maybe_reload's change test (mtime == cached vs the
+        old mtime <= cached), so the pin drives maybe_reload: cache a
+        forward-bumped generation, then restore an OLDER-mtime generation
+        that revokes, age the rate limit, and assert the revoke landed.
+        Reverting the fix to `mtime <= self._mtime` makes this fail.
+        """
+        # Load with a forward bump so the cached mtime is "now".
+        self.write({TOKEN: self.entry()}, bump=5)
+        pm = AUTH.load_principal_map(self.map_path)
+        self.assertIsNotNone(pm.lookup_token(TOKEN))
+        cached = pm._mtime
+        # An mtime-preserving restore of an OLDER generation that revokes.
+        self.write({TOKEN: self.entry(revoked=True)})
+        os.utime(self.map_path, (os.stat(self.map_path).st_atime,
+                                 os.stat(self.map_path).st_mtime - 60))
+        self.assertLess(os.stat(self.map_path).st_mtime_ns, cached)
+        pm._last_check -= 10  # past the 1s rate limit
+        pm.maybe_reload()
+        self.assertIsNone(pm.lookup_token(TOKEN),
+                          "an older-mtime rewrite must still be picked up")
+        pm._last_check -= 10
+        self.assertIsNone(pm.maybe_reload() or pm.lookup_token(TOKEN))
+
+    def test_force_reload_picks_up_a_same_tick_rewrite(self):
+        """The SIGHUP path re-reads unconditionally, same mtime included."""
         self.write({TOKEN: self.entry()})
         pm = AUTH.load_principal_map(self.map_path)
-        # Same-mtime rewrite that REVOKES must still be picked up.
-        with open(self.map_path, "w", encoding="utf-8") as f:
-            json.dump({TOKEN: self.entry(revoked=True)}, f)
+        self.write({TOKEN: self.entry(revoked=True)})
         st = os.stat(self.map_path)
         os.utime(self.map_path, (st.st_atime, st.st_mtime))
         pm.force_reload()
-        self.assertIsNone(pm.lookup_token(TOKEN),
-                          "a same-mtime rewrite must still reload")
+        self.assertIsNone(pm.lookup_token(TOKEN))
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
@@ -267,6 +291,52 @@ class DenyAllResolutionTest(_MapCase):
             auth_context_var.reset(ctx)
         self.assertEqual(result.get("error"), "namespace_not_allowed", result)
         self.assertNotIn("stored", json.dumps(result))
+
+    def test_session_end_stamps_caller_attribution(self):
+        """session_end is a write path: its row must carry the caller's
+        host:/agent: stamps (reviewer nit 1)."""
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+        server = self._build()
+        access = asyncio.run(server._token_verifier.verify_token(TOKEN))
+        ctx = auth_context_var.set(AuthenticatedUser(access))
+        try:
+            result = self._call(server, "session_end", namespace=NS,
+                                note="session end note from a mapped principal")
+        finally:
+            auth_context_var.reset(ctx)
+        self.assertNotIn("error", json.dumps(result), result)
+        conn = __import__("sqlite3").connect(self.store)
+        try:
+            row = conn.execute(
+                "SELECT tags FROM memory WHERE content LIKE ?",
+                ("session end note%",)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, result)
+        tags = {t.strip() for t in (row[0] or "").split(",") if t.strip()}
+        self.assertIn("host:dgx-fb", tags)
+        self.assertIn("agent:claude", tags)
+
+    def test_update_fails_closed_when_target_tags_unreadable(self):
+        """A failed inherited-tags read must block the update rather than
+        write the replacement row with the stamp only (reviewer nit 1)."""
+        server = self._build()
+        verifier = server._token_verifier
+        access = asyncio.run(verifier.verify_token(TOKEN))
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+        ctx = auth_context_var.set(AuthenticatedUser(access))
+        try:
+            result = self._call(
+                server, "update",
+                id="00000000-0000-0000-0000-000000000000",
+                content="update against a missing row")
+        finally:
+            auth_context_var.reset(ctx)
+        self.assertNotIn("updated", json.dumps(result))
 
     def test_known_principal_still_authorized(self):
         from mcp.server.auth.middleware.auth_context import auth_context_var
