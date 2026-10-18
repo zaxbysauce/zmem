@@ -319,9 +319,74 @@ class DenyAllResolutionTest(_MapCase):
         self.assertIn("host:dgx-fb", tags)
         self.assertIn("agent:claude", tags)
 
-    def test_update_fails_closed_when_target_tags_unreadable(self):
-        """A failed inherited-tags read must block the update rather than
-        write the replacement row with the stamp only (reviewer nit 1)."""
+    def _build_with_unscoped_principal(self):
+        """A map-mode principal with NO namespaces (unscoped), so update()
+        skips the scoped branch and reaches the inherited-tags read."""
+        mapping = {TOKEN: self.entry(), TOKEN_B: {
+            "principal": "ops", "host": "dgx-ops", "harness": "hermes"}}
+        self.write(mapping, bump=1)
+        os.environ["ZMEM_MCP_TOKENS_FILE"] = self.map_path
+        return self.mcp_server.build_server(host="127.0.0.1", port=0,
+                                            use_tls=False)
+
+    def test_unscoped_update_fails_closed_when_target_tags_unreadable(self):
+        """The INHERITED-TAGS read (the unscoped map-mode branch) must fail
+        closed.
+
+        The target row MUST exist, or the update fails for an unrelated
+        reason and the assertion would pass even with the branch fail-open.
+        So: add the row, then make the SECOND store read (the
+        inherited-tags get) fail, and assert nothing was written.
+        """
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+        server = self._build_with_unscoped_principal()
+        # Seed a real target row in the unscoped principal's own namespace.
+        access = asyncio.run(server._token_verifier.verify_token(TOKEN_B))
+        ctx = auth_context_var.set(AuthenticatedUser(access))
+        try:
+            seeded = self._call(server, "add", type="fact", namespace=NS,
+                                signal="none",
+                                content=f"unscoped target {uuid.uuid4().hex[:8]}")
+        finally:
+            auth_context_var.reset(ctx)
+        self.assertEqual(seeded.get("result"), "stored", seeded)
+        target = seeded["id"]
+
+        # Fail the inherited-tags read. For an UNSCOPED caller this get is
+        # the only one in the call (the scoped branch's read is skipped), so
+        # the FIRST get of this tool call IS the inherited-tags read.
+        real = self.mcp_server._run_store_async
+        calls = {"n": 0}
+
+        async def flaky(args, input_text=None, timing=None):
+            if args and args[0] == "get":
+                calls["n"] += 1
+                return {"ok": False, "stdout": "", "stderr": "injected read failure"}
+            return await real(args, input_text=input_text, timing=timing)
+
+        self.mcp_server._run_store_async = flaky
+        try:
+            ctx = auth_context_var.set(AuthenticatedUser(access))
+            try:
+                result = self._call(server, "update", id=target,
+                                    content="must not be written")
+            finally:
+                auth_context_var.reset(ctx)
+        finally:
+            self.mcp_server._run_store_async = real
+
+        self.assertNotIn("updated", json.dumps(result),
+                         "a failed inherited-tags read must block the write")
+        self.assertGreaterEqual(calls["n"], 1,
+                                "the inherited-tags read must have run")
+
+    def test_scoped_update_fails_closed_when_target_unreadable(self):
+        """The scoped branch's own read gate (same policy, earlier branch)."""
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
         server = self._build()
         verifier = server._token_verifier
         access = asyncio.run(verifier.verify_token(TOKEN))
