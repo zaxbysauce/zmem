@@ -108,10 +108,16 @@ def _resolve_occurrence(
             "temporal window"
         )
     mentioned_eff = mentioned_at.strip() or tx_now
-    clamped_mentioned, _ = _temporal.clamp_range(
-        mentioned_eff, mentioned_eff, prompt_timestamp=tx_now)
-    if clamped_mentioned:
-        mentioned_eff = clamped_mentioned
+    # Design 3 (issue #178): normalize mentioned_at to canonical UTC via the
+    # parse/format pair — clamp_range(x, x) always collapses (end <= start on
+    # equal endpoints) so it can never canonicalize a single instant.
+    mentioned_parsed = _temporal._parse_ts(mentioned_eff)
+    if mentioned_parsed is None:
+        raise ValueError(
+            "event mentioned_at must be canonical UTC "
+            "(YYYY-MM-DDTHH:MM:SSZ)"
+        )
+    mentioned_eff = _temporal._fmt(mentioned_parsed)
     return (clamped_start, clamped_end, mentioned_eff)
 
 

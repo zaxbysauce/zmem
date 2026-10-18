@@ -610,7 +610,12 @@ def _temporal_window(query: str,
             start, end = _temporal.parse_relative_range(
                 phrase, prompt_timestamp=prompt)
             if start and end:
-                return (start, end)
+                # Design 2 (issue #178): the arm calls parse_relative_range
+                # FOLLOWED BY clamp_range — future windows clamp to the
+                # prompt and collapse (empty arm), present-period windows
+                # truncate at the prompt instant.
+                return _temporal.clamp_range(
+                    start, end, prompt_timestamp=prompt)
     return ("", "")
 
 
@@ -1395,6 +1400,7 @@ def _recall_one_tier(
     # validity.
     temporal_pre = 0
     temporal_ids: list[str] = []
+    temporal_fused: list[str] = []
     try:
         t_start, t_end = _temporal_window(query, prompt_timestamp)
         if t_start and t_end:
@@ -1649,6 +1655,15 @@ def _recall_one_tier(
             # arm are link-rescued neighbors — they render but never feed
             # the surfaced/retrieval counters (bump_ids excludes them).
             "_graph_arrival_only": r["id"] in graph_only_ids,
+            # v17 (#178) Design 5: a temporal-only row is marked for
+            # attribution and gains no graph semantics (the graph_only
+            # subtraction above keeps it bump-eligible).
+            "_temporal_arrival_only": (
+                r["id"] in set(temporal_fused)
+                and r["id"] not in set(fts_ids)
+                and r["id"] not in set(vec_fused)
+                and r["id"] not in set(ent_fused)
+                and r["id"] not in set(graph_ids)),
             # Issue #115: the row's trust multiplier, EXPOSED so the shared
             # inject gate (_row_trust) can judge scored rows — a plain key
             # because it is row data, not a diagnostic (the SQL-backed rows

@@ -848,5 +848,36 @@ class GraphTemporalOverlapTest(unittest.TestCase):
         conn.close()
 
 
+
+class TemporalClampWindowTest(unittest.TestCase):
+    """Final-critic round-1 Critical: the arm applies clamp_range after
+    parse_relative_range (Design 2) — future phrases collapse to an empty
+    arm and present-period windows truncate at the prompt instant."""
+
+    def test_future_phrase_yields_empty_arm_and_present_period_truncates(self):
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib.recall as recall_mod
+        from storelib import temporal as temporal_mod
+        self.assertEqual(
+            recall_mod._temporal_window("what happened tomorrow",
+                                        "2026-09-10T12:00:00Z"),
+            ("", ""),
+            "future phrase must clamp-collapse to an empty window")
+        self.assertEqual(
+            recall_mod._temporal_window("in two days",
+                                        "2026-09-10T12:00:00Z"),
+            ("", ""))
+        start, end = recall_mod._temporal_window(
+            "this week", "2026-09-10T12:00:00Z")
+        self.assertEqual(start, "2026-09-07T00:00:00Z")
+        self.assertEqual(end, "2026-09-10T12:00:00Z",
+                         "present-period window must truncate at the prompt")
+        # The raw parse (pre-clamp) genuinely differs for this phrase —
+        # proving the clamp is the deciding step.
+        raw_start, raw_end = temporal_mod.parse_relative_range(
+            "this week", prompt_timestamp="2026-09-10T12:00:00Z")
+        self.assertEqual(raw_end, "2026-09-14T00:00:00Z")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
