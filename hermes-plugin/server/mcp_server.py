@@ -1949,16 +1949,24 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # stripped (see the issue #281 trace, plan-critic F12).
         if stamps and target_tags is None and tags is None:
             gr_tags = await _run_store_async(["get", "--id", mid])
-            if gr_tags["ok"]:
-                try:
-                    target_tags = (
-                        json.loads((gr_tags["stdout"] or "").strip())
-                        .get("tags") or ""
-                    )
-                except (json.JSONDecodeError, AttributeError):
-                    target_tags = ""
-            else:
-                target_tags = ""
+            if not gr_tags["ok"]:
+                # Fail closed rather than writing the replacement row with
+                # the stamp only — a transient store failure must not
+                # silently discard the target row's benign tags.
+                return _error(
+                    "could not read the target row's tags for attribution; "
+                    "retry the update"
+                )
+            try:
+                target_tags = (
+                    json.loads((gr_tags["stdout"] or "").strip())
+                    .get("tags") or ""
+                )
+            except (json.JSONDecodeError, AttributeError):
+                return _error(
+                    "could not read the target row's tags for attribution; "
+                    "retry the update"
+                )
         effective_tags = _merge_update_tags(tags, target_tags, caller)
         if effective_tags:
             args += ["--tags", effective_tags]
@@ -2446,6 +2454,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--source-ref", "session_end",
             "--json",
         ]
+        # session_end is a third write path: stamp the CALLER's attribution so
+        # every stored row is attributable. Empty in legacy mode (no
+        # host/harness), which keeps that path byte-identical.
+        _end_stamps = _attribution_tags(current_principal())
+        if _end_stamps:
+            args += ["--tags", ",".join(_end_stamps)]
         input_text = None
         if len(body) > _ARGV_SAFE_CONTENT_CHARS or body == "-":
             # F8: a note of exactly '-' would hit the CLI stdin sentinel

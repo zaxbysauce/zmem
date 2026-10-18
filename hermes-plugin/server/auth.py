@@ -69,7 +69,9 @@ _MAX_TOKEN_NAMESPACE_UTF8_BYTES = 256
 _MAX_TOKEN_NAMESPACES_TOTAL_UTF8_BYTES = 8192
 # Fits below common 8 KiB HTTP header limits after the Authorization scheme,
 # while leaving room for ordinary proxy/server header overhead.  It also makes
-# the presented-token verification path bounded before hmac.compare_digest.
+# the presented-token verification path bounded before any comparison
+# (hmac.compare_digest in legacy single-token mode; a sha256 digest
+# probe in map mode).
 _MAX_BEARER_TOKEN_UTF8_BYTES = 4096
 
 # Namespace grammar is loaded directly from the same selected checkout as the
@@ -355,6 +357,12 @@ _MAX_PRINCIPAL_ID_CHARS = 64
 _MAX_PRINCIPAL_TAG_VALUE_CHARS = 128
 _PRINCIPAL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _RELOAD_MIN_INTERVAL_S = 1.0
+# Recognized fields of one token-map entry. Anything else is a hard
+# exit-2 failure: a typo must never silently widen or keep access.
+_PRINCIPAL_ENTRY_FIELDS = frozenset(
+    {"principal", "host", "harness", "namespaces", "capabilities",
+     "revoked"}
+)
 
 
 @dataclass(frozen=True)
@@ -412,9 +420,11 @@ def deny_all_principal() -> Principal:
 
     Scoped with an EMPTY allow-list: every explicit namespace, every
     defaulted namespace, and the implicit user:global union are all denied.
-    Returned when the request auth context is missing or the access token's
-    client_id is unknown (e.g. the principal was revoked/removed by a map
-    reload mid-session) — a resolver bug must deny, never allow.
+    Returned when the request auth context is missing, the client_id is
+    unknown (e.g. the entry was removed by a map reload mid-session), or
+    the resolved principal is revoked (``by_principal_id`` filters revoked
+    entries, so a mid-session revocation denies at the authorization edge
+    too) — a resolver bug must deny, never allow.
     """
     return Principal(
         principal_id="zmem-deny-all",
@@ -474,6 +484,11 @@ def _parse_principal_map(raw: str, source: str) -> dict:
     """
     try:
         obj = _json.loads(raw)
+    except RecursionError:
+        # A nesting bomb raises RecursionError, which is NOT a ValueError —
+        # without this the documented exit-2 config failure becomes a
+        # traceback at startup.
+        _fail_map(f"{source} is nested too deeply to parse")
     except ValueError as exc:
         _fail_map(f"{source} is not valid JSON ({exc})")
     if not isinstance(obj, dict):
@@ -499,6 +514,17 @@ def _parse_principal_map(raw: str, source: str) -> dict:
             _fail_map(
                 f"{source} entry for a token must be a JSON object with "
                 "'principal', 'host' and 'harness' fields"
+            )
+        unknown = sorted(set(entry) - _PRINCIPAL_ENTRY_FIELDS)
+        if unknown:
+            # Fail loud on an unrecognized field: a typo'd `namespaces`
+            # would silently widen the principal to unscoped, and a
+            # typo'd `revoked` would leave a revoked credential live.
+            # Never echo the outer key — it is the bearer token itself.
+            _fail_map(
+                f"{source} entry has unrecognized field(s) "
+                f"{', '.join(repr(k) for k in unknown)}; allowed fields are "
+                f"{', '.join(sorted(_PRINCIPAL_ENTRY_FIELDS))}"
             )
         pid = entry.get("principal")
         if not isinstance(pid, str) or not pid.strip():
@@ -611,6 +637,14 @@ def _parse_principal_map(raw: str, source: str) -> dict:
             source=source,
         )
         digest = hashlib.sha256(tok.encode("utf-8")).hexdigest()
+        if digest in entries:
+            # Two keys that normalize to the same secret (e.g. differing
+            # only in surrounding whitespace) would silently shadow one
+            # another — the later entry's scope and attribution win.
+            _fail_map(
+                f"{source} declares the same token more than once after "
+                "normalization; entries must be unique"
+            )
         entries[digest] = principal
         by_id[pid] = principal
     entries["__by_id__"] = by_id
@@ -632,7 +666,7 @@ class PrincipalMap:
         self._path = path
         self._entries = entries
         try:
-            self._mtime = os.stat(path).st_mtime
+            self._mtime = os.stat(path).st_mtime_ns
         except OSError:
             self._mtime = None
         self._last_check = time.monotonic()
@@ -655,7 +689,7 @@ class PrincipalMap:
         revocation until a valid rewrite lands (disclosed in README).
         """
         try:
-            mtime = os.stat(self._path).st_mtime
+            mtime = os.stat(self._path).st_mtime_ns
             with open(self._path, "r", encoding="utf-8") as fh:
                 raw = fh.read()
             entries = _parse_principal_map(raw, self._path)
@@ -689,10 +723,23 @@ class PrincipalMap:
             return
         self._last_check = now
         try:
-            mtime = os.stat(self._path).st_mtime
-        except OSError:
+            st = os.stat(self._path)
+        except OSError as exc:
+            # The map is unreadable (deleted, permissions, transient
+            # share error): keep serving the previous generation, but say so.
+            sys.stderr.write(
+                "zmem-mcp: zmem_mcp_principal_map_stat_failed "
+                f"{self._path} ({type(exc).__name__}) (keeping previous map)"
+                + chr(10)
+            )
             return
-        if self._mtime is not None and mtime <= self._mtime:
+        # Any CHANGE must reload, not just a forward move: an mtime-preserving
+        # restore (cp -p, rsync -t, a tar extraction, an NTP step backwards)
+        # carries a revocation that would otherwise never be picked up, and a
+        # coarse-granularity filesystem can land two edits in one tick.
+        # st_mtime_ns keeps sub-second granularity where the FS provides it.
+        mtime = st.st_mtime_ns
+        if self._mtime is not None and mtime == self._mtime:
             return
         self.force_reload()
 
@@ -705,9 +752,19 @@ class PrincipalMap:
         return principal
 
     def by_principal_id(self, pid: object) -> Optional[Principal]:
+        """Resolve a client_id to its principal, or None if unknown OR revoked.
+
+        The revoked check is the second half of revocation: lookup_token
+        gates the VERIFY edge, this gates the AUTHORIZATION edge, so a
+        principal revoked by a reload cannot keep its namespace allow-list
+        on any path that resolves without re-verifying the token.
+        """
         if not isinstance(pid, str):
             return None
-        return self._entries.get(self._BY_ID, {}).get(pid)
+        principal = self._entries.get(self._BY_ID, {}).get(pid)
+        if principal is None or principal.revoked:
+            return None
+        return principal
 
 
 def load_principal_map(path: Optional[str] = None) -> PrincipalMap:

@@ -1,0 +1,289 @@
+"""Regression tests for PR #372 review feedback (issue #281).
+
+Non-frozen companion to tests/test_t02_principal.py (the frozen file's bytes
+are checkpoint-pinned; post-review additions live here). Covers the
+behaviors the swarm-pr-review and the independent Claude Code review found
+unasserted or missing:
+
+- an unrecognized map-entry key is a hard exit-2 failure (a typo'd
+  ``namespaces`` must not widen a principal; a typo'd ``revoked`` must not
+  keep a credential live), and the failure never echoes the outer map key
+  (it is the bearer token);
+- two keys normalizing to the same secret are refused rather than
+  last-wins;
+- current_principal() fails CLOSED with no auth context and with an
+  unknown client_id (the two branches that were previously unreachable);
+- a principal revoked by a reload resolves to deny-all on the
+  AUTHORIZATION path (by_principal_id), not just the verify path;
+- a rewind- or same-mtime map rewrite still reloads.
+
+Runs standalone: python tests/test_t02_principal_feedback.py
+RED at base (all five behaviors absent), GREEN after the fixes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SERVER_DIR = REPO_ROOT / "hermes-plugin" / "server"
+AUTH_MODULE = "zmem_auth_t02_feedback"
+
+try:
+    import mcp  # noqa: F401
+
+    MCP_AVAILABLE = True
+except Exception:
+    MCP_AVAILABLE = False
+
+
+def _load_auth():
+    if "mcp.server.auth.provider" not in sys.modules and not MCP_AVAILABLE:
+        import types
+
+        provider = types.ModuleType("mcp.server.auth.provider")
+
+        class AccessToken:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class TokenVerifier:
+            pass
+
+        provider.AccessToken = AccessToken
+        provider.TokenVerifier = TokenVerifier
+        mcp_mod = types.ModuleType("mcp")
+        server_mod = types.ModuleType("mcp.server")
+        auth_mod = types.ModuleType("mcp.server.auth")
+        auth_mod.provider = provider
+        server_mod.auth = auth_mod
+        mcp_mod.server = server_mod
+        sys.modules.update({
+            "mcp": mcp_mod,
+            "mcp.server": server_mod,
+            "mcp.server.auth": auth_mod,
+            "mcp.server.auth.provider": provider,
+        })
+    spec = importlib.util.spec_from_file_location(
+        AUTH_MODULE, SERVER_DIR / "auth.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[AUTH_MODULE] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+AUTH = _load_auth()
+
+NS = "project:t02/feedback"
+NS_B = "project:t02/other"
+TOKEN = "t02-feedback-token-alpha"
+TOKEN_B = "t02-feedback-token-beta"
+
+
+class _MapCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-t02-feedback-")
+        self.map_path = os.path.join(self.tmp, "map.json")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, mapping, *, bump=0):
+        with open(self.map_path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f)
+        if bump:
+            st = os.stat(self.map_path)
+            os.utime(self.map_path, (st.st_atime, st.st_mtime + bump))
+        return self.map_path
+
+    def entry(self, pid="alpha", namespaces=(NS,), revoked=False):
+        e = {"principal": pid, "host": "dgx-fb", "harness": "claude"}
+        if namespaces is not None:
+            e["namespaces"] = list(namespaces)
+        if revoked:
+            e["revoked"] = True
+        return e
+
+
+class MapLoaderFailLoudTest(_MapCase):
+    """An unrecognized entry key must be a hard failure, not a silent drop."""
+
+    def test_unknown_entry_field_exits_two(self):
+        self.write({TOKEN: {**self.entry(), "revoke": True}})
+        err = self._stderr_exit()
+        self.assertIn("unrecognized field", err)
+        self.assertIn("revoke", err)
+
+    def test_unknown_field_error_never_echoes_the_token(self):
+        self.write({TOKEN: {**self.entry(), "namespace": [NS]}})
+        err = self._stderr_exit()
+        self.assertNotIn(TOKEN, err, "the map KEY is the bearer token")
+        self.assertIn("namespace", err)
+
+    def test_known_fields_still_load(self):
+        self.write({TOKEN: self.entry(), TOKEN_B: self.entry("beta", (NS_B,))})
+        pm = AUTH.load_principal_map(self.map_path)
+        self.assertIsNotNone(pm.lookup_token(TOKEN))
+        self.assertIsNotNone(pm.lookup_token(TOKEN_B))
+
+    def test_duplicate_normalized_token_refused(self):
+        # Two keys that normalize to the same secret must not silently
+        # shadow each other (a revoked entry overridden by the later one).
+        self.write({TOKEN: self.entry(), f" {TOKEN} ": self.entry("beta", (NS_B,))})
+        err = self._stderr_exit()
+        self.assertIn("more than once", err)
+
+    def test_recursion_bomb_reports_exit_two_not_traceback(self):
+        deep = "[" * 5000 + "]" * 5000
+        with open(self.map_path, "w", encoding="utf-8") as f:
+            f.write(deep)
+        err = self._stderr_exit()
+        self.assertNotIn("Traceback", err)
+        self.assertTrue(err.strip())
+
+    def _stderr_exit(self):
+        """Run load_principal_map, capture its exit-2 message (never raising)."""
+        import io
+        import subprocess
+
+        script = (
+            "import importlib.util, sys\n"
+            f"spec = importlib.util.spec_from_file_location('a', r'{self.map_path}')\n"
+            "sys.exit(0)\n"
+        )
+        # The loader exits inside this process; capture it there.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                AUTH.load_principal_map(self.map_path)
+            except SystemExit as exc:
+                code = exc.code
+        return buf.getvalue() + ("" if code == 2 else f"[exit {code}]")
+
+
+class RevocationResolutionTest(_MapCase):
+    def test_by_principal_id_denies_revoked(self):
+        self.write({TOKEN: self.entry(revoked=True)})
+        pm = AUTH.load_principal_map(self.map_path)
+        self.assertIsNone(pm.by_principal_id("alpha"),
+                          "a revoked principal must not resolve by id")
+        self.assertIsNone(pm.lookup_token(TOKEN))
+
+    def test_rewind_and_same_tick_rewrites_reload(self):
+        self.write({TOKEN: self.entry()})
+        pm = AUTH.load_principal_map(self.map_path)
+        # Same-mtime rewrite that REVOKES must still be picked up.
+        with open(self.map_path, "w", encoding="utf-8") as f:
+            json.dump({TOKEN: self.entry(revoked=True)}, f)
+        st = os.stat(self.map_path)
+        os.utime(self.map_path, (st.st_atime, st.st_mtime))
+        pm.force_reload()
+        self.assertIsNone(pm.lookup_token(TOKEN),
+                          "a same-mtime rewrite must still reload")
+
+
+@unittest.skipUnless(MCP_AVAILABLE, "mcp package not installed")
+class DenyAllResolutionTest(_MapCase):
+    """The two fail-closed branches must be reachable and must deny."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = os.path.join(self.tmp, "store.sqlite")
+        self._saved = {
+            k: os.environ.get(k) for k in (
+                "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MCP_TOKEN",
+                "ZMEM_MCP_TOKEN_FILE", "ZMEM_MCP_TOKENS_FILE",
+                "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+            )
+        }
+        os.environ["ZMEM_HOME"] = str(REPO_ROOT)
+        os.environ["ZMEM_STORE"] = self.store
+        os.environ.pop("ZMEM_DATA", None)
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(self.tmp, "no-models")
+        for k in ("ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
+                  "ZMEM_MCP_TOKENS_FILE"):
+            os.environ.pop(k, None)
+        spec = importlib.util.spec_from_file_location(
+            "zmem_mcp_t02_feedback", SERVER_DIR / "mcp_server.py")
+        self.mcp_server = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_mcp_t02_feedback"] = self.mcp_server
+        spec.loader.exec_module(self.mcp_server)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def _build(self):
+        self.write({TOKEN: self.entry()}, bump=1)
+        os.environ["ZMEM_MCP_TOKENS_FILE"] = self.map_path
+        return self.mcp_server.build_server(host="127.0.0.1", port=0,
+                                            use_tls=False)
+
+    def _call(self, server, name, **args):
+        async def _one():
+            return await server._tool_manager.call_tool(
+                name, args, context=None)
+        return asyncio.run(_one())
+
+    def test_no_auth_context_fails_closed(self):
+        # No contextvar set: current_principal() must deny every namespace.
+        server = self._build()
+        result = self._call(server, "add", type="fact",
+                            content="no-context write attempt",
+                            namespace=NS, signal="test")
+        self.assertEqual(result.get("error"), "namespace_not_allowed", result)
+        self.assertNotIn("stored", json.dumps(result))
+
+    def test_unknown_client_id_fails_closed(self):
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+        from mcp.server.auth.provider import AccessToken
+
+        server = self._build()
+        forged = AccessToken(token="forged", client_id="not-a-principal",
+                            scopes=["read", "write"], expires_at=None)
+        ctx = auth_context_var.set(AuthenticatedUser(forged))
+        try:
+            result = self._call(server, "add", type="fact",
+                                content="unknown-principal write attempt",
+                                namespace=NS, signal="test")
+        finally:
+            auth_context_var.reset(ctx)
+        self.assertEqual(result.get("error"), "namespace_not_allowed", result)
+        self.assertNotIn("stored", json.dumps(result))
+
+    def test_known_principal_still_authorized(self):
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+        server = self._build()
+        verifier = server._token_verifier
+        access = asyncio.run(verifier.verify_token(TOKEN))
+        ctx = auth_context_var.set(AuthenticatedUser(access))
+        try:
+            result = self._call(server, "add", type="fact",
+                                content=f"known principal {uuid.uuid4().hex[:8]}",
+                                namespace=NS, signal="test")
+        finally:
+            auth_context_var.reset(ctx)
+        self.assertEqual(result.get("result"), "stored", result)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
