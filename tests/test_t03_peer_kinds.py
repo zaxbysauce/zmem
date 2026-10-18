@@ -81,7 +81,12 @@ class PeerKindsTest(T._TwoStoreCase):
         }
         r = self._ingest([rec])
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("namespace_refused=1", r.stdout, r.stdout)
+        # The refusal here is an AUTHORSHIP refusal, not a namespace one
+        # (final critic F4): the counter the docs define as "rows outside
+        # the allow-list" must stay at zero, or a reader cannot tell a
+        # namespace problem from a provenance one.
+        self.assertIn("authorship_refused=1", r.stdout, r.stdout)
+        self.assertIn("namespace_refused=0", r.stdout, r.stdout)
         self.assertIsNone(
             self.b.query_one(
                 "SELECT inject_until FROM memory_expiry WHERE memory_id=?",

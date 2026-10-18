@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "ab399334495715f7a607268001127bebc8da59ca6419f4923f1d3be0e935015d",
+  "digest": "17805e6255baa9f59fd7fe6e778133b515501321a26017c295020a2ff0c60063",
   "files": {
     "hermes-plugin/__init__.py": "e12a4d65f018b7290a8286de704fc392165d4849c7c903d90511416a94607a03",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -107,7 +107,7 @@
     "skills/memory/scripts/storelib/source.py": "72050fcc2ed63c3f99089ece204022038ccfeff13017cf2505ea3c288df5c3a2",
     "skills/memory/scripts/storelib/state.py": "aa4c8f3648e81e05a982de6e89471754de5ec0aad3c957452cbd8a702c839f61",
     "skills/memory/scripts/storelib/state_expiry.py": "fb3f2286aa5d503cce9288e6f9382e177f22750079d311f1faa985084e43f9bf",
-    "skills/memory/scripts/storelib/sync.py": "87ea1e0ed9db22ea06d7b1eb251bc52d161b160223e8e31db4d573b171dbebc9",
+    "skills/memory/scripts/storelib/sync.py": "649063ca70945435f7c59908c2dcdc3337788acb637d2bd89f0edf0764894dcf",
     "skills/memory/scripts/storelib/training.py": "a308dcc6289e4c16efb0286a14c65dc8de0b400334d99cda80e24ae101cea4d6",
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",

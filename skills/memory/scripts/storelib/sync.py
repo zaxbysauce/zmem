@@ -1337,6 +1337,31 @@ def _apply_expiry_record(conn: sqlite3.Connection, obj: dict) -> None:
     return "applied"
 
 
+def _expiry_record_is_identical(conn: sqlite3.Connection, obj: dict) -> bool:
+    """True when ``obj`` would apply as :func:`_apply_expiry_record`'s
+    idempotent no-op — the stored record already carries these exact values
+    (issue #282 final-critic F1).
+
+    The strict lane's peer authorship gate needs this BEFORE it may accept an
+    expiry for a row this import did not author: refusing those outright made
+    replaying an already-accepted peer file a whole-file failure, even though
+    the only record in question writes nothing. A store with no
+    ``memory_expiry`` table at all (pre-v15) is never identical, so the gate
+    still refuses — fail-closed, matching the strict lane's all-or-nothing
+    contract.
+    """
+    try:
+        existing = conn.execute(
+            "SELECT inject_until, expiry_class FROM memory_expiry "
+            "WHERE memory_id=?", (obj["memory_id"],)).fetchone()
+    except sqlite3.Error:
+        return False
+    if existing is None:
+        return False
+    return (existing["inject_until"], existing["expiry_class"]) == (
+        obj["inject_until"], obj["expiry_class"])
+
+
 def _purged_ids(conn: sqlite3.Connection) -> set:
     """Ids removed by `purge` (issue #255). Empty when the additive
     purged_id table does not exist yet (pre-#255 store / old snapshot)."""
@@ -1868,7 +1893,16 @@ def _strict_ingest_staged(
                 # namespace necessarily holds local rows, so namespace
                 # permission is not the boundary. strict_peer_authored is the
                 # staged set (the strict lane applies rows atomically later).
-                if obj["memory_id"] not in strict_peer_authored:
+                # Final-critic F1: gate only records that would MUTATE. An
+                # expiry identical to the one already stored applies as the
+                # lane's own idempotent no-op (see _apply_expiry_record), so
+                # replaying an already-accepted peer file must stay a no-op
+                # rather than failing the whole import — the retirement
+                # attack is unaffected, because an attacker-chosen lifetime is
+                # never identical to the store's (and a row with no stored
+                # expiry has nothing to be identical to).
+                if (obj["memory_id"] not in strict_peer_authored
+                        and not _expiry_record_is_identical(conn, obj)):
                     raise ValueError(
                         "namespace_not_allowed: memory_expiry targets row "
                         f"{obj['memory_id']}, which this peer file does not "
@@ -2361,10 +2395,14 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     deduped_ids: set = set()
     namespace_refused = trust_clamped = 0
     _peer_resolvable = None
-    # Issue #282 review: ids this import AUTHORED (memory rows) — the
-    # authorship boundary for destructive/structural side records.
-    _peer_authored = set()
+    # Issue #282 review: the ids this import AUTHORED (memory rows that landed
+    # in the store) — the authorship boundary for destructive/structural side
+    # records, tracked in peer_ingest_state["landed"] and counted separately
+    # from namespace_refused below (final-critic F4: an authorship refusal is
+    # NOT a namespace refusal, and conflating them misreports the documented
+    # counter).
     peer_ingest_state = {"landed": set()}
+    authorship_refused = 0
     capture_refused = 0
     quarantined = 0
     quarantine_failed = 0
@@ -2579,14 +2617,18 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 # _ingest_row's quarantine contract (the ledger entry keeps
                 # the PRE-policy row — the original is what was refused).
                 # Issue #282 review blocker: _ingest_row applies the capture
-                # policy ONLY to genuinely new rows (its local-existence
-                # short-circuit runs first), so evaluating here for an
-                # already-present id quarantined a no-op and appended a
-                # duplicate ledger line on EVERY replay (review probe: 1->2->3).
+                # policy ONLY to genuinely new rows (its local-existence AND
+                # purged-id short-circuits run first), so evaluating here for
+                # an already-present or purged id quarantined a no-op and
+                # appended a duplicate ledger line on EVERY replay (review
+                # probe: 1->2->3). Mirroring only half of the short-circuit
+                # left the purged-id corner growing the ledger while the
+                # authoritative path reported purged_denied and wrote
+                # nothing (final-critic F2).
                 _existing_row = conn.execute(
                     "SELECT 1 FROM memory WHERE id=?", (obj["id"],)).fetchone()
                 try:
-                    if _existing_row is None:
+                    if _existing_row is None and not _is_purged(conn, obj["id"]):
                         apply_capture_policy(
                             content=obj.get("content") or "",
                             source_ref=obj.get("source_ref") or "",
@@ -2641,7 +2683,6 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 if trust_policy is not None:
                     # Authorship record for the side-record gates below: a peer
                     # is never authoritative over a row it did not author.
-                    _peer_authored.add(obj["id"])
                     peer_ingest_state["landed"].add(obj["id"])
             elif outcome == "tombstoned":
                 tombstoned += 1
@@ -2883,8 +2924,16 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     # allow-listed namespace necessarily holds local rows, so
                     # namespace permission is NOT the boundary. A peer is
                     # never authoritative over a row it did not author.
-                    if (e["memory_id"] not in peer_ingest_state["landed"]):
-                        namespace_refused += 1
+                    if (e["memory_id"] not in peer_ingest_state["landed"]
+                            and not _expiry_record_is_identical(conn, e)):
+                        # Counted separately from namespace_refused: the row's
+                        # namespace was allowed, this import simply did not
+                        # author the parent (final-critic F4). An expiry
+                        # identical to the stored one is a no-op, not a
+                        # mutation, so it passes to the idempotent path below —
+                        # the strict lane's identical-only tolerance (F1),
+                        # applied here so both lanes replay alike.
+                        authorship_refused += 1
                         continue
                 if e["memory_id"] in deduped_ids:
                     # #173 PR-review F29: the parent folded into an existing
@@ -2923,6 +2972,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
           f"expiry_applied={expiry_applied} expiry_malformed={expiry_malformed} "
           f"expiry_skipped={expiry_skipped}"
           + (f" namespace_refused={namespace_refused} "
+             f"authorship_refused={authorship_refused} "
              f"trust_clamped={trust_clamped}"
              if trust_policy is not None else ""))
     if decode_error is not None:

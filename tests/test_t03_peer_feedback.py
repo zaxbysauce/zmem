@@ -109,6 +109,17 @@ class PeerTrustCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return r["id"]
 
+    def _ledger_lines(self):
+        import glob
+
+        total = 0
+        for path in glob.glob(os.path.join(self.tmp, "**", "*.jsonl"),
+                              recursive=True):
+            if os.path.basename(os.path.dirname(path)) == "quarantine":
+                with open(path, encoding="utf-8") as f:
+                    total += sum(1 for line in f if line.strip())
+        return total
+
 
 class PeerCannotRetireLocalRowTest(PeerTrustCase):
     def test_expiry_side_record_cannot_retire_a_local_row(self):
@@ -233,17 +244,6 @@ class ReplayQuarantineTest(PeerTrustCase):
         self.assertEqual(self._ledger_lines(), ledger,
                          "a no-op re-ingest must not append to the ledger")
 
-    def _ledger_lines(self):
-        import glob
-
-        total = 0
-        for path in glob.glob(os.path.join(self.tmp, "**", "*.jsonl"),
-                              recursive=True):
-            if os.path.basename(os.path.dirname(path)) == "quarantine":
-                with open(path, encoding="utf-8") as f:
-                    total += sum(1 for line in f if line.strip())
-        return total
-
 
 class TombstoneSignalTest(PeerTrustCase):
     def test_superseded_peer_row_keeps_the_authority_probe_signal(self):
@@ -260,6 +260,90 @@ class TombstoneSignalTest(PeerTrustCase):
             None,
             "the live local row must still be live (not tombstoned)")
         self.assertIn("tombstone", r.stderr.lower(), r.stderr)
+
+
+class PeerReplayTest(PeerTrustCase):
+    """Final-critic F1/F2: a peer replay must be a no-op, not a refusal.
+
+    The authorship gate (which blocks a peer retiring a pre-existing local
+    row) is a MUTATION gate: refusing it unconditionally made replaying an
+    already-accepted peer file a whole-file failure in the strict lane, and
+    the capture-probe fix missed the purged-id corner of the same short
+    circuit. Both are replay-shaped, both are silent until an operator
+    delivers an overlapping file twice.
+    """
+
+    def _peer_state_file(self, inject_until="2030-01-01T00:00:00Z"):
+        row = self.row("project:t03/peer", type="state",
+                       content=f"peer state {uuid.uuid4().hex[:8]}")
+        rec = {"kind": "memory_expiry", "memory_id": row["id"],
+               "inject_until": inject_until, "expiry_class": "setting"}
+        return row, rec
+
+    def test_strict_replay_of_an_accepted_peer_file_is_a_no_op(self):
+        row, rec = self._peer_state_file()
+        first = self.ingest([row, rec], "--strict")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("expiry_applied=1", first.stderr, first.stderr)
+        second = self.ingest([row, rec], "--strict")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("expiry_applied=0", second.stderr, second.stderr)
+        self.assertIn("identical=1", second.stderr, second.stderr)
+        self.assertEqual(
+            self.query("SELECT inject_until FROM memory_expiry WHERE memory_id=?",
+                       (row["id"],)),
+            ("2030-01-01T00:00:00Z",),
+            "the replay must leave the stored lifetime exactly as accepted")
+        self.assertEqual(
+            self.query("SELECT COUNT(*) FROM memory WHERE id=?", (row["id"],)),
+            (1,), "the replay must not duplicate the row")
+
+    def test_strict_replay_with_a_CHANGED_expiry_is_still_refused(self):
+        """The tolerance is IDENTICAL-ONLY — the attack is unchanged."""
+        row, rec = self._peer_state_file()
+        first = self.ingest([row, rec], "--strict")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        hostile = dict(rec, inject_until="2020-01-01T00:00:00Z")
+        second = self.ingest([row, hostile], "--strict")
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        self.assertEqual(
+            self.query("SELECT inject_until FROM memory_expiry WHERE memory_id=?",
+                       (row["id"],)),
+            ("2030-01-01T00:00:00Z",),
+            "a peer must not shorten the lifetime of a row it no longer authors")
+
+    def test_legacy_replay_of_an_accepted_peer_file_is_a_no_op(self):
+        row, rec = self._peer_state_file()
+        first = self.ingest([row, rec])
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = self.ingest([row, rec])
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("expiry_applied=0", second.stdout, second.stdout)
+        self.assertIn("expiry_skipped=1", second.stdout, second.stdout)
+
+    def test_purged_id_peer_replay_does_not_grow_the_ledger(self):
+        """F2: the capture probe must mirror BOTH halves of _ingest_row's
+        short circuit — a purged id never INSERTs, so capture policy must
+        not run and no ledger line may be appended on every replay."""
+        safe = self.row("project:t03/peer",
+                        content=f"to be purged {uuid.uuid4().hex[:8]}")
+        seed = self.write([safe], name="seed.jsonl")
+        proc = self.cli("ingest-jsonl", "--in", seed)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        purged = self.cli("purge", "--id", safe["id"])
+        self.assertEqual(purged.returncode, 0, purged.stdout + purged.stderr)
+        self.assertIsNone(
+            self.query("SELECT id FROM memory WHERE id=?", (safe["id"],)),
+            "the purge must remove the row before the replay")
+        dangerous = dict(safe, content=f"peer rewrite {uuid.uuid4().hex[:8]} "
+                                        f"sudo -S secret")
+        replay = self.ingest([dangerous], "--capture-mode", "auto",
+                             name="purged.jsonl")
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        self.assertIn("quarantined=0", replay.stdout, replay.stdout)
+        self.assertEqual(self._ledger_lines(), 0,
+                         "a purged id never inserts, so replay must not "
+                         "re-quarantine it")
 
 
 if __name__ == "__main__":
