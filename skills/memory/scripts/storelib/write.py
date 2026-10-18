@@ -71,6 +71,61 @@ def _clear_expiry(conn: sqlite3.Connection, memory_id: str) -> None:
     conn.execute("DELETE FROM memory_expiry WHERE memory_id=?", (memory_id,))
 
 
+def _resolve_occurrence(
+    type_: str,
+    occurred_start: str,
+    occurred_end: str,
+    mentioned_at: str,
+    tx_now: str,
+) -> tuple[str, str, str] | None:
+    """Validate the v17 (#178) event-occurrence arguments.
+
+    Returns the canonical ``(occurred_start, occurred_end, mentioned_at)``
+    triple for the `memory_occurrence` side table, or ``None`` for a
+    non-event row. Event rows require both occurrence endpoints; the
+    endpoints are normalized and clamped through ``temporal.clamp_range``
+    with the writer's ``tx_now`` as the prompt timestamp; ``occurred_end``
+    must exceed ``occurred_start``; an empty ``mentioned_at`` defaults to
+    ``tx_now``. Any non-event row carrying a non-empty occurrence field
+    raises the contract's exact ValueError BEFORE the first INSERT, so a
+    refused write never leaves a partial row (the #173 discipline).
+    """
+    from storelib import temporal as _temporal
+
+    if type_ != "event":
+        if occurred_start or occurred_end or mentioned_at:
+            raise ValueError("occurrence fields require type=event")
+        return None
+    if not occurred_start or not occurred_end:
+        raise ValueError(
+            "event memories require occurred_start and occurred_end"
+        )
+    clamped_start, clamped_end = _temporal.clamp_range(
+        occurred_start, occurred_end, prompt_timestamp=tx_now)
+    if not clamped_start or not clamped_end:
+        raise ValueError(
+            "event occurrence range is malformed, inverted, or outside the "
+            "temporal window"
+        )
+    mentioned_eff = mentioned_at.strip() or tx_now
+    clamped_mentioned, _ = _temporal.clamp_range(
+        mentioned_eff, mentioned_eff, prompt_timestamp=tx_now)
+    if clamped_mentioned:
+        mentioned_eff = clamped_mentioned
+    return (clamped_start, clamped_end, mentioned_eff)
+
+
+def _clear_occurrence(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Drop the v17 occurrence row for a memory being tombstoned/absorbed.
+
+    Same defect-class guardrail as `_clear_expiry`: every writer that
+    tombstones or hard-removes a memory row calls this in the SAME
+    transaction so a `memory_occurrence` row can never outlive its parent.
+    """
+    conn.execute(
+        "DELETE FROM memory_occurrence WHERE memory_id=?", (memory_id,))
+
+
 def _resolve_update_expiry(
     type_eff: str,
     expiry_class: str | None,
@@ -1300,8 +1355,13 @@ def add_memory(
     expiry_class: str | None = None,
     inject_until: str | None = None,
     now: str | None = None,
+    # #179 (entity_card): lineage + card-refresh bypass.
     update_of: str | None = None,
     force_append: bool = False,
+    # #178 (event + memory_occurrence): the occurrence triple.
+    occurred_start: str = "",
+    occurred_end: str = "",
+    mentioned_at: str = "",
 ) -> WriteResult:
     # #179 (issue #179, Workstream K PR 8): the two append-only card controls.
     # Both are appended AFTER the live keyword set (the #177/#178 signature
@@ -1393,6 +1453,10 @@ def add_memory(
     expiry_class_eff, inject_until_eff = _resolve_expiry(
         type_, expiry_class, inject_until, tx_now
     )
+    # v17 (#178): same validation discipline — before the first INSERT.
+    occurrence_eff = _resolve_occurrence(
+        type_, occurred_start, occurred_end, mentioned_at, tx_now
+    )
 
     started_tx = False
     try:
@@ -1480,6 +1544,15 @@ def add_memory(
                     "own expiry metadata; the supplied expiry_class/"
                     "inject_until were not applied"
                 )
+            # v17 (#178): a dedup fold keeps the KEEPER's occurrence data —
+            # the discarded row's resolved range is never inserted (no new
+            # memory id exists to carry it).
+            if occurrence_eff is not None:
+                print(
+                    f"[zmem] dedup: existing memory {existing['id']} kept its "
+                    "own occurrence data; the supplied occurred_start/"
+                    "occurred_end were not applied"
+                )
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
             return WriteResult(existing["id"], warnings=warns, deduped=True)
@@ -1533,6 +1606,16 @@ def add_memory(
                 "INSERT OR REPLACE INTO memory_expiry "
                 "(memory_id, inject_until, expiry_class) VALUES (?,?,?)",
                 (mid, inject_until_eff, expiry_class_eff),
+            )
+        # v17 (#178): same-transaction occurrence write. `occurrence_eff` is
+        # non-None only for a valid event row (validation ran above, before
+        # the first INSERT). REPLACE keeps an identical re-add idempotent.
+        if occurrence_eff is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_occurrence "
+                "(memory_id, occurred_start, occurred_end, mentioned_at) "
+                "VALUES (?,?,?,?)",
+                (mid, occurrence_eff[0], occurrence_eff[1], occurrence_eff[2]),
             )
         # v10 (issue #60, 5.2): deterministic entity extraction on every add.
         # Same transaction as the INSERT, so a failed link rolls back the row.
@@ -1772,6 +1855,7 @@ def supersede_memory(
         # stale-summary, sync tombstone, plus the hard-DELETE paths in
         # purge/import-store via purge._ID_SIDE_TABLES).
         _clear_expiry(conn, mid)
+        _clear_occurrence(conn, mid)
         if started_tx:
             _commit(conn)
     except Exception:
@@ -1992,6 +2076,37 @@ def update_memory(
         expiry_class_eff, inject_until_eff = _resolve_update_expiry(
             type_eff, expiry_class, inject_until, old_expiry, tx_now
         )
+        # v17 (#178): the occurrence transition matrix, resolved under the
+        # same lock. event->event INHERITS the old endpoints onto the
+        # replacement id; event->non-event clears (nothing to carry);
+        # non-event->event is refused (this surface takes no occurrence
+        # params — an event without endpoints violates the writer
+        # invariant). An occurrence-less imported event tolerates an
+        # event->event edit with nothing to inherit (documented orphan cell).
+        old_occurrence = conn.execute(
+            "SELECT occurred_start, occurred_end, mentioned_at "
+            "FROM memory_occurrence WHERE memory_id=?",
+            (mid,),
+        ).fetchone()
+        old_type = conn.execute(
+            "SELECT type FROM memory WHERE id=?", (mid,)
+        ).fetchone()
+        old_type_eff = old_type[0] if old_type else type_eff
+        occurrence_eff = None
+        if type_eff == "event":
+            if old_type_eff == "event":
+                if old_occurrence is not None:
+                    occurrence_eff = (
+                        old_occurrence[0], old_occurrence[1],
+                        old_occurrence[2])
+                # No old row (imported occurrence-less event): tolerated —
+                # nothing to inherit, nothing to insert.
+            else:
+                raise ValueError(
+                    "occurrence fields require type=event (update cannot "
+                    "create an event row: occurrence endpoints are set at "
+                    "add time only)"
+                )
 
         normalized_evidence_ids = _validated_evidence_ids(conn, evidence_ids)
 
@@ -2034,6 +2149,7 @@ def update_memory(
         # inherited pair), so the side table never holds a record keyed to a
         # dead parent.
         _clear_expiry(conn, mid)
+        _clear_occurrence(conn, mid)
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
@@ -2148,6 +2264,17 @@ def update_memory(
                 "INSERT OR REPLACE INTO memory_expiry "
                 "(memory_id, inject_until, expiry_class) VALUES (?,?,?)",
                 (new_id, inject_until_eff, expiry_class_eff),
+            )
+        # v17 (#178): the replacement row's occurrence record —
+        # event->event re-inserts the inherited triple under the new
+        # id; every other transition left occurrence_eff empty above.
+        if occurrence_eff is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_occurrence "
+                "(memory_id, occurred_start, occurred_end, mentioned_at) "
+                "VALUES (?,?,?,?)",
+                (new_id, occurrence_eff[0], occurrence_eff[1],
+                 occurrence_eff[2]),
             )
         # v10 (issue #60, 5.2): the update's replacement row runs the same
         # deterministic extractor as add. The tombstoned old row KEEPS its

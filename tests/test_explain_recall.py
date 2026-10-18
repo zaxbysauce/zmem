@@ -581,11 +581,76 @@ class ExplainSafetyTests(ExplainFixtureBase):
         # floor's job is that the NEXT explain-recall change does not move it
         # again without an explicit, disclosed bump here.
         # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2); the
-        # forward ceiling deliberately stays 15 for the constrained rebuild.
-        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): stamp-only bump for
-        # the entity_card type; FORWARD stays 15 (upgrade-required).
-        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 17)
-        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+        # forward ceiling deliberately stayed 15 for the constrained rebuild.
+        # v17 (#178): the additive `event`/`memory_occurrence` release — the
+        # same disclosed-bump rule; the additive window reopens at parity.
+        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 18)
+        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 18)
+
+
+class ExplainTemporalArmTest(unittest.TestCase):
+    """Issue #178 AC3/Design 6: `recall --explain` reports the temporal arm
+    with the same candidates/cap as normal recall and stays ZERO-WRITE —
+    the store file's SHA-256 is identical before and after."""
+
+    NS = "project:explain-temporal"
+    PROMPT_TS = "2026-09-10T12:00:00Z"
+
+    def test_explain_reports_temporal_arm_without_writes(self):
+        import hashlib
+
+        tmp = tempfile.mkdtemp(prefix="zmem-explain-temporal-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        store = os.path.join(tmp, "store.sqlite")
+        env = _pin_env(store)
+        env["ZMEM_DATA"] = tmp
+        env.pop("ZMEM_ARM_CAP_TEMPORAL", None)
+        # Seed one in-window event through the real add surface (the
+        # occurrence flags) — no wall-clock dependence in the assertion:
+        # the event's window overlaps "last week" at the fixed prompt ts.
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "add",
+             "--namespace", self.NS, "--type", "event",
+             "--content", "the outage during last week hit the api tier",
+             "--signal", "test",
+             "--occurred-start", "2026-09-01T08:00:00Z",
+             "--occurred-end", "2026-09-03T08:00:00Z",
+             "--mentioned-at", "2026-09-03T09:00:00Z",
+             "--json"],
+            env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        before = hashlib.sha256(Path(store).read_bytes()).hexdigest()
+        r = subprocess.run(
+            [PYTHON, str(STORE_PY), "recall",
+             "--query", "last week's outage",
+             "--namespace", self.NS,
+             "--prompt-timestamp", self.PROMPT_TS,
+             "--explain", "--json"],
+            env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        doc = json.loads(r.stdout)
+        exp = doc["explain"]
+        self.assertIn("arms", exp, "the explain envelope must carry the arm "
+                                   "map (the #136 contract)")
+        # The temporal arm entry: one candidate, post-cap one, cap 4.
+        self.assertEqual(
+            exp["arms"].get("temporal"),
+            {"pre": 1, "post": 1, "cap": 4},
+            f"explain must mirror normal recall's temporal arm, got "
+            f"{exp['arms']!r}")
+        # The in-window event is among the explained results/verdicts.
+        ids = [row.get("id") for row in doc.get("results", [])]
+        verdict_ids = [v["id"] for v in exp["verdicts"]]
+        self.assertTrue(
+            set(ids) & set(verdict_ids),
+            "the temporal candidate must be explained, not silently "
+            "dropped")
+        # ZERO-WRITE: identical store bytes before/after.
+        after = hashlib.sha256(Path(store).read_bytes()).hexdigest()
+        self.assertEqual(after, before,
+                         "--explain with a temporal arm must not write the "
+                         "store")
 
 
 if __name__ == "__main__":

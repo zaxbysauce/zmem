@@ -274,6 +274,35 @@ The current observation gate is recorded as `reject`, so page metadata omits
 set — `entity_card` joined as the card-refresh-only type; see "Entity cards
 (issue #179)" below).
 
+### event — occurrence-typed memories + the temporal recall arm (v17, issue #178)
+```
+<interpreter> <store.py> add --type event --namespace NS --content TEXT   --occurred-start 2026-09-01T08:00:00Z --occurred-end 2026-09-03T08:00:00Z   [--mentioned-at TS]
+<interpreter> <store.py> recall --query "last week's outage" --namespace NS   --prompt-timestamp 2026-09-10T12:00:00Z [--as-of TS]
+```
+Schema 17 adds the `event` memory type and the `memory_occurrence` side
+table (occurred_start / occurred_end / mentioned_at beside the memory id).
+Event rows require BOTH occurrence endpoints (clamped to the temporal
+window: the future clamps to the prompt timestamp, older than 3650 days
+clamps to the floor); non-event rows refuse any occurrence field (exit 2,
+no partial row). Occurrence rows live and die with their parent: every
+tombstone path deletes them in the same transaction, and event->event
+updates inherit the occurrence onto the replacement row (non-event->event
+via update is refused; dedup folds keep the keeper's occurrence).
+
+The temporal recall arm resolves relative phrases in the query (the fixed
+20-phrase vocabulary: today/yesterday/tomorrow, this/last/next week,
+this/last/next month, this/last year, past 24 hours/7 days/30 days,
+two/three days ago, in two days, earlier today, this/last quarter —
+longest-match-first, so "earlier today" wins over "today") against the
+`--prompt-timestamp` (default: the `ZMEM_TEST_NOW` seam / wall clock),
+selects occurrence-overlapping rows under the unchanged `--as-of`
+validity predicate, and fuses them as the capped fifth RRF arm
+(`ZMEM_ARM_CAP_TEMPORAL`, default 4). Knowledge validity (valid_from
+inclusive / valid_until exclusive) is SEPARATE from occurrence time.
+A phrase-free query or an occurrence-empty store fuses byte-identically.
+The Hermes/MCP `add` surfaces do not advertise `event` (they take no
+occurrence endpoints — the #173 `state` precedent).
+
 ### recall — surface relevant memories (high-precision)
 ```
 <interpreter> <store.py> recall --query "<query>" [--namespace NS] [--limit 5]

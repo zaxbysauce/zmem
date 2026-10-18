@@ -2003,6 +2003,18 @@ def main():
                        help="state expiry class: endpoint, setting, or metric")
     p_add.add_argument("--inject-until", type=str, dest="inject_until", default=None,
                        help="explicit UTC ISO8601 injection expiry timestamp")
+    # v17 (#178): event occurrence endpoints — required together for --type
+    # event, refused for every other type (cross-field hook below + the
+    # writer's ValueError both enforce it).
+    p_add.add_argument("--occurred-start", dest="occurred_start", action="store",
+                       type=str, default="",
+                       help="event occurrence start in canonical UTC form")
+    p_add.add_argument("--occurred-end", dest="occurred_end", action="store",
+                       type=str, default="",
+                       help="event occurrence end in canonical UTC form")
+    p_add.add_argument("--mentioned-at", dest="mentioned_at", action="store",
+                       type=str, default="",
+                       help="time the event was mentioned in the prompt")
 
     p_recall = _add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)
@@ -2043,6 +2055,11 @@ def main():
                                "unfold is explicit-recall-only and never runs here). "
                                "Implies --no-bump; the --json envelope gains reason and "
                                "candidate_ids (pre-gate ids) for the hook decision log.")
+    p_recall.add_argument("--prompt-timestamp", dest="prompt_timestamp",
+                          action="store", type=_iso8601, default=None,
+                          required=False,
+                          help="timestamp used to resolve relative temporal phrases; "
+                               "default is the injected test seam")
     p_recall.add_argument("--as-of", type=_iso8601, default=None,
                           help="temporal predicate (issue #59, 4.4): only return "
                                "rows VALID at as_of — valid_from <= as_of AND "
@@ -3711,6 +3728,15 @@ def main():
             and (args.expiry_class is not None or args.inject_until is not None)
             and getattr(args, "type", None) != "state"):
         ap.error("--expiry-class and --inject-until require --type state")
+    # v17 (#178): occurrence coupling — add only; update takes no occurrence
+    # params (its transition matrix lives in update_memory).
+    if (args.cmd == "add"
+            and (args.occurred_start or args.occurred_end or args.mentioned_at)
+            and getattr(args, "type", None) != "event"):
+        ap.error("--occurred-start/--occurred-end/--mentioned-at require --type event")
+    if (args.cmd == "add" and getattr(args, "type", None) == "event"
+            and not (args.occurred_start and args.occurred_end)):
+        ap.error("--type event requires --occurred-start and --occurred-end")
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
     # supplied --batch but ordinary reembed retains its historical default.
@@ -5243,15 +5269,23 @@ def main():
                         evidence_ids=args.evidence_ids,
                         expiry_class=args.expiry_class,
                         inject_until=args.inject_until,
+                        occurred_start=args.occurred_start,
+                        occurred_end=args.occurred_end,
+                        mentioned_at=args.mentioned_at,
                     )
                 finally:
                     if _human_out is not None:
                         sys.stdout = _human_out
                 if args.json:
-                    # Structured write result (issue #65, 10.8): consumed by the
-                    # MCP/Hermes add surfaces so remote write warnings (e.g. a
-                    # redaction) are structured data, not stderr text.
+                    # Structured write result (issue #65, 10.8): consumed by
+                    # the MCP/Hermes add surfaces so remote write warnings
+                    # (e.g. a redaction) are structured data, not stderr text.
+                    # v17 (#178): the additive `ok` flag mirrors the evidence
+                    # writer's envelope shape ({"ok": true, "id": ...}) so the
+                    # frozen certification drivers can assert success —
+                    # additive, existing keys and their order are unchanged.
                     print(json.dumps({
+                        "ok": True,
                         "id": str(res),
                         "result": "deduped" if res.deduped else "stored",
                         "warnings": res.warnings,
@@ -5486,6 +5520,7 @@ def main():
                     no_bump=args.no_bump,
                     include_global=args.include_global,
                     global_limit=args.global_limit, as_of=args.as_of,
+                    prompt_timestamp=args.prompt_timestamp,
                     no_mmr=args.no_mmr,
                     link_hops=args.link_hops,
                     link_budget=args.link_budget,
@@ -5502,6 +5537,7 @@ def main():
                     limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                     no_bump=args.no_bump, include_global=args.include_global,
                     global_limit=args.global_limit, as_of=args.as_of,
+                    prompt_timestamp=args.prompt_timestamp,
                     min_confidence=args.min_confidence,
                     no_mmr=args.no_mmr,
                     link_hops=args.link_hops, link_budget=args.link_budget,

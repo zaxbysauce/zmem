@@ -81,6 +81,7 @@ _ID_SIDE_TABLES = (
     # v15 (#173): injection-expiry metadata, keyed by memory_id. A purged (or
     # capture-refused staged) memory row would otherwise leave a dangling
     # memory_expiry row -- invisible to every recall lane because the parent is
+    ("memory_occurrence", "memory_id"),
     # gone, but still exported and re-validated against a re-created id. Both
     # consumers of this tuple guard on _table_exists, so a pre-v15 store is
     # unaffected.

@@ -313,6 +313,25 @@ def _cmd_export_jsonl_body(
             file=sys.stderr,
         )
 
+    # v17 (#178): occurrence records do not travel through export-jsonl (the
+    # issue scopes sync to occurrence CLEANUP only). Never drop metadata
+    # silently: when any packed row carries occurrence data, say so once on
+    # stderr (the #173 F14 precedent directly above).
+    try:
+        occ_count = conn.execute(
+            "SELECT COUNT(*) FROM memory_occurrence mo "
+            "JOIN memory m ON m.id = mo.memory_id"
+        ).fetchone()
+        if isinstance(occ_count, tuple) and occ_count and occ_count[0]:
+            print(
+                "[zmem] export-jsonl: memory_occurrence records skipped — "
+                "occurrence data does not travel through export/ingest yet; "
+                "event rows export without occurrence metadata",
+                file=sys.stderr,
+            )
+    except sqlite3.OperationalError:
+        pass  # memory_occurrence absent (pre-v17 store): nothing to say.
+
     lines = []
 
     def _emit(obj: dict, *, compact: bool = False) -> None:

@@ -1013,7 +1013,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     # contributed candidates post-cap), split by whether the decision
     # injected anything. Lines without the field (pre-#136 logs,
     # reason=disabled kill-switch lines) count under lines_without_arms.
-    arm_names = ("fts", "vec", "ent", "graph")
+    arm_names = ("fts", "vec", "ent", "graph", "temporal")
     arm_carry: dict = {a: {"injected": 0, "silent": 0} for a in arm_names}
     arms_lines_with = 0
     arms_lines_without = 0

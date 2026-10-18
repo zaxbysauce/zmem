@@ -62,19 +62,15 @@ class SchemaCompatGateTest(unittest.TestCase):
 
     def test_default_ceiling_refuses_supported_plus_one(self):
         # FORWARD_COMPAT defaults to SUPPORTED: today's behavior preserved.
-        # v16 (#175) opened a ONE-STEP window (FORWARD 15 under SUPPORTED 16
-        # — the entity-kinds rebuild is not additive).
-        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): the entity_card
-        # stamp-only bump keeps FORWARD at 15 — TWO steps under the new
-        # SUPPORTED 17, so the current client's additive window is empty by
-        # construction and anything above SUPPORTED still refuses exactly as
-        # before. The 15 stays load-bearing for the deployed v16-lineage
-        # clients (SUPPORTED 16 / FORWARD 15), which refuse a v17 store at
-        # open — the loud upgrade-required outcome this round demands
-        # (executed old-client blackout evidence: a <=0.106 host on card
-        # rows fails SILENT in its hooks).
-        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
-        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 17)
+        # v16 (#175) deliberately held a ONE-STEP gap (the entity-kinds
+        # rebuild is not additive, so FORWARD stayed 15 while SUPPORTED was
+        # 16). v17 (#178) is purely additive (new side table + index, no
+        # memory column or constraint change), so the window REOPENS AT
+        # PARITY: FORWARD == SUPPORTED and a store above SUPPORTED (v18+)
+        # still refuses exactly as before.
+        self.assertEqual(
+            self.schema.FORWARD_COMPAT_SCHEMA_VERSION,
+            self.schema.SUPPORTED_SCHEMA_VERSION)
         with self.assertRaises(RuntimeError) as cm:
             self._decide(self.schema.SUPPORTED_SCHEMA_VERSION + 1)
         self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA", str(cm.exception))
@@ -151,22 +147,21 @@ class SchemaCompatGateTest(unittest.TestCase):
                 conn.close()
         importlib.reload(self.schema)
         # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2 rebuild);
-        # FORWARD deliberately stays 15 — a v15 client refuses a v16 store.
-        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): SUPPORTED advanced
-        # 16 -> 17 (stamp-only entity_card bump); FORWARD STAYS 15 — a
-        # pre-0.107 client refuses a v17 store loudly instead of silently
-        # blacking out on card rows (the executed old-client evidence this
-        # re-pin cites).
-        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 17)
-        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+        # FORWARD deliberately stayed 15 — a v15 client refused a v16 store.
+        # v17 (#178): the additive `event`/`memory_occurrence` release moves
+        # SUPPORTED to 17 and REOPENS the additive window at parity
+        # (FORWARD 15 -> 17) — an older maintenance client may raise
+        # FORWARD_COMPAT (never SUPPORTED) to 17 and keep working on a v17
+        # store; clients still at FORWARD=15 refuse a v17 store.
+        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 18)
+        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 18)
         self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 17)
-        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 17)
 
 
-    def _build_current_store(self):
-        """Build an isolated CURRENT-version store via the real CLI; returns
-        its path. (v17 since the PR #385 review F-1 bump — 2026-10-18.)"""
-        tmp = tempfile.mkdtemp(prefix="zmem-v16onv17-")
+    def _build_v16_store(self):
+        """Build an isolated v16 store via the real CLI; returns its path."""
+        tmp = tempfile.mkdtemp(prefix="zmem-v15onv16-")
         self.addCleanup(shutil.rmtree, tmp, True)
         store = os.path.join(tmp, "store.sqlite")
         saved = {k: os.environ.get(k) for k in (
@@ -207,37 +202,37 @@ class SchemaCompatGateTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_v16_client_refuses_v17_store_with_actionable_message(self):
-        """The #175 upgrade-required discipline re-pinned at the v17
-        boundary (PR #385 review F-1/PRR-006, 2026-10-18): a v16-lineage
-        client (SUPPORTED=16, FORWARD=15 — the real pre-0.107 constants)
-        refuses a v17 store with the existing actionable message instead of
-        silently blacking out on entity_card rows. Both imported bindings
-        (storelib.schema and schema_meta) are patched, restored by the
-        patch context managers."""
+    def test_v15_client_refuses_v16_store_with_actionable_message(self):
+        """Issue #175 AC4: a v15 client (SUPPORTED=15, FORWARD=15) refuses a
+        newer upgrade-required store with the existing actionable message.
+        Both imported bindings (storelib.schema and schema_meta) are patched,
+        restored by the patch context managers. v17 (#178): the store the
+        CURRENT code builds is v17 — still above a v15 client's ceiling, so
+        the refusal contract is unchanged at the new boundary."""
         import schema_meta as meta
-        store = self._build_current_store()
+        store = self._build_v16_store()
         self.assertEqual(self._store_version(store), "17")
-        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
             try:
                 self.schema.connect()
-                self.fail("a v16-lineage client must refuse a v17 store")
+                self.fail("a v15 client must refuse a v17 store")
             except RuntimeError as exc:
                 self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA=1", str(exc))
                 self.assertIn("schema_version", str(exc))
         self.assertEqual(self._store_version(store), "17")
 
     def test_allow_newer_schema_override_proceeds_without_downgrade(self):
-        """ZMEM_ALLOW_NEWER_SCHEMA=1 proceeds on the v17 store, warns
-        exactly once, never downgrades or migrates it (re-pinned at the 17
-        boundary — the operator stopgap for the pre-0.107 fleet)."""
+        """Issue #175 AC4: ZMEM_ALLOW_NEWER_SCHEMA=1 proceeds on the newer
+        store, warns exactly once, never downgrades or migrates it. v17
+        (#178): the built store is v17; a v15 client under the override
+        keeps it at 17."""
         import io
         import schema_meta as meta
         from contextlib import redirect_stderr
-        store = self._build_current_store()
+        store = self._build_v16_store()
         self.assertEqual(self._store_version(store), "17")
         os.environ["ZMEM_ALLOW_NEWER_SCHEMA"] = "1"
-        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
             self.schema._schema_compat._warned = False
             buf = io.StringIO()
             with redirect_stderr(buf):
@@ -449,6 +444,196 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         ver = sqlite3.connect(os.environ["ZMEM_STORE"]).execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         self.assertEqual(ver, "15")
+
+
+class OlderV16ClientOnV17StoreTest(unittest.TestCase):
+    """Issue #178 AC1: a v16 MAINTENANCE client (SUPPORTED=16, FORWARD=17)
+    opens the current v17 store through the reopened additive window — one
+    NOTICE, ordinary read/write, never a downgrade. The four version
+    bindings are patched with unittest.mock.patch.object in the required
+    16/17 pattern (SUPPORTED may never be patched below FORWARD here)."""
+
+    def setUp(self):
+        import importlib
+        import storelib.schema as schema
+        # Reload first so a patched SUPPORTED from a prior test can never
+        # leak into this class (the sibling-class convention).
+        importlib.reload(schema)
+        self._tmp = tempfile.mkdtemp(prefix="zmem-178-v16onv17-")
+        self._saved = {k: os.environ.get(k) for k in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_ALLOW_NEWER_SCHEMA")}
+        os.environ["ZMEM_STORE"] = os.path.join(self._tmp, "store.sqlite")
+        os.environ["ZMEM_DATA"] = self._tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(self._tmp, "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
+        # Re-load AFTER the env is set: the module binds STORE_PATH at
+        # import and connect() must target THIS test's store.
+        importlib.reload(schema)
+        schema._schema_compat._warned = False
+        self._schema = schema
+        # Build the store with CURRENT code (v17).
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "init"],
+            capture_output=True, text=True, timeout=180,
+            env={**os.environ},
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def tearDown(self):
+        import importlib
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        importlib.reload(self._schema)  # restore patched constants
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_v16_maintenance_client_stores_and_recalls_on_v17_store(self):
+        import io
+        import sqlite3
+        from contextlib import redirect_stderr
+
+        import schema_meta
+        schema = self._schema
+        store = os.environ["ZMEM_STORE"]
+        self.assertEqual(self._store_version(store), "17",
+                         "precondition: the current code builds a v17 store")
+
+        with patch.object(schema, "SUPPORTED_SCHEMA_VERSION", 16), \
+             patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 17), \
+             patch.object(schema_meta, "SUPPORTED_SCHEMA_VERSION", 16), \
+             patch.object(schema_meta, "FORWARD_COMPAT_SCHEMA_VERSION", 17):
+            # Reset BEFORE: isolate this test's NOTICE from any prior fire.
+            schema._schema_compat._warned = False
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                # The compat verdict itself, pinned directly (this probe is
+                # what fires the one-shot NOTICE into the captured stream;
+                # every later call in this block must add nothing).
+                self.assertEqual(schema._schema_compat(17, store), "compat")
+                conn = schema.connect()
+                schema._prepare_store(conn)
+                from storelib.write import WriteResult, add_memory
+                from storelib.recall import recall_memory
+                res = add_memory(
+                    conn, namespace="project:fwd178", type_="fact",
+                    content="row stored by a simulated v16 maintenance client",
+                    signal="test",
+                )
+                self.assertIsInstance(res, WriteResult)
+                self.assertEqual(len(res), 36)
+                self.assertFalse(res.deduped)
+                row = conn.execute(
+                    "SELECT content FROM memory WHERE id=?",
+                    (str(res),)).fetchone()
+                self.assertIn("v16 maintenance client", row["content"])
+                # The additive window is read/write, not read-only.
+                rows = recall_memory(
+                    conn, query="maintenance client",
+                    namespace="project:fwd178")
+                self.assertTrue(
+                    any(str(r["id"]) == str(res) for r in rows),
+                    "the v16 maintenance client must be able to recall the "
+                    "row it just wrote on a v17 store")
+                conn.close()
+            notice = buf.getvalue()
+        # Exactly ONE NOTICE names the v17-vs-v16 gap.
+        self.assertEqual(notice.count("NOTICE"), 1,
+                         f"expected exactly one NOTICE, got: {notice!r}")
+        self.assertIn("store schema v17 is newer than this client's v16",
+                      notice)
+        self.assertIn("additive-only schema", notice)
+        # The store remains v17 — the older client never downgrades it.
+        self.assertEqual(self._store_version(store), "17")
+
+    @staticmethod
+    def _store_version(store) -> str:
+        conn = sqlite3.connect(store)
+        try:
+            return conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+
+class Schema18MigrationTest(unittest.TestCase):
+    """Issue #178 AC1 (atomicity): a failing v17 DDL statement leaves the
+    schema_version marker and the pre-migration table set unchanged."""
+
+    def test_failed_v17_migration_is_atomic(self):
+        import storelib.schema as schema
+
+        tmp = tempfile.mkdtemp(prefix="zmem-178-atomic-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        store = os.path.join(tmp, "store.sqlite")
+        saved = {k: os.environ.get(k) for k in (
+            "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+            "ZMEM_MODEL_AUTODOWNLOAD")}
+        os.environ["ZMEM_STORE"] = store
+        os.environ["ZMEM_DATA"] = tmp
+        os.environ["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(_restore)
+
+        # Build a full store with current code, then hold it at the v16
+        # surface (drop the v17 objects, marker back to 16) — the state a
+        # pre-migration store is in when the v17 block runs.
+        conn = sqlite3.connect(store)
+        try:
+            schema.init_db(conn)
+            schema.migrate(conn)
+            conn.execute("DROP INDEX IF EXISTS idx_memory_occurrence_range")
+            conn.execute("DROP TABLE IF EXISTS memory_occurrence")
+            conn.execute(
+                "UPDATE meta SET value='16' WHERE key='schema_version'")
+            conn.commit()
+
+            def snapshot():
+                version = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()[0]
+                tables = sorted(r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"))
+                return version, tables
+
+            before_version, before_tables = snapshot()
+            self.assertEqual(before_version, "16")
+            self.assertNotIn("memory_occurrence", before_tables)
+
+            # Inject ONE failing v17 DDL: keep the table statement, break
+            # the LAST statement (the index) against a nonexistent table.
+            broken_ddl = (
+                schema._MEMORY_OCCURRENCE_SCHEMA_DDL[0],
+                "CREATE INDEX IF NOT EXISTS idx_memory_occurrence_range "
+                "ON no_such_v17_table(occurred_start)",
+            )
+            with patch.object(schema, "_MEMORY_OCCURRENCE_SCHEMA_DDL",
+                              broken_ddl):
+                with self.assertRaises(sqlite3.OperationalError):
+                    schema.migrate(conn)
+
+            after_version, after_tables = snapshot()
+            self.assertEqual(after_version, before_version,
+                             "a failed v17 migration must leave the version "
+                             "marker below 17")
+            self.assertEqual(after_tables, before_tables,
+                             "a failed v17 migration must leave the table "
+                             "set unchanged (no partial memory_occurrence)")
+            self.assertNotIn("memory_occurrence", after_tables)
+        finally:
+            conn.close()
 
 
 class DoctorCompatGradingTest(unittest.TestCase):

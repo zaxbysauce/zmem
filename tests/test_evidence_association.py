@@ -756,10 +756,10 @@ class SchemaInvariantTest(unittest.TestCase):
             # FORWARD deliberately stays 15 — the rebuild is not additive.
             # v17 (PR #385 review F-1/PRR-006, 2026-10-18): stamp-only bump
             # for the entity_card type; FORWARD stays 15 (upgrade-required).
-            self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 17)
-            self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
-            self.assertEqual(schema.SUPPORTED_SCHEMA_VERSION, 17)
-            self.assertEqual(schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+            self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 18)
+            self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 18)
+            self.assertEqual(schema.SUPPORTED_SCHEMA_VERSION, 18)
+            self.assertEqual(schema.FORWARD_COMPAT_SCHEMA_VERSION, 18)
 
 
 class CliEvidenceAssociationTest(unittest.TestCase):

@@ -208,7 +208,10 @@ class GoldRescueTest(_FloorEnvHermetic, unittest.TestCase):
     def test_arms_attribution_carries_the_hit(self):
         env = _recall_envelope(self.conn)
         arms = env["arms"]
-        self.assertEqual(set(arms), {"fts", "vec", "entity", "graph"})
+        # v17 (#178): the temporal arm joins the accounting set — the five
+        # arms are always present (temporal zero-filled when empty).
+        self.assertEqual(set(arms),
+                         {"fts", "vec", "entity", "graph", "temporal"})
         for arm, entry in arms.items():
             self.assertEqual(set(entry), {"pre", "post", "cap"},
                              f"arms[{arm}] shape drifted: {entry}")
@@ -306,8 +309,9 @@ class PerArmCapsTest(_FloorEnvHermetic, unittest.TestCase):
 
     def test_explain_envelope_reports_arms(self):
         exp = _explain_envelope(self.conn)
+        # v17 (#178): explain parity — the temporal arm joins the set.
         self.assertEqual(set(exp["arms"]),
-                         {"fts", "vec", "entity", "graph"})
+                         {"fts", "vec", "entity", "graph", "temporal"})
         self.assertGreaterEqual(exp["arms"]["graph"]["post"], 2)
 
     def test_env_cap_truncates_fts_before_fusion(self):
@@ -460,6 +464,36 @@ class RrfFuseUnitTest(unittest.TestCase):
         self.assertEqual(recall_mod._rrf_fuse(["a"], [], ["b"]), ["a", "b"])
         self.assertEqual(recall_mod._rrf_fuse(["a"], [], None), ["a"])
 
+    def test_temporal_is_keyword_only_fifth_list(self):
+        # v17 (#178): temporal_ids is the FIFTH ranked list, keyword-only,
+        # appended AFTER graph_ids and the #176 entity-weight seam.
+        import inspect
+        params = inspect.signature(recall_mod._rrf_fuse).parameters
+        self.assertEqual(params["temporal_ids"].kind,
+                         inspect.Parameter.KEYWORD_ONLY)
+        key_order = [name for name, p in params.items()
+                     if p.kind == inspect.Parameter.KEYWORD_ONLY]
+        self.assertEqual(
+            key_order, ["graph_ids", "entity_weight_by_memory",
+                        "temporal_ids"])
+
+    def test_fuse_with_and_without_temporal_changes_order(self):
+        # Without the temporal arm the pinned four-arm order holds; WITH it
+        # the temporal-only id enters and the fused ORDER changes (a gains a
+        # second list, tying with b at the top of the stable sort).
+        base = recall_mod._rrf_fuse(["a", "b"], ["b"], ["c"],
+                                    graph_ids=["d"], k=60)
+        self.assertEqual(base, ["b", "a", "c", "d"])
+        self.assertNotIn("e", base)
+        with_t = recall_mod._rrf_fuse(["a", "b"], ["b"], ["c"],
+                                      graph_ids=["d"], k=60,
+                                      temporal_ids=["e", "a"])
+        self.assertIn("e", with_t)
+        self.assertEqual(with_t[0], "a",
+                         "the temporal contribution to 'a' must reorder the "
+                         "fusion (b no longer first)")
+        self.assertNotEqual(base, with_t)
+
 
 class ArmCapUnitTest(unittest.TestCase):
     def test_bounds(self):
@@ -563,6 +597,110 @@ class BgLogArmsFieldTest(unittest.TestCase):
             out = self._parse(self.BASE + "\n", tmp)
             self.assertEqual(len(out), 1)
             self.assertIsNone(out[0]["arms"])
+
+    def test_line_with_temporal_segment_parses(self):
+        # v17 (#178) reader parity, parse level: the exact writer-emitted
+        # five-segment shape (temporal AFTER graph) rides the arms= token
+        # verbatim through parse_bg_log.
+        import tempfile
+        wire = "arms=fts:4/15,vec:2/15,ent:1/50,graph:0/4,temporal:3/4"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._parse(self.BASE + " " + wire + "\n", tmp)
+            self.assertEqual(len(out), 1)
+            self.assertEqual(out[0]["arms"],
+                             "fts:4/15,vec:2/15,ent:1/50,graph:0/4,"
+                             "temporal:3/4")
+
+    def test_hook_renders_temporal_after_graph_wire_order(self):
+        # v17 (#178): the hook serializer must append temporal:<post>/<cap>
+        # AFTER graph in the arms= field — the exact wire order. Loads the
+        # real hook body (the tests/test_bg_log_sid.py importlib pattern)
+        # and feeds a decision carrying all five arms.
+        import importlib.util
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["ZMEM_DATA"] = tmp
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "zmem_recall_body_under_test_178", str(HOOK_BODY))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                data_dir = mod._data_dir()
+                mod._log_inject_decision(
+                    [{"id": "a"}], [{"id": "a"}], "injected", "injected",
+                    tokens_used=10, tokens_budget=1500,
+                    session_id="sess-temporal-wire", store_py="",
+                    arms={"fts": {"pre": 6, "post": 4, "cap": 15},
+                          "vec": {"pre": 3, "post": 2, "cap": 15},
+                          "entity": {"pre": 2, "post": 1, "cap": 50},
+                          "graph": {"pre": 1, "post": 0, "cap": 4},
+                          "temporal": {"pre": 3, "post": 3, "cap": 4}})
+            finally:
+                os.environ.pop("ZMEM_DATA", None)
+            log = Path(data_dir) / "zmem-decisions.log"
+            self.assertTrue(log.is_file(), "decision line must be written")
+            # The resolved log home is shared across hook tests (the
+            # existing test above notes the module-store precedence), so
+            # scope to THIS decision's sid.
+            lines = [ln for ln in
+                     log.read_text(encoding="utf-8").splitlines()
+                     if " arms=" in ln and "sess-temporal-wire" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(
+            "arms=fts:4/15,vec:2/15,ent:1/50,graph:0/4,temporal:3/4",
+            lines[0],
+            "the wire field must carry the exact five-segment order with "
+            "temporal AFTER graph")
+        # Order pinned by position, not substring luck.
+        self.assertLess(
+            lines[0].index("graph:0/4"), lines[0].index("temporal:3/4"))
+
+    def test_miss_report_parses_temporal_segment(self):
+        # v17 (#178) reader parity, report level: run_miss_report's
+        # arm-name segmentation (arm_names) must aggregate the temporal
+        # segment of the exact writer-emitted line — carried.temporal
+        # counts an injected decision — while the legacy four-segment
+        # shape still parses beside it.
+        import sqlite3
+        import tempfile
+        from storelib import miss_rate
+        from storelib.schema import init_db, migrate
+        with tempfile.TemporaryDirectory(prefix="zmem-178-report-") as tmp:
+            store = os.path.join(tmp, "store.sqlite")
+            conn = sqlite3.connect(store)
+            try:
+                init_db(conn)
+                migrate(conn)
+            finally:
+                conn.close()
+            log = os.path.join(tmp, "zmem-decisions.log")
+            with open(log, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "[1700000000] zmem-hook status=injected "
+                    "reason=injected ids=['a'] all=['a'] tokens=10/1500 "
+                    "sid=sess-a moment=user_prompt "
+                    "arms=fts:4/15,vec:2/15,ent:1/50,graph:0/4,"
+                    "temporal:3/4\n")
+                handle.write(
+                    "[1700000100] zmem-hook status=injected "
+                    "reason=injected ids=['b'] all=['b'] tokens=5/1500 "
+                    "sid=sess-b moment=user_prompt "
+                    "arms=fts:2/15,vec:0/15,ent:0/50,graph:1/4\n")
+            rep = miss_rate.run_miss_report(store_path=store,
+                                            bg_log_path=log)
+        self.assertIsNone(rep.get("error"), rep.get("error"))
+        arms = rep["arms"]
+        self.assertEqual(arms["lines_with_arms"], 2)
+        self.assertEqual(arms["lines_without_arms"], 0)
+        # The temporal segment of line 1 aggregates (post=3 > 0, injected).
+        self.assertEqual(arms["carried"]["temporal"],
+                         {"injected": 1, "silent": 0})
+        # The legacy four-segment line still parses (graph carried there).
+        self.assertEqual(arms["carried"]["graph"],
+                         {"injected": 1, "silent": 0})
+        # Parity: the report's arm set matches the five wire labels.
+        self.assertEqual(sorted(arms["carried"]),
+                         ["ent", "fts", "graph", "temporal", "vec"])
 
     def test_hook_renders_arms_from_envelope(self):
         # F11 (review round): functional, not source-grep — load the real

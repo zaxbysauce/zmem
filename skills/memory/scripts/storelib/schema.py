@@ -1389,6 +1389,59 @@ _EVIDENCE_LOOKUP_INDEX_DDL = (
 # inert and the writer's explicit `DELETE FROM memory_expiry` cleanup is what
 # keeps the side table from orphaning on a tombstone. `idx_memory_expiry_until`
 # is the single index (#174's live-expiry gate scans by inject_until).
+_MEMORY_OCCURRENCE_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS memory_occurrence (
+        memory_id TEXT PRIMARY KEY REFERENCES memory(id),
+        occurred_start TEXT NOT NULL,
+        occurred_end TEXT NOT NULL,
+        mentioned_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_memory_occurrence_range "
+    "ON memory_occurrence(occurred_start, occurred_end)",
+)
+
+
+def _migrate_v18(conn: sqlite3.Connection) -> None:
+    """Create the `memory_occurrence` side table and advance to v18 atomically.
+
+    Mirrors `_migrate_v14`/`_migrate_v15`: one transaction (savepoint under a
+    caller's) so a DDL failure leaves the table set, index set, and version
+    marker unchanged; the version advances only after BOTH statements succeed.
+    Purely additive — no `memory` column or constraint change — so the v18
+    forward-compat window reopens (schema_meta header). The store does not
+    enable PRAGMA foreign_keys; occurrence cleanup is explicit at every
+    tombstone/delete site, never cascade-relied-upon. Second call is a no-op
+    via the `ver < 18` guard. Fresh stores reach this block through the
+    init_db (schema_version '1') -> migrate() walk.
+    """
+    savepoint = "zmem_v18_memory_occurrence"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _MEMORY_OCCURRENCE_SCHEMA_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "UPDATE meta SET value='18' WHERE key=?",
+            (SCHEMA_VERSION_KEY,),
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
 _MEMORY_EXPIRY_SCHEMA_DDL = (
     """
     CREATE TABLE IF NOT EXISTS memory_expiry (
@@ -2475,6 +2528,21 @@ def migrate(conn: sqlite3.Connection) -> None:
         # exists so pre-0.107 clients refuse the store loudly (upgrade-
         # required) instead of silently blacking out on card rows.
         _migrate_v17(conn)
+
+    if ver < 18:
+        # v18 (issue #178, PR #382): additive `memory_occurrence` side table +
+        # range index — same discipline as v14/v15: the DDL lives only here, so
+        # a failed migration rolls back the table set, index set, and version
+        # marker together (Schema18MigrationTest pins the atomicity).
+        #
+        # RENUMBERED from 17 during the rebase onto main. Sibling #385 already
+        # owns 17 with a STAMP-ONLY migration, so keeping the number would
+        # have made this block unreachable on every store a released client had
+        # stamped — `memory_occurrence` never created, `ALLOWED_TYPES`
+        # accepting `event`, and the first `add --type event` dying on a
+        # missing table. Two definitions behind one integer is precisely what
+        # the version gate exists to prevent.
+        _migrate_v18(conn)
 
     # Version-independent evidence-first lookup index: this repairs existing
     # v14 stores without a version bump and is idempotent on every open.

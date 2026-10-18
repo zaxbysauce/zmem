@@ -81,3 +81,9 @@ tests/fixtures/fleet/*.jsonl text eol=lf
 # CRLF on Windows checkout. *.jsonl is not covered by the global *.json
 # rule, so pin the whole directory.
 tests/fixtures/entity_card/** text eol=lf
+
+# schema 17 (issue #178): the temporal phrase projection and the as-of
+# golden are byte-compared, so pin LF. (*.py is ALREADY pinned globally
+# above; *.txt and *.jsonl are the families actually missing.)
+tests/fixtures/temporal/** text eol=lf
+tests/fixtures/asof/** text eol=lf
