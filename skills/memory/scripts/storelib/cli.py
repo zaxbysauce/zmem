@@ -5584,25 +5584,19 @@ def main():
                     "--allow-namespace (a peer file must be scoped; refusing "
                     "everything silently is not an import)")
             if args.trust == "untrusted-peer":
+                # Issue #282 review (PR #379 inline finding): reuse the
+                # canonical admission rule. schema_meta declares itself the
+                # single source of truth for writer/MCP/auth/doctor namespace
+                # grammar, and the inline copy this replaces had already
+                # drifted from it — it accepted a whitespace-bearing scoped
+                # name ("host:my box") that the writer itself refuses.
+                from schema_meta import is_valid_namespace as _is_valid_ns
                 for _ns in args.allow_namespace:
-                    _v = (_ns or "").strip()
-                    if (not _v or ":" not in _v
-                            or any(ord(c) < 32 for c in _v)):
+                    if not _is_valid_ns(_ns):
                         p_ingest_jsonl.error(
-                            f"--allow-namespace values must be non-empty "
-                            f"scoped namespaces, got {_ns!r}")
-                    _prefix = _v.split(":", 1)[0]
-                    _rest = _v.split(":", 1)[1]
-                    if _prefix not in ("project", "user", "fleet", "host",
-                                       "agent", "domain") or not _rest:
-                        p_ingest_jsonl.error(
-                            f"--allow-namespace value {_ns!r} is not a valid "
-                            "namespace shape")
-                    if (_prefix in ("fleet", "host", "agent", "domain")
-                            and ":" in _rest):
-                        p_ingest_jsonl.error(
-                            f"--allow-namespace value {_ns!r}: scoped "
-                            "namespace kinds take a colon-free name")
+                            "--allow-namespace values must be namespaces the "
+                            "store itself admits (scoped, e.g. project:foo or "
+                            f"host:box), got {_ns!r}")
                 from storelib.sync import IngestTrustPolicy
                 _trust_policy = IngestTrustPolicy(
                     allowed_namespaces=args.allow_namespace,

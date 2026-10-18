@@ -148,6 +148,27 @@ class PeerKindsTest(T._TwoStoreCase):
                 "SELECT score FROM memory_link WHERE src_id=?", (victim,)),
             "an id-collision row must not graft edges onto the victim")
 
+    def test_allow_list_reuses_the_canonical_namespace_grammar(self):
+        """PR #379 inline finding: the allow-list grammar is the store's own.
+
+        ``schema_meta`` declares itself the single source of truth for
+        namespace admission (writer, MCP, auth, doctor). The CLI's own copy
+        had already drifted from it — it accepted a whitespace-bearing scoped
+        name ("host:my box") that the writer itself refuses, so an operator
+        could allow-list a namespace the store would never admit.
+        """
+        path = os.path.join(self.b.tmp, "peer.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(T._sync_row(id=str(uuid.uuid4()),
+                                        content="grammar probe row")) + "\n")
+        for bad in ("host:my box", "host:a:b", "project:", "global", "*"):
+            r = self.b.run("ingest-jsonl", "--in", path,
+                           "--trust", "untrusted-peer",
+                           "--allow-namespace", bad)
+            self.assertEqual(r.returncode, 2, f"{bad!r}: {r.stdout}{r.stderr}")
+            self.assertIn("namespaces the store itself admits",
+                          r.stderr, f"{bad!r}: {r.stderr}")
+
     def test_strict_link_score_clamped(self):
         # Final-critic F1 pin: the STRICT lane clamps edge scores too.
         target = self.a_add(NS)

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "17805e6255baa9f59fd7fe6e778133b515501321a26017c295020a2ff0c60063",
+  "digest": "bc522bac827f68b04a197cfd6837d2f097bbc6dae55ca68dca1f4034b1ed761b",
   "files": {
     "hermes-plugin/__init__.py": "e12a4d65f018b7290a8286de704fc392165d4849c7c903d90511416a94607a03",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -75,7 +75,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "4b1cdafbed2f1cf8fa09d1bf4c55d946646289600010530c2a45a8fc6a706570",
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
-    "skills/memory/scripts/storelib/cli.py": "2464f8ffdbdb3e309ce9e1f130e03d88b7efb23a2734e2f9617a6a8df2c70422",
+    "skills/memory/scripts/storelib/cli.py": "181056adf3235b1dca4b81f26e3482ea0ef9ebb5d2ecae8c9db690ab7145466a",
     "skills/memory/scripts/storelib/consolidate.py": "a86f1aea1573b03b0b57a00f6a2d9e21b5c1aeeb73de2669c64cf81a70c3e4ba",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
