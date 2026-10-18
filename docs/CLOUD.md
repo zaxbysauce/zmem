@@ -596,6 +596,17 @@ tombstone authority. A corrupt row still never aborts the file (legacy
 lane); `--strict` makes violations fatal. Your own export/rebuild keeps the
 default `--trust authoritative` path byte-identical.
 
+**A peer is never authoritative over a row it did not author.** Where the
+boundary is authorship rather than namespace, the summary counts it
+separately from the namespace gate: `authorship_refused=N` (on top of
+`namespace_refused=N`) for a `memory_expiry` aimed at a row this import did
+not land, because an allow-listed namespace necessarily holds local rows. That
+gate covers *mutations*, so replaying a file you already accepted stays a
+no-op: a lifetime already recorded for the row is left exactly as it is. A
+peer that re-states a row's expiry with DIFFERENT values is still refused —
+the tolerance is identical-only, and under `--strict` the refusal is fatal for
+the whole file.
+
 ### The pattern
 
 - **Local side** (the box that owns the real `~/.zmem` store) periodically
@@ -696,10 +707,12 @@ default `--trust authoritative` path byte-identical.
     --capture-mode auto
   ```
   Repeated ingestion of the same outbox file — or overlap between two cloud
-  sessions' outboxes — is safe (again, see below). Same exit-code contract as
-  the cloud-side ingest above: `2` only for a missing/inaccessible or
-  empty/whitespace-only outbox file, `0` otherwise (malformed rows never fail
-  the run). A cloud outbox is remote-authored data: ingest always tags
+  sessions' outboxes — is safe in both lanes, peer mode included (the
+  authorship gate blocks *mutations* of rows this import did not author, so
+  re-stating a lifetime the store already holds is a no-op). Same exit-code
+  contract as the cloud-side ingest above: `2` only for a missing/inaccessible
+  or empty/whitespace-only outbox file, `0` otherwise (malformed rows never
+  fail the run). A cloud outbox is remote-authored data: ingest always tags
   `prompt-injection-risk` on rows matching injection patterns (in every mode),
   and `--capture-mode auto` additionally redacts secret-like values and
   quarantines rows that look secret-like (source_ref, unredactable content,
