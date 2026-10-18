@@ -875,9 +875,10 @@ table, recreate `entity` with the new CHECK, copy back) in one BEGIN
 IMMEDIATE transaction with `PRAGMA foreign_key_check` before commit; every
 `entity`, `entity_alias`, and `memory_entity` row
 survives unchanged. This is NOT an additive bump: a changed SQL constraint is
-outside the forward-compat window, so `SUPPORTED_SCHEMA_VERSION` is 16 while
-`FORWARD_COMPAT_SCHEMA_VERSION` deliberately stays 15 — every client older
-than the v16 release REFUSES a migrated v16 store (the actionable refusal
+outside the forward-compat window, so per the v16 contract
+`SUPPORTED_SCHEMA_VERSION` is 16 while `FORWARD_COMPAT_SCHEMA_VERSION`
+deliberately stays 15 — every client older than the v16 release REFUSES a
+migrated v16 store (the actionable refusal
 names `ZMEM_ALLOW_NEWER_SCHEMA=1`, the explicit operator override that
 proceeds at the operator's own risk and never downgrades or migrates the
 store). The #172 taxonomy decision for `entity_card` is REJECT: that memory
@@ -887,6 +888,15 @@ ships the type — cards are born only through the refresh path. Since 0.107.0
 `ALLOWED_TYPES` carries `entity_card` (the #175 kinds precedent: the RFC map
 is a frozen record, not a veto); see "Entity cards (issue #179)" below for
 the full card contract.
+
+Schema 17 (issue #178) is purely additive (the `event` type plus the
+`memory_occurrence` side table — no `memory` column or constraint change),
+so the forward-compat window REOPENS: `SUPPORTED_SCHEMA_VERSION` is 17 and
+`FORWARD_COMPAT_SCHEMA_VERSION` is 17. Clients whose forward ceiling is
+still 15 (every 0.10x-era install) refuse a migrated v17 store until
+updated — on shared-store machines, update every zmem client before the
+first v17 client opens the store (`ZMEM_ALLOW_NEWER_SCHEMA=1` is the
+stopgap; see CUTOVER.md and the CHANGELOG operator note).
 
 #### Injection token budget (issues #65 10.9, #116)
 

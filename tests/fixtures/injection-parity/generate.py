@@ -74,11 +74,14 @@ def _expected_row(memory_id: str, content: str) -> dict:
 # Refreshed 2026-09-23 (issue #126, release 0.61.0): the selector subprocess
 # now applies the user_prompt fact profile (moment weighting), so the
 # pinned score is the base 0.88 x (1.15/1.05) = 0.9638 (4 dp).
+# Refreshed 2026-10-17 (issue #178, schema 17): arms gained the additive
+# zero-filled "temporal" entry (this fixture carries no event rows).
 EXPECTED_ENVELOPE = {
     "arms": {
         "entity": {"cap": 50, "post": 0, "pre": 0},
         "fts": {"cap": 15, "post": 2, "pre": 2},
         "graph": {"cap": 5, "post": 0, "pre": 0},
+        "temporal": {"cap": 4, "post": 0, "pre": 0},
         "vec": {"cap": 15, "post": 0, "pre": 0},
     },
     "budget_admission": 68,

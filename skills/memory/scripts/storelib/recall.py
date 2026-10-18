@@ -1481,8 +1481,12 @@ def _recall_one_tier(
         # (not also surfaced by a query-measuring arm) are link-rescued
         # neighbors in the #114 sense — they render but never feed the
         # surfaced/retrieval counters (bump_ids excludes them below).
+        # v17 (#178): temporal is a query-measuring arm too, so it must be
+        # subtracted here — a row arriving via BOTH graph and temporal is not
+        # graph-arrival-only and must stay bump-eligible.
         graph_only_ids = (set(graph_ids) - set(fts_ids)
-                          - set(vec_fused) - set(ent_fused))
+                          - set(vec_fused) - set(ent_fused)
+                          - set(temporal_fused))
         rrf_pos = {mid: i for i, mid in enumerate(fused_ids, 1)}
         rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
     else:
@@ -2015,6 +2019,7 @@ def _scoped_tier_pools(
     collect_lanes: bool = False,
     moment: str | None = None,
     lane: str | None = None,
+    prompt_timestamp: str | None = None,
 ) -> tuple[dict[str, list[tuple[float, dict]]], list[str]]:
     """Score the independent scoped pools and apply tier provenance labels."""
     namespace_tiers, selected_namespaces = _scoped_namespaces(
@@ -3184,6 +3189,7 @@ def _recall_memory_impl(
                 as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
                 moment=effective_moment, lane=lane,
                 expiry_lane=expiry_active, expiry_acc=expiry_acc,
+                prompt_timestamp=prompt_timestamp,
             )
 
     # Issue #235: the user:global tier floor.  The selector threads the
@@ -3929,6 +3935,7 @@ def _explain_run_pipeline(
         conn, query=query, ns_list=ns_list, limit=max(limit * 3, limit + 5),
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
         as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
+        prompt_timestamp=prompt_timestamp,
     )
     global_deep: list[tuple[float, dict]] = []
     if global_ns_list:
@@ -3937,6 +3944,7 @@ def _explain_run_pipeline(
             limit=max(global_limit * 3, global_limit + 5),
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
+            prompt_timestamp=prompt_timestamp,
         )
     # Issue #179 (PR #385 review F-5d): the same suppression pass over the
     # DEEP pools — the verdict stream must agree with the presented fence,

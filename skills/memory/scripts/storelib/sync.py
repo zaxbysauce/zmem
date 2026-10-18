@@ -322,7 +322,10 @@ def _cmd_export_jsonl_body(
             "SELECT COUNT(*) FROM memory_occurrence mo "
             "JOIN memory m ON m.id = mo.memory_id"
         ).fetchone()
-        if isinstance(occ_count, tuple) and occ_count and occ_count[0]:
+        # Index, never isinstance(tuple): schema.connect() sets
+        # row_factory=sqlite3.Row, and a Row is not a tuple — the previous
+        # tuple guard made this notice unreachable (#178 review).
+        if occ_count is not None and occ_count[0]:
             print(
                 "[zmem] export-jsonl: memory_occurrence records skipped — "
                 "occurrence data does not travel through export/ingest yet; "

@@ -747,7 +747,7 @@ class QueryRewriteSurfaceIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 set(search_payload),
                 {"results", "count", "omitted", "injection_risk",
-                 "tokens_used", "tokens_budget"},
+                 "tokens_used", "tokens_budget", "arms"},
             )
 
     def test_empty_query_rewrite_context_is_shared_across_surfaces(self):

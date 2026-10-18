@@ -438,8 +438,10 @@ class EnvelopeContractTest(ForInjectionBase):
         doc = json.loads(r.stdout)
         self.assertNotIn("reason", doc)
         self.assertNotIn("candidate_ids", doc)
-        self.assertEqual(sorted(doc), ["count", "injection_risk", "omitted",
-                                       "results", "tokens_budget",
+        # `arms` (v17, issue #178) is a per-arm stats map, not an
+        # injection-only flag — it belongs in the plain envelope.
+        self.assertEqual(sorted(doc), ["arms", "count", "injection_risk",
+                                       "omitted", "results", "tokens_budget",
                                        "tokens_used"])
 
     def test_for_injection_envelope_carries_reason_and_candidates(self):

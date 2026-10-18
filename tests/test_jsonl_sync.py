@@ -200,6 +200,15 @@ class _TwoStoreCase(unittest.TestCase):
         except sqlite3.OperationalError:
             return set()  # pre-v15 store: no side table
 
+    @staticmethod
+    def _occurrence_ids(store: "Store") -> set:
+        """The memory_ids a store actually holds occurrence rows for (issue #178)."""
+        try:
+            return {r[0] for r in store.query_all(
+                "SELECT memory_id FROM memory_occurrence")}
+        except sqlite3.OperationalError:
+            return set()  # pre-v17 store: no side table
+
 
 def _sync_row(**overrides) -> dict:
     """A well-formed export-jsonl row, overridable field by field. Every
@@ -688,6 +697,77 @@ class TombstonePropagationTest(_TwoStoreCase):
         self.assertEqual(self._expiry_pairs(self.b), set(),
                          "the imported tombstone must delete B's side row in the "
                          "same transaction -- no memory_expiry orphan may survive")
+
+    def test_imported_event_tombstone_deletes_occurrence_row(self):
+        # Issue #178 reviewer finding -- the #173 expiry-cleanup precedent
+        # (test_imported_state_tombstone_deletes_expiry_row directly above)
+        # mirrored for the occurrence side table: an ingest that tombstones an
+        # imported event row must leave NO memory_occurrence row. Occurrence
+        # data does NOT travel through export/ingest (the #178 sync scoping:
+        # export-jsonl skips occurrence records), so B's occurrence row is
+        # planted directly below -- standing in for any local source of that
+        # data -- and the tombstone import must still reap it in the same
+        # transaction: no memory_occurrence row may outlive its parent.
+        r = self.a.run("add", "--namespace", NS, "--type", "event",
+                       "--content", "incident event rotated upstream",
+                       "--signal", "test",
+                       "--occurred-start", "2026-10-01T00:00:00Z",
+                       "--occurred-end", "2026-10-01T01:00:00Z")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mid = self.a.find_id(NS, "incident event rotated upstream")
+        self.assertIsNotNone(mid)
+        self.assertEqual(self._occurrence_ids(self.a), {mid},
+                         "A must hold the occurrence row for its live event")
+
+        export_a = os.path.join(self.a.tmp, "live_event.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The not-silent contract (#173 F14 precedent): the occurrence record
+        # is skipped WITH a stderr notice, never dropped silently.
+        self.assertIn("memory_occurrence records skipped", r.stderr)
+
+        r = self.b.run("ingest-jsonl", "--in", export_a)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        self.assertEqual(self._occurrence_ids(self.b), set(),
+                         "the imported event row lands with no occurrence row "
+                         "(occurrence data does not travel)")
+
+        # B acquires occurrence data locally (the wire never carries it).
+        conn = sqlite3.connect(self.b.path)
+        try:
+            conn.execute(
+                "INSERT INTO memory_occurrence (memory_id, occurred_start, "
+                "occurred_end, mentioned_at) VALUES (?,?,?,?)",
+                (mid, "2026-10-01T00:00:00Z", "2026-10-01T01:00:00Z",
+                 "2026-10-02T00:00:00Z"))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self._occurrence_ids(self.b), {mid},
+                         "B must hold the locally-acquired occurrence row for "
+                         "the live imported parent")
+
+        # A tombstones the row, then ships the tombstone downstream.
+        r = self.a.run("supersede", "--id", mid, "--reason", "rotated upstream")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._occurrence_ids(self.a), set(),
+                         "A's own supersede must clean its occurrence row too")
+        export_a2 = os.path.join(self.a.tmp, "tombstone_event.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a2, "--include-superseded")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+        r = self.b.run("ingest-jsonl", "--in", export_a2, "--allow-tombstones")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["tombstoned"], 1)
+        # B's row is now tombstoned (superseded_at set)...
+        self.assertIsNotNone(self.b.query_one(
+            "SELECT superseded_at FROM memory WHERE id=?", (mid,))[0])
+        # ...and its occurrence row went with it in the same transaction.
+        self.assertEqual(self._occurrence_ids(self.b), set(),
+                         "the imported tombstone must delete B's occurrence row "
+                         "in the same transaction -- no memory_occurrence "
+                         "orphan may survive")
 
 
 # ---------------------------------------------------------------------------
