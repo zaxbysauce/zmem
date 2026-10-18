@@ -2520,11 +2520,24 @@ file order; re-ingesting the same file is an exact no-op.
 
 ### ingest-jsonl — import Tier 3 sync JSONL
 ```
-<interpreter> <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode auto|reviewed|manual]
+<interpreter> <store.py> ingest-jsonl --in FILE [--source-ref REF] [--allow-tombstones] [--capture-mode auto|reviewed|manual] [--trust authoritative|untrusted-peer] [--allow-namespace NS ...] [--attribute-host HOST]
 ```
 Imports a JSONL file written by `export-jsonl`. Every row is validated before
 touching the store, and a bad row is counted and reported by line number
-rather than aborting the file. `--source-ref` overrides source_ref on every
+rather than aborting the file. For files whose sender is NOT authoritative
+over this store, pass `--trust untrusted-peer` with one or more
+`--allow-namespace` values (issue #282): trust claims in the rows are
+clamped (taint, signal grounding kept only as `claimed_signal:` tags,
+confidence/trust_score ceiling 0.6), `host:`/`agent:` attribution and
+source provenance are stamped from the caller (`--attribute-host`,
+`peer:<host>`), every record kind is gated against the allow-list (evidence
+records refused outright; tombstone authority refused), and the peer-mode
+summary line carries `namespace_refused=`, `authorship_refused=` and
+`trust_clamped=` counts (`authorship_refused` counts side records aimed at a
+row this import did not author — a peer is never authoritative over a row it
+did not land, though restating a lifetime the store already holds is a no-op;
+absent trust_score resolves 1.0, so trust_clamped fires on most peer rows
+by design — it reports "the policy altered this row"). `--source-ref` overrides source_ref on every
 row inserted this run (default: keep each row's own incoming source_ref).
 `--allow-tombstones` lets an incoming superseded row tombstone a live local
 row with the same id — off by default; use it only when the file is an

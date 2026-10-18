@@ -1,13 +1,13 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "d6a4141372b919f8f62a4585cdb51ee42cf9c36ffc6ec6dd96f9a4c337aecf98",
+  "digest": "ba45943229112bd9d4e0d73c54e6fc556df43aeff1ce42494058116e5d46727d",
   "files": {
     "hermes-plugin/__init__.py": "e12a4d65f018b7290a8286de704fc392165d4849c7c903d90511416a94607a03",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "48f85a387b1e07082324acaef8abdb8eea309f08d88f007b4ec3666c0f6a945d",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fb4362d885142bf743c3a5c4aa12ae92c9a1274ca445f307e4b4dc699b4f69bd",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "8136c77c2044ec74de954bc5525b6a3dabf70b69a62760e6412506b6dad33599",
+    "hermes-plugin/plugin.yaml": "2f3ec951ad47fb34ccaaaf776da930c6b5795c9d130bb349aa49e90abb5a12ce",
     "hermes-plugin/server/auth.py": "99210fb80cd9f736f46d2776603164669e533e7810f4d4f1f73158621503937f",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
@@ -56,7 +56,7 @@
     "scripts/release_gate.py": "0fee2823312e51cdd7b0a4827509aa806907e06ae95b87b2a90f532997c76ecb",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "b43f4c9fc602917bd5f627560f1ab5abbfb3b34e60ad0d27f7a219a7492368ef",
-    "skills/memory/SKILL.md": "da74789bdf2a11a49cf1087132c4e71bfb9388cb51f3e239a1991552ac34f7a3",
+    "skills/memory/SKILL.md": "8f2cafbf899e177f2e94f4cdb5f47087a57470619b0f7a29955c9680bbdedab8",
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
@@ -75,7 +75,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "4b1cdafbed2f1cf8fa09d1bf4c55d946646289600010530c2a45a8fc6a706570",
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
-    "skills/memory/scripts/storelib/cli.py": "a44cc78c784d502f8be9a27bf638441952b5a8b8c14dbdd93c98c9cb8a51092c",
+    "skills/memory/scripts/storelib/cli.py": "181056adf3235b1dca4b81f26e3482ea0ef9ebb5d2ecae8c9db690ab7145466a",
     "skills/memory/scripts/storelib/consolidate.py": "a86f1aea1573b03b0b57a00f6a2d9e21b5c1aeeb73de2669c64cf81a70c3e4ba",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
     "skills/memory/scripts/storelib/dataset.py": "1851e337dfb3e4974395ced0dc6271ef621e686e4f78cf9e150f2931f4d6f466",
@@ -107,7 +107,7 @@
     "skills/memory/scripts/storelib/source.py": "72050fcc2ed63c3f99089ece204022038ccfeff13017cf2505ea3c288df5c3a2",
     "skills/memory/scripts/storelib/state.py": "aa4c8f3648e81e05a982de6e89471754de5ec0aad3c957452cbd8a702c839f61",
     "skills/memory/scripts/storelib/state_expiry.py": "fb3f2286aa5d503cce9288e6f9382e177f22750079d311f1faa985084e43f9bf",
-    "skills/memory/scripts/storelib/sync.py": "40279a48a4462a11a26c162330f5d8ffa281cf9186e973bf4dfc6a0e060970c3",
+    "skills/memory/scripts/storelib/sync.py": "649063ca70945435f7c59908c2dcdc3337788acb637d2bd89f0edf0764894dcf",
     "skills/memory/scripts/storelib/training.py": "a308dcc6289e4c16efb0286a14c65dc8de0b400334d99cda80e24ae101cea4d6",
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
@@ -116,5 +116,5 @@
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },
-  "version": "0.103.0"
+  "version": "0.104.0"
 }

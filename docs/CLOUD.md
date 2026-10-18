@@ -577,6 +577,36 @@ same care you give the store itself. Treat a compromise of the sync repo as a
 compromise of the store, and rebuild rather than "clean up" — see the
 `--allow-tombstones` rule below for which direction of ingest is trusted.
 
+#### Ingesting a file you do not fully trust (issue #282)
+
+Any ingest whose sender is NOT authoritative over this store — another
+machine's outbox, a peer exchange — must run:
+
+```
+ingest-jsonl --in FILE --trust untrusted-peer \
+  --allow-namespace <your namespaces...> [--attribute-host <this box>] \
+  --capture-mode auto
+```
+
+Peer mode clamps every trust-bearing field the rows self-declare (taint,
+signal grounding, confidence, trust_score, usage counters), stamps
+caller-derived attribution and provenance, gates EVERY record kind against
+the allow-list (evidence records are refused outright), and refuses
+tombstone authority. A corrupt row still never aborts the file (legacy
+lane); `--strict` makes violations fatal. Your own export/rebuild keeps the
+default `--trust authoritative` path byte-identical.
+
+**A peer is never authoritative over a row it did not author.** Where the
+boundary is authorship rather than namespace, the summary counts it
+separately from the namespace gate: `authorship_refused=N` (on top of
+`namespace_refused=N`) for a `memory_expiry` aimed at a row this import did
+not land, because an allow-listed namespace necessarily holds local rows. That
+gate covers *mutations*, so replaying a file you already accepted stays a
+no-op: a lifetime already recorded for the row is left exactly as it is. A
+peer that re-states a row's expiry with DIFFERENT values is still refused —
+the tolerance is identical-only, and under `--strict` the refusal is fatal for
+the whole file.
+
 ### The pattern
 
 - **Local side** (the box that owns the real `~/.zmem` store) periodically
@@ -664,17 +694,25 @@ compromise of the store, and rebuild rather than "clean up" — see the
   correctness. If bandwidth matters, scope `--namespace` tightly to just the
   namespace(s) the cloud session actually wrote to.
 
-- **Local side ingests the outbox** on its own cadence — **without**
-  `--allow-tombstones`:
+- **Local side ingests the outbox** on its own cadence — **with**
+  `--trust untrusted-peer`, because a remote session is not authoritative
+  over your local rows. Peer mode clamps the file's trust claims, gates
+  every record kind against `--allow-namespace`, and refuses tombstone
+  authority outright (`--allow-tombstones` is a usage error with peer
+  mode — stricter than merely skipping tombstones):
   ```bash
   <interpreter> <store.py> ingest-jsonl --in sync-repo/outbox/<file>.jsonl \
-    --source-ref "cloud:<cloud-session-id>"
+    --source-ref "cloud:<cloud-session-id>" \
+    --trust untrusted-peer --allow-namespace <your namespaces...> \
+    --capture-mode auto
   ```
   Repeated ingestion of the same outbox file — or overlap between two cloud
-  sessions' outboxes — is safe (again, see below). Same exit-code contract as
-  the cloud-side ingest above: `2` only for a missing/inaccessible or
-  empty/whitespace-only outbox file, `0` otherwise (malformed rows never fail
-  the run). A cloud outbox is remote-authored data: ingest always tags
+  sessions' outboxes — is safe in both lanes, peer mode included (the
+  authorship gate blocks *mutations* of rows this import did not author, so
+  re-stating a lifetime the store already holds is a no-op). Same exit-code
+  contract as the cloud-side ingest above: `2` only for a missing/inaccessible
+  or empty/whitespace-only outbox file, `0` otherwise (malformed rows never
+  fail the run). A cloud outbox is remote-authored data: ingest always tags
   `prompt-injection-risk` on rows matching injection patterns (in every mode),
   and `--capture-mode auto` additionally redacts secret-like values and
   quarantines rows that look secret-like (source_ref, unredactable content,
@@ -704,7 +742,7 @@ those ids*, not about convenience:
 |---|---|---|
 | Local store ← your own export (rebuild, restore, box-to-box move) | `--allow-tombstones` | The file is authoritative for those ids; a supersession you made must propagate. |
 | Cloud store ← `sync/memory.jsonl` (your box's export) | `--allow-tombstones` | Same: your box owns those ids, the cloud copy is downstream. |
-| Local store ← `outbox/*.jsonl` (cloud/remote session output) | **no flag** | A remote session is not authoritative over your local rows. Tombstoning is the one irreversible thing an outbox could ask for. |
+| Local store ← `outbox/*.jsonl` (cloud/remote session output) | **`--trust untrusted-peer`** (required; see "Ingesting a file you do not fully trust" above) | A remote session is not authoritative over your local rows, so peer mode clamps the row's trust claims, gates every record kind against `--allow-namespace`, and refuses tombstone authority outright (`--allow-tombstones` is a usage error with peer mode). |
 
 Without the flag, such a row is left alone and counted in the summary as
 `tombstones_refused=N`, with a single stderr note naming the first refused

@@ -5,6 +5,52 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.104.0] - 2026-10-17
+
+### Added
+- **Untrusted-peer ingest mode (issue #282, Workstream T PR 3 of 12):**
+  `ingest-jsonl --trust untrusted-peer` turns the ingest path into an
+  authorization boundary for files whose sender is not authoritative over
+  the receiving store (peer JSONL exchange, cloud outboxes):
+  - **Trust clamps (clamp, never reject):** a row's self-declared
+    `trusted_internal` taint drops to `untrusted_tool`; the claimed signal
+    survives only as a `claimed_signal:<v>` tag (stored grounding becomes
+    `none`, so dedup's stronger-signal merge can never launder a forged
+    claim); `confidence` and `trust_score` clamp to the 0.6 peer ceiling;
+    `applied_count`/`violated_count` zero out (they feed promote security
+    decisions). `trust_clamped=N` reports rows the policy altered (absent
+    trust_score resolves 1.0, so the counter fires on most peer rows by
+    design — it reports "policy altered", not "the peer lied").
+  - **Namespace allow-list (`--allow-namespace`, repeatable; reject, never
+    clamp):** EVERY record kind is gated — memory and episode rows by their
+    own namespace; `episode_memory` memberships by BOTH endpoints' resolved
+    namespaces; `memory_expiry` by its parent's; standalone `evidence`
+    records are refused outright (a peer is never an evidence authority).
+    `namespace_refused=N` appears on the legacy summary line in peer mode
+    (strict mode refusals are fatal with full rollback, per the lane's
+    all-or-nothing contract).
+  - **Caller-derived attribution (`--attribute-host`):** row-carried
+    `host:`/`agent:` tags are stripped and `host:<value>` stamped; without
+    `--source-ref` each row's self-described provenance is replaced by
+    `peer:<host-or-unknown>` AFTER the original ran through the
+    reserved-ref warning and the capture-policy secret-refusal evaluation
+    (a stamp never masks a refusal; the quarantine ledger keeps the
+    pre-policy row).
+  - **Link hardening:** edges are collected only from rows that actually
+    landed this run (an id-collision row can no longer graft the victim's
+    edges); each endpoint's namespace must sit inside the allow-list; edge
+    scores clamp to the peer ceiling.
+  - **Usage guardrails:** `--allow-tombstones` + `--trust untrusted-peer`
+    is a usage error (exit 2); superseded rows are dropped (a peer is not
+    authoritative over tombstone-shaped history); `--strict` threads the
+    same policy with fatal semantics. Default `--trust authoritative` keeps
+    the own-export path byte-identical.
+- **Tests:** frozen `tests/test_t03_ingest_trust.py` (forged-trust clamp,
+  namespace allow-list, attribution stamp, usage-error exit) plus
+  `tests/test_t03_peer_kinds.py` (episode/expiry/evidence kind gates, link
+  carriage, strict-fatal, authoritative floor); existing ingest suites
+  unchanged and green.
+
 ## [0.103.0] - 2026-10-17
 
 ### Added
