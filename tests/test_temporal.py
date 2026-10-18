@@ -741,19 +741,23 @@ class ScopedPromptTimestampTest(unittest.TestCase):
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", env=env, timeout=120, check=False,
                 cwd=str(REPO_ROOT))
+        implicit_ns = "project:github.com/zaxbysauce/zmem"
         run_cli(["init"])
         add = run_cli([
             "add", "--type", "event",
-            "--namespace", "project:asof",
+            "--namespace", implicit_ns,
             "--content", "outage during last week at the scoped cluster",
             "--confidence", "0.9", "--signal", "user",
             "--occurred-start", "2026-09-01T08:00:00Z",
             "--occurred-end", "2026-09-03T08:00:00Z",
             "--mentioned-at", "2026-09-03T09:00:00Z"])
         self.assertEqual(add.returncode, 0, add.stderr)
+        # NO --namespace on the recall side: the CLI's implicit-scope lane
+        # (args.namespace is None) is the path _scoped_tier_pools serves —
+        # the round-3 finding. cwd=REPO_ROOT resolves the implicit scope to
+        # this repository's project namespace, so seed into it explicitly.
         scoped_args = [
             "recall", "--query", "last week outage scoped cluster",
-            "--namespace", "project:asof",
             "--prompt-timestamp", "2026-09-10T12:00:00Z",
             "--json"]
         result = run_cli(scoped_args)
@@ -792,30 +796,55 @@ class GraphTemporalOverlapTest(unittest.TestCase):
         # Seed a seed row + an overlapping event row sharing its entity so
         # the graph arm rescues the event while the temporal arm also
         # selects it.
-        add_memory(conn, namespace="project:overlap",
+        seed_row = add_memory(conn, namespace="project:overlap",
                    type_="fact", content="the alpha clustermaintenance ledger",
                    tags="entity:project:alpha", confidence=0.9,
                    signal="user", now="2026-09-01T00:00:00Z")
-        add_memory(conn, namespace="project:overlap",
+        # The event shares NO query term and NO entity tag with the query:
+        # it arrives ONLY via the planted graph hop and the temporal window,
+        # so the graph_only_ids subtraction is the deciding line (a query
+        # term or entity hit would mask it — the round-3 vacuity).
+        event_row = add_memory(conn, namespace="project:overlap",
                    type_="event",
-                   content="outage during last week on the alpha cluster",
-                   tags="entity:project:alpha", confidence=0.9,
+                   content="unplanned downtime window at the facility",
+                   tags="", confidence=0.9,
                    signal="user", now="2026-09-05T00:00:00Z",
                    occurred_start="2026-09-01T08:00:00Z",
                    occurred_end="2026-09-03T08:00:00Z")
-        rows = recall_mod.recall_memory(
-            conn, query="alpha cluster last week outage",
-            namespace="project:overlap", limit=5,
-            prompt_timestamp="2026-09-10T12:00:00Z",
-            no_telemetry=True)
+        # Plant a real graph edge seed->event so the graph arm RESCUES the
+        # event row through one hop (the round-3 finding: without a graph
+        # arrival the subtraction is untested — graph_ids was empty).
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_link "
+            "(src_id, dst_id, relation, score, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (str(seed_row), str(event_row), "related", 0.9,
+             "2026-09-05T00:00:00Z"))
+        conn.commit()
+        saved_env = {k: os.environ.get(k) for k in
+                     ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_TEST_NOW")}
+        try:
+            rows = recall_mod.recall_memory(
+                conn, query="alpha clustermaintenance ledger last week outage",
+                namespace="project:overlap", limit=5,
+                prompt_timestamp="2026-09-10T12:00:00Z",
+                no_telemetry=True)
+        finally:
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         self.assertTrue(rows, "no rows recalled")
         overlap = [r for r in rows
-                   if "outage during last week" in (r.get("content") or "")]
+                   if "unplanned downtime window" in (r.get("content") or "")]
         self.assertTrue(overlap, "the graph+temporal event row is absent")
         row = overlap[0]
-        self.assertNotIn(
-            "graph", (row.get("_graph_arrival_only"), row.get("arrival")),
-            f"row misclassified graph-arrival-only: {row.get('_graph_arrival_only')}")
+        self.assertIs(
+            row.get("_graph_arrival_only"), False,
+            f"row misclassified graph-arrival-only: the graph+temporal "
+            f"overlap must stay bump-eligible "
+            f"(_graph_arrival_only={row.get('_graph_arrival_only')})")
         conn.close()
 
 
