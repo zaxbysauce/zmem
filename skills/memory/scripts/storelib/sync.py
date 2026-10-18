@@ -1839,7 +1839,14 @@ def _strict_ingest_staged(
                          if t == "memory"}
         # Issue #282 review: ids this file AUTHORED — the authorship boundary
         # for destructive side records (memory_expiry).
-        strict_peer_authored = set(staged_mem_ns)
+        # Issue #282 review Critical: STAGED is not AUTHORED. A peer row
+        # whose id already exists locally lands as `skipped`, so the file
+        # never authored it — counting staged ids let an id-collision file
+        # retire a pre-existing local row via memory_expiry (including one
+        # outside the allow-list). Authorship = staged AND not already in
+        # the store, mirroring the legacy lane's landed-set rule.
+        pre_existing = {r[0] for r in conn.execute("SELECT id FROM memory")}
+        strict_peer_authored = set(staged_mem_ns) - pre_existing
         staged_ep_ns = {o["id"]: o.get("namespace") for t, o in rows
                         if t == "episode"}
         for table, obj in rows:

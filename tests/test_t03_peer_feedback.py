@@ -124,6 +124,28 @@ class PeerCannotRetireLocalRowTest(PeerTrustCase):
                        (local,)),
             "a peer must not retire a row it did not author")
 
+    def test_strict_expiry_cannot_retire_a_local_row_via_id_collision(self):
+        """Strict lane: STAGED is not AUTHORED.
+
+        A peer file whose memory row reuses a PRE-EXISTING local id lands as
+        `skipped` (the row was never authored), so its memory_expiry must
+        not retire that local row — the same attack the legacy gate blocks.
+        """
+        local = self.seed_local_state_row()
+        collider = self.row("project:t03/peer",
+                            content=f"collision {uuid.uuid4().hex[:8]}")
+        collider["id"] = local  # same id as the live local row
+        rec = {
+            "kind": "memory_expiry", "memory_id": local,
+            "inject_until": "2020-01-01T00:00:00Z", "expiry_class": "setting",
+        }
+        r = self.ingest([collider, rec], "--strict")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIsNone(
+            self.query("SELECT inject_until FROM memory_expiry WHERE memory_id=?",
+                       (local,)),
+            "strict peer mode must not retire a row the file did not author")
+
     def test_expiry_for_a_peer_authored_row_still_applies(self):
         """The gate is AUTHORSHIP, not a blanket refusal."""
         peer_row = self.row("project:t03/peer", type="state",

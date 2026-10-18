@@ -683,11 +683,17 @@ default `--trust authoritative` path byte-identical.
   correctness. If bandwidth matters, scope `--namespace` tightly to just the
   namespace(s) the cloud session actually wrote to.
 
-- **Local side ingests the outbox** on its own cadence — **without**
-  `--allow-tombstones`:
+- **Local side ingests the outbox** on its own cadence — **with**
+  `--trust untrusted-peer`, because a remote session is not authoritative
+  over your local rows. Peer mode clamps the file's trust claims, gates
+  every record kind against `--allow-namespace`, and refuses tombstone
+  authority outright (`--allow-tombstones` is a usage error with peer
+  mode — stricter than merely skipping tombstones):
   ```bash
   <interpreter> <store.py> ingest-jsonl --in sync-repo/outbox/<file>.jsonl \
-    --source-ref "cloud:<cloud-session-id>"
+    --source-ref "cloud:<cloud-session-id>" \
+    --trust untrusted-peer --allow-namespace <your namespaces...> \
+    --capture-mode auto
   ```
   Repeated ingestion of the same outbox file — or overlap between two cloud
   sessions' outboxes — is safe (again, see below). Same exit-code contract as
