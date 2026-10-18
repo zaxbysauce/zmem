@@ -1,17 +1,17 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "36afc08ad688d5f81675ecb7817ef00391ef665037858cbd7edf3908a86303a9",
+  "digest": "d6a4141372b919f8f62a4585cdb51ee42cf9c36ffc6ec6dd96f9a4c337aecf98",
   "files": {
     "hermes-plugin/__init__.py": "e12a4d65f018b7290a8286de704fc392165d4849c7c903d90511416a94607a03",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "48f85a387b1e07082324acaef8abdb8eea309f08d88f007b4ec3666c0f6a945d",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fb4362d885142bf743c3a5c4aa12ae92c9a1274ca445f307e4b4dc699b4f69bd",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
-    "hermes-plugin/plugin.yaml": "9373097136deff0a6e6e4ddf4f93314c8cd43d2aac62d6586d2fd7c6d1a69496",
-    "hermes-plugin/server/auth.py": "c2804ea5da0fcb4d1e2901d49f3936d1745ce869574bafb78752db78f43960f2",
+    "hermes-plugin/plugin.yaml": "8136c77c2044ec74de954bc5525b6a3dabf70b69a62760e6412506b6dad33599",
+    "hermes-plugin/server/auth.py": "99210fb80cd9f736f46d2776603164669e533e7810f4d4f1f73158621503937f",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
-    "hermes-plugin/server/mcp_server.py": "894652d305563a12814a45d8f161dd33e1639c1fa191b6fc8fe9306719ea614a",
+    "hermes-plugin/server/mcp_server.py": "87c6f8607e39cf95c3b9f6c37aad9a9fd8edd2af241e4a10c8080f6a63478455",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hermes-plugin/transport.py": "ee264bc110ac8061bbefd70111d938e56c6bd03503d498799105312ad76ad808",
@@ -116,5 +116,5 @@
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },
-  "version": "0.102.0"
+  "version": "0.103.0"
 }
