@@ -692,6 +692,11 @@ class RecallExpansionTest(_Store):
         # additive: head-minus-arms deep-equals the pre-#178 envelope.
         self.assertEqual(
             hashlib.sha256(recall_first_raw).hexdigest(),
+        # Byte golden (issue #178): TWO additive deltas vs pre-#178 — the
+        # top-level arms map, then the per-row _temporal_arrival_only key.
+        # Proof chain: current wire minus _temporal_arrival_only equals the
+        # round-2 pin 23825bdb... (reviewer strip-probe); that minus the arms
+        # key deep-equals the pre-#178 envelope (round-2 dual-tree proof).
             "77a3b0c1354f92da226a098f71946efc4ee895f25103ca0dc2d29e8bc79f9c8b",
         )
         # Issue #176: the explain envelope gained entity_kind_weights (the
@@ -702,6 +707,10 @@ class RecallExpansionTest(_Store):
         # (sole delta vs the previous golden), moving it to e8e66a58....
         self.assertEqual(
             hashlib.sha256(explain_first_raw).hexdigest(),
+        # Explain golden (issue #178 round-5): moved to 9d0d165d... by the
+        # additive _temporal_arrival_only row key — head minus that key
+        # equals the round-2 pin e8e66a58... byte-exactly (reviewer
+        # strip-probe); arms.temporal minus-key equals pre-#178.
             "9d0d165deb300978cf5557961d8f25c0bade286d66e8794408613cb033a7691d",
         )
         self.assertEqual(self._expansion_ids(recall_first), expected["present"])
