@@ -2193,6 +2193,35 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         return out
 
     @mcp.tool()
+    async def prefetch_ack(reservation: str) -> dict[str, Any]:
+        """Acknowledge a prefetch reservation (issue #284, T-05).
+
+        The delivery-commitment half of ``prefetch(reserve=True)``: call it
+        AFTER the reserved rows have actually been rendered into a session
+        context, to commit them to the delivery ledger exactly once. The
+        reservation id comes from the prefetch envelope's
+        ``reservation_id`` field. Idempotent: a duplicate ack is a no-op
+        (``duplicate: true``, exit-0 semantics); an expired reservation
+        commits nothing (``expired: true``); an unknown id is an error.
+        The ledger identity (principal/harness/session key) is read from
+        the reservation sidecar — pass nothing here.
+        """
+        rid = (reservation or "").strip()
+        if not rid:
+            return _error("prefetch_ack requires reservation")
+        r = await _run_store_async(["prefetch-ack", "--reservation", rid])
+        if not r["ok"]:
+            return _error(_sanitize_store_error(r))
+        stdout = (r["stdout"] or "").strip()
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except json.JSONDecodeError:
+            return _error("non-JSON from store.py prefetch-ack")
+        if not isinstance(parsed, dict) or "committed" not in parsed:
+            return _error("incomplete prefetch-ack result from store.py")
+        return parsed
+
+    @mcp.tool()
     async def session_start(
         namespace: Optional[str] = None,
         limit: int = 3,

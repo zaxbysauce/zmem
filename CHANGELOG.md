@@ -34,6 +34,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     processes racing the same (session, memory) admit exactly one and the
     loser observes already-delivered. The local single-process selector
     path keeps its byte-identical one-step `record()` behavior.
+  - The reservation path carries the #136/#250 reward-law split through
+    the sidecar (per-id `bump` fuel flag reconstructed at ack), so an
+    acked delivery records the same query-matched bump-eligibility
+    markers a direct `record()` would have, and the render-time
+    surfaced-count bump is skipped on the reserve path (reward follows
+    delivery). The MCP server pairs `prefetch(reserve=true)` with a
+    `prefetch_ack` tool carrying the CLI's duplicate/expired semantics.
   - The envelope registry gains the `reservation` key (keyed only in
     reserve mode; mirrored in the Hermes fallback set); docs/FLEET.md
     documents the reservation workflow and the disclosed ack-vs-ingestion

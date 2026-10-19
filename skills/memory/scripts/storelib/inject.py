@@ -1504,7 +1504,7 @@ def select_and_budget_for_injection(
         bump_rows = [row for row in ledger_rows
                      if not row.get("link_relation")
                      and not row.get("_graph_arrival_only")]
-        if bump_rows:
+        if bump_rows and not reserve:
             try:
                 recall_module._bump_telemetry(
                     conn, [r["id"] for r in bump_rows], no_bump=True)
@@ -1527,6 +1527,7 @@ def select_and_budget_for_injection(
                 # already-delivered turn).
                 reservation_id = ledger.reserve(
                     resolved_data, session_id, ledger_rows, moment,
+                    bump_eligible_ids=[r["id"] for r in bump_rows],
                     principal=principal, harness=harness)
             else:
                 ledger.record(resolved_data, session_id, ledger_rows, moment,

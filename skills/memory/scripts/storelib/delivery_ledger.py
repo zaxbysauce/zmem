@@ -61,6 +61,18 @@ without closing the session. The terminal CLI ``delivery-clear`` uses
 :func:`end_delivery_state` to add the bounded marker before removing both.
 Context summarized away or a session ending means "already delivered" is
 false.
+
+Reservations (issue #284, T-05): ``reserve()`` writes
+``ops/resv-<id>.reserve`` — per-id ``{id, text, bump}`` fuel plus the keyed
+identity — WITHOUT touching the ledger, and ``commit_reservation()``
+(the ``prefetch-ack`` CLI / MCP ``prefetch_ack`` tool) commits the sidecar's
+ids through :func:`record_undelivered` exactly once. A sidecar expires by
+TTL (``ZMEM_RESERVATION_TTL_S``, default 120 s) and each ledger key holds at
+most ``_RESERVATION_CAP`` (32) active reservations, oldest unacked evicted;
+a committed sidecar is never evicted before its TTL reap, so a duplicate ack
+stays a no-op even at cap pressure. Expired sidecars are reaped lazily on
+every reserve/ack; the ack's own classification (expired / duplicate) stays
+observable past its TTL by exempting the target from that reap.
 """
 
 from __future__ import annotations
@@ -877,14 +889,17 @@ def _reap_expired_reservations(data_dir: str, now: float,
 
 def reserve(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
             moment: str, now: Optional[float] = None,
+            bump_eligible_ids: Optional[Iterable[str]] = None,
             principal: Optional[str] = None,
             harness: Optional[str] = None) -> Optional[str]:
     """Reserve the rendered rows WITHOUT recording delivery (issue #284).
 
     Writes ``ops/resv-<id>.reserve`` (#252 atomic write, 0o600) holding
-    per-id ``{id, entry_text}`` fuel plus the keyed-session identity, so
-    ``prefetch-ack`` can commit full-fidelity entries without re-opening
-    the store. Returns the reservation id, or None when every requested
+    per-id ``{id, entry_text, bump}`` fuel plus the keyed-session
+    identity, so ``prefetch-ack`` can commit full-fidelity entries without
+    re-opening the store. ``bump_eligible_ids`` names the query-matched
+    subset (#136/#250 reward law): the flag rides the sidecar so the ack
+    records the same bump_eligible markers a direct record() would have. Returns the reservation id, or None when every requested
     id is ALREADY delivered (the caller reports the already-delivered
     turn as today). Retries mint a NEW reservation and re-select (nothing
     was delivered, so the same ids come back). Expired sidecars are
@@ -900,11 +915,16 @@ def reserve(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
     ttl = _reservation_ttl_s()
     _reap_expired_reservations(data_dir, now)
     current = {e["id"] for e in delivered(data_dir, key, now=now)}
+    eligible = (None if bump_eligible_ids is None
+                else set(bump_eligible_ids))
     fuel = []
     for r in rows:
         rid = r.get("id") if isinstance(r, dict) else None
         if isinstance(rid, str) and rid and rid not in current:
-            fuel.append({"id": rid, "text": entry_text(r)})
+            entry = {"id": rid, "text": entry_text(r)}
+            if eligible is not None:
+                entry["bump"] = rid in eligible
+            fuel.append(entry)
     if not fuel:
         return None
     # Per-key cap: evict the oldest UNACKED reservation of this key.
@@ -975,12 +995,25 @@ def commit_reservation(data_dir: str, reservation_id: str,
         expired = True
     if expired:
         return {"committed": [], "duplicate": False, "expired": True}
+    sidecar_rows = [row for row in data.get("rows", [])
+                    if isinstance(row, dict)
+                    and isinstance(row.get("id"), str)]
     rows = [{"id": row.get("id"), "content": row.get("text", "")}
-            for row in data.get("rows", [])
-            if isinstance(row, dict) and isinstance(row.get("id"), str)]
+            for row in sidecar_rows]
+    # Reconstruct the #136/#250 query-matched subset from the sidecar's
+    # bump flags. A sidecar with no flag at all is a reserve() call that
+    # was not told the subset — pass None so every admitted row stays
+    # bump-eligible, the same legacy reading _entries_for gives an absent
+    # marker (never the inversion: absent-key-means-eligible applies only
+    # when the caller genuinely did not know the split).
+    if any("bump" in row for row in sidecar_rows):
+        bump_ids = [row["id"] for row in sidecar_rows if row.get("bump")]
+    else:
+        bump_ids = None
     admitted = record_undelivered(
         data_dir, str(data.get("session_id", "")), rows,
         str(data.get("moment", "")), now=now,
+        bump_eligible_ids=bump_ids,
         principal=data.get("principal"), harness=data.get("harness"))
     data["committed"] = True
     data["committed_ts"] = now

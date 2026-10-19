@@ -146,6 +146,14 @@ def test_concurrent_record_admits_one():
     (storelib.delivery_ledger.record_undelivered does not exist), GREEN
     after the fix (the documented contract in this file's docstring)."""
     with _pinned_scratch() as tmp:
+        # Re-pin the import path INSIDE the test body: pytest-randomly
+        # shuffles module/test order, and a sibling module's sys.path
+        # restore can wipe this file's module-level insert before this
+        # test runs (observed as a bare ModuleNotFoundError under an
+        # 8-module session that never reproduces per-file).
+        import sys as _sys
+        if SCRIPTS not in _sys.path:
+            _sys.path.insert(0, SCRIPTS)
         import storelib.delivery_ledger as dl  # noqa: E402 (after env pin)
 
         assert hasattr(dl, "record_undelivered"), (
