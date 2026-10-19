@@ -1125,11 +1125,22 @@ def _page_fts_coverage(content: str, rows: list[dict[str, Any]], query: str) -> 
 def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
                                   query: str, namespace: str, moment: str | None = None,
                                   lane: str | None = None,
-                                  user_global_floor: float | None = None) -> list[dict]:
-    """Internal selector discovery with current source/evidence revalidation."""
+                                  user_global_floor: float | None = None,
+                                  authorized_namespaces: frozenset | None = None) -> list[dict]:
+    """Internal selector discovery with current source/evidence revalidation.
+
+    ``authorized_namespaces`` (issue #283, T-04): the caller's namespace
+    allow-list. ``user:global`` pages join the pool only when the allow-list
+    is None (unscoped) or contains ``user:global`` — the same membership
+    rule that gates the ordinary user:global lane, so a scoped principal
+    never receives cross-namespace page content (issue #284 review).
+    """
     candidates: list[dict] = []
+    global_allowed = (authorized_namespaces is None
+                      or "user:global" in authorized_namespaces)
+    eligible = {namespace} | ({"user:global"} if global_allowed else set())
     metadata = [item for item in page_list(data_dir=data_dir, namespace=None)
-                if item.get("namespace") in {namespace, "user:global"}]
+                if item.get("namespace") in eligible]
     # Count eligible namespaces before the cap so foreign artifacts cannot
     # displace a local page. Newest publication wins; page id breaks ties.
     metadata.sort(key=lambda item: str(item.get("id", "")))
@@ -1140,7 +1151,7 @@ def _page_candidates_for_selector(conn: sqlite3.Connection, *, data_dir: str,
             candidate = page_for_injection(data_dir=data_dir, page_id=page_id)
             directory = _page_dir(data_dir, page_id)
             _definition, committed, _raw = _read_committed(directory)
-            if candidate["namespace"] not in {namespace, "user:global"}:
+            if candidate["namespace"] not in eligible:
                 continue
             ids = candidate["source_ids"]
             if not ids:

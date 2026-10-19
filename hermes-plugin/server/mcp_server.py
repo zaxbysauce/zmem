@@ -1261,7 +1261,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         return ",".join(cleaned + stamps)
 
     def _guard_namespace(
-        namespace: Optional[str], *, default: Optional[str] = None
+        namespace: Optional[str], *, default: Optional[str] = None,
+        caller=None,
     ) -> Optional[dict[str, Any]]:
         """Scoped-token namespace check (issue #65, 10.2). None = allowed.
 
@@ -1270,8 +1271,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         (write/session tools), else is DENIED for scoped tokens (reads without
         a namespace span the whole store — cannot be proven in-scope).
         Unscoped operator tokens allow everything (pre-v13 behavior).
+
+        ``caller`` (issue #284 review): a tool that resolves the principal
+        once passes the snapshot here so the guard and the caller's later
+        authorization decisions (flag emission) cannot observe different
+        map generations across a reload.
         """
-        caller = current_principal()
+        if caller is None:
+            caller = current_principal()
         if not caller.scoped:
             return None
         ns = (namespace or "").strip()
@@ -2106,9 +2113,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         (namespace, session_id, moment required; lane against the five-value
         tuple — never defaulted to a host lane), enforces namespace scope,
         and returns the complete selector envelope plus the additive
-        ``context`` alias equal to ``rendered``. Scoped tokens cannot use the
-        legacy cross-project admission tokens because that admission path
-        predates MCP namespace allow-lists. ``lane=None`` stays None.
+        ``context`` alias equal to ``rendered``. Scoped principals keep
+        their operation tokens; the selector's cross-project lane
+        intersects its foreign namespace set with the principal's
+        authorized allow-list, so cross-project rows are admitted only from
+        allow-listed namespaces (issue #283; the #236 foreign-project
+        exclusion is enforced there). ``lane=None`` stays None.
         """
         if not (namespace or "").strip() or not (session_id or "").strip() \
                 or not (moment or "").strip():
@@ -2130,22 +2140,23 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "budget_truncated": 0, "budget_dropped_protected": 0,
                 "arms": [], "rendered": "", "context": "",
             }
-        denied = _guard_namespace(namespace)
+        # (the guard ran above with the shared principal snapshot)
+        # Issue #283 (T-04): one authorization-aware selection policy. The
+        # principal's allow-list is passed to the store-side selector, which
+        # filters candidates per lane BEFORE ranking, budgeting and the
+        # delivery ledger — authorized project rows are delivered, the
+        # user:global lane runs only for principals allowed user:global, and
+        # the cross-project lane intersects its foreign set with the
+        # allow-list. The old whole-response "global-not-allowed" deny
+        # (issue #159 review) suppressed authorized rows; unscoped
+        # principals pass no flags and keep byte-identical behavior.
+        # caller resolved ONCE: shared with the guard below so the guard
+        # and the --authorized-namespace emission observe the same snapshot
+        # (issue #284 review: TOCTOU across a map reload).
+        caller = current_principal()
+        denied = _guard_namespace(namespace, caller=caller)
         if denied:
             return denied
-        if not _include_global_allowed() and namespace != "user:global":
-            # Scoped token without user:global in its allow-list: the
-            # selector unions user:global rows into project results, which
-            # would leak cross-namespace content. Gate here (issue #159
-            # review; matches the legacy session_start pattern).
-            return {
-                "results": [], "count": 0, "omitted": 0,
-                "reason": "global-not-allowed", "excluded": [],
-                "candidate_ids": [], "tokens_used": 0, "tokens_budget": 0,
-                "budget_dropped": 0, "budget_admission": 0,
-                "budget_truncated": 0, "budget_dropped_protected": 0,
-                "arms": [], "rendered": "", "context": "",
-            }
         safe_query = (query or "").strip()[:_MAX_QUERY_CHARS]
         query_arg = (["--query=" + safe_query] if safe_query.startswith("-")
                      else ["--query", safe_query])
@@ -2158,18 +2169,29 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ]
         if lane is not None:
             args += ["--lane", lane]
-        # The legacy cross-project hazard lane does not consult MCP token
-        # allow-lists. Passing caller-supplied operation tokens through would
-        # therefore let a project-scoped token admit rows from foreign
-        # projects (issue #236). Keep that operator-only capability for
-        # unscoped tokens, and fail closed for every scoped token.
-        effective_ops_tokens = (
-            [] if current_principal().scoped else (ops_tokens or [])
-        )
-        for _tok in effective_ops_tokens:
+        if caller.scoped:
+            for _ns in sorted(caller.namespaces or frozenset()):
+                args += ["--authorized-namespace", _ns]
+        # Issue #236: foreign-project rows stay excluded because the
+        # selector's cross-project lane intersects its foreign namespace set
+        # with the authorized allow-list (issue #283); in-allow-list
+        # cross-project rows are admitted when the operation tokens ground
+        # them, so scoped principals keep their ops tokens.
+        for _tok in (ops_tokens or []):
             args += ["--ops-token", _tok]
         r = await _run_store_async(args)
         if not r["ok"]:
+            # Issue #284 review: an older ZMEM_HOME checkout predates
+            # --authorized-namespace and argparse-rejects the whole argv.
+            # Fail LOUD with an actionable message instead of letting the
+            # transport coerce the error into a silent empty envelope.
+            stderr = (r.get("stderr") or "")
+            if "--authorized-namespace" in stderr \
+                    and "unrecognized arguments" in stderr:
+                return _error(
+                    "store.py at ZMEM_HOME predates this server "
+                    "(no --authorized-namespace support): update the zmem "
+                    "checkout ZMEM_HOME points at to >= 0.105.0")
             return _error(_sanitize_store_error(r))
         stdout = (r["stdout"] or "").strip()
         try:
@@ -2182,6 +2204,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # Pass through the selector envelope (its closed key set already
         # covers injection_risk/candidate_lanes/budget_note when present);
         # MCP adds only the additive context alias.
+        if caller.scoped and not parsed.get("results"):
+            # Issue #284 review: an authorization-filtered prefetch is
+            # wire-identical to an empty store — leave one log line so an
+            # operator can tell them apart.
+            logger.info(
+                "prefetch: status=empty reason=scope-filtered namespace=%s",
+                namespace)
         out = dict(parsed)
         out["context"] = parsed.get("rendered", "")
         return out
@@ -2238,7 +2267,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "tokens_used": None,
                 "tokens_budget": None,
             }
-        denied = _guard_namespace(resolved_ns)
+        _session_caller = current_principal()
+        denied = _guard_namespace(resolved_ns, caller=_session_caller)
         if denied:
             return denied
         n = max(1, min(int(limit or 3), _HARD_LIMIT_MAX))
@@ -2251,6 +2281,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ]
         if _include_global_allowed() and resolved_ns != "user:global":
             args += ["--include-global", "--global-limit", "2"]
+        # Issue #283 (T-04): scoped principals carry their allow-list so the
+        # selector leg (--session-id below) filters the user:global and
+        # cross-project lanes per namespace instead of unioning globals
+        # unconditionally; the legacy leg is governed by the conditional
+        # above, which stays live on the plain recent dispatch.
+        if _session_caller.scoped:
+            for _ns in sorted(_session_caller.namespaces or frozenset()):
+                args += ["--authorized-namespace", _ns]
         timing: dict[str, int] = {}
         r = await _run_store_async(args, timing=timing)
         # _run_store records only the actual subprocess attempt.  Semaphore
@@ -2266,6 +2304,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 args += ["--lane", lane]
         r = await _run_store_async(args)
         if not r["ok"]:
+            # Twin of prefetch's loud mixed-version error (issue #284
+            # review): an older ZMEM_HOME checkout rejects the new flag.
+            stderr = (r.get("stderr") or "")
+            if "--authorized-namespace" in stderr \
+                    and "unrecognized arguments" in stderr:
+                return _error(
+                    "store.py at ZMEM_HOME predates this server "
+                    "(no --authorized-namespace support): update the zmem "
+                    "checkout ZMEM_HOME points at to >= 0.105.0")
             await _append_session_decision_async(
                 status="silent", reason="omitted", ids=[], all_ids=[], lane=lane,
                 t_ms=elapsed,

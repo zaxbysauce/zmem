@@ -152,10 +152,13 @@ governs. The tier is query-time: the queryless `recent` pull never admits
 cross rows. The #155 real-corpus replay baseline has landed: the predeclared
 measurement record `eval/real-corpus-2026-09-19.json` is the calibration
 reference for this tier.
-Scoped MCP tokens do not forward `ops_tokens` to this legacy path, so foreign
-rows are excluded before rendering, context construction, or delivery-ledger
-updates. The selector and delivery boundary are described in Query-aware
-passive prefetch (#159) below.
+Scoped MCP principals keep their `ops_tokens`; the selector's cross-project
+lane intersects its foreign namespace set with the principal's authorized
+allow-list (issue #283), so foreign projects outside the allow-list are
+excluded before rendering, context construction, or delivery-ledger
+updates, while allow-listed cross-project rows can be admitted when
+operation tokens ground them. The selector and delivery boundary are
+described in Query-aware passive prefetch (#159) below.
 
 ### Query-aware passive prefetch (issue #159)
 
@@ -167,7 +170,8 @@ envelope; no consumer-side renderer, no second budget run:
 <interpreter> <store.py> prefetch --query "<text>" --namespace <ns> \
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
-  [--ops-token <token>]... [--exclude <memory-id>]...
+  [--ops-token <token>]... [--exclude <memory-id>]... \
+  [--authorized-namespace <ns>]...
 ```
 
 `--query`, `--namespace`, `--session-id`, and `--moment` are required; JSON is
@@ -1008,7 +1012,7 @@ MCP server:
 | `ZMEM_CODEX_MEMORY` | Codex `MEMORY.md` path for `mine-history --source codex` and exact-file provenance lookup. | `~/.codex/MEMORY.md` |
 | `ZMEM_HERMES_SESSIONS` | Hermes session-JSONL root for `mine-history --source hermes` (issue #71 I). | `~/.hermes/sessions` |
 | `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). A bare text file is an UNSCOPED operator token (full access). A JSON file `{"token": "...", "namespaces": ["project:x", "user:global"]}` scopes the token: requests outside the allow-list fail closed with the stable `namespace_not_allowed` error, and scoped tokens must pass an allowed namespace explicitly on every read (issue #65, 10.2). Omitting `namespaces` — or setting it to `null` — means an UNSCOPED operator token (full access), exactly like a bare text file. | — |
-| `ZMEM_MCP_TOKENS_FILE` | Path to a JSON map of per-machine principals (fleet mode, issue #281): `{"<token>": {"principal": "web01", "host": "web01", "harness": "claude", "namespaces": ["project:x"]}, ...}`. Takes precedence over `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE`. `principal` must be unique across entries; `host`/`harness` are required and are stamped server-side as `host:`/`agent:` tags on every write (client-supplied ones are stripped); `namespaces` absent = unscoped; `revoked: true` (or removing the token) takes effect on the next request after a map reload — any change to the file's mtime, including a rewind from an mtime-preserving restore (checked at most once a second), or SIGHUP where available; no restart. Entry keys are allow-listed: an unrecognized field name is a hard startup error (a typo must never silently widen a principal or keep a revoked credential live), and two keys that normalize to the same token are refused. An unreadable/invalid RELOAD keeps the previous map (a corrupt rewrite defers pending revocations until a valid rewrite lands; logged as `zmem_mcp_principal_map_reload_failed` (an unreadable path logs `zmem_mcp_principal_map_stat_failed`)); a malformed map at STARTUP exits 2. `capabilities` (`read`, `passive`, `write`, `mutate`, `admin`) is parsed onto the token's scopes but not yet enforced (#283/#288). | — |
+| `ZMEM_MCP_TOKENS_FILE` | Path to a JSON map of per-machine principals (fleet mode, issue #281): `{"<token>": {"principal": "web01", "host": "web01", "harness": "claude", "namespaces": ["project:x"]}, ...}`. Takes precedence over `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE`. `principal` must be unique across entries; `host`/`harness` are required and are stamped server-side as `host:`/`agent:` tags on every write (client-supplied ones are stripped); `namespaces` absent = unscoped; `revoked: true` (or removing the token) takes effect on the next request after a map reload — any change to the file's mtime, including a rewind from an mtime-preserving restore (checked at most once a second), or SIGHUP where available; no restart. Entry keys are allow-listed: an unrecognized field name is a hard startup error (a typo must never silently widen a principal or keep a revoked credential live), and two keys that normalize to the same token are refused. An unreadable/invalid RELOAD keeps the previous map (a corrupt rewrite defers pending revocations until a valid rewrite lands; logged as `zmem_mcp_principal_map_reload_failed` (an unreadable path logs `zmem_mcp_principal_map_stat_failed`)); a malformed map at STARTUP exits 2. `capabilities` (`read`, `passive`, `write`, `mutate`, `admin`) is parsed onto the token's scopes but not yet enforced (#288; #283 shipped namespace-allow-list selection in 0.105.0). | — |
 | `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |
 | `ZMEM_MCP_MAX_CONCURRENT` | Cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). | `8` |
 | `ZMEM_MCP_QUEUE_TIMEOUT_S` | How long a queued tool call waits for a concurrency slot before returning an overload error. | `60` |

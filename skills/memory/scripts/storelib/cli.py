@@ -2134,6 +2134,14 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recall.add_argument("--authorized-namespace",
+                          dest="authorized_namespace", action="append",
+                          type=str, default=[],
+                          help="Namespace the caller is authorized to see "
+                               "(repeatable; issue #283 T-04). Selector "
+                               "for-injection paths only: the user:global "
+                               "and cross-project lanes are filtered to "
+                               "this allow-list; omitted means unscoped.")
     p_recall.add_argument("--include-cross-project",
                           dest="include_cross_project", action="store_true",
                           default=False,
@@ -2199,6 +2207,14 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recent.add_argument("--authorized-namespace",
+                          dest="authorized_namespace", action="append",
+                          type=str, default=[],
+                          help="Namespace the caller is authorized to see "
+                               "(repeatable; issue #283 T-04). Selector "
+                               "for-injection paths only: the user:global "
+                               "and cross-project lanes are filtered to "
+                               "this allow-list; omitted means unscoped.")
     p_recent.add_argument("--include-cross-project",
                           dest="include_cross_project", action="store_true",
                           default=False,
@@ -2229,6 +2245,15 @@ def main():
                             action="append", default=[],
                             help="Operation token from the pretool ring "
                                  "(repeatable)")
+    p_prefetch.add_argument("--authorized-namespace",
+                            dest="authorized_namespace", action="append",
+                            type=str, default=[],
+                            help="Namespace the caller is authorized to see "
+                                 "(repeatable; issue #283 T-04): the "
+                                 "user:global and cross-project lanes are "
+                                 "filtered to this allow-list; omitted "
+                                 "means unscoped (the MCP server passes a "
+                                 "scoped principal's allow-list here).")
     p_prefetch.add_argument("--exclude", dest="exclude_ids", type=str,
                             action="append", default=[],
                             help="Memory id excluded from passive results "
@@ -5038,6 +5063,9 @@ def main():
                         global_limit=args.global_limit,
                         min_confidence=args.min_confidence,
                         pretool_input=private_pretool_input,
+                        authorized_namespaces=(
+                            frozenset(args.authorized_namespace)
+                            if args.authorized_namespace else None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -5109,6 +5137,9 @@ def main():
                 _read_cli_or_report_value_error(
                     recall_memory, conn, query=args.query, namespace=args.namespace,
                     scopes=scoped_cli_scopes,
+                    _authorized_namespaces=(
+                        frozenset(args.authorized_namespace)
+                        if args.authorized_namespace else None),
                     limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                     no_bump=args.no_bump, include_global=args.include_global,
                     global_limit=args.global_limit, as_of=args.as_of,
@@ -5141,6 +5172,9 @@ def main():
                         exclude_ids=args.exclude,
                         global_limit=args.global_limit,
                         min_confidence=args.min_confidence,
+                        authorized_namespaces=(
+                            frozenset(args.authorized_namespace)
+                            if args.authorized_namespace else None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -5160,6 +5194,9 @@ def main():
             _read_cli_or_report_value_error(
                 recent_memory, conn, namespace=args.namespace, limit=args.limit,
                 scopes=scoped_cli_scopes,
+                _authorized_namespaces=(
+                    frozenset(args.authorized_namespace)
+                    if args.authorized_namespace else None),
                 min_confidence=(args.min_confidence
                                 if args.min_confidence is not None
                                 else inject_recent_floor()),
@@ -5211,6 +5248,9 @@ def main():
                     global_limit=3,
                     budget_tokens=1500,
                     data_dir=None,
+                    authorized_namespaces=(
+                        frozenset(args.authorized_namespace)
+                        if args.authorized_namespace else None),
                 )
             except ValueError as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)
