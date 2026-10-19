@@ -29,7 +29,7 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v16
+- schema compatibility against current v17
 - `embeddings_health` check: active profile vs stored vector dimension,
   rows with/without embeddings, shipped-profile inventory, and warnings
   when a non-temporary store runs `ZMEM_EMBED_PROFILE=fake` (issue #63)
@@ -82,6 +82,16 @@ at 15 and every client older than the v16 release **refuses** a migrated v16
 store. Update every client that shares a store BEFORE the first v16 client
 opens it; `ZMEM_ALLOW_NEWER_SCHEMA=1` proceeds at the operator's own risk and
 never migrates or downgrades the store.
+
+**Schema 17 (issue #179, 0.107.0) is a STAMP-ONLY upgrade-required bump.**
+No DDL and no data change — a card is an ordinary `memory` row — but the new
+`entity_card` type poisons older binaries (their type preference raises and
+their hooks fail SILENT, a fleet-wide memory blackout executed during the
+PR #385 review round), so `FORWARD_COMPAT_SCHEMA_VERSION` deliberately stays
+at 15 and every pre-0.107 client **refuses** a store the first 0.107 client
+migrates to 17. Update every client that shares a store BEFORE the first
+0.107 host opens it; `ZMEM_ALLOW_NEWER_SCHEMA=1` is the stopgap (at the
+operator's own risk; it never downgrades the store).
 
 ## 3. Disable native memory explicitly
 

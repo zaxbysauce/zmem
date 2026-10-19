@@ -1212,7 +1212,14 @@ def _check_schema(store_path: Path, access_check: dict) -> dict:
             actual=version,
             compat_ceiling=COMPAT_CEILING,
         )
-    if version > COMPAT_CEILING:
+    if version > COMPAT_CEILING and version > CURRENT_SCHEMA_VERSION:
+        # PR #385 review F-1 (2026-10-18): the second conjunct. Since the
+        # v17 bump, FORWARD (15) sits TWO steps under SUPPORTED (17), so a
+        # v16 store is above the ceiling yet still OLDER than this client —
+        # the writer gate opens it ("ok") and migrates it, and doctor must
+        # agree with the writer gate (the module's founding invariant). Only
+        # a store above BOTH the ceiling and the current version is
+        # genuinely newer than this checkout.
         return _check(
             "schema-version",
             "fail",

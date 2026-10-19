@@ -582,7 +582,9 @@ class ExplainSafetyTests(ExplainFixtureBase):
         # again without an explicit, disclosed bump here.
         # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2); the
         # forward ceiling deliberately stays 15 for the constrained rebuild.
-        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 16)
+        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): stamp-only bump for
+        # the entity_card type; FORWARD stays 15 (upgrade-required).
+        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 17)
         self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 

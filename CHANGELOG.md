@@ -5,6 +5,123 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.107.0] - 2026-10-18
+
+### Added
+- **`entity_card` — deterministic entity cards, construction, refresh and
+  recall (issue #179, Workstream K PR 8 of 8):** `entity_card` joins
+  `ALLOWED_TYPES` as the 8th type; the schema stamp advances to **17**
+  (stamp-only, no DDL — see the Changed subsection for the upgrade-required
+  operator note). This REVERSES the
+  recorded #172 taxonomy decision — the same disclosed-reversal precedent
+  as the #175 entity kinds (the RFC map is a frozen record, not a veto);
+  README and SKILL.md keep the original reject sentence and append the
+  reversal. The type is CARD-REFRESH-ONLY: card rows are born only through
+  the refresh path, never an interactive add. `add --type` choices derive
+  from ALLOWED_TYPES minus `entity_card`; the Hermes and MCP add tools
+  validate against the same exclusion; jsonl ingest refuses the type
+  line-numbered (ingest bypasses add_memory and must never mint cards —
+  the born-only-through-refresh invariant); `add_memory` refuses the type
+  without the refresh path's `force_append=True`, and every ordinary write
+  rejects any tag carrying the reserved `entity_card_sha256=` prefix before
+  mutation.
+- **Card construction and refresh:** each qualifying entity (at least
+  `ZMEM_CARD_MIN_MENTIONS`, default 5, inclusive) gets one live card in
+  `user:global` with `source_ref=card:<entity_id>`, `signal=none`,
+  confidence 0.5, a direct-only entity link, and the reserved
+  `entity_card_sha256=<hex>` watermark tag (SHA-256 over the card's exact
+  UTF-8 bytes). The rendering is fixed-order (`Entity`/`Kind`/`Aliases`/
+  `Mentions`/`Last seen`/`Sources`), scores six decimals, provenance capped
+  at `ZMEM_CARD_TOP_N` (default 8) rows ordered confidence DESC,
+  ingestion_ts DESC, id ASC, `Last seen` spanning EVERY live source row,
+  and whitespace-collapsed single-line mention text. An invalid env value
+  (empty/non-integer/zero/negative) fails before any card write. Refresh is
+  append-only and fail-closed: identical bytes + watermark is a NO SQL
+  write no-op; changed content tombstones the old row (both `superseded_at`
+  and `valid_until` set) and inserts a replacement with `update_of`;
+  any failure rolls back the whole transaction (writer time never reads
+  `ZMEM_TEST_NOW`).
+- **`entity-card build|refresh ENTITY` CLI:** id-or-exact-canonical-name
+  resolution (zero/multiple name matches exit 2), `build` refuses a live
+  card (exit 2, no write) and reports `no_card` below threshold, `refresh`
+  returns `created`/`updated`/`unchanged`/`no_card` (below-threshold
+  refresh tombstones the live card first); `--json` emits one object with
+  the exact key order `result, id, entity_id, source_ref, warnings`.
+- **Organize cadence sweep:** the card refresh runs immediately after
+  entity backfill, in ascending entity-id order, and reports exactly five
+  counts — `created`/`refreshed`/`unchanged`/`removed`/`skipped` — under
+  `entity_cards` in the organize `--json` report and the session-cadence
+  JSON envelope; `--dry-run` computes the same counts read-only. The
+  sweep's env configuration resolves BEFORE any write of the run; an
+  invalid value skips the card stage (one stderr line, zero counts)
+  without aborting organize, and a per-entity apply failure (an oversized
+  card, a stale plan) rolls back only that entity's transaction, counts
+  the entity as `skipped`, and the sweep continues.
+- **Card taint floor:** a card's taint is the WORST OF its own
+  signal-derived default (`untrusted_tool` for signal=none) and every
+  selected source row's taint — one `untrusted_web` mention makes the
+  card itself `untrusted_web`, so the passive untrusted fence withholds
+  the card exactly as it withholds the source it aggregates. Disclosed
+  redaction tradeoff: cards are written `capture_mode=manual` (the pinned
+  mode that preserves the watermark tag), so their machine-assembled
+  content is not re-redacted at card-write time; the source rows were
+  already redacted at their own writes and the card renders their
+  already-redacted text.
+- **Cards never travel:** `export-jsonl` omits `entity_card` rows from
+  every export shape (live-only and `--include-superseded`) — cards are
+  store-local derived state and every ingest surface refuses the type;
+  destinations re-derive them via their own organize cadence.
+- **Same-fence recall suppression:** `entity_match_ids` gains
+  `prefer_cards=True` — a matched entity's live card enters the entity arm
+  with that entity's relevance. One suppression pass resolves selected
+  card rows by exact `source_ref=card:<entity_id>` plus a direct entity
+  link — never card text — and removes ALL live non-card rows linked to
+  those entities under the active namespace and `as_of` predicates: the
+  fence renders the card, not the mentions it summarizes. The pass runs
+  at EVERY merge site: the scoped tier pools with the global tier
+  included, the cross-tier merge, the UNSCOPED default surface
+  (`namespace=None`), the cross-project hazard pool before its splice,
+  and `--explain`'s presented AND deep pools; the suppressed-id set is
+  threaded into link expansion's exclusion so a removed source cannot
+  re-enter as a 1-hop neighbour. The passive `recent` lane never renders
+  cards at all (`entity_card` rows are excluded from every recent pool).
+  Queries with no selected card keep their current result; a project-only
+  or scoped-without-global recall selects no card and applies no
+  suppression. (Disclosed placement: the pass runs after per-tier arm
+  caps, RRF fusion, and MMR — per-tier placement is impossible because the
+  card lives in `user:global` while its sources live in project fences.)
+- **Tests and fixtures:** `tests/test_entity_card.py` (the issue's five
+  classes plus the forced-link-failure atomicity, dry-run SHA, writer-guard,
+  sweep-isolation, recent/re-entry, taint-floor, TOCTOU, and scoped-site
+  tests) and `tests/fixtures/entity_card/` (six/four mention JSONL, the
+  exact rendered card, the recall pair, the zero-card oracle) — all
+  LF-pinned via `.gitattributes`.
+
+### Changed
+- **Schema stamp 16 -> 17: UPGRADE-REQUIRED (issue #179 PR #385 review
+  round, 2026-10-18):** the bump is stamp-only (no DDL — a card is an
+  ordinary `memory` row), but old clients cannot be fixed from this
+  release and would poison themselves on `entity_card` rows (their type
+  preference raises on the unknown type and their hooks fail SILENT — a
+  fleet-wide memory blackout once any 0.107 host runs a cadence sweep).
+  `FORWARD_COMPAT_SCHEMA_VERSION` therefore deliberately STAYS at 15: a
+  pre-0.107 client refuses a v17 store loudly at open (the #175
+  upgrade-required discipline) instead of silently blacking out. KEY
+  OPERATOR NOTE for shared-store machines: every pre-0.107 client refuses
+  the store after the first 0.107 client migrates the stamp — update
+  every client that shares a store BEFORE the first 0.107 host opens it;
+  `ZMEM_ALLOW_NEWER_SCHEMA=1` is the stopgap (proceed at the operator's
+  own risk; it never downgrades the store). Sibling #382 (issue #178)
+  also claims 17; if it merges first this stamp renumbers to 18 at rebase
+  time (documented sibling-collision procedure).
+- **Upgrade impact of the card cadence:** after upgrading, the first
+  organize/session-cadence run MINTS cards for every qualifying entity
+  (five or more live non-card mentions), and same-fence suppression then
+  REMOVES the represented source rows from recall fences in favor of the
+  card on every card-bearing surface (scoped+global, cross-tier, and the
+  unscoped default). Queries with no selected card are byte-identical;
+  `recent` never renders cards.
+
 ## [0.104.0] - 2026-10-17
 
 ### Added

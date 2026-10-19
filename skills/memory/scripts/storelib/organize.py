@@ -97,7 +97,15 @@ from storelib.consolidate import (
 # (PRR-007).
 import importlib
 _consolidate_mod = importlib.import_module("storelib.consolidate")
-from storelib.entity import extract_entities, link_memory_entities
+from storelib.entity import (
+    build_entity_card_text,
+    card_config_from_env,
+    card_matches_content,
+    extract_entities,
+    link_memory_entities,
+    live_card_row,
+    refresh_entity_card,
+)
 from storelib.links import (
     LINK_THRESHOLD,
     _link_neighbors_lexical,
@@ -111,7 +119,7 @@ from storelib.schema import (
     _parse_iso_to_epoch,
     now_iso,
 )
-from storelib.write import AutoCaptureRuntimeError, CapturePolicyRefusal, _clear_expiry, add_memory, update_memory
+from storelib.write import AutoCaptureRuntimeError, CapturePolicyRefusal, _clear_expiry, add_memory, supersede_memory, update_memory
 
 # Summaries are real rows. A signal=none row inherits SIGNAL_CONFIDENCE["none"]
 # (0.2) which sits BELOW the CONFIDENCE_FLOOR (0.25) — such a row is invisible
@@ -614,6 +622,139 @@ def _copy_merged_from(conn: sqlite3.Connection, old_id: str, new_id: str) -> Non
         conn.execute("UPDATE memory SET merged_from=? WHERE id=?", (merged, new_id))
 
 
+# Issue #179: the entity-card cadence sweep's five counters, in the exact
+# return-key order. created = a qualifying entity gained its first live
+# card; refreshed = represented mentions changed and the card was replaced;
+# unchanged = SHA-256 no-op (byte-identical content + watermark, no SQL
+# write); removed = a live card fell below the threshold and was
+# tombstoned; skipped = a non-qualifying entity with no live card.
+ENTITY_CARD_COUNT_KEYS = ("created", "refreshed", "unchanged", "removed",
+                          "skipped")
+
+
+def _zero_entity_card_counts() -> dict[str, int]:
+    return {k: 0 for k in ENTITY_CARD_COUNT_KEYS}
+
+
+def _plan_entity_card_pass(
+    conn: sqlite3.Connection, *, min_mentions: int, top_n: int,
+) -> list[tuple[str, str, str | None, str | None, str | None]]:
+    """Classify every entity's card action WITHOUT writing anything.
+
+    Returns ``(entity_id, action, content, taint, live_card_id)`` tuples in
+    ascending entity-id byte order; ``action`` is one of the five counter
+    names and the apply path (refresh_entity_cards) maps 1:1 onto these
+    decisions. ``taint`` is the build's worst-of source taint (PR #385
+    review F-8) carried to refresh_entity_card; it is None exactly when
+    content is. Shared by the real sweep and the dry-run counts so both
+    derive from the same ordered inputs.
+    """
+    plan: list[tuple[str, str, str | None, str | None, str | None]] = []
+    eids = [r[0] for r in conn.execute(
+        "SELECT id FROM entity ORDER BY id").fetchall()]
+    for eid in eids:
+        built = build_entity_card_text(
+            conn, entity_id=eid, min_mentions=min_mentions, top_n=top_n)
+        live = live_card_row(conn, eid)
+        if built is None:
+            if live is not None:
+                plan.append((eid, "removed", None, None, live["id"]))
+            else:
+                plan.append((eid, "skipped", None, None, None))
+            continue
+        content, _source_ids, taint = built
+        if live is None:
+            plan.append((eid, "created", content, taint, None))
+        elif card_matches_content(live, content):
+            plan.append((eid, "unchanged", content, taint, live["id"]))
+        else:
+            plan.append((eid, "refreshed", content, taint, live["id"]))
+    return plan
+
+
+def refresh_entity_cards(
+    conn: sqlite3.Connection,
+    *,
+    min_mentions: int = 5,
+    top_n: int = 8,
+    now: str | None = None,
+) -> dict[str, int]:
+    """The entity-card cadence sweep (issue #179): create, refresh, or
+    tombstone every entity's card in ascending entity-id byte order.
+
+    One ``now`` value is resolved at the start (``schema.now_iso()`` when
+    ``now`` is None) and passed to every refresh_entity_card call; tests
+    pass ``now="2026-09-10T00:00:00Z"``. Each entity's change lands in its
+    own scoped transaction; a per-entity failure (PR #385 review F-4/PRR-003,
+    2026-10-18: an oversized card raising ContentTooLarge, a stale plan
+    superseding an already-superseded card, ...) rolls back ONLY that
+    entity's transaction, prints ONE stderr line naming the entity and the
+    error, and counts the entity as ``skipped`` — one bad entity never
+    aborts the sweep or the later organize stages. The ``removed`` branch
+    re-reads the live card INSIDE its transaction and supersedes THAT id
+    (the plan's snapshot can go stale between plan and apply); a re-read
+    that finds nothing live counts the entity as skipped.
+
+    Returns EXACTLY the five counts (created / refreshed / unchanged /
+    removed / skipped); unchanged means the SHA-256 no-op predicate held and
+    no SQL write happened for that card; skipped covers non-qualifying
+    entities with no live card AND per-entity apply failures. No thread,
+    daemon, timer, or detached worker ever runs this.
+    """
+    counts = _zero_entity_card_counts()
+    ts = now if now is not None else now_iso()
+    for eid, action, content, taint, live_id in _plan_entity_card_pass(
+            conn, min_mentions=min_mentions, top_n=top_n):
+        if action in ("skipped", "unchanged"):
+            counts[action] += 1
+            continue
+        try:
+            with _scoped_tx(conn):
+                if action == "removed":
+                    # F-4(c): the plan's live_id was read BEFORE this
+                    # transaction opened — a concurrent writer may have
+                    # already tombstoned (or replaced) the card. Re-read the
+                    # live row under the lock and supersede THAT id; a None
+                    # re-read means the plan is stale and the entity counts
+                    # as skipped (supersede_memory would refuse an
+                    # already-superseded id).
+                    live_now = live_card_row(conn, eid)
+                    if live_now is None:
+                        counts["skipped"] += 1
+                        continue
+                    supersede_memory(
+                        conn, live_now["id"], "entity_card_below_threshold",
+                        at=ts)
+                else:
+                    refresh_entity_card(
+                        conn, entity_id=eid, content=content, taint=taint,
+                        now=ts)
+        except ValueError as exc:
+            # F-4(b): per-entity isolation. ContentTooLarge (a >64KiB card),
+            # a stale-plan supersede refusal, a config-derived ValueError —
+            # one failure logs one line, counts as skipped, and the sweep
+            # CONTINUES with the remaining entities (the pinned five-count
+            # contract holds; the entity's own transaction rolled back).
+            print(f"[zmem] entity cards: skipped entity {eid}: {exc}",
+                  file=sys.stderr)
+            counts["skipped"] += 1
+            continue
+        counts[action] += 1
+    return counts
+
+
+def entity_card_counts_readonly(
+    conn: sqlite3.Connection, *, min_mentions: int, top_n: int,
+) -> dict[str, int]:
+    """Dry-run twin of refresh_entity_cards: the SAME counts from the SAME
+    ordered inputs, with no write transaction opened."""
+    counts = _zero_entity_card_counts()
+    for _eid, action, _c, _s, _l in _plan_entity_card_pass(
+            conn, min_mentions=min_mentions, top_n=top_n):
+        counts[action] += 1
+    return counts
+
+
 def organize(
     conn: sqlite3.Connection,
     *,
@@ -653,7 +794,15 @@ def organize(
          ``ZMEM_ORGANIZE_EPISODE_BOUND`` (default 256, clamped to the
          per-namespace consolidation cap).
       4. Entity backfill (7.2) — every working row missing ``memory_entity``
-         links gets them via the deterministic extractor.
+         links gets them via the deterministic extractor. The card sweep's
+         env configuration resolves BEFORE this loop (PR #385 review F-4:
+         before ANY write; an invalid value skips the card stage with one
+         stderr line instead of aborting mid-run). Immediately after the
+         backfill (#179): the entity-card cadence sweep — one deterministic
+         card per qualifying entity (five counts: created/refreshed/
+         unchanged/removed/skipped, reported under ``entity_cards``; dry run
+         computes the same counts read-only; a per-entity apply failure
+         counts as skipped and never aborts the sweep or the later stages).
       5. Link backfill (7.2) — every working row missing ``memory_link`` edges
          gets them via ``generate_links_on_write``.
       6. Consolidation (7.1) — ``consolidate(force=True, ...)`` on EXACTLY the
@@ -682,6 +831,9 @@ def organize(
         "episode_ids": [],
         "entity_backfill": {"candidates": 0, "backfilled": 0, "would_backfill": 0},
         "link_backfill": {"candidates": 0, "backfilled": 0, "would_backfill": 0},
+        # Issue #179: the card sweep's five counts (present even on gate/idle
+        # skips so the report shape is stable).
+        "entity_cards": _zero_entity_card_counts(),
         "consolidate": None,
         "topics": [],
         "summaries": {
@@ -750,6 +902,23 @@ def organize(
     report["episode_ids"] = sorted(r["id"] for r in working)
     work_ids = set(r["id"] for r in working)
 
+    # --- 3b) Card configuration (#179; PR #385 review F-4/PRR-003) --------
+    # Resolved BEFORE the entity-backfill loop below — the FIRST write stage
+    # — so an invalid ZMEM_CARD_MIN_MENTIONS / ZMEM_CARD_TOP_N can never
+    # abort organize halfway through committed backfill writes (executed at
+    # base: the config error fired after the backfill had already written).
+    # An invalid value does NOT fail the run: one stderr line, the card
+    # stage is skipped entirely (counts stay zero), and every later stage
+    # runs. The card stage (4b) uses these pre-resolved values.
+    card_config_error: str | None = None
+    card_min: int | None = None
+    card_top: int | None = None
+    try:
+        card_min, card_top = card_config_from_env()
+    except ValueError as exc:
+        card_config_error = str(exc)
+        print(f"[zmem] organize: entity cards skipped - {exc}", file=sys.stderr)
+
     # --- 4) Entity backfill (7.2) ---
     eb = report["entity_backfill"]
     for r in sorted(working, key=lambda row: row["id"]):
@@ -767,6 +936,24 @@ def organize(
             )
             if linked_now:
                 eb["backfilled"] += 1
+
+    # --- 4b) Entity cards (#179): the cadence card sweep -----------------
+    # Runs immediately AFTER the entity-backfill loop (freshly linked rows
+    # already count as card sources) and only here — past the cadence and
+    # idle gates. Configuration was resolved at the TOP of the run (step
+    # 3b, before ANY write); an invalid config skips the card stage here
+    # with the counts left at zero (the warning already printed) and never
+    # aborts the run.
+    if card_config_error is not None:
+        pass  # warned at step 3b; entity_cards stays the zero counts
+    elif dry_run:
+        assert card_min is not None and card_top is not None
+        report["entity_cards"] = entity_card_counts_readonly(
+            conn, min_mentions=card_min, top_n=card_top)
+    else:
+        assert card_min is not None and card_top is not None
+        report["entity_cards"] = refresh_entity_cards(
+            conn, min_mentions=card_min, top_n=card_top)
 
     # --- 5) Link backfill (7.2) ---
     lb = report["link_backfill"]
@@ -995,6 +1182,9 @@ def organize(
             f"DRY RUN: entity backfill would-link {eb['would_backfill']} "
             f"of {eb['candidates']} candidates",
             f"link backfill would-link {lb['would_backfill']} of {lb['candidates']} candidates",
+            f"entity cards would-create {report['entity_cards']['created']} / "
+            f"refresh {report['entity_cards']['refreshed']} / "
+            f"remove {report['entity_cards']['removed']}",
             f"topics {len(topics)}",
             f"summaries would-create {sm['would_create']} / would-update {sm['would_update']}",
             f"compressed would-compress {comp['would_count']}",
@@ -1005,6 +1195,9 @@ def organize(
         parts = [
             f"entity backfill {eb['backfilled']} of {eb['candidates']} candidates",
             f"link backfill {lb['backfilled']} of {lb['candidates']} candidates",
+            f"entity cards {report['entity_cards']['created']} created / "
+            f"{report['entity_cards']['refreshed']} refreshed / "
+            f"{report['entity_cards']['removed']} removed",
             f"topics {len(topics)}",
             f"summaries {sm['created']} created / {sm['updated']} updated",
             f"compressed {comp['count']}",

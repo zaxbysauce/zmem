@@ -192,7 +192,13 @@ def _cmd_export_jsonl_body(
     """Write one JSON object per line for LIVE rows (plus tombstoned rows too
     when include_superseded), sorted by ingestion_ts then id for deterministic
     diffs. No embedding fields -- bytes are not portable across machines;
-    receivers rebuild via `reembed`."""
+    receivers rebuild via `reembed`.
+
+    PR #385 review F-3 (PRR-002): ``entity_card`` rows are NEVER exported
+    (live or superseded) — cards never travel; the destination re-derives
+    them via its own organize cadence sweep. Every ingest surface refuses the
+    type, so an exported card could only fail the strict re-ingest (exit 2,
+    zero applied) or drop as legacy noise."""
     # The public wrapper owns the read snapshot and its rollback cleanup; this
     # body keeps one snapshot across memory, episode, and evidence sections.
     # Never silently downgrade a partial v14 schema to a legacy export.
@@ -238,6 +244,15 @@ def _cmd_export_jsonl_body(
         params.append(namespace)
     if not include_superseded:
         clauses.append("superseded_at IS NULL")
+    # PR #385 review F-3 (PRR-002, 2026-10-18): cards never travel. The
+    # born-only-through-refresh invariant means an entity_card row is store-
+    # local DERIVED state — every ingest surface refuses the type, so an
+    # exported card could only be refused (strict re-ingest exits 2 with
+    # zero applied, executed at base) or dropped as noise. The destination
+    # re-derives cards via its own cadence sweep. Applied UNCONDITIONALLY to
+    # the one memory query both the live-only and --include-superseded
+    # variants share, so every export shape omits live AND tombstoned cards.
+    clauses.append("type != 'entity_card'")
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(
         f"""SELECT id, namespace, type, content, tags, source_ref, confidence, signal,
@@ -977,6 +992,18 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     type_ = obj.get("type")
     if not isinstance(type_, str) or type_ not in ALLOWED_TYPES:
         raise ValueError(f"field 'type' must be one of {', '.join(ALLOWED_TYPES)}")
+    # Issue #179 ([R15] mechanism): entity_card is a card-refresh-only
+    # reserved type. ALLOWED_TYPES carries it (the #172 reversal), so the
+    # membership check above alone would now accept it — refuse it
+    # explicitly here: ingest bypasses add_memory and must never mint cards
+    # (the born-only-through-refresh invariant). The row is malformed,
+    # line-numbered, and never commits — same handling as any other bad
+    # field.
+    if type_ == "entity_card":
+        raise ValueError(
+            "field 'type' value 'entity_card' is reserved: card rows are "
+            "born only through the entity-card refresh path "
+            "(entity-card build|refresh / organize cadence), never ingest")
 
     # Signal is normalized, not rejected: an unknown signal costs the row its
     # confidence default, which is a fine outcome; losing the row is not. A

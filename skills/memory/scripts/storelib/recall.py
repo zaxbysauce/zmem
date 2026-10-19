@@ -1706,6 +1706,87 @@ def _exact_one_tier(
         }))
     return scored
 
+def _suppress_card_source_rows(
+    conn: sqlite3.Connection,
+    tier_pools: list[list[tuple[float, dict]]],
+) -> tuple[int, set[str]]:
+    """Same-fence provenance suppression (issue #179, [R1]/[R16] disclosed
+    placement: the CROSS-TIER MERGE, after per-tier arm caps / RRF fusion /
+    MMR — suppressed rows may already have consumed tier slots).
+
+    The pass resolves SELECTED card rows from the MERGED candidate set (the
+    pools of every participating tier) by exact
+    ``source_ref=card:<entity_id>`` plus a DIRECT ``memory_entity`` link —
+    never by matching card text — then removes ALL live non-card rows
+    linked to those entities from every pool: the fence renders the card,
+    not the mentions it summarizes. The pools were fetched under the active
+    namespace and as_of predicates, so suppression honors those predicates
+    by construction; a query with no selected card keeps its current
+    result. Mutates each pool IN PLACE and returns ``(removed_count,
+    suppressed_ids)`` — the suppressed-id set is threaded by the caller
+    into ``expand_recall_links``' exclusion (PR #385 review F-5/PRR-005: a
+    removed source row must not re-enter the fence as a 1-hop neighbour of
+    a surviving row). (PR #385 review fixed-in-passing RB-07/TC-14: the
+    former ``as_of`` parameter was dead — the pools arrive pre-filtered —
+    and has been removed.)
+
+    Per-tier placement is impossible (the card lives in ``user:global``
+    while its represented sources live in project fences, and the entity
+    arm namespace-filters per tier), so the pass necessarily runs at every
+    merge site: the scoped tier-pool merge (global tier included), the
+    cross-tier merge, the UNSCOPED default surface, the cross pool before
+    its splice, and the explain pipeline's presented AND deep pools (all
+    PR #385 review F-5) — a project-only recall selects no card and applies
+    no suppression.
+    """
+    card_entity: dict[str, str] = {}
+    for pool in tier_pools:
+        for _score, item in pool:
+            src = item.get("source_ref") or ""
+            if item.get("type") == "entity_card" and src.startswith("card:"):
+                eid = src[len("card:"):]
+                if eid:
+                    card_entity[item["id"]] = eid
+    if not card_entity:
+        return 0, set()
+    # Verify the direct entity link — a foreign row typed entity_card with
+    # a card: source_ref but no direct link is not a selected card.
+    verified: set[str] = set()
+    for mid, eid in card_entity.items():
+        row = conn.execute(
+            "SELECT 1 FROM memory_entity WHERE memory_id=? AND entity_id=? "
+            "LIMIT 1",
+            (mid, eid),
+        ).fetchone()
+        if row is not None:
+            verified.add(eid)
+    if not verified:
+        return 0, set()
+    eph = ",".join("?" * len(verified))
+    linked = {
+        r[0] for r in conn.execute(
+            f"SELECT DISTINCT memory_id FROM memory_entity "
+            f"WHERE entity_id IN ({eph})",
+            sorted(verified),
+        ).fetchall()
+    }
+    suppress_ids = linked - set(card_entity)
+    if not suppress_ids:
+        return 0, set()
+    removed = 0
+    for pool in tier_pools:
+        kept: list[tuple[float, dict]] = []
+        for pair in pool:
+            item = pair[1]
+            if (item["id"] in suppress_ids
+                    and item.get("type") != "entity_card"):
+                removed += 1
+                continue
+            kept.append(pair)
+        pool[:] = kept
+    return removed, suppress_ids
+
+
 def _merge_tiers(
     project_scored: list[tuple[float, dict]],
     global_scored: list[tuple[float, dict]],
@@ -3063,12 +3144,34 @@ def _recall_memory_impl(
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
 
+    # Issue #179 (PR #385 review F-5): the suppressed-id set is captured at
+    # EVERY merge site and threaded into the link-expansion exclusion below
+    # so a removed source row cannot re-enter the fence as a 1-hop neighbour
+    # of a surviving row.
+    card_suppressed: set[str] = set()
     if scopes is not None:
+        # Issue #179: same-fence card suppression over the merged scoped
+        # pools — only when the global tier is included (the card lives in
+        # user:global; a scoped recall without it selects no card).
+        if include_global and scoped_tiers:
+            _n, card_suppressed = _suppress_card_source_rows(
+                conn, list(scoped_tiers.values()))
         results = _merge_reserved_tiers(
             scoped_tiers or {}, scoped_slots or _DEFAULT_TIER_SLOTS)
     elif do_global:
+        # Issue #179: same-fence card suppression at the cross-tier merge —
+        # the card (global tier, entity arm) renders and its represented
+        # source rows (project tier) leave the fence.
+        _n, card_suppressed = _suppress_card_source_rows(
+            conn, [project_scored, global_scored])
         results = _merge_tiers(project_scored, global_scored, limit, global_limit)
     else:
+        # Issue #179 (review r1): the unscoped path (namespace=None) also
+        # renders ONE fence — the project-tier pool covers every namespace
+        # and entity_match_ids promotes the card without an ns clause, so
+        # the represented sources must leave this fence too (a no-op when
+        # no card is selected).
+        _n, card_suppressed = _suppress_card_source_rows(conn, [project_scored])
         results = [item for _score, item in project_scored[:limit]]
 
     # Issue #58, 3.4: on `--no-bump` / hook paths, drop injection-risk
@@ -3146,10 +3249,14 @@ def _recall_memory_impl(
         # neighbour through expansion. On the plain path the pre-filter above
         # has already removed every excluded id from results, so seeds ==
         # results there and this is a no-op regardless of what was excluded.
+        # Issue #179 (PR #385 review F-5): the same-fence suppression's
+        # removed source ids join the exclusion — a suppressed source row
+        # linked to a SURVIVING row must not re-enter as a 1-hop neighbour.
         _expanded = expand_recall_links(
             conn, results, ns_list=ns_list, budget=link_budget, as_of=as_of,
             min_confidence=min_confidence, no_bump=no_bump,
             exclude_ids=exclude_ids,
+            suppress_ids=sorted(card_suppressed) or None,
         )
         # Issue #174: link-expansion arrivals pass the expiry gate at append
         # time on the passive lane (every arrival is gated; the neighbors a
@@ -3238,6 +3345,15 @@ def _recall_memory_impl(
             if any(item.get("inject_until") for _, item in kept_cross):
                 expiry_acc["engaged"] = True
             kept_cross = gated
+        # Issue #179 (PR #385 review F-5): run the suppression pass over the
+        # cross pool BEFORE the splice — a represented source row admitted
+        # by the cross tier must not re-enter the fence the merge just
+        # cleaned. The card is resolved from the delivered results pool (a
+        # card is never itself a cross row — the tier admits project:*
+        # namespaces only) and its sources are removed from both pools.
+        if kept_cross:
+            _suppress_card_source_rows(
+                conn, [[(0.0, r) for r in results], kept_cross])
         cross_bump_ids = _splice_cross_rows(results, kept_cross)
         bump_ids = bump_ids + cross_bump_ids
 
@@ -3651,6 +3767,10 @@ def _explain_run_pipeline(
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=True,
         )
+        # Issue #179: same suppression pass as recall_memory's scoped merge
+        # so explain's presented set is the same fence.
+        if include_global and pools:
+            _suppress_card_source_rows(conn, list(pools.values()))
         presented = _merge_reserved_tiers(pools, slots)
         return presented, [], [], pools, slots
 
@@ -3673,8 +3793,15 @@ def _explain_run_pipeline(
     for _s, item in global_scored:
         item["prompt_injection_risk"] = _classify_injection(item)
     if global_ns_list:
+        # Issue #179: same-fence card suppression at the explain pipeline's
+        # cross-tier merge (mirrors recall_memory's merge placement).
+        _suppress_card_source_rows(conn, [project_scored, global_scored])
         presented = _merge_tiers(project_scored, global_scored, limit, global_limit)
     else:
+        # Issue #179 (review r1): explain's unscoped path mirrors
+        # recall_memory's — the single all-namespace pool renders one
+        # fence, so the card's represented sources leave it too.
+        _suppress_card_source_rows(conn, [project_scored])
         presented = [item for _score, item in project_scored[:limit]]
     project_deep = _recall_one_tier(
         conn, query=query, ns_list=ns_list, limit=max(limit * 3, limit + 5),
@@ -3689,6 +3816,15 @@ def _explain_run_pipeline(
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
         )
+    # Issue #179 (PR #385 review F-5d): the same suppression pass over the
+    # DEEP pools — the verdict stream must agree with the presented fence,
+    # so a represented source row that scored-but-did-not-present must not
+    # appear in the deep "just missed the cut" evidence either. Mirrors the
+    # presented shape: both pools under the merge, project-only otherwise.
+    if global_ns_list:
+        _suppress_card_source_rows(conn, [project_deep, global_deep])
+    else:
+        _suppress_card_source_rows(conn, [project_deep])
     return presented, project_deep, global_deep, {}, None
 
 
@@ -4394,6 +4530,15 @@ def _recent_one_tier(
     (valid_from INCLUSIVE, valid_until EXCLUSIVE) via
     ``_as_of_temporal_predicate`` — dropping the ``superseded_at IS NULL``
     live filter when set.
+
+    Issue #179 (PR #385 review F-5/PRR-005): ``entity_card`` rows are
+    EXCLUDED from every recent pool, live and as-of alike — cards serve the
+    entity arm of QUERY recall only; a query-less recency pull rendering a
+    card (confidence 0.5, above the 0.5 recent floor) would both crowd the
+    tier's slots and render card-plus-sources in one fence (executed at
+    base), the exact contract break the same-fence suppression exists to
+    prevent. With no card in the pool the recent lane never suppresses
+    anything — the passive pull keeps its ordinary rows.
     """
     params: list = [min_confidence]
     ns_clause = ""
@@ -4432,6 +4577,7 @@ def _recent_one_tier(
                   applied_count, violated_count
             FROM memory
             WHERE {live_clause} confidence >= ?
+            AND type != 'entity_card'
             {ns_clause}
             {as_of_clause}
             ORDER BY {order_clause} LIMIT ?""",

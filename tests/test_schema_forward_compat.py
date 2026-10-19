@@ -62,12 +62,19 @@ class SchemaCompatGateTest(unittest.TestCase):
 
     def test_default_ceiling_refuses_supported_plus_one(self):
         # FORWARD_COMPAT defaults to SUPPORTED: today's behavior preserved.
-        # v16 (#175) deliberately opens a ONE-STEP window: the entity-kinds
-        # rebuild is not additive, so FORWARD stays 15 while SUPPORTED is 16 —
-        # a store above SUPPORTED (v17+) still refuses exactly as before.
-        self.assertEqual(
-            self.schema.FORWARD_COMPAT_SCHEMA_VERSION,
-            self.schema.SUPPORTED_SCHEMA_VERSION - 1)
+        # v16 (#175) opened a ONE-STEP window (FORWARD 15 under SUPPORTED 16
+        # — the entity-kinds rebuild is not additive).
+        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): the entity_card
+        # stamp-only bump keeps FORWARD at 15 — TWO steps under the new
+        # SUPPORTED 17, so the current client's additive window is empty by
+        # construction and anything above SUPPORTED still refuses exactly as
+        # before. The 15 stays load-bearing for the deployed v16-lineage
+        # clients (SUPPORTED 16 / FORWARD 15), which refuse a v17 store at
+        # open — the loud upgrade-required outcome this round demands
+        # (executed old-client blackout evidence: a <=0.106 host on card
+        # rows fails SILENT in its hooks).
+        self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
+        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 17)
         with self.assertRaises(RuntimeError) as cm:
             self._decide(self.schema.SUPPORTED_SCHEMA_VERSION + 1)
         self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA", str(cm.exception))
@@ -145,15 +152,21 @@ class SchemaCompatGateTest(unittest.TestCase):
         importlib.reload(self.schema)
         # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2 rebuild);
         # FORWARD deliberately stays 15 — a v15 client refuses a v16 store.
-        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 16)
+        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): SUPPORTED advanced
+        # 16 -> 17 (stamp-only entity_card bump); FORWARD STAYS 15 — a
+        # pre-0.107 client refuses a v17 store loudly instead of silently
+        # blacking out on card rows (the executed old-client evidence this
+        # re-pin cites).
+        self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 17)
         self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 15)
-        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 16)
+        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 17)
         self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 15)
 
 
-    def _build_v16_store(self):
-        """Build an isolated v16 store via the real CLI; returns its path."""
-        tmp = tempfile.mkdtemp(prefix="zmem-v15onv16-")
+    def _build_current_store(self):
+        """Build an isolated CURRENT-version store via the real CLI; returns
+        its path. (v17 since the PR #385 review F-1 bump — 2026-10-18.)"""
+        tmp = tempfile.mkdtemp(prefix="zmem-v16onv17-")
         self.addCleanup(shutil.rmtree, tmp, True)
         store = os.path.join(tmp, "store.sqlite")
         saved = {k: os.environ.get(k) for k in (
@@ -194,33 +207,37 @@ class SchemaCompatGateTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_v15_client_refuses_v16_store_with_actionable_message(self):
-        """Issue #175 AC4: a v15 client (SUPPORTED=15, FORWARD=15) refuses a
-        v16 store with the existing actionable message. Both imported
-        bindings (storelib.schema and schema_meta) are patched, restored by
-        the patch context managers."""
+    def test_v16_client_refuses_v17_store_with_actionable_message(self):
+        """The #175 upgrade-required discipline re-pinned at the v17
+        boundary (PR #385 review F-1/PRR-006, 2026-10-18): a v16-lineage
+        client (SUPPORTED=16, FORWARD=15 — the real pre-0.107 constants)
+        refuses a v17 store with the existing actionable message instead of
+        silently blacking out on entity_card rows. Both imported bindings
+        (storelib.schema and schema_meta) are patched, restored by the
+        patch context managers."""
         import schema_meta as meta
-        store = self._build_v16_store()
-        self.assertEqual(self._store_version(store), "16")
-        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+        store = self._build_current_store()
+        self.assertEqual(self._store_version(store), "17")
+        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
             try:
                 self.schema.connect()
-                self.fail("a v15 client must refuse a v16 store")
+                self.fail("a v16-lineage client must refuse a v17 store")
             except RuntimeError as exc:
                 self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA=1", str(exc))
                 self.assertIn("schema_version", str(exc))
-        self.assertEqual(self._store_version(store), "16")
+        self.assertEqual(self._store_version(store), "17")
 
     def test_allow_newer_schema_override_proceeds_without_downgrade(self):
-        """Issue #175 AC4: ZMEM_ALLOW_NEWER_SCHEMA=1 proceeds on the v16
-        store, warns exactly once, never downgrades or migrates it."""
+        """ZMEM_ALLOW_NEWER_SCHEMA=1 proceeds on the v17 store, warns
+        exactly once, never downgrades or migrates it (re-pinned at the 17
+        boundary — the operator stopgap for the pre-0.107 fleet)."""
         import io
         import schema_meta as meta
         from contextlib import redirect_stderr
-        store = self._build_v16_store()
-        self.assertEqual(self._store_version(store), "16")
+        store = self._build_current_store()
+        self.assertEqual(self._store_version(store), "17")
         os.environ["ZMEM_ALLOW_NEWER_SCHEMA"] = "1"
-        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
+        with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 16),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
             self.schema._schema_compat._warned = False
             buf = io.StringIO()
             with redirect_stderr(buf):
@@ -232,7 +249,7 @@ class SchemaCompatGateTest(unittest.TestCase):
         self.assertEqual(buf.getvalue().count("WARNING"), 1,
                          f"expected exactly one WARNING, got: {buf.getvalue()!r}")
         self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA=1", buf.getvalue())
-        self.assertEqual(self._store_version(store), "16")
+        self.assertEqual(self._store_version(store), "17")
 
 
 class OlderClientOnNewerStoreTest(unittest.TestCase):

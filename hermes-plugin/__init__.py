@@ -1218,9 +1218,17 @@ _SCHEMA_CONSTANTS = _store_constants()
 # `state` is excluded here (not read from schema_meta) because the degraded
 # fallback must stay usable when schema_meta is unreadable; the ratchet test
 # pins this set to schema_meta.ALLOWED_TYPES minus state.
+# #179 (Workstream K PR 8): `entity_card` extends the same exclusion chain —
+# it is a CARD-REFRESH-ONLY type no interactive surface may create (card rows
+# are born only through `entity-card build|refresh` and the organize cadence
+# sweep). Loaded and degraded paths agree: the derivation below subtracts it
+# from the real enum, and the degraded fallback literal already stops at the
+# six serviceable types.
 _STATE_TYPES = frozenset({"state"})
+_CARD_REFRESH_ONLY_TYPES = frozenset({"entity_card"})
 _ADDABLE_TYPES = tuple(
-    t for t in _SCHEMA_CONSTANTS["ALLOWED_TYPES"] if t not in _STATE_TYPES
+    t for t in _SCHEMA_CONSTANTS["ALLOWED_TYPES"]
+    if t not in _STATE_TYPES and t not in _CARD_REFRESH_ONLY_TYPES
 )
 _ADD_TYPE_ENUM = list(_ADDABLE_TYPES)
 _ADD_SIGNAL_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_SIGNALS"])
