@@ -475,6 +475,7 @@ def expand_recall_links(
     ns_list: list[str] | None, budget: int, as_of: str | None = None,
     min_confidence: float | None = None, no_bump: bool = False,
     exclude_ids: list[str] | None = None,
+    suppress_ids: list[str] | None = None,
 ) -> list[dict]:
     """Budgeted 1-hop link expansion at recall (issue #61, 6.3).
 
@@ -496,6 +497,15 @@ def expand_recall_links(
     row the session has already seen. Defaults to ``None`` so every existing
     caller (including the non-``recall_memory`` ones) is unaffected, and a
     link-free store stays byte-identical either way.
+
+    Issue #179 (PR #385 review F-5/PRR-005, 2026-10-18): ``suppress_ids``
+    names rows the caller's same-fence card suppression REMOVED from the
+    result set. Unlike ``exclude_ids`` (a seed-side skip only), a suppressed
+    id is barred from BOTH sides of the walk — it is not a seed AND it can
+    never arrive as a 1-hop neighbour of a surviving row, which is exactly
+    the re-entry hole the review executed (a source row linked to a kept
+    row re-entered the fence the merge had just cleaned). ``None`` keeps
+    every existing caller byte-identical.
     """
     from storelib.recall import _classify_injection, _fetch_by_ids
 
@@ -508,7 +518,15 @@ def expand_recall_links(
         seeds = [r for r in results if r["id"] not in _excluded]
         if not seeds:
             return []
-    have = {r["id"] for r in results}
+    # Issue #179 F-5: suppressed ids are non-candidates too — fold them into
+    # the `have` set so the edge walk's `other in have` guard bars them from
+    # the neighbour pool, and drop them from the seeds for symmetry.
+    _suppressed = set(suppress_ids) if suppress_ids else set()
+    if _suppressed:
+        seeds = [r for r in seeds if r["id"] not in _suppressed]
+        if not seeds:
+            return []
+    have = {r["id"] for r in results} | _suppressed
     as_of_dt = _parse_iso_utc(as_of) if as_of else None
     # Best edge per candidate neighbor id: highest score wins; ties break by
     # (relation, parent id) so the choice is deterministic run-to-run.

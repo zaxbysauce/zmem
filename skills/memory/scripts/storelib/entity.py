@@ -48,6 +48,7 @@ identically on every host.)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -56,9 +57,23 @@ import sqlite3
 import sys
 import uuid
 
-from schema_meta import ENTITY_KINDS
+from schema_meta import (
+    CARD_MIN_MENTIONS_DEFAULT,
+    CARD_MIN_MENTIONS_ENV,
+    CARD_TOP_N_DEFAULT,
+    CARD_TOP_N_ENV,
+    ENTITY_CARD_WATERMARK_PREFIX,
+    ENTITY_KINDS,
+    worse_taint,
+)
 from storelib.ops_tokens import RUNNER_HEADS
-from storelib.schema import _as_of_temporal_predicate, _normalize_content, now_iso
+from storelib.schema import (
+    GLOBAL_NAMESPACE,
+    _as_of_temporal_predicate,
+    _commit,
+    _normalize_content,
+    now_iso,
+)
 
 # The single link role shipped in v10. The column exists so phase 6 (links)
 # can enrich relationships without another migration; every v10 link row
@@ -708,6 +723,7 @@ def entity_match_ids(
     as_of: str | None = None,
     limit: int = 5,
     matched_kinds: dict[str, set[str]] | None = None,
+    prefer_cards: bool = True,
 ) -> tuple[list[str], dict[str, float]]:
     """The entity lane of recall (issue #60, 5.3): match the QUERY against
     stored aliases and return live memory ids ranked for RRF fusion.
@@ -734,6 +750,12 @@ def entity_match_ids(
     matched_entities / total_matched_query_entities in [0, 1] — the relevance
     proxy the tier's composite scoring uses for entity-only rows (they have
     neither an FTS rank nor a vec similarity).
+
+    Issue #179: with ``prefer_cards=True`` (the default), a live card of a
+    matched entity (type entity_card, source_ref=card:<entity_id>) is
+    promoted to the HEAD of the ranked list under the tier's own namespace
+    and as_of predicates, entering the entity arm with that entity's
+    relevance. A store with no card rows keeps a byte-identical result.
 
     Unknown alias ⇒ empty list (the other lanes fuse unchanged, no crash).
     The result window is ``max(50, limit*10)``: bounded fetch work, while the
@@ -801,7 +823,74 @@ def entity_match_ids(
             }
     total = float(len(eids))
     rel_map = {r["mid"]: min(1.0, r["n"] / total) if total else 0.0 for r in rows}
-    return [r["mid"] for r in rows], rel_map
+    ranked = [r["mid"] for r in rows]
+    if prefer_cards and eids:
+        # Issue #179: promote the matched entities' live cards to the head
+        # of the entity arm under this tier's own namespace/as_of
+        # predicates, so the card (not its represented sources) leads the
+        # arm. The cross-tier suppression of the represented rows happens at
+        # recall's merge (recall.py) — per-tier placement is impossible
+        # because the card lives in user:global while its sources live in
+        # project fences.
+        card_ids = _live_card_ids_for_entities(
+            conn, eids, ns_list=ns_list, as_of=as_of)
+        if card_ids:
+            card_set = set(card_ids)
+            # The card enters with that entity's relevance: matched-entity
+            # count / total matched query entities, the same reduction the
+            # natural ranking applies.
+            cph = ",".join("?" * len(card_ids))
+            eph = ",".join("?" * len(eids))
+            try:
+                counts = {
+                    r[0]: r[1] for r in conn.execute(
+                        f"SELECT me.memory_id, COUNT(DISTINCT me.entity_id) "
+                        f"FROM memory_entity me WHERE me.memory_id IN ({cph}) "
+                        f"AND me.entity_id IN ({eph}) GROUP BY me.memory_id",
+                        [*card_ids, *eids],
+                    ).fetchall()
+                }
+            except sqlite3.OperationalError:
+                counts = {}
+            for cid in card_ids:
+                rel_map[cid] = (
+                    min(1.0, counts.get(cid, 1) / total) if total else 0.0)
+            ranked = card_ids + [m for m in ranked if m not in card_set]
+    return ranked, rel_map
+
+
+def _live_card_ids_for_entities(
+    conn: sqlite3.Connection,
+    eids: list[str],
+    *,
+    ns_list: list[str] | None,
+    as_of: str | None,
+) -> list[str]:
+    """Live card ids for the given entity ids under ns/as_of predicates
+    (deterministic id ASC order). Fail-open to [] on a pre-v10 edge."""
+    refs = [card_source_ref(e) for e in eids]
+    rph = ",".join("?" * len(refs))
+    params: list = list(refs)
+    ns_clause = ""
+    if ns_list:
+        ns_ph = ",".join("?" * len(ns_list))
+        ns_clause = f"AND m.namespace IN ({ns_ph})"
+        params.extend(ns_list)
+    as_of_clause, as_of_params = _as_of_temporal_predicate(as_of, alias="m")
+    params.extend(as_of_params)
+    live_clause = "" if as_of else "AND m.superseded_at IS NULL"
+    try:
+        return [
+            r[0] for r in conn.execute(
+                f"SELECT m.id FROM memory m "
+                f"WHERE m.type='entity_card' AND m.source_ref IN ({rph}) "
+                f"{ns_clause} {live_clause} {as_of_clause} "
+                f"ORDER BY m.id",
+                params,
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        return []  # fail open: no cards, the arm fuses unchanged
 
 
 def cmd_entity_list(
@@ -997,3 +1086,461 @@ def cmd_reclassify_entities(
               f"other -> {c['new_kind']}")
     print(f"scanned={envelope['scanned']} changed={envelope['changed']}")
     return 0
+
+
+# --- Issue #179 (Workstream K PR 8): entity cards ---------------------------
+#
+# One deterministic card per qualifying entity: a live `entity_card` memory
+# row in user:global with source_ref=card:<entity_id>, signal=none, and the
+# reserved entity_card_sha256=<hex> watermark tag (SHA-256 over the card's
+# exact UTF-8 content bytes). Cards are CARD-REFRESH-ONLY: they are born
+# through refresh_entity_card (the entity-card CLI and the organize cadence
+# sweep) and through nothing else — every interactive add surface refuses
+# the type, and every ordinary write refuses the watermark tag.
+
+_CARD_TEXT_WS_RE = re.compile(r"\s+")
+
+
+def _card_env_int(name: str, default: int) -> int:
+    """Read one card env var as an integer >= 1 (absent -> default).
+
+    A present empty string, non-integer, zero, or negative value raises
+    ValueError naming the variable and the required lower bound, BEFORE any
+    card write starts (the caller resolves configuration first).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int((raw or "").strip())
+    except ValueError:
+        value = None
+    if value is None or value < 1:
+        raise ValueError(
+            f"{name} must be an integer >= 1 (got {raw!r}); the card sweep "
+            "refuses to start a write with an invalid configuration"
+        )
+    return value
+
+
+def card_config_from_env() -> tuple[int, int]:
+    """(min_mentions, top_n) from ZMEM_CARD_MIN_MENTIONS / ZMEM_CARD_TOP_N.
+
+    Defaults 5 and 8. An absent variable selects its default; an invalid
+    value raises before any card write starts.
+    """
+    return (
+        _card_env_int(CARD_MIN_MENTIONS_ENV, CARD_MIN_MENTIONS_DEFAULT),
+        _card_env_int(CARD_TOP_N_ENV, CARD_TOP_N_DEFAULT),
+    )
+
+
+def card_source_ref(entity_id: str) -> str:
+    """The card row's structural source_ref: ``card:<entity_id>``."""
+    return "card:" + entity_id
+
+
+def card_watermark_tag(content: str) -> str:
+    """The reserved card tag: SHA-256 over the card's exact UTF-8 bytes."""
+    return ENTITY_CARD_WATERMARK_PREFIX + hashlib.sha256(
+        content.encode("utf-8")).hexdigest()
+
+
+def _tag_tokens(tags: str | None) -> set[str]:
+    return {t.strip() for t in (tags or "").split(",") if t.strip()}
+
+
+def card_matches_content(live: sqlite3.Row, content: str) -> bool:
+    """The SHA-256 no-op predicate: True when the live card row carries
+    exactly ``content`` bytes AND its reserved watermark tag matches the
+    recomputed digest (identical content + watermark -> no SQL write)."""
+    return (live["content"] == content
+            and card_watermark_tag(content) in _tag_tokens(live["tags"]))
+
+
+def live_card_row(
+    conn: sqlite3.Connection, entity_id: str
+) -> sqlite3.Row | None:
+    """The live entity_card row for entity_id (source_ref == card:<id>).
+
+    Liveness is the same law every lane uses: ``superseded_at IS NULL``. A
+    tombstoned card remains queryable history and never matches here.
+    """
+    return conn.execute(
+        "SELECT id, type, content, tags, ingestion_ts FROM memory "
+        "WHERE type='entity_card' AND source_ref=? AND superseded_at IS NULL "
+        "ORDER BY ingestion_ts DESC, id DESC LIMIT 1",
+        (card_source_ref(entity_id),),
+    ).fetchone()
+
+
+def _card_mention_line(r) -> str:
+    """One ``Mentions:`` bullet from a selected source row: score (six
+    decimals), last_seen, id, source_ref, and the whitespace-collapsed
+    single-line text (CR, LF, and every whitespace run become one ASCII
+    space, then stripped)."""
+    text = _CARD_TEXT_WS_RE.sub(" ", r["content"] or "").strip()
+    return (f"- score={r['conf']:.6f} last_seen={r['ts']} id={r['mid']} "
+            f"source_ref={r['ref'] or ''} text={text}")
+
+
+def build_entity_card_text(
+    conn: sqlite3.Connection,
+    *,
+    entity_id: str,
+    min_mentions: int,
+    top_n: int,
+) -> tuple[str, list[str], str] | None:
+    """Deterministically render entity_id's card.
+
+    PR #385 review fixed-in-passing (RB-05/RB-06, 2026-10-18): the two knob
+    bounds are validated HERE as well — ``min_mentions >= 1`` and
+    ``top_n >= 1`` raise ValueError. The config path (card_config_from_env)
+    already guarantees both, but a direct library caller bypassing it must
+    not reach the selection SQL with a zero/negative bound (a ``top_n`` of 0
+    would render a card with zero mentions and zero provenance rows).
+
+    Selects live NON-card rows (superseded_at IS NULL; a row with a
+    non-empty valid_until is NOT live) linked to entity_id across ALL
+    namespaces, orders them confidence DESC (NULL confidence reads as 0.0),
+    ingestion_ts DESC, memory id ASC, returns None when the live count is
+    below min_mentions (inclusive), and renders the first top_n rows.
+
+    Rendering (UTF-8, LF-terminated), fixed field order::
+
+        Entity: <canonical_name>
+        Kind: <kind>
+        Aliases: <alias_norm_1>, <alias_norm_2>
+        Mentions:
+        - score=<six decimals> last_seen=<ts> id=<id> source_ref=<ref> text=<single-line>
+        Last seen: <max ingestion_ts over EVERY live non-card source row>
+        Sources:
+        - <memory_id>
+
+    Aliases are the lexicographically sorted alias_norm values. Mention
+    content replaces CR, LF, and every whitespace run with one ASCII space,
+    then strips. Returns ``(text, selected_memory_ids_in_render_order,
+    taint)`` where ``taint`` is the WORST-OF taint over the SELECTED source
+    rows (PR #385 review F-8/PRR-008: max TAINT_RANK; a NULL/empty row taint
+    reads as its schema default trusted_internal, an unknown value degrades
+    fail-closed to the worst rank) — the card's aggregated content is only
+    as trustworthy as its least-trustworthy contributor, so an
+    ``untrusted_web`` mention makes the card itself untrusted and the
+    passive untrusted fence withholds the card exactly as it withholds the
+    source row it aggregates.
+    """
+    if min_mentions < 1:
+        raise ValueError(
+            f"min_mentions must be >= 1 (got {min_mentions!r}); refusing to "
+            "build an entity card with an invalid threshold")
+    if top_n < 1:
+        raise ValueError(
+            f"top_n must be >= 1 (got {top_n!r}); refusing to build an "
+            "entity card with an invalid provenance cap")
+    ent = conn.execute(
+        "SELECT kind, canonical_name FROM entity WHERE id=?", (entity_id,)
+    ).fetchone()
+    if ent is None:
+        return None
+    rows = conn.execute(
+        "SELECT m.id AS mid, m.content AS content, m.source_ref AS ref, "
+        "COALESCE(m.confidence, 0.0) AS conf, m.ingestion_ts AS ts, "
+        "m.taint AS taint "
+        "FROM memory m JOIN memory_entity me ON me.memory_id = m.id "
+        "WHERE me.entity_id = ? AND m.type != 'entity_card' "
+        "AND m.superseded_at IS NULL "
+        "AND (m.valid_until IS NULL OR m.valid_until = '') "
+        "ORDER BY conf DESC, m.ingestion_ts DESC, m.id ASC",
+        (entity_id,),
+    ).fetchall()
+    if len(rows) < min_mentions:
+        return None
+    aliases = [r[0] for r in conn.execute(
+        "SELECT alias_norm FROM entity_alias WHERE entity_id=? "
+        "ORDER BY alias_norm",
+        (entity_id,),
+    ).fetchall()]
+    selected = rows[:top_n]
+    lines = [
+        f"Entity: {ent['canonical_name']}",
+        f"Kind: {ent['kind']}",
+        "Aliases: " + ", ".join(aliases),
+        "Mentions:",
+    ]
+    # F-8: worst-of over the SELECTED rows only — the rendered Mentions/
+    # Sources lines are exactly the selected set, so the taint floor covers
+    # precisely the content the card aggregates (an unselected row's text is
+    # absent from the card). The floor starts at the card's own
+    # signal-derived default (signal=none -> untrusted_tool, the writer's
+    # _default_taint_for_signal law), so a clean store's card keeps its
+    # pre-F-8 taint byte-identically and an untrusted_web mention (rank 2)
+    # dominates it. NULL/empty row taint reads trusted_internal (the schema
+    # default); worse_taint keeps an unknown value fail-closed at the worst
+    # rank.
+    taint = "untrusted_tool"
+    for r in selected:
+        taint = worse_taint(taint, r["taint"] or "trusted_internal")
+        lines.append(_card_mention_line(r))
+    # [R9] Last seen spans EVERY live non-card source row linked to the
+    # entity — all of them, not only the selected top_n.
+    lines.append("Last seen: " + max(r["ts"] for r in rows))
+    lines.append("Sources:")
+    lines.extend(f"- {r['mid']}" for r in selected)
+    return "\n".join(lines) + "\n", [r["mid"] for r in selected], taint
+
+
+# Issue #179: the card row's explicit confidence. A signal=none row inherits
+# SIGNAL_CONFIDENCE["none"] (0.2), which sits BELOW the recall CONFIDENCE_FLOOR
+# (0.25) — an implicit-confidence card would be invisible to floor-filtered
+# recall and the entity arm could never surface it. The summary precedent
+# (organize.SUMMARY_CONFIDENCE): high enough to be recallable anywhere, low
+# enough to never outrank the grounded rows it aggregates.
+ENTITY_CARD_CONFIDENCE = 0.5
+
+
+def refresh_entity_card(
+    conn: sqlite3.Connection,
+    *,
+    entity_id: str,
+    content: str,
+    taint: str | None = None,
+    now: str | None = None,
+) -> tuple[str, bool]:
+    """Create or replace entity_id's card; returns (card_id, changed).
+
+    Runs INSIDE the caller's writer transaction (starts one only when the
+    caller holds none). ``now`` defaults to ``schema.now_iso()`` — the
+    writer clock NEVER reads ZMEM_TEST_NOW (that seam is recall-only, the
+    #178 lesson); tests pass ``now="2026-09-10T00:00:00Z"``.
+
+    - Identical content bytes AND matching watermark -> ``(existing_id,
+      False)`` with NO SQL write (SHA-256 no-op detection). PR #385 review
+      fixed-in-passing WD-08: the no-op path first verifies the card's
+      DIRECT entity link still exists and repairs it (INSERT OR IGNORE) if
+      missing before returning — a no-op must never leave the card
+      unlinkable from the entity arm. PR #385 review F-6/PRR-004: the
+      PRE-lock read is only that fast path; the authoritative liveness
+      decision is a RE-READ inside the BEGIN IMMEDIATE (after the write
+      lock is held), so a card committed by a concurrent writer between
+      plan and apply is superseded, never duplicated into two live cards.
+    - Otherwise: tombstone the live card (superseded_at AND valid_until both
+      set — the old row stays queryable history with a non-empty
+      valid_until), insert the replacement via add_memory with
+      type_=entity_card, source_ref=card:<entity_id>, signal="none",
+      update_of=<old_id>, force_append=True, capture_mode="manual" (the
+      pinned manual mode keeps the watermark tag from being dropped by
+      auto-mode redaction), and link the new row DIRECTLY to entity_id.
+    - Any failure raises and rolls back the WHOLE transaction.
+
+    ``taint`` (PR #385 review F-8/PRR-008) is the caller-passed worst-of
+    source taint (build_entity_card_text computes it over the selected
+    rows); add_memory validates it. The card's aggregated content is only
+    as trustworthy as its least-trustworthy contributor.
+
+    (PR #385 review fixed-in-passing RB-08: the former ``source_ids``
+    parameter was dead — the provenance set is already rendered into the
+    content's fixed ``Sources:`` lines by build_entity_card_text — and has
+    been removed; callers that minted it from the same build no longer
+    pass it.)
+    """
+    # Imported here (not at module scope) because write.py imports this
+    # module's link helpers — a top-level import would be circular.
+    from storelib.write import add_memory, supersede_memory
+
+    ts = now if now is not None else now_iso()
+    watermark = card_watermark_tag(content)
+    # F-6 fast path ONLY: a pre-lock read may short-circuit the SHA no-op
+    # without taking the write lock; every other decision is re-made on the
+    # post-lock re-read below.
+    live = live_card_row(conn, entity_id)
+    if live is not None and card_matches_content(live, content):
+        _ensure_direct_card_link(conn, live["id"], entity_id)
+        return live["id"], False
+
+    started_tx = False
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+            started_tx = True
+        # F-6: the AUTHORITATIVE read. Between the pre-lock read above and
+        # this BEGIN IMMEDIATE a concurrent writer (another entity-card CLI
+        # under the shared consolidate lock, or a cadence sweep) may have
+        # committed its own card for this entity — deciding old_id on the
+        # stale pre-lock row would leave that card live alongside the
+        # replacement (the executed duplicate-live-card probe).
+        live = live_card_row(conn, entity_id)
+        if live is not None and card_matches_content(live, content):
+            # Byte-identical under the lock: a no-op after all. The empty
+            # transaction commits (nothing was written); WD-08 repairs the
+            # direct link first.
+            _ensure_direct_card_link(conn, live["id"], entity_id)
+            if started_tx:
+                _commit(conn)
+            return live["id"], False
+        old_id = live["id"] if live is not None else None
+        if old_id is not None:
+            supersede_memory(conn, old_id, "entity_card_refresh", at=ts)
+        new_id = add_memory(
+            conn,
+            namespace=GLOBAL_NAMESPACE,
+            type_="entity_card",
+            content=content,
+            tags=watermark,
+            source_ref=card_source_ref(entity_id),
+            signal="none",
+            confidence=ENTITY_CARD_CONFIDENCE,
+            capture_mode="manual",
+            update_of=old_id,
+            force_append=True,
+            taint=taint,
+            # The watermark is a structural marker like a summary's tags —
+            # never evolve it onto neighbor rows (the organize-summary
+            # precedent).
+            link_attr_propagate=False,
+            now=ts,
+        )
+        # Direct provenance link: the card's ONLY entity link is the entity
+        # it summarizes. add_memory's deterministic extractor ran over the
+        # card text (which yields nothing) and the reserved watermark tag
+        # (whose token shape would otherwise mint a fresh garbage entity on
+        # every content change) — drop the extractor's links for this row
+        # and any entity they minted that is now linkless, then link the
+        # row directly.
+        auto_eids = [r[0] for r in conn.execute(
+            "SELECT entity_id FROM memory_entity "
+            "WHERE memory_id=? AND entity_id<>?",
+            (new_id, entity_id),
+        ).fetchall()]
+        if auto_eids:
+            conn.execute(
+                "DELETE FROM memory_entity WHERE memory_id=? AND entity_id<>?",
+                (new_id, entity_id),
+            )
+            aph = ",".join("?" * len(auto_eids))
+            orphans = [r[0] for r in conn.execute(
+                f"SELECT id FROM entity WHERE id IN ({aph}) AND NOT EXISTS "
+                "(SELECT 1 FROM memory_entity me WHERE me.entity_id = entity.id)",
+                auto_eids,
+            ).fetchall()]
+            for eid in orphans:
+                conn.execute(
+                    "DELETE FROM entity_alias WHERE entity_id=?", (eid,))
+                conn.execute("DELETE FROM entity WHERE id=?", (eid,))
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_entity(memory_id, entity_id, role) "
+            "VALUES (?,?,?)",
+            (new_id, entity_id, ENTITY_ROLE_DEFAULT),
+        )
+        if started_tx:
+            _commit(conn)
+        return new_id, True
+    except Exception:
+        if started_tx and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _ensure_direct_card_link(
+    conn: sqlite3.Connection, card_id: str, entity_id: str
+) -> None:
+    """WD-08 (PR #385 review, fixed-in-passing): the SHA no-op path must not
+    return a card whose direct entity link has gone missing (a store-level
+    repair or a hand-edit could have dropped it — the recall suppression
+    resolves cards by the DIRECT link, so an unlinkable card would render
+    unsuppressed). Re-insert the link when absent; INSERT OR IGNORE keeps an
+    existing link untouched. On the pre-lock fast path no transaction is
+    open, so the repair commits its own tiny transaction; inside a caller's
+    open transaction the insert joins it."""
+    started = not conn.in_transaction
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_entity(memory_id, entity_id, role) "
+        "VALUES (?,?,?)",
+        (card_id, entity_id, ENTITY_ROLE_DEFAULT),
+    )
+    if started and conn.in_transaction:
+        conn.commit()
+
+
+def resolve_entity(conn: sqlite3.Connection, spec: str) -> str:
+    """Resolve an entity ID or canonical name to exactly one entity id.
+
+    Exact entity id first; then exact canonical name. Zero matches and
+    multiple canonical-name matches raise ValueError (the CLI maps them to
+    exit 2 before any write).
+    """
+    row = conn.execute("SELECT id FROM entity WHERE id=?", (spec,)).fetchone()
+    if row is not None:
+        return row[0]
+    rows = conn.execute(
+        "SELECT id FROM entity WHERE canonical_name=? ORDER BY id", (spec,)
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0][0]
+    if not rows:
+        raise ValueError(
+            f"no entity with id or canonical name {spec!r}")
+    raise ValueError(
+        f"canonical name {spec!r} matches {len(rows)} entities "
+        f"({', '.join(r[0] for r in rows)}); pass the entity ID")
+
+
+def cmd_entity_card(
+    conn: sqlite3.Connection, *, action: str, entity: str
+) -> dict[str, object]:
+    """`store.py entity-card build|refresh ENTITY` (issue #179).
+
+    Both actions resolve configuration (card_config_from_env) and the
+    entity (id first, then canonical name) BEFORE any write — an invalid
+    configuration or an unresolvable/ambiguous entity raises ValueError and
+    the CLI exits 2 with the store bytes unchanged. One ``now_iso()`` clock
+    is resolved per command and passed to every write (WD-10, PR #385
+    review fixed-in-passing: the below-threshold tombstone and any card
+    refresh share a single timestamp instead of straddling two internal
+    ``now_iso()`` reads). Returns the result object with the EXACT key
+    order ``result, id, entity_id, source_ref, warnings`` (id/source_ref
+    are None for ``no_card``).
+    """
+    min_mentions, top_n = card_config_from_env()
+    entity_id = resolve_entity(conn, entity)
+    ts = now_iso()
+    live = live_card_row(conn, entity_id)
+    built = build_entity_card_text(
+        conn, entity_id=entity_id, min_mentions=min_mentions, top_n=top_n)
+    warnings: list = []
+    ref = card_source_ref(entity_id)
+    if action == "build":
+        if live is not None:
+            raise ValueError(
+                f"entity {entity_id} already has a live card ({live['id']}); "
+                "build refuses a duplicate (use refresh)")
+        if built is None:
+            return {"result": "no_card", "id": None, "entity_id": entity_id,
+                    "source_ref": None, "warnings": warnings}
+        content, _source_ids, taint = built
+        new_id, _changed = refresh_entity_card(
+            conn, entity_id=entity_id, content=content, taint=taint, now=ts)
+        return {"result": "created", "id": new_id, "entity_id": entity_id,
+                "source_ref": ref, "warnings": warnings}
+    if action == "refresh":
+        if built is None:
+            if live is not None:
+                # Below-threshold refresh tombstones the previously live
+                # card, then reports no_card.
+                from storelib.write import supersede_memory
+                supersede_memory(
+                    conn, live["id"], "entity_card_below_threshold", at=ts)
+            return {"result": "no_card", "id": None, "entity_id": entity_id,
+                    "source_ref": None, "warnings": warnings}
+        content, _source_ids, taint = built
+        new_id, changed = refresh_entity_card(
+            conn, entity_id=entity_id, content=content, taint=taint, now=ts)
+        if not changed:
+            result = "unchanged"
+        elif live is not None:
+            result = "updated"
+        else:
+            result = "created"
+        return {"result": result, "id": new_id, "entity_id": entity_id,
+                "source_ref": ref, "warnings": warnings}
+    raise ValueError(
+        f"unknown entity-card action {action!r} (expected build or refresh)")

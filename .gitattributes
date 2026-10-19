@@ -71,3 +71,10 @@ tests/fixtures/state/*.json text eol=lf
 # (T-04/T-08 replay it verbatim); *.jsonl is not covered by the global
 # *.json rule, so pin it explicitly.
 tests/fixtures/fleet/*.jsonl text eol=lf
+
+# Issue #179 entity-card fixtures are byte-contract inputs (the six/four
+# mention JSONL seeds, the exact rendered card, and the recall pair are
+# compared byte-for-byte and pinned by SHA-256); they must never pick up
+# CRLF on Windows checkout. *.jsonl is not covered by the global *.json
+# rule, so pin the whole directory.
+tests/fixtures/entity_card/** text eol=lf

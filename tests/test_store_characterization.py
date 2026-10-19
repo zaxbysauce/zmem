@@ -194,7 +194,9 @@ KNOWN_SUBCMDS = [
     "capture-training-revoke", "purge-training-captures",
     "export-training",
     # v10 (issue #60): the entity identity inspection/reconciliation surface.
-    "entity-list", "entity-merge",
+    # Issue #179 (PR #385 review F-7/PRR-009, 2026-10-18): entity-card
+    # build|refresh joins the surface (real --json flag on both actions).
+    "entity-list", "entity-merge", "entity-card",
     # Issue #176 (Workstream K PR 5): deterministic other-row reclassification
     # (early-dispatched; --dry-run/--apply/--json are real flags).
     "reclassify-entities",
@@ -581,7 +583,10 @@ class CharacterizationTests(unittest.TestCase):
         # 54 -> 55: the embedding lane health command joined (issue #131).
         # 55 -> 56: the state classifier dry-run command joined (issue #174).
         # 56 -> 57: the entity reclassification command joined (issue #176).
-        self.assertEqual(len(KNOWN_SUBCMDS), 57)
+        # 57 -> 58: the entity-card build/refresh command joined (issue #179,
+        # PR #385 review F-7/PRR-009, 2026-10-18 — the PR shipped it off the
+        # frozen ledger; re-pinned with the dated history line).
+        self.assertEqual(len(KNOWN_SUBCMDS), 58)
         for banned in ("explain", "why-not", "unfold"):
             self.assertNotIn(banned, KNOWN_SUBCMDS)
 
@@ -599,7 +604,8 @@ class CharacterizationTests(unittest.TestCase):
                               f"{cmd} --help must expose {flag} (issue #137)")
         # 55 -> 56: the state classifier dry-run command joined (issue #174).
         # 56 -> 57: the entity reclassification command joined (issue #176).
-        self.assertEqual(len(KNOWN_SUBCMDS), 57)
+        # 57 -> 58: the entity-card build/refresh command joined (issue #179).
+        self.assertEqual(len(KNOWN_SUBCMDS), 58)
 
     def test_embedding_health_help_surface(self):
         """Issue #131: `embedding-health` joined the CLI surface with a

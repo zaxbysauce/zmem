@@ -175,6 +175,7 @@ try:
         ALLOWED_TAINTS,
         TAINT_RANK,
         TAINT_TRUSTED_SIGNALS,
+        ENTITY_CARD_WATERMARK_PREFIX,
         has_namespace_control,
         is_valid_namespace,
         validate_taint,
@@ -191,6 +192,7 @@ except ImportError:
         ALLOWED_TAINTS,
         TAINT_RANK,
         TAINT_TRUSTED_SIGNALS,
+        ENTITY_CARD_WATERMARK_PREFIX,
         has_namespace_control,
         is_valid_namespace,
         validate_taint,
@@ -367,16 +369,31 @@ def _normalize_capture_mode(mode: str | None) -> str:
 # rejects, never touches JSON stdout). Canonical definition lives here because
 # both storelib.cli and storelib.sync (the JSONL ingest row loop) need the
 # exact same bytes.
-RESERVED_SOURCE_REF_PREFIX = "organize:"
+# PR #385 review F-2 (2026-10-18): `card:` joins the reserved set — entity
+# cards key their structural identity on `source_ref=card:<entity_id>`, so an
+# ordinary row claiming a card: ref can masquerade as a card. The organize:
+# warning line is a PINNED contract (tests/test_organize.py asserts its exact
+# bytes), so it stays byte-identical and card: carries its own line; the
+# hard refusal for card: lives in add_memory/update_memory below (an
+# ordinary write claiming a card: ref raises ValueError before any
+# mutation).
+RESERVED_SOURCE_REF_PREFIX = ("organize:", "card:")
 RESERVED_SOURCE_REF_WARNING = (
     "[zmem] WARNING: source_ref prefix organize: is reserved for organize summaries"
+)
+CARD_SOURCE_REF_WARNING = (
+    "[zmem] WARNING: source_ref prefix card: is reserved for entity cards"
 )
 
 
 def warn_reserved_source_ref(source_ref: str | None) -> None:
-    """Emit the reserved-prefix warning for `organize:` source_refs."""
-    if source_ref and source_ref.startswith(RESERVED_SOURCE_REF_PREFIX):
+    """Emit the reserved-prefix warning for `organize:`/`card:` source_refs."""
+    if not source_ref:
+        return
+    if source_ref.startswith("organize:"):
         print(RESERVED_SOURCE_REF_WARNING, file=sys.stderr)
+    elif source_ref.startswith("card:"):
+        print(CARD_SOURCE_REF_WARNING, file=sys.stderr)
 
 def _redact_secret_like_text(text: str) -> tuple[str, int]:
     return _shared_redact_secret_like_text(text)
@@ -1283,7 +1300,45 @@ def add_memory(
     expiry_class: str | None = None,
     inject_until: str | None = None,
     now: str | None = None,
+    update_of: str | None = None,
+    force_append: bool = False,
 ) -> WriteResult:
+    # #179 (issue #179, Workstream K PR 8): the two append-only card controls.
+    # Both are appended AFTER the live keyword set (the #177/#178 signature
+    # lesson) and default to ordinary behavior: update_of=None keeps the
+    # lineage column empty, force_append=False keeps dedup-on-write. Only the
+    # card refresh path (entity.refresh_entity_card) passes
+    # type_=entity_card with force_append=True — an ordinary write with the
+    # card type is refused, and an ordinary write carrying the reserved
+    # watermark tag is refused BEFORE any mutation, so card rows and their
+    # watermarks are born only through the refresh path.
+    _card_refresh_write = force_append and type_ == "entity_card"
+    if type_ == "entity_card" and not _card_refresh_write:
+        raise ValueError(
+            "type 'entity_card' is card-refresh-only: card rows are born "
+            "only through the refresh path (entity-card build|refresh / "
+            "organize cadence), never an ordinary add"
+        )
+    if not _card_refresh_write:
+        for _tok in (tags or "").split(","):
+            if _tok.strip().startswith(ENTITY_CARD_WATERMARK_PREFIX):
+                raise ValueError(
+                    f"tag {_tok.strip()!r} carries the reserved "
+                    f"{ENTITY_CARD_WATERMARK_PREFIX}prefix: that watermark is "
+                    "minted only by the entity-card refresh path"
+                )
+        # PR #385 review F-2 (PRR-001): an ordinary write cannot CLAIM a card
+        # source_ref either — cards key their structural identity on
+        # ``card:<entity_id>`` (reserved-prefix list above), so a forged ref
+        # would masquerade as a card in the recall suppression resolution.
+        # Refused BEFORE any mutation, exactly like the watermark guard; the
+        # refresh path (_card_refresh_write) is the only exempt writer.
+        if (source_ref or "").startswith("card:"):
+            raise ValueError(
+                "source_ref prefix card: is reserved for entity cards: card "
+                "rows are born only through the entity-card refresh path, "
+                "and an ordinary row cannot claim a card identity"
+            )
     # Capture the pre-policy length: value-span redaction GROWS text
     # ([REDACTED_SECRET] is longer than a short value), so an input that fit
     # the cap can overflow it after redaction. That row has no safe storable
@@ -1355,6 +1410,11 @@ def add_memory(
         # dedup-on-write semantics to incoming rows without duplicating this logic.
         _warn_fake_active_once()
         existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
+        if force_append:
+            # #179: the card refresh path appends unconditionally — dedup
+            # would fold the replacement card into the live card it is
+            # replacing (the SHA-256 no-op check already ran above it).
+            existing = None
 
         # v11 (issue #61, 6.2): similarity cannot distinguish "always X" from
         # "never X" — the contested-cluster guard consolidate applies at
@@ -1449,11 +1509,11 @@ def add_memory(
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
                 retrieval_count, last_retrieved, embedding, embedding_model, embedded_at,
                 content_norm, valid_until, update_of, taint)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?,?,'', '', ?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,?,?,?,?,?,'', ?, ?)""",
             (mid, namespace, type_, content, tags, source_ref, shash,
              confidence, signal, valid_from, ts, ts, emb, emb_model,
              ts if emb is not None else None, _normalize_content(content),
-             taint),
+             update_of or "", taint),
         )
         # Insert into vec0 table if we have an embedding.
         if emb is not None:
@@ -1786,7 +1846,11 @@ def update_memory(
 
     Returns ``(result_id, created_new)``. Raises ContentTooLarge for oversize
     content (CLI exit 1, mirroring ``add``), CapturePolicyRefusal for a
-    capture-policy refusal, ValueError for unknown / already-superseded ids.
+    capture-policy refusal, ValueError for unknown / already-superseded ids,
+    and — PR #385 review F-2 — for the three card-guard refusals: converting
+    an ordinary row INTO ``entity_card``, an explicitly supplied watermark-
+    prefix tag, or claiming a ``card:`` source_ref on an ordinary row (a
+    pre-existing card row's content-only edit stays allowed).
     """
     # #135 correction lineage is a closed export signal.  Validate before the
     # first read or transaction so an invalid request cannot partially update.
@@ -1824,6 +1888,48 @@ def update_memory(
     source_ref_eff = source_ref if source_ref is not None else old["source_ref"]
     conf_eff = confidence if confidence is not None else old["confidence"]
     sig_eff = signal if signal is not None else old["signal"]
+
+    # PR #385 review F-2 (PRR-001, 2026-10-18): update-path parity with
+    # add_memory's two card guards. All three fire BEFORE any mutation (the
+    # first write below is the tombstone) so a refused update leaves the old
+    # row and the store bytes untouched.
+    if type_eff == "entity_card" and old["type"] != "entity_card":
+        # (a) Type conversion INTO the reserved type: `update --type
+        # entity_card` on an ordinary row would mint a forged card (executed
+        # at base: the forged card then suppressed the row's real facts at
+        # recall). The refresh path is the only card minter; it never routes
+        # through update_memory. A pre-existing card row updated WITHOUT a
+        # type override keeps type_eff == old type and stays allowed (the
+        # `state` content-only precedent).
+        raise ValueError(
+            "update refused: type 'entity_card' is card-refresh-only — an "
+            "ordinary row cannot be converted into a card (use entity-card "
+            "build|refresh / the organize cadence)"
+        )
+    if tags is not None:
+        # (b) An EXPLICITLY supplied tag carrying the reserved watermark
+        # prefix: only the refresh path mints watermarks. Inheritance is not
+        # incoming input — a content-only update of a pre-existing card row
+        # keeps the card's own watermark tag and stays allowed (the `state`
+        # precedent). A transient watermark desync introduced by such a
+        # content-only card edit self-heals at the next card refresh, which
+        # recomputes the digest over the new bytes (disclosed).
+        for _tok in tags.split(","):
+            if _tok.strip().startswith(ENTITY_CARD_WATERMARK_PREFIX):
+                raise ValueError(
+                    f"update refused: tag {_tok.strip()!r} carries the "
+                    f"reserved {ENTITY_CARD_WATERMARK_PREFIX}prefix: that "
+                    "watermark is minted only by the entity-card refresh path"
+                )
+    if ((source_ref_eff or "").startswith("card:")
+            and old["type"] != "entity_card"):
+        # (c) An ordinary row cannot CLAIM a card source_ref (reserved-prefix
+        # list above); a pre-existing card row's content-only edit keeps its
+        # own card: ref.
+        raise ValueError(
+            "update refused: source_ref prefix card: is reserved for entity "
+            "cards — an ordinary row cannot claim a card identity"
+        )
 
     # v15 (#173): one clock per transaction; the SAME `ts` stamps the old row's
     # tombstone, the new row's valid_from/ingestion_ts, and the side-table row

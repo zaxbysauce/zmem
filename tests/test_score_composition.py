@@ -193,15 +193,21 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
         the committed #126 projection gold stay byte-identical (the frozen-
         mean guard that replaced the silent ~0.7% global rescale). `state`
         normalizes exactly like any unlisted type: neutral 1.0 product over
-        the frozen six-type mean."""
+        the frozen six-type mean. Issue #179: `entity_card` joins the same
+        frozen-mean exclusion (`state`/`event` precedent) — it does NOT join
+        the mean either, and the derived-tuple pin excludes it explicitly."""
         from schema_meta import ALLOWED_TYPES
 
         self.assertIn("state", ALLOWED_TYPES)
+        self.assertIn("entity_card", ALLOWED_TYPES)
         self.assertNotIn("state", recall_mod.TYPE_PREFERENCE_MEAN_TYPES)
+        self.assertNotIn("entity_card", recall_mod.TYPE_PREFERENCE_MEAN_TYPES)
         self.assertEqual(
-            tuple(t for t in ALLOWED_TYPES if t != "state"),
+            tuple(t for t in ALLOWED_TYPES
+                  if t not in ("state", "entity_card")),
             recall_mod.TYPE_PREFERENCE_MEAN_TYPES,
-            "the frozen #126 mean set must be exactly today's types minus state",
+            "the frozen #126 mean set must be exactly today's types minus "
+            "state and entity_card",
         )
         # Lane profiles key the frozen set too, keeping the committed
         # tests/fixtures/issue126/profile-expected.json gold byte-stable.

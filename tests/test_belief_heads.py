@@ -525,9 +525,12 @@ class BeliefHeadTest(unittest.TestCase):
             self.assertEqual(schema_meta.allowed_types(),
                              schema_meta.ALLOWED_TYPES)
             self.assertNotIn("observation", schema_meta.allowed_types())
+            # #179: entity_card joined as the 8th type (the #172 reversal;
+            # card-refresh-only — schema constants untouched).
             self.assertEqual(schema_meta.ALLOWED_TYPES,
                              ("fact", "lesson", "convention", "preference",
-                              "decision", "constraint", "state"))
+                              "decision", "constraint", "state",
+                              "entity_card"))
             # Accept branch, isolated per decision: the gate reader is the
             # seam allowed_types() must consult.
             with patch.object(schema_meta, "observation_gate_decision",
@@ -540,7 +543,8 @@ class BeliefHeadTest(unittest.TestCase):
                                  schema_meta.ALLOWED_TYPES)
             self.assertEqual(schema_meta.ALLOWED_TYPES,
                              ("fact", "lesson", "convention", "preference",
-                              "decision", "constraint", "state"))
+                              "decision", "constraint", "state",
+                              "entity_card"))
             # Explicit-path decisions: accept, missing, malformed, unknown.
             with tempfile.TemporaryDirectory(
                     prefix="zmem-obs-gate-") as tmp:

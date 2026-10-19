@@ -1063,7 +1063,9 @@ candidate; represented canonical sources are suppressed only after the page
 itself is admitted and rendered. Filtering, floor rejection, or budget
 dropping a page suppresses zero represented source rows. The recorded
 `evidence/gates/172-observation.json` currently says `reject`, so page metadata
-does not expose `runbook` and the `ALLOWED_TYPES` vocabulary is unchanged.
+does not expose `runbook` (and since 0.107.0 the `ALLOWED_TYPES` vocabulary
+is the EIGHT-type set — `entity_card` joined as the card-refresh-only
+type; see SKILL.md "Entity cards (issue #179)").
 
 Passive verification has a finite cost policy. Metadata discovery may enumerate
 pages, but expensive source/evidence verification is limited to the 50

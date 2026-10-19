@@ -1594,6 +1594,50 @@ def _migrate_v16(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v17(conn: sqlite3.Connection) -> None:
+    """Advance the schema stamp to 17 for the `entity_card` type (issue #179).
+
+    PR #385 review round (2026-10-18, F-1/PRR-006): STAMP-ONLY — no DDL, no
+    data change. A card is an ordinary ``memory`` row (``type='entity_card'``,
+    ``source_ref=card:<entity_id>``), so v17 exists purely as the version-gate
+    signal that makes pre-0.107 clients REFUSE the store loudly instead of
+    silently blacking out on the unknown type (executed end-to-end at base:
+    an old client's ``type_preference`` raises and its hooks fail silent).
+
+    Follows the ``_migrate_vNN`` dispatch shape: one BEGIN IMMEDIATE (or a
+    savepoint inside a caller transaction) owns the single meta UPDATE;
+    idempotent by construction (the ``ver < 17`` dispatch guard means this
+    runs exactly once per store, and a crash before the commit leaves the
+    stamp at 16 for a clean re-run); a store above SUPPORTED_SCHEMA_VERSION
+    never reaches here (``migrate()`` returns early — a newer store is never
+    this client's to migrate).
+    """
+    savepoint = "zmem_v17_entity_card_stamp"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        conn.execute(
+            "UPDATE meta SET value='17' WHERE key=?",
+            (SCHEMA_VERSION_KEY,),
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
 def _ensure_evidence_lookup_index(conn: sqlite3.Connection) -> None:
     """Add the evidence-first association index to existing v14 stores.
 
@@ -2424,6 +2468,13 @@ def migrate(conn: sqlite3.Connection) -> None:
         # cover it (a changed CHECK is not valid on an older client's SQL), so
         # v15 clients refuse a v16 store and this branch is the only path to 16.
         _migrate_v16(conn)
+
+    if ver < 17:
+        # v17 (issue #179, PR #385 review F-1/PRR-006, 2026-10-18): stamp-only
+        # advance for the entity_card type — no DDL, no data change; the bump
+        # exists so pre-0.107 clients refuse the store loudly (upgrade-
+        # required) instead of silently blacking out on card rows.
+        _migrate_v17(conn)
 
     # Version-independent evidence-first lookup index: this repairs existing
     # v14 stores without a version bump and is idempotent on every open.

@@ -538,9 +538,10 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         self.assertEqual(
             self.allowed_types,
             ("fact", "lesson", "convention", "preference",
-             "decision", "constraint", "state"),
-            "ALLOWED_TYPES must be exactly the v9 shipped set — dropping a "
-            "shipped type is a schema regression",
+             "decision", "constraint", "state", "entity_card"),
+            "ALLOWED_TYPES must be exactly the shipped set (v9 six + v15 "
+            "state + the #179 entity_card reversal) — dropping a shipped "
+            "type is a schema regression",
         )
 
     def test_taint_set_is_exactly_three_ranks(self):
@@ -553,8 +554,19 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
 
     def test_cli_and_agent_surfaces_load_the_shared_enum(self):
         cli_src = (SCRIPTS_DIR / "storelib" / "cli.py").read_text(encoding="utf-8")
+        # `update --type` keeps the full shared enum (content-only updates of
+        # pre-existing rows inherit and succeed — the #173 precedent).
         self.assertIn("choices=list(ALLOWED_TYPES)", cli_src)
         self.assertIn("choices=list(ALLOWED_TAINTS)", cli_src)
+        # #179: the ADD parser derives its choices from ALLOWED_TYPES minus
+        # the card-refresh-only entity_card type — cards are born only
+        # through `entity-card build|refresh` / cadence refresh.
+        self.assertIn(
+            '_ADD_TYPE_CHOICES = tuple(\n'
+            '    t for t in ALLOWED_TYPES if t != "entity_card"\n'
+            ')',
+            cli_src)
+        self.assertIn("choices=list(_ADD_TYPE_CHOICES)", cli_src)
         hermes_src = HERMES_INIT.read_text(encoding="utf-8")
         self.assertIn('consts["ALLOWED_TYPES"]', hermes_src)
         self.assertIn('consts["ALLOWED_TAINTS"]', hermes_src)
@@ -567,15 +579,28 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         # wired (follow-up issue). The pins tie the serviceable set to
         # schema_meta: if a future type ships, the derived subset moves with
         # it and these source pins keep the exclusion honest.
+        # #179 (Workstream K PR 8): `entity_card` extends the exclusion —
+        # a card-refresh-only type no interactive surface may create. The
+        # addable set is schema_meta.ALLOWED_TYPES minus {state,
+        # entity_card} and stays the six serviceable types; loaded and
+        # degraded paths agree.
         self.assertIn("state", self.allowed_types,
                       "precondition: the exclusion exists because state is shipped")
-        serviceable = tuple(t for t in self.allowed_types if t != "state")
+        self.assertIn("entity_card", self.allowed_types,
+                      "precondition: entity_card shipped in ALLOWED_TYPES "
+                      "(the #179 reversal)")
+        serviceable = tuple(
+            t for t in self.allowed_types
+            if t not in ("state", "entity_card"))
         self.assertEqual(
             serviceable,
             ("fact", "lesson", "convention", "preference", "decision",
              "constraint"))
         hermes_src = HERMES_INIT.read_text(encoding="utf-8")
         self.assertIn('_STATE_TYPES = frozenset({"state"})', hermes_src)
+        self.assertIn(
+            '_CARD_REFRESH_ONLY_TYPES = frozenset({"entity_card"})',
+            hermes_src)
         self.assertIn("_ADD_TYPE_ENUM = list(_ADDABLE_TYPES)", hermes_src)
         self.assertIn("if mtype not in _ADDABLE_TYPES:", hermes_src)
         # The degraded-mode fallback literal must be the serviceable subset —
@@ -587,7 +612,9 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         mcp_src = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
                    ).read_text(encoding="utf-8")
         self.assertIn(
-            '_ALLOWED_TYPES_ADDABLE = tuple(t for t in types if t != "state")',
+            '_ALLOWED_TYPES_ADDABLE = tuple(\n'
+            '                t for t in types if t != "state" '
+            'and t != "entity_card")',
             mcp_src)
         self.assertIn("if mtype not in _ALLOWED_TYPES_ADDABLE:", mcp_src)
 

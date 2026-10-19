@@ -497,6 +497,69 @@ class RoundTripTest(_TwoStoreCase):
         self.assertEqual(len(rows), 1)
 
 
+class EntityCardExportSymmetryTest(_TwoStoreCase):
+    """PR #385 review F-3 (PRR-002, 2026-10-18): cards never travel. A
+    card-bearing store exports ZERO entity_card rows (live and superseded
+    variants), and a strict re-ingest of the full export exits 0 with every
+    row applied — the destination re-derives cards via its own cadence."""
+
+    def _build_card_store(self):
+        """Six qualifying `entity:Acme` mentions + one live card + one
+        tombstoned card generation (a refresh after a 7th mention)."""
+        for i in range(6):
+            self.a.add(NS, f"Acme deployment note {i + 1}",
+                       confidence=0.8, tags="entity:Acme")
+        r = self.a.run("entity-card", "build", "Acme", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A 7th mention + refresh tombstones the first card generation.
+        self.a.add(NS, "Acme deployment note 7", confidence=0.99,
+                   tags="entity:Acme")
+        r = self.a.run("entity-card", "refresh", "Acme", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["result"], "updated")
+        cards = self.a.query_all(
+            "SELECT COUNT(*) FROM memory WHERE type='entity_card'")
+        tomb = self.a.query_all(
+            "SELECT COUNT(*) FROM memory WHERE type='entity_card' "
+            "AND superseded_at IS NOT NULL")
+        self.assertEqual(cards[0][0], 2, "one live + one tombstoned card")
+
+    def test_export_of_card_bearing_store_has_zero_card_rows(self):
+        self._build_card_store()
+        for extra in ([], ["--include-superseded"]):
+            out_path = os.path.join(self.a.tmp, "cards.jsonl")
+            r = self.a.run("export-jsonl", "--out", out_path, *extra)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rows = self._read_jsonl(out_path)
+            types = [row.get("type") for row in rows
+                     if row.get("kind", "memory") == "memory"]
+            self.assertNotIn("entity_card", types,
+                             f"cards never travel ({extra}): {types}")
+            self.assertEqual(len(rows), 7, (extra, len(rows)))
+
+    def test_strict_reingest_of_full_export_applies_every_row(self):
+        self._build_card_store()
+        export_a = os.path.join(self.a.tmp, "full.jsonl")
+        r = self.a.run("export-jsonl", "--out", export_a,
+                       "--include-superseded")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = self._read_jsonl(export_a)
+        self.assertEqual(len(rows), 7, rows)
+
+        # Pre-fix shape: strict ingest refused the exported cards (exit 2,
+        # zero applied). Post-fix the export carries no cards at all, so
+        # the whole file applies cleanly and B holds zero card rows.
+        r = self.b.run("ingest-jsonl", "--strict", "--in", export_a)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertIn("strict rows=7", r.stdout)
+        b_added = self.b.query_all(
+            "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL")
+        self.assertEqual(b_added[0][0], 7)
+        b_cards = self.b.query_all(
+            "SELECT COUNT(*) FROM memory WHERE type='entity_card'")
+        self.assertEqual(b_cards[0][0], 0)
+
+
 # ---------------------------------------------------------------------------
 # --source-ref: attribute a whole import batch, vs. keep each row's own
 # ---------------------------------------------------------------------------
@@ -1179,10 +1242,13 @@ class IngestValidationTest(_TwoStoreCase):
     def test_v16_entity_kind_enum_is_used(self):
         """Issue #175 AC6: the shared 12-kind ENTITY_KINDS vocabulary is what
         ingest consumes — a NEW v2 kind tag (host) derives a real entity link,
-        and a row typed `entity_card` (the #172 decision REJECTED that type, so
-        ALLOWED_TYPES keeps it absent) fails validation line-numbered on the
+        and a row typed `entity_card` fails validation line-numbered on the
         default legacy ingest surface before its row commits, while the valid
-        rows land. No entity-record format exists in the JSONL."""
+        rows land. entity_card is a card-refresh-only type; ingest refuses it
+        — the born-only-through-refresh invariant (ALLOWED_TYPES carries it
+        since the #179 reversal, so the reserved-type refusal beside the enum
+        check keeps this refusal green). No entity-record format exists in
+        the JSONL."""
         rows = [
             _sync_row(id="00000000-0000-4000-8000-000000000201",
                       content="acme-prod is the deployment host",

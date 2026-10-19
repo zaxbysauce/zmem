@@ -370,7 +370,14 @@ def _load_store_constants() -> None:
             # v15 (#173 PR-review F22): derive the addable subset from the
             # real type set — anything this server cannot express as a create
             # (today: `state`) stays out of the add surface's validation.
-            _ALLOWED_TYPES_ADDABLE = tuple(t for t in types if t != "state")
+            # #179 (Workstream K PR 8): `entity_card` joins the exclusion —
+            # a card-refresh-only type no interactive surface may create
+            # (cards are born only through `entity-card build|refresh` and
+            # the organize cadence sweep). `update` keeps the full set
+            # (content-only updates of pre-existing rows inherit and
+            # succeed), exactly like the `state` precedent.
+            _ALLOWED_TYPES_ADDABLE = tuple(
+                t for t in types if t != "state" and t != "entity_card")
         taints = getattr(mod, "ALLOWED_TAINTS", None)
         if taints:
             _ALLOWED_TAINTS = tuple(taints)

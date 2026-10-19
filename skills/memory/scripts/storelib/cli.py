@@ -26,6 +26,7 @@ from storelib import beliefs as _beliefs
 from storelib.organize import organize
 from storelib.entity import (
     ENTITY_KINDS,
+    cmd_entity_card,
     cmd_entity_list,
     cmd_entity_merge,
     cmd_reclassify_entities,
@@ -86,6 +87,15 @@ from storelib.query_ambiguity import (
     read_recent_edit_basenames,
 )
 from storelib.source import SourceRefusal, scan as source_scan, show as source_show
+
+# Issue #179 (Workstream K PR 8): `add --type` derives its choices from
+# ALLOWED_TYPES minus `entity_card` — the card type is CARD-REFRESH-ONLY
+# (born through `entity-card build|refresh` and the organize cadence sweep),
+# so the interactive add parser must refuse it. Derived, not hand-typed, so
+# a future type ships here automatically.
+_ADD_TYPE_CHOICES = tuple(
+    t for t in ALLOWED_TYPES if t != "entity_card"
+)
 
 
 def _warn_reserved_source_ref(source_ref: str | None) -> None:
@@ -1959,7 +1969,7 @@ def main():
 
     p_add = _add_parser("add", help="add a memory")
     p_add.add_argument("--namespace", required=True)
-    p_add.add_argument("--type", required=True, choices=list(ALLOWED_TYPES))
+    p_add.add_argument("--type", required=True, choices=list(_ADD_TYPE_CHOICES))
     p_add.add_argument("--content", required=True,
                        help="the memory text; the literal '-' reads content from "
                             "stdin (use for payloads near the content cap — "
@@ -3323,6 +3333,34 @@ def main():
                                      "changes silently); person-to-person "
                                      "merges are allowed but only ever manual.")
 
+    # Issue #179 (Workstream K PR 8): entity cards. build creates a missing
+    # qualifying card (refuses a live card with exit 2); refresh returns
+    # created/updated/unchanged/no_card and tombstones a live card that fell
+    # below the threshold. Cards are born ONLY through this surface and the
+    # organize cadence sweep — `add --type entity_card` is refused.
+    p_entity_card = _add_parser(
+        "entity-card",
+        help="build or refresh one entity's deterministic card "
+             "(entity_card rows are born only here and in the cadence sweep)")
+    entity_card_sub = p_entity_card.add_subparsers(
+        dest="action", required=True)
+    p_card_build = entity_card_sub.add_parser(
+        "build", help="create the entity's card; refuses a live card "
+                      "(exit 2, no write)")
+    p_card_refresh = entity_card_sub.add_parser(
+        "refresh", help="create, replace, or verify the entity's card "
+                        "(created/updated/unchanged/no_card)")
+    for _card_sub in (p_card_build, p_card_refresh):
+        # NOTE: a plain argparse positional is required by construction —
+        # argparse refuses an explicit required=True here, and the subparser
+        # itself is required=True so `entity` must be supplied.
+        _card_sub.add_argument("entity", type=str,
+                               metavar="ENTITY",
+                               help="entity ID or canonical name")
+        _card_sub.add_argument("--json", dest="json", action="store_true",
+                               default=False,
+                               help="emit a JSON result")
+
     # Issue #176 (Workstream K PR 5): deterministic reclassification of
     # stored `other` entities. Exactly one mode flag is required; the
     # dispatch (below, early) keeps dry-run read-only and apply under the
@@ -4422,6 +4460,7 @@ def main():
     # wrong-dim blobs with the vec-row insert silently swallowed.
     if args.cmd in {"add", "update", "recall", "search", "consolidate",
                     "organize", "ingest-jsonl"} or args.cmd == "reembed" \
+            or args.cmd == "entity-card" \
             or (args.cmd == "episode-close" and args.summary):
         # PR-review F1 (PR #81 round 2): episode-close --summary embeds via
         # add_memory — include it so a profile/dimension mismatch refuses
@@ -4443,6 +4482,9 @@ def main():
                      "capture-training-revoke", "purge-training-captures"}
         or (args.cmd == "evidence" and args.evidence_cmd == "write")
         or args.cmd == "hermes-convention"
+        # Issue #179: entity-card build/refresh writes card rows (a
+        # below-threshold no_card write takes the lease harmlessly).
+        or args.cmd == "entity-card"
         # v12 (issue #64, 9.4): feedback is a write surface — it takes the
         # lease so it serializes against restore/backup like every writer.
         or args.cmd == "feedback"
@@ -5370,6 +5412,10 @@ def main():
             organized = False
             backed_up = False
             training_retention = {"purged_captures": 0}
+            # Issue #179: the cadence's entity-card counts ride the JSON
+            # envelope (zeros when organize skipped by its cadence gate or
+            # failed — the sweep never ran in that case).
+            cadence_card_counts = None
             # One clock defines both fixed retention boundaries. Compute it
             # before backup so a successful purge keeps a record the cadence
             # regards as expired out of that backup.
@@ -5386,7 +5432,10 @@ def main():
                     steps.append("organize: already running - skipped")
                 else:
                     try:
-                        organize(conn, force=False)
+                        cadence_report = organize(conn, force=False)
+                        cadence_card_counts = (
+                            cadence_report.get("entity_cards")
+                            if isinstance(cadence_report, dict) else None)
                         organized = True
                         steps.append("organize: ok")
                     except Exception as exc:  # never abort the other cadence ops
@@ -5430,9 +5479,17 @@ def main():
             # store and owns one transaction using the cadence boundary.
             retention = sweep_evidence(conn, now_ts=cadence_now)
             if getattr(args, "as_json", False):
+                from storelib.organize import ENTITY_CARD_COUNT_KEYS
+                if cadence_card_counts is None:
+                    cadence_card_counts = {k: 0
+                                           for k in ENTITY_CARD_COUNT_KEYS}
                 print(json.dumps({
                     "organized": organized,
                     "backed_up": backed_up,
+                    "entity_cards": {
+                        k: int(cadence_card_counts.get(k, 0))
+                        for k in ENTITY_CARD_COUNT_KEYS
+                    },
                     "evidence_expired": retention["expired"],
                     "evidence_capped": retention["capped"],
                     "episode_links": retention["episode_links"],
@@ -5619,6 +5676,53 @@ def main():
         elif args.cmd == "entity-merge":
             sys.exit(cmd_entity_merge(conn, from_id=args.from_id, to_id=args.to_id,
                                       confirm=args.confirm))
+        elif args.cmd == "entity-card":
+            # Issue #179 PR #385 review F-6/PRR-004: the two card-writing
+            # surfaces mutually exclude on the SHARED "consolidate" advisory
+            # lock — organize's cadence sweep already single-flights on it,
+            # and entity-card build|refresh writes the same card rows, so
+            # both surfaces serialize here (closing the advisory-lease gap
+            # that let a sweep and a manual refresh interleave; the
+            # authoritative TOCTOU fix is refresh_entity_card's post-lock
+            # re-read). Lock-busy is an operational refusal (exit 1): an
+            # explicit operator command is skipped loudly, never silently.
+            _card_token = _acquire_lock(
+                "consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+            if _card_token is None:
+                print("[zmem] entity-card: another organize/consolidation is "
+                      "already running - skipped (retry once it finishes)",
+                      file=sys.stderr)
+                sys.exit(1)
+            # Issue #179: under --json the human progress lines from the
+            # write path ([zmem] added/superseded ...) go to STDERR so
+            # stdout is one pure JSON object (the add --json discipline).
+            _card_human_out = None
+            if args.json:
+                sys.stdout, _card_human_out = sys.stderr, sys.stdout
+            try:
+                try:
+                    card_result = cmd_entity_card(
+                        conn, action=args.action, entity=args.entity)
+                finally:
+                    if _card_human_out is not None:
+                        sys.stdout = _card_human_out
+            except ValueError as exc:
+                # Refused BEFORE the write: invalid card configuration,
+                # unresolvable/ambiguous entity, or a duplicate build. Exit
+                # 2 with the store bytes unchanged.
+                print(f"[zmem] entity-card: {exc}", file=sys.stderr)
+                sys.exit(2)
+            finally:
+                _release_lock("consolidate", _card_token)
+            if args.json:
+                print(json.dumps(card_result))
+            else:
+                print(f"[zmem] entity-card {args.action}: "
+                      f"result={card_result['result']} "
+                      f"id={card_result['id']} "
+                      f"entity_id={card_result['entity_id']} "
+                      f"source_ref={card_result['source_ref']}")
+            sys.exit(0)
         elif args.cmd == "links":
             sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,
                                add=args.add, relation=args.relation,

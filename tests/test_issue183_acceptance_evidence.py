@@ -314,7 +314,16 @@ class Issue183AcceptanceHostEvidenceTest(unittest.TestCase):
             report = json.loads(output.getvalue())
             self.assertEqual(
                 list(report),
-                ["organized", "backed_up", "evidence_expired", "evidence_capped", "episode_links", "memory_links"],
+                # Issue #179: the cadence envelope carries the entity-card
+                # sweep's five counts under `entity_cards` (added after
+                # `backed_up`, before the retention keys).
+                ["organized", "backed_up", "entity_cards",
+                 "evidence_expired", "evidence_capped", "episode_links",
+                 "memory_links"],
+            )
+            self.assertEqual(
+                list(report["entity_cards"]),
+                ["created", "refreshed", "unchanged", "removed", "skipped"],
             )
             self.assertEqual(report["evidence_expired"], 1)
             remaining = sqlite3.connect(env["ZMEM_STORE"])
