@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "4d606120bb842571af93ec31e73df64426667a83aca8a87e7af65432338da7bf",
+  "digest": "d21b1d3b62033114b2a851f895efe2a6787f157042f51776a71535396da771f6",
   "files": {
     "hermes-plugin/__init__.py": "b62b376cd3885e2fc78fbace7316c0be1495ddd1c5facea9bec77c0ea2dbf20b",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -11,7 +11,7 @@
     "hermes-plugin/server/auth.py": "b0b2072d60f76423eaa1b0ad69e477f5ac698f685981bf65b648f236bdcdceb1",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
-    "hermes-plugin/server/mcp_server.py": "7db0e60136ecb1f222d10847cb25a90cceaac44266cd7fabafabad0f20a447ea",
+    "hermes-plugin/server/mcp_server.py": "5aac9d1b45dd09a46e3128a5deacce16fbb0d7a15acba935e01b590da8e767f4",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hermes-plugin/transport.py": "ee264bc110ac8061bbefd70111d938e56c6bd03503d498799105312ad76ad808",
@@ -56,7 +56,7 @@
     "scripts/release_gate.py": "0fee2823312e51cdd7b0a4827509aa806907e06ae95b87b2a90f532997c76ecb",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "b43f4c9fc602917bd5f627560f1ab5abbfb3b34e60ad0d27f7a219a7492368ef",
-    "skills/memory/SKILL.md": "5c09d1b651ef007ea3035938a340d92258a6a948ff6087e1f5ebc185e594903c",
+    "skills/memory/SKILL.md": "cb5f8ca89ee1321ef1b927dd3d43a7b023caf9200769515445b82472801076f2",
     "skills/memory/scripts/capture_quality.py": "1dc991c100dad7f6045406c810014357ee351425c9095f5624ff6051bfb79ded",
     "skills/memory/scripts/correction_queue.py": "2b8945a63716225937885840ad0043c7d3fd462765edec9d3b2cea17547aebfd",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
