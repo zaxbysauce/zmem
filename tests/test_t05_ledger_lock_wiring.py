@@ -67,18 +67,45 @@ def test_record_undelivered_acquires_the_delivery_lock():
         from storelib import delivery_ledger as dl
 
         calls = []
+        state = {"held": False, "published_inside": None}
         real_acquire = host.acquire_lock
+        real_release = host.release_lock
 
         def recording_acquire(path, stale_s=None):
             calls.append(str(path))
-            return real_acquire(path, stale_s)
+            token = real_acquire(path, stale_s)
+            if token is not None:
+                state["held"] = True
+            return token
+
+        def recording_release(path, token):
+            state["held"] = False
+            return real_release(path, token)
+
+        real_publish = dl._publish_segment
+
+        def checking_publish(data_dir, key, entries):
+            # Review round 2 (finding 5): acquiring the lock and then
+            # publishing OUTSIDE it must fail this pin — a mutant that
+            # runs `with lock: pass` before the critical section still
+            # records an acquire, so the held-at-publish state is the
+            # deterministic discriminator.
+            state["published_inside"] = state["held"]
+            return real_publish(data_dir, key, entries)
 
         host.acquire_lock = recording_acquire
+        host.release_lock = recording_release
+        dl._publish_segment = checking_publish
         try:
             sid = f"lockwire-{uuid.uuid4().hex}"
             rows = [{"id": "lockwire-row-1",
                      "content": "lock wiring probe row"}]
+            # The ADMITTING call is the discriminator: its fresh entries
+            # go through _publish_segment, and the held-at-publish state
+            # must be True. (The no-admit second call publishes nothing,
+            # so it exercises the no-lock-acquire leg below.)
             admitted = dl.record_undelivered(tmp, sid, rows, "user_prompt")
+            first_publish_state = state["published_inside"]
             # Second call with the SAME row: admits nothing, so no
             # compaction runs after it (admitted==[] skips _try_compact)
             # — the only acquire this call can produce is the critical
@@ -88,9 +115,18 @@ def test_record_undelivered_acquires_the_delivery_lock():
             readmitted = dl.record_undelivered(tmp, sid, rows, "user_prompt")
         finally:
             host.acquire_lock = real_acquire
+            host.release_lock = real_release
+            dl._publish_segment = real_publish
 
         assert admitted == ["lockwire-row-1"], admitted
         assert readmitted == [], readmitted
+        assert first_publish_state is True, (
+            "record_undelivered must publish WITH the delivery-state lock "
+            "held (host.acquire_lock acquired and not yet released when "
+            "_publish_segment runs) — acquire-then-publish-outside would "
+            "re-open the #362 double-fire window; observed "
+            f"published_inside={first_publish_state!r}, "
+            f"acquire_lock calls: {calls}")
         lock_paths = [p for p in calls if p.endswith(".delivery-state.lock")]
         assert lock_paths, (
             "record_undelivered must acquire the delivery-state lock "

@@ -841,7 +841,14 @@ def _reservation_ttl_s() -> float:
 
 
 def _reservation_sidecar_path(data_dir: str, reservation_id: str) -> Optional[str]:
-    if not data_dir or not reservation_id:
+    # Shape-check the id (review round 2, LOW recommended in-PR): ids are
+    # always self-minted uuid4().hex, so anything else is caller error —
+    # and on Windows a crafted id like "a/../../../evil" would otherwise
+    # resolve the sidecar path OUTSIDE ops/ and let commit_reservation
+    # read+mark a planted file. Malformed ids return None, which
+    # commit_reservation reports as "unknown reservation" (exit 2).
+    if (not data_dir or not reservation_id
+            or not re.fullmatch(r"[0-9a-f]{32}", reservation_id)):
         return None
     return os.path.join(data_dir, "ops", "resv-" + reservation_id + _RESERVE_SUFFIX)
 

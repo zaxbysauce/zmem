@@ -11,7 +11,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Delivery reservations and principal-keyed ledger (issue #284,
   Workstream T PR 5 of 12):** selection and delivery commitment are now
   separate steps for remote callers, the delivery ledger gains caller
-  identity, and the cross-process record race (#362, absorbed) is closed:
+  identity, and the reserve→ack path closes the cross-process record race
+  (#362; the non-reserve hook path keeps its documented lock-free
+  `record()` posture, so #362 stays open for the general case):
   - `prefetch --reserve` returns the selection plus a `reservation` id
     WITHOUT recording delivery — an identical retry inside the
     reservation TTL returns the same ids, so a lost response is no longer

@@ -1113,8 +1113,8 @@ The exact session-aware CLI forms are:
   --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
   [--ops-token <token>]... [--authorized-namespace <ns>]...
-<interpreter> <store.py> ledger-clear --session-id=<id>
-<interpreter> <store.py> delivery-clear --session-id=<id>
+<interpreter> <store.py> ledger-clear --session-id=<id> [--principal <id>] [--harness <id>]
+<interpreter> <store.py> delivery-clear --session-id=<id> [--principal <id>] [--harness <id>]
 ```
 
 The passive `recall` and `recent` commands accept the additive attribution
@@ -1173,7 +1173,9 @@ second budget run.
 `--reserve` (issue #284, T-05) returns the selection with a `reservation`
 id and records nothing in the delivery ledger — commit with
 `prefetch-ack --reservation <id>` (exactly-once; duplicate ack is a
-no-op; the TTL defaults to 120 s via `ZMEM_RESERVATION_TTL_S`);
+no-op within the reservation TTL — default 120 s via
+`ZMEM_RESERVATION_TTL_S`; an expired reservation commits nothing and an
+unknown or malformed id exits 2);
 `--principal`/`--harness` key the delivery ledger as
 `principal|harness|session` (omitted keeps the legacy session-only key).
 `--exclude` (memory ids the caller already holds) is repeatable.

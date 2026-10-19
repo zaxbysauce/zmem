@@ -404,10 +404,81 @@ def test_ledger_is_keyed_by_principal_harness_and_session():
             f"{[p.name for p in _ledger_family_files(tmp)]}")
 
 
+def test_identity_dimensions_isolate_independently():
+    """Review round 2 (finding 6): AC3 varies principal AND harness
+    TOGETHER, so a single-dimension drop — principal lost from the
+    sidecar, harness lost at commit, either lost from _session_key —
+    passes it while two callers' deliveries alias into one ledger. This
+    pin varies the dimensions independently (same harness / different
+    principal; same principal / different harness), and checks the
+    bare-session ledger stays empty under keyed callers (no aliasing to
+    the legacy session-only key). Also pins the unknown- and malformed-id
+    ack refusals (exit 2)."""
+    marker = f"t05-ac3b-{uuid.uuid4().hex}"
+    session_id = f"t05-ac3b-{uuid.uuid4()}"  # the SAME native session id
+    ns = "project:t05-ac3b"
+    with _pinned_scratch("ac3b") as tmp:
+        _init_store()
+        row_id = _seed_row(ns, f"{marker} identity isolation row")
+
+        def caller(principal=None, harness=None) -> dict:
+            argv = ["prefetch", "--query", marker,
+                    "--namespace", ns, "--session-id", session_id,
+                    "--moment", "user_prompt", "--json"]
+            if principal is not None:
+                argv += ["--principal", principal]
+            if harness is not None:
+                argv += ["--harness", harness]
+            r = _run_store(*argv)
+            assert r.returncode == 0, (
+                f"prefetch failed rc={r.returncode}: {r.stderr.strip()}")
+            return json.loads(r.stdout)
+
+        # Same harness, DIFFERENT principal.
+        env_a = caller("t05-id-principal-a", "claude-code")
+        env_b = caller("t05-id-principal-b", "claude-code")
+        # Same principal, DIFFERENT harness.
+        env_c = caller("t05-id-principal-a", "codex-cli")
+        # Bare session (no identity): the legacy session-only key.
+        env_bare = caller()
+
+        for name, env in (("a", env_a), ("b", env_b), ("c", env_c),
+                          ("bare", env_bare)):
+            assert env.get("count", 0) > 0, (
+                f"caller {name} selected nothing: {env}")
+            assert env.get("reason") != "already-delivered", (
+                f"caller {name} was suppressed by an earlier caller under "
+                f"the same native session id (single-dimension key drop): "
+                f"{env}")
+
+        # Distinct ledgers: all four deliveries land in distinct ledger
+        # files — the two keyed dimensions isolate independently AND the
+        # keyed callers never touch the bare session-only ledger.
+        holders = [p for p in _ledger_family_files(tmp)
+                   if row_id in _ledger_entry_ids(p)]
+        assert len(holders) >= 4, (
+            "the four callers' deliveries collapsed into fewer ledgers — "
+            f"the identity dimensions must isolate independently; family: "
+            f"{[p.name for p in _ledger_family_files(tmp)]}")
+
+        # Review round 2: unknown-id ack is the exit-2 refusal, and the
+        # id shape check keeps a crafted path id from resolving outside
+        # ops/ (it reports the same refusal).
+        r = _run_store("prefetch-ack", "--reservation", "0" * 32)
+        assert r.returncode == 2, (
+            f"unknown-but-well-formed reservation must exit 2: "
+            f"rc={r.returncode} stderr={r.stderr.strip()}")
+        r2 = _run_store("prefetch-ack", "--reservation", "../../evil")
+        assert r2.returncode == 2, (
+            f"malformed reservation id must exit 2 (never resolve outside "
+            f"ops/): rc={r2.returncode} stderr={r2.stderr.strip()}")
+
+
 _TESTS = (
     test_unacked_selection_is_not_suppressed_on_retry,
     test_ack_commits_once_and_is_idempotent,
     test_ledger_is_keyed_by_principal_harness_and_session,
+    test_identity_dimensions_isolate_independently,
 )
 
 
