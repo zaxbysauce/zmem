@@ -964,9 +964,12 @@ from the prompt event itself — the #158 hook boundary keeps the hook a thin
 flag forwarder); any other non-empty value → `pretool` only plus a one-shot
 stderr warning. The tier is query-time — the queryless `recent` pull never
 admits cross rows.
-Scoped MCP tokens do not forward `ops_tokens` to this legacy path, so foreign
-rows are excluded before rendering, context construction, or delivery-ledger
-updates.
+Scoped MCP principals keep their `ops_tokens`; the selector's cross-project
+lane intersects its foreign namespace set with the principal's authorized
+allow-list (issue #283), so foreign projects outside the allow-list are
+excluded before rendering, context construction, or delivery-ledger
+updates, while allow-listed cross-project rows can be admitted when
+operation tokens ground them.
 
 No-copy rule: a cross row is never copied, rewritten, or mirrored — the
 store's own row renders in place, inside the untrusted fence, tagged
@@ -1112,11 +1115,11 @@ The exact session-aware CLI forms are:
 <interpreter> <store.py> recall --query "<text>" --for-injection --json \
   --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
-  [--ops-token <token>]...
+  [--ops-token <token>]... [--authorized-namespace <ns>]...
 <interpreter> <store.py> recent --for-injection --json \
   --session-id=<id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   --lane <claude|codex|zcode|hermes-provider|hermes-compat> \
-  [--ops-token <token>]...
+  [--ops-token <token>]... [--authorized-namespace <ns>]...
 <interpreter> <store.py> ledger-clear --session-id=<id>
 <interpreter> <store.py> delivery-clear --session-id=<id>
 ```
@@ -1124,7 +1127,10 @@ The exact session-aware CLI forms are:
 The passive `recall` and `recent` commands accept the additive attribution
 flags `--session-id=<id>`, `--moment`, `--lane`, and repeatable `--ops-token` when
 called with `--for-injection --json`, plus the payload flag
-`--delegation-prompt` (issue #253). `--delegation-prompt` is honored ONLY on
+`--delegation-prompt` (issue #253) and repeatable `--authorized-namespace`
+(issue #283: the caller's namespace allow-list — the selector's
+`user:global` and cross-project lanes are filtered to it; omitted means
+unscoped). `--delegation-prompt` is honored ONLY on
 `--moment pretool` with a session id, is secret-redacted before it touches the
 sidecar, and exists to park the delegating Agent/Task prompt for the subagent
 moment; every other moment ignores it. An empty query dispatches to recent
@@ -1165,7 +1171,8 @@ second budget run.
 <interpreter> <store.py> prefetch --query "<text>" --namespace <ns> \
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
-  [--ops-token <token>]... [--exclude <memory-id>]...
+  [--ops-token <token>]... [--exclude <memory-id>]... \
+  [--authorized-namespace <ns>]...
 ```
 
 `--query`, `--namespace`, `--session-id`, and `--moment` are required;
@@ -1184,10 +1191,12 @@ The MCP server exposes the same one-call envelope as the `prefetch` tool
 validated against the five-value tuple, never defaulted to a host lane — and
 `ops_tokens`), enforcing namespace scope and the `ZMEM_INJECT=0` kill switch
 before any store subprocess, and returning the complete selector envelope
-plus the additive `context` alias equal to `rendered`. The MCP
-server does not forward `ops_tokens` for scoped tokens: the legacy cross-project
-admission path has no namespace-allow-list awareness, so scoped prefetch cannot
-admit foreign project rows before rendering or ledger updates. The MCP
+plus the additive `context` alias equal to `rendered`. Scoped principals keep
+their `ops_tokens`: the selector's cross-project lane intersects its foreign
+namespace set with the principal's authorized allow-list (issue #283), so
+foreign projects outside the allow-list are never admitted before rendering
+or ledger updates, while allow-listed cross-project rows can be admitted
+when operation tokens ground them. The MCP
 `session_start` tool rides the same store-owned queryless selector path via
 `recent --for-injection --json --session-id <id> --moment session_start`,
 returning that envelope (additive `context` alias; `result`/`namespace`/

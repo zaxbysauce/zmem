@@ -509,8 +509,10 @@ class PrefetchValidationTest(unittest.TestCase):
                          "subprocess")
 
     def test_scoped_token_cannot_admit_cross_project_prefetch_rows(self):
-        # Issue #236: the legacy prefetch hazard lane treats operation tokens
-        # as admission evidence without consulting MCP namespace scopes. Seed
+        # Issue #236, as revised by issue #283 (T-04): the selector's
+        # cross-project lane intersects its foreign namespace set with the
+        # caller's authorized allow-list, so operation tokens DO flow for
+        # scoped principals while a foreign project is never admitted. Seed
         # matching rows in both the caller's project and a foreign project,
         # then exercise the actual scoped FastMCP tool and store subprocess.
         query = f"scope-boundary-{uuid.uuid4().hex}"
@@ -570,9 +572,20 @@ class PrefetchValidationTest(unittest.TestCase):
             with self.subTest(moment=moment):
                 self.assertNotIn("error", result, result)
                 self.assertEqual(len(calls), 1, calls)
-                self.assertNotIn("--ops-token", calls[0],
-                                 "scoped-token operations must not reach the "
-                                 "legacy cross-project admission path")
+                argv = calls[0]
+                # T-04 (issue #283): scoped ops tokens flow to the selector;
+                # enforcement moved from the argv strip to the selector's
+                # authorized-namespace allow-list intersection (#236).
+                for tok in ("stash", "pop"):
+                    self.assertIn(tok, argv,
+                                  "scoped-token ops tokens must reach the "
+                                  "selector (the allow-list intersection is "
+                                  "the enforcement)")
+                self.assertEqual(
+                    [argv[i + 1] for i in range(len(argv))
+                     if argv[i] == "--authorized-namespace"],
+                    ["project:allowed", "user:global"],
+                    "the scoped principal's allow-list rides the store argv")
                 self.assertNotIn(foreign_id,
                                  {row["id"] for row in result["results"]},
                                  result)

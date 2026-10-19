@@ -955,6 +955,7 @@ def select_and_budget_for_injection(
     min_confidence: float | None = None,
     pretool_input: dict | None = None,
     user_global_floor: float | None = None,
+    authorized_namespaces: frozenset | None = None,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -962,6 +963,17 @@ def select_and_budget_for_injection(
     distinguishes omitted (``None``: derive the pretool ring in storelib) from
     explicitly empty (``[]``: do not read the ring).  The caller owns ``conn``;
     this function never opens or closes SQLite.
+
+    ``authorized_namespaces`` (issue #283, T-04): the caller's namespace
+    allow-list.  ``None`` (the default, every local caller) is unscoped —
+    behavior is byte-identical to the pre-T-04 selector.  When set, the
+    user:global lane runs only if ``user:global`` is a member, and the
+    cross-project lane's foreign namespace set is intersected with the
+    allow-list, so unauthorized candidates are filtered BEFORE ranking,
+    budgeting and the delivery ledger (a denied row can never consume
+    budget or be recorded as delivered).  The MCP surface translates its
+    principal's allow-list into this input; fail-closed denial for an
+    unauthorized REQUESTED namespace stays at the caller's boundary.
 
     ``user_global_floor`` (issue #235) overrides the env-derived
     user:global tier floor; ``None`` resolves it from the environment on
@@ -1222,7 +1234,15 @@ def select_and_budget_for_injection(
         # passive pull (plan-critic round-1 finding).
         kwargs = dict(
             namespace=namespace, limit=limit, as_json=False, no_bump=True,
-            include_global=True, global_limit=global_limit,
+            # Issue #283 (T-04): one authorization-aware selection policy.
+            # Unscoped callers keep the unconditional global union; a scoped
+            # caller's allow-list gates the user:global lane here (both
+            # dispatch branches ride this same dict) and constrains the
+            # cross-project lane via _authorized_namespaces.
+            include_global=(
+                True if authorized_namespaces is None
+                else ("user:global" in authorized_namespaces)),
+            global_limit=global_limit,
             no_telemetry=True, for_injection=True,
             exclude_ids=exclusions, _capture=capture,
             # Keep the ordinary retrieval/gate candidate set intact only when
@@ -1241,6 +1261,7 @@ def select_and_budget_for_injection(
             # recent_memory); an asymmetric kwarg here is the PR #225
             # fail-open class, pinned by tests/test_user_global_floor.py.
             _user_global_floor=effective_user_global_floor,
+            _authorized_namespaces=authorized_namespaces,
         )
         if effective_query.strip():
             kwargs["query"] = effective_query

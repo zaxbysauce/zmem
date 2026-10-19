@@ -2079,6 +2079,7 @@ def cross_project_admissions(
     as_of: str | None = None,
     weights: dict | None = None,
     explicit: bool = False,
+    authorized_namespaces: frozenset | None = None,
 ) -> list:
     """Evaluate the cross-project hazard tier (issue #98).
 
@@ -2095,6 +2096,13 @@ def cross_project_admissions(
     surface, an empty query (the tier is query-time), or an empty foreign
     set returns []. The tier is deliberately NOT MMR-diversified: cap-2
     selection stays deterministic.
+
+    ``authorized_namespaces`` (issue #283, T-04): when not None, the
+    foreign set is additionally intersected with the caller's namespace
+    allow-list BEFORE the deep-pool fetch, so a foreign project outside
+    the allow-list is never admitted (#236) while an in-allow-list
+    foreign project can be when ops tokens ground it (AC3). Membership is
+    literal, matching Principal.check_namespace at the MCP boundary.
     """
     if not cross_project_surface_enabled(moment, explicit=explicit):
         return []
@@ -2114,7 +2122,9 @@ def cross_project_admissions(
         "WHERE superseded_at IS NULL AND namespace LIKE 'project:%'"
     ).fetchall()
     foreign = [r["namespace"] for r in rows
-               if r["namespace"] not in current_aliases]
+               if r["namespace"] not in current_aliases
+               and (authorized_namespaces is None
+                    or r["namespace"] in authorized_namespaces)]
     if not foreign:
         return []
     # PR #207 review: the grounded-signal filter runs AFTER scoring, so the
@@ -2828,6 +2838,7 @@ def _recall_memory_impl(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    _authorized_namespaces: frozenset | None = None,
     exact: bool = False,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
@@ -3140,6 +3151,7 @@ def _recall_memory_impl(
             exclude_ids=exclude_ids, min_confidence=min_confidence,
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of,
             weights=weights, explicit=_cross_explicit,
+            authorized_namespaces=_authorized_namespaces,
         )
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
@@ -4733,6 +4745,7 @@ def _recent_memory_impl(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    _authorized_namespaces: frozenset | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -4857,6 +4870,7 @@ def _recent_memory_impl(
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
             exclude_ids=exclude_ids, min_confidence=min_confidence,
             explicit=_cross_explicit, as_of=as_of,
+            authorized_namespaces=_authorized_namespaces,
         )
         for _score, item in cross_scored:
             item["prompt_injection_risk"] = _classify_injection(item)
@@ -4995,6 +5009,7 @@ def _collect_injection_candidates(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    _authorized_namespaces: frozenset | None = None,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -5025,6 +5040,7 @@ def _collect_injection_candidates(
         moment=moment,
         lane=lane,
         _user_global_floor=_user_global_floor,
+        _authorized_namespaces=_authorized_namespaces,
     )
     if query is None:
         _recent_memory_impl(
@@ -5083,6 +5099,7 @@ def recall_memory(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    _authorized_namespaces: frozenset | None = None,
     exact: bool = False,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
@@ -5142,6 +5159,7 @@ def recall_memory(
             moment=moment,
             lane=lane,
             _user_global_floor=_user_global_floor,
+            _authorized_namespaces=_authorized_namespaces,
             exact=exact,
         )
 
@@ -5177,6 +5195,7 @@ def recall_memory(
         moment=moment,
         lane=lane,
         _user_global_floor=_user_global_floor,
+        _authorized_namespaces=_authorized_namespaces,
     )
     if _capture is not None:
         _capture.clear()
@@ -5226,6 +5245,7 @@ def recent_memory(
     moment: str | None = None,
     lane: str | None = None,
     _user_global_floor: float | None = None,
+    _authorized_namespaces: frozenset | None = None,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -5252,6 +5272,7 @@ def recent_memory(
             moment=moment,
             lane=lane,
             _user_global_floor=_user_global_floor,
+            _authorized_namespaces=_authorized_namespaces,
         )
 
     if scopes is not None:
@@ -5286,6 +5307,7 @@ def recent_memory(
         moment=moment,
         lane=lane,
         _user_global_floor=_user_global_floor,
+        _authorized_namespaces=_authorized_namespaces,
     )
     if _capture is not None:
         _capture.clear()

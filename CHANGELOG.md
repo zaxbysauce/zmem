@@ -5,6 +5,39 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.108.0] - 2026-10-19
+
+### Added
+- **Authorization-aware selection policy (issue #283, Workstream T PR 4 of
+  12):** one namespace-authorization policy now serves the local CLI selector
+  and the MCP server alike — unauthorized candidates are filtered BEFORE
+  ranking, budgeting and the delivery ledger (a denied row can never consume
+  budget or be recorded as delivered), and authorized results are never
+  suppressed because some other namespace is off-limits:
+  - `select_and_budget_for_injection` accepts `authorized_namespaces`
+    (`frozenset | None`). `None` — every local caller — is unscoped and
+    byte-identical to the previous selector; when set, the `user:global`
+    lane runs only for principals allowed `user:global` and the
+    cross-project lane's foreign namespace set intersects the allow-list.
+  - Repeatable `--authorized-namespace` on `recall`, `recent`, and
+    `prefetch` (selector for-injection paths only; omitted means unscoped).
+  - MCP `prefetch`: the whole-response `global-not-allowed` deny (issue
+    #159 review) is replaced by the allow-list input — a scoped principal
+    now receives its authorized project rows instead of an all-empty
+    envelope, and keeps its operation tokens (issue #236 is enforced by the
+    selector's cross-lane intersection: foreign projects outside the
+    allow-list are never admitted; in-allow-list cross-project rows are
+    admitted when operation tokens ground them).
+
+### Fixed
+- **MCP `session_start` user:global leak (issue #283):** the selector leg
+  (`--session-id`) hardcoded `include_global=True`, so the MCP-side
+  conditional `--include-global` was inert there and a principal scoped to
+  one project received `user:global` rows in its session-start fence.
+  Scoped principals now carry their allow-list on both session_start legs
+  (the legacy leg's `--include-global --global-limit 2` conditional stays
+  live and byte-identical); unscoped argv is unchanged.
+
 ## [0.107.0] - 2026-10-18
 
 ### Added

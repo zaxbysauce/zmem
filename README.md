@@ -152,10 +152,13 @@ governs. The tier is query-time: the queryless `recent` pull never admits
 cross rows. The #155 real-corpus replay baseline has landed: the predeclared
 measurement record `eval/real-corpus-2026-09-19.json` is the calibration
 reference for this tier.
-Scoped MCP tokens do not forward `ops_tokens` to this legacy path, so foreign
-rows are excluded before rendering, context construction, or delivery-ledger
-updates. The selector and delivery boundary are described in Query-aware
-passive prefetch (#159) below.
+Scoped MCP principals keep their `ops_tokens`; the selector's cross-project
+lane intersects its foreign namespace set with the principal's authorized
+allow-list (issue #283), so foreign projects outside the allow-list are
+excluded before rendering, context construction, or delivery-ledger
+updates, while allow-listed cross-project rows can be admitted when
+operation tokens ground them. The selector and delivery boundary are
+described in Query-aware passive prefetch (#159) below.
 
 ### Query-aware passive prefetch (issue #159)
 
@@ -167,7 +170,8 @@ envelope; no consumer-side renderer, no second budget run:
 <interpreter> <store.py> prefetch --query "<text>" --namespace <ns> \
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
-  [--ops-token <token>]... [--exclude <memory-id>]...
+  [--ops-token <token>]... [--exclude <memory-id>]... \
+  [--authorized-namespace <ns>]...
 ```
 
 `--query`, `--namespace`, `--session-id`, and `--moment` are required; JSON is
