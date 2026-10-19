@@ -66,7 +66,7 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v17
+- schema compatibility against current v16
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
@@ -270,9 +270,7 @@ delivery only; it does not promise encryption or redaction of page content at
 rest.
 
 The current observation gate is recorded as `reject`, so page metadata omits
-`runbook` (and since 0.107.0 the `ALLOWED_TYPES` vocabulary is the EIGHT-type
-set — `entity_card` joined as the card-refresh-only type; see "Entity cards
-(issue #179)" below).
+`runbook` and the `ALLOWED_TYPES` vocabulary remains unchanged.
 
 ### recall — surface relevant memories (high-precision)
 ```
@@ -853,11 +851,6 @@ names `ZMEM_ALLOW_NEWER_SCHEMA=1`, the explicit operator override that
 proceeds at the operator's own risk and never downgrades or migrates the
 store). The #172 taxonomy decision for `entity_card` is REJECT: that memory
 type does not exist and `ALLOWED_TYPES` is unchanged by this release.
-The #172 decision was reject; the #179 workstream contract reverses it and
-ships the type — cards are born only through the refresh path. Since 0.107.0
-`ALLOWED_TYPES` carries `entity_card` (the #175 kinds precedent: the RFC map
-is a frozen record, not a veto); see "Entity cards (issue #179)" below for
-the full card contract.
 
 #### Injection token budget (issues #65 10.9, #116)
 
@@ -1172,10 +1165,17 @@ second budget run.
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
   [--ops-token <token>]... [--exclude <memory-id>]... \
-  [--authorized-namespace <ns>]...
+  [--authorized-namespace <ns>]... [--reserve] \
+  [--principal <id>] [--harness <id>]
 ```
 
 `--query`, `--namespace`, `--session-id`, and `--moment` are required;
+`--reserve` (issue #284, T-05) returns the selection with a `reservation`
+id and records nothing in the delivery ledger — commit with
+`prefetch-ack --reservation <id>` (exactly-once; duplicate ack is a
+no-op; the TTL defaults to 120 s via `ZMEM_RESERVATION_TTL_S`);
+`--principal`/`--harness` key the delivery ledger as
+`principal|harness|session` (omitted keeps the legacy session-only key).
 `--exclude` (memory ids the caller already holds) is repeatable.
 `--for-injection`, `--no-bump`, and `--json` are accepted as explicit markers
 of the (only) passive mode the selector pins. The selector owns the
@@ -1866,22 +1866,7 @@ Pipeline (in order):
    `--json` output) is untouched.
 4. **Entity backfill** — every working row missing `memory_entity` links gets
    them via the deterministic extractor (idempotent; rows with nothing
-   extractable are counted as candidates but link nothing). The card sweep's
-   env configuration (`ZMEM_CARD_MIN_MENTIONS` / `ZMEM_CARD_TOP_N`) resolves
-   BEFORE this loop — before ANY write of the run (PR #385 review F-4); an
-   invalid value prints one stderr line, skips the card stage with zero
-   counts, and never aborts the run. Immediately after the backfill
-   (issue #179): **the entity-card cadence sweep** — see "Entity cards
-   (issue #179)" below. Per entity (ascending entity-id order) one
-   deterministic card is created, refreshed, or tombstoned; the report (and
-   `organize --json`) carries the five counts under `entity_cards`:
-   `created` / `refreshed` / `unchanged` (SHA-256 no-op — no SQL write) /
-   `removed` (a live card that fell below the threshold) / `skipped`
-   (non-qualifying entity with no live card, AND per-entity apply failures —
-   one bad entity rolls back only its own transaction, logs one stderr
-   line, and the sweep continues). `--dry-run` computes the same
-   counts read-only; the session-cadence JSON envelope carries them under
-   `entity_cards` too.
+   extractable are counted as candidates but link nothing).
 5. **Link backfill** — every working row missing `memory_link` edges gets them
    via the standard write-time linker (`related`/`contradicts` at
    `ZMEM_LINK_THRESHOLD`).
@@ -1937,8 +1922,8 @@ Pipeline (in order):
 
 `--dry-run` writes NOTHING (no meta, no backfill, no summaries) and the `--json`
 report carries per-step would-be counts (`entity_backfill`, `link_backfill`,
-`entity_cards`, `topics`, `summaries`, `compressed`, `pruned`, `episode_ids`,
-`consolidate` sub-report).  A concurrent organize/consolidate loses cleanly (exit 0, a
+`topics`, `summaries`, `compressed`, `pruned`, `episode_ids`, `consolidate`
+sub-report).  A concurrent organize/consolidate loses cleanly (exit 0, a
 `- skipped` notice, or `{"error": "organize lock busy"}` under `--json`).
 
 Optional local NLI judge (7.5): when `ZMEM_NLI_CMD` is set to an argv template
@@ -1960,148 +1945,6 @@ pre-existing columns (`merged_from`, `source_ref`, `tags`, `confidence`,
 `source_hash`), so a store stamped at an older schema version keeps opening
 normally in an older client until the new version is installed — verify a
 template store with `store.py organize --dry-run` before upgrading.
-
-### Entity cards (issue #179)
-
-One deterministic `entity_card` memory row per qualifying entity — a
-continuously refreshed summary card with provenance, built and maintained
-entirely store-side. The #172 taxonomy decision REJECTED this type; the #179
-workstream contract reverses that decision (the #175 kinds precedent: the RFC
-map is a frozen record, not a veto), and `ALLOWED_TYPES` carries
-`entity_card` as the 8th type. A card is an ordinary `memory` row keyed by
-`source_ref=card:<entity_id>`; the schema stamp is **17** (0.107.0, PR #385
-review F-1): the bump is STAMP-ONLY (no DDL), but it is upgrade-required —
-see the operator note below.
-
-**KEY OPERATOR NOTE (schema 17, upgrade-required).** `FORWARD_COMPAT`
-deliberately stays at 15: every pre-0.107 client (<= 0.106) sharing a store
-**refuses** it, loudly at open, once the first 0.107 client migrates the
-stamp to 17. Without the bump those clients would fail SILENT on
-`entity_card` rows (an unknown type raises in their type preference and
-their hooks swallow the error — a fleet-wide memory blackout the review
-round executed end-to-end). On shared-store machines update every client
-BEFORE the first 0.107 host runs a cadence; `ZMEM_ALLOW_NEWER_SCHEMA=1` is
-the operator stopgap (proceed at your own risk; it never downgrades the
-store).
-
-**Type and birth invariant.** `entity_card` is CARD-REFRESH-ONLY: card rows
-are born ONLY through `store.py entity-card build|refresh` and the organize
-cadence sweep. Every interactive add surface refuses the type (`add --type`
-choices derive from ALLOWED_TYPES minus `entity_card`; the Hermes/MCP add
-tools validate against the same exclusion), jsonl ingest refuses it
-line-numbered (ingest bypasses add_memory and must never mint cards), an
-ordinary `add_memory` call with the type but without the refresh path's
-`force_append=True` raises ValueError, every ordinary write rejects any tag
-carrying the reserved `entity_card_sha256=` prefix BEFORE mutation, and
-(since the PR #385 review round) the `card:` source_ref prefix is reserved
-the same way — an ordinary `add`/`update` cannot claim a card identity.
-The SAME guards cover the update path (review F-2): `update --type
-entity_card` on an ordinary row is refused (type conversion into the
-reserved type), an explicitly supplied watermark-prefix tag is refused, and
-a `card:` source_ref claim is refused. Content-only updates of
-pre-existing card rows keep the full type enum and succeed — the `state`
-precedent; a transient watermark desync from such an edit self-heals at the
-next refresh, which recomputes the digest over the new bytes (disclosed).
-
-**Configuration.** `ZMEM_CARD_MIN_MENTIONS` (default 5, inclusive) is the
-live non-card mention count an entity needs to qualify;
-`ZMEM_CARD_TOP_N` (default 8) caps the card's provenance rows. An absent
-variable selects its default; a present empty, non-integer, zero, or
-negative value raises before any card write starts (CLI exit 2, store bytes
-unchanged).
-
-**Rendering.** The card is UTF-8, LF-terminated, fixed field order:
-`Entity: <canonical_name>` / `Kind: <kind>` / `Aliases: <sorted alias_norm>`
-/ `Mentions:` (one `- score=<six decimals> last_seen=<ingestion_ts>
-id=<memory_id> source_ref=<ref> text=<single-line>` per selected row) /
-`Last seen: <max ingestion_ts over EVERY live non-card source row linked to
-the entity>` / `Sources:` (one `- <memory_id>` per selected row, same
-order). Mention text collapses CR/LF/whitespace runs to one space. Source
-rows are live (`superseded_at IS NULL`, empty `valid_until`), non-card,
-linked to the entity across ALL namespaces, NULL confidence reads 0.0, and
-ordered confidence DESC, ingestion_ts DESC, id ASC.
-
-**Provenance and lifecycle.** Every card row lives in `user:global` with
-`source_ref=card:<entity_id>`, `signal=none`, confidence 0.5 (above the
-recall floor — a signal=none row's inherited 0.2 would be invisible; the
-summary precedent), `capture_mode=manual`, and the reserved
-`entity_card_sha256=<hex>` tag (SHA-256 over the card's exact UTF-8 bytes —
-the no-op watermark). The card's TAINT is the WORST OF its own
-signal-derived default (signal=none -> `untrusted_tool`) and every SELECTED
-source row's taint (PR #385 review F-8): one `untrusted_web` mention makes
-the card itself `untrusted_web`, so the passive untrusted fence withholds
-the card exactly as it withholds the source it aggregates. The card row is linked DIRECTLY to its entity —
-that is its only entity link. REDACTION
-TRADEOFF (disclosed): the card is written with `capture_mode=manual` — the
-pinned mode that keeps the watermark tag from being dropped — so its
-machine-assembled content is NOT re-redacted at card write time; the source
-rows were already redacted at their own writes, and their rendered mention
-text is the already-redacted form. Refresh is append-only and fail-closed:
-identical content bytes AND matching watermark return `(existing_id,
-False)` with NO SQL write; changed content tombstones the old row
-(`superseded_at` AND `valid_until` both set — history stays queryable) and
-inserts the replacement with `update_of=<old_id>`; any failure (tombstone,
-insert, link, watermark) raises and rolls back the whole transaction. The
-liveness decision is made on a RE-READ inside the `BEGIN IMMEDIATE` (the
-pre-lock read is only the no-op fast path), and the `entity-card` CLI
-single-flights on the shared `consolidate` advisory lock with the cadence
-sweep, so two card writers cannot interleave (PR #385 review F-6). Writer
-timestamps come from one `schema.now_iso()` value per sweep and NEVER read
-`ZMEM_TEST_NOW`. The cadence sweep (organize step 4b) enumerates entity ids
-in ascending byte order and returns exactly the five counts
-`created/refreshed/unchanged/removed/skipped`; a live card whose entity
-fell below the threshold is tombstoned and counted `removed`; `skipped`
-also covers per-entity apply failures (an oversized card, a stale-plan
-supersede) — one failure logs one stderr line, rolls back only that
-entity's transaction, and the sweep CONTINUES (PR #385 review F-4).
-
-**CLI.** `store.py entity-card build ENTITY --json` creates a missing
-qualifying card (`created`), refuses a live card with exit 2 and no write,
-and reports `no_card` (no write) below the threshold;
-`entity-card refresh ENTITY --json` returns `created` / `updated` /
-`unchanged` / `no_card` (below-threshold refresh tombstones the live card
-first). `ENTITY` resolves an exact entity id first, then an exact canonical
-name (zero or multiple name matches: exit 2). `--json` stdout is one object
-with the exact key order `result, id, entity_id, source_ref, warnings`
-(id/source_ref are JSON null for `no_card`); errors before the write exit 2
-with store bytes unchanged. The command single-flights on the shared
-`consolidate` advisory lock with the organize cadence (a lock-busy run
-exits 1 with a stderr notice, never a silent skip).
-
-**Cards never travel.** `export-jsonl` omits `entity_card` rows from every
-export shape (live-only and `--include-superseded`): cards are store-local
-derived state, every ingest surface refuses the type, and the destination
-re-derives them via its own organize cadence sweep (PR #385 review F-3).
-
-**Same-fence recall suppression.** With `prefer_cards=True` (the default,
-`entity_match_ids`), a live card of a query-matched entity enters the
-entity arm with that entity's relevance. One suppression pass resolves the
-selected card rows by exact `source_ref=card:<entity_id>` plus a direct
-entity link — never by matching card text — and removes ALL live non-card
-rows linked to those entities from the fence under the active namespace and
-`as_of` predicates: the fence renders the card, not the mentions it
-summarizes. The pass runs at EVERY merge site (complete enumeration, PR
-#385 review F-5): (1) the scoped five-tier pools when the global tier is
-included (`--include-global`); (2) the cross-tier merge (namespace +
-`--include-global`); (3) the UNSCOPED default surface (`namespace=None`,
-the default `recall --query` path) — its single all-namespace pool renders
-one fence, so the card's represented sources leave it too; (4) the
-cross-project hazard pool, cleaned before its rows splice into the fence;
-(5) `--explain`'s presented pools, mirroring (1)-(3), AND its deep
-"scored but beyond --limit" pools, so the verdict stream agrees with the
-presented fence; and (6) the suppressed-id set is threaded into
-`expand_recall_links`' exclusion, so a removed source row cannot re-enter
-the fence as a 1-hop link neighbour of a surviving row. The PASSIVE
-prefetch lane (`recent` / SessionStart pulls) never renders cards at all —
-`entity_card` rows are excluded from every recent pool, so the query-less
-branch can never render card and sources together. A query with no selected
-card keeps its current result; a project-only or scoped-without-global
-recall selects no card and applies no suppression. (Disclosed placement:
-the pass runs after per-tier arm caps, RRF fusion, and MMR — suppressed
-rows may already have consumed tier slots; per-tier placement is impossible
-because the card lives in `user:global` while its represented sources live
-in project fences.) Cards are NOT in `PROTECTED_INJECT_TYPES` — they are
-ordinary recall rows for explicit id retrieval.
 
 ### rekey-namespace — remediate stranded namespace rows (admin)
 ```
@@ -3120,19 +2963,6 @@ entities for the same thing (e.g. `rg` and `ripgrep`); find both ids with
 `entity-list`, dry-run the merge, then apply with `--confirm`. Afterwards
 the alias `rg` resolves to the surviving entity and recall's third list
 returns all its linked memories.
-
-### entity-card — build or refresh one entity's card (issue #179)
-```
-<interpreter> <store.py> entity-card build ENTITY [--json]
-<interpreter> <store.py> entity-card refresh ENTITY [--json]
-```
-Direct card operations on one entity (`ENTITY` = entity id, or an exact
-canonical name; zero/multiple name matches exit 2). `build` creates a
-missing qualifying card and REFUSES a live card (exit 2, no write);
-`refresh` returns `created`/`updated`/`unchanged`/`no_card` and tombstones
-a live card whose entity fell below `ZMEM_CARD_MIN_MENTIONS`. `--json`
-emits one object with the exact key order `result, id, entity_id,
-source_ref, warnings`. Full contract: "Entity cards (issue #179)" above.
 
 ### reclassify-entities — rekind stored `other` entities (issue #176)
 ```

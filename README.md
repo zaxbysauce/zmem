@@ -171,11 +171,20 @@ envelope; no consumer-side renderer, no second budget run:
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
   [--ops-token <token>]... [--exclude <memory-id>]... \
-  [--authorized-namespace <ns>]...
+  [--authorized-namespace <ns>]... [--reserve] \
+  [--principal <id>] [--harness <id>]
 ```
 
 `--query`, `--namespace`, `--session-id`, and `--moment` are required; JSON is
-the command's only output mode. The MCP `prefetch` tool takes the same inputs
+the command's only output mode. `--reserve` (issue #284, T-05) selects
+WITHOUT committing the delivery ledger — the envelope carries a
+`reservation` id; acknowledge it with `store.py prefetch-ack
+--reservation <id>` once the text was emitted (a duplicate ack is a
+no-op; an unacknowledged reservation expires — default 120 s,
+`ZMEM_RESERVATION_TTL_S`). `--principal`/`--harness` key the delivery
+ledger as `principal|harness|session`, so fleet callers sharing a native
+session id never share delivery state; omitted they keep the legacy
+session-only key. The MCP `prefetch` tool takes the same inputs
 (`query`, `namespace`, `session_id`, `moment` required; optional `lane` —
 validated against the five-value tuple, never defaulted — and `ops_tokens`),
 enforces namespace scope and the `ZMEM_INJECT=0` kill switch, and returns the
@@ -1012,7 +1021,7 @@ MCP server:
 | `ZMEM_CODEX_MEMORY` | Codex `MEMORY.md` path for `mine-history --source codex` and exact-file provenance lookup. | `~/.codex/MEMORY.md` |
 | `ZMEM_HERMES_SESSIONS` | Hermes session-JSONL root for `mine-history --source hermes` (issue #71 I). | `~/.hermes/sessions` |
 | `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). A bare text file is an UNSCOPED operator token (full access). A JSON file `{"token": "...", "namespaces": ["project:x", "user:global"]}` scopes the token: requests outside the allow-list fail closed with the stable `namespace_not_allowed` error, and scoped tokens must pass an allowed namespace explicitly on every read (issue #65, 10.2). Omitting `namespaces` — or setting it to `null` — means an UNSCOPED operator token (full access), exactly like a bare text file. | — |
-| `ZMEM_MCP_TOKENS_FILE` | Path to a JSON map of per-machine principals (fleet mode, issue #281): `{"<token>": {"principal": "web01", "host": "web01", "harness": "claude", "namespaces": ["project:x"]}, ...}`. Takes precedence over `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE`. `principal` must be unique across entries; `host`/`harness` are required and are stamped server-side as `host:`/`agent:` tags on every write (client-supplied ones are stripped); `namespaces` absent = unscoped; `revoked: true` (or removing the token) takes effect on the next request after a map reload — any change to the file's mtime, including a rewind from an mtime-preserving restore (checked at most once a second), or SIGHUP where available; no restart. Entry keys are allow-listed: an unrecognized field name is a hard startup error (a typo must never silently widen a principal or keep a revoked credential live), and two keys that normalize to the same token are refused. An unreadable/invalid RELOAD keeps the previous map (a corrupt rewrite defers pending revocations until a valid rewrite lands; logged as `zmem_mcp_principal_map_reload_failed` (an unreadable path logs `zmem_mcp_principal_map_stat_failed`)); a malformed map at STARTUP exits 2. `capabilities` (`read`, `passive`, `write`, `mutate`, `admin`) is parsed onto the token's scopes but not yet enforced (#288; #283 shipped namespace-allow-list selection in 0.105.0). | — |
+| `ZMEM_MCP_TOKENS_FILE` | Path to a JSON map of per-machine principals (fleet mode, issue #281): `{"<token>": {"principal": "web01", "host": "web01", "harness": "claude", "namespaces": ["project:x"]}, ...}`. Takes precedence over `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE`. `principal` must be unique across entries; `host`/`harness` are required and are stamped server-side as `host:`/`agent:` tags on every write (client-supplied ones are stripped); `namespaces` absent = unscoped; `revoked: true` (or removing the token) takes effect on the next request after a map reload — any change to the file's mtime, including a rewind from an mtime-preserving restore (checked at most once a second), or SIGHUP where available; no restart. Entry keys are allow-listed: an unrecognized field name is a hard startup error (a typo must never silently widen a principal or keep a revoked credential live), and two keys that normalize to the same token are refused. An unreadable/invalid RELOAD keeps the previous map (a corrupt rewrite defers pending revocations until a valid rewrite lands; logged as `zmem_mcp_principal_map_reload_failed` (an unreadable path logs `zmem_mcp_principal_map_stat_failed`)); a malformed map at STARTUP exits 2. `capabilities` (`read`, `passive`, `write`, `mutate`, `admin`) is parsed onto the token's scopes but not yet enforced (#283/#288). | — |
 | `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |
 | `ZMEM_MCP_MAX_CONCURRENT` | Cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). | `8` |
 | `ZMEM_MCP_QUEUE_TIMEOUT_S` | How long a queued tool call waits for a concurrency slot before returning an overload error. | `60` |
@@ -1334,14 +1343,6 @@ marketplace update), or set `ZMEM_ALLOW_NEWER_SCHEMA=1` to proceed at the
 operator's own risk — the override never downgrades or migrates the store.
 The #172 taxonomy decision for the proposed `entity_card` memory type is
 reject: it is not part of this release and `ALLOWED_TYPES` is unchanged.
-The #172 decision was reject; the #179 workstream contract reverses it and
-ships the type — cards are born only through the refresh path. Since 0.107.0
-`ALLOWED_TYPES` carries `entity_card` as a card-refresh-only type: card rows
-live in `user:global` with `source_ref=card:<entity_id>`, are written only by
-`store.py entity-card build|refresh` and the organize cadence sweep, and every
-interactive add surface (CLI `add --type`, the Hermes/MCP add tools, jsonl
-ingest) refuses the type. See skills/memory/SKILL.md (entity cards) for the
-rendering, provenance, refresh lifecycle, and same-fence recall suppression.
 
 ### Entity classification, reclassification and lane weights (issue #176)
 

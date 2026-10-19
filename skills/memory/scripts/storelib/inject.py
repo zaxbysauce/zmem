@@ -56,13 +56,18 @@ INJECTION_ENVELOPE_OPTIONAL = frozenset({
     # Issue #235: present only when the user:global tier floor withheld.
     "global_withheld",
     # Issue #174: present only when the live-expiry gate ENGAGED (the
-    # passive lane saw at least one memory_expiry side row). Registering
-    # the key here is mandatory, not cosmetic — the Hermes prefetch and
+    # passive lane saw at least one memory_expiry side row). Registering the
+    # key here is mandatory, not cosmetic — the Hermes prefetch and
     # provider validators reject ANY envelope key outside required|optional,
     # so an unregistered key silently blackouts recall on every store that
     # adopts the expiry feature, including with `expired: 0`. Mirrored in
     # hermes-plugin/__init__.py's degraded fallback set.
     "expired",
+    # Issue #284 (T-05): present only when the caller passed reserve=True —
+    # the reservation id the caller acknowledges via `prefetch-ack` to
+    # commit the delivery. Keyed-only-when-present keeps the legacy wire
+    # unchanged; mirrored in hermes-plugin/__init__.py's fallback set.
+    "reservation",
 })
 
 def _capture_envelope_enabled() -> bool:
@@ -956,6 +961,9 @@ def select_and_budget_for_injection(
     pretool_input: dict | None = None,
     user_global_floor: float | None = None,
     authorized_namespaces: frozenset | None = None,
+    reserve: bool = False,
+    principal: str | None = None,
+    harness: str | None = None,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -1158,7 +1166,9 @@ def select_and_budget_for_injection(
         # delivered() returns, so this halves the hot-path cost and the two
         # views can no longer disagree across a compaction landing between
         # them.
-        delivered_entries = list(ledger.delivered(resolved_data, session_id))
+        delivered_entries = list(ledger.delivered(
+            resolved_data, session_id,
+            principal=principal, harness=harness))
         delivered_ids = [e["id"] for e in delivered_entries
                          if isinstance(e, dict)
                          and isinstance(e.get("id"), str)]
@@ -1209,8 +1219,7 @@ def select_and_budget_for_injection(
         page_candidates_pre = _pages._page_candidates_for_selector(
             conn, data_dir=resolved_data, query=effective_query,
             namespace=namespace, moment=moment, lane=lane,
-            user_global_floor=effective_user_global_floor,
-            authorized_namespaces=authorized_namespaces)
+            user_global_floor=effective_user_global_floor)
         page_candidate_ids_pre = [r.get("id") for r in page_candidates_pre
                                   if isinstance(r.get("id"), str)]
         page_rows_pre = [r for r in page_candidates_pre if r.get("id") not in exclusions]
@@ -1501,18 +1510,32 @@ def select_and_budget_for_injection(
                     conn, [r["id"] for r in bump_rows], no_bump=True)
             except Exception:
                 pass
+        reservation_id = None
         try:
             # Issue #250: the recorded set is every RENDERED row, which is
             # larger than the set #136 allows to be rewarded. Name the
             # query-matched subset so a downstream consumer (operation
             # feedback, the #249 report) can tell the two apart from the entry
             # instead of re-deriving arrival shape.
-            ledger.record(resolved_data, session_id, ledger_rows, moment,
-                          bump_eligible_ids=[r["id"] for r in bump_rows])
+            if reserve:
+                # Issue #284 (T-05): the reserving caller acknowledges the
+                # reservation via prefetch-ack; delivery is NOT committed
+                # here. The sidecar carries the ledger_rows ids and their
+                # entry_text fuel (the rendered set — the #114 fence-bound
+                # law, never candidate_ids), and reserve() returns None when
+                # every id is already delivered (the caller keeps today's
+                # already-delivered turn).
+                reservation_id = ledger.reserve(
+                    resolved_data, session_id, ledger_rows, moment,
+                    principal=principal, harness=harness)
+            else:
+                ledger.record(resolved_data, session_id, ledger_rows, moment,
+                              bump_eligible_ids=[r["id"] for r in bump_rows],
+                              principal=principal, harness=harness)
         except Exception:
             # Rendering has already produced safe fenced text; a delivery
             # write failure is fail-open and must not discard that text.
-            pass
+            reservation_id = None
         from storelib.recall import build_injection_envelope
         return build_injection_envelope(
             rows, omitted=parsed.get("omitted", 0), reason=reason,
@@ -1537,6 +1560,10 @@ def select_and_budget_for_injection(
             # when-engaged — the store lane keys it only when it saw a
             # memory_expiry side row, and None keeps the wire unchanged.
             expired=parsed.get("expired"),
+            # Issue #284 (T-05): the reservation id rides the envelope
+            # keyed-only-when-present (registered above); the caller
+            # acknowledges it via `prefetch-ack` to commit delivery.
+            reservation=reservation_id,
         )
     except Exception:
         return _selector_silent(budget_tokens=budget, excluded=exclusions)

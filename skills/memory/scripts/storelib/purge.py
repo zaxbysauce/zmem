@@ -812,6 +812,47 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
             stats["tmp_removed"] += 1
         except OSError:
             pass
+    # Issue #284 (T-05): reservation sidecars stage through
+    # _atomic_write_json's uuid tmp pattern; reap crashed-write orphans so
+    # ops/ never leaks the family (the .tasktext.tmp.* precedent).
+    for path in ops.glob("*.reserve.tmp.*"):
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
+    # Issue #284 (T-05): reservation sidecars carry entry_text fuel, so
+    # they follow the FULL ledger scrub law (drop_ids AND folded-needle
+    # entries removed; an emptied reservation file is deleted) — otherwise
+    # the fail-closed *.reserve verify below could never complete.
+    for path in ops.glob("resv-*.reserve"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        rows = doc.get("rows") if isinstance(doc, dict) else None
+        if not isinstance(rows, list):
+            continue
+        kept = [
+            r for r in rows
+            if isinstance(r, dict)
+            and str(r.get("id", "")) not in drop_ids
+            and not any(_ascii_fold(n) in _ascii_fold(str(r.get("text", "")))
+                        for n in needles)
+        ]
+        if len(kept) != len(rows):
+            doc["rows"] = kept
+            # #252 discipline (PRR-001 parity with the *.ledger scrub
+            # below): rewrite through the atomic JSON writer, never a
+            # plain truncate-write that can tear on a crash.
+            _atomic_write_json(str(path), doc)
+            stats["files_scrubbed"] += 1
+        if not kept:
+            try:
+                path.unlink()
+                stats["entries_dropped"] += 1
+            except OSError:
+                pass
     for path in ops.glob("*.ledger"):
         doc = json.loads(path.read_text(encoding="utf-8"))
         entries = doc.get("entries")
@@ -956,7 +997,7 @@ def _verify_ledgers_clean(data_dir: Path, needles: list[str]) -> dict[str, int]:
     ops = data_dir / "ops"
     if not ops.is_dir():
         return residue
-    for path in ops.glob("*.ledger*"):
+    for path in list(ops.glob("*.ledger*")) + list(ops.glob("*.reserve")):
         data = path.read_bytes().lower()
         for n in needles:
             c = data.count(n.encode("utf-8").lower())
