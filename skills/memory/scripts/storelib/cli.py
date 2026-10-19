@@ -2197,6 +2197,14 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recent.add_argument("--principal", dest="principal", type=str,
+                          default=None,
+                          help="caller principal id (issue #284, T-05): "
+                               "keys the delivery ledger as "
+                               "principal|harness|session")
+    p_recent.add_argument("--harness", dest="harness", type=str,
+                          default=None,
+                          help="caller harness id (issue #284, T-05)")
     p_recent.add_argument("--authorized-namespace",
                           dest="authorized_namespace", action="append",
                           type=str, default=[],
@@ -5093,6 +5101,8 @@ def main():
                         authorized_namespaces=(
                             frozenset(args.authorized_namespace)
                             if args.authorized_namespace else None),
+                        principal=getattr(args, "principal", None),
+                        harness=getattr(args, "harness", None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -5199,6 +5209,8 @@ def main():
                         authorized_namespaces=(
                             frozenset(args.authorized_namespace)
                             if args.authorized_namespace else None),
+                        principal=getattr(args, "principal", None),
+                        harness=getattr(args, "harness", None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
