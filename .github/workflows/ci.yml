@@ -258,7 +258,7 @@ jobs:
       # collected as an artifact; the score never gates the build (no
       # --fail-under) and nothing is downloaded.
       - name: Run offline eval (model-absent, fake profile)
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           ZMEM_EMBED_PROFILE: fake
@@ -267,7 +267,7 @@ jobs:
           python scripts/eval_runner.py --store .eval-tmp/store.sqlite --gold eval/gold.jsonl --json-out .eval-tmp/eval-results.json
 
       - name: Upload eval report artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: eval-results-${{ matrix.os }}
@@ -279,7 +279,7 @@ jobs:
       # efficacy claim; empty observation denominators remain explicit zero
       # compatibility values in the report.
       - name: Run deterministic replay audit
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -292,7 +292,7 @@ jobs:
             --json-out .eval-tmp/replay-results.json
 
       - name: Upload replay report artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: replay-results-${{ matrix.os }}
@@ -307,7 +307,7 @@ jobs:
       # baseline (eval/baseline-injection.json) is what later phases diff
       # against; flipping this to a gate is ONE flag.
       - name: Run injection eval (model-absent, fake profile)
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           ZMEM_EMBED_PROFILE: fake
@@ -322,7 +322,7 @@ jobs:
       # a real-model id must take the exact skip path without any model call.
       # The generator is a developer-side tool; CI never regenerates.
       - name: Run counterfactual stub replay and verify oracle bytes
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -338,7 +338,7 @@ jobs:
           cmp tests/fixtures/counterfactual/expected.json "$scratch/counterfactual.json"
 
       - name: Validate counterfactual schema (Draft 2020-12)
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -353,7 +353,7 @@ jobs:
           PY
 
       - name: Assert counterfactual real-model skip path
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -367,7 +367,7 @@ jobs:
           printf '%s\n' "$output" | grep -Fx "SKIPPED: model calls disabled"
 
       - name: Upload injection eval report artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: eval-inject-results-${{ matrix.os }}
@@ -375,9 +375,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Run Node test suites
-        # always(): the eval step above can fail operationally (exit 2) — a
+        # !cancelled(): the eval step above can fail operationally (exit 2) — a
         # JS-coverage blackout on one matrix leg must not be its side effect.
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
