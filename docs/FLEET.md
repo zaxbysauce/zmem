@@ -100,10 +100,43 @@ codex `session-start` and codex `recall` rows carry this note — the two
 delivery rows; codex `capture-correction` also rides UserPromptSubmit but
 is a capture moment, so the delivery-ledger dedupe does not apply to it. A
 future change that gates the dedupe on a Codex version floor violates this
-contract. Until T-05's reservations land, the dedupe rests on the delivery
-ledger alone; the pre-existing cross-process gap in that ledger
-(`storelib/delivery_ledger.py` `record()` takes no lock) is tracked as a
-follow-up and is T-05's to close.
+contract. The dedupe rests on the delivery ledger. T-05 closed the
+cross-process double-fire window on the reserve→ack path (the admit-once
+`record_undelivered` API serializes the check+publish under the
+delivery-state lock) and the reservations below carry the remote-caller
+case; the non-reserve local path — every hook and the default MCP
+prefetch — still records through the lock-free `record()`, where the
+pre-existing cross-process gap (issue #362) remains open in its
+documented fail-open posture.
+
+## Reservations and delivery commitment (T-05, issue #284)
+
+Selection and delivery commitment are separate steps for remote callers:
+`prefetch --reserve` (MCP `prefetch(reserve=true)`) returns the selection
+plus a reservation id WITHOUT recording delivery (an identical retry
+inside the reservation TTL returns the same ids — a lost response is no
+longer indistinguishable from a delivered one), and
+`prefetch-ack --reservation <id>` (MCP `prefetch_ack`) commits exactly
+the reserved ids once (a duplicate ack is a no-op within the
+reservation TTL; an expired reservation commits nothing). The delivery
+ledger is keyed by `principal|harness|session` when the caller carries
+identity (the MCP server forwards it for map-mode principals), so two
+machines or harnesses sharing a native session id never share a ledger;
+local hooks keep the one-step session-keyed behavior byte-identically.
+On the reserve→ack path the cross-process record race (#362) is closed
+by the admit-once `record_undelivered` ledger API (the delivery-state
+lock serializes the check+publish); the non-reserve path keeps the
+pre-existing lock-free `record()` posture and issue #362 stays open for
+that general case.
+
+**Disclosed residual — the ack-vs-ingestion gap:** the broker can
+acknowledge only what its adapter EMITTED, never what the model actually
+INGESTED. An ack asserts successful emission into the harness's context
+channel, not comprehension or use. This gap is inherent to the
+architecture (the harness offers no delivery receipt for context it
+rendered) and is why the reservation TTL is short (default 120 s,
+`ZMEM_RESERVATION_TTL_S`): an unacknowledged selection expires and may be
+re-selected, at-least-once emission, rather than pretending ingestion.
 
 ## Client-local vs hub-authoritative inputs
 

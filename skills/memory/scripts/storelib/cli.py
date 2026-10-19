@@ -2134,6 +2134,14 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recall.add_argument("--principal", dest="principal", type=str,
+                          default=None,
+                          help="caller principal id for the delivery ledger key "
+                               "(issue #284 T-05; repeatable callers omit it)")
+    p_recall.add_argument("--harness", dest="harness", type=str,
+                          default=None,
+                          help="caller harness id for the delivery ledger key "
+                               "(issue #284 T-05)")
     p_recall.add_argument("--authorized-namespace",
                           dest="authorized_namespace", action="append",
                           type=str, default=[],
@@ -2207,6 +2215,14 @@ def main():
                           type=str, default=[],
                           help="Operation token from the pretool ring "
                                "(repeatable)")
+    p_recent.add_argument("--principal", dest="principal", type=str,
+                          default=None,
+                          help="caller principal id for the delivery ledger key "
+                               "(issue #284 T-05; repeatable callers omit it)")
+    p_recent.add_argument("--harness", dest="harness", type=str,
+                          default=None,
+                          help="caller harness id for the delivery ledger key "
+                               "(issue #284 T-05)")
     p_recent.add_argument("--authorized-namespace",
                           dest="authorized_namespace", action="append",
                           type=str, default=[],
@@ -2245,6 +2261,14 @@ def main():
                             action="append", default=[],
                             help="Operation token from the pretool ring "
                                  "(repeatable)")
+    p_prefetch.add_argument("--principal", dest="principal", type=str,
+                            default=None,
+                            help="caller principal id for the delivery ledger key "
+                                 "(issue #284 T-05)")
+    p_prefetch.add_argument("--harness", dest="harness", type=str,
+                            default=None,
+                            help="caller harness id for the delivery ledger key "
+                                 "(issue #284 T-05)")
     p_prefetch.add_argument("--authorized-namespace",
                             dest="authorized_namespace", action="append",
                             type=str, default=[],
@@ -2267,6 +2291,12 @@ def main():
     p_prefetch.add_argument("--json", action="store_true",
                             help="print the selector envelope as JSON (the "
                                  "only output mode; issue #159)")
+    p_prefetch.add_argument("--reserve", action="store_true",
+                            help="select WITHOUT committing the delivery "
+                                 "ledger (issue #284, T-05): the envelope "
+                                 "carries a reservation id; commit it with "
+                                 "prefetch-ack --reservation <id> once the "
+                                 "text was emitted")
 
     p_query_rewrite = _add_parser(
         "query-rewrite", help="deterministically add recent passive context")
@@ -2280,13 +2310,33 @@ def main():
     p_query_rewrite.add_argument("--json", action="store_true",
                                  help="emit the exact {query,rewrite} object")
 
+    p_prefetch_ack = _add_parser(
+        "prefetch-ack",
+        help="acknowledge a prefetch reservation: commit its ids to "
+             "the delivery ledger exactly once (issue #284, T-05)")
+    p_prefetch_ack.add_argument("--reservation", dest="reservation",
+                                required=True,
+                                help="reservation id from a prefetch --reserve envelope")
+
     p_ledger_clear = _add_parser(
         "ledger-clear", help="clear one session's delivery ledger")
+    p_ledger_clear.add_argument("--principal", dest="principal", type=str,
+                                default=None,
+                                help="caller principal id (issue #284)")
+    p_ledger_clear.add_argument("--harness", dest="harness", type=str,
+                                default=None,
+                                help="caller harness id (issue #284)")
     p_ledger_clear.add_argument("--session-id", required=True,
                                 help="Session id whose delivery ledger will be cleared")
 
     p_delivery_clear = _add_parser(
         "delivery-clear", help="clear one session's delivery state")
+    p_delivery_clear.add_argument("--principal", dest="principal", type=str,
+                                  default=None,
+                                  help="caller principal id (issue #284)")
+    p_delivery_clear.add_argument("--harness", dest="harness", type=str,
+                                  default=None,
+                                  help="caller harness id (issue #284)")
     p_delivery_clear.add_argument("--session-id", required=True,
                                   help="Session id whose delivery state will be cleared")
 
@@ -3966,6 +4016,26 @@ def main():
                                sentiment=args.sentiment,
                                decay_days=args.decay_days, as_json=args.json))
 
+    if args.cmd == "prefetch-ack":
+        from storelib import delivery_ledger
+        try:
+            data_dir = _injection_data_dir(None)
+            result = delivery_ledger.commit_reservation(
+                data_dir, args.reservation)
+        except ValueError as exc:
+            print(f"[zmem] {exc}", file=sys.stderr)
+            sys.exit(2)
+        except Exception:
+            print("[zmem] prefetch-ack failed", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(
+            {"reservation": args.reservation,
+             "committed": result.get("committed", []),
+             "duplicate": result.get("duplicate", False),
+             "expired": result.get("expired", False)},
+            separators=(",", ":")) + "\n", end="")
+        sys.exit(0)
+
     # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
     # so session lifecycle cleanup remains idempotent and SQLite-independent.
     if args.cmd in ("ledger-clear", "delivery-clear"):
@@ -3975,7 +4045,9 @@ def main():
             clear_fn = (delivery_ledger.end_delivery_state
                         if args.cmd == "delivery-clear"
                         else delivery_ledger.clear)
-            clear_fn(data_dir, args.session_id)
+            clear_fn(data_dir, args.session_id,
+                     principal=getattr(args, "principal", None),
+                     harness=getattr(args, "harness", None))
         except Exception:
             print(f"[zmem] {args.cmd} failed", file=sys.stderr)
             sys.exit(1)
@@ -5066,6 +5138,8 @@ def main():
                         authorized_namespaces=(
                             frozenset(args.authorized_namespace)
                             if args.authorized_namespace else None),
+                        principal=getattr(args, "principal", None),
+                        harness=getattr(args, "harness", None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -5175,6 +5249,8 @@ def main():
                         authorized_namespaces=(
                             frozenset(args.authorized_namespace)
                             if args.authorized_namespace else None),
+                        principal=getattr(args, "principal", None),
+                        harness=getattr(args, "harness", None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)
@@ -5251,6 +5327,9 @@ def main():
                     authorized_namespaces=(
                         frozenset(args.authorized_namespace)
                         if args.authorized_namespace else None),
+                    reserve=args.reserve,
+                    principal=args.principal,
+                    harness=args.harness,
                 )
             except ValueError as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)

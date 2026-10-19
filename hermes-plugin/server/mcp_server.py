@@ -2104,6 +2104,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         moment: str,
         lane: Optional[str] = None,
         ops_tokens: list[str] = [],
+        reserve: bool = False,
     ) -> dict[str, Any]:
         """Query-aware passive prefetch (issue #159, Workstream H-2).
 
@@ -2172,6 +2173,18 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if caller.scoped:
             for _ns in sorted(caller.namespaces or frozenset()):
                 args += ["--authorized-namespace", _ns]
+        # Issue #284 (T-05): key the delivery ledger by the resolved
+        # principal's identity. The gate is host/harness PRESENCE (the
+        # established map-mode discriminator) — never principal_id
+        # truthiness, which would re-key the legacy startup principal
+        # ("zmem-operator") and break legacy byte-compat. The map loader
+        # validates the shapes (auth.py), and the = form keeps a
+        # dash-leading id unambiguous.
+        if getattr(caller, "host", None) or getattr(caller, "harness", None):
+            args += ["--principal=" + (caller.principal_id or ""),
+                     "--harness=" + (caller.harness or "")]
+        if reserve:
+            args += ["--reserve"]
         # Issue #236: foreign-project rows stay excluded because the
         # selector's cross-project lane intersects its foreign namespace set
         # with the authorized allow-list (issue #283); in-allow-list
@@ -2214,6 +2227,35 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         out = dict(parsed)
         out["context"] = parsed.get("rendered", "")
         return out
+
+    @mcp.tool()
+    async def prefetch_ack(reservation: str) -> dict[str, Any]:
+        """Acknowledge a prefetch reservation (issue #284, T-05).
+
+        The delivery-commitment half of ``prefetch(reserve=True)``: call it
+        AFTER the reserved rows have actually been rendered into a session
+        context, to commit them to the delivery ledger exactly once. The
+        reservation id comes from the prefetch envelope's
+        ``reservation_id`` field. Idempotent: a duplicate ack is a no-op
+        (``duplicate: true``, exit-0 semantics); an expired reservation
+        commits nothing (``expired: true``); an unknown id is an error.
+        The ledger identity (principal/harness/session key) is read from
+        the reservation sidecar — pass nothing here.
+        """
+        rid = (reservation or "").strip()
+        if not rid:
+            return _error("prefetch_ack requires reservation")
+        r = await _run_store_async(["prefetch-ack", "--reservation", rid])
+        if not r["ok"]:
+            return _error(_sanitize_store_error(r))
+        stdout = (r["stdout"] or "").strip()
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except json.JSONDecodeError:
+            return _error("non-JSON from store.py prefetch-ack")
+        if not isinstance(parsed, dict) or "committed" not in parsed:
+            return _error("incomplete prefetch-ack result from store.py")
+        return parsed
 
     @mcp.tool()
     async def session_start(
@@ -2289,6 +2331,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _session_caller.scoped:
             for _ns in sorted(_session_caller.namespaces or frozenset()):
                 args += ["--authorized-namespace", _ns]
+        # Issue #284 (T-05): identity-keyed delivery ledger for fleet
+        # callers — same host/harness-presence gate as prefetch.
+        if (getattr(_session_caller, "host", None)
+                or getattr(_session_caller, "harness", None)):
+            args += ["--principal=" + (_session_caller.principal_id or ""),
+                     "--harness=" + (_session_caller.harness or "")]
         timing: dict[str, int] = {}
         r = await _run_store_async(args, timing=timing)
         # _run_store records only the actual subprocess attempt.  Semaphore

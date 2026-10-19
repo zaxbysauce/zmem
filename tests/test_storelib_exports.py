@@ -380,10 +380,12 @@ class EnvelopeContractTest(unittest.TestCase):
         # only when a credential withhold happened); issue #235 adds
         # global_withheld the same way (present only when the user:global
         # tier floor withheld a candidate); issue #174 adds expired the same
-        # way (present only when the live-expiry gate engaged).
+        # way (present only when the live-expiry gate engaged); issue #284
+        # (T-05) adds reservation the same way (present only in reserve
+        # mode; mirrored in hermes-plugin/__init__.py's fallback set).
         expected_optional = {
             "injection_risk", "candidate_lanes", "budget_note", "effective_ops",
-            "secret_withheld", "global_withheld", "expired",
+            "secret_withheld", "global_withheld", "expired", "reservation",
         }
         self.assertEqual(set(INJECTION_ENVELOPE_REQUIRED), expected_required)
         self.assertEqual(set(INJECTION_ENVELOPE_OPTIONAL), expected_optional)

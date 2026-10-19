@@ -109,6 +109,16 @@ def _ascii_fold(text: str) -> str:
         chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
 
 
+def _fold_needle(needle: str) -> str:
+    """Fold a needle the way the stored surfaces fold their text: the
+    reservation sidecar rows (and every ledger entry) are written through
+    delivery_ledger.entry_text, which lowercases and collapses ALL
+    whitespace — a raw multi-line needle can never meet its stored form
+    and the scrub would silently keep the residue (review round 2,
+    finding 7; the normalized byte-verify makes any residual miss loud)."""
+    return _ascii_fold(" ".join(needle.split()))
+
+
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
@@ -812,6 +822,47 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
             stats["tmp_removed"] += 1
         except OSError:
             pass
+    # Issue #284 (T-05): reservation sidecars stage through
+    # _atomic_write_json's uuid tmp pattern; reap crashed-write orphans so
+    # ops/ never leaks the family (the .tasktext.tmp.* precedent).
+    for path in ops.glob("*.reserve.tmp.*"):
+        try:
+            path.unlink()
+            stats["tmp_removed"] += 1
+        except OSError:
+            pass
+    # Issue #284 (T-05): reservation sidecars carry entry_text fuel, so
+    # they follow the FULL ledger scrub law (drop_ids AND folded-needle
+    # entries removed; an emptied reservation file is deleted) — otherwise
+    # the fail-closed *.reserve verify below could never complete.
+    for path in ops.glob("resv-*.reserve"):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        rows = doc.get("rows") if isinstance(doc, dict) else None
+        if not isinstance(rows, list):
+            continue
+        kept = [
+            r for r in rows
+            if isinstance(r, dict)
+            and str(r.get("id", "")) not in drop_ids
+            and not any(_fold_needle(n) in _ascii_fold(str(r.get("text", "")))
+                        for n in needles)
+        ]
+        if len(kept) != len(rows):
+            doc["rows"] = kept
+            # #252 discipline (PRR-001 parity with the *.ledger scrub
+            # below): rewrite through the atomic JSON writer, never a
+            # plain truncate-write that can tear on a crash.
+            _atomic_write_json(str(path), doc)
+            stats["files_scrubbed"] += 1
+        if not kept:
+            try:
+                path.unlink()
+                stats["entries_dropped"] += 1
+            except OSError:
+                pass
     for path in ops.glob("*.ledger"):
         doc = json.loads(path.read_text(encoding="utf-8"))
         entries = doc.get("entries")
@@ -951,15 +1002,41 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     return stats
 
 
+def _verify_needle_variants(needle: str) -> list[bytes]:
+    """Byte variants one needle can take on the scanned surfaces (issue
+    #284 review round 2, finding 7): ledger/reservation entry text is
+    whitespace-collapsed and lowercased at write time
+    (delivery_ledger.entry_text), the scrub matches on the ascii fold, and
+    json.dump escapes non-ASCII to \\uXXXX — so the raw needle bytes alone
+    miss multi-line, accented and non-ASCII residue. A scrub regression
+    must never verify clean just because the encoding differs."""
+    collapsed = " ".join(needle.split()).lower()
+    folded = _ascii_fold(needle)
+    texts: list[str] = []
+    for t in (needle.lower(), collapsed, folded):
+        if t and t not in texts:
+            texts.append(t)
+    out: list[bytes] = []
+    for t in texts:
+        raw = t.encode("utf-8")
+        if raw not in out:
+            out.append(raw)
+        escaped = json.dumps(t).encode("utf-8")[1:-1]
+        if escaped and escaped not in out:
+            out.append(escaped)
+    return out
+
+
 def _verify_ledgers_clean(data_dir: Path, needles: list[str]) -> dict[str, int]:
     residue: dict[str, int] = {}
     ops = data_dir / "ops"
     if not ops.is_dir():
         return residue
-    for path in ops.glob("*.ledger*"):
+    variants = [v for n in needles for v in _verify_needle_variants(n)]
+    for path in list(ops.glob("*.ledger*")) + list(ops.glob("*.reserve")):
         data = path.read_bytes().lower()
-        for n in needles:
-            c = data.count(n.encode("utf-8").lower())
+        for v in variants:
+            c = data.count(v.lower())
             if c:
                 residue[str(path.name)] = residue.get(str(path.name), 0) + c
     return residue

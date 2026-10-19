@@ -61,6 +61,18 @@ without closing the session. The terminal CLI ``delivery-clear`` uses
 :func:`end_delivery_state` to add the bounded marker before removing both.
 Context summarized away or a session ending means "already delivered" is
 false.
+
+Reservations (issue #284, T-05): ``reserve()`` writes
+``ops/resv-<id>.reserve`` — per-id ``{id, text, bump}`` fuel plus the keyed
+identity — WITHOUT touching the ledger, and ``commit_reservation()``
+(the ``prefetch-ack`` CLI / MCP ``prefetch_ack`` tool) commits the sidecar's
+ids through :func:`record_undelivered` exactly once. A sidecar expires by
+TTL (``ZMEM_RESERVATION_TTL_S``, default 120 s) and each ledger key holds at
+most ``_RESERVATION_CAP`` (32) active reservations, oldest unacked evicted;
+a committed sidecar is never evicted before its TTL reap, so a duplicate ack
+stays a no-op even at cap pressure. Expired sidecars are reaped lazily on
+every reserve/ack; the ack's own classification (expired / duplicate) stays
+observable past its TTL by exempting the target from that reap.
 """
 
 from __future__ import annotations
@@ -167,9 +179,27 @@ def _hashed_name(session_id: str, suffix: str) -> Optional[str]:
     return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32] + suffix
 
 
-def ledger_path(data_dir: str, session_id: str) -> Optional[str]:
+def _session_key(session_id: str, principal: Optional[str] = None,
+                 harness: Optional[str] = None) -> str:
+    """Composite ledger key (issue #284, T-05).
+
+    When either identity dimension is present the hashed key material is
+    ``principal|harness|session_id`` so two machines or harnesses that
+    present the same native session id keep separate ledgers. With no
+    identity the key is EXACTLY the session id — every legacy caller,
+    on-disk ledger, and pinned test stays byte-identical.
+    """
+    if not (principal or harness):
+        return session_id or ""
+    return "|".join((principal or "", harness or "", session_id or ""))
+
+
+def ledger_path(data_dir: str, session_id: str,
+                principal: Optional[str] = None,
+                harness: Optional[str] = None) -> Optional[str]:
     """Path of the session's delivery ledger, or None without inputs."""
-    name = _hashed_name(session_id, ".ledger")
+    name = _hashed_name(_session_key(session_id, principal, harness),
+                        ".ledger")
     if not name or not data_dir:
         return None
     return os.path.join(data_dir, "ops", name)
@@ -605,8 +635,13 @@ def _load_entries(path: Optional[str], now: float) -> List[Dict[str, Any]]:
 
 
 def delivered(data_dir: str, session_id: str,
-              now: Optional[float] = None) -> List[Dict[str, Any]]:
+              now: Optional[float] = None,
+              principal: Optional[str] = None,
+              harness: Optional[str] = None) -> List[Dict[str, Any]]:
     """The session's in-window delivered entries (pruned view; no write).
+
+    Issue #284 (T-05): optional ``principal``/``harness`` select the
+    composite ledger key; omitted they keep the legacy session-id key.
 
     Issue #252: merges the base ledger with any live segments through the
     shared reducer, so rows recorded by concurrent writers whose compaction
@@ -619,23 +654,57 @@ def delivered(data_dir: str, session_id: str,
     transiently hide a row — over-delivery direction, now closed)."""
     if now is None:
         now = time.time()
+    key = _session_key(session_id, principal, harness)
     seg_lists: List[List[Dict[str, Any]]] = []
-    for p in _seg_paths(data_dir, session_id):
+    for p in _seg_paths(data_dir, key):
         entries = _read_seg_file(p)
         if entries is not None:
             seg_lists.append(entries)
-    base = _load_entries(ledger_path(data_dir, session_id), now)
+    base = _load_entries(ledger_path(data_dir, key), now)
     return _reduce_entries(base, seg_lists, now)
 
 
 def delivered_ids(data_dir: str, session_id: str,
-                  now: Optional[float] = None) -> List[str]:
-    return [e["id"] for e in delivered(data_dir, session_id, now=now)]
+                  now: Optional[float] = None,
+                  principal: Optional[str] = None,
+                  harness: Optional[str] = None) -> List[str]:
+    return [e["id"] for e in delivered(data_dir, session_id, now=now,
+                                       principal=principal, harness=harness)]
+
+
+def _entries_for(rows: List[Dict[str, Any]], moment: str, now: float,
+                 bump_eligible_ids: Optional[Iterable[str]]
+                 ) -> List[Dict[str, Any]]:
+    """Ledger entries for the given rows (shared by record paths)."""
+    eligible = None if bump_eligible_ids is None else set(bump_eligible_ids)
+    entries: List[Dict[str, Any]] = []
+    for r in rows:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if not isinstance(rid, str) or not rid:
+            continue
+        entry = {
+            "id": rid,
+            "moment": str(moment or ""),
+            "ts": now,
+            "text": entry_text(r),
+        }
+        # Only stamp the marker when the caller supplied the subset.
+        # A caller that does not know which rows were query-matched
+        # keeps the legacy four-key entry shape (pinned by the #182
+        # training acceptance repro), and readers already treat an
+        # absent key as eligible -- the correct reading for a ledger
+        # that only ever recorded query-matched rows.
+        if eligible is not None:
+            entry["bump_eligible"] = rid in eligible
+        entries.append(entry)
+    return entries
 
 
 def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
            moment: str, now: Optional[float] = None,
-           bump_eligible_ids: Optional[Iterable[str]] = None) -> None:
+           bump_eligible_ids: Optional[Iterable[str]] = None,
+           principal: Optional[str] = None,
+           harness: Optional[str] = None) -> None:
     """Record delivered rows (envelope result dicts) as ledger entries.
 
     Upsert by id (a re-delivery via the escalation path refreshes the entry),
@@ -666,39 +735,20 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
     visible (over-suppression only; the 6 h window prune self-heals)."""
     if not rows:
         return
-    path = ledger_path(data_dir, session_id)
+    key = _session_key(session_id, principal, harness)
+    path = ledger_path(data_dir, key)
     if not path:
         return
     if now is None:
         now = time.time()
-    eligible = None if bump_eligible_ids is None else set(bump_eligible_ids)
-    entries: List[Dict[str, Any]] = []
-    for r in rows:
-        rid = r.get("id") if isinstance(r, dict) else None
-        if not isinstance(rid, str) or not rid:
-            continue
-        entry = {
-            "id": rid,
-            "moment": str(moment or ""),
-            "ts": now,
-            "text": entry_text(r),
-        }
-        # Only stamp the marker when the caller supplied the subset.
-        # A caller that does not know which rows were query-matched
-        # keeps the legacy four-key entry shape (pinned by the #182
-        # training acceptance repro), and readers already treat an
-        # absent key as eligible -- the correct reading for a ledger
-        # that only ever recorded query-matched rows.
-        if eligible is not None:
-            entry["bump_eligible"] = rid in eligible
-        entries.append(entry)
+    entries = _entries_for(rows, moment, now, bump_eligible_ids)
     if not entries:
         return
-    seg = _publish_segment(data_dir, session_id, entries)
+    seg = _publish_segment(data_dir, key, entries)
     if seg is None:
         return
-    _try_compact(data_dir, session_id, now)
-    if _delivery_state_ended(data_dir, session_id):
+    _try_compact(data_dir, key, now)
+    if _delivery_state_ended(data_dir, key):
         # Self-unlink after a fresh terminal marker. Wrapped (issue #252
         # review group G): a Windows sharing violation on the unlink must
         # degrade to "the segment lingers for the sweep", never escape
@@ -709,7 +759,281 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
             pass
 
 
-def clear(data_dir: str, session_id: str) -> None:
+
+def record_undelivered(data_dir: str, session_id: str,
+                       rows: List[Dict[str, Any]], moment: str,
+                       now: Optional[float] = None,
+                       bump_eligible_ids: Optional[Iterable[str]] = None,
+                       principal: Optional[str] = None,
+                       harness: Optional[str] = None) -> List[str]:
+    """Admit-once record (issue #362 via issue #284, T-05).
+
+    Returns the ids THIS call admitted; a concurrent winner's ids come
+    back as [] (the loser observes already-delivered). LOCKING CONTRACT:
+    the delivery-state lock is acquired once and the in-lock critical
+    section is the delivered() read + `_publish_segment` for the
+    not-yet-delivered entries ONLY — never `_try_compact` (host.acquire_lock
+    is O_EXCL and non-reentrant; a nested acquire would burn the bounded
+    wait). Compaction runs after release, exactly as record() does. On
+    lock-timeout the acquire retries for up to 2 s total, then proceeds
+    lock-free with a fresh delivered() re-read immediately before
+    publishing — so the loser either admits nothing AND observes the
+    winner's entries, or the retry acquired; in the lock-pathology corner
+    (both callers exhausting the retry behind a crashed holder) the call
+    degrades to record()-level behavior, the module's documented fail-open
+    posture. The child can never crash on the lock path.
+    """
+    if not rows:
+        return []
+    key = _session_key(session_id, principal, harness)
+    if not ledger_path(data_dir, key):
+        return []
+    if now is None:
+        now = time.time()
+    entries = _entries_for(rows, moment, now, bump_eligible_ids)
+    if not entries:
+        return []
+
+    def _critical() -> List[str]:
+        current = {e["id"] for e in delivered(data_dir, key, now=now)}
+        fresh = [e for e in entries if e["id"] not in current]
+        if not fresh:
+            return []
+        seg = _publish_segment(data_dir, key, fresh)
+        if seg is None:
+            # Publication failed (the module's fail-open posture): report
+            # the ids as admitted so the caller does not retry-record.
+            return [e["id"] for e in fresh]
+        return [e["id"] for e in fresh]
+
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            with _delivery_state_lock(data_dir):
+                admitted = _critical()
+            break
+        except DeliveryStateLockError:
+            if time.monotonic() >= deadline:
+                admitted = _critical()  # lock-free fallback, fresh re-read
+                break
+            time.sleep(0.05)
+    if admitted:
+        _try_compact(data_dir, key, now)
+    return admitted
+
+
+_RESERVE_SUFFIX = ".reserve"
+_RESERVATION_TTL_DEFAULT_S = 120.0
+_RESERVATION_CAP = 32
+
+
+def _reservation_ttl_s() -> float:
+    """ZMEM_RESERVATION_TTL_S override (positive float; default 120 s —
+    the _DELIVERY_END_MARKER_TTL_S expiring-sidecar precedent)."""
+    raw = os.environ.get("ZMEM_RESERVATION_TTL_S", "").strip()
+    if not raw:
+        return _RESERVATION_TTL_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _RESERVATION_TTL_DEFAULT_S
+    return value if value > 0 else _RESERVATION_TTL_DEFAULT_S
+
+
+def _reservation_sidecar_path(data_dir: str, reservation_id: str) -> Optional[str]:
+    # Shape-check the id (review round 2, LOW recommended in-PR): ids are
+    # always self-minted uuid4().hex, so anything else is caller error —
+    # and on Windows a crafted id like "a/../../../evil" would otherwise
+    # resolve the sidecar path OUTSIDE ops/ and let commit_reservation
+    # read+mark a planted file. Malformed ids return None, which
+    # commit_reservation reports as "unknown reservation" (exit 2).
+    if (not data_dir or not reservation_id
+            or not re.fullmatch(r"[0-9a-f]{32}", reservation_id)):
+        return None
+    return os.path.join(data_dir, "ops", "resv-" + reservation_id + _RESERVE_SUFFIX)
+
+
+def _reservation_files(data_dir: str) -> List[str]:
+    ops = os.path.join(data_dir, "ops")
+    try:
+        names = os.listdir(ops)
+    except OSError:
+        return []
+    return [os.path.join(ops, n) for n in sorted(names)
+            if n.startswith("resv-") and n.endswith(_RESERVE_SUFFIX)]
+
+
+def _load_reservation(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _reap_expired_reservations(data_dir: str, now: float,
+                               keep: Optional[set] = None) -> None:
+    """Lazy TTL reap: an expired reservation commits nothing and its
+    sidecar is removed (issue #284: reservations expire if unacked).
+    ``keep`` names ids whose sidecars must survive this pass (the ack's
+    own target, so its expired/duplicate classification stays
+    observable)."""
+    keep = keep or set()
+    for path in _reservation_files(data_dir):
+        data = _load_reservation(path)
+        if data is None:
+            _unlink_delivery_path(path)
+            continue
+        try:
+            expires_at = float(data.get("ts", 0)) + float(data.get("ttl", 0))
+        except (TypeError, ValueError):
+            _unlink_delivery_path(path)
+            continue
+        if now >= expires_at and data.get("id") not in keep:
+            _unlink_delivery_path(path)
+
+
+def reserve(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
+            moment: str, now: Optional[float] = None,
+            bump_eligible_ids: Optional[Iterable[str]] = None,
+            principal: Optional[str] = None,
+            harness: Optional[str] = None) -> Optional[str]:
+    """Reserve the rendered rows WITHOUT recording delivery (issue #284).
+
+    Writes ``ops/resv-<id>.reserve`` (#252 atomic write, 0o600) holding
+    per-id ``{id, entry_text, bump}`` fuel plus the keyed-session
+    identity, so ``prefetch-ack`` can commit full-fidelity entries without
+    re-opening the store. ``bump_eligible_ids`` names the query-matched
+    subset (#136/#250 reward law): the flag rides the sidecar so the ack
+    records the same bump_eligible markers a direct record() would have. Returns the reservation id, or None when every requested
+    id is ALREADY delivered (the caller reports the already-delivered
+    turn as today). Retries mint a NEW reservation and re-select (nothing
+    was delivered, so the same ids come back). Expired sidecars are
+    reaped lazily; the per-key active cap evicts the OLDEST UNACKED
+    reservation first — a committed sidecar is never evicted before its
+    TTL reap (the duplicate-ack exit-0 guarantee holds at cap pressure).
+    """
+    key = _session_key(session_id, principal, harness)
+    if not ledger_path(data_dir, key) or not rows:
+        return None
+    if now is None:
+        now = time.time()
+    ttl = _reservation_ttl_s()
+    _reap_expired_reservations(data_dir, now)
+    current = {e["id"] for e in delivered(data_dir, key, now=now)}
+    eligible = (None if bump_eligible_ids is None
+                else set(bump_eligible_ids))
+    fuel = []
+    for r in rows:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if isinstance(rid, str) and rid and rid not in current:
+            entry = {"id": rid, "text": entry_text(r)}
+            if eligible is not None:
+                entry["bump"] = rid in eligible
+            fuel.append(entry)
+    if not fuel:
+        return None
+    # Per-key cap: evict the oldest UNACKED reservation of this key.
+    same_key = []
+    for path in _reservation_files(data_dir):
+        data = _load_reservation(path)
+        if data and data.get("session_key") == key and not data.get("committed"):
+            try:
+                same_key.append((float(data.get("ts", 0)), path))
+            except (TypeError, ValueError):
+                continue
+    same_key.sort()
+    while len(same_key) >= _RESERVATION_CAP:
+        _unlink_delivery_path(same_key.pop(0)[1])
+    reservation_id = uuid.uuid4().hex
+    payload = {
+        "id": reservation_id,
+        "session_key": key,
+        "session_id": session_id,
+        "principal": principal,
+        "harness": harness,
+        "moment": str(moment or ""),
+        "ts": now,
+        "ttl": ttl,
+        "rows": fuel,
+    }
+    path = _reservation_sidecar_path(data_dir, reservation_id)
+    if not path:
+        return None
+    try:
+        _atomic_write_json(path, payload)
+    except OSError:
+        return None
+    return reservation_id
+
+
+def commit_reservation(data_dir: str, reservation_id: str,
+                       now: Optional[float] = None) -> Dict[str, Any]:
+    """Acknowledge a reservation: commit exactly its ids, once (idempotent).
+
+    Returns ``{"committed": [...], "duplicate": bool, "expired": bool}``.
+    A duplicate ack is a no-op (the sidecar is retained until its TTL
+    reap, never deleted on commit); an expired reservation commits
+    nothing; an unknown id raises ValueError (the CLI's exit-2 refusal
+    convention).
+    """
+    if now is None:
+        now = time.time()
+    # The plan's lazy-reap letter: every reserve/ack reaps expired
+    # reservations — EXCEPT the target: the ack's own classification
+    # (expired -> {"committed": [], "expired": true}; duplicate ->
+    # exit-0 no-op) must stay observable even when the target's TTL has
+    # lapsed, so the target sidecar is exempt from this reap and dies by
+    # its own TTL on the next reserve/ack.
+    _reap_expired_reservations(data_dir, now,
+                               keep={reservation_id})
+    path = _reservation_sidecar_path(data_dir, reservation_id)
+    if not path or not os.path.exists(path):
+        raise ValueError(f"unknown reservation: {reservation_id}")
+    data = _load_reservation(path)
+    if data is None:
+        raise ValueError(f"unreadable reservation: {reservation_id}")
+    if data.get("committed"):
+        return {"committed": [], "duplicate": True, "expired": False}
+    try:
+        expired = now >= float(data.get("ts", 0)) + float(data.get("ttl", 0))
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        return {"committed": [], "duplicate": False, "expired": True}
+    sidecar_rows = [row for row in data.get("rows", [])
+                    if isinstance(row, dict)
+                    and isinstance(row.get("id"), str)]
+    rows = [{"id": row.get("id"), "content": row.get("text", "")}
+            for row in sidecar_rows]
+    # Reconstruct the #136/#250 query-matched subset from the sidecar's
+    # bump flags. A sidecar with no flag at all is a reserve() call that
+    # was not told the subset — pass None so every admitted row stays
+    # bump-eligible, the same legacy reading _entries_for gives an absent
+    # marker (never the inversion: absent-key-means-eligible applies only
+    # when the caller genuinely did not know the split).
+    if any("bump" in row for row in sidecar_rows):
+        bump_ids = [row["id"] for row in sidecar_rows if row.get("bump")]
+    else:
+        bump_ids = None
+    admitted = record_undelivered(
+        data_dir, str(data.get("session_id", "")), rows,
+        str(data.get("moment", "")), now=now,
+        bump_eligible_ids=bump_ids,
+        principal=data.get("principal"), harness=data.get("harness"))
+    data["committed"] = True
+    data["committed_ts"] = now
+    try:
+        _atomic_write_json(path, data)
+    except OSError:
+        pass  # the ledger commit already holds; the marker is best-effort
+    return {"committed": admitted, "duplicate": False, "expired": False}
+
+
+def clear(data_dir: str, session_id: str,
+          principal: Optional[str] = None,
+          harness: Optional[str] = None) -> None:
     """Remove the session's ledger — base file AND any live segments
     (compaction / PreCompact re-admission). Segments ARE ledger state
     since #252: a PreCompact clear that left un-compacted segments behind
@@ -723,12 +1047,13 @@ def clear(data_dir: str, session_id: str) -> None:
     while base and segments survive is the silent over-suppression this
     function exists to prevent. (OSError during the unlinks stays
     swallowed: pre-existing partial-clear posture, tracked separately.)"""
-    if not ledger_path(data_dir, session_id):
+    key = _session_key(session_id, principal, harness)
+    if not ledger_path(data_dir, key):
         return
     try:
         with _delivery_state_lock(data_dir):
-            _unlink_delivery_path(ledger_path(data_dir, session_id))
-            for p in _seg_paths(data_dir, session_id):
+            _unlink_delivery_path(ledger_path(data_dir, key))
+            for p in _seg_paths(data_dir, key):
                 _unlink_delivery_path(p)
     except DeliveryStateLockError:
         raise
@@ -800,24 +1125,30 @@ def consume_pending(data_dir: str, session_id: str) -> str:
     return ctx
 
 
-def clear_delivery_state(data_dir: str, session_id: str) -> None:
+def clear_delivery_state(data_dir: str, session_id: str,
+                         principal: Optional[str] = None,
+                         harness: Optional[str] = None) -> None:
     """Compaction / session end: "already delivered" is false again."""
-    if not ledger_path(data_dir, session_id):
+    key = _session_key(session_id, principal, harness)
+    if not ledger_path(data_dir, key):
         return
     try:
         with _delivery_state_lock(data_dir):
-            _clear_delivery_sidecars_locked(data_dir, session_id)
+            _clear_delivery_sidecars_locked(data_dir, key)
     except (OSError, DeliveryStateLockError):
         pass
 
 
-def end_delivery_state(data_dir: str, session_id: str) -> None:
+def end_delivery_state(data_dir: str, session_id: str,
+                       principal: Optional[str] = None,
+                       harness: Optional[str] = None) -> None:
     """Terminal SessionEnd clear with an idempotent per-session marker."""
-    if not delivery_ended_path(data_dir, session_id):
+    key = _session_key(session_id, principal, harness)
+    if not delivery_ended_path(data_dir, key):
         return
     with _delivery_state_lock(data_dir):
-        _write_delivery_ended_locked(data_dir, session_id)
-        _clear_delivery_sidecars_locked(data_dir, session_id)
+        _write_delivery_ended_locked(data_dir, key)
+        _clear_delivery_sidecars_locked(data_dir, key)
 
 
 def _load_compact(path: Optional[str]) -> Dict[str, Any]:

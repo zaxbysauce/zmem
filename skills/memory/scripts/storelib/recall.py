@@ -307,6 +307,7 @@ def build_injection_envelope(
     budget_note: str | None = None,
     effective_ops: list[str] | None = None,
     expired: int | None = None,
+    reservation: str | None = None,
 ) -> dict:
     """Build the closed passive-injection envelope shared by adapters."""
     envelope = {
@@ -350,6 +351,10 @@ def build_injection_envelope(
     # the committed #158/#183 parity wires byte-identical.
     if expired is not None:
         envelope["expired"] = expired
+    # Issue #284 (T-05): the reservation id, keyed ONLY when the selector
+    # ran in reserve mode — every legacy envelope keeps its exact bytes.
+    if reservation is not None:
+        envelope["reservation"] = reservation
     return envelope
 
 

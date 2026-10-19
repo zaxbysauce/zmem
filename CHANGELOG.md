@@ -5,6 +5,50 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.109.0] - 2026-10-19
+
+### Added
+- **Delivery reservations and principal-keyed ledger (issue #284,
+  Workstream T PR 5 of 12):** selection and delivery commitment are now
+  separate steps for remote callers, the delivery ledger gains caller
+  identity, and the reserve→ack path closes the cross-process record race
+  (#362; the non-reserve hook path keeps its documented lock-free
+  `record()` posture, so #362 stays open for the general case):
+  - `prefetch --reserve` returns the selection plus a `reservation` id
+    WITHOUT recording delivery — an identical retry inside the
+    reservation TTL returns the same ids, so a lost response is no longer
+    indistinguishable from a delivered one. `store.py prefetch-ack
+    --reservation <id>` commits exactly the reserved ids once (duplicate
+    ack is a no-op; expired reservations commit nothing; unknown ids exit
+    2). Reservation sidecars live under `ops/resv-*.reserve` with the
+    #252 atomic-write discipline, a lazy TTL reap (default 120 s,
+    `ZMEM_RESERVATION_TTL_S`), and a per-key unacked cap of 32; the
+    backup age sweep and the purge scrub/verify own the family.
+  - `--principal`/`--harness` on `prefetch`, `ledger-clear`, and
+    `delivery-clear` key the delivery ledger as
+    `principal|harness|session`; the MCP server forwards the resolved
+    principal's identity for map-mode principals (host/harness presence
+    gate — legacy single-token servers keep the byte-identical
+    session-only key). Two machines or harnesses sharing a native session
+    id never share delivery state.
+  - `delivery_ledger.record_undelivered(...)` (admit-once, #362): under
+    the delivery-state lock the check+publish is serialized, so two
+    processes racing the same (session, memory) admit exactly one and the
+    loser observes already-delivered. The local single-process selector
+    path keeps its byte-identical one-step `record()` behavior.
+  - The reservation path carries the #136/#250 reward-law split through
+    the sidecar (per-id `bump` fuel flag reconstructed at ack), so an
+    acked delivery records the same query-matched bump-eligibility
+    markers a direct `record()` would have, and the render-time
+    surfaced-count bump is skipped on the reserve path (reward follows
+    delivery). The MCP server pairs `prefetch(reserve=true)` with a
+    `prefetch_ack` tool carrying the CLI's duplicate/expired semantics.
+  - The envelope registry gains the `reservation` key (keyed only in
+    reserve mode; mirrored in the Hermes fallback set); docs/FLEET.md
+    documents the reservation workflow and the disclosed ack-vs-ingestion
+    gap (the broker can ack only what it emitted, never what the model
+    ingested).
+
 ## [0.108.0] - 2026-10-19
 
 ### Added

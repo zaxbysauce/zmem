@@ -171,16 +171,31 @@ envelope; no consumer-side renderer, no second budget run:
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
   [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
   [--ops-token <token>]... [--exclude <memory-id>]... \
-  [--authorized-namespace <ns>]...
+  [--authorized-namespace <ns>]... [--reserve] \
+  [--principal <id>] [--harness <id>]
 ```
 
 `--query`, `--namespace`, `--session-id`, and `--moment` are required; JSON is
-the command's only output mode. The MCP `prefetch` tool takes the same inputs
+the command's only output mode. `--reserve` (issue #284, T-05) selects
+WITHOUT committing the delivery ledger — the envelope carries a
+`reservation` id; acknowledge it with `store.py prefetch-ack
+--reservation <id>` once the text was emitted (a duplicate ack is a
+no-op; an unacknowledged reservation expires — default 120 s,
+`ZMEM_RESERVATION_TTL_S`; at most 32 unacked reservations live per ledger
+key, oldest evicted first — a committed sidecar is never evicted before its
+TTL reap, so the duplicate-ack no-op holds at cap pressure).
+`--principal`/`--harness` key the delivery
+ledger as `principal|harness|session`, so fleet callers sharing a native
+session id never share delivery state; omitted they keep the legacy
+session-only key. The MCP `prefetch` tool takes the same inputs
 (`query`, `namespace`, `session_id`, `moment` required; optional `lane` —
-validated against the five-value tuple, never defaulted — and `ops_tokens`),
-enforces namespace scope and the `ZMEM_INJECT=0` kill switch, and returns the
-complete selector envelope plus the additive `context` alias equal to
-`rendered`. The selector owns the relevance/trust gate and the 1,500-token
+validated against the five-value tuple, never defaulted — `ops_tokens`, and
+`reserve`), enforces namespace scope and the `ZMEM_INJECT=0` kill switch,
+returns the complete selector envelope plus the additive `context` alias
+equal to `rendered`, and pairs with the MCP `prefetch_ack` tool, which
+commits a reservation id from that envelope exactly once (same duplicate /
+expired semantics as the CLI). The selector owns the relevance/trust gate
+and the 1,500-token
 budget on both surfaces; like every passive lane, prefetch never advances
 `retrieval_count`. Delivery is session-attributed: a second turn for the same
 session whose delivery ledger already holds the candidate rows returns the

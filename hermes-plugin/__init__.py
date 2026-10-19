@@ -3264,7 +3264,10 @@ class ZmemMemoryProvider(MemoryProvider):
                            # fallback in step with
                            # storelib.inject.INJECTION_ENVELOPE_OPTIONAL —
                            # a key missing from BOTH sets blackouts recall.
-                           "expired")))
+                           "expired",
+                           # Issue #284 (T-05): the reservation id, keyed
+                           # only in reserve mode. Same keep-in-step rule.
+                           "reservation")))
 
     def pre_verify(self, **kwargs: Any) -> Dict[str, Any]:
         """Reflect-before-stop probe (issue #163): when the session captured

@@ -531,9 +531,13 @@ def cmd_sweep(marker_dir: str | None = None,
                 # Issue #252: per-call ledger segments (<hash>.ledger.seg.<hex>)
                 # carry no constant suffix, so they need a containment match
                 # alongside the endswith tuple.
-                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals"))
+                # Issue #284 (T-05): the reservation sidecar family
+                # (resv-*.reserve) joins the sweep so an unacked/expired
+                # reservation can never linger past the max-age policy.
+                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals", ".reserve"))
                         and ".ledger.seg." not in rname
-                        and ".ledger.tmp." not in rname):
+                        and ".ledger.tmp." not in rname
+                        and ".reserve.tmp." not in rname):
                     continue
                 rp = ops_dir / rname
                 try:
