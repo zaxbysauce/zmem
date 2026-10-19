@@ -34,9 +34,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (`--session-id`) hardcoded `include_global=True`, so the MCP-side
   conditional `--include-global` was inert there and a principal scoped to
   one project received `user:global` rows in its session-start fence.
-  Scoped principals now carry their allow-list on both session_start legs
-  (the legacy leg's `--include-global --global-limit 2` conditional stays
-  live and byte-identical); unscoped argv is unchanged.
+  Scoped principals now carry their allow-list on the session_start
+  selector leg (the legacy leg's flag is accepted but enforced by its
+  `--include-global --global-limit 2` conditional, which stays live and
+  byte-identical); unscoped argv is unchanged.
 
 ## [0.107.0] - 2026-10-18
 

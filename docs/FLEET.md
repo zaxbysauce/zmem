@@ -166,7 +166,8 @@ caller-claimed trust, taint, signal, and confidence at the ingest boundary
 recall alike (T-04). T-02 (per-machine principals) and T-03 (the
 ingest-side trust boundary: `--trust untrusted-peer`, the namespace
 allow-list, caller-derived attribution) shipped in 0.103.0 and 0.104.0;
-T-04 owns the rest.
+T-04's namespace-allow-list selection shipped in 0.105.0; capability
+enforcement and the broker lanes remain (#288, T-05+).
 
 Hook payloads, transcripts, and tool output are untrusted data on every
 path. Capture payloads are redacted before they leave the machine:

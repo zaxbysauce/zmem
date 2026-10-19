@@ -5137,6 +5137,9 @@ def main():
                 _read_cli_or_report_value_error(
                     recall_memory, conn, query=args.query, namespace=args.namespace,
                     scopes=scoped_cli_scopes,
+                    _authorized_namespaces=(
+                        frozenset(args.authorized_namespace)
+                        if args.authorized_namespace else None),
                     limit=args.limit, as_json=args.json, hybrid=hybrid_arg,
                     no_bump=args.no_bump, include_global=args.include_global,
                     global_limit=args.global_limit, as_of=args.as_of,
@@ -5191,6 +5194,9 @@ def main():
             _read_cli_or_report_value_error(
                 recent_memory, conn, namespace=args.namespace, limit=args.limit,
                 scopes=scoped_cli_scopes,
+                _authorized_namespaces=(
+                    frozenset(args.authorized_namespace)
+                    if args.authorized_namespace else None),
                 min_confidence=(args.min_confidence
                                 if args.min_confidence is not None
                                 else inject_recent_floor()),

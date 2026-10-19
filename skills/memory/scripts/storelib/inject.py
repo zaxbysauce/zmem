@@ -1209,7 +1209,8 @@ def select_and_budget_for_injection(
         page_candidates_pre = _pages._page_candidates_for_selector(
             conn, data_dir=resolved_data, query=effective_query,
             namespace=namespace, moment=moment, lane=lane,
-            user_global_floor=effective_user_global_floor)
+            user_global_floor=effective_user_global_floor,
+            authorized_namespaces=authorized_namespaces)
         page_candidate_ids_pre = [r.get("id") for r in page_candidates_pre
                                   if isinstance(r.get("id"), str)]
         page_rows_pre = [r for r in page_candidates_pre if r.get("id") not in exclusions]

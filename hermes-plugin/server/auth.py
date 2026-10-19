@@ -345,10 +345,10 @@ class StaticTokenVerifier(TokenVerifier):
 # -- Workstream T: per-machine principals (issue #281) ------------------------
 
 #: Capabilities an entry may declare; absent = the legacy behaviour of that
-#: token kind (parsed and minted into AccessToken.scopes; enforcement is
-#: owned by the authorization-aware selection PR (#283) and the op queue
-#: (#288) — parse-only forward-compat metadata in this PR, disclosed in the
-#: issue #281 trace).
+#: token kind (parsed and minted into AccessToken.scopes; namespace-allow-list
+#: selection shipped in 0.105.0 (#283); capability enforcement itself remains
+#: owned by the op queue (#288) — parse-only forward-compat metadata here,
+#: disclosed in the issue #281 trace).
 _ALLOWED_CAPABILITIES = frozenset(
     {"read", "passive", "write", "mutate", "admin"}
 )
