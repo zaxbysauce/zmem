@@ -123,6 +123,165 @@ def test_generous_deadline_succeeds():
         assert calls["n"] == 1, "the subprocess must have run exactly once"
 
 
+def test_short_deadline_success_path_and_unit_scale():
+    """N-5 (review F-2): a ~2 s budget on a fast fake store SUCCEEDS with
+    the subprocess timeout clamped near the remaining budget — kills both
+    demonstrated mutants (expired() = declared_ms < 30000 would refuse a
+    2000 ms call; a divide-by-10000 unit error would clamp the timeout to
+    0.2 s)."""
+    with _pinned_server("short-ok") as (server, mod, tmp):
+        seen = {}
+        real_run_store = mod._run_store
+
+        def fast_fake(args, input_text=None, timing=None, timeout=None):
+            seen["timeout"] = timeout
+            return {"ok": True,
+                    "stdout": '{"id": "short-ok", "result": "stored"}',
+                    "stderr": "", "returncode": 0}
+
+        mod._run_store = fast_fake
+        try:
+            resp = _call(server, "add", {
+                "type": "fact", "content": "t07-supp short-ok",
+                "namespace": "user:global", "deadline_ms": 2000,
+            })
+        finally:
+            mod._run_store = real_run_store
+        assert resp.get("result") == "stored", resp
+        assert seen["timeout"] is not None and 1.5 <= seen["timeout"] <= 1.9, (
+            f"the subprocess timeout must be the ~1.8 s remaining budget "
+            f"(2 s minus the reserve), got: {seen['timeout']!r}")
+
+
+def test_pool_knobs_are_distinct_and_swap_detectable():
+    """N-21: with DIFFERENT read/write knob values, the module constants
+    and both semaphores must reflect them (a construction swap would fail
+    the value assertions)."""
+    tmp = tempfile.mkdtemp(prefix="zmem-t07s-pools-")
+    saved = {k: os.environ.get(k) for k in _PIN_KEYS}
+    for key in _PIN_KEYS:
+        os.environ.pop(key, None)
+    os.environ.update({
+        "ZMEM_HOME": str(REPO_ROOT),
+        "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+        "ZMEM_DATA": tmp,
+        "ZMEM_MODELS_DIR": os.path.join(tmp, "missing-models"),
+        "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        "PYTHONIOENCODING": "utf-8",
+        "ZMEM_MCP_TOKEN": "t07-supp-token",
+        "ZMEM_MCP_MAX_CONCURRENT_READ": "3",
+        "ZMEM_MCP_MAX_CONCURRENT_WRITE": "5",
+    })
+    for mod_name in [k for k in list(sys.modules) if k == "mcp_server"]:
+        del sys.modules[mod_name]
+    sys.path.insert(0, str(SERVER_DIR))
+    try:
+        import mcp_server
+        assert mcp_server._MAX_CONCURRENT_READ == 3, (
+            mcp_server._MAX_CONCURRENT_READ)
+        assert mcp_server._MAX_CONCURRENT_WRITE == 5, (
+            mcp_server._MAX_CONCURRENT_WRITE)
+        read_sem, write_sem = asyncio.run(_acquire_both(mcp_server))
+        assert read_sem is not write_sem
+    finally:
+        sys.path.remove(str(SERVER_DIR))
+        for mod_name in [k for k in list(sys.modules) if k == "mcp_server"]:
+            del sys.modules[mod_name]
+        shutil.rmtree(tmp, ignore_errors=True)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+async def _acquire_both(mod):
+    """Acquire one permit from each pool (post-rebind) and return them."""
+    r = mod._get_read_semaphore()
+    w = mod._get_store_semaphore()
+    await r.acquire()
+    await w.acquire()
+    r.release()
+    w.release()
+    return r, w
+
+
+def test_submit_failure_releases_the_permit():
+    """N-20: when executor.submit raises after a successful acquire, the
+    submit-failure guard must restore the pool permit (a dropped release
+    would permanently shrink the pool)."""
+    with _pinned_server("submitfail") as (server, mod, tmp):
+        class _BoomExecutor:
+            def submit(self, *a, **k):
+                raise RuntimeError("fb submit failure")
+
+        real_executor = mod._store_executor
+        mod._store_executor = _BoomExecutor()
+        try:
+            raised = None
+            try:
+                _call(server, "add", {
+                    "type": "fact", "content": "t07-supp submitfail",
+                    "namespace": "user:global", "deadline_ms": 30000,
+                })
+            except Exception as exc:
+                raised = exc
+            assert raised is not None, (
+                "a submit failure must propagate (after the permit is "
+                f"restored), got: {resp!r}" if False else
+                "a submit failure must propagate after the permit restore")
+            sem = mod._get_store_semaphore()
+            assert sem._value >= 1, (
+                f"the write-pool permit must be restored after a submit "
+                f"failure (value={sem._value})")
+        finally:
+            mod._store_executor = real_executor
+
+
+def test_recall_and_update_honour_the_deadline():
+    """N-17: deadline coverage beyond add/prefetch — recall carries the
+    client_protocol gate, and update's multi-leg span recomputes the
+    budget so the mutation leg is killed inside what is left."""
+    with _pinned_server("recall-update") as (server, mod, tmp):
+        real_run_store = mod._run_store
+
+        def two_leg_fake(args, input_text=None, timing=None, timeout=None):
+            # Model subprocess.run's kill: a timeout below the fake's 2 s
+            # work time surfaces the same envelope _run_store returns on
+            # TimeoutExpired (flag set, stdout empty).
+            if timeout is not None and timeout < 1.9:
+                return {"ok": False, "stdout": "",
+                        "stderr": f"store.py timed out after {timeout}s",
+                        "returncode": 124, "deadline_exceeded": True}
+            if args and args[0] == "get":
+                return {"ok": True, "stdout": '{"namespace": "user:global", "tags": ""}',
+                        "stderr": "", "returncode": 0}
+            time.sleep(2.0)
+            return {"ok": True, "stdout": '{"id": "upd", "result": "updated"}',
+                    "stderr": "", "returncode": 0}
+
+        mod._run_store = two_leg_fake
+        try:
+            refused = _call(server, "recall", {
+                "query": "t07 supp gate", "client_protocol": 99})
+            assert refused.get("error") == "protocol_incompatible", (
+                f"recall must carry the client_protocol gate: {refused!r}")
+            expired = _call(server, "recall", {
+                "query": "t07 supp gate", "deadline_ms": 0})
+            assert expired.get("error") == "deadline_exceeded", expired
+            started = time.perf_counter()
+            resp = _call(server, "update", {
+                "id": "fb-target", "content": "t07 supp update",
+                "deadline_ms": 500})
+            elapsed = time.perf_counter() - started
+            assert resp.get("error") == "deadline_exceeded", resp
+            assert elapsed < 2.0, (
+                f"update's mutation leg must be killed inside the "
+                f"recomputed budget, took {elapsed:.2f}s")
+        finally:
+            mod._run_store = real_run_store
+
+
 def test_deadline_ms_normalization_table():
     with _pinned_server("normalize") as (server, mod, tmp):
         ran = {"n": 0}
@@ -135,7 +294,8 @@ def test_deadline_ms_normalization_table():
 
         mod._run_store = never_fake
         try:
-            for bad in (True, "500", -1, [500], {"ms": 500}, 1.5 + 0j):
+            for bad in (True, "500", -1, [500], {"ms": 500}, 1.5 + 0j,
+                        float("nan"), float("inf")):
                 resp = _call(server, "add", {
                     "type": "fact", "content": "t07-supp normalize",
                     "namespace": "user:global", "deadline_ms": bad,
@@ -145,6 +305,9 @@ def test_deadline_ms_normalization_table():
                     f"deadline_ms={bad!r} must yield the structured "
                     f"invalid-argument refusal, got: {resp!r}")
                 assert resp.get("field") == "deadline_ms", resp
+                # N-8/N-15: the echoed value is bounded (never the raw
+                # unserializable float or an unbounded container).
+                assert len(repr(resp.get("value"))) <= 80, resp
             # A valid float deadline is accepted (numbers are numbers).
             ok_resp = _call(server, "add", {
                 "type": "fact", "content": "t07-supp float-ok",
@@ -191,6 +354,10 @@ def test_expired_at_entry_touches_no_ledger_family():
 def _all_checks():
     return (
         test_generous_deadline_succeeds,
+        test_short_deadline_success_path_and_unit_scale,
+        test_pool_knobs_are_distinct_and_swap_detectable,
+        test_submit_failure_releases_the_permit,
+        test_recall_and_update_honour_the_deadline,
         test_deadline_ms_normalization_table,
         test_expired_at_entry_touches_no_ledger_family,
     )

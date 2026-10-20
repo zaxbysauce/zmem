@@ -140,6 +140,28 @@ jobs:
           fi
           echo "t06 hello-handshake checks green (base + feedback)"
 
+      # Issue #286 (Workstream T PR 7): same guard for the deadline checks —
+      # the frozen acceptance file + the supp file both SKIP without mcp.
+      - name: MCP deadline checks (skip-guarded)
+        shell: bash
+        run: |
+          set -e
+          out="$(python tests/test_t07_deadline.py 2>&1)" || {
+            printf '%s' "$out"
+            exit 1
+          }
+          printf '%s' "$out"
+          out2="$(python tests/test_t07_deadline_supp.py 2>&1)" || {
+            printf '%s' "$out2"
+            exit 1
+          }
+          printf '%s' "$out2"
+          if printf '%s' "$out" | grep -Eq '^SKIP:' || printf '%s' "$out2" | grep -Eq '^SKIP:'; then
+            echo "::error::t07 deadline checks skipped — the mcp dependency must be installed and exercised on every matrix leg (issues #159/#286)"
+            exit 1
+          fi
+          echo "t07 deadline checks green (frozen + supp)"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

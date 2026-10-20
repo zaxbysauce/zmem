@@ -878,13 +878,17 @@ minimal by design (liveness only — no version identity).
 an optional `deadline_ms` (the caller's REMAINING budget, in
 milliseconds). The hub bounds queue admission, the store subprocess and
 its response reserve by that budget and returns the stable
-`deadline_exceeded` error when it expires (nothing is committed by an
-expired call; an unacknowledged prefetch reservation left behind commits
-nothing and TTL-reaps per the T-05 contract). Reads and writes draw from
-separate concurrency pools (`ZMEM_MCP_MAX_CONCURRENT_READ` /
-`ZMEM_MCP_MAX_CONCURRENT_WRITE`), so a burst of writes cannot starve
-passive injection. Calls without `deadline_ms` keep the fixed legacy
-budgets (60 s queue wait, 30 s subprocess) byte-identically.
+`deadline_exceeded` error when it expires (an expired call is killed at
+the deadline; a write that committed just before the kill is not rolled
+back — verify before retrying; an unacknowledged prefetch reservation
+left behind commits nothing and TTL-reaps per the T-05 contract; the
+same eager-write window exists on `session_start`'s selector leg). Reads
+and writes draw from separate concurrency pools
+(`ZMEM_MCP_MAX_CONCURRENT_READ` / `ZMEM_MCP_MAX_CONCURRENT_WRITE`), so a
+burst of writes cannot starve passive injection; the legacy
+`ZMEM_MCP_MAX_CONCURRENT` knob seeds both pools, doubling the aggregate
+cap it capped before. Calls without `deadline_ms` keep the fixed legacy
+budgets (60 s queue wait, 30 s subprocess).
 
 **On the store-host box** (this machine, with `~/.zmem/store.sqlite`):
 

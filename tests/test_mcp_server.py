@@ -739,7 +739,9 @@ class McpServerToolSurfaceTest(unittest.TestCase):
                     "stderr": ""}
 
         self.mcp_server._MAX_CONCURRENT_STORE = 1
-        self.mcp_server._store_semaphore = None
+        # Issue #286 review N-4: search draws from the READ pool — reset it
+        # alongside the legacy alias so the planted seam takes effect.
+        self.mcp_server._read_semaphore = None
         original = self.mcp_server._run_store_async
         self.mcp_server._run_store_async = _spy
         try:
@@ -748,6 +750,7 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         finally:
             self.mcp_server._run_store_async = original
             self.mcp_server._store_semaphore = None
+            self.mcp_server._read_semaphore = None
         argv = captured.get("argv", [])
         self.assertTrue(argv, "search must invoke the store subprocess")
         self.assertIn("--no-hybrid", argv,

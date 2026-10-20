@@ -1136,12 +1136,17 @@ def _run_store(
             "stderr": proc.stderr,
             "returncode": proc.returncode,
         }
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         _record_timing()
         effective = _STORE_TIMEOUT_S if timeout is None else timeout
         result = {
             "ok": False,
-            "stdout": "",
+            # N-24: CPython populates exc.stdout/stderr on Windows via the
+            # post-kill communicate(); a post-commit kill's stdout carries
+            # the "[zmem] added memory <id>" line, which is exactly the
+            # evidence _sanitize_store_error's [zmem]-line preference needs
+            # to tell the caller the write DID land.
+            "stdout": exc.stdout or "",
             "stderr": f"store.py timed out after {effective}s",
             "returncode": 124,
         }
@@ -1192,7 +1197,9 @@ def _get_read_semaphore() -> "asyncio.Semaphore":
 def _pool_semaphore(pool: str) -> "asyncio.Semaphore":
     if pool == "read":
         return _get_read_semaphore()
-    return _get_store_semaphore()
+    if pool == "write":
+        return _get_store_semaphore()
+    raise ValueError(f"unknown pool: {pool!r}")
 
 
 # Shared thread pool for store.py subprocess offload. Bounded large enough that
@@ -1257,9 +1264,30 @@ async def _run_store_async(
                 "deadline_ms": deadline.describe(),
             }
     try:
-        await asyncio.wait_for(sem.acquire(), timeout=queue_budget)
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=queue_budget)
+        except RuntimeError as exc:
+            # N-6: an asyncio.Semaphore binds its loop on the first CONTENDED
+            # acquire (not construction), and the module-level pools are never
+            # invalidated — a harness that runs a second event loop over the
+            # same import hits "bound to a different event loop". Recreate the
+            # pool's semaphore on the CURRENT loop and retry once.
+            if "bound to a different event loop" not in str(exc):
+                raise
+            global _store_semaphore, _read_semaphore
+            if pool == "read":
+                _read_semaphore = None
+                sem = _get_read_semaphore()
+            else:
+                _store_semaphore = None
+                sem = _get_store_semaphore()
+            await asyncio.wait_for(sem.acquire(), timeout=queue_budget)
     except asyncio.TimeoutError:
-        if deadline is not None and deadline.expired():
+        # N-22: asyncio timers may fire up to one clock resolution EARLY, so
+        # a budget-exhausted wait can reach this handler with remaining_s()
+        # a hair above 0 — classify it as the deadline, not a 503 overload
+        # (clients branch on the token).
+        if deadline is not None and deadline.remaining_s() <= 0.02:
             return {
                 "ok": False, "stdout": "",
                 "stderr": "caller deadline expired waiting for a "
@@ -1278,6 +1306,18 @@ async def _run_store_async(
                 "pool; retry shortly"
             ),
             "returncode": 503,
+        }
+    if deadline is not None and deadline.expired():
+        # N-14: the slot was granted after the budget died — release it and
+        # return the deadline envelope instead of spawning a subprocess with
+        # timeout=0.0 that is guaranteed to be killed at first poll.
+        sem.release()
+        return {
+            "ok": False, "stdout": "",
+            "stderr": "caller deadline expired when the pool slot was granted",
+            "returncode": 504,
+            "error": _ERROR_DEADLINE_EXCEEDED,
+            "deadline_ms": deadline.describe(),
         }
     loop = asyncio.get_running_loop()
     # Submit directly to the executor so we hold the CONCURRENT future (whose
@@ -1672,7 +1712,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return None, None
         normalized = _deadline_from_raw(deadline_ms)
         if isinstance(normalized, str):
-            return None, _invalid_argument("deadline_ms", deadline_ms)
+            # N-8/N-15: bound the echoed value — the raw object can be a
+            # non-serializable float (NaN/Inf) or an unbounded container,
+            # while every sibling echo surface (describe, client_protocol)
+            # is capped.
+            return None, _invalid_argument(
+                "deadline_ms", _render_client_protocol(deadline_ms))
         return normalized, None
 
     def _protocol_allowed(client_protocol: object) -> bool:
@@ -3047,6 +3092,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if _bad_deadline is not None:
             return _bad_deadline
         if deadline is not None and deadline.expired():
+            await _append_session_decision_async(
+                status="silent", reason="deadline-exceeded",
+                ids=[], all_ids=[], lane=None, t_ms=0,
+            )
             return _deadline_response(deadline)
         # ``lane`` is optional for old clients.  An explicit value is closed
         # and rejected before namespace/store work so a typo cannot produce an
@@ -3124,6 +3173,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         r = await _run_store_async(args, deadline=deadline, pool="read")
         if not r["ok"]:
             if r.get("error") == _ERROR_DEADLINE_EXCEEDED or r.get("deadline_exceeded"):
+                await _append_session_decision_async(
+                    status="silent", reason="deadline-exceeded",
+                    ids=[], all_ids=[], lane=lane, t_ms=elapsed,
+                )
                 return _store_failure(r)
             # Twin of prefetch's loud mixed-version error (issue #284
             # review): an older ZMEM_HOME checkout rejects the new flag.

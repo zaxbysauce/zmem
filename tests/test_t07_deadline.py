@@ -5,7 +5,7 @@ tests/test_hermes_transport.py -k Deadline, untouched). Every check names
 its standing at both ends:
 
 - AC1 ``test_queue_admission_honours_caller_deadline`` — with every
-  concurrency slot held (``_MAX_CONCURRENT_STORE`` slow fake stores), an
+  concurrency slot held (``_MAX_CONCURRENT_WRITE`` slow fake stores), an
   ``add`` carrying ``deadline_ms=500`` must return the stable error token
   ``deadline_exceeded`` within 500 ms + 100 ms slack (elapsed < 0.6 s),
   not wait on the fixed 60 s queue budget. RED at base (``deadline_ms``
@@ -102,6 +102,11 @@ _PIN_KEYS = (
     "ZMEM_NAMESPACE", "ZMEM_CROSS_PROJECT", "ZMEM_MCP_TOKEN",
     "ZMEM_MCP_TOKEN_FILE", "ZMEM_MCP_TOKENS_FILE", "ZMEM_MCP_DEFAULT_NS",
     "ZMEM_EMBED_PROFILE", "ZMEM_HOST", "ZMEM_SESSION",
+    # Issue #286 review N-4: the pool sizing + queue knobs are read at
+    # import into module constants — ambient values would mis-size the
+    # slot saturation AC1/AC3 rely on.
+    "ZMEM_MCP_MAX_CONCURRENT", "ZMEM_MCP_MAX_CONCURRENT_READ",
+    "ZMEM_MCP_MAX_CONCURRENT_WRITE", "ZMEM_MCP_QUEUE_TIMEOUT_S",
 )
 
 # AC1: the issue's own bound — deadline_ms=500 plus 100 ms slack.
@@ -211,7 +216,7 @@ def _live_row_count(store_path: str) -> int:
 async def _run_full_slot_scenario(server, mod, measured_call):
     """Saturate every store slot, then run ONE measured call, then unwind.
 
-    Launches ``mod._MAX_CONCURRENT_STORE`` filler ``add`` calls (they hold
+    Launches ``mod._MAX_CONCURRENT_WRITE`` filler ``add`` calls (they hold
     a permit each for the fake's sleep), waits 0.3 s so every filler has
     acquired its slot, then times ``measured_call()`` — an async callable
     invoking the tool under measurement. Filler tasks are cancelled and
@@ -228,7 +233,7 @@ async def _run_full_slot_scenario(server, mod, measured_call):
             }, context=None)
 
     fillers = [asyncio.create_task(filler(i))
-               for i in range(mod._MAX_CONCURRENT_STORE)]
+               for i in range(mod._MAX_CONCURRENT_WRITE)]
     await asyncio.sleep(0.3)  # let every filler acquire a slot
     started = time.perf_counter()
     resp = await measured_call()
@@ -268,7 +273,7 @@ def test_queue_admission_honours_caller_deadline():
         assert elapsed < _AC1_MAX_ELAPSED_S, (
             f"a call carrying deadline_ms=500 must be answered within "
             f"500 ms + 100 ms slack even when all "
-            f"{mod._MAX_CONCURRENT_STORE} slots are held; measured "
+            f"{mod._MAX_CONCURRENT_WRITE} slots are held; measured "
             f"{elapsed:.2f}s (queue admission ignored the caller's "
             f"deadline and waited on the fixed budget)")
         assert isinstance(resp, dict), f"expected a dict, got {resp!r}"
@@ -369,7 +374,7 @@ def test_passive_reads_not_starved_by_writes():
         assert elapsed < _AC3_MAX_ELAPSED_S, (
             f"a passive prefetch must be admitted from the separate READ "
             f"pool while the WRITE pool is saturated; measured "
-            f"{elapsed:.2f}s under {mod._MAX_CONCURRENT_STORE} held write "
+            f"{elapsed:.2f}s under {mod._MAX_CONCURRENT_WRITE} held write "
             f"slots (one shared pool starved the read behind the burst)")
         assert isinstance(resp, dict), f"expected a dict, got {resp!r}"
         assert "error" not in resp, (
