@@ -5,6 +5,55 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.112.0] - 2026-10-20
+
+### Added
+- **Authenticated hello handshake (issue #285, Workstream T PR 6 of 12):**
+  fleet clients can now negotiate compatibility with the hub at runtime
+  instead of silently accepting a changed envelope:
+  - New MCP tool `hello` (authenticated, no store subprocess) returns the
+    hub's full identity: `protocol` major, `event_schema` (envelope
+    schema) version, `capture_policy` id, `store_schema` version, the
+    active `embed_profile` and `reranker_profile` ids, `zmem_version`,
+    and a sorted `capabilities` list (auth mode, reservations, evidence
+    paging, …). The unauthenticated `/health` probe stays minimal by
+    design.
+  - Every other MCP tool accepts an optional `client_protocol` (the
+    caller's protocol major, typed raw so validation happens at the hub).
+    A major outside the hub's supported window is refused on writes and
+    interactive reads with the stable `protocol_incompatible` error
+    BEFORE any subprocess (nothing is stored); passive reads
+    (`prefetch`, `session_start`) fail open with the empty envelope and
+    `reason: "protocol-incompatible"` — distinguishable from
+    `empty-pool`, never an error. `session_start` also logs the refusal
+    to the decision log. An omitted `client_protocol` is a legacy client
+    treated as protocol 1 for one release.
+  - New dependency-free module `skills/memory/scripts/protocol.py` is
+    the single source of truth for the constants (protocol majors,
+    supported window, event-schema version, capture-policy id, error and
+    reason tokens) — the same discipline as `schema_meta.py`, consumed
+    next by the T-08 broker negotiation loop.
+  - CI runs the new `tests/test_t06_hello.py` acceptance checks on both
+    matrix legs with a skip guard (the #159 blind-spot rule).
+### Fixed
+- Review-round fixes (swarm-pr-review pr387-20261020): the embed/reranker
+  identity loader logs failures and no longer skips the reranker leg when
+  the embed leg fails; hello resolves `zmem_version` with the same
+  ZMEM_HOME-first precedence as every identity field and exposes
+  `supported_protocol_majors`; a deeply nested `client_protocol` gets the
+  stable refusal instead of a RecursionError; the documented
+  legacy-compat levers are both named (surgical constant move vs window
+  edit) and an empty window tuple is honored; `ZMEM_INJECT=0` now
+  dominates a client-supplied `client_protocol` on the passive surfaces;
+  protocol refusals log at debug; `--reserve` on an outdated store gets
+  an actionable mixed-version error; `miss_rate` excludes the
+  `protocol-incompatible` boundary reason from the missed classification
+  (the #133 class); fallback-literal and lever comments corrected; new
+  unfrozen checks `tests/test_t06_hello_fb.py` cover all 13 gates, the
+  raw-value normalization contract, the refusal payload shape, the
+  kill-switch precedence, the decision-log leg, and the principal-map
+  capability branch.
+
 ## [0.111.0] - 2026-10-20
 
 - **Schema 18 — the `event` type and `memory_occurrence` side table

@@ -854,6 +854,26 @@ Instead, run the **zmem MCP server** on this box (the store host) and point
 the remote Hermes at it. The remote gets the same `recall` / `add` / `search`
 / `supersede` / `recent` tools over the network.
 
+**Compatibility handshake (issue #285)** — an authenticated client can call
+the `hello` tool to learn the hub's full negotiation identity in one round
+trip: `protocol` (major), `event_schema` (envelope schema version),
+`capture_policy`, `store_schema`, `embed_profile`, `reranker_profile`,
+`zmem_version`, `supported_protocol_majors` (the accepted window), and a
+sorted `capabilities` list (auth mode, reservation support, evidence
+paging, …). Every other tool accepts an optional
+`client_protocol` (your protocol major): a major outside the hub's supported
+window is refused on writes and interactive reads with the stable
+`protocol_incompatible` error (nothing is stored), while passive reads
+(`prefetch`, `session_start`) fail open with the empty envelope and
+`reason: "protocol-incompatible"` — distinguishable from `empty-pool`, never
+an error. An omitted `client_protocol` is a legacy client, treated as
+protocol 1 for one release. (Boundary note: a call that is BOTH malformed
+— missing required fields — and protocol-incompatible fails FastMCP's
+argument validation before the gate runs; the stable
+`protocol_incompatible` token is guaranteed for well-formed calls.) The
+unauthenticated `/health` probe stays
+minimal by design (liveness only — no version identity).
+
 **On the store-host box** (this machine, with `~/.zmem/store.sqlite`):
 
 ```bash

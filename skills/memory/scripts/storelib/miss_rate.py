@@ -994,7 +994,11 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     # nothing, so a failure in such a window is "switch off", never a
     # retrieval miss. Without this bucket every disabled line collapses
     # into missed and a disabled box reports a false 100% miss rate.
-    disabled_lines = [ln for ln in lines if ln.get("reason") == "disabled"]
+    # issue #285/#133 class: every deliberate-silence boundary reason the
+    # hub writes must be excluded from the missed classification, exactly
+    # like the kill switch — a negotiation refusal is not a retrieval miss.
+    disabled_lines = [ln for ln in lines if ln.get("reason") in (
+        "disabled", "protocol-incompatible")]
     decision_ts = [ln["ts"] for ln in lines]
     period = [min(decision_ts), max(decision_ts)] if decision_ts else None
     sid_lines = sum(1 for ln in lines if ln.get("sid") is not None)
