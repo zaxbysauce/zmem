@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "90635604f5a902aada3395c772d6d7a501b09686c4f75327d26103a77315dad4",
+  "digest": "6c9e6a5ce9ef67a8cbfc464d32c58d877449486b786d864e236243f109dee81c",
   "files": {
     "hermes-plugin/__init__.py": "4b0a6c2521c87fbfcdcec7fe1515de6093492a2563ea272aec8df01931741498",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
@@ -11,7 +11,7 @@
     "hermes-plugin/server/auth.py": "b0b2072d60f76423eaa1b0ad69e477f5ac698f685981bf65b648f236bdcdceb1",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
-    "hermes-plugin/server/mcp_server.py": "80395ea875bdfae5cce56da7d1cfbd632895d12521ad5dbddf13c8de453cdc9f",
+    "hermes-plugin/server/mcp_server.py": "1ad578e2b21bd53e3c95c4f5feb60c5730046d4b1d95c2193d9b2942cbff9552",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hermes-plugin/transport.py": "ee264bc110ac8061bbefd70111d938e56c6bd03503d498799105312ad76ad808",
@@ -106,7 +106,7 @@
     "skills/memory/scripts/storelib/recall.py": "a01b5dbae36a50ac320939fd81d18cd0bb8709ae6685386b812703892a79da4e",
     "skills/memory/scripts/storelib/rekey.py": "ed7e38f9660c2aa3aa6b2251e133f06d574bd87f3bd23c714fd585472ec6dfb3",
     "skills/memory/scripts/storelib/retain.py": "6b950fc9f8613206c2c2c688faf8b652bddd8d4d0d2f9752eadc3f58c443e111",
-    "skills/memory/scripts/storelib/schema.py": "59ec017281da20ee2cdaac2b68d22f4d5235fe4ae5af34a1000203fa82179b49",
+    "skills/memory/scripts/storelib/schema.py": "4f6a0a6d321afd298e28702fee377cc1dae29c5e0e41109a4467891f668f7c87",
     "skills/memory/scripts/storelib/source.py": "72050fcc2ed63c3f99089ece204022038ccfeff13017cf2505ea3c288df5c3a2",
     "skills/memory/scripts/storelib/state.py": "aa4c8f3648e81e05a982de6e89471754de5ec0aad3c957452cbd8a702c839f61",
     "skills/memory/scripts/storelib/state_expiry.py": "fb3f2286aa5d503cce9288e6f9382e177f22750079d311f1faa985084e43f9bf",

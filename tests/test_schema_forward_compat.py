@@ -64,7 +64,7 @@ class SchemaCompatGateTest(unittest.TestCase):
         # FORWARD_COMPAT defaults to SUPPORTED: today's behavior preserved.
         # v16 (#175) deliberately held a ONE-STEP gap (the entity-kinds
         # rebuild is not additive, so FORWARD stayed 15 while SUPPORTED was
-        # 16). v17 (#178) is purely additive (new side table + index, no
+        # 16). v18 (#178) is purely additive (new side table + index, no
         # memory column or constraint change), so the window REOPENS AT
         # PARITY: FORWARD == SUPPORTED and a store above SUPPORTED (v18+)
         # still refuses exactly as before.
@@ -207,7 +207,7 @@ class SchemaCompatGateTest(unittest.TestCase):
         """Issue #175 AC4: a v15 client (SUPPORTED=15, FORWARD=15) refuses a
         newer upgrade-required store with the existing actionable message.
         Both imported bindings (storelib.schema and schema_meta) are patched,
-        restored by the patch context managers. v17 (#178): the store the
+        restored by the patch context managers. v18 (#178): the store the
         CURRENT code builds is v18 — still above a v15 client's ceiling, so
         the refusal contract is unchanged at the new boundary."""
         import schema_meta as meta
@@ -563,7 +563,7 @@ class OlderV16ClientOnV18StoreTest(unittest.TestCase):
 
 
 class Schema18MigrationTest(unittest.TestCase):
-    """Issue #178 AC1 (atomicity): a failing v17 DDL statement leaves the
+    """Issue #178 AC1 (atomicity): a failing v18 DDL statement leaves the
     schema_version marker and the pre-migration table set unchanged."""
 
     def test_failed_v18_migration_is_atomic(self):

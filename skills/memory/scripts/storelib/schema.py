@@ -1383,12 +1383,14 @@ _EVIDENCE_LOOKUP_INDEX_DDL = (
     "ON memory_evidence(evidence_id, memory_id)"
 )
 
-# v15 (issue #173): the additive `memory_expiry` side table. `memory_id` is the
-# PK (one expiry record per memory row) and REFERENCES memory(id) documents the
-# parent — but no code enables SQLite foreign keys, so the REFERENCES clause is
-# inert and the writer's explicit `DELETE FROM memory_expiry` cleanup is what
-# keeps the side table from orphaning on a tombstone. `idx_memory_expiry_until`
-# is the single index (#174's live-expiry gate scans by inject_until).
+# v18 (issue #178): the additive `memory_occurrence` side table — the
+# occurrence triple (occurred_start/occurred_end/mentioned_at) for `event`
+# rows. `memory_id` is the PK (one occurrence record per memory row) and
+# REFERENCES memory(id) documents the parent; as with every side table in
+# this file, no code enables SQLite foreign keys, so the REFERENCES clause
+# is inert and the writers' explicit cleanup keeps it from orphaning.
+# `idx_memory_occurrence_range` is the single index (the temporal arm's
+# overlap window scans by occurred_start/occurred_end).
 _MEMORY_OCCURRENCE_SCHEMA_DDL = (
     """
     CREATE TABLE IF NOT EXISTS memory_occurrence (
@@ -1441,7 +1443,13 @@ def _migrate_v18(conn: sqlite3.Connection) -> None:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
 
-
+# v15 (issue #173): the additive `memory_expiry` side table. `memory_id` is
+# the PK (one expiry record per memory row) and REFERENCES memory(id)
+# documents the parent — but no code enables SQLite foreign keys, so the
+# REFERENCES clause is inert and the writer's explicit
+# `DELETE FROM memory_expiry` cleanup is what keeps the side table from
+# orphaning on a tombstone. `idx_memory_expiry_until` is the single index
+# (#174's live-expiry gate scans by inject_until).
 _MEMORY_EXPIRY_SCHEMA_DDL = (
     """
     CREATE TABLE IF NOT EXISTS memory_expiry (

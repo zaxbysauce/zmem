@@ -40,10 +40,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the occurrence row in the SAME transaction, and the hard-delete paths
   (purge, import-store) clean it through the shared side-table registry.
   Update transitions: event->event inherits the occurrence onto the
-  replacement row; event->non-event cleans; non-event->event is refused;
-  dedup folds keep the keeper's occurrence (the caller's args are
-  discarded with a visible warning). Occurrence data does NOT travel
-  through export/import yet — export emits a notice whenever occurrence
+  replacement row; event->non-event cleans; non-event->event is refused.
+  A dedup fold is the event->event transition with an EXISTING target, so
+  the inherited triple follows the same inheritance rule there: carried
+  onto an event target that has no occurrence of its own, keeper wins on
+  conflict, and every discard prints a visible warning (an update takes
+  no occurrence arguments — what a fold can drop is the SUPERSEDED row's
+  inherited data, never caller args). Occurrence data does NOT travel
+  through export/import yet — export emits a scoped, counted notice
+  whenever occurrence
   rows cannot travel (never dropping metadata silently).
 - **`storelib/temporal.py`:** deterministic relative-date parsing for the
   20 fixture phrases against an injected prompt timestamp (UTC calendar

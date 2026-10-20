@@ -77,7 +77,7 @@ _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "con
 # the full set (content-only updates of pre-existing state rows inherit and
 # succeed). Fallback mirrors the six; the loader derives the subset from the
 # real ALLOWED_TYPES so the two can never silently diverge from schema_meta.
-# v17 (#178): `event` joins `state` in the non-addable set on this surface
+# v18 (#178): `event` joins `state` in the non-addable set on this surface
 # (occurrence endpoints are add-time CLI/store parameters only) — the
 # #173 F22/F23 rule: advertise and write-validate only what the surface
 # can actually CREATE.
