@@ -111,6 +111,35 @@ jobs:
           fi
           echo "mcp suites green; skipped=0"
 
+      # Issue #285 (Workstream T PR 6): the hello-handshake checks are
+      # module-level pytest functions with a __main__ runner, so they run in
+      # the direct-execution python lane — but that lane's skip path exits 0
+      # ungated. Run them here (post requirements install) and fail loudly
+      # on the visible SKIP, closing the #159 blind spot for this file.
+      - name: MCP hello-handshake checks (skip-guarded)
+        shell: bash
+        run: |
+          set -e
+          out="$(python tests/test_t06_hello.py 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -Eq '^SKIP:'; then
+            echo "::error::tests/test_t06_hello.py skipped — the mcp dependency must be installed and exercised on every matrix leg (issues #159/#285)"
+            exit 1
+          fi
+          out="$(python tests/test_t06_hello_fb.py 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -Eq '^SKIP:'; then
+            echo "::error::tests/test_t06_hello_fb.py skipped — the mcp dependency must be installed and exercised on every matrix leg (issues #159/#285)"
+            exit 1
+          fi
+          echo "t06 hello-handshake checks green (base + feedback)"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
