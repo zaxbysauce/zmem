@@ -159,7 +159,7 @@ class SchemaCompatGateTest(unittest.TestCase):
         self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 17)
 
 
-    def _build_v16_store(self):
+    def _build_pre_v18_store(self):
         """Build an isolated v16 store via the real CLI; returns its path."""
         tmp = tempfile.mkdtemp(prefix="zmem-v15onv16-")
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -207,30 +207,30 @@ class SchemaCompatGateTest(unittest.TestCase):
         newer upgrade-required store with the existing actionable message.
         Both imported bindings (storelib.schema and schema_meta) are patched,
         restored by the patch context managers. v17 (#178): the store the
-        CURRENT code builds is v17 — still above a v15 client's ceiling, so
+        CURRENT code builds is v18 — still above a v15 client's ceiling, so
         the refusal contract is unchanged at the new boundary."""
         import schema_meta as meta
-        store = self._build_v16_store()
-        self.assertEqual(self._store_version(store), "17")
+        store = self._build_pre_v18_store()
+        self.assertEqual(self._store_version(store), "18")
         with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
             try:
                 self.schema.connect()
-                self.fail("a v15 client must refuse a v17 store")
+                self.fail("a v15 client must refuse a v18 store")
             except RuntimeError as exc:
                 self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA=1", str(exc))
                 self.assertIn("schema_version", str(exc))
-        self.assertEqual(self._store_version(store), "17")
+        self.assertEqual(self._store_version(store), "18")
 
     def test_allow_newer_schema_override_proceeds_without_downgrade(self):
         """Issue #175 AC4: ZMEM_ALLOW_NEWER_SCHEMA=1 proceeds on the newer
         store, warns exactly once, never downgrades or migrates it. v17
-        (#178): the built store is v17; a v15 client under the override
-        keeps it at 17."""
+        (#178): the built store is v18; a v15 client under the override
+        keeps it at 18."""
         import io
         import schema_meta as meta
         from contextlib import redirect_stderr
-        store = self._build_v16_store()
-        self.assertEqual(self._store_version(store), "17")
+        store = self._build_pre_v18_store()
+        self.assertEqual(self._store_version(store), "18")
         os.environ["ZMEM_ALLOW_NEWER_SCHEMA"] = "1"
         with patch.object(self.schema, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(self.schema, "FORWARD_COMPAT_SCHEMA_VERSION", 15),              patch.object(meta, "SUPPORTED_SCHEMA_VERSION", 15),              patch.object(meta, "FORWARD_COMPAT_SCHEMA_VERSION", 15):
             self.schema._schema_compat._warned = False
@@ -244,7 +244,7 @@ class SchemaCompatGateTest(unittest.TestCase):
         self.assertEqual(buf.getvalue().count("WARNING"), 1,
                          f"expected exactly one WARNING, got: {buf.getvalue()!r}")
         self.assertIn("ZMEM_ALLOW_NEWER_SCHEMA=1", buf.getvalue())
-        self.assertEqual(self._store_version(store), "17")
+        self.assertEqual(self._store_version(store), "18")
 
 
 class OlderClientOnNewerStoreTest(unittest.TestCase):
@@ -500,8 +500,8 @@ class OlderV16ClientOnV17StoreTest(unittest.TestCase):
         import schema_meta
         schema = self._schema
         store = os.environ["ZMEM_STORE"]
-        self.assertEqual(self._store_version(store), "17",
-                         "precondition: the current code builds a v17 store")
+        self.assertEqual(self._store_version(store), "18",
+                         "precondition: the current code builds a v18 store")
 
         with patch.object(schema, "SUPPORTED_SCHEMA_VERSION", 16), \
              patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 17), \
@@ -544,11 +544,11 @@ class OlderV16ClientOnV17StoreTest(unittest.TestCase):
         # Exactly ONE NOTICE names the v17-vs-v16 gap.
         self.assertEqual(notice.count("NOTICE"), 1,
                          f"expected exactly one NOTICE, got: {notice!r}")
-        self.assertIn("store schema v17 is newer than this client's v16",
+        self.assertIn("store schema v18 is newer than this client's v16",
                       notice)
         self.assertIn("additive-only schema", notice)
-        # The store remains v17 — the older client never downgrades it.
-        self.assertEqual(self._store_version(store), "17")
+        # The store remains v18 — the older client never downgrades it.
+        self.assertEqual(self._store_version(store), "18")
 
     @staticmethod
     def _store_version(store) -> str:
