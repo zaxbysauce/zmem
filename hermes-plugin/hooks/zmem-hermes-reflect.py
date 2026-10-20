@@ -385,6 +385,150 @@ def _prefetch(user_message: str, namespace: str, session_id: str,
     return {}
 
 
+def _normalize_compatibility_messages(
+    payload: dict,
+    *,
+    session_id: str,
+    namespace: str,
+) -> list[dict]:
+    """Local Hermes-schema filter + evidence mapping (issue #177).
+
+    Mirrors the provider-side adapter shape locally (this hook never imports
+    store modules): user kept; assistant discarded; tool kept only with
+    runner_error; isMeta true/missing/non-bool discarded; ids and timestamps
+    preserved.  Every row carries the explicit ``hermes-compat`` host.
+    """
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    rows: list[dict] = []
+    for msg in messages if isinstance(messages, list) else []:
+        if not isinstance(msg, dict):
+            continue
+        if not isinstance(msg.get("isMeta"), bool) or msg["isMeta"]:
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        mid = msg.get("id")
+        ts = msg.get("timestamp")
+        if (role not in ("user", "assistant", "tool")
+                or not isinstance(content, str)
+                or not isinstance(mid, str) or not mid
+                or not isinstance(ts, str) or not ts):
+            continue
+        if role == "assistant":
+            continue
+        row = {
+            "evidence_id": mid,
+            "text": content,
+            "timestamp": ts,
+            "session": session_id,
+            "namespace": namespace,
+            "host": "hermes-compat",
+        }
+        if role == "tool":
+            runner_error = msg.get("runner_error")
+            if not isinstance(runner_error, str) or not runner_error:
+                continue
+            row["runner_error"] = runner_error
+        rows.append(row)
+    return rows
+
+
+def _auto_retain_enabled() -> bool:
+    """Consult the store-side ``auto_retain`` gate BEFORE spawning anything.
+
+    The feature is default off, but this hook fires on every pre-LLM-call, so
+    without a pre-check an operator who never opted in paid two interpreter
+    starts and a full payload re-serialization per model request. The store
+    subprocess stays authoritative; this only refuses to start work it can
+    already prove is unwanted, and returns True when the store path cannot be
+    resolved so the child still gets its say.
+    """
+    if os.environ.get("ZMEM_AUTO_RETAIN") == "0":
+        return False
+    if os.environ.get("ZMEM_AUTO_RETAIN") == "1":
+        return True
+    store = os.environ.get("ZMEM_STORE") or ""
+    data = os.environ.get("ZMEM_DATA") or ""
+    if store:
+        base = Path(store).expanduser().resolve().parent
+    elif data:
+        base = Path(data).expanduser().resolve()
+    else:
+        return True
+    try:
+        with open(base / "config.json", "rb") as handle:
+            config = json.loads(handle.read().decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    value = config.get("auto_retain", False)
+    if not isinstance(value, bool):
+        sys.stderr.write(
+            "[zmem] retain: ignoring non-boolean auto_retain in config.json\n")
+        return False
+    return value
+
+
+def _retain_compatibility_payload(
+    payload: dict,
+    *,
+    session_id: str,
+    namespace: str,
+) -> None:
+    """Run the retention subprocess pair once (issue #177), fail-open.
+
+    ``store.py retain-adapt --input - --host hermes-compat`` normalizes the
+    JSON payload; its stdout pipes into ``store.py retain --input -``.  Every
+    failure logs exactly one child-warning line and returns None; retention
+    never blocks passive delivery.
+
+    The gate is checked here, before either child is spawned, so a default
+    install costs nothing on this lane either.
+    """
+    if not _auto_retain_enabled():
+        return
+    scripts = _scripts_dir()
+    if scripts is None:
+        return
+    store_py = scripts / "store.py"
+    try:
+        encoded = json.dumps(payload, separators=(",", ":"),
+                             ensure_ascii=False)
+        adapt = subprocess.run(
+            [sys.executable, str(store_py), "retain-adapt", "--input", "-",
+             "--namespace", namespace, "--session", session_id,
+             "--host", "hermes-compat"],
+            input=encoded + "\n", capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=_clamp_timeout(os.environ.get("ZMEM_MCP_TIMEOUT", "")),
+            check=False,
+        )
+        if adapt.returncode != 0:
+            sys.stderr.write("[zmem] retain: adapter: %s\n" % (
+                (adapt.stderr or "").strip()[:200] or "child failed"))
+            return
+        retain = subprocess.run(
+            [sys.executable, str(store_py), "retain", "--input", "-",
+             "--namespace", namespace, "--session", session_id,
+             "--host", "hermes-compat"],
+            input=adapt.stdout, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=_clamp_timeout(os.environ.get("ZMEM_MCP_TIMEOUT", "")),
+            check=False,
+        )
+        if retain.returncode != 0:
+            sys.stderr.write("[zmem] retain: classify: %s\n" % (
+                (retain.stderr or "").strip()[:200] or "child failed"))
+        elif (retain.stderr or "").strip():
+            # The child exits 0 even when the queue write failed, so its own
+            # diagnostic is the only signal anything went wrong.
+            sys.stderr.write("[zmem] retain: classify: %s\n" % (
+                retain.stderr.strip()[:200]))
+    except Exception:
+        sys.stderr.write("[zmem] retain: child warning\n")
+
+
 def main() -> int:
     # Capture is separately parent-controlled and deliberately independent of
     # ZMEM_INJECT. Check it before payload parsing, namespace resolution, or a
@@ -397,6 +541,11 @@ def main() -> int:
     session = _session_id(payload)
     user_message = _extract_user_message(payload)
     namespace = _resolve_hook_namespace()
+
+    # Issue #177: one retention subprocess pair (retain-adapt -> retain, host
+    # hermes-compat) before passive delivery; fail-open on every path.
+    _retain_compatibility_payload(payload, session_id=session,
+                                  namespace=namespace)
 
     # One store-owned capture/prepare call runs before the independent delivery
     # switch. ZMEM_INJECT=0 suppresses delivery but preserves this one capture.

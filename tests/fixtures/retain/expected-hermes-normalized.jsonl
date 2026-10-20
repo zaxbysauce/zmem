@@ -1,0 +1,3 @@
+{"evidence_id":"provider-1","text":"Remember: pin release gate","timestamp":"2026-09-10T12:00:00Z","session":"provider-session","namespace":"project:retain","host":"hermes-provider"}
+{"evidence_id":"provider-3","text":"Permission denied while running tests","timestamp":"2026-09-10T12:02:00Z","session":"provider-session","namespace":"project:retain","host":"hermes-provider","runner_error":"Permission denied"}
+{"evidence_id":"compat-1","text":"Remember: use compatibility mode","timestamp":"2026-09-10T12:03:00Z","session":"compat-session","namespace":"project:retain","host":"hermes-compat"}

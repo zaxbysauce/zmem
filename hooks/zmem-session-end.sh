@@ -68,6 +68,32 @@ if [ -z "$PYTHON_BIN" ]; then
     exit 0
 fi
 
+# Evidence-gated retention stage (issue #177): default-off; the exact
+# ZMEM_CAPTURE=0 kill switch and the exact ZMEM_AUTO_RETAIN=0 override skip
+# it entirely. One subprocess driver call (hooks/lib/zmem-retain-process.py)
+# runs retain-adapt then retain with the transcript path; this script never
+# touches the queue or the store directly. The driver consults the auto_retain
+# gate itself and no-ops before reading the transcript.
+#
+# stdout stays discarded but stderr is forwarded so a failure is diagnosable.
+# The stage is bounded by `timeout` because it otherwise had NO bound at all:
+# a slow transcript read could block past the 12s launcher watchdog and kill
+# the delivery-ledger cleanup below, which is the job of this hook. 3s is the
+# remainder of launcher_watchdog_ms after the store recall budget.
+RETAIN_STAGE=1
+if [ "$(printenv ZMEM_CAPTURE 2>/dev/null)" = "0" ]; then RETAIN_STAGE=0; fi
+if [ "${ZMEM_AUTO_RETAIN:-}" = "0" ]; then RETAIN_STAGE=0; fi
+if [ "$RETAIN_STAGE" = "1" ] && [ -n "${ZMEM_TRANSCRIPT:-}" ] \
+   && [ -n "${ZMEM_SESSION:-}" ] \
+   && [ -f "$HOOKS_DIR/lib/zmem-retain-process.py" ]; then
+    RHOST="${ZMEM_HOST:-zcode}"
+    timeout 3 "$PYTHON_BIN" "$HOOKS_DIR/lib/zmem-retain-process.py" \
+        --host "$RHOST" \
+        --session "$ZMEM_SESSION" \
+        --namespace "$NS" \
+        --transcript "$ZMEM_TRANSCRIPT" >/dev/null || true
+fi
+
 OUT="$($PYTHON_BIN "$BODY" "$STORE_PY" "$NS" "$BUDGET" "session_end" 2>/dev/null || echo '{}')"
 
 printf '%s\n' "$OUT"

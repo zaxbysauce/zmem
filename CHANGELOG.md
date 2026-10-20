@@ -5,6 +5,113 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.110.0] - 2026-10-19
+
+### Added
+- **Evidence-gated automatic retention behind `auto_retain` (issue #177,
+  Workstream K PR 6):** one deterministic extractor
+  (`storelib/retain.py::extract_candidates`) classifies normalized evidence
+  rows — explicit `remember:` rows, decisions carrying a rationale marker,
+  `Actually,`-style corrections, and twice-repeated runner errors — into
+  REVIEW-QUEUE CANDIDATES only. It never writes a memory row, never opens
+  SQLite, and stamps every candidate with the full legacy review shape plus
+  `class`, `evidence_ids`, `evidence_timestamp`, `signal=none`, a stable
+  32-hex SHA-256 `id` and a `retain_hash` taken over the message that was
+  actually persisted (after secret redaction, so the digest cannot be used
+  to confirm a redacted secret).
+- **Default off, gated three ways:** the new `store.py retain` command is
+  disabled unless `<store_dir>/config.json` carries a literal boolean
+  `{"auto_retain": true}` (read by the new store-side `storelib/config.py`
+  reader; the file sits beside the store file — the queue itself lives in a
+  `queue/` subdirectory beside it) or `ZMEM_AUTO_RETAIN=1` forces it on;
+  exact `ZMEM_AUTO_RETAIN=0` forces off; any other non-empty value prints
+  `[zmem] retain: invalid ZMEM_AUTO_RETAIN` with `{"count":0,"ok":false}`
+  and exit 0. A non-boolean `auto_retain` in `config.json` is REFUSED and
+  leaves the gate closed, so a config meant to disable retention cannot
+  enable it. Exact `ZMEM_CAPTURE=0` is byte-passive (no input read, no queue
+  file, no store file). The Hermes provider's #161 `auto_retain` key is the
+  provider-home pre-check `sync_turn` consults before spawning a child.
+- **Host wiring — what is live and what is not:**
+  - Claude/Codex/ZCode Stop and Claude SessionEnd run the stage through
+    `hooks/lib/zmem-retain-process.py`, which spawns `store.py retain-adapt`
+    then `store.py retain` under a 10s per-child deadline. That seam is
+    shared by those four lanes ONLY.
+  - The Hermes provider (`sync_turn`, `on_pre_compress`) does NOT use that
+    seam; it calls `store.py retain` directly with its own duplicate
+    deadline copy.
+  - The Hermes compatibility `pre_llm_call` hook does NOT use that seam
+    either; it calls `subprocess.run` with its own `ZMEM_MCP_TIMEOUT` clamp
+    (8s default).
+  - The shared SessionEnd script does NOT run on the Codex SessionEnd
+    lane — the Codex fast path returns before that script is spawned, so the
+    retention stage there is currently unreachable for Codex.
+  - Retention survives on lanes with no transcript path only if the host's
+    own payload shape is understood by the matching adapter; see the
+    `remember:` classifier note below for the shape sensitivity.
+- **Pre-boost correction pricing:** correction candidates take the
+  classifier's pattern-table confidence (the live capture path's
+  short-message +0.10 boost is intentionally NOT applied to normalized
+  evidence rows), gated so the unpadded classifier verdict — including
+  question-mark false-positive suppression — always decides whether a row
+  is a candidate at all.
+- **Outcome rows separate ordering from confidence:** a twice-repeated runner
+  error carries the aggregate's `review_priority` as its OWN field and a
+  fixed confidence below the stale-prune threshold, because
+  `review_priority` is a review-ORDERING weight and the closeout rubric
+  forbids it becoming the row's confidence.
+
+### Fixed
+- **Retention is now idempotent.** Re-running the same evidence no longer
+  appends a fresh copy per hook fire: candidates are keyed by a stable id and
+  already-present ids are skipped, under a per-namespace lock, so Stop,
+  SessionEnd and the Hermes background worker no longer race each other's
+  read-modify-write on the shared queue file.
+- **Batch loss on non-ASCII and on odd line separators.** The retention
+  stdin seam read with the process locale codec while every writer emitted
+  UTF-8, so on a default Windows install non-ASCII transcript text was
+  silently corrupted or the whole batch aborted; both readers now decode
+  UTF-8 explicitly. JSONL is split on newlines only (a U+2028/U+2029/U+0085
+  inside a message no longer shreds the payload) and each row is parsed
+  under its own guard, so one malformed line costs that line instead of the
+  session.
+- **Adapter contracts match the live capture path.** The Claude adapter now
+  accepts an absent `isMeta` and block-form `message.content`, and
+  millisecond-precision timestamps are accepted and canonicalized, matching
+  what `corrections.extract_user_messages` already accepts; the Hermes
+  compatibility lane understands the real `user_message` /
+  `conversation_history` payload instead of a `messages` key the host never
+  sends.
+- **Pasted third-party text is no longer promoted as a user fact.** The
+  `remember:` match is unanchored, so a quoted answer, an `AGENTS.md`
+  excerpt or a diff that merely contained the literal string became a
+  highest-confidence candidate; material that reads as quoted or
+  machine-authored is now skipped.
+- **Retention reports whether it succeeded.** Both verbs answer with
+  `{"count":N,"ok":bool}`, where `ok` is false on a partial write, a
+  classify failure or an invalid override. Previously every failure path
+  exited 0 with empty stdout, so a checkpoint-v2 caller read a partial
+  write as success. Diagnostics are appended to a `zmem-retain.log` sidecar
+  in the store data directory AND echoed to stderr where the host preserves
+  it; the Stop hook runs its python block with `2>/dev/null`, so the sidecar
+  is the channel that always survives.
+- **Default-off costs almost nothing.** The stage driver checks the gate
+  BEFORE reading the transcript, and the Hermes provider and compat hook check
+  their own gate before spawning, so a default install never parses a
+  transcript on any lane. The Claude/Codex/ZCode Stop and SessionEnd stages
+  still start ONE interpreter to evaluate the gate before declining (the shell
+  seam cannot read the store-side config without one), so the saving on those
+  two lanes is the transcript parse rather than the process start. The hook
+  stages are bounded to 3s so they fit inside the launcher's 12s watchdog.
+
+### Known limitations
+- The `decision` classification requires a `kind` field that no wired host
+  adapter emits, so it is currently unreachable through the shipped lanes;
+  it activates only for callers that set `kind` explicitly.
+- Retention persists only to the bounded review queue; it never promotes to
+  memory on its own.
+- No schema change: `SUPPORTED_SCHEMA_VERSION` and
+  `FORWARD_COMPAT_SCHEMA_VERSION` are untouched (16/15).
+
 ## [0.109.0] - 2026-10-19
 
 ### Added

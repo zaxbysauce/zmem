@@ -1,0 +1,8 @@
+{"evidence_id":"e-1","text":"Remember: use staged deploys","timestamp":"2026-09-10T10:00:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"explicit"}
+{"evidence_id":"e-2","text":"Use a canary because rollback is required","timestamp":"2026-09-10T10:01:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"decision"}
+{"evidence_id":"e-3","text":"Actually, run tests before merge","timestamp":"2026-09-10T10:02:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"user"}
+{"evidence_id":"e-4","text":"Permission denied while running tests","timestamp":"2026-09-10T10:03:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"runner","runner_error":"Permission denied"}
+{"evidence_id":"e-5","text":"Permission denied while running tests","timestamp":"2026-09-10T10:04:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"runner","runner_error":"Permission denied"}
+{"evidence_id":"e-6","text":"# Relevant memories (zmem recall)\n- old memory that must not be retained","timestamp":"2026-09-10T10:05:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"user"}
+{"evidence_id":"e-7","text":"<<<ZMEM_UNTRUSTED_FENCE>>>\nsecret-looking enclosed text\n<<<END_ZMEM_UNTRUSTED_FENCE>>>","timestamp":"2026-09-10T10:06:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"user"}
+{"evidence_id":"e-8","text":"A neutral status note for fixture retention","timestamp":"2026-09-10T10:06:00Z","session":"session-a","namespace":"project:retain","host":"claude","kind":"note"}

@@ -50,6 +50,9 @@ from storelib.promote import promote_memory
 from storelib.recall import (_reembed, cross_project_surface_enabled,
                              explain_recall, get_memory, list_memory,
                              recall_memory, recent_memory, stats)
+from storelib.retain import (RETAIN_HOSTS, _retention_enabled,
+                             extract_candidates, normalize_host_payload,
+                             write_candidates)
 from storelib.inject import (INJECTION_LANES, INJECTION_MOMENTS,
                              _injection_data_dir, inject_recent_floor,
                              inject_token_budget,
@@ -3275,6 +3278,40 @@ def main():
     p_source_exists.add_argument("--json", dest="json", action="store_true",
                                  default=False, help="emit a machine-readable result")
 
+    # Issue #177: evidence-gated automatic retention — the extractor and the
+    # raw-payload adapters both dispatch BEFORE connect()/_prepare_store()/
+    # migration/embedding checks (see the dispatch blocks below).
+    p_retain = _add_parser(
+        "retain", help="classify evidence rows into the review queue "
+                       "(issue #177; default off)")
+    p_retain.add_argument("--input", dest="input_path", type=str, default=None,
+                          required=False,
+                          help="JSONL evidence rows to classify into the review queue")
+    p_retain.add_argument("--namespace", dest="namespace", type=str, required=True,
+                          help="queue namespace")
+    p_retain.add_argument("--session", dest="session", type=str, required=True,
+                          help="session id for candidate provenance")
+    p_retain.add_argument("--host", dest="host", type=str, required=True,
+                          choices=RETAIN_HOSTS,
+                          help="host label for candidate provenance")
+    p_retain.add_argument("--dry-run", dest="dry_run", action="store_true",
+                          default=False,
+                          help="classify without writing the review queue")
+
+    p_retain_adapt = _add_parser(
+        "retain-adapt",
+        help="normalize a raw host payload into evidence rows (issue #177)")
+    p_retain_adapt.add_argument("--input", dest="input_path", type=str,
+                                required=True,
+                                help="raw host payload path; use - for stdin")
+    p_retain_adapt.add_argument("--namespace", dest="namespace", type=str,
+                                required=True, help="normalized row namespace")
+    p_retain_adapt.add_argument("--session", dest="session", type=str,
+                                required=True, help="normalized row session")
+    p_retain_adapt.add_argument("--host", dest="host", type=str, required=True,
+                                choices=RETAIN_HOSTS,
+                                help="host payload format and row lane")
+
     p_source_ref_exists = _add_parser(
         "source-ref-exists",
         help="check whether a live lesson row carries this source_ref "
@@ -4235,6 +4272,254 @@ def main():
         sys.exit(cmd_query_rewrite(
             prompt=args.prompt, session_id=args.session_id,
             namespace=args.namespace))
+
+    # Issue #177: evidence-gated automatic retention.  Both commands dispatch
+    # BEFORE connect()/_prepare_store()/migration/embedding checks — a
+    # disabled or capture-off path must never create or open the store file.
+    # retain-adapt is a pure normalization utility: only the exact
+    # ZMEM_CAPTURE=0 kill switch applies.  The auto_retain gate (config file
+    # beside the store, ZMEM_AUTO_RETAIN override) scopes to `retain`, the
+    # only queue-writing command.  All exact-output contracts emit LF-only
+    # bytes (the issue pins `{"count":0}\n` and LF-terminated JSONL rows on
+    # every platform; plain print() would translate to CRLF on Windows).
+    def _retain_out(text: str) -> None:
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            buf.write(text.encode("utf-8"))
+            buf.flush()
+        else:  # in-process tests redirect stdout to a StringIO
+            sys.stdout.write(text)
+
+    def _retain_err(text: str) -> None:
+        buf = getattr(sys.stderr, "buffer", None)
+        if buf is not None:
+            buf.write(text.encode("utf-8"))
+            buf.flush()
+        else:  # in-process tests redirect stderr to a StringIO
+            sys.stderr.write(text)
+
+    def _retain_read_stdin() -> str:
+        """Read stdin as UTF-8 bytes.
+
+        Every writer in this PR emits UTF-8, but a bare ``sys.stdin.read()``
+        decodes with the process locale codec — cp1252 on a default Windows
+        install, a first-class platform.  Non-ASCII evidence text was silently
+        mojibake'd into the queue, and a byte cp1252 leaves undefined (0x81,
+        0x8D, 0x8F, 0x90, 0x9D — common UTF-8 continuation bytes) raised
+        UnicodeDecodeError and killed the whole batch.  Same shape the file
+        already uses at the two bounded stdin readers above.
+        """
+        buf = getattr(sys.stdin, "buffer", None)
+        if buf is not None:
+            return buf.read().decode("utf-8", errors="replace")
+        return sys.stdin.read()
+
+    def _retain_jsonl(raw: str) -> list:
+        """Parse JSONL one row at a time, skipping unreadable rows.
+
+        ``str.splitlines()`` also splits on U+2028/U+2029/U+0085, which
+        ``json.dumps(ensure_ascii=False)`` — the producer in the same command
+        pair — emits raw, so one such character shredded a whole transcript.
+        Split on newlines only, and guard each parse so one malformed row
+        costs that row instead of the batch (the guard corrections.py:388
+        already applies to the live capture path).
+        """
+        rows = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                _retain_err("[zmem] retain: skipped malformed row\n")
+        return rows
+
+    def _retain_result(count: int, ok: bool) -> None:
+        """Emit the single stdout line both retention verbs return.
+
+        ``ok`` is what separates "the gate is off / nothing new to retain"
+        (a successful no-op) from "the batch failed or was partially written".
+        Without it the hook lanes and the Hermes checkpoint v2 caller saw
+        empty stdout for every failure and could not tell them apart.
+        """
+        _retain_out('{"count":%d,"ok":%s}\n' % (count, "true" if ok else "false"))
+
+    def _retain_now_ts() -> str:
+        """Current UTC instant in the canonical ``...THH:MM:SSZ`` shape."""
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _retain_hermes_compat_records(payload: dict, fallback_ts: str) -> list | None:
+        """Unwrap the real Hermes ``pre_llm_call`` payload into message records.
+
+        The compat hook's own reader documents the upstream shapes as
+        ``user_message`` (top level or under ``extra``),
+        ``conversation_history`` (entries whose role is ``user``/``human``),
+        and ``prompt``/``input``/``text`` — there is no ``messages`` key, so
+        ``retain-adapt`` parsed the whole payload as one record and the lane
+        produced nothing while its tests asserted a synthetic shape the host
+        never sends.
+
+        Returns ``None`` — NOT an empty list — when the object carries none of
+        those markers, so an ordinary single-record JSONL payload falls through
+        to the per-line parser instead of being silently emptied.
+
+        Those entries carry no id and no timestamp, so a deterministic
+        content-derived id is synthesized (the same text always maps to the
+        same row, which the idempotency guard depends on) and the supplied
+        fallback timestamp is stamped.  That stamp is the normalization time,
+        not a message time: the compat host does not send one.
+        """
+        records: list[dict] = []
+
+        def _synthetic(content: str) -> str:
+            # Content ONLY. Keying on a position made the id change whenever
+            # the history length changed, so the same user text produced a new
+            # evidence_id on every turn and the idempotency guard could never
+            # match it — the duplicate accumulation this lane was fixed for.
+            digest = hashlib.sha256(
+                ("compat\0%s" % content).encode("utf-8"))
+            return digest.hexdigest()[:32]
+
+        extra = payload.get("extra")
+        history = payload.get("conversation_history")
+        user_message = payload.get("user_message")
+        if not isinstance(user_message, str) and isinstance(extra, dict):
+            user_message = extra.get("user_message")
+        if not isinstance(user_message, str) or not user_message.strip():
+            for key in ("prompt", "input", "text"):
+                candidate = payload.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    user_message = candidate
+                    break
+
+        if isinstance(history, list):
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("role") not in ("user", "human"):
+                    continue
+                content = entry.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                records.append({
+                    "id": _synthetic(content),
+                    "timestamp": fallback_ts,
+                    "role": "user",
+                    "content": content,
+                })
+        if isinstance(user_message, str) and user_message.strip():
+            records.append({
+                "id": _synthetic(user_message),
+                "timestamp": fallback_ts,
+                "role": "user",
+                "content": user_message,
+            })
+        return records or None
+
+    if args.cmd == "retain-adapt":
+        try:
+            if os.environ.get("ZMEM_CAPTURE", "1").strip() == "0":
+                sys.exit(0)
+            if args.input_path == "-":
+                raw = _retain_read_stdin()
+            else:
+                raw = open(args.input_path, "r", encoding="utf-8").read()
+            # A top-level {"messages": [...]} object (the Hermes compatibility
+            # payload shape) unwraps to its message list; a top-level JSON array
+            # IS already the message list.  The real Hermes host also sends
+            # {"user_message": ...} / {"conversation_history": [...]}, which is
+            # unwrapped here rather than being silently treated as one record.
+            records = None
+            stripped = raw.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    whole = json.loads(stripped)
+                except ValueError:
+                    whole = None
+                if isinstance(whole, list) and args.host in (
+                        "hermes-provider", "hermes-compat"):
+                    records = whole
+                elif isinstance(whole, dict) and args.host in (
+                        "hermes-provider", "hermes-compat"):
+                    # Only the Hermes lanes speak these shapes. Applying the
+                    # unwrap to a Claude/Codex/ZCode record would misread an
+                    # ordinary `text` field as a compat prompt.
+                    messages = whole.get("messages")
+                    if not isinstance(messages, list):
+                        messages = _retain_hermes_compat_records(
+                            whole, _retain_now_ts())
+                    if isinstance(messages, list):
+                        records = messages
+                elif isinstance(whole, dict) and isinstance(
+                        whole.get("messages"), list):
+                    records = whole["messages"]
+            if records is None:
+                records = _retain_jsonl(raw)
+            rows = normalize_host_payload(
+                records, host=args.host, session=args.session,
+                namespace=args.namespace)
+            payload_out = "".join(
+                json.dumps(row, separators=(",", ":"),
+                           ensure_ascii=False) + "\n" for row in rows)
+            _retain_out(payload_out)
+        except SystemExit:
+            raise
+        except Exception:
+            _retain_err("[zmem] retain: adapter failed\n")
+        sys.exit(0)
+
+    if args.cmd == "retain":
+        try:
+            if os.environ.get("ZMEM_CAPTURE", "1").strip() == "0":
+                _retain_result(0, True)
+                sys.exit(0)
+            try:
+                enabled = _retention_enabled()
+            except ValueError:
+                _retain_err("[zmem] retain: invalid ZMEM_AUTO_RETAIN\n")
+                _retain_result(0, False)
+                sys.exit(0)
+            if not enabled:
+                # The disabled path reads no input, invokes no adapter, opens
+                # no SQLite, touches no queue file (issue #177 Design step 3).
+                _retain_result(0, True)
+                sys.exit(0)
+            if args.input_path is None or args.input_path == "-":
+                raw = _retain_read_stdin()
+            else:
+                raw = open(args.input_path, "r", encoding="utf-8").read()
+            rows = _retain_jsonl(raw)
+            candidates = extract_candidates(rows)
+            if args.dry_run:
+                _retain_result(len(candidates), True)
+                sys.exit(0)
+            total = len(candidates)
+            _appended, landed, deferred = write_candidates(
+                candidates, namespace=args.namespace)
+            if deferred:
+                # Ordinary contention: another writer holds this namespace.
+                # Nothing was attempted and nothing was lost -- the next Stop
+                # re-derives the same candidates and the id guard makes that
+                # safe. Reporting this as a write failure would escalate
+                # benign contention into a checkpoint-v2 host abort.
+                _retain_err(
+                    "[zmem] retain: queue busy, deferred to the next run\n")
+                _retain_result(0, True)
+                sys.exit(0)
+            if landed < total:
+                _retain_err(
+                    "[zmem] retain: queue write failed; written=%d; total=%d\n"
+                    % (landed, total))
+                _retain_result(landed, False)
+                sys.exit(0)
+            _retain_result(landed, True)
+        except SystemExit:
+            raise
+        except Exception:
+            _retain_err("[zmem] retain: classify failed\n")
+            _retain_result(0, False)
+        sys.exit(0)
 
     # Capture adapters use this read through the public store boundary instead
     # of opening SQLite in hook processes.  It is deliberately read-only and
