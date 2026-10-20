@@ -106,6 +106,149 @@ _STORE_PY_REL = Path("skills") / "memory" / "scripts" / "store.py"
 _CORE_MD_REL = Path("core.md")
 # Subprocess cap for store.py calls — recall is fast; this is a safety net.
 _STORE_TIMEOUT_S = 20
+# Issue #177: retention subprocess deadline.  Matches
+# hooks/lib/zmem-retain-process.py::RETAIN_SUBPROCESS_TIMEOUT_S so every
+# retain child on every surface shares one deadline contract.
+_RETAIN_SUBPROCESS_TIMEOUT_S = 10.0
+
+
+def _now_iso_utc() -> str:
+    """Canonical UTC timestamp — the provider retention clock seam.
+
+    Tests inject a fixed value by patching this module-level function;
+    production reads the wall clock exactly once per retention call.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _retain_synthetic_id(prefix: str, session_id: str, timestamp: str,
+                         content: str) -> str:
+    """Deterministic synthetic evidence id for a provider turn row."""
+    payload = session_id + "\0" + timestamp + "\0" + content
+    return prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _validated_hermes_rows(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Validate Hermes-schema messages into filterable hermes rows.
+
+    Discards non-dicts, isMeta true/missing/non-bool, unknown roles, and
+    rows missing string id/timestamp/content (the compat hook shares this
+    exact local schema — see zmem-hermes-reflect.py).
+    """
+    rows: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        # Only an EXPLICIT true discards. The field is simply absent
+        # from the real conversation_history entries the Hermes host
+        # sends; requiring it to be a present boolean dropped those
+        # messages, while the store-side normalizer accepts them.
+        # Issue #177 step 4 pins ONE strict schema for both layers.
+        if msg.get("isMeta", False) is True:
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant", "tool"):
+            continue
+        content = msg.get("content")
+        mid = msg.get("id")
+        ts = msg.get("timestamp")
+        if (not isinstance(content, str) or not isinstance(mid, str)
+                or not mid or not isinstance(ts, str) or not ts):
+            continue
+        row: Dict[str, Any] = {
+            "id": mid,
+            "timestamp": ts,
+            "role": role,
+            "content": content,
+            "isMeta": False,
+        }
+        if (role == "tool" and isinstance(msg.get("runner_error"), str)
+                and msg["runner_error"]):
+            row["runner_error"] = msg["runner_error"]
+        rows.append(row)
+    return rows
+
+
+def _hermes_rows_to_evidence(
+    hermes_rows: List[Dict[str, Any]],
+    *,
+    session_id: str,
+    namespace: str,
+    host: str = "hermes-provider",
+) -> List[Dict[str, Any]]:
+    """Local Hermes-schema role filter + evidence mapping (issue #177).
+
+    user kept; assistant discarded; tool kept only with runner_error; the
+    id/timestamp/content fields map to evidence_id/timestamp/text.  Local by
+    design — the provider never imports the store-side adapter.
+    """
+    rows: List[Dict[str, Any]] = []
+    for row in hermes_rows:
+        if row.get("role") == "assistant":
+            continue
+        if row.get("role") == "tool" and not row.get("runner_error"):
+            continue
+        evidence: Dict[str, Any] = {
+            "evidence_id": row["id"],
+            "text": row["content"],
+            "timestamp": row["timestamp"],
+            "session": session_id,
+            "namespace": namespace,
+            "host": host,
+        }
+        if row.get("runner_error"):
+            evidence["runner_error"] = row["runner_error"]
+        rows.append(evidence)
+    return rows
+
+
+def _normalize_provider_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    user_content: str,
+    assistant_content: str,
+    session_id: str,
+    namespace: str,
+    now: str,
+) -> List[Dict[str, Any]]:
+    """Build normalized evidence rows for a Hermes turn (issue #177).
+
+    Supplied messages keep their own ids/timestamps.  The two synthetic turn
+    rows use the injected clock timestamp and deterministic
+    ``turn-user-``/``turn-assistant-`` SHA-256 ids; the synthetic assistant
+    row is built and then discarded by the role filter (the issue pins that
+    exact shape), while the synthetic user row is retained.  The Hermes
+    message schema, the role filter (user kept; assistant discarded; tool
+    kept only with runner_error; isMeta true/missing/non-bool discarded) and
+    the id/timestamp mapping are implemented locally — this provider never
+    imports the store-side adapter.
+    """
+    hermes_rows: List[Dict[str, Any]] = _validated_hermes_rows(messages)
+    if isinstance(user_content, str) and user_content:
+        hermes_rows.append({
+            "id": _retain_synthetic_id("turn-user-", session_id, now,
+                                       user_content),
+            "timestamp": now,
+            "role": "user",
+            "content": user_content,
+            "isMeta": False,
+        })
+    if isinstance(assistant_content, str) and assistant_content:
+        hermes_rows.append({
+            "id": _retain_synthetic_id("turn-assistant-", session_id, now,
+                                       assistant_content),
+            "timestamp": now,
+            "role": "assistant",
+            "content": assistant_content,
+            "isMeta": False,
+        })
+    rows = _hermes_rows_to_evidence(hermes_rows, session_id=session_id,
+                                    namespace=namespace)
+    return rows
+
+
 # Max chars of a query passed to store.py by the memory tools' argv.
 _MAX_QUERY_CHARS = 500
 _MAX_CONFIG_BYTES = 1_048_576
@@ -677,6 +820,9 @@ def _run_store(
     args: List[str], input_text: str | None = None,
     timing: Optional[Dict[str, int]] = None,
     env: Optional[Dict[str, str]] = None,
+    *,
+    popen_factory: Optional[Callable[..., subprocess.Popen]] = None,
+    timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run ``store.py <args>`` and return ``{ok, stdout, stderr, returncode}``.
 
@@ -684,6 +830,12 @@ def _run_store(
     decides whether a non-zero returncode is fatal. ``input_text`` (optional)
     is piped to the child's stdin — used for oversize content (see
     ``_ARGV_SAFE_CONTENT_CHARS``).
+
+    Issue #177 retention seam: when ``popen_factory`` or ``timeout_s`` is
+    supplied (the retention path and its tests), the child runs through the
+    kill/communicate/wait sequence with the run_retain timeout semantics
+    (default 10.0s when only a factory is given); both None keeps the legacy
+    ``subprocess.run`` path byte-identical for every existing caller.
     """
     store_py = _resolve_store_py()
     if store_py is None:
@@ -711,6 +863,59 @@ def _run_store(
     # budget at one second while retaining the existing longer cap for all
     # historical store commands.
     command_timeout = min(_STORE_TIMEOUT_S, 1.0) if args and args[0] == "query-rewrite" else _STORE_TIMEOUT_S
+    if popen_factory is not None or timeout_s is not None:
+        # Issue #177 retention path: injected Popen factory + explicit
+        # deadline with the kill/communicate/wait drain (the same semantics
+        # as hooks/lib/zmem-retain-process.py::run_retain).
+        effective_timeout = (
+            timeout_s if timeout_s is not None
+            else _RETAIN_SUBPROCESS_TIMEOUT_S
+        )
+        factory = popen_factory or subprocess.Popen  # noqa: S603
+        started = time.perf_counter()
+
+        def _record_timing() -> None:  # noqa: F811 - scoped redefinition
+            if timing is not None:
+                timing["t_ms"] = _elapsed_ms(started)
+
+        try:
+            proc = factory(
+                cmd,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            try:
+                stdout, stderr = proc.communicate(
+                    input_text, timeout=effective_timeout)
+                code = proc.wait()
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    stdout, stderr = proc.communicate()
+                except Exception:
+                    stdout, stderr = "", ""
+                proc.wait()
+                code = 124
+            _record_timing()
+            return {
+                "ok": code == 0,
+                "stdout": stdout or "",
+                "stderr": stderr or "",
+                "returncode": code,
+            }
+        except Exception as exc:  # pragma: no cover — defensive
+            _record_timing()
+            return {
+                "ok": False,
+                "stdout": "",
+                "stderr": f"store.py failed: {exc}",
+                "returncode": 1,
+            }
     try:
         proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
             cmd,
@@ -2045,6 +2250,11 @@ def _delegation_hash(value: str) -> str:
 class ZmemMemoryProvider(MemoryProvider):
     """ZMem local-first memory — subprocess-bridges Hermes to ``store.py``."""
 
+    # Issue #177: the pre-compress checkpoint evidence API version this
+    # provider speaks (evidence_messages + require_checkpoint + the version
+    # kwarg on on_pre_compress).
+    pre_compress_checkpoint_api_version = 2
+
     def __init__(self, *, scheduler: Optional[object] = None,
                  deadline: Optional[object] = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
@@ -2602,10 +2812,20 @@ class ZmemMemoryProvider(MemoryProvider):
         return "user:global"
 
     def auto_retain_enabled(self) -> bool:
-        """The only retention signal exported by issue #161 (consumed by
-        #177); False whenever the field is absent."""
+        """The provider-home retention signal (issue #161, consumed by #177).
+
+        Consulted by ``sync_turn`` BEFORE it spawns a ``store.py`` child, so an
+        operator who never opted in does not pay a subprocess per turn. The
+        store-side gate (``<store_dir>/config.json``) remains authoritative
+        and still decides inside the child; this is an additional, cheaper
+        pre-check on the provider's own config home.
+
+        Strict boolean on purpose: bare ``bool()`` meant a config intended to
+        disable retention — ``{"auto_retain": "false"}`` — silently enabled
+        it. Anything that is not ``True`` leaves the gate closed.
+        """
         cfg = self._config if isinstance(self._config, dict) else {}
-        return bool(cfg.get("auto_retain", False))
+        return cfg.get("auto_retain", False) is True
 
     # -- recall -------------------------------------------------------------
 
@@ -3928,9 +4148,117 @@ class ZmemMemoryProvider(MemoryProvider):
         """
         return None
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Deferred — no pre-compress extraction in v1."""
-        return ""
+    def _retain_evidence(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        session_id: str,
+        namespace: str,
+        require_checkpoint: bool = False,
+    ) -> str:
+        """Serialize normalized Hermes rows into the retain subprocess.
+
+        Returns the summary string for on_pre_compress ("" on every ordinary
+        path).  The store-side config gate decides retention inside the
+        child — the provider passes no environment and no enable flag
+        (issue #177 Design step 6).
+
+        The child answers ``{"count":N,"ok":bool}``.  ``ok`` is what separates
+        "the gate is off, or there was nothing new to retain" (a successful
+        no-op) from "the batch failed or was only partially written".  Reading
+        only ``count`` made every failure look like success to a
+        checkpoint-v2 caller, because the child always exits 0 on the
+        fail-open hook contract.
+        """
+        try:
+            payload = "".join(
+                json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+                + "\n"
+                for msg in messages
+            )
+            result = _run_store(
+                ["retain", "--input", "-",
+                 "--namespace", namespace,
+                 "--session", session_id,
+                 "--host", "hermes-provider"],
+                input_text=payload,
+                popen_factory=subprocess.Popen,
+                timeout_s=_RETAIN_SUBPROCESS_TIMEOUT_S,
+            )
+            if result.get("returncode") != 0:
+                if require_checkpoint:
+                    raise RuntimeError(
+                        "zmem retention checkpoint failed (store exit %s)"
+                        % result.get("returncode"))
+                return ""
+            stdout = (result.get("stdout") or "").strip()
+            try:
+                obj = json.loads(stdout) if stdout else {}
+            except ValueError:
+                if require_checkpoint:
+                    raise RuntimeError(
+                        "zmem retention checkpoint failed (malformed output)")
+                return ""
+            count = obj.get("count") if isinstance(obj, dict) else None
+            if not isinstance(count, int):
+                if require_checkpoint:
+                    raise RuntimeError(
+                        "zmem retention checkpoint failed (missing count)")
+                return ""
+            if obj.get("ok") is not True:
+                # Empty or absent stdout is itself the failure signal: the
+                # child refused to claim a count it could not honour.
+                if require_checkpoint:
+                    raise RuntimeError(
+                        "zmem retention checkpoint failed (write incomplete)")
+                return ""
+            if count > 0:
+                return "Filed %d retention candidate(s)." % count
+            return ""
+        except RuntimeError:
+            raise
+        except Exception:
+            if require_checkpoint:
+                raise RuntimeError(
+                    "zmem retention checkpoint failed (subprocess error)")
+            return ""
+
+    def on_pre_compress(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        evidence_messages: Optional[List[Dict[str, Any]]] = None,
+        require_checkpoint: bool = False,
+        checkpoint_api_version: int = 2,
+    ) -> str:
+        """Pre-compress retention evidence (issue #177, checkpoint API v2).
+
+        Uses ``evidence_messages`` when supplied and otherwise ``messages``.
+        Returns "" when the store-side config is false, when no candidates
+        are produced, when the child reports zero, or on an ordinary queue
+        failure; a positive count returns exactly
+        ``Filed N retention candidate(s).``  With ``require_checkpoint=True``
+        a nonzero exit, malformed JSON, timeout, or missing count raises a
+        sanitized RuntimeError after the child is terminated.
+        """
+        try:
+            source = evidence_messages if evidence_messages is not None else messages
+            sid = self._session_id
+            if not sid:
+                return ""
+            evidence = _hermes_rows_to_evidence(
+                _validated_hermes_rows(source),
+                session_id=sid, namespace=self._namespace)
+            return self._retain_evidence(
+                evidence, session_id=sid, namespace=self._namespace,
+                require_checkpoint=require_checkpoint,
+            )
+        except RuntimeError:
+            if require_checkpoint:
+                raise
+            return ""
+        except Exception:
+            return ""
 
     def on_delegation(
         self, task: str, result: str, *, child_session_id: str = "", **kwargs
@@ -4072,6 +4400,47 @@ class ZmemMemoryProvider(MemoryProvider):
         still records a fresh-key standalone partial without a snapshot.
         """
         try:
+            # Issue #177: evidence-gated retention runs at method entry, on
+            # every production path (the standalone partial and the no-task
+            # branches below are ordinary paths that must still retain), and
+            # can never raise into Hermes.
+            #
+            # Three corrections over the first cut:
+            #  * the store-side gate is consulted FIRST, so a default install
+            #    (retention off) does not spawn a store.py child on every turn;
+            #  * the candidate's identity is the provider's OWN active session,
+            #    not the caller-supplied kwarg. _claim_turn_ticket and
+            #    _standalone_turn_identity below both refuse an explicit stale
+            #    session, and this block runs before either, so taking the
+            #    kwarg wrote a principal-attributed durable row for a session
+            #    the turn was not allowed to claim;
+            #  * (session, namespace) are read together under the turn-ticket
+            #    lock so a concurrent session switch cannot pair session A
+            #    with namespace B and misfile the row permanently.
+            try:
+                if self.auto_retain_enabled():
+                    with self._turn_ticket_lock:
+                        _retain_sid = self._session_id or ""
+                        _retain_ns = self._namespace
+                    _retain_sid = _retain_sid.strip()
+                    if _retain_sid:
+                        _retain_rows = _normalize_provider_messages(
+                            messages or [],
+                            user_content=(
+                                user_content if isinstance(user_content, str)
+                                else ""),
+                            assistant_content=(
+                                assistant_content
+                                if isinstance(assistant_content, str) else ""),
+                            session_id=_retain_sid,
+                            namespace=_retain_ns,
+                            now=_now_iso_utc(),
+                        )
+                        self._retain_evidence(
+                            _retain_rows, session_id=_retain_sid,
+                            namespace=_retain_ns)
+            except Exception:
+                pass
             ticket = self._claim_turn_ticket(session_id, user_content)
             task_id = str(
                 kwargs.get("task_id") or kwargs.get("taskId")

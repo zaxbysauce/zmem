@@ -2506,6 +2506,87 @@ is reviewed under the SAME closeout Step 0.5 rubric as any other queue item —
 there is no fast track; `--type` accepts exactly the `add` command's type
 enum, so an accepted note needs no type conversion when it is promoted.
 
+### retain / retain-adapt — evidence-gated automatic retention (issue #177, default off)
+```
+<interpreter> <store.py> retain [--input PATH|-] --namespace NS --session ID \
+  --host claude|codex|zcode|hermes-provider|hermes-compat [--dry-run]
+<interpreter> <store.py> retain-adapt --input PATH|- --namespace NS \
+  --session ID --host claude|codex|zcode|hermes-provider|hermes-compat
+```
+The automatic-retention surface (Workstream K PR 6). `retain` classifies
+normalized JSONL evidence rows through the deterministic extractor
+(`storelib/retain.py::extract_candidates`) into REVIEW-QUEUE CANDIDATES —
+never memory rows: explicit `remember:` rows (class `explicit`), decisions
+carrying a rationale marker (`because` / `so that` / `therefore` /
+`rationale:` / `reason:`, class `decision`), `Actually,`-style corrections
+(class `correction`, priced at the classifier's pattern-table confidence —
+the live-capture short-message boost deliberately does not apply), and
+twice-repeated runner errors (class `outcome` via `aggregate_errors`). Every
+candidate keeps the full legacy review shape plus `class`, `evidence_ids`,
+`signal=none`, a stable 32-hex SHA-256 id, and a `retain_hash`; writes go
+through the same capped, atomic queue sidecar as manual capture (a failed
+write keeps prior writes and reports
+`[zmem] retain: queue write failed; written=<k-1>; total=<N>`).
+
+**The gate (default OFF):** retention runs only when `<store_dir>/config.json`
+(the file sits beside the store file; the queue itself lives in a `queue/`
+subdirectory beside it — read by the store-side `storelib/config.py` reader)
+contains a literal boolean `{"auto_retain": true}`, or `ZMEM_AUTO_RETAIN=1`
+forces it on. Exact `ZMEM_AUTO_RETAIN=0` forces off; any other non-empty value
+prints `[zmem] retain: invalid ZMEM_AUTO_RETAIN` with
+`{"count":0,"ok":false}` and exits 0. A non-boolean `auto_retain` in
+`config.json` is REFUSED and leaves the gate CLOSED — a config meant to
+disable retention cannot enable it. Exact `ZMEM_CAPTURE=0` is byte-passive — no
+input read, no queue file, no store file. The Hermes provider's `auto_retain`
+config key (issue #161) is a SEPARATE provider-home setting that `sync_turn`
+consults BEFORE spawning a child; the store subprocess never reads provider
+home. Both commands dispatch before the store opens: a disabled run never
+creates or migrates the store, and the stage driver checks the gate BEFORE it
+reads the transcript, so a default install never parses a transcript. The
+Stop/SessionEnd seams still start one interpreter to evaluate the gate before
+declining, because the shell cannot read the store-side config without one.
+
+Both retention verbs answer with `{"count":N,"ok":bool}` on stdout. `ok` is
+false on a partial write, a classify failure or an invalid override, so a
+caller can tell a successful no-op from a failure even though every hook path
+still exits 0.
+
+`retain-adapt` normalizes a raw host payload (Claude transcript records —
+`isMeta` may be absent and `message.content` may be block-form —, Codex
+`id`/`timestamp`/`role`/`content` records, ZCode
+`event_id`/`ts`/`role`/`text` records, or a Hermes payload) into evidence rows
+stamped with the CLI provenance triple. Timestamps are accepted with or
+without millisecond precision and canonicalized to `...THH:MM:SSZ`.
+
+**Host wiring — which lanes share the subprocess seam:**
+- Claude/Codex/ZCode Stop and Claude SessionEnd run
+  `hooks/lib/zmem-retain-process.py` (10s per-child deadline, exit 124 on
+  timeout), which spawns `store.py retain-adapt` then `store.py retain`.
+- The Hermes provider (`sync_turn`, `on_pre_compress` checkpoint API v2) calls
+  `store.py retain` DIRECTLY with its own duplicate deadline copy; it does not
+  import the shared seam.
+- The Hermes compatibility `pre_llm_call` hook uses `subprocess.run` with its
+  own `ZMEM_MCP_TIMEOUT` clamp (8s default), not the shared seam.
+- The shared SessionEnd script does NOT run on the Codex SessionEnd lane — the
+  Codex fast path returns before that script spawns — so the retention stage
+  there is currently unreachable for Codex.
+
+Hooks and providers consume child JSON only — no storelib import, no SQLite,
+no direct queue access. Every failure path exits 0 so a retention problem can
+never break a host hook. Diagnostics are appended to a `zmem-retain.log`
+sidecar in the store data directory and echoed to stderr where the host
+preserves it — the Stop hook suppresses its own stderr, so the sidecar is the
+channel that always survives.
+
+Retention is idempotent: candidates are keyed by a stable id, already-present
+ids are skipped, and the batch runs under a per-namespace lock, so repeated
+Stop/SessionEnd fires over one transcript add nothing on the second run. The
+`remember:` classifier is unanchored, so material that reads as quoted or
+machine-authored (a pasted answer, a project instruction file, a diff) is
+skipped rather than promoted as the user's own standing fact. The `decision`
+classification needs a `kind` field no wired adapter emits, so it is
+currently reachable only by callers that set `kind` explicitly.
+
 ### convention-drift — surface conventions a queued correction contradicts (read-only)
 ```
 <interpreter> <store.py> convention-drift --namespace NS [--json]

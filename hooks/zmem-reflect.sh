@@ -247,6 +247,46 @@ if payload.get("stop_hook_active"):
 if payload.get("agent_id") or payload.get("agent_transcript_path"):
     emit({})
 
+# 1c. Evidence-gated retention stage (issue #177): default-off; the exact
+#     ZMEM_AUTO_RETAIN=0 override skips it.  One subprocess driver call
+#     (hooks/lib/zmem-retain-process.py) runs retain-adapt then retain; this
+#     hook never touches the queue or the store directly.  The driver consults
+#     the auto_retain gate itself and no-ops before reading the transcript, so
+#     a default install pays nothing here.
+#
+#     stdout stays discarded (the stage is not part of the hook envelope)
+#     but stderr is forwarded, so a retention failure is diagnosable instead
+#     of being indistinguishable from "nothing to retain".  The outer bound is
+#     deliberately 3s: launcher_watchdog_ms is 12000 and the recall budget
+#     this hook already spends is 8000, so this stage may claim only the
+#     remainder. Breaching it kills the hook and the launcher answers with an
+#     empty envelope, losing the Stop context the hook exists to deliver.
+#     With the gate off (the default) the driver no-ops well inside this bound.
+if os.environ.get("ZMEM_AUTO_RETAIN", "") != "0":
+    try:
+        _retain_root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(store_py))))
+        _retain_driver = os.path.join(_retain_root, "hooks", "lib",
+                                      "zmem-retain-process.py")
+        _retain_host = os.environ.get("ZMEM_HOST", "zcode").strip().lower()
+        if (_retain_host in ("claude", "codex", "zcode")
+                and os.path.isfile(_retain_driver)):
+            _retain_argv = [sys.executable, _retain_driver,
+                            "--host", _retain_host,
+                            "--session", session_id,
+                            "--namespace", ns,
+                            "--transcript", transcript or "-"]
+            if transcript:
+                subprocess.run(_retain_argv, stdout=subprocess.DEVNULL,
+                               stderr=sys.stderr, timeout=3)
+            else:
+                subprocess.run(_retain_argv, input=raw_stdin, text=True,
+                               encoding="utf-8", errors="replace",
+                               stdout=subprocess.DEVNULL,
+                               stderr=sys.stderr, timeout=3)
+    except Exception:
+        pass
+
 # 2. Unified failure detection (fail-open — failures prints an empty result on
 #    any error, and we treat a non-JSON/empty response as zero failures).
 count = 0

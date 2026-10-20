@@ -1,0 +1,3 @@
+{"evidence_id":"claude-1","text":"Remember: use staged deploys","timestamp":"2026-09-10T11:00:00Z","session":"adapter-session","namespace":"project:retain","host":"claude"}
+{"evidence_id":"codex-1","text":"Run tests before merge","timestamp":"2026-09-10T11:01:00Z","session":"adapter-session","namespace":"project:retain","host":"codex"}
+{"evidence_id":"zcode-1","text":"Keep the canary green","timestamp":"2026-09-10T11:02:00Z","session":"adapter-session","namespace":"project:retain","host":"zcode"}
