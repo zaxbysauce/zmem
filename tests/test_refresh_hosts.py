@@ -835,10 +835,13 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
 
     def test_change_outside_runtime_surface_replaces_every_cache(self):
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
-        plugin_json = self.checkout / ".claude-plugin/plugin.json"
-        data = json.loads(plugin_json.read_text(encoding="utf-8"))
-        data["hooks"] = "./hooks/NEW.json"
-        plugin_json.write_text(json.dumps(data), encoding="utf-8")
+        # notes.txt is outside the runtime surface. (The original fixture
+        # edited .claude-plugin/plugin.json as its "outside" example; issue
+        # #359 made the version-bearing manifests part of the surface, so a
+        # plugin.json edit without a manifest re-emit is now — correctly —
+        # refused by the refresh's verify step instead of mirrored.)
+        notes = self.checkout / "notes.txt"
+        notes.write_text("changed outside the surface\n", encoding="utf-8")
         new_sha = _commit(self.checkout)
 
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
@@ -847,8 +850,8 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
         self.assertEqual(report["gitCommitSha"], new_sha)
         for row in report["hosts"]:
             self.assertEqual(
-                (Path(row["cacheRoot"]) / ".claude-plugin/plugin.json").read_bytes(),
-                plugin_json.read_bytes(),
+                (Path(row["cacheRoot"]) / "notes.txt").read_bytes(),
+                notes.read_bytes(),
             )
 
     def test_extra_stale_file_in_cache_is_removed_by_refresh(self):

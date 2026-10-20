@@ -1170,7 +1170,10 @@ refreshed plugin cache can serve different bytes under the same `version`. Since
 0.17.0 every release ships `release-manifest.json` — a sha-256 content hash of
 the runtime surface (`hooks/**`, `skills/memory/scripts/**`, `skills/**/SKILL.md`,
 `hermes-plugin/**`, `scripts/**` — the last joined in 0.18.0 so the canary is
-integrity-visible), committed at the repo root and attached to the GitHub
+integrity-visible — plus every version-bearing host manifest
+`plugin.json`/`plugin.yaml`/`marketplace.json` outside the test fixtures,
+discovered by name since issue #359 so a tampered manifest is drift-visible),
+committed at the repo root and attached to the GitHub
 Release. zmem compares the served tree against it in two places:
 
 - **`doctor`** — the `served-drift` check reports `matched` (pass), `drifted`

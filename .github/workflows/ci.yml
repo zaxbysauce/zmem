@@ -225,18 +225,22 @@ jobs:
           python scripts/host_canary.py --host claude --self-test
           python scripts/host_canary.py --host codex --self-test
 
-      # Issue #107 follow-up: a release-prep PR (manifest version bump) must
-      # carry a fresh release-manifest.json — fail the PR, not the post-merge
-      # release. Non-bump PRs pass (the manifest is intentionally stale
-      # between releases); indeterminate version reads fail closed. The PR
-      # checkout is shallow and carries no origin/main ref, so the step
-      # fetches the base tip explicitly (depth-1 suffices: the gate reads
-      # only git show <ref>:<manifest> per tracked version surface).
+      # Issues #107/#325/#354/#359: the PR-time release gate verifies the
+      # committed release-manifest.json on EVERY run (equal versions are the
+      # sibling-collision state, not a benign skip), fails a version that is
+      # already tagged (collision) or below the newest tag (ordering) when
+      # the PR claims a release target, and fails closed on indeterminate
+      # version reads. The PR checkout is shallow and carries no origin/main
+      # ref, so the step fetches the base tip explicitly (depth-1 suffices:
+      # the gate reads only git show <ref>:<manifest> per tracked version
+      # surface); --tags (not the old --no-tags) also materializes the tag
+      # universe the collision/ordering check reads — without it that check
+      # is structurally vacuous in CI.
       - name: Manifest freshness on release-prep changes
         if: github.event_name == 'pull_request' && !cancelled()
         shell: bash
         run: |
-          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
           python scripts/release_gate.py --check-manifest-freshness --base origin/main
 
       # Issue #106 (P0-1, durable half): fail a merge to main that leaves

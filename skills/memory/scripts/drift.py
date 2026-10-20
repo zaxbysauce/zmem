@@ -16,8 +16,15 @@ gives the runtime surface a CONTENT-addressed identity instead:
 
 Surface (the runtime surface, nothing else): ``hooks/**``,
 ``skills/memory/scripts/**``, ``skills/**/SKILL.md``, ``hermes-plugin/**``,
-``scripts/**`` (joined in 0.18.0, issue #108 review round — see _SURFACE_DIRS).
-Excluded: any ``__pycache__`` path segment and ``.pyc``/``.pyo`` suffixes.
+``scripts/**`` (joined in 0.18.0, issue #108 review round — see _SURFACE_DIRS),
+plus every version-bearing host manifest discovered by name —
+``plugin.json`` / ``plugin.yaml`` / ``marketplace.json`` outside the
+deterministic test-fixture tree (issue #359: a version bump or tamper on the
+seven shipping manifests must be drift-visible; discovery by name, not a
+remembered list, so a newly added shipping surface can never silently escape —
+the same principle release_gate's manifest inventory follows). Excluded: any
+``__pycache__`` or ``node_modules``/``.zcode``/``issue-traces`` path segment and
+``.pyc``/``.pyo`` suffixes.
 ``release-manifest.json`` sits at the repo root, outside every prefix, so it
 is never self-hashed.
 
@@ -73,8 +80,31 @@ _SURFACE_DIRS = ("hooks/", "skills/memory/scripts/", "hermes-plugin/", "scripts/
 # docs/SKILL.md is not runtime surface).
 _SKILL_MD_SELF = "skills/SKILL.md"
 
+# Version-bearing host manifests (issue #359): plugin/marketplace descriptors
+# by NAME, anywhere outside the deterministic test-fixture tree — discovery,
+# not a remembered list, matching release_gate's shipping-manifest inventory.
+# This regex is the single definition both sides share (drift._is_surface and
+# release_gate._is_shipping_manifest); do not fork it.
+VERSION_MANIFEST_RE = re.compile(
+    r"(?:^|/)(?:plugin\.(?:json|yaml)|marketplace\.json)$"
+)
+# Deterministic host-refresh fixtures contain descriptor-shaped files; they are
+# test data, not shipped surfaces.
+_FIXTURE_TREE_PREFIX = "tests/fixtures/"
+
+
+def is_version_manifest(rel: str) -> bool:
+    """Whether a repo-relative POSIX path is a shipped version manifest."""
+    return bool(VERSION_MANIFEST_RE.search(rel)) and not rel.startswith(
+        _FIXTURE_TREE_PREFIX
+    )
+
 # Excluded path segments / suffixes (build artifacts, never runtime identity).
-_EXCLUDED_SEGMENTS = {"__pycache__"}
+# node_modules mirrors release_gate's disk-walk fallback; .zcode/issue-traces
+# carry manifest-name COPIES in dev checkouts that would be noise on the
+# doctor disk walk (segment-level pruning keeps .agents/plugins/marketplace.json
+# itself inside the surface).
+_EXCLUDED_SEGMENTS = {"__pycache__", "node_modules", ".zcode", "issue-traces"}
 _EXCLUDED_SUFFIXES = (".pyc", ".pyo")
 
 # Canonical ops-lane session-id rule (same as miss_rate / recall-body): the
@@ -102,6 +132,8 @@ def _is_surface(rel: str) -> bool:
     if rel.endswith(_EXCLUDED_SUFFIXES):
         return False
     if rel.startswith(_SURFACE_DIRS):
+        return True
+    if is_version_manifest(rel):
         return True
     return rel == _SKILL_MD_SELF or (
         rel.startswith("skills/") and rel.endswith("/SKILL.md"))
