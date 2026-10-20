@@ -122,43 +122,14 @@ def _resolve_occurrence(
 
 
 def _clear_occurrence(conn: sqlite3.Connection, memory_id: str) -> None:
-    """Drop the occurrence row for a memory being HARD-removed.
+    """Drop the v17 occurrence row for a memory being tombstoned/absorbed.
 
-    Occurrence time is point-in-time HISTORY, not live gate state, so it
-    must NOT be cleared on a soft tombstone. A superseded parent stays
-    `--as-of`-reachable, and deleting its occurrence made as-of temporal
-    recall permanently unable to reach a pre-update event: the replacement
-    row fails the validity predicate for as-of instants before the
-    tombstone, and the original's occurrence was already gone. The temporal
-    arm's JOIN carries ``m.superseded_at IS NULL``, so a retained row on a
-    tombstoned parent is invisible to LIVE recall; only a hard delete needs
-    to reap it, which purge and import-store do via ``purge._ID_SIDE_TABLES``.
-
-    ``_clear_expiry`` is the opposite case and still clears on tombstone:
-    injection-expiry is a LIVE gate that must never outlive its parent.
+    Same defect-class guardrail as `_clear_expiry`: every writer that
+    tombstones or hard-removes a memory row calls this in the SAME
+    transaction so a `memory_occurrence` row can never outlive its parent.
     """
     conn.execute(
         "DELETE FROM memory_occurrence WHERE memory_id=?", (memory_id,))
-
-
-def _carry_occurrence(conn: sqlite3.Connection, old_id: str,
-                      new_id: str) -> bool:
-    """Move an occurrence triple onto a surviving row after a dedup fold.
-
-    Returns True when a row was moved. The fold is the one path where the
-    CONTENT survives but the row it was keyed to does not, so without this
-    the event silently left the temporal arm — and with no warning, because
-    the fold path returned before the re-insert.
-    """
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_occurrence "
-        "(memory_id, occurred_start, occurred_end, mentioned_at) "
-        "SELECT ?, occurred_start, occurred_end, mentioned_at "
-        "FROM memory_occurrence WHERE memory_id=?",
-        (new_id, old_id))
-    return bool(conn.execute(
-        "SELECT count(*) FROM memory_occurrence WHERE memory_id=?",
-        (new_id,)).fetchone()[0])
 
 
 def _resolve_update_expiry(
@@ -1894,13 +1865,7 @@ def supersede_memory(
         # stale-summary, sync tombstone, plus the hard-DELETE paths in
         # purge/import-store via purge._ID_SIDE_TABLES).
         _clear_expiry(conn, mid)
-        # v18 (issue #178): the occurrence row is RETAINED here. This
-        # is a soft tombstone and the parent stays --as-of reachable,
-        # so deleting its occurrence made as-of temporal recall
-        # permanently unable to reach the pre-supersede event. The
-        # arm's JOIN filters superseded_at IS NULL, so the retained
-        # row is invisible to live recall. Hard deletes still reap it
-        # through purge._ID_SIDE_TABLES.
+        _clear_occurrence(conn, mid)
         if started_tx:
             _commit(conn)
     except Exception:
@@ -2194,11 +2159,7 @@ def update_memory(
         # inherited pair), so the side table never holds a record keyed to a
         # dead parent.
         _clear_expiry(conn, mid)
-        # v18 (issue #178): RETAIN the occurrence row for the same
-        # as-of reason as the supersede path above. If the fold below
-        # moves the content onto another live row, `_carry_occurrence`
-        # moves the triple with it; if not, the tombstoned row keeps
-        # it for as-of.
+        _clear_occurrence(conn, mid)
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
@@ -2219,13 +2180,6 @@ def update_memory(
                 existing = None
         if existing:
             dup_id = existing["id"]
-            # v18 (issue #178): the content survives on `dup_id`
-            # while `mid` is tombstoned, so the occurrence triple has
-            # to travel with it or the event silently leaves the
-            # temporal arm. Reported, not silent.
-            if _carry_occurrence(conn, mid, dup_id):
-                print("[zmem] dedup: existing memory %s kept the "
-                      "occurrence data" % dup_id, file=sys.stderr)
             # v15 (#173 PR-review F04): an EXPLICIT expiry request must not be
             # silently destroyed by the dedup fold. State target: install the
             # resolved pair (the update's explicit expiry intent wins, exactly
