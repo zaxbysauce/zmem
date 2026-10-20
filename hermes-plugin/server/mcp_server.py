@@ -1139,15 +1139,19 @@ def _run_store(
     except subprocess.TimeoutExpired as exc:
         _record_timing()
         effective = _STORE_TIMEOUT_S if timeout is None else timeout
+        # N-24/F-1: CPython populates exc.stdout on Windows via the post-kill
+        # communicate(); a post-commit kill's stdout carries the
+        # "[zmem] added memory <id>" line. _sanitize_store_error prefers
+        # stderr, so the evidence is appended INTO the stderr text (bounded)
+        # — the caller's detail then names the commit that landed.
+        child_stdout = (exc.stdout or "").strip()
+        stderr_text = f"store.py timed out after {effective}s"
+        if "[zmem]" in child_stdout:
+            stderr_text += " | child stdout: " + child_stdout[:200]
         result = {
             "ok": False,
-            # N-24: CPython populates exc.stdout/stderr on Windows via the
-            # post-kill communicate(); a post-commit kill's stdout carries
-            # the "[zmem] added memory <id>" line, which is exactly the
-            # evidence _sanitize_store_error's [zmem]-line preference needs
-            # to tell the caller the write DID land.
             "stdout": exc.stdout or "",
-            "stderr": f"store.py timed out after {effective}s",
+            "stderr": stderr_text,
             "returncode": 124,
         }
         if timeout is not None:

@@ -53,6 +53,10 @@ _PIN_KEYS = (
     "ZMEM_MODEL_AUTODOWNLOAD", "PYTHONIOENCODING", "ZMEM_INJECT",
     "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
     "ZMEM_MCP_TOKENS_FILE", "ZMEM_NAMESPACE", "ZMEM_CROSS_PROJECT",
+    # Issue #286 review F-3: the pool knobs leak into module constants at
+    # import — pin them so same-process sibling tests inherit a clean env.
+    "ZMEM_MCP_MAX_CONCURRENT", "ZMEM_MCP_MAX_CONCURRENT_READ",
+    "ZMEM_MCP_MAX_CONCURRENT_WRITE", "ZMEM_MCP_QUEUE_TIMEOUT_S",
 )
 
 
@@ -183,6 +187,11 @@ def test_pool_knobs_are_distinct_and_swap_detectable():
             mcp_server._MAX_CONCURRENT_WRITE)
         read_sem, write_sem = asyncio.run(_acquire_both(mcp_server))
         assert read_sem is not write_sem
+        # F-3: the pool SIZES come from the matching knob — a construction
+        # swap (read built from WRITE, write from READ) passes the constant
+        # and distinctness checks but flips these values.
+        assert read_sem._value == 3, read_sem._value
+        assert write_sem._value == 5, write_sem._value
     finally:
         sys.path.remove(str(SERVER_DIR))
         for mod_name in [k for k in list(sys.modules) if k == "mcp_server"]:
@@ -218,68 +227,133 @@ def test_submit_failure_releases_the_permit():
         real_executor = mod._store_executor
         mod._store_executor = _BoomExecutor()
         try:
+            before = mod._get_store_semaphore()._value
             raised = None
             try:
                 _call(server, "add", {
                     "type": "fact", "content": "t07-supp submitfail",
                     "namespace": "user:global", "deadline_ms": 30000,
                 })
-            except Exception as exc:
-                raised = exc
-            assert raised is not None, (
-                "a submit failure must propagate (after the permit is "
-                f"restored), got: {resp!r}" if False else
-                "a submit failure must propagate after the permit restore")
-            sem = mod._get_store_semaphore()
-            assert sem._value >= 1, (
+            except Exception:
+                raised = True
+            assert raised, "a submit failure must propagate after the restore"
+            after = mod._get_store_semaphore()._value
+            assert after == before, (
                 f"the write-pool permit must be restored after a submit "
-                f"failure (value={sem._value})")
+                f"failure (before={before}, after={after} — a dropped "
+                f"release shrinks the pool)")
         finally:
             mod._store_executor = real_executor
 
 
 def test_recall_and_update_honour_the_deadline():
     """N-17: deadline coverage beyond add/prefetch — recall carries the
-    client_protocol gate, and update's multi-leg span recomputes the
-    budget so the mutation leg is killed inside what is left."""
-    with _pinned_server("recall-update") as (server, mod, tmp):
+    client_protocol gate, and update's multi-leg span (map mode: the
+    scoped get + the mutation) recomputes the budget so a later leg is
+    killed inside what an earlier leg consumed."""
+    # Map mode (principal map) makes update a genuine multi-leg tool:
+    # the scoped get + attribution-tags get + mutation, all under ONE
+    # _Deadline with per-leg remaining_s() recompute.
+    tmp = tempfile.mkdtemp(prefix="zmem-t07s-map-")
+    saved = {k: os.environ.get(k) for k in _PIN_KEYS}
+    for key in _PIN_KEYS:
+        os.environ.pop(key, None)
+    token = "fb-map-token-" + uuid.uuid4().hex
+    tokens_path = Path(tmp) / "tokens.json"
+    tokens_path.write_text(json.dumps({
+        token: {"principal": "fbhost", "host": "fbhost",
+                "harness": "fbharness", "namespaces": ["user:global"]},
+    }), encoding="utf-8")
+    os.environ.update({
+        "ZMEM_HOME": str(REPO_ROOT),
+        "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+        "ZMEM_DATA": tmp,
+        "ZMEM_MODELS_DIR": os.path.join(tmp, "missing-models"),
+        "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        "PYTHONIOENCODING": "utf-8",
+        "ZMEM_MCP_TOKENS_FILE": str(tokens_path),
+    })
+    for mod_name in [k for k in list(sys.modules) if k == "mcp_server"]:
+        del sys.modules[mod_name]
+    sys.path.insert(0, str(SERVER_DIR))
+    try:
+        import mcp_server as mod
+        server = mod.build_server(host="127.0.0.1", port=0, use_tls=False)
+        # Map mode resolves the caller from the request context — the direct
+        # ToolManager call carries none, so set the SDK auth context var the
+        # same way the transport would (the t02 test's pattern).
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+        access = asyncio.run(server._token_verifier.verify_token(token))
+        assert access is not None, "token verifier must accept the map token"
+
+        def _call_scoped(name, args):
+            ctx = auth_context_var.set(AuthenticatedUser(access))
+            try:
+                return _call(server, name, args)
+            finally:
+                auth_context_var.reset(ctx)
+
         real_run_store = mod._run_store
 
+        seen_legs = []
+
         def two_leg_fake(args, input_text=None, timing=None, timeout=None):
-            # Model subprocess.run's kill: a timeout below the fake's 2 s
-            # work time surfaces the same envelope _run_store returns on
-            # TimeoutExpired (flag set, stdout empty).
-            if timeout is not None and timeout < 1.9:
+            # Model subprocess.run's kill per leg: each leg has its own work
+            # time; a timeout below it surfaces the TimeoutExpired envelope.
+            # F-4: capture the per-leg timeouts — the recompute pin asserts
+            # leg 2's clamp is BELOW leg 1's by the get leg's consumed time.
+            seen_legs.append((args[0] if args else "?", timeout))
+            work = 0.5 if (args and args[0] == "get") else 3.5
+            if timeout is not None and timeout < work:
                 return {"ok": False, "stdout": "",
                         "stderr": f"store.py timed out after {timeout}s",
                         "returncode": 124, "deadline_exceeded": True}
+            time.sleep(work)
             if args and args[0] == "get":
                 return {"ok": True, "stdout": '{"namespace": "user:global", "tags": ""}',
                         "stderr": "", "returncode": 0}
-            time.sleep(2.0)
             return {"ok": True, "stdout": '{"id": "upd", "result": "updated"}',
                     "stderr": "", "returncode": 0}
 
         mod._run_store = two_leg_fake
         try:
-            refused = _call(server, "recall", {
-                "query": "t07 supp gate", "client_protocol": 99})
+            refused = _call_scoped("recall", {
+                "query": "t07 supp gate", "namespace": "user:global",
+                "client_protocol": 99})
             assert refused.get("error") == "protocol_incompatible", (
                 f"recall must carry the client_protocol gate: {refused!r}")
-            expired = _call(server, "recall", {
-                "query": "t07 supp gate", "deadline_ms": 0})
+            expired = _call_scoped("recall", {
+                "query": "t07 supp gate", "namespace": "user:global",
+                "deadline_ms": 0})
             assert expired.get("error") == "deadline_exceeded", expired
-            started = time.perf_counter()
-            resp = _call(server, "update", {
+            resp = _call_scoped("update", {
                 "id": "fb-target", "content": "t07 supp update",
-                "deadline_ms": 500})
-            elapsed = time.perf_counter() - started
+                "deadline_ms": 3000})
             assert resp.get("error") == "deadline_exceeded", resp
-            assert elapsed < 2.0, (
-                f"update's mutation leg must be killed inside the "
-                f"recomputed budget, took {elapsed:.2f}s")
+            # F-4: the recompute discriminator — a later leg's subprocess
+            # timeout must be clamped BELOW the first leg's by the consumed
+            # work time. A mutant passing the gate-time budget to every leg
+            # passes equal timeouts and fails here.
+            assert len(seen_legs) >= 2, seen_legs
+            first_t, last_t = seen_legs[0][1], seen_legs[-1][1]
+            assert first_t is not None and last_t is not None, seen_legs
+            assert last_t < first_t - 0.25, (
+                f"a later leg's subprocess timeout must be recomputed below "
+                f"the first leg's (first={first_t!r}, last={last_t!r}, "
+                f"legs={seen_legs!r})")
         finally:
             mod._run_store = real_run_store
+    finally:
+        sys.path.remove(str(SERVER_DIR))
+        for mod_name in [k for k in list(sys.modules) if k == "mcp_server"]:
+            del sys.modules[mod_name]
+        shutil.rmtree(tmp, ignore_errors=True)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_deadline_ms_normalization_table():
