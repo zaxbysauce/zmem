@@ -5,6 +5,72 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.113.0] - 2026-10-20
+
+### Added
+- **Caller deadlines and split read/write concurrency pools (issue #286,
+  Workstream T PR 7 of 12):** the hub now respects the caller's remaining
+  budget instead of its own fixed 60 s queue wait and 30 s subprocess cap:
+  - Every MCP tool except `hello` accepts an optional `deadline_ms` (the
+    caller's REMAINING budget in milliseconds; raw-typed so validation
+    happens at the hub gate — bools, strings, containers and negatives
+    get the structured invalid-argument refusal naming the field). The
+    hub bounds queue admission, the store subprocess timeout and its own
+    200 ms response-serialization reserve by that budget; an expired
+    call is killed at the deadline and returns the stable
+    `deadline_exceeded` error through one shared failure-mapping choke
+    point (a write that committed just before the kill is NOT rolled
+    back — treat `deadline_exceeded` on a write as an unknown outcome
+    and verify before retrying). Multi-leg tools (update/supersede/invalidate's
+    read-then-write pairs) span ONE deadline object — each leg runs only
+    inside what is left. Calls without `deadline_ms` keep the fixed
+    legacy budgets (60 s queue wait, 30 s subprocess).
+  - Split pools: passive/interactive reads (recall, search, recent,
+    evidence, prefetch, session_start) draw from
+    `ZMEM_MCP_MAX_CONCURRENT_READ` (default 8) while writes (add,
+    update, supersede, invalidate, session_end, prefetch_ack) draw from
+    `ZMEM_MCP_MAX_CONCURRENT_WRITE` (default 8); the legacy
+    `ZMEM_MCP_MAX_CONCURRENT` seeds both when the specific vars are
+    unset, and the executor is resized to `max(2*(read+write), 16)`
+    workers so the semaphores stay the real limit. A burst of writes can
+    no longer starve passive injection.
+  - Reservation disclosure (the issue's scope constraint): the hub never
+    drives `prefetch-ack` for an expired call, and an unacknowledged
+    reservation commits nothing and TTL-reaps (the shipped T-05
+    mechanism); the residual eager-ledger window for killed NON-reserving
+    passive calls — `prefetch` AND `session_start`'s selector leg — is
+    narrowed from the 30 s fixed budget to the caller's declared budget.
+  - Feedback-round fixes (swarm-pr-review pr388-20261020): a slot granted
+    after the budget expired releases the permit and returns the deadline
+    envelope instead of spawning a doomed subprocess; a deadline-exhausted
+    wait near the timer boundary classifies as `deadline_exceeded`, not
+    503; cross-loop semaphore rebinding; the invalid-argument echo is
+    bounded (NaN/Inf no longer reachable in the response JSON);
+    session_start's deadline exits append their decision line and
+    `miss_rate` excludes the boundary reason from the missed count;
+    `_pool_semaphore` rejects unknown pool names; new supp checks pin the
+    short-deadline success path, the pool knobs, the submit-failure
+    guard, and multi-leg recompute.
+  - New acceptance checks `tests/test_t07_deadline.py` (frozen:
+    queue-admission, kill-commits-nothing with a fake-checkout marker
+    probe, read-pool admission under write saturation) plus
+    `tests/test_t07_deadline_supp.py` (generous-deadline positive path,
+    the raw-value normalization table, expiry-at-entry touches no ledger
+    family); the existing semaphore-seam tests are adapted to the split
+    pools.
+
+### Changed
+- The MCP overload error text now names the pool (`... in flight in the
+  write pool; retry shortly`) and, for legacy operators,
+  `ZMEM_MCP_MAX_CONCURRENT` seeds BOTH pools — aggregate store
+  concurrency doubles (8+8), and the executor resizes to
+  `max(2*(read+write), 16)` threads. Set explicit
+  `ZMEM_MCP_MAX_CONCURRENT_READ`/`_WRITE` values to control the split
+  independently.
+- The deadline kill path now surfaces the killed child's captured stdout
+  (which may carry a `[zmem] added memory <id>` line proving a write
+  committed just before the kill) instead of discarding it.
+
 ## [0.112.0] - 2026-10-20
 
 ### Added

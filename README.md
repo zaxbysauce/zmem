@@ -874,6 +874,22 @@ argument validation before the gate runs; the stable
 unauthenticated `/health` probe stays
 minimal by design (liveness only — no version identity).
 
+**Caller deadlines (issue #286)** — every tool except `hello` also accepts
+an optional `deadline_ms` (the caller's REMAINING budget, in
+milliseconds). The hub bounds queue admission, the store subprocess and
+its response reserve by that budget and returns the stable
+`deadline_exceeded` error when it expires (an expired call is killed at
+the deadline; a write that committed just before the kill is not rolled
+back — verify before retrying; an unacknowledged prefetch reservation
+left behind commits nothing and TTL-reaps per the T-05 contract; the
+same eager-write window exists on `session_start`'s selector leg). Reads
+and writes draw from separate concurrency pools
+(`ZMEM_MCP_MAX_CONCURRENT_READ` / `ZMEM_MCP_MAX_CONCURRENT_WRITE`), so a
+burst of writes cannot starve passive injection; the legacy
+`ZMEM_MCP_MAX_CONCURRENT` knob seeds both pools, doubling the aggregate
+cap it capped before. Calls without `deadline_ms` keep the fixed legacy
+budgets (60 s queue wait, 30 s subprocess).
+
 **On the store-host box** (this machine, with `~/.zmem/store.sqlite`):
 
 ```bash
@@ -1049,8 +1065,10 @@ MCP server:
 | `ZMEM_MCP_TOKEN_FILE` | Path to a file containing the token (alternative to `ZMEM_MCP_TOKEN`). A bare text file is an UNSCOPED operator token (full access). A JSON file `{"token": "...", "namespaces": ["project:x", "user:global"]}` scopes the token: requests outside the allow-list fail closed with the stable `namespace_not_allowed` error, and scoped tokens must pass an allowed namespace explicitly on every read (issue #65, 10.2). Omitting `namespaces` — or setting it to `null` — means an UNSCOPED operator token (full access), exactly like a bare text file. | — |
 | `ZMEM_MCP_TOKENS_FILE` | Path to a JSON map of per-machine principals (fleet mode, issue #281): `{"<token>": {"principal": "web01", "host": "web01", "harness": "claude", "namespaces": ["project:x"]}, ...}`. Takes precedence over `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE`. `principal` must be unique across entries; `host`/`harness` are required and are stamped server-side as `host:`/`agent:` tags on every write (client-supplied ones are stripped); `namespaces` absent = unscoped; `revoked: true` (or removing the token) takes effect on the next request after a map reload — any change to the file's mtime, including a rewind from an mtime-preserving restore (checked at most once a second), or SIGHUP where available; no restart. Entry keys are allow-listed: an unrecognized field name is a hard startup error (a typo must never silently widen a principal or keep a revoked credential live), and two keys that normalize to the same token are refused. An unreadable/invalid RELOAD keeps the previous map (a corrupt rewrite defers pending revocations until a valid rewrite lands; logged as `zmem_mcp_principal_map_reload_failed` (an unreadable path logs `zmem_mcp_principal_map_stat_failed`)); a malformed map at STARTUP exits 2. `capabilities` (`read`, `passive`, `write`, `mutate`, `admin`) is parsed onto the token's scopes but not yet enforced (#288; #283 shipped namespace-allow-list selection in 0.105.0). | — |
 | `ZMEM_MCP_ALLOW_INSECURE_BIND` | Set to `1` to allow `0.0.0.0` / `::` (and IPv4-mapped) wildcard binds. | unset |
-| `ZMEM_MCP_MAX_CONCURRENT` | Cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). | `8` |
-| `ZMEM_MCP_QUEUE_TIMEOUT_S` | How long a queued tool call waits for a concurrency slot before returning an overload error. | `60` |
+| `ZMEM_MCP_MAX_CONCURRENT` | Legacy cap on simultaneous `store.py` subprocesses the MCP server will run (overload protection). With the issue #286 split pools this seeds BOTH per-pool bounds when they are unset; a specific per-pool var wins. | `8` |
+| `ZMEM_MCP_MAX_CONCURRENT_READ` | Cap for the passive/interactive READ pool (recall, search, recent, evidence, prefetch, session_start) — a burst of writes cannot starve injection (issue #286). Specific value wins over `ZMEM_MCP_MAX_CONCURRENT`. | `8` |
+| `ZMEM_MCP_MAX_CONCURRENT_WRITE` | Cap for the WRITE pool (add, update, supersede, invalidate, session_end, prefetch_ack) (issue #286). Specific value wins over `ZMEM_MCP_MAX_CONCURRENT`. | `8` |
+| `ZMEM_MCP_QUEUE_TIMEOUT_S` | How long a queued tool call waits for a concurrency slot before returning an overload error (a call carrying `deadline_ms` instead gives up at its own remaining budget and returns the stable `deadline_exceeded` error). | `60` |
 
 > **Performance characteristics (inherent, not bugs):** `store.py backup` is
 > O(store size) by nature — SQLite's Online Backup API copies the live database

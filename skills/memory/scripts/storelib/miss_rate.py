@@ -998,7 +998,7 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     # hub writes must be excluded from the missed classification, exactly
     # like the kill switch — a negotiation refusal is not a retrieval miss.
     disabled_lines = [ln for ln in lines if ln.get("reason") in (
-        "disabled", "protocol-incompatible")]
+        "disabled", "protocol-incompatible", "deadline-exceeded")]
     decision_ts = [ln["ts"] for ln in lines]
     period = [min(decision_ts), max(decision_ts)] if decision_ts else None
     sid_lines = sum(1 for ln in lines if ln.get("sid") is not None)
