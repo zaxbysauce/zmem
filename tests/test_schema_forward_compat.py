@@ -449,7 +449,7 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
 
 class OlderV16ClientOnV18StoreTest(unittest.TestCase):
     """Issue #178 AC1: a v16 MAINTENANCE client (SUPPORTED=16, FORWARD=17)
-    opens the current v17 store through the reopened additive window — one
+    opens the current v18 store through the reopened additive window — one
     NOTICE, ordinary read/write, never a downgrade. The four version
     bindings are patched with unittest.mock.patch.object in the required
     16/17 pattern (SUPPORTED may never be patched below FORWARD here)."""
@@ -539,7 +539,7 @@ class OlderV16ClientOnV18StoreTest(unittest.TestCase):
                 self.assertTrue(
                     any(str(r["id"]) == str(res) for r in rows),
                     "the v16 maintenance client must be able to recall the "
-                    "row it just wrote on a v17 store")
+                    "row it just wrote on a v18 store")
                 conn.close()
             notice = buf.getvalue()
         # Exactly ONE NOTICE names the v17-vs-v16 gap.

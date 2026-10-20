@@ -185,6 +185,17 @@ def clamp_range(start: str, end: str,
     endpoints older than ``prompt - MAX_TEMPORAL_DAYS`` clamp to that
     lower bound.  Malformed inputs answer ``("", "")``; never raises.
     """
+    # Same boundary-year guard as parse_relative_range (review CL2-15):
+    # `floor` arithmetic at year 0001 raised OverflowError past the
+    # documented ("", "") contract.
+    try:
+        return _clamp_range_inner(start, end, prompt_timestamp=prompt_timestamp)
+    except (OverflowError, ValueError):
+        return ("", "")
+
+
+def _clamp_range_inner(start: str, end: str,
+                       *, prompt_timestamp: str) -> tuple[str, str]:
     prompt = _parse_ts(prompt_timestamp)
     start_moment = _parse_ts(start)
     end_moment = _parse_ts(end)
