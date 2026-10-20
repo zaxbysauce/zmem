@@ -1094,10 +1094,17 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         so the lazy semaphore is constructed and used on the same event loop
         (robust across Python versions — cubic-10)."""
         import asyncio
+        # Issue #286: pools are split — pin BOTH bounds (the seed add draws
+        # from the write pool, the recall gather from the read pool) and
+        # reset BOTH lazy semaphores so they rebuild at 1 permit each.
         original = self.mcp_server._MAX_CONCURRENT_STORE
-        # Force a tiny cap and reset the lazy semaphore so it rebuilds.
+        original_read = self.mcp_server._MAX_CONCURRENT_READ
+        original_write = self.mcp_server._MAX_CONCURRENT_WRITE
         self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._MAX_CONCURRENT_READ = 1
+        self.mcp_server._MAX_CONCURRENT_WRITE = 1
         self.mcp_server._store_semaphore = None
+        self.mcp_server._read_semaphore = None
         in_flight = {"count": 0, "peak": 0}
         original_run_store = self.mcp_server._run_store
 
@@ -1137,7 +1144,10 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         finally:
             self.mcp_server._run_store = original_run_store
             self.mcp_server._MAX_CONCURRENT_STORE = original
+            self.mcp_server._MAX_CONCURRENT_READ = original_read
+            self.mcp_server._MAX_CONCURRENT_WRITE = original_write
             self.mcp_server._store_semaphore = None
+            self.mcp_server._read_semaphore = None
 
     def test_cancellation_does_not_release_permit_prematurely(self):
         """cubic-6: if a request is cancelled while its subprocess is running,
@@ -1147,7 +1157,12 @@ class McpServerToolSurfaceTest(unittest.TestCase):
         asyncio wrapper future (which cancels immediately)."""
         import asyncio
         original = self.mcp_server._MAX_CONCURRENT_STORE
+        # Issue #286: the direct _run_store_async call below draws from the
+        # WRITE pool (default pool argument) — pin the write bound and reset
+        # the lazy write semaphore so it rebuilds at 1 permit.
+        original_write = self.mcp_server._MAX_CONCURRENT_WRITE
         self.mcp_server._MAX_CONCURRENT_STORE = 1
+        self.mcp_server._MAX_CONCURRENT_WRITE = 1
         self.mcp_server._store_semaphore = None
         original_run_store = self.mcp_server._run_store
         # A blocking _run_store that waits on an event we control.
@@ -1203,6 +1218,7 @@ class McpServerToolSurfaceTest(unittest.TestCase):
             release_event["go"] = True
             self.mcp_server._run_store = original_run_store
             self.mcp_server._MAX_CONCURRENT_STORE = original
+            self.mcp_server._MAX_CONCURRENT_WRITE = original_write
             self.mcp_server._store_semaphore = None
 
 

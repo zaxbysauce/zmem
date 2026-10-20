@@ -360,11 +360,15 @@ class DenyAllResolutionTest(_MapCase):
         real = self.mcp_server._run_store_async
         calls = {"n": 0}
 
-        async def flaky(args, input_text=None, timing=None):
+        async def flaky(args, input_text=None, timing=None,
+                        deadline=None, pool="write"):
+            # deadline/pool: the issue #286 per-call kwargs ride every
+            # _run_store_async call now; pass them through unchanged.
             if args and args[0] == "get":
                 calls["n"] += 1
                 return {"ok": False, "stdout": "", "stderr": "injected read failure"}
-            return await real(args, input_text=input_text, timing=timing)
+            return await real(args, input_text=input_text, timing=timing,
+                              deadline=deadline, pool=pool)
 
         self.mcp_server._run_store_async = flaky
         try:

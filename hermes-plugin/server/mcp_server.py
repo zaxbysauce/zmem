@@ -329,10 +329,87 @@ _LINK_BUDGET_RESERVED = 2
 # Concurrency cap on simultaneous store.py subprocesses. Each tool call spawns a
 # fresh store.py; without a bound an authorized but chatty remote client could
 # exhaust the process table / FDs / memory. Default 8; override via env (#36 M6).
+#
+# Issue #286 (Workstream T PR 7): the single shared pool is SPLIT into a
+# passive-read pool and a write pool so a burst of writes cannot starve
+# injection. The SPECIFIC per-pool var wins when set; each falls back to the
+# legacy ZMEM_MCP_MAX_CONCURRENT knob when that is set, else 8. The
+# `_store_semaphore`/`_get_store_semaphore()` names below REMAIN the
+# WRITE-pool surface (compat seam for the tests that reset/plant them).
 _MAX_CONCURRENT_STORE = max(1, int(os.environ.get("ZMEM_MCP_MAX_CONCURRENT", "8")))
+# Reviewer R-6 note: _MAX_CONCURRENT_STORE is now a COMPAT ALIAS only — the
+# write semaphore builds from _MAX_CONCURRENT_WRITE below; the retained name
+# serves the legacy env knob and the test seam that pins it.
+_MAX_CONCURRENT_WRITE = max(1, int(
+    os.environ.get("ZMEM_MCP_MAX_CONCURRENT_WRITE",
+                   os.environ.get("ZMEM_MCP_MAX_CONCURRENT", "8"))))
+_MAX_CONCURRENT_READ = max(1, int(
+    os.environ.get("ZMEM_MCP_MAX_CONCURRENT_READ",
+                   os.environ.get("ZMEM_MCP_MAX_CONCURRENT", "8"))))
 # How long a queued tool call waits to acquire the concurrency slot before
 # returning a 503-style overload error (vs. waiting forever).
 _QUEUE_TIMEOUT_S = float(os.environ.get("ZMEM_MCP_QUEUE_TIMEOUT_S", "60"))
+
+
+# Issue #286: the hub's response-serialization reserve — the fraction of a
+# caller's deadline the hub keeps for itself so a call that "just fits" the
+# budget still gets its response serialized and delivered inside it.
+_DEADLINE_RESERVE_S = 0.2
+# Stable error token for a call whose caller-declared deadline expired
+# (queue admission, subprocess budget, or expiry-at-entry).
+_ERROR_DEADLINE_EXCEEDED = "deadline_exceeded"
+
+
+class _Deadline:
+    """A caller-declared remaining budget spanning one tool call.
+
+    Built from the raw ``deadline_ms`` tool parameter (milliseconds).
+    ``remaining_s()`` subtracts the hub's serialization reserve and is
+    recomputed on every use, so multi-subprocess tools (update/supersede's
+    get-then-write legs) each run only inside what is LEFT. ``None`` means
+    legacy: every budget keeps its historical fixed value.
+    """
+
+    __slots__ = ("_deadline_at", "_declared_ms")
+
+    def __init__(self, declared_ms: float):
+        self._declared_ms = declared_ms
+        self._deadline_at = time.perf_counter() + max(0.0, declared_ms) / 1000.0
+
+    def remaining_s(self) -> float:
+        return max(0.0, self._deadline_at - time.perf_counter() - _DEADLINE_RESERVE_S)
+
+    def expired(self) -> bool:
+        return self.remaining_s() <= 0.0
+
+    def describe(self) -> str:
+        rendered = repr(self._declared_ms)
+        return rendered if len(rendered) <= 40 else rendered[:37] + "..."
+
+
+def _deadline_from_raw(value: object) -> "_Deadline | None | str":
+    """Normalize the raw ``deadline_ms`` tool parameter.
+
+    Returns None for an omitted deadline (legacy), a _Deadline for a
+    non-negative number, or a stable refusal string for anything the hub
+    will not interpret (bools — ``True`` is not 1 ms — strings, containers,
+    negatives, NaN/inf). Raw-typed parameter: validation happens HERE, at
+    the hub gate, never in the transport's argument model.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "deadline_ms must be a non-negative number of milliseconds"
+    if value != value or value in (float("inf"), float("-inf")):
+        return "deadline_ms must be a non-negative number of milliseconds"
+    if value < 0:
+        return "deadline_ms must be a non-negative number of milliseconds"
+    try:
+        return _Deadline(float(value))
+    except OverflowError:
+        # A JSON arbitrary-precision int beyond float range (e.g. 10**400)
+        # must get the structured refusal, never a transport crash.
+        return "deadline_ms must be a non-negative number of milliseconds" 
 
 
 def _resolve_zmem_home() -> Path:
@@ -856,7 +933,6 @@ def _compute_health() -> dict:
     }
 
 
-
 # PR-review PRR-P (issue #59 review round): Windows CreateProcess argv caps
 # near 32k chars while the store content cap is 65536 — content past this
 # threshold is piped via stdin (`--content -`) instead of an argv element.
@@ -1024,11 +1100,15 @@ def _namespace_guard_denial(
 def _run_store(
     args: list[str], input_text: str | None = None,
     timing: Optional[dict[str, int]] = None,
+    timeout: Optional[float] = None,
 ) -> dict[str, Any]:
     """Run ``store.py <args>``; returns {ok, stdout, stderr, returncode}.
 
     ``input_text`` (optional) is piped to the child's stdin — used for
-    oversize content (see ``_ARGV_SAFE_CONTENT_CHARS``)."""
+    oversize content (see ``_ARGV_SAFE_CONTENT_CHARS``). ``timeout``
+    (issue #286) overrides the fixed ``_STORE_TIMEOUT_S`` subprocess
+    budget for CALLER-DEADLINE calls; legacy calls keep the fixed budget
+    and the historical TimeoutExpired shape byte-identically."""
     store_py = _resolve_store_py()
     cmd = [sys.executable, str(store_py), *args]
     # Start at the exact subprocess boundary.  Resolving paths and waiting for
@@ -1047,7 +1127,7 @@ def _run_store(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=_STORE_TIMEOUT_S,
+            timeout=_STORE_TIMEOUT_S if timeout is None else timeout,
         )
         _record_timing()
         return {
@@ -1058,12 +1138,20 @@ def _run_store(
         }
     except subprocess.TimeoutExpired:
         _record_timing()
-        return {
+        effective = _STORE_TIMEOUT_S if timeout is None else timeout
+        result = {
             "ok": False,
             "stdout": "",
-            "stderr": f"store.py timed out after {_STORE_TIMEOUT_S}s",
+            "stderr": f"store.py timed out after {effective}s",
             "returncode": 124,
         }
+        if timeout is not None:
+            # Issue #286: this kill came from the CALLER's remaining
+            # deadline, not the hub's fixed budget — flag it so the shared
+            # failure mapper emits the stable token (a flag, never a value
+            # comparison: min(30, remaining) == 30 is value-ambiguous).
+            result["deadline_exceeded"] = True
+        return result
     except Exception as exc:  # pragma: no cover — defensive
         _record_timing()
         return {
@@ -1074,18 +1162,37 @@ def _run_store(
         }
 
 
-# Process-wide concurrency cap. Created lazily inside the running event loop
+# Process-wide concurrency caps. Created lazily inside the running event loop
 # (an asyncio.Semaphore binds to the loop active at construction time), so the
-# first async tool call builds it. Bounds simultaneous store.py subprocesses to
-# prevent process-table/FD exhaustion from an authorized but chatty client (#36 M6).
+# first async tool call builds them. Bounds simultaneous store.py subprocesses
+# to prevent process-table/FD exhaustion from an authorized but chatty client
+# (#36 M6). Issue #286: TWO pools — `_store_semaphore` (the WRITE pool, kept
+# under its historical name as the compat seam for tests that reset/plant it)
+# and `_read_semaphore` (the passive/interactive read lane: recall, search,
+# recent, evidence, prefetch, session_start) — so a burst of writes cannot
+# starve injection.
 _store_semaphore: "asyncio.Semaphore | None" = None
+_read_semaphore: "asyncio.Semaphore | None" = None
 
 
 def _get_store_semaphore() -> "asyncio.Semaphore":
     global _store_semaphore
     if _store_semaphore is None:
-        _store_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_STORE)
+        _store_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_WRITE)
     return _store_semaphore
+
+
+def _get_read_semaphore() -> "asyncio.Semaphore":
+    global _read_semaphore
+    if _read_semaphore is None:
+        _read_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_READ)
+    return _read_semaphore
+
+
+def _pool_semaphore(pool: str) -> "asyncio.Semaphore":
+    if pool == "read":
+        return _get_read_semaphore()
+    return _get_store_semaphore()
 
 
 # Shared thread pool for store.py subprocess offload. Bounded large enough that
@@ -1100,7 +1207,10 @@ def _get_executor() -> "ThreadPoolExecutor":
     if _store_executor is None:
         from concurrent.futures import ThreadPoolExecutor
         _store_executor = ThreadPoolExecutor(
-            max_workers=max(_MAX_CONCURRENT_STORE * 2, 16),
+            # Issue #286: sized to the SPLIT pool totals so the semaphores,
+            # not the executor, stay the real concurrency limit.
+            max_workers=max(
+                2 * (_MAX_CONCURRENT_READ + _MAX_CONCURRENT_WRITE), 16),
             thread_name_prefix="zmem-store",
         )
     return _store_executor
@@ -1109,6 +1219,8 @@ def _get_executor() -> "ThreadPoolExecutor":
 async def _run_store_async(
     args: list[str], input_text: str | None = None,
     timing: Optional[dict[str, int]] = None,
+    deadline: "Optional[_Deadline]" = None,
+    pool: str = "write",
 ) -> dict[str, Any]:
     """Async, concurrency-bounded wrapper around the sync ``_run_store``.
 
@@ -1132,16 +1244,38 @@ async def _run_store_async(
     runs to completion (Python threads can't be killed); its result is
     discarded.
     """
-    sem = _get_store_semaphore()
+    sem = _pool_semaphore(pool)
+    queue_budget = _QUEUE_TIMEOUT_S
+    if deadline is not None:
+        queue_budget = min(_QUEUE_TIMEOUT_S, deadline.remaining_s())
+        if deadline.expired():
+            return {
+                "ok": False, "stdout": "",
+                "stderr": "caller deadline already expired at queue admission",
+                "returncode": 504,
+                "error": _ERROR_DEADLINE_EXCEEDED,
+                "deadline_ms": deadline.describe(),
+            }
     try:
-        await asyncio.wait_for(sem.acquire(), timeout=_QUEUE_TIMEOUT_S)
+        await asyncio.wait_for(sem.acquire(), timeout=queue_budget)
     except asyncio.TimeoutError:
+        if deadline is not None and deadline.expired():
+            return {
+                "ok": False, "stdout": "",
+                "stderr": "caller deadline expired waiting for a "
+                          f"{pool} pool slot",
+                "returncode": 504,
+                "error": _ERROR_DEADLINE_EXCEEDED,
+                "deadline_ms": deadline.describe(),
+            }
         return {
             "ok": False,
             "stdout": "",
             "stderr": (
-                f"zmem-mcp: overloaded — { _MAX_CONCURRENT_STORE } concurrent "
-                "store.py subprocesses in flight; retry shortly"
+                f"zmem-mcp: overloaded — "
+                f"{_MAX_CONCURRENT_WRITE if pool == 'write' else _MAX_CONCURRENT_READ} "
+                f"concurrent store.py subprocesses in flight in the {pool} "
+                "pool; retry shortly"
             ),
             "returncode": 503,
         }
@@ -1150,12 +1284,30 @@ async def _run_store_async(
     # done-callback fires when the worker thread returns), not the asyncio
     # wrapper (whose callback fires on cancellation, too early).
     executor = _get_executor()
-    if timing is None:
-        # Preserve the historical call shape for partial deployments and tests
-        # that provide a compatible _run_store shim without instrumentation.
-        cfut = executor.submit(_run_store, args, input_text=input_text)
-    else:
-        cfut = executor.submit(_run_store, args, input_text=input_text, timing=timing)
+    submit_kwargs: dict[str, Any] = {"input_text": input_text}
+    if deadline is not None:
+        # The timeout kwarg rides ONLY when the CALLER's remaining budget is
+        # the tighter bound (R-3: kwarg presence must equal causation — a
+        # budget looser than the fixed cap keeps the fixed-cap kill's
+        # historical no-flag shape); legacy calls and the historical
+        # _run_store shims (tests) keep the 2/3-kwarg shape.
+        remaining = deadline.remaining_s()
+        if remaining < _STORE_TIMEOUT_S:
+            submit_kwargs["timeout"] = remaining
+    try:
+        if timing is None:
+            # Preserve the historical call shape for partial deployments and
+            # tests that provide a compatible _run_store shim without
+            # instrumentation.
+            cfut = executor.submit(_run_store, args, **submit_kwargs)
+        else:
+            cfut = executor.submit(
+                _run_store, args, timing=timing, **submit_kwargs)
+    except BaseException:
+        # Submit failed after a successful acquire — the permit must not
+        # leak (#286).
+        sem.release()
+        raise
 
     def _release_on_worker_done(_cfut, _loop=loop, _sem=sem):
         # Runs in the worker thread on completion — marshal release to the loop.
@@ -1167,10 +1319,53 @@ async def _run_store_async(
             _sem.release()
 
     cfut.add_done_callback(_release_on_worker_done)
-    return await asyncio.wrap_future(cfut)
+    result = await asyncio.wrap_future(cfut)
+    if (deadline is not None
+            and result.get("deadline_exceeded") is True
+            and "deadline_ms" not in result):
+        # R-4: the kill flag came from _run_store; attach the caller's
+        # bounded render so the structured response never says "unknown".
+        result["deadline_ms"] = deadline.describe()
+    return result
 
 
 _WARN_RE = re.compile(r"^\[zmem\].*\b(WARNING|NOTICE)\b.*:")
+
+
+def _deadline_response(deadline: "_Deadline") -> dict[str, Any]:
+    """The stable deadline-expiry envelope (entry-level expiry)."""
+    return {
+        "error": _ERROR_DEADLINE_EXCEEDED,
+        "deadline_ms": deadline.describe(),
+        "detail": (
+            "the caller's deadline expired before the hub could finish "
+            "(queue admission, store subprocess budget, or response "
+            "serialization reserve); nothing was committed by this call"
+        ),
+    }
+
+
+def _store_failure(r: dict[str, Any]) -> dict[str, Any]:
+    """The single failure-mapping choke point (issue #286, F-6/F-10).
+
+    Every not-ok store envelope flows through here — the tool sites AND the
+    helper-level branches (_write_response / _parse_results). Recognizes
+    BOTH deadline markers: the queue/entry path's ``error`` token and the
+    subprocess-kill path's ``deadline_exceeded`` flag; either yields the
+    stable structured ``deadline_exceeded`` dict, everything else keeps
+    today's sanitized-error shape.
+    """
+    if (r.get("error") == _ERROR_DEADLINE_EXCEEDED
+            or r.get("deadline_exceeded") is True):
+        return {
+            "error": _ERROR_DEADLINE_EXCEEDED,
+            "deadline_ms": r.get("deadline_ms", "unknown"),
+            "detail": _sanitize_store_error(r) or (
+                "the caller's deadline expired before the hub could finish; "
+                "nothing was committed by this call"
+            ),
+        }
+    return _error(_sanitize_store_error(r))
 
 
 def _parse_store_warnings(stderr: str) -> list[str]:
@@ -1225,7 +1420,7 @@ def _write_response(r: dict[str, Any], *, ok_result: str) -> dict[str, Any]:
     surfaces something rather than nothing.
     """
     if not r["ok"]:
-        resp = _error(_sanitize_store_error(r))
+        resp = _store_failure(r)
         stderr_warnings = _parse_store_warnings(r.get("stderr", ""))
         if stderr_warnings:
             resp["warnings"] = stderr_warnings
@@ -1325,7 +1520,7 @@ def _parse_results(r: dict[str, Any]) -> dict[str, Any]:
     counts default to 0.
     """
     if not r["ok"]:
-        return _error(_sanitize_store_error(r))
+        return _store_failure(r)
     stdout = (r["stdout"] or "").strip()
     if not stdout:
         return {"results": [], "count": 0, "omitted": 0, "injection_risk": 0}
@@ -1464,6 +1659,21 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "budget_truncated": 0, "budget_dropped_protected": 0,
             "arms": [], "rendered": "", "context": "",
         }
+
+    def _deadline_gate(deadline_ms: object):
+        """Normalize the raw deadline_ms parameter (issue #286).
+
+        Returns (deadline, refusal): (None, None) for a legacy call; a
+        _Deadline for a valid budget; (None, structured-refusal) for a value
+        the hub will not interpret. Placement: AFTER the protocol gate,
+        BEFORE payload validation.
+        """
+        if deadline_ms is None:
+            return None, None
+        normalized = _deadline_from_raw(deadline_ms)
+        if isinstance(normalized, str):
+            return None, _invalid_argument("deadline_ms", deadline_ms)
+        return normalized, None
 
     def _protocol_allowed(client_protocol: object) -> bool:
         """None (legacy) or a supported non-bool int major passes.
@@ -1727,6 +1937,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Recall memories relevant to a query (semantic + full-text).
 
@@ -1761,6 +1972,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         q = (query or "").strip()
         if not q:
             return _error("query is required")
@@ -1779,13 +1995,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args.insert(3, "--include-global")
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
-        return _parse_results(await _run_store_async(args))
+        return _parse_results(await _run_store_async(args, deadline=deadline, pool="read"))
 
     @mcp.tool()
     async def evidence_for(
         memory_id: str, limit: int = _EVIDENCE_PAGE_DEFAULT,
         after_id: Optional[str] = None,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Return paged untrusted evidence for one memory.
 
@@ -1798,6 +2015,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         mid, selector_error = _bounded_evidence_selector(memory_id, "memory_id")
         if selector_error:
             return _error(selector_error)
@@ -1827,8 +2049,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     return _error(cursor_error)
                 result_args += ["--after-id", cursor]
             result_args += ["--json"]
-        result = await _run_store_async(result_args)
+        result = await _run_store_async(result_args, deadline=deadline, pool="read")
         if not result["ok"]:
+            if result.get("error") == _ERROR_DEADLINE_EXCEEDED or result.get("deadline_exceeded"):
+                return _store_failure(result)
             if caller.scoped:
                 if _is_expected_scoped_evidence_denial(result):
                     return _scoped_evidence_denial(None, scoped_detail)
@@ -1867,6 +2091,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         after_namespace: Optional[str] = None,
         after_memory_id: Optional[str] = None,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Show one evidence row without leaking foreign-ID existence.
 
@@ -1881,6 +2106,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         evidence_id, selector_error = _bounded_evidence_selector(id, "id")
         if selector_error:
             return _error(selector_error)
@@ -1915,8 +2145,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "--id", evidence_id, "--limit", str(page_limit),
                 *cursor_args,
                 "--json",
-            ])
+            ], deadline=deadline, pool="read")
             if not result["ok"]:
+                if result.get("error") == _ERROR_DEADLINE_EXCEEDED or result.get("deadline_exceeded"):
+                    return _store_failure(result)
                 if _is_expected_scoped_evidence_denial(result):
                     return _scoped_evidence_denial(scoped_namespace, scoped_detail)
                 return _scoped_evidence_operational_denial(
@@ -1928,8 +2160,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "--id", evidence_id, "--limit", str(page_limit),
                 *cursor_args,
                 "--json",
-            ])
+            ], deadline=deadline, pool="read")
             if not result["ok"]:
+                if result.get("error") == _ERROR_DEADLINE_EXCEEDED or result.get("deadline_exceeded"):
+                    return _store_failure(result)
                 detail = _sanitize_store_error(result)
                 if detail in {"evidence id not found", "[zmem] evidence id not found"}:
                     return {"error": "evidence id not found"}
@@ -1962,6 +2196,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         source_ref: Optional[str] = None,
         taint: str = "untrusted_tool",
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Capture a grounded memory to the shared store.
 
@@ -1980,6 +2215,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         mtype = (type or "").strip()
         body = (content or "").strip()
         # v15 (#173 PR-review F22): creation is validated against the
@@ -2073,7 +2313,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # like oversize content so it is stored verbatim.
             args[args.index("--content") + 1] = "-"
             input_text = body
-        r = await _run_store_async(args, input_text=input_text)
+        r = await _run_store_async(args, input_text=input_text, deadline=deadline, pool="write")
         return _write_response(r, ok_result="stored")
 
     @mcp.tool()
@@ -2082,6 +2322,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Search the shared store (keyword-only, unlike recall).
 
@@ -2098,6 +2339,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         q = (query or "").strip()
         if not q:
             return _error("query is required")
@@ -2124,12 +2370,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args.insert(3, "--include-global")
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
-        return _parse_results(await _run_store_async(args))
+        return _parse_results(await _run_store_async(args, deadline=deadline, pool="read"))
 
     @mcp.tool()
     async def supersede(
         id: str, reason: Optional[str] = None,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Mark a stored memory obsolete (corrected or OBE).
 
@@ -2146,14 +2393,21 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         mid = (id or "").strip()
         if not mid:
             return _error("id is required")
         ns_pin = None
         caller = current_principal()
         if caller.scoped:
-            gr = await _run_store_async(["get", "--id", mid])
+            gr = await _run_store_async(["get", "--id", mid], deadline=deadline, pool="write")
             if not gr["ok"]:
+                if gr.get("error") == _ERROR_DEADLINE_EXCEEDED or gr.get("deadline_exceeded"):
+                    return _store_failure(gr)
                 return _error(
                     _sanitize_store_error(gr) or f"memory id {mid} not found"
                 )
@@ -2176,8 +2430,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--reason", str(reason)]
         if ns_pin:
             args += ["--expected-namespace", ns_pin]
-        r = await _run_store_async(args)
+        r = await _run_store_async(args, deadline=deadline, pool="write")
         if not r["ok"]:
+            if r.get("error") == _ERROR_DEADLINE_EXCEEDED or r.get("deadline_exceeded"):
+                return _store_failure(r)
             sanitized = _sanitize_store_error(r)
             # A store-level --expected-namespace refusal (rekey race between
             # the get and the mutation) is a namespace denial, not a generic
@@ -2199,6 +2455,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         signal: Optional[str] = None,
         taint: str = "untrusted_tool",
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Append-only knowledge update (issue #59, 4.2).
 
@@ -2228,6 +2485,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         mid = (id or "").strip()
         body = (content or "").strip()
         if not mid:
@@ -2259,8 +2521,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # able to rewrite a row that lives in a foreign namespace. Read
             # the target's namespace first (one cheap get) and scope-check
             # it. Unscoped tokens skip the extra subprocess entirely.
-            gr = await _run_store_async(["get", "--id", mid])
+            gr = await _run_store_async(["get", "--id", mid], deadline=deadline, pool="write")
             if not gr["ok"]:
+                if gr.get("error") == _ERROR_DEADLINE_EXCEEDED or gr.get("deadline_exceeded"):
+                    return _store_failure(gr)
                 return _error(
                     _sanitize_store_error(gr)
                     or f"memory id {mid} not found or already superseded"
@@ -2325,8 +2589,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # attribution stamp always lands and host:/agent: are always
         # stripped (see the issue #281 trace, plan-critic F12).
         if stamps and target_tags is None and tags is None:
-            gr_tags = await _run_store_async(["get", "--id", mid])
+            gr_tags = await _run_store_async(["get", "--id", mid], deadline=deadline, pool="write")
             if not gr_tags["ok"]:
+                if (gr_tags.get("error") == _ERROR_DEADLINE_EXCEEDED
+                        or gr_tags.get("deadline_exceeded")):
+                    return _store_failure(gr_tags)
                 # Fail closed rather than writing the replacement row with
                 # the stamp only — a transient store failure must not
                 # silently discard the target row's benign tags. The store's
@@ -2366,7 +2633,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # F8: see add — pipe literal '-' via stdin.
             args[args.index("--content") + 1] = "-"
             input_text = body
-        r = await _run_store_async(args, input_text=input_text)
+        r = await _run_store_async(args, input_text=input_text, deadline=deadline, pool="write")
         if not r["ok"]:
             # The pinned branch arms a store-level --expected-old-namespace
             # guard; its refusal is a namespace denial, not a generic store
@@ -2384,6 +2651,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     async def invalidate(
         id: str, reason: str,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Tombstone a memory BECAUSE THE FACT IS NO LONGER TRUE (issue #59, 4.3).
 
@@ -2402,6 +2670,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         mid = (id or "").strip()
         why = (reason or "").strip()
         if not mid:
@@ -2414,8 +2687,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ns_pin = None
         caller = current_principal()
         if caller.scoped:
-            gr = await _run_store_async(["get", "--id", mid])
+            gr = await _run_store_async(["get", "--id", mid], deadline=deadline, pool="write")
             if not gr["ok"]:
+                if gr.get("error") == _ERROR_DEADLINE_EXCEEDED or gr.get("deadline_exceeded"):
+                    return _store_failure(gr)
                 return _error(
                     _sanitize_store_error(gr) or f"memory id {mid} not found"
                 )
@@ -2431,8 +2706,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         args = ["invalidate", "--id", mid, "--reason", why]
         if ns_pin:
             args += ["--expected-namespace", ns_pin]
-        r = await _run_store_async(args)
+        r = await _run_store_async(args, deadline=deadline, pool="write")
         if not r["ok"]:
+            if r.get("error") == _ERROR_DEADLINE_EXCEEDED or r.get("deadline_exceeded"):
+                return _store_failure(r)
             sanitized = _sanitize_store_error(r)
             guard_denial = _namespace_guard_denial(sanitized, ns_pin)
             if guard_denial:
@@ -2448,6 +2725,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Return the most recently ingested memories.
 
@@ -2458,6 +2736,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         denied = _guard_namespace(namespace)
         if denied:
             return denied
@@ -2469,7 +2752,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args.append("3")
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
-        return _parse_results(await _run_store_async(args))
+        return _parse_results(await _run_store_async(args, deadline=deadline, pool="read"))
 
     @mcp.tool()
     async def prefetch(
@@ -2481,6 +2764,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ops_tokens: list[str] = [],
         reserve: bool = False,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Query-aware passive prefetch (issue #159, Workstream H-2).
 
@@ -2518,6 +2802,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             }
         if not _protocol_allowed(client_protocol):
             return _passive_protocol_envelope()
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         if not (namespace or "").strip() or not (session_id or "").strip() \
                 or not (moment or "").strip():
             return _error(
@@ -2589,8 +2878,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # them, so scoped principals keep their ops tokens.
         for _tok in (ops_tokens or []):
             args += ["--ops-token", _tok]
-        r = await _run_store_async(args)
+        r = await _run_store_async(args, deadline=deadline, pool="read")
         if not r["ok"]:
+            if r.get("error") == _ERROR_DEADLINE_EXCEEDED or r.get("deadline_exceeded"):
+                return _store_failure(r)
             # Issue #284 review: an older ZMEM_HOME checkout predates
             # --authorized-namespace and argparse-rejects the whole argv.
             # Fail LOUD with an actionable message instead of letting the
@@ -2637,6 +2928,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
     async def prefetch_ack(
         reservation: str,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Acknowledge a prefetch reservation (issue #284, T-05).
 
@@ -2655,12 +2947,17 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         rid = (reservation or "").strip()
         if not rid:
             return _error("prefetch_ack requires reservation")
-        r = await _run_store_async(["prefetch-ack", "--reservation", rid])
+        r = await _run_store_async(["prefetch-ack", "--reservation", rid], deadline=deadline, pool="write")
         if not r["ok"]:
-            return _error(_sanitize_store_error(r))
+            return _store_failure(r)
         stdout = (r["stdout"] or "").strip()
         try:
             parsed = json.loads(stdout) if stdout else None
@@ -2677,6 +2974,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         session_id: str = "",
         lane: Optional[str] = None,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Passive session prefetch — the queryless selector envelope path
         (issue #65, 10.5; reworked by issue #159, Workstream H-2).
@@ -2745,6 +3043,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "tokens_used": None,
                 "tokens_budget": None,
             }
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         # ``lane`` is optional for old clients.  An explicit value is closed
         # and rejected before namespace/store work so a typo cannot produce an
         # unattributed compatibility decision or start a subprocess.
@@ -2806,7 +3109,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--principal=" + (_session_caller.principal_id or ""),
                      "--harness=" + (_session_caller.harness or "")]
         timing: dict[str, int] = {}
-        r = await _run_store_async(args, timing=timing)
+        r = await _run_store_async(args, timing=timing, deadline=deadline, pool="read")
         # _run_store records only the actual subprocess attempt.  Semaphore
         # queue time and pre-attempt failures intentionally remain zero.
         elapsed = timing.get("t_ms", 0)
@@ -2818,8 +3121,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--session-id", session_id, "--moment", "session_start"]
             if lane is not None:
                 args += ["--lane", lane]
-        r = await _run_store_async(args)
+        r = await _run_store_async(args, deadline=deadline, pool="read")
         if not r["ok"]:
+            if r.get("error") == _ERROR_DEADLINE_EXCEEDED or r.get("deadline_exceeded"):
+                return _store_failure(r)
             # Twin of prefetch's loud mixed-version error (issue #284
             # review): an older ZMEM_HOME checkout rejects the new flag.
             stderr = (r.get("stderr") or "")
@@ -2986,6 +3291,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         note: Optional[str] = None,
         namespace: Optional[str] = None,
         client_protocol: object = None,
+        deadline_ms: object = None,
     ) -> dict[str, Any]:
         """End-of-session pairing tool (issue #65, 10.5).
 
@@ -3004,6 +3310,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
         if not note or not note.strip():
             return {"result": "session_ended", "written": False}
         body = note.strip()
@@ -3046,7 +3357,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # and store an empty note — pipe it via stdin.
             args[args.index("--content") + 1] = "-"
             input_text = body
-        r = await _run_store_async(args, input_text=input_text)
+        r = await _run_store_async(args, input_text=input_text, deadline=deadline, pool="write")
         resp = _write_response(r, ok_result="session_ended")
         if "error" not in resp:
             resp["written"] = True
