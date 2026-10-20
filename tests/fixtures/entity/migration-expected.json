@@ -1,7 +1,7 @@
 {
   "input_sha256": "5bbd958c6657cd4ef8a214303073155726ffd3ef6581a761f0a8d2422c79447d",
   "post": {
-    "schema_version": 17,
+    "schema_version": 18,
     "tables": {
       "entity": {
         "count": 5,
@@ -35,6 +35,11 @@
           "{\"entity_id\":\"da42a4a2-ce8a-5739-881b-e42fb9b4023f\",\"memory_id\":\"00000000-0000-4000-8000-000000000005\",\"role\":\"mentions\"}"
         ],
         "sha256": "4af649538134c517a13374e6c2b240b046dcd106dd444f17ace2f16c70e3587e"
+      },
+      "memory_occurrence": {
+        "count": 0,
+        "rows": [],
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       }
     }
   },

@@ -158,7 +158,21 @@ DATA_SHA = {
     # no `_score`, ordering, or content change on this link-free fixture
     # (the graph lane joins the lane-max at None, which max() ignores).
     # stats/list/export_jsonl are byte-identical to their prior freezes.
-    "recall": "2c59b0f4e7dd165cd5a789dfefda5bce3708d39cc11ac824fe2cc74d1cb969f1",
+    # v17 (issue #178, 2026-10-18): the NON-for-injection recall --json
+    # envelope gained the additive top-level `arms` map (the per-arm
+    # pre/post/cap accounting the for-injection and explain envelopes
+    # already carried; issue Design 6 "Normal recall and explain JSON arm
+    # maps always contain temporal:..."). VERIFIED before this re-capture:
+    # capturing the same surface at base a3e7517 (hash 2c59b0f4…) and at
+    # this head, then stripping exactly the `arms` key from the head's
+    # PARSED envelope, reproduces the base parsed document exactly (same
+    # envelope keys, same scalars, every row identical) — no `_score`,
+    # ordering, or content change. stats/list/export_jsonl are
+    # byte-identical to their prior freezes.
+    # 2026-10-18 (issue #178 round-5): recall rows gained the additive
+    # _temporal_arrival_only key -> b1913cd1 (head minus that key
+    # reproduces the round-2 aeab5282 pin; reviewer strip-probe).
+    "recall": "b1913cd1b6ba8eab0f46a91c68b2a69f079f2457649e699958e13a98573df047",
     # v11 (issue #61): export-jsonl re-captured ONLY for the two new row keys
     # (`trust_score`, `links`) — stripping exactly those keys from the new
     # output reproduces the v10 freeze 8552767c… byte-for-byte (verified at

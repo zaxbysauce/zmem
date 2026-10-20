@@ -66,7 +66,7 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v17
+- schema compatibility against current v18
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
@@ -273,6 +273,35 @@ The current observation gate is recorded as `reject`, so page metadata omits
 `runbook` (and since 0.107.0 the `ALLOWED_TYPES` vocabulary is the EIGHT-type
 set — `entity_card` joined as the card-refresh-only type; see "Entity cards
 (issue #179)" below).
+
+### event — occurrence-typed memories + the temporal recall arm (v18, issue #178)
+```
+<interpreter> <store.py> add --type event --namespace NS --content TEXT   --occurred-start 2026-09-01T08:00:00Z --occurred-end 2026-09-03T08:00:00Z   [--mentioned-at TS]
+<interpreter> <store.py> recall --query "last week's outage" --namespace NS   --prompt-timestamp 2026-09-10T12:00:00Z [--as-of TS]
+```
+Schema 18 adds the `event` memory type and the `memory_occurrence` side
+table (occurred_start / occurred_end / mentioned_at beside the memory id).
+Event rows require BOTH occurrence endpoints (clamped to the temporal
+window: the future clamps to the prompt timestamp, older than 3650 days
+clamps to the floor); non-event rows refuse any occurrence field (exit 2,
+no partial row). Occurrence rows live and die with their parent: every
+tombstone path deletes them in the same transaction, and event->event
+updates inherit the occurrence onto the replacement row (non-event->event
+via update is refused; dedup folds keep the keeper's occurrence).
+
+The temporal recall arm resolves relative phrases in the query (the fixed
+20-phrase vocabulary: today/yesterday/tomorrow, this/last/next week,
+this/last/next month, this/last year, past 24 hours/7 days/30 days,
+two/three days ago, in two days, earlier today, this/last quarter —
+longest-match-first, so "earlier today" wins over "today") against the
+`--prompt-timestamp` (default: the `ZMEM_TEST_NOW` seam / wall clock),
+selects occurrence-overlapping rows under the unchanged `--as-of`
+validity predicate, and fuses them as the capped fifth RRF arm
+(`ZMEM_ARM_CAP_TEMPORAL`, default 4). Knowledge validity (valid_from
+inclusive / valid_until exclusive) is SEPARATE from occurrence time.
+A phrase-free query or an occurrence-empty store fuses byte-identically.
+The Hermes/MCP `add` surfaces do not advertise `event` (they take no
+occurrence endpoints — the #173 `state` precedent).
 
 ### recall — surface relevant memories (high-precision)
 ```
@@ -846,9 +875,10 @@ table, recreate `entity` with the new CHECK, copy back) in one BEGIN
 IMMEDIATE transaction with `PRAGMA foreign_key_check` before commit; every
 `entity`, `entity_alias`, and `memory_entity` row
 survives unchanged. This is NOT an additive bump: a changed SQL constraint is
-outside the forward-compat window, so `SUPPORTED_SCHEMA_VERSION` is 16 while
-`FORWARD_COMPAT_SCHEMA_VERSION` deliberately stays 15 — every client older
-than the v16 release REFUSES a migrated v16 store (the actionable refusal
+outside the forward-compat window, so per the v16 contract
+`SUPPORTED_SCHEMA_VERSION` is 16 while `FORWARD_COMPAT_SCHEMA_VERSION`
+deliberately stays 15 — every client older than the v16 release REFUSES a
+migrated v16 store (the actionable refusal
 names `ZMEM_ALLOW_NEWER_SCHEMA=1`, the explicit operator override that
 proceeds at the operator's own risk and never downgrades or migrates the
 store). The #172 taxonomy decision for `entity_card` is REJECT: that memory
@@ -858,6 +888,20 @@ ships the type — cards are born only through the refresh path. Since 0.107.0
 `ALLOWED_TYPES` carries `entity_card` (the #175 kinds precedent: the RFC map
 is a frozen record, not a veto); see "Entity cards (issue #179)" below for
 the full card contract.
+
+Schema 18 (issue #178) is purely additive (the `event` type plus the
+`memory_occurrence` side table — no `memory` column or constraint change),
+so the forward-compat window REOPENS: `SUPPORTED_SCHEMA_VERSION` is 18 and
+`FORWARD_COMPAT_SCHEMA_VERSION` is 18. Clients whose forward ceiling is
+still 15 (every 0.10x-era install) refuse a migrated v18 store until
+updated — on shared-store machines, update every zmem client before the
+first v18 client opens the store (`ZMEM_ALLOW_NEWER_SCHEMA=1` is the
+stopgap; see CUTOVER.md and the CHANGELOG operator note).
+NUMBERING: #179's `entity_card` bump owns schema 17 as a STAMP-ONLY step
+(no DDL); this PR's `memory_occurrence` DDL therefore renumbered to 18 at
+rebase — one integer can never carry two schema definitions, or the
+`ver < N` guard would skip the DDL on every store a released client had
+already stamped.
 
 #### Injection token budget (issues #65 10.9, #116)
 
@@ -1983,8 +2027,9 @@ map is a frozen record, not a veto), and `ALLOWED_TYPES` carries
 review F-1): the bump is STAMP-ONLY (no DDL), but it is upgrade-required —
 see the operator note below.
 
-**KEY OPERATOR NOTE (schema 17, upgrade-required).** `FORWARD_COMPAT`
-deliberately stays at 15: every pre-0.107 client (<= 0.106) sharing a store
+**KEY OPERATOR NOTE (schema 17, upgrade-required; FORWARD since
+superseded — see the schema 18 note above).** For THAT bump
+`FORWARD_COMPAT` deliberately stayed at 15: every pre-0.107 client (<= 0.106) sharing a store
 **refuses** it, loudly at open, once the first 0.107 client migrates the
 stamp to 17. Without the bump those clients would fail SILENT on
 `entity_card` rows (an unknown type raises in their type preference and

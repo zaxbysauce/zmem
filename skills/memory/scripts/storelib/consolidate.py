@@ -23,7 +23,7 @@ from pathlib import Path
 from storelib.entity import relink_memory
 from storelib.schema import _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
-from storelib.write import _clear_expiry, _merge_on_dedup, supersede_memory
+from storelib.write import _clear_expiry, _clear_occurrence, _merge_on_dedup, supersede_memory
 
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
 
@@ -501,6 +501,7 @@ def _absorb_into_keeper(
     # plus the hard-DELETE paths in purge/import-store, which reach it through
     # purge._ID_SIDE_TABLES).
     _clear_expiry(conn, absorbed["id"])
+    _clear_occurrence(conn, absorbed["id"])
 
     # v10 (issue #60): the keeper's content/tags may have grown above, so its
     # entity links are re-derived from the stored row. The ABSORBED row keeps

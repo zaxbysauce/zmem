@@ -188,26 +188,24 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
         )
 
     def test_state_normalizes_against_frozen_six_type_mean(self):
-        """Issue #173 additivity pin: `state` joined ALLOWED_TYPES but must
-        NOT join the #126 normalization mean — every pre-#173 multiplier and
-        the committed #126 projection gold stay byte-identical (the frozen-
-        mean guard that replaced the silent ~0.7% global rescale). `state`
-        normalizes exactly like any unlisted type: neutral 1.0 product over
-        the frozen six-type mean. Issue #179: `entity_card` joins the same
-        frozen-mean exclusion (`state`/`event` precedent) — it does NOT join
-        the mean either, and the derived-tuple pin excludes it explicitly."""
+        """Issue #173 additivity pin, extended to `event` by #178: `state`
+        and `event` joined ALLOWED_TYPES but must NOT join the #126
+        normalization mean — every pre-#173 multiplier and the committed #126
+        projection gold stay byte-identical (the frozen-mean guard that
+        replaced the silent ~0.7% global rescale). Each normalizes exactly
+        like any unlisted type: neutral 1.0 product over the frozen six-type
+        mean."""
         from schema_meta import ALLOWED_TYPES
 
         self.assertIn("state", ALLOWED_TYPES)
-        self.assertIn("entity_card", ALLOWED_TYPES)
+        self.assertIn("event", ALLOWED_TYPES)
         self.assertNotIn("state", recall_mod.TYPE_PREFERENCE_MEAN_TYPES)
-        self.assertNotIn("entity_card", recall_mod.TYPE_PREFERENCE_MEAN_TYPES)
+        self.assertNotIn("event", recall_mod.TYPE_PREFERENCE_MEAN_TYPES)
         self.assertEqual(
-            tuple(t for t in ALLOWED_TYPES
-                  if t not in ("state", "entity_card")),
+            tuple(t for t in ALLOWED_TYPES if t not in ("state", "entity_card", "event")),
             recall_mod.TYPE_PREFERENCE_MEAN_TYPES,
             "the frozen #126 mean set must be exactly today's types minus "
-            "state and entity_card",
+            "state and event",
         )
         # Lane profiles key the frozen set too, keeping the committed
         # tests/fixtures/issue126/profile-expected.json gold byte-stable.
@@ -224,11 +222,14 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
                 for t in recall_mod.TYPE_PREFERENCE_MEAN_TYPES
             ]
             expected = 1.0 / (sum(products) / len(products))
-            self.assertAlmostEqual(
-                recall_mod.type_preference("state", moment=m), expected,
-                places=15,
-                msg=f"state multiplier at {m} must use the frozen mean",
-            )
+            # #178 follows #173: `event` is additive-only, normalized against
+            # the same frozen mean as `state` (identical multiplier).
+            for unlisted in ("state", "entity_card", "event"):
+                self.assertAlmostEqual(
+                    recall_mod.type_preference(unlisted, moment=m), expected,
+                    places=15,
+                    msg=f"{unlisted} multiplier at {m} must use the frozen mean",
+                )
 
     def test_runtime_moment_and_lane_validation(self):
         """AC2: five runtime moments x five lanes accepted; exact ValueError

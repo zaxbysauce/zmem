@@ -538,10 +538,12 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         self.assertEqual(
             self.allowed_types,
             ("fact", "lesson", "convention", "preference",
-             "decision", "constraint", "state", "entity_card"),
+             "decision", "constraint", "state", "entity_card", "event"),
             "ALLOWED_TYPES must be exactly the shipped set (v9 six + v15 "
-            "state + the #179 entity_card reversal) — dropping a shipped "
-            "type is a schema regression",
+            "state + the #179 entity_card reversal + the #178 event type). "
+            "Each side of the #378 rebase claimed the 8th slot, so the union "
+            "is the only resolution that drops no shipped type — dropping "
+            "one is a schema regression",
         )
 
     def test_taint_set_is_exactly_three_ranks(self):
@@ -589,15 +591,20 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         self.assertIn("entity_card", self.allowed_types,
                       "precondition: entity_card shipped in ALLOWED_TYPES "
                       "(the #179 reversal)")
+        # #178 (issue #178): `event` joins the exclusion — it needs
+        # occurrence endpoints neither agent surface takes. All three
+        # non-addable types are excluded; taking only one side of the
+        # rebase would have dropped the others' exclusion.
         serviceable = tuple(
             t for t in self.allowed_types
-            if t not in ("state", "entity_card"))
+            if t not in ("state", "entity_card", "event"))
         self.assertEqual(
             serviceable,
             ("fact", "lesson", "convention", "preference", "decision",
              "constraint"))
         hermes_src = HERMES_INIT.read_text(encoding="utf-8")
-        self.assertIn('_STATE_TYPES = frozenset({"state"})', hermes_src)
+        self.assertIn('_STATE_TYPES = frozenset({"state", "event"})',
+                      hermes_src)
         self.assertIn(
             '_CARD_REFRESH_ONLY_TYPES = frozenset({"entity_card"})',
             hermes_src)
@@ -611,10 +618,11 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
             hermes_src.replace("'", '"'))
         mcp_src = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
                    ).read_text(encoding="utf-8")
+        # All THREE non-addable types are excluded on the MCP surface too.
         self.assertIn(
             '_ALLOWED_TYPES_ADDABLE = tuple(\n'
-            '                t for t in types if t != "state" '
-            'and t != "entity_card")',
+            '                t for t in types\n'
+            '                if t not in ("state", "entity_card", "event"))',
             mcp_src)
         self.assertIn("if mtype not in _ALLOWED_TYPES_ADDABLE:", mcp_src)
 

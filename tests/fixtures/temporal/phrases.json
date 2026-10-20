@@ -1,0 +1,22 @@
+[
+  {"now":"2026-09-10T15:30:00Z","phrase":"today","expected_start":"2026-09-10T00:00:00Z","expected_end":"2026-09-11T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"yesterday","expected_start":"2026-09-09T00:00:00Z","expected_end":"2026-09-10T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"tomorrow","expected_start":"2026-09-11T00:00:00Z","expected_end":"2026-09-12T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"last week","expected_start":"2026-08-31T00:00:00Z","expected_end":"2026-09-07T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"this week","expected_start":"2026-09-07T00:00:00Z","expected_end":"2026-09-14T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"next week","expected_start":"2026-09-14T00:00:00Z","expected_end":"2026-09-21T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"last month","expected_start":"2026-08-01T00:00:00Z","expected_end":"2026-09-01T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"this month","expected_start":"2026-09-01T00:00:00Z","expected_end":"2026-10-01T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"next month","expected_start":"2026-10-01T00:00:00Z","expected_end":"2026-11-01T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"last year","expected_start":"2025-01-01T00:00:00Z","expected_end":"2026-01-01T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"this year","expected_start":"2026-01-01T00:00:00Z","expected_end":"2027-01-01T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"past 24 hours","expected_start":"2026-09-09T15:30:00Z","expected_end":"2026-09-10T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"past 7 days","expected_start":"2026-09-03T15:30:00Z","expected_end":"2026-09-10T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"past 30 days","expected_start":"2026-08-11T15:30:00Z","expected_end":"2026-09-10T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"two days ago","expected_start":"2026-09-08T15:30:00Z","expected_end":"2026-09-09T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"three days ago","expected_start":"2026-09-07T15:30:00Z","expected_end":"2026-09-08T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"in two days","expected_start":"2026-09-12T15:30:00Z","expected_end":"2026-09-13T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"earlier today","expected_start":"2026-09-10T00:00:00Z","expected_end":"2026-09-10T15:30:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"last quarter","expected_start":"2026-04-01T00:00:00Z","expected_end":"2026-07-01T00:00:00Z"},
+  {"now":"2026-09-10T15:30:00Z","phrase":"this quarter","expected_start":"2026-07-01T00:00:00Z","expected_end":"2026-10-01T00:00:00Z"}
+]

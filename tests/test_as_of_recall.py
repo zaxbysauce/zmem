@@ -9,7 +9,12 @@ correctly against ``valid_from`` stored with a Z-suffix (I6 critic-fix).
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -645,6 +650,181 @@ class Iso8601ArgparseTests(unittest.TestCase):
                     import shutil
 
                     shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TemporalAsOfTest(unittest.TestCase):
+    """Issue #178 AC4: the as-of golden over tests/fixtures/asof/input.jsonl.
+
+    Seeds the four fixture rows exactly like the frozen check driver — CLI
+    `add` per row (the event rows through the occurrence flags), then ONE
+    direct SQLite pass pinning each row's fixture id and validity window
+    (the row with a non-empty valid_until is the superseded one and also
+    gets its tombstone), renaming the id in every memory_id side table —
+    then runs ``recall --as-of 2026-09-10T12:00:00Z --query "last week's
+    outage"`` and byte-compares the returned-id stdout with
+    tests/fixtures/asof/expected.txt (…178 then …181, two lines + final LF;
+    …179 and …180 absent — valid_from inclusive / valid_until exclusive
+    unchanged).
+    """
+
+    AS_OF = "2026-09-10T12:00:00Z"
+    QUERY = "last week's outage"
+    NAMESPACE = "project:asof"
+    EXPECTED_BYTES = (
+        "00000000-0000-4000-8000-000000000178\n"
+        "00000000-0000-4000-8000-000000000181\n"
+    ).encode("utf-8")
+    UUID_SHAPE = re.compile(
+        r"\[([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{12})\]"
+    )
+
+    def _read_fixture(self):
+        path = REPO_ROOT / "tests" / "fixtures" / "asof" / "input.jsonl"
+        rows = [json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+        self.assertEqual(len(rows), 4, "the as-of fixture holds 4 rows")
+        for row in rows:
+            self.assertEqual(row["namespace"], self.NAMESPACE)
+            self.assertEqual(row["prompt_timestamp"], self.AS_OF)
+        return rows
+
+    def _seed_store(self, env, store, rows):
+        """The frozen check driver's seeding, verbatim in shape."""
+        generated = {}
+        for row in rows:
+            argv = [
+                sys.executable, str(SCRIPTS_DIR / "store.py"), "add",
+                "--namespace", row["namespace"],
+                "--type", row["type"],
+                "--content", row["content"],
+                "--confidence", "0.9",
+                "--signal", "user",
+                "--json",
+            ]
+            if row["type"] == "event":
+                argv += [
+                    "--occurred-start", row["occurred_start"],
+                    "--occurred-end", row["occurred_end"],
+                    "--mentioned-at", row["mentioned_at"],
+                ]
+            proc = subprocess.run(
+                argv, cwd=str(REPO_ROOT), env=env, capture_output=True,
+                text=True, timeout=300)
+            self.assertEqual(
+                proc.returncode, 0,
+                "add of fixture row %s exited %d: %s"
+                % (row["id"], proc.returncode,
+                   (proc.stderr or proc.stdout).strip()[-300:]))
+            lines = [line for line in proc.stdout.splitlines()
+                     if line.startswith("{")]
+            payload = json.loads(lines[-1])
+            self.assertTrue(payload.get("ok") or payload.get("id"), payload)
+            generated[row["id"]] = payload["id"]
+
+        conn = sqlite3.connect(store)
+        try:
+            mid_tables = []
+            for (table,) in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall():
+                try:
+                    columns = [
+                        c[1] for c in
+                        conn.execute('PRAGMA table_info("%s")' % table
+                                     ).fetchall()
+                    ]
+                except sqlite3.Error:
+                    continue
+                if table != "memory" and "memory_id" in columns:
+                    mid_tables.append(table)
+            for row in rows:
+                gen = generated[row["id"]]
+                conn.execute(
+                    "UPDATE memory SET valid_from = ?, valid_until = ? "
+                    "WHERE id = ?",
+                    (row.get("valid_from", ""), row.get("valid_until", ""),
+                     gen),
+                )
+                if row.get("valid_until"):
+                    conn.execute(
+                        "UPDATE memory SET superseded_at = ? WHERE id = ?",
+                        (row["valid_until"], gen),
+                    )
+                conn.execute(
+                    "UPDATE memory SET id = ? WHERE id = ?", (row["id"], gen)
+                )
+                for table in mid_tables:
+                    conn.execute(
+                        'UPDATE "%s" SET memory_id = ? WHERE memory_id = ?'
+                        % table,
+                        (row["id"], gen),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        # Direct test-connection contract (the issue's isolation note): a
+        # separate read connection asserts PRAGMA foreign_keys=ON is
+        # honored. The pin pass above keeps the frozen driver's shape (no
+        # FK pragma — the id rename has no cascade).
+        verify = sqlite3.connect(store)
+        try:
+            verify.execute("PRAGMA foreign_keys=ON")
+            self.assertEqual(
+                verify.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            for row in rows:
+                self.assertEqual(verify.execute(
+                    "SELECT COUNT(*) FROM memory WHERE id=?",
+                    (row["id"],)).fetchone()[0], 1)
+        finally:
+            verify.close()
+
+    def test_as_of_golden_preserves_validity_window(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-178-asof-golden-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        store = str(Path(tmp) / "store.sqlite")
+        env = {
+            # Strip ambient ZMEM_* (the PRR-022 sibling discipline) so no
+            # operator tuning knob can move the golden comparison.
+            **{k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")},
+            "ZMEM_STORE": store,
+            "ZMEM_DATA": tmp,
+            "ZMEM_MODELS_DIR": str(Path(tmp) / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_TEST_NOW": self.AS_OF,
+        }
+        rows = self._read_fixture()
+        self._seed_store(env, store, rows)
+
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "store.py"), "recall",
+             "--as-of", self.AS_OF,
+             "--query", self.QUERY,
+             "--namespace", self.NAMESPACE],
+            cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+            timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
+        ids = []
+        for line in proc.stdout.splitlines():
+            if "] [conf=" not in line:
+                continue
+            match = self.UUID_SHAPE.search(line)
+            if match:
+                ids.append(match.group(1))
+        actual = ("\n".join(ids) + "\n").encode("utf-8") if ids else b""
+        expected = (REPO_ROOT / "tests" / "fixtures" / "asof" /
+                    "expected.txt").read_bytes()
+        self.assertEqual(expected, self.EXPECTED_BYTES,
+                         "the committed golden must hold exactly the two "
+                         "pinned lines")
+        self.assertEqual(
+            actual, expected,
+            "recall --as-of must return the golden id bytes (valid_from "
+            "inclusive / valid_until exclusive unchanged; the future …179 "
+            "and superseded …180 rows absent). got %r" % actual)
 
 
 if __name__ == "__main__":

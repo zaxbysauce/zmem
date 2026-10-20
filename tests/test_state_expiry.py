@@ -213,10 +213,12 @@ class StateSchemaTest(_StoreCase):
         self.assertEqual(ver, str(SUPPORTED_SCHEMA_VERSION))
         # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2); the
         # forward ceiling deliberately stays 15.
-        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): stamp-only bump for
-        # the entity_card type; FORWARD stays 15 (upgrade-required).
-        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 17)
-        self.assertEqual(FORWARD_COMPAT_SCHEMA_VERSION, 15)
+        # v18 (issue #178): the ADDITIVE event/memory_occurrence release
+        # renumbers to 18 and REOPENS the forward window at parity, so
+        # FORWARD follows SUPPORTED up from 15. (v17 was #179's stamp-only
+        # bump, which deliberately held FORWARD at 15.)
+        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 18)
+        self.assertEqual(FORWARD_COMPAT_SCHEMA_VERSION, 18)
         self.assertIn("state", ALLOWED_TYPES)
         tabs = [r[0] for r in self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")]

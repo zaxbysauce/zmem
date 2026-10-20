@@ -106,24 +106,39 @@ def normalize_content(s: str) -> str:
 # v16 (issue #175): entity kinds v2 — the `entity` table's CHECK widens from
 # five to the twelve v2 kinds via a constrained-table rebuild (entity_v16
 # copy/drop/recreate in `_migrate_v16`). NOT additive: a changed SQL constraint
-# is not covered by the forward-compat window, so FORWARD stays at 15 and a
-# v15 client refuses a v16 store until it upgrades (ZMEM_ALLOW_NEWER_SCHEMA=1
+# is not covered by the forward-compat window, so FORWARD stayed at 15 and a
+# v15 client refused a v16 store until it upgraded (ZMEM_ALLOW_NEWER_SCHEMA=1
 # is the operator override).
-# v17 (issue #179 PR #385 review round, 2026-10-18, F-1/PRR-006): the
-# `entity_card` memory type. The bump is STAMP-ONLY (no DDL — a card is an
-# ordinary `memory` row), but old clients (<= 0.106) cannot be fixed from this
-# PR and would POISON themselves on card rows (executed end-to-end at base:
-# an old client's type_preference raises on the unknown type and its hooks
-# fail SILENT — a fleet-wide memory blackout once any 0.107 host runs a
-# cadence sweep). The version gate is the only technically capable lever, so
-# SUPPORTED advances 16 -> 17 while FORWARD deliberately STAYS at 15: a
-# pre-0.107 client REFUSES a v17 store loudly (upgrade-required, the #175
-# discipline) instead of silently blacking out. ZMEM_ALLOW_NEWER_SCHEMA=1 is
-# the operator stopgap. Sibling #382 (issue #178) also claims 17; if it merges
-# first, this PR's stamp renumbers to 18 at rebase time (documented
-# sibling-collision procedure; no DDL collision — both bumps are stamp-only
-# in the worst case).
-SUPPORTED_SCHEMA_VERSION = 17
+# v18 (issue #178, PR #382): the additive `event` memory type plus the
+# `memory_occurrence` side table and range index — no `memory` column or
+# constraint change.
+#
+# RENUMBERED 17 -> 18 at rebase time, and this is load-bearing rather than
+# cosmetic. Sibling #385 (issue #179) merged first and already owns schema
+# 17, but its `_migrate_v17` is STAMP-ONLY — it writes `meta.schema_version`
+# and creates no table. Had this PR kept the number 17, its `if ver < 17`
+# guard would be FALSE on every store a released 0.107/0.108 client had
+# already stamped, so `memory_occurrence` would never be created while
+# `ALLOWED_TYPES` accepted `event`, and the first `add --type event` would
+# die on `no such table`. It is worse under the other resolution: had this
+# PR's `_migrate_v17` lost the conflict, the table would be absent from
+# FRESH inits too, making the crash universal. Two incompatible meanings for
+# one integer is the exact hazard the version gate exists to prevent.
+# main's own note on this file anticipated it: "if it merges first, this
+# PR's stamp renumbers to 18 at rebase time".
+#
+# The v17 STAMP (PR #385, issue #179) keeps its own rationale: old clients
+# cannot be fixed from that PR and would POISON themselves on `entity_card`
+# rows (executed at base: an old client's type_preference raises and its
+# hooks fail SILENT — a fleet-wide memory blackout once any newer host runs
+# a cadence sweep), so SUPPORTED advanced while FORWARD deliberately STAYED
+# at 15 to make those clients refuse loudly instead. ZMEM_ALLOW_NEWER_SCHEMA=1
+# is the operator stopgap. This v18 bump follows the same discipline: it is
+# ADDITIVE, so FORWARD_COMPAT reopens to 18 and a maintenance client that
+# raises only its FORWARD keeps working with a one-time NOTICE, while every
+# deployed client still on FORWARD 15 refuses the migrated store until it is
+# updated — see the CHANGELOG operator note.
+SUPPORTED_SCHEMA_VERSION = 18
 
 # Forward-compat window (issue #65 follow-up): a client refuses a store whose
 # schema_version exceeds its SUPPORTED_SCHEMA_VERSION. For ADDITIVE-ONLY bumps
@@ -135,13 +150,16 @@ SUPPORTED_SCHEMA_VERSION = 17
 # SUPPORTED and FORWARD_COMPAT the client prints a one-time stderr NOTICE and
 # proceeds; above FORWARD_COMPAT it still refuses (ZMEM_ALLOW_NEWER_SCHEMA=1
 # overrides, at the operator's own risk).
-FORWARD_COMPAT_SCHEMA_VERSION = 15
-# (2026-10-18, PR #385 review F-1): FORWARD deliberately stays 15 across the
-# v17 bump — see the SUPPORTED_SCHEMA_VERSION note above. For the CURRENT
-# client (SUPPORTED 17 > FORWARD 15) the additive window is empty by
-# construction; the constant is load-bearing for the v16-lineage clients
-# still deployed (SUPPORTED 16 / FORWARD 15): they refuse a v17 store at
-# open, which is the intended loud upgrade-required outcome.
+FORWARD_COMPAT_SCHEMA_VERSION = 18
+# (PR #385 review F-1, 2026-10-18) held FORWARD at 15 across the v17 bump
+# because that bump was STAMP-ONLY, not additive: there was nothing an older
+# client could safely do with a v17 store, so it had to refuse loudly. This
+# v18 bump IS additive (a new side table plus a new enum member that the
+# old clients never select), so the forward-compat window reopens to 18 and a
+# maintenance client that raises only FORWARD keeps reading and writing with
+# a one-time NOTICE. Clients still on FORWARD 15 — every 0.10x-era install —
+# refuse the migrated store until updated, which is the intended loud
+# upgrade-required outcome.
 
 # v12 (issue #64): one-time trust_score reduction applied when a row's
 # violated_count crosses to 2 (the promote ladder's "violated" tier). Clamped
@@ -188,7 +206,12 @@ CROSS_PROJECT_HAZARD_VERBS_ENV = "ZMEM_CROSS_PROJECT_HAZARD_VERBS"
 # STAMP (PR #385 review F-1/PRR-006, 2026-10-18) exists purely so pre-0.107
 # clients refuse the store loudly instead of silently blacking out on the
 # new type — see SUPPORTED_SCHEMA_VERSION above.
-ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint", "state", "entity_card")
+# `event` joins as the 9th type (#178) — the two sides of this merge each
+# claimed the 8th slot, and resolving either way alone would have deleted a
+# SHIPPED type from the write vocabulary (and, on the read side, made every
+# older client's `type_preference` raise). The union is the only resolution
+# that leaves both features working.
+ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint", "state", "entity_card", "event")
 
 # #179: the reserved card watermark tag prefix. The card refresh path stores
 # `entity_card_sha256=<hex>` (SHA-256 over the card's exact UTF-8 content
@@ -206,6 +229,11 @@ CARD_TOP_N_DEFAULT = 8
 CARD_MIN_MENTIONS_ENV = "ZMEM_CARD_MIN_MENTIONS"
 CARD_TOP_N_ENV = "ZMEM_CARD_TOP_N"
 
+# v18 (#178): `event` rows carry occurrence time in the
+# `memory_occurrence` side table (occurred_start/occurred_end/mentioned_at);
+# the temporal recall arm selects by occurrence overlap. The Hermes/MCP add
+# surfaces deliberately do NOT advertise it (they take no occurrence
+# endpoints — the #173 `state` precedent; see hermes _ADDABLE_TYPES).
 # v15 (#173): `state` rows declare HOW they expire (class) and WHEN
 # (inject_until, stored in `memory_expiry`). Three classes, each a default TTL
 # in days and an operator env override. The env var NAME is what the validation

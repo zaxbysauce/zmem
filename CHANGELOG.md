@@ -5,6 +5,78 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.111.0] - 2026-10-20
+
+- **Schema 18 — the `event` type and `memory_occurrence` side table
+  (issue #178, Workstream K PR 7):** `ALLOWED_TYPES` gains `event`; a fresh
+  store and the `ver < 18` migration both create
+  `memory_occurrence(memory_id PK REFERENCES memory(id), occurred_start,
+  occurred_end, mentioned_at)` + `idx_memory_occurrence_range` in ONE
+  transaction, with the version advanced only after both DDL statements
+  succeed (a failed migration rolls back the table set, index set, and
+  version together). Purely additive — no `memory` column or constraint
+  change.
+- **The forward-compat window reopens:** `FORWARD_COMPAT_SCHEMA_VERSION`
+  moves 15 -> 18 alongside `SUPPORTED_SCHEMA_VERSION` 17 -> 18 (v18 is the
+  additive case the window exists for; v16's closure was specific to its
+  constrained-table rebuild, and #179's v17 stamp held it because a
+  stamp-only bump gives an older client nothing safe to do). NUMBERING:
+  #179's `entity_card` bump owns 17 as a stamp-only step, so this DDL
+  renumbered 17 -> 18 at rebase — one integer can never carry two schema
+  definitions. **KEY OPERATOR NOTE for shared-store
+  machines:** a v18 client migrating the store makes every client whose
+  FORWARD_COMPAT is below 18 (all 0.10x-era installs carry 15) REFUSE the
+  store until updated — update every zmem client on the box (Claude Code,
+  Codex, ZCode caches) BEFORE the first v18 client opens the shared store;
+  `ZMEM_ALLOW_NEWER_SCHEMA=1` remains the stopgap.
+- **Occurrence writes and lifecycle:** `add_memory` gains keyword-only
+  `occurred_start` / `occurred_end` / `mentioned_at` (event rows require
+  both endpoints; they are clamped through the new temporal window;
+  non-event rows carrying any occurrence field are refused with
+  `occurrence fields require type=event` and the CLI exits 2 with no
+  partial row). The CLI surfaces them as `add --occurred-start
+  --occurred-end --mentioned-at`. Every tombstone path
+  (supersede/update/consolidate/organize/sync tombstone import) deletes
+  the occurrence row in the SAME transaction, and the hard-delete paths
+  (purge, import-store) clean it through the shared side-table registry.
+  Update transitions: event->event inherits the occurrence onto the
+  replacement row; event->non-event cleans; non-event->event is refused.
+  A dedup fold is the event->event transition with an EXISTING target, so
+  the inherited triple follows the same inheritance rule there: carried
+  onto an event target that has no occurrence of its own, keeper wins on
+  conflict, and every discard prints a visible warning (an update takes
+  no occurrence arguments — what a fold can drop is the SUPERSEDED row's
+  inherited data, never caller args). Occurrence data does NOT travel
+  through export/import yet — export emits a scoped, counted notice
+  whenever occurrence
+  rows cannot travel (never dropping metadata silently).
+- **`storelib/temporal.py`:** deterministic relative-date parsing for the
+  20 fixture phrases against an injected prompt timestamp (UTC calendar
+  boundaries; ISO weeks start Monday; calendar quarters; fixed timedeltas
+  for the past-N families), plus `clamp_range` (future endpoints clamp to
+  the prompt; older-than-3650-days endpoints clamp to the floor). Malformed
+  or unrecognized input answers empty — never raises. The only clock input
+  is the supplied timestamp.
+- **The temporal candidate arm:** `recall` gains `--prompt-timestamp`
+  (default: the existing `ZMEM_TEST_NOW` seam); `_rrf_fuse` gains the
+  keyword-only fifth list `temporal_ids` (appended after the #176
+  entity-weight seam); the arm selects occurrence-overlapping rows in the
+  tier namespace under the unchanged `--as-of` validity predicate
+  (valid_from inclusive / valid_until exclusive — occurrence time stays
+  separate from knowledge validity), ordered by descending overlap
+  duration, descending mentioned_at, ascending memory_id, capped by
+  `ZMEM_ARM_CAP_TEMPORAL` (default 4, 0..1000, invalid warns and uses 4),
+  sliced before fusion. A missing side table, malformed timestamps, an
+  unrecognized phrase, or a temporal SQL error yield an empty arm and
+  preserve the non-temporal result. Explain reports the same arm
+  zero-write; the hook decision log appends `temporal:<post>/<cap>` after
+  `graph`, and the miss-rate reader parses it.
+- **Add-surface scoping:** the Hermes and MCP `add` surfaces do not
+  advertise `event` (they take no occurrence endpoints — the #173 `state`
+  precedent; loaded and degraded modes stay in agreement).
+- **#172 taxonomy note:** the RFC recorded `event -> defer` with handoff
+  #178; this release executes the deferred decision. The frozen RFC
+  artifact and its pins are untouched.
 ## [0.110.0] - 2026-10-19
 
 ### Added

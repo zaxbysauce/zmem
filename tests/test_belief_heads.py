@@ -530,7 +530,7 @@ class BeliefHeadTest(unittest.TestCase):
             self.assertEqual(schema_meta.ALLOWED_TYPES,
                              ("fact", "lesson", "convention", "preference",
                               "decision", "constraint", "state",
-                              "entity_card"))
+                              "entity_card", "event"))
             # Accept branch, isolated per decision: the gate reader is the
             # seam allowed_types() must consult.
             with patch.object(schema_meta, "observation_gate_decision",
@@ -544,7 +544,7 @@ class BeliefHeadTest(unittest.TestCase):
             self.assertEqual(schema_meta.ALLOWED_TYPES,
                              ("fact", "lesson", "convention", "preference",
                               "decision", "constraint", "state",
-                              "entity_card"))
+                              "entity_card", "event"))
             # Explicit-path decisions: accept, missing, malformed, unknown.
             with tempfile.TemporaryDirectory(
                     prefix="zmem-obs-gate-") as tmp:

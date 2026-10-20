@@ -40,13 +40,9 @@ from schema_meta import ENTITY_KINDS, SUPPORTED_SCHEMA_VERSION  # noqa: E402
 def _base_env(store_path: str) -> dict:
     env = dict(os.environ)
     env["ZMEM_STORE"] = store_path
-    # Issue #179 (Files-to-change note): the isolated-store helper sets
-    # ZMEM_DATA (alongside ZMEM_STORE / ZMEM_MODELS_DIR /
-    # ZMEM_MODEL_AUTODOWNLOAD) so the store's data-directory side state can
-    # never leak to or from the operator's ~/.zmem.
-    env["ZMEM_DATA"] = str(Path(store_path).parent)
     env["ZMEM_MODELS_DIR"] = str(Path(store_path).parent / "no-models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env.pop("ZMEM_DATA", None)
     env.pop("ZMEM_BACKUP_DIR", None)
     env.pop("ZMEM_MMR_LAMBDA", None)
     # Issue #176 review: the byte-oracle assertions below assume DEFAULT
@@ -656,12 +652,10 @@ class MigrationTest(V16SchemaTestMixin, _Store):
             "migration-expected.json")
         self.assertEqual(pre, expected["pre"])
         self.assertEqual(post, expected["post"])
-        # v17 (PR #385 review F-1/PRR-006, 2026-10-18): a v15 store the CLI
-        # migrates walks THROUGH the v16 rebuild to the v17 entity_card
-        # stamp (stamp-only, no DDL) — the fixture's post.schema_version and
-        # this pin advanced 16 -> 17 together; the entity-table preservation
-        # invariants above are the point of the test and are unchanged.
-        self.assertEqual(post["schema_version"], 17)
+        # v18 (issue #178): the chain continues past the v16 entity rebuild —
+        # the additive `memory_occurrence` side table lands and the marker
+        # advances to 17 (recorded in the fixture's post.tables above).
+        self.assertEqual(post["schema_version"], 18)
 
         # PR #355 review PRR-007: the fixture's five legacy rows cannot prove
         # the MIGRATED table carries the new vocabulary — on a real v15 store
@@ -703,10 +697,9 @@ class MigrationTest(V16SchemaTestMixin, _Store):
         self.migrate_via_cli(store)
         second = self.dump_state(store)
         self.assertEqual(first, second, "second migration changed state")
-        # v17 (PR #385 review F-1, 2026-10-18): the terminal stamp is 17
-        # (v16 entity rebuild + the stamp-only entity_card bump); a re-run
-        # is a byte-identical no-op at 17.
-        self.assertEqual(second["schema_version"], 17)
+        # v18 (issue #178): idempotent chain end state is 18 after the
+        # renumber (#179 owns 17 as a stamp-only step).
+        self.assertEqual(second["schema_version"], 18)
         conn = sqlite3.connect(str(store))
         try:
             self.assertEqual(

@@ -75,10 +75,16 @@ CREATE TABLE entity_v15 (
 );
 """
 
+# v17 (issue #178): the migration chain continues past the v16 entity rebuild
+# and creates the additive `memory_occurrence` side table — the POST snapshot
+# must record it (empty: the fixture rows are `fact`, and v17 backfills
+# nothing). The PRE (v15) store predates the table, so `snapshot()` includes
+# it only when sqlite_master knows it.
 _TABLE_SORT_KEY = {
     "entity": lambda r: (r["id"],),
     "entity_alias": lambda r: (r["alias_norm"],),
     "memory_entity": lambda r: (r["memory_id"], r["entity_id"]),
+    "memory_occurrence": lambda r: (r["memory_id"],),
 }
 
 
@@ -135,6 +141,12 @@ def seed_v15_store(store_path: Path) -> None:
         )
         conn.execute("DROP TABLE entity")
         conn.execute("ALTER TABLE entity_v15 RENAME TO entity")
+        # Faithfulness: init_db above created the CURRENT table set, so the
+        # v17 `memory_occurrence` side table (issue #178) is present before
+        # the rollback. A real v15 store has no such table — drop it, so the
+        # POST snapshot's occurrence table is provably created by the v17
+        # migration block, not inherited from the seeding pass.
+        conn.execute("DROP TABLE IF EXISTS memory_occurrence")
         conn.execute(
             "UPDATE meta SET value='15' WHERE key='schema_version'"
         )
@@ -194,8 +206,17 @@ def snapshot(store_path: Path) -> dict:
         version = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()[0]
+        # memory_occurrence exists only from v17 on: a faithful v15 PRE
+        # snapshot must not fabricate it, a POST snapshot must not hide it.
+        tables_present = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
         tables = {}
-        for table in ("entity", "entity_alias", "memory_entity"):
+        for table in ("entity", "entity_alias", "memory_entity",
+                      "memory_occurrence"):
+            if table not in tables_present:
+                continue
             rows = [
                 dict(r) for r in conn.execute(f"SELECT * FROM {table}")
             ]

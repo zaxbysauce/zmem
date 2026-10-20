@@ -77,6 +77,10 @@ _ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "con
 # the full set (content-only updates of pre-existing state rows inherit and
 # succeed). Fallback mirrors the six; the loader derives the subset from the
 # real ALLOWED_TYPES so the two can never silently diverge from schema_meta.
+# v18 (#178): `event` joins `state` in the non-addable set on this surface
+# (occurrence endpoints are add-time CLI/store parameters only) — the
+# #173 F22/F23 rule: advertise and write-validate only what the surface
+# can actually CREATE.
 _ALLOWED_TYPES_ADDABLE = ("fact", "lesson", "convention", "preference", "decision", "constraint")
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # Never invent a validator fallback. If the selected checkout cannot provide
@@ -370,14 +374,18 @@ def _load_store_constants() -> None:
             # v15 (#173 PR-review F22): derive the addable subset from the
             # real type set — anything this server cannot express as a create
             # (today: `state`) stays out of the add surface's validation.
-            # #179 (Workstream K PR 8): `entity_card` joins the exclusion —
-            # a card-refresh-only type no interactive surface may create
-            # (cards are born only through `entity-card build|refresh` and
-            # the organize cadence sweep). `update` keeps the full set
-            # (content-only updates of pre-existing rows inherit and
-            # succeed), exactly like the `state` precedent.
+            # BOTH non-addable types are excluded, each for its own reason.
+            # `state` rides injection-expiry metadata this surface cannot set.
+            # #179: `entity_card` is card-refresh-only (cards are born only
+            # through `entity-card build|refresh` and the cadence sweep).
+            # #178: `event` needs occurrence endpoints this tool does not
+            # take. Taking either side of the rebase alone would have deleted
+            # the other's exclusion, so the derivation subtracts BOTH and
+            # still matches the degraded fallback literal (the F23 split-brain
+            # guard). `update` keeps the full set, like the `state` precedent.
             _ALLOWED_TYPES_ADDABLE = tuple(
-                t for t in types if t != "state" and t != "entity_card")
+                t for t in types
+                if t not in ("state", "entity_card", "event"))
         taints = getattr(mod, "ALLOWED_TAINTS", None)
         if taints:
             _ALLOWED_TAINTS = tuple(taints)

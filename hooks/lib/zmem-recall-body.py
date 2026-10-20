@@ -280,7 +280,8 @@ def _log_inject_decision(
                     "%s:%d/%d" % (label, int(arms[key].get("post", 0)),
                                    int(arms[key].get("cap", 0)))
                     for label, key in (("fts", "fts"), ("vec", "vec"),
-                                       ("ent", "entity"), ("graph", "graph"))
+                                       ("ent", "entity"), ("graph", "graph"),
+                                       ("temporal", "temporal"))
                     if key in arms))
             except (AttributeError, TypeError, ValueError):
                 pass

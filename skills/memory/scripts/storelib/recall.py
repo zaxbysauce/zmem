@@ -584,6 +584,54 @@ def _vec_knn_in_namespace(
     return _helper(conn, embedding, namespaces=namespaces, k=k,
                    overfetch=overfetch, k_cap=k_cap)
 
+def _temporal_window(query: str,
+                     prompt_timestamp: str | None) -> tuple[str, str]:
+    """Extract the temporal window from the query (v17, issue #178).
+
+    Longest-first phrase matching over the fixed 20-phrase vocabulary, then
+    ``temporal.parse_relative_range`` + ``clamp_range``. The prompt
+    timestamp is the caller-supplied ``--prompt-timestamp``; when omitted
+    the existing ``ZMEM_TEST_NOW``/now seam supplies it (the same contract
+    as ``_now_epoch``). An unrecognized query answers ``("", "")`` — an
+    empty temporal arm.
+    """
+    try:
+        from storelib import temporal as _temporal
+    except ImportError:
+        return ("", "")
+    # v18 (#178 review CL2-05/CL2-14): canonicalize BOTH clock inputs here —
+    # the single consumer — so every entry point is covered at once.
+    # temporal._parse_ts accepts only the exact Z form; _now_epoch parses
+    # ZMEM_TEST_NOW with fromisoformat (offsets/naive/fractional fine), so
+    # without this one env value pinned the scoring clock while silently
+    # emptying the temporal arm, and a programmatic prompt_timestamp did the
+    # same. Normalize, then fall back; unparseable input answers ("", "")
+    # exactly like an unrecognized phrase.
+    prompt = _normalize_as_of(prompt_timestamp) if prompt_timestamp else ""
+    if not prompt:
+        raw_env = os.environ.get("ZMEM_TEST_NOW", "").strip()
+        prompt = (_normalize_as_of(raw_env) if raw_env else "") or now_iso()
+    text = (query or "").strip().lower()
+    if not text:
+        return ("", "")
+    for phrase in _temporal.PHRASES_LONGEST_FIRST:
+        # v18 (#178 review CL2-07): word-boundary match, not substring —
+        # "this yearly planning cycle" contains "this year" and "next weekly
+        # sync" contains "next week", which false-activated the arm and
+        # silently changed RRF composition on a non-temporal query.
+        if re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text):
+            start, end = _temporal.parse_relative_range(
+                phrase, prompt_timestamp=prompt)
+            if start and end:
+                # Design 2 (issue #178): the arm calls parse_relative_range
+                # FOLLOWED BY clamp_range — future windows clamp to the
+                # prompt and collapse (empty arm), present-period windows
+                # truncate at the prompt instant.
+                return _temporal.clamp_range(
+                    start, end, prompt_timestamp=prompt)
+    return ("", "")
+
+
 def _arm_cap(env_name: str, default: int) -> int:
     """Per-arm candidate cap (issue #136): how many ranked ids one arm may
     contribute to RRF fusion, applied BEFORE fusion so an over-generous
@@ -604,6 +652,7 @@ def _rrf_fuse(
     *,
     graph_ids: list[str] | None = None,
     entity_weight_by_memory: dict[str, float] | None = None,
+    temporal_ids: list[str] | None = None,
 ) -> list[str]:
     """Reciprocal Rank Fusion: combine ranked lists by 1/(k+rank).
 
@@ -638,6 +687,13 @@ def _rrf_fuse(
     for rank, mid in enumerate(entity_ids or [], 1):
         scores[mid] = scores.get(mid, 0.0) + weights.get(mid, 1.0) / (k + rank)
     for rank, mid in enumerate(graph_ids or [], 1):
+        scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+    # v17 (#178): ``temporal_ids`` is the FIFTH ranked list — the
+    # occurrence-overlap arm. Additive like every other arm; an empty list
+    # contributes nothing, so a phrase-free query (or an occurrence-empty
+    # store) fuses byte-identically. Keyword-only, appended AFTER the #176
+    # entity-weight seam so no existing caller rebinding can occur.
+    for rank, mid in enumerate(temporal_ids or [], 1):
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
     return sorted(scores, key=scores.get, reverse=True)
 
@@ -1155,6 +1211,7 @@ def _recall_one_tier(
     lane: str | None = None,
     expiry_lane: bool = False,
     expiry_acc: dict | None = None,
+    prompt_timestamp: str | None = None,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -1337,10 +1394,59 @@ def _recall_one_tier(
                         max(15, limit + 10) * (2 if as_of else 1)),
         "entity": _arm_cap("ZMEM_ARM_CAP_ENTITY", max(50, limit * 10)),
         "graph": _arm_cap("ZMEM_ARM_CAP_GRAPH", max(4, limit)),
+        # v17 (#178): the temporal arm's own cap — default 4 (the issue's
+        # pinned constant, NOT max(4, limit)); 0..1000 clamp + the existing
+        # warning-on-invalid are _arm_cap's own behavior.
+        "temporal": _arm_cap("ZMEM_ARM_CAP_TEMPORAL", 4),
     }
     graph_ids: list[str] = []
     graph_rel_map: dict[str, float] = {}
     graph_ids_set: set[str] = set()
+    # v17 (#178): the temporal candidate arm — full list before slicing,
+    # ordered by descending overlap duration, descending mentioned_at, then
+    # ascending memory_id. A missing side table (pre-v17 store), malformed
+    # occurrence timestamps, an unrecognized query phrase, or a temporal SQL
+    # error each yield an EMPTY arm and preserve the non-temporal result;
+    # the arm never becomes an eligibility filter. The as-of predicate stays
+    # the shared `_as_of_temporal_predicate` (valid_from inclusive /
+    # valid_until exclusive) — occurrence time is SEPARATE from knowledge
+    # validity.
+    temporal_pre = 0
+    temporal_ids: list[str] = []
+    temporal_fused: list[str] = []
+    try:
+        t_start, t_end = _temporal_window(query, prompt_timestamp)
+        if t_start and t_end:
+            placeholders = ",".join("?" for _ in (ns_list or [""]))
+            temporal_rows = conn.execute(
+                f"""
+                SELECT mo.memory_id,
+                       MIN(julianday(mo.occurred_end), julianday(?))
+                       - MAX(julianday(mo.occurred_start), julianday(?))
+                       AS overlap_days,
+                       mo.mentioned_at
+                FROM memory_occurrence mo
+                JOIN memory m ON m.id = mo.memory_id
+                WHERE mo.occurred_start < ?
+                  AND mo.occurred_end > ?
+                  AND m.namespace IN ({placeholders})
+                  {"AND m.superseded_at IS NULL" if not as_of else ""}
+                  {_as_of_temporal_predicate(as_of, "m")[0]}
+                ORDER BY overlap_days DESC, mo.mentioned_at DESC,
+                         mo.memory_id ASC
+                """,
+                (t_end, t_start, t_end, t_start, *(ns_list or [""]),
+                 *_as_of_temporal_predicate(as_of, "m")[1]),
+            ).fetchall()
+            temporal_pre = len(temporal_rows)
+            temporal_ids = [r[0] for r in temporal_rows]
+    except sqlite3.OperationalError:
+        # Pre-v17 store (no memory_occurrence) — the arm is empty.
+        temporal_pre = 0
+        temporal_ids = []
+    except Exception:
+        temporal_pre = 0
+        temporal_ids = []
     if entity_ids and os.environ.get("ZMEM_GRAPH_SEED", "1").strip() != "0":
         graph_ids, graph_rel_map = graph_seed_ids(
             conn, entity_ids[:caps["entity"]],
@@ -1355,6 +1461,8 @@ def _recall_one_tier(
             ("entity", len(entity_ids),
              min(len(entity_ids), caps["entity"])),
             ("graph", len(graph_rel_map), len(graph_ids)),
+            ("temporal", temporal_pre,
+             min(temporal_pre, caps["temporal"])),
         ):
             cur = arm_stats.get(arm)
             if cur is None:
@@ -1365,7 +1473,7 @@ def _recall_one_tier(
                 cur["post"] += post
                 cur["cap"] = max(cur["cap"], caps[arm])
 
-    if vec_ids or entity_ids or graph_ids:
+    if vec_ids or entity_ids or graph_ids or temporal_ids:
         # Fuse whenever ANY lane beyond FTS produced ids (v10: that includes
         # the entity lane alone — the model-absent default). Preserve FTS
         # ranks BEFORE rows are replaced by the re-fetch, then re-fetch the
@@ -1383,15 +1491,21 @@ def _recall_one_tier(
         fts_ids = [r["id"] for r in rows[:caps["fts"]]]
         vec_fused = vec_ids[:caps["vec"]]
         ent_fused = entity_ids[:caps["entity"]]
+        temporal_fused = temporal_ids[:caps["temporal"]]
         fused_ids = _rrf_fuse(fts_ids, vec_fused, ent_fused,
                               graph_ids=graph_ids, k=60,
-                              entity_weight_by_memory=entity_weight_map)
+                              entity_weight_by_memory=entity_weight_map,
+                              temporal_ids=temporal_fused)
         # Issue #136 review round: rows whose ONLY arrival is the graph arm
         # (not also surfaced by a query-measuring arm) are link-rescued
         # neighbors in the #114 sense — they render but never feed the
         # surfaced/retrieval counters (bump_ids excludes them below).
+        # v17 (#178): temporal is a query-measuring arm too, so it must be
+        # subtracted here — a row arriving via BOTH graph and temporal is not
+        # graph-arrival-only and must stay bump-eligible.
         graph_only_ids = (set(graph_ids) - set(fts_ids)
-                          - set(vec_fused) - set(ent_fused))
+                          - set(vec_fused) - set(ent_fused)
+                          - set(temporal_fused))
         rrf_pos = {mid: i for i, mid in enumerate(fused_ids, 1)}
         rows = _fetch_by_ids(conn, fused_ids, ns_list, floor, as_of=as_of)
     else:
@@ -1554,6 +1668,15 @@ def _recall_one_tier(
             # arm are link-rescued neighbors — they render but never feed
             # the surfaced/retrieval counters (bump_ids excludes them).
             "_graph_arrival_only": r["id"] in graph_only_ids,
+            # v17 (#178) Design 5: a temporal-only row is marked for
+            # attribution and gains no graph semantics (the graph_only
+            # subtraction above keeps it bump-eligible).
+            "_temporal_arrival_only": (
+                r["id"] in set(temporal_fused)
+                and r["id"] not in set(fts_ids)
+                and r["id"] not in set(vec_fused)
+                and r["id"] not in set(ent_fused)
+                and r["id"] not in set(graph_ids)),
             # Issue #115: the row's trust multiplier, EXPOSED so the shared
             # inject gate (_row_trust) can judge scored rows — a plain key
             # because it is row data, not a diagnostic (the SQL-backed rows
@@ -1924,6 +2047,7 @@ def _scoped_tier_pools(
     collect_lanes: bool = False,
     moment: str | None = None,
     lane: str | None = None,
+    prompt_timestamp: str | None = None,
 ) -> tuple[dict[str, list[tuple[float, dict]]], list[str]]:
     """Score the independent scoped pools and apply tier provenance labels."""
     namespace_tiers, selected_namespaces = _scoped_namespaces(
@@ -1953,6 +2077,7 @@ def _scoped_tier_pools(
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of, mmr=mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=collect_lanes,
             stable_ties=True, moment=moment, lane=lane,
+            prompt_timestamp=prompt_timestamp,
         )
         for _score, item in scored:
             item["tier"] = tier
@@ -1968,7 +2093,7 @@ def _scoped_tier_pools(
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=False, weights=weights, arm_stats=arm_stats,
             collect_lanes=collect_lanes, stable_ties=True, moment=moment,
-            lane=lane,
+            lane=lane, prompt_timestamp=prompt_timestamp,
         )
         admitted: list[tuple[float, dict]] = []
         for score, item in candidates:
@@ -2082,6 +2207,7 @@ def cross_project_admissions(
     hybrid: bool = False,
     now_epoch: float | None = None,
     as_of: str | None = None,
+    prompt_timestamp: str | None = None,
     weights: dict | None = None,
     explicit: bool = False,
     authorized_namespaces: frozenset | None = None,
@@ -2141,6 +2267,7 @@ def cross_project_admissions(
         limit=CROSS_PROJECT_MAX * 16,
         min_confidence=min_confidence, hybrid=hybrid,
         now_epoch=now_epoch if now_epoch is not None else _now_epoch(),
+            prompt_timestamp=prompt_timestamp,
         as_of=as_of, mmr=False, weights=weights,
     )
     excluded = set(exclude_ids or [])
@@ -2824,6 +2951,7 @@ def _recall_memory_impl(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    prompt_timestamp: str | None = None,
     no_mmr: bool = False,
     link_hops: int = 1,
     link_budget: int = 2,
@@ -3010,6 +3138,11 @@ def _recall_memory_impl(
     # so programmatic callers (MCP/Hermes/tests) get the same Z-suffixed
     # UTC form the CLI's argparse type produces.
     as_of = _normalize_as_of(as_of)
+    # v18 (#178 review CL2-05): prompt_timestamp has the identical exposure —
+    # temporal._parse_ts accepts ONLY the canonical Z form, and a programmatic
+    # caller passing any other valid ISO-8601 spelling silently emptied the
+    # temporal arm. Same canonicalizer, same entry-point discipline.
+    prompt_timestamp = _normalize_as_of(prompt_timestamp)
 
     ns_list = _expand_namespace_aliases(conn, namespace)
 
@@ -3036,7 +3169,7 @@ def _recall_memory_impl(
             min_confidence=min_confidence, hybrid=hybrid,
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
             weights=weights, arm_stats=arms, moment=effective_moment,
-            lane=lane,
+            lane=lane, prompt_timestamp=prompt_timestamp,
         )
         # Expansion and belief surfaces must stay inside the selected scoped
         # namespace union; foreign candidates enter only through the explicit
@@ -3072,6 +3205,7 @@ def _recall_memory_impl(
                 min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
                 as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
                 moment=effective_moment, lane=lane,
+                prompt_timestamp=prompt_timestamp,
                 expiry_lane=expiry_active, expiry_acc=expiry_acc,
             )
 
@@ -3089,6 +3223,7 @@ def _recall_memory_impl(
                 as_of=as_of, mmr=not no_mmr, weights=weights, arm_stats=arms,
                 moment=effective_moment, lane=lane,
                 expiry_lane=expiry_active, expiry_acc=expiry_acc,
+                prompt_timestamp=prompt_timestamp,
             )
 
     # Issue #235: the user:global tier floor.  The selector threads the
@@ -3155,6 +3290,7 @@ def _recall_memory_impl(
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
             exclude_ids=exclude_ids, min_confidence=min_confidence,
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of,
+            prompt_timestamp=prompt_timestamp,
             weights=weights, explicit=_cross_explicit,
             authorized_namespaces=_authorized_namespaces,
         )
@@ -3528,6 +3664,14 @@ def _recall_memory_impl(
             "tokens_used": tokens_used,
             "tokens_budget": inject_token_budget(),
         }
+        if not for_injection:
+            # v17 (#178, Design 6): the NORMAL recall --json envelope carries
+            # the per-arm pre/post/cap map too (the for-injection envelope
+            # below replaces this dict wholesale and already has it; explain
+            # builds its own; recent runs no recall tiers). Always present,
+            # temporal zero-filled when the arm is empty — which arm carried
+            # a hit is observable on every JSON surface.
+            envelope["arms"] = arms
         # Issue #117 (D-1): present ONLY when an exclusion list was supplied,
         # so every unused-path envelope stays byte-identical (C5 freeze).
         if exclude_ids:
@@ -3759,7 +3903,7 @@ def _explain_run_pipeline(
     arm_stats: dict | None = None,
     scopes: dict[str, str] | None = None,
     scoped_slots: dict[str, int] | None = None,
-) -> tuple[list[dict], list[tuple[float, dict]], list[tuple[float, dict]],
+    prompt_timestamp: str | None = None,) -> tuple[list[dict], list[tuple[float, dict]], list[tuple[float, dict]],
            dict[str, list[tuple[float, dict]]], dict[str, int] | None]:
     """Run the SAME orchestration recall_memory runs (same helpers, same
     order, same real `limit`) and return (presented_pre_omit, project_deep,
@@ -3783,6 +3927,7 @@ def _explain_run_pipeline(
             slots=slots, min_confidence=min_confidence, hybrid=hybrid,
             now_epoch=now_epoch, as_of=as_of, mmr=not no_mmr,
             weights=weights, arm_stats=arm_stats, collect_lanes=True,
+            prompt_timestamp=prompt_timestamp,
         )
         # Issue #179: same suppression pass as recall_memory's scoped merge
         # so explain's presented set is the same fence.
@@ -3796,6 +3941,7 @@ def _explain_run_pipeline(
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
         as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
         arm_stats=arm_stats,
+        prompt_timestamp=prompt_timestamp,
     )
     global_scored: list[tuple[float, dict]] = []
     if global_ns_list:
@@ -3804,6 +3950,7 @@ def _explain_run_pipeline(
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
             arm_stats=arm_stats,
+            prompt_timestamp=prompt_timestamp,
         )
     for _s, item in project_scored:
         item["prompt_injection_risk"] = _classify_injection(item)
@@ -3824,6 +3971,7 @@ def _explain_run_pipeline(
         conn, query=query, ns_list=ns_list, limit=max(limit * 3, limit + 5),
         min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
         as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
+        prompt_timestamp=prompt_timestamp,
     )
     global_deep: list[tuple[float, dict]] = []
     if global_ns_list:
@@ -3832,6 +3980,7 @@ def _explain_run_pipeline(
             limit=max(global_limit * 3, global_limit + 5),
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, mmr=not no_mmr, weights=weights, collect_lanes=True,
+            prompt_timestamp=prompt_timestamp,
         )
     # Issue #179 (PR #385 review F-5d): the same suppression pass over the
     # DEEP pools — the verdict stream must agree with the presented fence,
@@ -4068,6 +4217,7 @@ def explain_recall(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    prompt_timestamp: str | None = None,
     no_mmr: bool = False,
     link_hops: int = 1,
     link_budget: int = 2,
@@ -4182,6 +4332,7 @@ def explain_recall(
             min_confidence=min_confidence, hybrid=hybrid, now_epoch=now_epoch,
             as_of=as_of, no_mmr=no_mmr, weights=weights,
             arm_stats=explain_arms, scopes=scopes, scoped_slots=scoped_slots,
+            prompt_timestamp=prompt_timestamp,
         )
         # Keep test and extension seams that stubbed the pre-#167 three-value
         # helper compatible while the scoped path carries its tier pools.
@@ -4737,6 +4888,7 @@ def _recent_memory_impl(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    prompt_timestamp: str | None = None,
     no_telemetry: bool = False,
     for_injection: bool = False,
     exclude_ids: list[str] | None = None,
@@ -4996,6 +5148,7 @@ def _collect_injection_candidates(
     include_global: bool,
     global_limit: int,
     as_of: str | None,
+    prompt_timestamp: str | None = None,
     hybrid: bool | None,
     no_mmr: bool,
     link_hops: int,
@@ -5032,6 +5185,7 @@ def _collect_injection_candidates(
         include_global=include_global,
         global_limit=global_limit,
         as_of=as_of,
+        prompt_timestamp=prompt_timestamp,
         no_telemetry=no_telemetry,
         for_injection=True,
         exclude_ids=exclude_ids,
@@ -5085,6 +5239,7 @@ def recall_memory(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    prompt_timestamp: str | None = None,
     no_mmr: bool = False,
     link_hops: int = 1,
     link_budget: int = 2,
@@ -5148,6 +5303,7 @@ def recall_memory(
             include_global=include_global,
             global_limit=global_limit,
             as_of=as_of,
+        prompt_timestamp=prompt_timestamp,
             no_mmr=no_mmr,
             link_hops=link_hops,
             link_budget=link_budget,
@@ -5182,6 +5338,7 @@ def recall_memory(
         include_global=include_global,
         global_limit=global_limit,
         as_of=as_of,
+        prompt_timestamp=prompt_timestamp,
         hybrid=hybrid,
         no_mmr=no_mmr,
         link_hops=link_hops,
@@ -5237,6 +5394,7 @@ def recent_memory(
     include_global: bool = False,
     global_limit: int = 3,
     as_of: str | None = None,
+    prompt_timestamp: str | None = None,
     no_telemetry: bool = False,
     for_injection: bool = False,
     exclude_ids: list[str] | None = None,
@@ -5267,6 +5425,7 @@ def recent_memory(
             include_global=include_global,
             global_limit=global_limit,
             as_of=as_of,
+        prompt_timestamp=prompt_timestamp,
             no_telemetry=no_telemetry,
             exclude_ids=exclude_ids,
             include_cross_project=include_cross_project,
@@ -5294,6 +5453,7 @@ def recent_memory(
         include_global=include_global,
         global_limit=global_limit,
         as_of=as_of,
+        prompt_timestamp=prompt_timestamp,
         hybrid=None,
         no_mmr=False,
         link_hops=0,

@@ -686,17 +686,32 @@ class RecallExpansionTest(_Store):
                 for row in recall_first["results"]
             )
         )
+        # v17 (issue #178): the plain recall --json envelope gained the
+        # additive top-level `arms` map (five entries incl. temporal), so the
+        # byte golden moved from b5536984... to the value below — verified
+        # additive: head-minus-arms deep-equals the pre-#178 envelope.
         self.assertEqual(
             hashlib.sha256(recall_first_raw).hexdigest(),
-            "b553698456c5a29e47bda99de0e1d739b1d86a219e0a3529a1be6cad9bda17f9",
+        # Byte golden (issue #178): TWO additive deltas vs pre-#178 — the
+        # top-level arms map, then the per-row _temporal_arrival_only key.
+        # Proof chain: current wire minus _temporal_arrival_only equals the
+        # round-2 pin 23825bdb... (reviewer strip-probe); that minus the arms
+        # key deep-equals the pre-#178 envelope (round-2 dual-tree proof).
+            "77a3b0c1354f92da226a098f71946efc4ee895f25103ca0dc2d29e8bc79f9c8b",
         )
         # Issue #176: the explain envelope gained entity_kind_weights (the
         # effective per-kind entity-lane RRF weights), so the byte golden
         # moved from c2d71075... to the value below. The hash is stable only
         # under DEFAULT weights — ZMEM_ENTITY_KIND_WEIGHTS changes it.
+        # v17 (issue #178): explain.arms gained the additive `temporal` entry
+        # (sole delta vs the previous golden), moving it to e8e66a58....
         self.assertEqual(
             hashlib.sha256(explain_first_raw).hexdigest(),
-            "59e311d25224593037bb2f56ba5b71fa44d979afedbca0c68862835fd2f3cbaf",
+        # Explain golden (issue #178 round-5): moved to 9d0d165d... by the
+        # additive _temporal_arrival_only row key — head minus that key
+        # equals the round-2 pin e8e66a58... byte-exactly (reviewer
+        # strip-probe); arms.temporal minus-key equals pre-#178.
+            "9d0d165deb300978cf5557961d8f25c0bade286d66e8794408613cb033a7691d",
         )
         self.assertEqual(self._expansion_ids(recall_first), expected["present"])
         self.assertEqual(self._expansion_ids(recall_second), expected["present"])
