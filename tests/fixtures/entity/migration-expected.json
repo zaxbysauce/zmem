@@ -1,7 +1,7 @@
 {
   "input_sha256": "5bbd958c6657cd4ef8a214303073155726ffd3ef6581a761f0a8d2422c79447d",
   "post": {
-    "schema_version": 17,
+    "schema_version": 18,
     "tables": {
       "entity": {
         "count": 5,

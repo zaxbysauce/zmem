@@ -148,15 +148,16 @@ class SchemaCompatGateTest(unittest.TestCase):
         importlib.reload(self.schema)
         # v16 (#175): SUPPORTED advanced 15 -> 16 (entity kinds v2 rebuild);
         # FORWARD deliberately stayed 15 — a v15 client refused a v16 store.
-        # v17 (#178): the additive `event`/`memory_occurrence` release moves
-        # SUPPORTED to 17 and REOPENS the additive window at parity
-        # (FORWARD 15 -> 17) — an older maintenance client may raise
-        # FORWARD_COMPAT (never SUPPORTED) to 17 and keep working on a v17
-        # store; clients still at FORWARD=15 refuse a v17 store.
+        # v18 (#178): the additive `event`/`memory_occurrence` release moves
+        # SUPPORTED to 18 and REOPENS the additive window at parity
+        # (FORWARD 15 -> 18) — an older maintenance client may raise
+        # FORWARD_COMPAT (never SUPPORTED) to 18 and keep working on a v18
+        # store; clients still at FORWARD=15 refuse a v18 store.
+        # (Renumbered from 17 at rebase: #179 owns 17 as stamp-only.)
         self.assertEqual(self.schema.SUPPORTED_SCHEMA_VERSION, 18)
         self.assertEqual(self.schema.FORWARD_COMPAT_SCHEMA_VERSION, 18)
-        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 17)
-        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 17)
+        self.assertEqual(meta.SUPPORTED_SCHEMA_VERSION, 18)
+        self.assertEqual(meta.FORWARD_COMPAT_SCHEMA_VERSION, 18)
 
 
     def _build_pre_v18_store(self):
@@ -446,7 +447,7 @@ class OlderClientOnNewerStoreTest(unittest.TestCase):
         self.assertEqual(ver, "15")
 
 
-class OlderV16ClientOnV17StoreTest(unittest.TestCase):
+class OlderV16ClientOnV18StoreTest(unittest.TestCase):
     """Issue #178 AC1: a v16 MAINTENANCE client (SUPPORTED=16, FORWARD=17)
     opens the current v17 store through the reopened additive window — one
     NOTICE, ordinary read/write, never a downgrade. The four version
@@ -492,7 +493,7 @@ class OlderV16ClientOnV17StoreTest(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_v16_maintenance_client_stores_and_recalls_on_v17_store(self):
+    def test_v16_maintenance_client_stores_and_recalls_on_v18_store(self):
         import io
         import sqlite3
         from contextlib import redirect_stderr
@@ -504,9 +505,9 @@ class OlderV16ClientOnV17StoreTest(unittest.TestCase):
                          "precondition: the current code builds a v18 store")
 
         with patch.object(schema, "SUPPORTED_SCHEMA_VERSION", 16), \
-             patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 17), \
+             patch.object(schema, "FORWARD_COMPAT_SCHEMA_VERSION", 18), \
              patch.object(schema_meta, "SUPPORTED_SCHEMA_VERSION", 16), \
-             patch.object(schema_meta, "FORWARD_COMPAT_SCHEMA_VERSION", 17):
+             patch.object(schema_meta, "FORWARD_COMPAT_SCHEMA_VERSION", 18):
             # Reset BEFORE: isolate this test's NOTICE from any prior fire.
             schema._schema_compat._warned = False
             buf = io.StringIO()
@@ -514,7 +515,7 @@ class OlderV16ClientOnV17StoreTest(unittest.TestCase):
                 # The compat verdict itself, pinned directly (this probe is
                 # what fires the one-shot NOTICE into the captured stream;
                 # every later call in this block must add nothing).
-                self.assertEqual(schema._schema_compat(17, store), "compat")
+                self.assertEqual(schema._schema_compat(18, store), "compat")
                 conn = schema.connect()
                 schema._prepare_store(conn)
                 from storelib.write import WriteResult, add_memory
@@ -565,7 +566,7 @@ class Schema18MigrationTest(unittest.TestCase):
     """Issue #178 AC1 (atomicity): a failing v17 DDL statement leaves the
     schema_version marker and the pre-migration table set unchanged."""
 
-    def test_failed_v17_migration_is_atomic(self):
+    def test_failed_v18_migration_is_atomic(self):
         import storelib.schema as schema
 
         tmp = tempfile.mkdtemp(prefix="zmem-178-atomic-")
@@ -587,9 +588,11 @@ class Schema18MigrationTest(unittest.TestCase):
                     os.environ[k] = v
         self.addCleanup(_restore)
 
-        # Build a full store with current code, then hold it at the v16
-        # surface (drop the v17 objects, marker back to 16) — the state a
-        # pre-migration store is in when the v17 block runs.
+        # Build a full store with current code, then hold it at the v17
+        # surface (drop the v18 objects, marker back to 17) — the state a
+        # pre-migration store is in when the v18 block runs. The pre-state
+        # moved 16 -> 17 with the renumber: sibling #179 owns 17 as a
+        # stamp-only step, so a v17 store is the real starting point here.
         conn = sqlite3.connect(store)
         try:
             schema.init_db(conn)
@@ -597,7 +600,7 @@ class Schema18MigrationTest(unittest.TestCase):
             conn.execute("DROP INDEX IF EXISTS idx_memory_occurrence_range")
             conn.execute("DROP TABLE IF EXISTS memory_occurrence")
             conn.execute(
-                "UPDATE meta SET value='16' WHERE key='schema_version'")
+                "UPDATE meta SET value='17' WHERE key='schema_version'")
             conn.commit()
 
             def snapshot():
@@ -609,15 +612,15 @@ class Schema18MigrationTest(unittest.TestCase):
                 return version, tables
 
             before_version, before_tables = snapshot()
-            self.assertEqual(before_version, "16")
+            self.assertEqual(before_version, "17")
             self.assertNotIn("memory_occurrence", before_tables)
 
-            # Inject ONE failing v17 DDL: keep the table statement, break
+            # Inject ONE failing v18 DDL: keep the table statement, break
             # the LAST statement (the index) against a nonexistent table.
             broken_ddl = (
                 schema._MEMORY_OCCURRENCE_SCHEMA_DDL[0],
                 "CREATE INDEX IF NOT EXISTS idx_memory_occurrence_range "
-                "ON no_such_v17_table(occurred_start)",
+                "ON no_such_v18_table(occurred_start)",
             )
             with patch.object(schema, "_MEMORY_OCCURRENCE_SCHEMA_DDL",
                               broken_ddl):
