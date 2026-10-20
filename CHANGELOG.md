@@ -7,9 +7,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [0.111.0] - 2026-10-20
 
-- **Schema 17 — the `event` type and `memory_occurrence` side table
+- **Schema 18 — the `event` type and `memory_occurrence` side table
   (issue #178, Workstream K PR 7):** `ALLOWED_TYPES` gains `event`; a fresh
-  store and the `ver < 17` migration both create
+  store and the `ver < 18` migration both create
   `memory_occurrence(memory_id PK REFERENCES memory(id), occurred_start,
   occurred_end, mentioned_at)` + `idx_memory_occurrence_range` in ONE
   transaction, with the version advanced only after both DDL statements
@@ -17,13 +17,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   version together). Purely additive — no `memory` column or constraint
   change.
 - **The forward-compat window reopens:** `FORWARD_COMPAT_SCHEMA_VERSION`
-  moves 15 -> 17 alongside `SUPPORTED_SCHEMA_VERSION` 16 -> 17 (v17 is the
+  moves 15 -> 18 alongside `SUPPORTED_SCHEMA_VERSION` 17 -> 18 (v18 is the
   additive case the window exists for; v16's closure was specific to its
-  constrained-table rebuild). **KEY OPERATOR NOTE for shared-store
-  machines:** a v17 client migrating the store makes every client whose
-  FORWARD_COMPAT is below 17 (all 0.10x-era installs carry 15) REFUSE the
+  constrained-table rebuild, and #179's v17 stamp held it because a
+  stamp-only bump gives an older client nothing safe to do). NUMBERING:
+  #179's `entity_card` bump owns 17 as a stamp-only step, so this DDL
+  renumbered 17 -> 18 at rebase — one integer can never carry two schema
+  definitions. **KEY OPERATOR NOTE for shared-store
+  machines:** a v18 client migrating the store makes every client whose
+  FORWARD_COMPAT is below 18 (all 0.10x-era installs carry 15) REFUSE the
   store until updated — update every zmem client on the box (Claude Code,
-  Codex, ZCode caches) BEFORE the first v17 client opens the shared store;
+  Codex, ZCode caches) BEFORE the first v18 client opens the shared store;
   `ZMEM_ALLOW_NEWER_SCHEMA=1` remains the stopgap.
 - **Occurrence writes and lifecycle:** `add_memory` gains keyword-only
   `occurred_start` / `occurred_end` / `mentioned_at` (event rows require

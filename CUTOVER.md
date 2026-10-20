@@ -29,7 +29,7 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v17
+- schema compatibility against current v18
 - `embeddings_health` check: active profile vs stored vector dimension,
   rows with/without embeddings, shipped-profile inventory, and warnings
   when a non-temporary store runs `ZMEM_EMBED_PROFILE=fake` (issue #63)
@@ -261,18 +261,24 @@ Any personal workstation paths, branch names, and one-time remediation commands
 from earlier development are intentionally excluded from this checklist. Keep
 them in issue notes or rollout logs, not in the supported operator path.
 
-## Schema 17 — `event` + `memory_occurrence` (issue #178, additive)
+## Schema 18 — `event` + `memory_occurrence` (issue #178, additive)
 
-`SUPPORTED_SCHEMA_VERSION` 17, `FORWARD_COMPAT_SCHEMA_VERSION` 17: the
+`SUPPORTED_SCHEMA_VERSION` 18, `FORWARD_COMPAT_SCHEMA_VERSION` 18: the
 forward-compat window REOPENS (v16 held it at 15 because its
-constrained-table rebuild is not additive; v17 changes no `memory` column
-or constraint). Fresh stores and the `ver < 17` migration both create
-`memory_occurrence` + `idx_memory_occurrence_range` in one transaction,
-version advanced only after both statements succeed. A v16 maintenance
-client raised to FORWARD 17 reads/writes a v17 store with one NOTICE.
-Clients still at FORWARD 15 (every 0.10x-era install) refuse a migrated
-v17 store — update ALL zmem clients on shared-store machines before the
-first v17 client opens the store (`ZMEM_ALLOW_NEWER_SCHEMA=1` stopgap).
+constrained-table rebuild is not additive; #179's v17 stamp held it there
+because a stamp-only bump gives an older client nothing safe to do; v18
+changes no `memory` column or constraint). Fresh stores and the
+`ver < 18` migration both create `memory_occurrence` +
+`idx_memory_occurrence_range` in one transaction, version advanced only
+after both statements succeed. A v16 maintenance client raised to
+FORWARD 18 reads/writes a v18 store with one NOTICE. Clients still at
+FORWARD 15 (every 0.10x-era install) refuse a migrated v18 store —
+update ALL zmem clients on shared-store machines before the first v18
+client opens the store (`ZMEM_ALLOW_NEWER_SCHEMA=1` stopgap).
+NUMBERING: #179's `entity_card` bump owns 17 as a STAMP-ONLY step; this
+PR's occurrence DDL renumbered 17 -> 18 at rebase because one integer can
+never carry two schema definitions (a `ver < 17` guard would skip the DDL
+on every store a released 0.107/0.108 client had already stamped).
 The `event` type writes occurrence endpoints at add time only
 (`--occurred-start/--occurred-end/--mentioned-at`); recall resolves
 relative phrases via `--prompt-timestamp` and fuses the capped temporal
