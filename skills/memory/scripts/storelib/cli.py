@@ -2014,7 +2014,8 @@ def main():
                        help="event occurrence end in canonical UTC form")
     p_add.add_argument("--mentioned-at", dest="mentioned_at", action="store",
                        type=str, default="",
-                       help="time the event was mentioned in the prompt")
+                       help="time the event was mentioned in the prompt "
+                            "(canonical UTC; default: the write instant)")
 
     p_recall = _add_parser("recall", help="recall relevant memories")
     p_recall.add_argument("--query", required=True)

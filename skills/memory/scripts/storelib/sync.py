@@ -318,18 +318,25 @@ def _cmd_export_jsonl_body(
     # silently: when any packed row carries occurrence data, say so once on
     # stderr (the #173 F14 precedent directly above).
     try:
-        occ_count = conn.execute(
-            "SELECT COUNT(*) FROM memory_occurrence mo "
-            "JOIN memory m ON m.id = mo.memory_id"
-        ).fetchone()
+        # v18 (#178 review CL2-21): scope the count to the rows this export
+        # actually emits (the same namespace/live predicates as the pack
+        # query) and render the number — the unscoped store-wide count
+        # asserted loss on exports that lost nothing, training operators to
+        # ignore the real notice.
+        occ_sql = ("SELECT COUNT(*) FROM memory_occurrence mo "
+                   "JOIN memory m ON m.id = mo.memory_id")
+        if clauses:
+            occ_sql += " WHERE " + " AND ".join(clauses)
+        occ_count = conn.execute(occ_sql, params).fetchone()
         # Index, never isinstance(tuple): schema.connect() sets
         # row_factory=sqlite3.Row, and a Row is not a tuple — the previous
         # tuple guard made this notice unreachable (#178 review).
         if occ_count is not None and occ_count[0]:
             print(
-                "[zmem] export-jsonl: memory_occurrence records skipped — "
-                "occurrence data does not travel through export/ingest yet; "
-                "event rows export without occurrence metadata",
+                "[zmem] export-jsonl: %d memory_occurrence record(s) "
+                "skipped — occurrence data does not travel through "
+                "export/ingest yet; event rows export without occurrence "
+                "metadata" % occ_count[0],
                 file=sys.stderr,
             )
     except sqlite3.OperationalError:

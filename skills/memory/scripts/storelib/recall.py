@@ -599,14 +599,27 @@ def _temporal_window(query: str,
         from storelib import temporal as _temporal
     except ImportError:
         return ("", "")
-    prompt = prompt_timestamp
-    if prompt is None:
-        prompt = os.environ.get("ZMEM_TEST_NOW", "").strip() or now_iso()
+    # v18 (#178 review CL2-05/CL2-14): canonicalize BOTH clock inputs here —
+    # the single consumer — so every entry point is covered at once.
+    # temporal._parse_ts accepts only the exact Z form; _now_epoch parses
+    # ZMEM_TEST_NOW with fromisoformat (offsets/naive/fractional fine), so
+    # without this one env value pinned the scoring clock while silently
+    # emptying the temporal arm, and a programmatic prompt_timestamp did the
+    # same. Normalize, then fall back; unparseable input answers ("", "")
+    # exactly like an unrecognized phrase.
+    prompt = _normalize_as_of(prompt_timestamp) if prompt_timestamp else ""
+    if not prompt:
+        raw_env = os.environ.get("ZMEM_TEST_NOW", "").strip()
+        prompt = (_normalize_as_of(raw_env) if raw_env else "") or now_iso()
     text = (query or "").strip().lower()
     if not text:
         return ("", "")
     for phrase in _temporal.PHRASES_LONGEST_FIRST:
-        if phrase in text:
+        # v18 (#178 review CL2-07): word-boundary match, not substring —
+        # "this yearly planning cycle" contains "this year" and "next weekly
+        # sync" contains "next week", which false-activated the arm and
+        # silently changed RRF composition on a non-temporal query.
+        if re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text):
             start, end = _temporal.parse_relative_range(
                 phrase, prompt_timestamp=prompt)
             if start and end:
@@ -3125,6 +3138,11 @@ def _recall_memory_impl(
     # so programmatic callers (MCP/Hermes/tests) get the same Z-suffixed
     # UTC form the CLI's argparse type produces.
     as_of = _normalize_as_of(as_of)
+    # v18 (#178 review CL2-05): prompt_timestamp has the identical exposure —
+    # temporal._parse_ts accepts ONLY the canonical Z form, and a programmatic
+    # caller passing any other valid ISO-8601 spelling silently emptied the
+    # temporal arm. Same canonicalizer, same entry-point discipline.
+    prompt_timestamp = _normalize_as_of(prompt_timestamp)
 
     ns_list = _expand_namespace_aliases(conn, namespace)
 
@@ -3272,6 +3290,7 @@ def _recall_memory_impl(
             current_namespace=namespace, ops_tokens=_cross_ops_tokens,
             exclude_ids=exclude_ids, min_confidence=min_confidence,
             hybrid=hybrid, now_epoch=now_epoch, as_of=as_of,
+            prompt_timestamp=prompt_timestamp,
             weights=weights, explicit=_cross_explicit,
             authorized_namespaces=_authorized_namespaces,
         )

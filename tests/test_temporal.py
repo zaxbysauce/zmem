@@ -879,5 +879,120 @@ class TemporalClampWindowTest(unittest.TestCase):
         self.assertEqual(raw_end, "2026-09-14T00:00:00Z")
 
 
+class TemporalReviewRegressionTest(unittest.TestCase):
+    """One discriminating pin per v18 review-round fix. Each fails when its
+    fix is reverted — the property the original 20-phrase suite lacked."""
+
+    def test_word_boundary_match_rejects_superstrings(self):
+        """CL2-07: "this yearly planning cycle" contains "this year" as a
+        SUBSTRING but is not the phrase — the arm must stay empty.
+        Reverts if: the match goes back to `phrase in text`."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib.recall as recall_mod
+        self.assertEqual(
+            recall_mod._temporal_window("notes from this yearly planning "
+                                        "cycle", "2026-09-10T12:00:00Z"),
+            ("", ""), "superstring false-activated the arm")
+        self.assertEqual(
+            recall_mod._temporal_window("the next weekly sync notes",
+                                        "2026-09-10T12:00:00Z"),
+            ("", ""))
+        # The real phrases still match through the same path.
+        self.assertNotEqual(
+            recall_mod._temporal_window("this year", "2026-09-10T12:00:00Z"),
+            ("", ""))
+
+    def test_prompt_timestamp_is_normalized_at_entry(self):
+        """CL2-05: a programmatic caller passing a valid non-canonical
+        ISO-8601 instant still activates the arm (PRR-022 discipline).
+        Reverts if: the raw string flows into temporal._parse_ts, which
+        accepts only the exact Z form."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import storelib.recall as recall_mod
+        canonical = recall_mod._temporal_window(
+            "last week", "2026-09-10T12:00:00Z")
+        for variant in ("2026-09-10T12:00:00+00:00",
+                        "2026-09-10 12:00:00",
+                        "2026-09-10T14:00:00+02:00"):
+            self.assertEqual(
+                recall_mod._temporal_window("last week", variant),
+                canonical,
+                "non-canonical prompt timestamp silently emptied the arm")
+
+    def test_extreme_prompt_timestamp_never_raises(self):
+        """CL2-15: the documented never-raises contract holds at the
+        boundary years the CLI validator accepts.
+        Reverts if: the inner body is un-wrapped again."""
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        from storelib import temporal as temporal_mod
+        for phrase in ("this year", "tomorrow", "last week", "past 30 days"):
+            for prompt in ("9999-12-31T23:59:59Z", "0001-01-01T00:00:00Z"):
+                try:
+                    start, end = temporal_mod.parse_relative_range(
+                        phrase, prompt_timestamp=prompt)
+                except (OverflowError, ValueError) as exc:
+                    self.fail("parse_relative_range(%r, %r) raised %s"
+                              % (phrase, prompt, exc))
+                self.assertIsInstance(start, str)
+                self.assertIsInstance(end, str)
+
+    def test_update_fold_prints_the_occurrence_discard(self):
+        """CL2-03: the update dedup-fold must print the occurrence notice —
+        the PR's own disclosed contract ("dedup folds drop args with a
+        visible warning") and the add-path fold precedent. The fold targets
+        a keeper that already carries its own occurrence, so the keeper-wins
+        branch fires. Reverts if: the fold returns before the occurrence
+        block again (the silent-discard defect)."""
+        import subprocess
+        scratch = tempfile.mkdtemp(prefix="zmem-178-foldpin-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        env = dict(os.environ)
+        for key in ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                    "ZMEM_MODEL_AUTODOWNLOAD"):
+            env.pop(key, None)
+        env.update({
+            "ZMEM_DATA": scratch,
+            "ZMEM_STORE": os.path.join(scratch, "store.sqlite"),
+            "ZMEM_MODELS_DIR": os.path.join(scratch, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+
+        def run_cli(args):
+            return subprocess.run(
+                [sys.executable, str(STORE_PY), *args],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", env=env, timeout=120, check=False,
+                cwd=str(REPO_ROOT))
+
+        run_cli(["init"])
+        ns = "project:fold-pin"
+        add1 = run_cli([
+            "add", "--type", "event", "--namespace", ns,
+            "--content", "outage during last week at the fold cluster",
+            "--occurred-start", "2026-09-01T08:00:00Z",
+            "--occurred-end", "2026-09-03T08:00:00Z"])
+        self.assertEqual(add1.returncode, 0, add1.stderr)
+        add2 = run_cli([
+            "add", "--type", "event", "--namespace", ns,
+            "--content", "unrelated seed so the second event stands alone",
+            "--occurred-start", "2026-10-01T08:00:00Z",
+            "--occurred-end", "2026-10-03T08:00:00Z"])
+        self.assertEqual(add2.returncode, 0, add2.stderr)
+        ev2 = re.search(r"added memory ([0-9a-f-]{36})", add2.stdout).group(1)
+        # Updating ev2's content to ev1's exact text folds ev2 into ev1
+        # (similarity 1.000 >= 0.85); the keeper already carries its own
+        # occurrence, so the keeper-wins warning must fire.
+        upd = run_cli([
+            "update", "--id", ev2, "--namespace", ns,
+            "--content", "outage during last week at the fold cluster"])
+        self.assertEqual(upd.returncode, 0, upd.stderr)
+        combined = upd.stdout + upd.stderr
+        self.assertIn("merged into existing live memory", combined,
+                      "the update did not fold at all — pin is vacuous")
+        self.assertIn("kept its own occurrence data", combined,
+                      "fold discarded the inherited occurrence SILENTLY: "
+                      + combined[-400:])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

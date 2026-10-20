@@ -107,6 +107,18 @@ def _resolve_occurrence(
             "event occurrence range is malformed, inverted, or outside the "
             "temporal window"
         )
+    # v18 (#178 review CL2-10): the clamp bounds the temporal window, but at
+    # WRITE time it silently rewrote the caller's stated date — an event
+    # stated as 2015 stored occurred_start = prompt - 3650d. Keep the clamp
+    # (the issue mandates it) but never let a stored value differ from the
+    # supplied one without saying so.
+    if clamped_start != occurred_start or clamped_end != occurred_end:
+        print(
+            "[zmem] notice: occurrence endpoints clamped to the temporal "
+            f"window ({occurred_start}..{occurred_end} -> "
+            f"{clamped_start}..{clamped_end})",
+            file=sys.stderr,
+        )
     mentioned_eff = mentioned_at.strip() or tx_now
     # Design 3 (issue #178): normalize mentioned_at to canonical UTC via the
     # parse/format pair — clamp_range(x, x) always collapses (end <= start on
@@ -2229,6 +2241,43 @@ def update_memory(
                 attach_memory_evidence(
                     conn, memory_id=dup_id, evidence_ids=normalized_evidence_ids
                 )
+            # v18 (issue #178): the fold is the event→event transition with an
+            # EXISTING target, so the inherited occurrence triple follows the
+            # same rule as the non-fold insert below — with the keeper-wins
+            # precedent of the add-path fold — and the discard is VISIBLE,
+            # matching this PR's own disclosed contract ("folds drop with a
+            # visible warning") and the v15 expiry F04 escape hatch above.
+            # Branch rules: dup event WITHOUT occurrence → inherit (the
+            # documented imported-orphan cell); dup event WITH occurrence →
+            # keeper wins, warn; dup non-event → drop with warning (the
+            # matrix's "event→non-event cleans" sanctions exactly this).
+            if occurrence_eff is not None:
+                dup_type_row2 = conn.execute(
+                    "SELECT type FROM memory WHERE id=?", (dup_id,)
+                ).fetchone()
+                dup_is_event = bool(dup_type_row2
+                                    and dup_type_row2["type"] == "event")
+                dup_has_occurrence = bool(conn.execute(
+                    "SELECT 1 FROM memory_occurrence WHERE memory_id=?",
+                    (dup_id,)).fetchone())
+                if dup_is_event and not dup_has_occurrence:
+                    conn.execute(
+                        "INSERT INTO memory_occurrence "
+                        "(memory_id, occurred_start, occurred_end, "
+                        "mentioned_at) VALUES (?,?,?,?)",
+                        (dup_id, occurrence_eff[0], occurrence_eff[1],
+                         occurrence_eff[2]),
+                    )
+                    print(f"[zmem] dedup: existing memory {dup_id} inherited "
+                          "the occurrence data")
+                else:
+                    print(
+                        f"[zmem] dedup: existing memory {dup_id} kept its own "
+                        f"occurrence data; the superseded event's range was "
+                        f"dropped"
+                        + ("" if dup_is_event else
+                           f" (fold target {dup_id} is a non-event row)")
+                    )
             if started_tx:
                 _commit(conn)
             print(f"[zmem] update: {mid} superseded; new content merged into existing "

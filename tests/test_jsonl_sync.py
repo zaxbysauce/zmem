@@ -723,8 +723,12 @@ class TombstonePropagationTest(_TwoStoreCase):
         r = self.a.run("export-jsonl", "--out", export_a)
         self.assertEqual(r.returncode, 0, r.stderr)
         # The not-silent contract (#173 F14 precedent): the occurrence record
-        # is skipped WITH a stderr notice, never dropped silently.
-        self.assertIn("memory_occurrence records skipped", r.stderr)
+        # is skipped WITH a stderr notice, never dropped silently. The notice
+        # renders the COUNT of skipped records in THIS export's scope (the
+        # v18 review re-scoped it from a store-wide count that asserted loss
+        # on exports that lost nothing).
+        self.assertIn("memory_occurrence record(s) skipped", r.stderr)
+        self.assertRegex(r.stderr, r"export-jsonl: \d+ memory_occurrence")
 
         r = self.b.run("ingest-jsonl", "--in", export_a)
         self.assertEqual(r.returncode, 0, r.stderr)

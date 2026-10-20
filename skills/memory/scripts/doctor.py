@@ -4513,7 +4513,10 @@ def _check_miss_rate(
     arm_rep = report.get("arms") or {}
     if (arm_rep.get("lines_with_arms") or 0) > 0:
         arm_bits = []
-        for _a in ("fts", "vec", "ent", "graph"):
+        # v18 (#178 review CL2-20): miss_rate emits five arms; the doctor
+        # renderer still iterated the four-arm tuple, so temporal-only
+        # carries were invisible in the operator summary.
+        for _a in ("fts", "vec", "ent", "graph", "temporal"):
             _b = (arm_rep.get("carried") or {}).get(_a) or {}
             if _b.get("injected", 0) or _b.get("silent", 0):
                 arm_bits.append(

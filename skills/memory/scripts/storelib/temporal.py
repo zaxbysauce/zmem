@@ -97,6 +97,20 @@ def parse_relative_range(phrase: str,
     malformed prompt timestamp, an unrecognized phrase, or an
     inverted/collapsed range.  Never raises.
     """
+    # v18 (#178 review CL2-15): the never-raises contract is enforced here,
+    # at the single public entry. datetime arithmetic at the boundary years
+    # (the CLI's _iso8601 validator accepts 0001 and 9999) raised
+    # OverflowError/ValueError out of replace()/timedelta below, converting
+    # the documented ("", "") answer into an exception that the arm's
+    # blanket except then silently swallowed.
+    try:
+        return _parse_relative_range_inner(phrase, prompt_timestamp)
+    except (OverflowError, ValueError):
+        return ("", "")
+
+
+def _parse_relative_range_inner(
+        phrase: str, prompt_timestamp: str) -> tuple[str, str]:
     prompt = _parse_ts(prompt_timestamp)
     if prompt is None:
         return ("", "")
