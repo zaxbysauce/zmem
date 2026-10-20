@@ -452,7 +452,10 @@ def _supersede_stale_summaries(
             # `tomb_at` is computed once above, so this transaction
             # writes a single timestamp (AC7).
             _clear_expiry(conn, row["id"])
-            _clear_occurrence(conn, row["id"])
+            # v18 (issue #178): occurrence is RETAINED on this soft
+            # tombstone so --as-of temporal recall can still reach the
+            # summary as it stood before the rewrite; hard deletes reap
+            # it through purge._ID_SIDE_TABLES.
 
 
 def _cluster_topics(
