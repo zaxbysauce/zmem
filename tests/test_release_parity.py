@@ -487,6 +487,48 @@ class CiWorkflowContractTest(unittest.TestCase):
             "the drift gate is skipped whenever any earlier step fails — "
             "add !cancelled() to the condition")
 
+    def test_triggers_concurrency_and_timeouts(self):
+        # CI speed quick wins: branch pushes are covered by the PR run, so
+        # push is main-only (the drift gate needs it); only PR runs are
+        # cancellable; every job is bounded by a timeout. Text-based (no
+        # PyYAML): CI does not install it for this loop.
+        import re
+        self.assertIn('push:\n    branches: ["main"]\n', self.yml)
+        self.assertIn('pull_request:\n    branches: ["**"]\n', self.yml)
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+            self.yml)
+        group = re.search(r"^  group: (.*)$", self.yml, re.MULTILINE)
+        self.assertIsNotNone(group, "ci.yml lost its concurrency group")
+        self.assertEqual(
+            group.group(1),
+            "${{ github.workflow }}-${{ github.event_name == 'pull_request'"
+            " && github.ref || github.run_id }}",
+            "non-PR runs must not share a group (pending-run drop)")
+        jobs = re.split(r"^jobs:\n", self.yml, flags=re.MULTILINE)[1]
+        blocks = re.split(r"^  (?=[a-z][\w-]*:\n)", jobs, flags=re.MULTILINE)
+        blocks = [b for b in blocks if b.strip()]
+        names = {b.split(":")[0] for b in blocks}
+        self.assertTrue(
+            {"test", "test-embeddings", "test-source-hermes"} <= names, names)
+        for b in blocks:
+            m = re.search(r"^    timeout-minutes: (.+)$", b, re.MULTILINE)
+            self.assertIsNotNone(
+                m, "job %r lacks timeout-minutes" % b.split(":")[0])
+            if b.startswith("test:"):
+                # Per-OS bound: ubuntu stays bounded, and every other label
+                # (Windows successful runs reached 151 min) falls back to a
+                # value that must never go below 180.
+                per_os = re.fullmatch(
+                    r"\$\{\{ matrix\.os == 'ubuntu-latest' && (\d+) "
+                    r"\|\| (\d+) \}\}", m.group(1))
+                self.assertIsNotNone(
+                    per_os, "test job timeout must be per-OS: %r" % m.group(1))
+                self.assertGreaterEqual(int(per_os.group(1)), 40)
+                self.assertGreaterEqual(int(per_os.group(2)), 180)
+            else:
+                self.assertRegex(m.group(1), r"^\d+$")
+
     def test_freshness_step_fetches_base_ref_before_the_gate(self):
         # The PR checkout is shallow and carries no origin/main ref; the
         # freshness gate fails closed on an unreadable base. Pin that the

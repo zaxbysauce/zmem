@@ -1,6 +1,7 @@
 name: CI
 
-# Runs the full test suite on every push/PR, without the ~90MB embedding
+# Runs the full test suite on pull requests and on pushes to main (pushes to
+# other branches are covered by their PR's run), without the ~90MB embedding
 # model (skills/memory/models/minilm.onnx is gitignored — Phase 10,
 # PLAN.md §7-P10). ZMEM_MODEL_AUTODOWNLOAD=0 guarantees no lazy-download is
 # attempted here either, so this job never fetches the model over the
@@ -10,14 +11,30 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
     branches: ["**"]
+
+# A new push to a PR supersedes the in-flight PR run, so cancel it. Only
+# pull_request runs are cancellable: pushes to main must always run to
+# completion (the release drift gate below polices every main merge). Non-PR
+# runs key on run_id, not the ref: even with cancel-in-progress off, a shared
+# group keeps only ONE pending run, so two quick merges to main would silently
+# drop the drift gate for the middle commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Successful-run durations 2026-09-29..10-18: windows max 151 min (median
+    # 58, p95 78, next-highest 104); ubuntu max 26 min. ubuntu gets 60 (>2x
+    # its max) so a hung leg fails in an hour; every other label, Windows
+    # included, gets 240 (1.5x the Windows max, rounded up), so a renamed
+    # runner label falls back to the generous bound, never the tight one.
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 60 || 240 }}
     # Least-privilege token scope (#37 L13). This workflow runs on push/PR
     # (never pull_request_target), uses no secrets, and only needs to read the
     # repo to check it out — so scope the GITHUB_TOKEN to read-only. `actions:
@@ -241,7 +258,7 @@ jobs:
       # collected as an artifact; the score never gates the build (no
       # --fail-under) and nothing is downloaded.
       - name: Run offline eval (model-absent, fake profile)
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           ZMEM_EMBED_PROFILE: fake
@@ -250,7 +267,7 @@ jobs:
           python scripts/eval_runner.py --store .eval-tmp/store.sqlite --gold eval/gold.jsonl --json-out .eval-tmp/eval-results.json
 
       - name: Upload eval report artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: eval-results-${{ matrix.os }}
@@ -262,7 +279,7 @@ jobs:
       # efficacy claim; empty observation denominators remain explicit zero
       # compatibility values in the report.
       - name: Run deterministic replay audit
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -275,7 +292,7 @@ jobs:
             --json-out .eval-tmp/replay-results.json
 
       - name: Upload replay report artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: replay-results-${{ matrix.os }}
@@ -290,7 +307,7 @@ jobs:
       # baseline (eval/baseline-injection.json) is what later phases diff
       # against; flipping this to a gate is ONE flag.
       - name: Run injection eval (model-absent, fake profile)
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           ZMEM_EMBED_PROFILE: fake
@@ -305,7 +322,7 @@ jobs:
       # a real-model id must take the exact skip path without any model call.
       # The generator is a developer-side tool; CI never regenerates.
       - name: Run counterfactual stub replay and verify oracle bytes
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -321,7 +338,7 @@ jobs:
           cmp tests/fixtures/counterfactual/expected.json "$scratch/counterfactual.json"
 
       - name: Validate counterfactual schema (Draft 2020-12)
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -336,7 +353,7 @@ jobs:
           PY
 
       - name: Assert counterfactual real-model skip path
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -350,7 +367,7 @@ jobs:
           printf '%s\n' "$output" | grep -Fx "SKIPPED: model calls disabled"
 
       - name: Upload injection eval report artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: eval-inject-results-${{ matrix.os }}
@@ -358,9 +375,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Run Node test suites
-        # always(): the eval step above can fail operationally (exit 2) — a
+        # !cancelled(): the eval step above can fail operationally (exit 2) — a
         # JS-coverage blackout on one matrix leg must not be its side effect.
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -e
@@ -377,6 +394,9 @@ jobs:
   test-embeddings:
     name: test-embeddings (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Successful-run max 3.7 min (windows), 1.3 min (ubuntu); 15 = floor
+    # covering pip/install variance.
+    timeout-minutes: 15
     permissions:
       contents: read
       actions: read
@@ -421,6 +441,8 @@ jobs:
   test-source-hermes:
     name: test-source-hermes
     runs-on: ubuntu-latest
+    # Successful-run max 1.4 min; 15 = floor covering checkout/install variance.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
