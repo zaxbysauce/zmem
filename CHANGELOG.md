@@ -5,6 +5,67 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.114.0] - 2026-10-20
+
+### Fixed (release integrity)
+
+- **Release gate: freshness no longer skips on equal versions** (issues #325,
+  #359b). `--check-manifest-freshness` now verifies the committed
+  `release-manifest.json` on every run — the equal-version case is exactly the
+  sibling-collision state the old "not a release-prep change" skip waved
+  through (live incidents: PR #319, PR #350). A no-bump PR that edits runtime
+  files without re-emitting the manifest now fails at PR time; the historical
+  "[skip release] + re-emit at the same version" escape is retired (a
+  re-emitted manifest at an already-tagged version claims content under a
+  published release).
+- **Release gate: version-collision and version-ordering checks** (issue
+  #354). A PR that claims a release target — any manifest version differing
+  from base, or a changed `release-manifest.json` at an equal version — now
+  fails when the target version already exists as a published tag (collision)
+  or sits below the newest published tag (ordering). ci.yml's freshness step
+  fetches tags (`--tags`, previously `--no-tags`) so the check sees a real
+  tag universe.
+- **Publish workflow verifies before the early exit** (issues #325, #359c).
+  `release.yml` runs `--verify-manifest` before the existing-release early
+  exit, so a re-run or version collision can no longer skip the only content
+  check.
+- **All seven host manifests join the content-addressed release surface**
+  (issue #359a). `drift.py` discovers version-bearing manifests
+  (`plugin.json`/`plugin.yaml`/`marketplace.json`) by name outside the test
+  fixtures, so a version bump or tamper on any shipping manifest is
+  served-drift-visible in doctor, the session-start hook and
+  `--verify-manifest`. The manifest inventory regex is now defined once and
+  shared between drift and the release gate.
+- **Feedback-round hardening (PR #390 review).** The collision check compares
+  parsed version tuples, so spelling variants of a published version
+  (`0.112.00`) collide too; tag parsing accepts only strict `vX.Y.Z` names
+  (skipped strays are counted in the output) and a non-`X.Y.Z` manifest
+  version fails with an actionable diagnostic instead of a traceback;
+  malformed manifest JSON (non-object, deeply nested) parses to the standard
+  "no parseable version" refusal; an indeterminate tag universe or
+  manifest-blob read prints a `::warning::` and an empty tag universe fails
+  closed in GitHub Actions; a BOM before a line-1 `## [Unreleased]` heading
+  can no longer void the drift census; the duplicate-heading diagnostic names
+  the stranded-heading remediation; the collision message distinguishes a
+  version-bump collision from an equal-version re-emit. CONTRIBUTING.md now
+  documents the release rules (every runtime-surface edit rides a release
+  bump; the equal-version re-emit escape is retired).
+- **Drift-surface exclusions extended** (`.claude`, `worktrees` path
+  segments): nested worktree checkouts carrying manifest-name copies no
+  longer flood served-drift with warn-only noise; segment-exact matching
+  keeps the shipped `.zcode-plugin/` and `.claude-plugin/` directories in the
+  surface, and the release gate's git-less disk-walk fallback now prunes the
+  same segments as drift. Note: `refresh_hosts` refuses a checkout whose
+  host manifests were edited without a manifest re-emit — re-emit first, then
+  refresh.
+- **Unreleased-section scan covers every heading** (issue #364). The release
+  gate's `[Unreleased]` drift check scans all `## [Unreleased]` headings and
+  fails with a diagnostic naming every line number when more than one exists;
+  content under any heading is detected. The single-empty-section exit-0
+  floor is unchanged.
+
+
+
 ## [0.113.0] - 2026-10-20
 
 ### Added

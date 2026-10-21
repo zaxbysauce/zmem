@@ -2,6 +2,23 @@
 
 How to file issues. This repository originated the workstream convention; the per-AC check binding below is the codified upgrade of that practice.
 
+## Release rules — every runtime-surface edit rides a release (issues #325/#354/#359)
+
+The release gate verifies the committed `release-manifest.json` on EVERY pull request and
+fails a PR that claims a version already published as a tag (version collision) or below the
+newest published tag (version ordering). The practical consequences, all enforced:
+
+- Any edit under `hooks/`, `skills/memory/scripts/`, `skills/**/SKILL.md`, `hermes-plugin/`,
+  `scripts/`, or any of the seven host manifests requires a release-version bump in the same PR
+  (all seven manifests + a dated newest-first `## [X.Y.Z]` CHANGELOG section + a re-emitted
+  `release-manifest.json` after `git add`). There is no equal-version re-emit escape: re-emitting
+  the manifest at an already-tagged version is refused as a collision.
+- Docs/tests/CI-only PRs need no bump — an unchanged version with an unchanged manifest passes.
+- `[skip release]` in a merge subject is for docs/CI-only merges; it cannot bypass the
+  collision/ordering checks or the manifest verification.
+- Version targets must be strict `X.Y.Z` and must move forward; the gate compares parsed
+  version tuples, so spelling variants of a published version collide too.
+
 <!-- CANONICAL-VERSION: ZaxbyHub/opencode-swarm@78a4c546bb (PR #3185, follow-up section from PRs #3371 and #3377). Verbatim-copy core; repo notes are repo-specific. Update by re-copying from the canonical and bumping this stamp. -->
 
 

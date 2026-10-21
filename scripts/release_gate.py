@@ -43,7 +43,8 @@ gate (the Release workflow and its tests depend on that).
 
 Exit codes: 0 gate passed (release OR skip), 1 contract violation.
 Network-free: only `git ls-files` / `git rev-parse` / `git show` / `git log`
-against the local clone.
+/ `git tag --list` against the local clone (tag names feed the issue #354
+collision/ordering check; visibility is the caller's fetch policy).
 Runnable standalone for local pre-flight: `python scripts/release_gate.py`.
 """
 
@@ -72,16 +73,16 @@ import drift  # noqa: E402
 # is discovered, not remembered (the seven-surface lesson: enumerating from
 # memory is how a surface gets missed). Deterministic host-refresh fixtures
 # also contain descriptor-shaped files, but are test data rather than shipped
-# surfaces; keep that test-only tree out of the release inventory.
-MANIFEST_RE = re.compile(r"(?:^|/)(?:plugin\.(?:json|yaml)|marketplace\.json)$")
-FIXTURE_PREFIX = "tests/fixtures/"
+# surfaces; keep that test-only tree out of the release inventory. The
+# definition itself lives in drift.py (VERSION_MANIFEST_RE) and is shared
+# with the content surface (issue #359) — one definition, two gates.
+MANIFEST_RE = drift.VERSION_MANIFEST_RE
+FIXTURE_PREFIX = drift._FIXTURE_TREE_PREFIX
 
 
 def _is_shipping_manifest(rel_path: str) -> bool:
     """Whether a repo-relative POSIX path is a shipped manifest descriptor."""
-    return bool(MANIFEST_RE.search(rel_path)) and not rel_path.startswith(
-        FIXTURE_PREFIX
-    )
+    return drift.is_version_manifest(rel_path)
 
 
 def _has_link_component(path: Path, root: Path) -> bool:
@@ -169,7 +170,14 @@ def read_version(rel_path: str, repo_root: Path | None = None) -> str | None:
 
 
 def _version_from_text(text: str, path: Path) -> str | None:
-    """Parse a manifest version from its text (path only picks the shape)."""
+    """Parse a manifest version from its text (path only picks the shape).
+
+    Any parse failure — invalid JSON, valid JSON of a non-object type
+    (`null`, `[]`, a bare string), or pathological nesting that overflows
+    the interpreter — resolves to None, the same "no parseable version"
+    contract as an unreadable file, so callers produce their actionable
+    diagnostics instead of a traceback.
+    """
     if path.suffix == ".yaml":
         m = _VERSION_RE.search(text)
         if not m:
@@ -179,7 +187,9 @@ def _version_from_text(text: str, path: Path) -> str | None:
         return m.group(1).strip("\"'")
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return None
+    if not isinstance(data, dict):
         return None
     if isinstance(data.get("version"), str):
         return data["version"]
@@ -283,32 +293,76 @@ def tag_exists(version: str) -> bool:
 _UNRELEASED_RE = re.compile(r"^## \[Unreleased\][^\n]*$", re.MULTILINE)
 
 
-def unreleased_body(text: str) -> str:
-    """Body of the `## [Unreleased]` section, or "" when the section is absent.
+def unreleased_heading_lines(text: str) -> list[int]:
+    """1-based line numbers of EVERY `## [Unreleased]` heading (issue #364).
 
-    The body runs to the next `## ` header (or EOF), matching
+    More than one heading is itself a defect even when every section is
+    empty: whichever heading `unreleased_body` does not read is silently
+    unmonitored, and the stranded-heading history shows duplicates coexist
+    undetected without this census.
+    """
+    return [text.count("\n", 0, m.start()) + 1 for m in _UNRELEASED_RE.finditer(text)]
+
+
+def _unreleased_section_bodies(text: str) -> list[str]:
+    """Bodies of every `## [Unreleased]` section, in file order.
+
+    Each body runs to the next `## ` header (or EOF), matching
     latest_changelog_section's termination rule.
     """
-    m = _UNRELEASED_RE.search(text)
-    if not m:
-        return ""
-    start = m.end()
-    nxt = text.find("\n## ", start)
-    return text[start:] if nxt < 0 else text[start:nxt]
+    bodies = []
+    for m in _UNRELEASED_RE.finditer(text):
+        start = m.end()
+        nxt = text.find("\n## ", start)
+        bodies.append(text[start:] if nxt < 0 else text[start:nxt])
+    return bodies
+
+
+def unreleased_body(text: str) -> str:
+    """Body of the first `## [Unreleased]` section carrying content, "" when
+    the section is absent.
+
+    Issue #364: the body is no longer read from the FIRST heading only —
+    content under ANY heading counts. "Carrying content" means a non-blank
+    line (a structurally empty section's body still holds the newline after
+    the heading, so a raw != "" test would never skip one — the M6
+    mutation-probe finding). An all-whitespace changelog resolves to the
+    FIRST section's raw body, preserving the single-heading contract
+    tests/test_release_parity.py pins: a whitespace-only body is returned
+    raw, never collapsed to "". Callers deciding "has content" use
+    unreleased_has_content, which applies the same per-section test.
+    """
+    bodies = _unreleased_section_bodies(text)
+    for body in bodies:
+        if any(line.strip() for line in body.splitlines()):
+            return body
+    return bodies[0] if bodies else ""
 
 
 def unreleased_has_content(text: str) -> bool:
-    """True when the [Unreleased] section carries any non-blank line."""
-    return any(line.strip() for line in unreleased_body(text).splitlines())
+    """True when ANY `## [Unreleased]` section carries a non-blank line."""
+    return any(
+        any(line.strip() for line in body.splitlines())
+        for body in _unreleased_section_bodies(text)
+    )
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess | None:
+    """Run git, returning None on ANY failure (spawn, timeout, decode).
+
+    Output is decoded as UTF-8 with replacement rather than the platform's
+    ANSI code page: the windows CI leg would otherwise raise an uncaught
+    UnicodeDecodeError out of Popen on non-cp1252 bytes (commit subjects and
+    file contents are contributor-controlled), defeating this helper's
+    None-on-failure contract.
+    """
     try:
         return subprocess.run(
             ["git", *args], cwd=str(repo_root),
             capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return None
 
 
@@ -373,13 +427,34 @@ def check_unreleased_drift(repo_root: Path) -> int:
     HEAD did not bump a manifest version relative to HEAD~1 AND the merge
     subject carries no [skip release] marker. Order: the CHANGELOG-state
     check runs first (cheap, history-free — the common clean case never
-    needs git), then the marker escape, then the bump comparison.
+    needs git), then the duplicate-heading structural check (issue #364),
+    which deliberately runs BEFORE the marker escape and the content
+    early-exit: empty duplicates are the defect itself (an unmonitored
+    heading), and a cleanup merge resolves the duplication rather than
+    needing to carry it, so the marker cannot bypass this one. The file is
+    decoded utf-8-sig so a BOM before a line-1 heading cannot make the
+    whole census vacuous.
     """
     try:
-        changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8-sig")
     except OSError:
         print(f"::error::{repo_root / 'CHANGELOG.md'} is unreadable — "
               f"the drift gate cannot run")
+        return 1
+    # Issue #364: a duplicate Unreleased heading is a structural defect even
+    # when the sections are empty — whichever heading a first-match reader
+    # does not read is silently unmonitored. Diagnose every line number. The
+    # real CHANGELOG history carries a stranded mid-file heading, so the
+    # message names the actual remediation: delete the stranded duplicate.
+    heading_lines = unreleased_heading_lines(changelog)
+    if len(heading_lines) > 1:
+        print(f"::error::CHANGELOG.md carries {len(heading_lines)} "
+              f"'## [Unreleased]' headings (lines "
+              f"{', '.join(str(n) for n in heading_lines)}) — exactly one "
+              f"Unreleased section is allowed; merge their content into one "
+              f"section and DELETE the stranded duplicate (a second heading "
+              f"often sits mid-file below the released sections) "
+              f"(issue #364)")
         return 1
     if not unreleased_has_content(changelog):
         print("[release-gate] no unreleased drift: "
@@ -404,15 +479,16 @@ def check_unreleased_drift(repo_root: Path) -> int:
 # --- Release-manifest modes (issue #107) --------------------------------------
 #
 # The runtime surface (hooks/**, skills/memory/scripts/**, skills/**/SKILL.md,
-# hermes-plugin/**, scripts/** since 0.18.0) gets a CONTENT-addressed identity: `--emit-manifest`
-# writes release-manifest.json (committed at the repo root, outside every
-# surface prefix so it is never self-hashed) and `--verify-manifest` proves
-# the committed manifest still describes the tree at release time. Both hash
-# the DISK tree via the same drift module the served side uses — a cache
-# mirror copies the working tree, so the manifest must describe exactly that.
-# The verify runs ONLY inside the release publish path (release.yml, after the
-# release-exists early exit): between releases the manifest is intentionally
-# stale while work sits under [Unreleased].
+# hermes-plugin/**, scripts/** since 0.18.0, plus every version-bearing host
+# manifest by name since issue #359) gets a CONTENT-addressed identity:
+# `--emit-manifest` writes release-manifest.json (committed at the repo root,
+# outside every surface prefix so it is never self-hashed) and
+# `--verify-manifest` proves the committed manifest still describes the tree
+# at release time. Both hash the DISK tree via the same drift module the
+# served side uses — a cache mirror copies the working tree, so the manifest
+# must describe exactly that. The verify runs inside the release publish path
+# (release.yml, BEFORE the release-exists early exit since issue #325/#359)
+# and at PR time via --check-manifest-freshness on every invocation.
 
 
 def _discover_manifests_disk(repo_root: Path) -> list[str]:
@@ -420,11 +496,14 @@ def _discover_manifests_disk(repo_root: Path) -> list[str]:
 
     Used only by the manifest modes so --emit/--verify work in git-less
     trees (synthetic fixtures); the default mode keeps the authoritative
-    git-tracked enumeration."""
+    git-tracked enumeration. Prunes the SAME segments drift's walk prunes
+    (plus .git), so the two gates cannot disagree about which
+    manifest-named copies are inventory (PR #390 review: three divergent
+    exclusion sets behind one shared definition)."""
     out = []
     for dirpath, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [d for d in dirnames
-                       if d not in (".git", "node_modules", "__pycache__")]
+                       if d not in drift._EXCLUDED_SEGMENTS | {".git"}]
         for name in filenames:
             full = os.path.join(dirpath, name)
             # Never read through symlinks: a planted file-symlink could point
@@ -588,13 +667,96 @@ def verify_manifest(repo_root: Path) -> int:
     return 0
 
 
+_TAG_RE = re.compile(r"^v(\d+\.\d+\.\d+)$")
+
+
+def _tag_versions(repo_root: Path) -> list[str] | None:
+    """Strict `vX.Y.Z` tag versions, sorted ascending; None when git fails.
+
+    Issue #354 feedback round: only names matching `v<digits>.<digits>.<digits>`
+    are accepted — `v1_0` would otherwise parse as version 10 via Python's
+    underscore integer literals, and `v0.9.0-rc1`/`v1.2` would distort the
+    newest-tag ordering. Skipped non-conforming names are counted and
+    reported so a stray tag is diagnosable rather than silently dropped.
+    None (git unavailable/timed out) is distinct from [] (a genuine
+    tag-less repo): the caller prints a `::warning::` on None (visible
+    degradation) and fails the check closed on [] when running in GitHub
+    Actions, where a silently vacuous collision check is the issue #325
+    failure mode one layer up.
+    """
+    out = _git(repo_root, "tag", "--list")
+    if out is None or out.returncode != 0:
+        return None
+    versions = []
+    skipped = 0
+    for name in out.stdout.splitlines():
+        name = name.strip()
+        m = _TAG_RE.match(name)
+        if m:
+            versions.append(m.group(1))
+        elif name:
+            skipped += 1
+    if skipped:
+        print(f"[release-gate] {skipped} tag(s) do not match vX.Y.Z and are "
+              f"excluded from the collision/ordering check")
+    return sorted(set(versions), key=_version_tuple)
+
+
+def _ref_resolves(repo_root: Path, ref: str) -> bool:
+    out = _git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    return out is not None and out.returncode == 0
+
+
+def _manifest_blob(repo_root: Path, ref: str) -> str | None:
+    """Blob SHA of `release-manifest.json` at <ref>, "absent" when the ref
+    resolves but the manifest does not exist there, None when the state is
+    INDETERMINATE (git failure or an unresolvable ref).
+
+    The three-way result keeps the trigger honest (feedback round, PR #390
+    review): a missing-on-either-side pair still counts as changed, but a
+    git hiccup or an unfetchable base can no longer masquerade as
+    "unchanged" via None != None. A deleted manifest remains separately
+    caught fail-closed by verify_manifest's "no readable
+    release-manifest.json" refusal.
+    """
+    if not _ref_resolves(repo_root, ref):
+        return None
+    out = _git(repo_root, "rev-parse", "--verify", "--quiet",
+               f"{ref}:{drift.MANIFEST_NAME}")
+    if out is None or out.returncode != 0:
+        return "absent"
+    return out.stdout.strip()
+
+
 def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
-    """PR-time gate (issue #107 follow-up): fail when a release-prep change
-    (any host-facing manifest version differs from <base_ref>) leaves the
-    committed manifest stale. Non-bump changes pass — the manifest is
-    intentionally stale between releases while work sits under
-    [Unreleased]. Indeterminate version reads (git hiccup, unreadable
-    manifest) FAIL the check, never silently skip it."""
+    """PR-time gate (issues #107, #325, #354, #359): fail when a PR leaves
+    the committed manifest stale, claims an already-published version, or
+    regresses version ordering.
+
+    The manifest is verified on EVERY invocation — version bump or not
+    (issue #325/#359b: the equal-version case is exactly the sibling-collision
+    state a first-match "not a release-prep change" skip used to wave through;
+    between-releases work sits under [Unreleased] with runtime files only in
+    convention-violating PRs, which now fail here instead of merging
+    unverified). Indeterminate version reads (git hiccup, unreadable
+    manifest) FAIL the check, never silently skip it.
+
+    Version-collision/ordering (issue #354) fire when the PR CLAIMS a
+    release target — any manifest version differs from <base_ref>, OR the
+    committed release-manifest.json itself differs from <base_ref>'s (an
+    equal-version re-emit claiming content under an already-published
+    version). An unchanged version with an unchanged manifest is the normal
+    post-release steady state of a no-bump docs/tests PR and must pass. The
+    collision compares PARSED version tuples, so spelling variants
+    (`0.112.00`, ` 0.112.0`) of a published version cannot slip past string
+    inequality. On a partial multi-manifest bump there is no single claimed
+    version: skip the tag checks and let verify_manifest's parity refusal
+    fail loudly with the actionable error. An indeterminate tag universe or
+    manifest-blob read prints a `::warning::` (fail-open but VISIBLE) —
+    except in GitHub Actions, where an empty/failed tag fetch fails the
+    step, because CI is the enforcement point and a silently vacuous
+    headline check is the issue #325 failure mode one layer up.
+    """
     try:
         manifests = discover_manifests(repo_root)
     except RuntimeError as exc:
@@ -602,6 +764,7 @@ def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
               f"manifests: {exc}")
         return 1
     bumped = False
+    head_versions: dict[str, str | None] = {}
     for rel in manifests:
         cur = _version_at(repo_root, "HEAD", rel)
         base = _version_at(repo_root, base_ref, rel)
@@ -609,15 +772,94 @@ def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
             print(f"::error::--check-manifest-freshness could not read "
                   f"version of {rel} at HEAD or {base_ref} — failing closed")
             return 1
+        head_versions[rel] = cur
         if cur != base:
             bumped = True
-    if not bumped:
-        print("[release-gate] not a release-prep change (no manifest "
-              "version bump vs "
-              f"{base_ref}) — manifest freshness not required")
-        return 0
-    print("[release-gate] release-prep change detected — verifying the "
-          "committed manifest describes the tree")
+    head_blob = _manifest_blob(repo_root, "HEAD")
+    base_blob = _manifest_blob(repo_root, base_ref)
+    if head_blob is None or base_blob is None:
+        print(f"::warning::--check-manifest-freshness could not read "
+              f"release-manifest.json at HEAD or {base_ref} — the "
+              f"manifest-changed collision trigger is indeterminate")
+        release_manifest_changed = False
+    else:
+        release_manifest_changed = head_blob != base_blob
+    claims_target = bumped or release_manifest_changed
+    if claims_target:
+        distinct = set(head_versions.values())
+        if len(distinct) == 1:
+            claimed = next(iter(distinct))
+            if not re.fullmatch(r"\d+\.\d+\.\d+", claimed):
+                print(f"::error::--check-manifest-freshness: the manifests "
+                      f"claim {claimed!r}, which is not an X.Y.Z version — "
+                      f"fix the version surfaces (issue #354)")
+                return 1
+            try:
+                claimed_tuple = _version_tuple(claimed)
+            except ValueError:
+                # e.g. a component long enough to exceed CPython's int-string
+                # conversion limit: fullmatch passes, int() refuses.
+                print(f"::error::--check-manifest-freshness: the manifests "
+                      f"claim {claimed!r}, whose components are not usable "
+                      f"as version numbers — fix the version surfaces "
+                      f"(issue #354)")
+                return 1
+            tags = _tag_versions(repo_root)
+            if tags is None:
+                print("::warning::git tag enumeration failed — version "
+                      "collision/ordering check skipped (fetch tags for "
+                      "full coverage; ci.yml fetches them for this step)")
+            elif not tags:
+                # Fail closed in CI ONLY for the real-checkout context: there,
+                # an empty tag universe means the --tags fetch regressed and
+                # the headline check would be silently vacuous (issue #325
+                # one layer up). Synthetic fixtures (--repo-root elsewhere,
+                # as in every test) legitimately have sparse tag sets and
+                # stay informational — otherwise CI's GITHUB_ACTIONS env
+                # would red every tag-less fixture (caught live on the PR
+                # #390 ubuntu lane).
+                if os.environ.get("GITHUB_ACTIONS") and (
+                        repo_root.resolve() == REPO_ROOT.resolve()):
+                    print("::error::no vX.Y.Z tags visible in CI — the "
+                          "version collision/ordering check would be "
+                          "vacuous, failing closed instead (issue #354)")
+                    return 1
+                print("[release-gate] no vX.Y.Z tags visible — version "
+                      "collision/ordering check vacuous (fetch tags for "
+                      "full coverage; ci.yml fetches them for this step)")
+            elif claimed_tuple in {_version_tuple(t) for t in tags}:
+                collision = next(t for t in tags
+                                 if _version_tuple(t) == claimed_tuple)
+                if bumped:
+                    remedy = ("retarget the seven manifests to the next "
+                              "unused version")
+                else:
+                    remedy = ("this PR re-emitted release-manifest.json at "
+                              "an already-published version — revert the "
+                              "re-emit, or bump to the next unused version")
+                # Report staleness TOO when both defects are present: the
+                # collision return would otherwise hide it (PR #390 review
+                # PRR-010 half two).
+                if verify_manifest(repo_root) != 0:
+                    print(f"::error::and the committed manifest does not "
+                          f"describe the tree — see the STALE diagnostic "
+                          f"above")
+                print(f"::error::version collision: v{claimed} already "
+                      f"exists as a published tag v{collision} — "
+                      f"{remedy} (issue #354)")
+                return 1
+            elif claimed_tuple < _version_tuple(tags[-1]):
+                print(f"::error::version ordering: target v{claimed} is "
+                      f"below the newest published tag v{tags[-1]} — "
+                      f"releases must move forward (issue #354)")
+                return 1
+    if bumped:
+        print("[release-gate] release-prep change detected — verifying the "
+              "committed manifest describes the tree")
+    else:
+        print(f"[release-gate] manifest version unchanged vs {base_ref} — "
+              f"verifying the committed manifest anyway (issues #325/#359: "
+              f"equal versions are the sibling-collision state)")
     return verify_manifest(repo_root)
 
 
@@ -654,17 +896,17 @@ def main(argv: list[str] | None = None) -> int:
              "longer describes the tree (release-time use only)")
     ap.add_argument(
         "--check-manifest-freshness", action="store_true",
-        help="issue #107: fail only when a release-prep change (manifest "
-             "version bump vs --base) leaves the committed manifest stale; "
-             "pass elsewhere (PR-time use)")
+        help="issues #107/#325/#354/#359: verify the committed manifest on "
+             "every run, and fail when the PR claims a version that is "
+             "already tagged or below the newest tag (PR-time use)")
     ap.add_argument(
         "--base", default="origin/main",
         help="base ref for --check-manifest-freshness (default origin/main)")
     ap.add_argument(
         "--repo-root", default=None,
         help="repo root for --check-unreleased-drift/--emit-manifest/"
-             "--verify-manifest (synthetic-repo tests); ignored by the "
-             "default release mode")
+             "--verify-manifest/--check-manifest-freshness "
+             "(synthetic-repo tests); ignored by the default release mode")
     args = ap.parse_args(argv)
     root = Path(args.repo_root).resolve() if args.repo_root else REPO_ROOT
     if args.check_unreleased_drift:
