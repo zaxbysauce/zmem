@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f8fcb5a5890aa4ac3f8411cb7e7fba82d41d7542d36f11ed731a552841977200",
+  "digest": "59bdb21df172964ef6c61a571703b5828df9289fad4acc1f00c1467112ac9c57",
   "files": {
     ".agents/plugins/marketplace.json": "d0006f9cf3e5d93ddfb6700d221b8098af6bb37db52a704c5271d83cff4d0721",
     ".claude-plugin/marketplace.json": "bac712f50c41c02bcd84dd9b3bbfb0b37c290506736008799f14b9875ed7cdcb",
@@ -60,7 +60,7 @@
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
     "scripts/refresh-report-schema.json": "a2105db8ca57a6e860c35bf25a6e8f943b70c0f3abaf65fcf2803d9d99b01bea",
     "scripts/refresh_hosts.py": "aae858aacc2d776b3e834c775b578ce9893b9d9c1d46e13d142db001188d35fc",
-    "scripts/release_gate.py": "20fde074f70ab32e4fa63b84c014d53dc77731d93774e8f0516d63879210836a",
+    "scripts/release_gate.py": "eaf7ab374a3e4d2eeabb63959a30eaca59828c175f6557f8594c4fba922b8ead",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "b43f4c9fc602917bd5f627560f1ab5abbfb3b34e60ad0d27f7a219a7492368ef",
     "skills/memory/SKILL.md": "075afc05db68e6147a964485feb28ea5d9b9807d28f66d16eecc857b6409416b",

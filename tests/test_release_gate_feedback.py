@@ -114,14 +114,36 @@ class IndeterminateInputsTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_empty_tag_universe_fails_closed_in_github_actions(self):
+        # CI fail-closed applies ONLY to the real-checkout context (an empty
+        # universe there means the --tags fetch regressed); synthetic
+        # --repo-root fixtures legitimately have sparse tags and stay
+        # informational. Pin the real-context branch in-process with the tag
+        # universe mocked empty.
+        # Fully hermetic: in CI the python suites run BEFORE the freshness
+        # step fetches origin/main, so even real `git show origin/main:...`
+        # reads fail here. Mock the manifest inventory, the per-ref version
+        # reads (distinct -> bumped -> claims_target), the blob comparison,
+        # and the tag universe; nothing touches git.
+        with mock.patch.object(gate, "discover_manifests",
+                               return_value=["plugin.json"]),              mock.patch.object(gate, "_version_at",
+                               side_effect=lambda r, ref, rel,
+                                            _h="0.114.0", _b="0.113.0":
+                                            _h if ref == "HEAD" else _b),              mock.patch.object(gate, "_tag_versions", return_value=[]),              mock.patch.object(gate, "_manifest_blob",
+                               side_effect=lambda r, ref: "a" if ref == "HEAD" else "b"),              mock.patch.dict("os.environ", {"GITHUB_ACTIONS": "1"}):
+            rc, out = _captured(gate.check_manifest_freshness,
+                                gate.REPO_ROOT, "origin/main")
+        self.assertEqual(rc, 1, "empty tag universe in CI must fail closed")
+        self.assertIn("no vX.Y.Z tags visible in CI", out)
+
+    def test_empty_tag_universe_synthetic_fixture_stays_informational(self):
         tmp, repo, git = _scratch_repo()
         try:
             _bump_and_commit(repo, git, version="0.6.0", edit_hook=False)
             r = _freshness(repo, "HEAD~1", env_extra={"GITHUB_ACTIONS": "1"})
             combined = r.stdout + r.stderr
-            self.assertNotEqual(r.returncode, 0,
-                                "empty tag universe in CI must fail closed")
-            self.assertIn("no vX.Y.Z tags visible in CI", combined)
+            # The verify leg may fail on a fixture without a manifest, but the
+            # TAG check itself must not be the fail-closed error.
+            self.assertNotIn("no vX.Y.Z tags visible in CI", combined)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

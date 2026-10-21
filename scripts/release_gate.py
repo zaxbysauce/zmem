@@ -810,7 +810,16 @@ def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
                       "collision/ordering check skipped (fetch tags for "
                       "full coverage; ci.yml fetches them for this step)")
             elif not tags:
-                if os.environ.get("GITHUB_ACTIONS"):
+                # Fail closed in CI ONLY for the real-checkout context: there,
+                # an empty tag universe means the --tags fetch regressed and
+                # the headline check would be silently vacuous (issue #325
+                # one layer up). Synthetic fixtures (--repo-root elsewhere,
+                # as in every test) legitimately have sparse tag sets and
+                # stay informational — otherwise CI's GITHUB_ACTIONS env
+                # would red every tag-less fixture (caught live on the PR
+                # #390 ubuntu lane).
+                if os.environ.get("GITHUB_ACTIONS") and (
+                        repo_root.resolve() == REPO_ROOT.resolve()):
                     print("::error::no vX.Y.Z tags visible in CI — the "
                           "version collision/ordering check would be "
                           "vacuous, failing closed instead (issue #354)")
