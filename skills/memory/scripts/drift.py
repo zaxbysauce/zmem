@@ -101,10 +101,12 @@ def is_version_manifest(rel: str) -> bool:
 
 # Excluded path segments / suffixes (build artifacts, never runtime identity).
 # node_modules mirrors release_gate's disk-walk fallback; .zcode/issue-traces
-# carry manifest-name COPIES in dev checkouts that would be noise on the
-# doctor disk walk (segment-level pruning keeps .agents/plugins/marketplace.json
-# itself inside the surface).
-_EXCLUDED_SEGMENTS = {"__pycache__", "node_modules", ".zcode", "issue-traces"}
+# carry manifest-name COPIES in dev checkouts; .claude/worktrees hold full
+# nested checkouts whose manifest copies would flood served drift with
+# warn-only noise. All are SEGMENT-EXACT, so the shipped .zcode-plugin/ and
+# .claude-plugin/ directories (hyphenated names) are never pruned.
+_EXCLUDED_SEGMENTS = {"__pycache__", "node_modules", ".zcode", "issue-traces",
+                      ".claude", "worktrees"}
 _EXCLUDED_SUFFIXES = (".pyc", ".pyo")
 
 # Canonical ops-lane session-id rule (same as miss_rate / recall-body): the
@@ -202,7 +204,10 @@ def load_manifest(root: Path):
     path = Path(root) / MANIFEST_NAME
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError is a RuntimeError, not a ValueError: deeply nested
+        # contributor-controlled JSON must land in the same malformed path
+        # (PR #390 review PRR-008).
         return None
     if not isinstance(data, dict):
         return None

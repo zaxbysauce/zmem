@@ -985,7 +985,11 @@ class HostRefreshFixtureTest(_RefreshFixtureMixin, unittest.TestCase):
             )
         )
 
-    def test_case_only_rename_outside_runtime_surface_is_a_change(self):
+    def test_case_only_rename_inside_the_cache_is_replaced(self):
+        # Renames a manifest-named file INSIDE the cache mirror; the
+        # refresher must replace it with the checkout's canonical name.
+        # (Originally named '...outside_runtime_surface...' before issue
+        # #359 made plugin.json part of the surface.)
         self.assertEqual(self._main_status(*self._refresh_args()), 0)
         renamed: list[Path] = []
         for row in self._report()["hosts"]:

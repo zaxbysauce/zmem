@@ -236,7 +236,7 @@ jobs:
       # surface); --tags (not the old --no-tags) also materializes the tag
       # universe the collision/ordering check reads — without it that check
       # is structurally vacuous in CI.
-      - name: Manifest freshness on release-prep changes
+      - name: Manifest freshness (release gate)
         if: github.event_name == 'pull_request' && !cancelled()
         shell: bash
         run: |

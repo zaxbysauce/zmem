@@ -25,9 +25,14 @@ PYTHON = sys.executable
 
 
 def _git(cwd: Path, *args: str):
-    return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                           *args], cwd=str(cwd), capture_output=True, text=True,
-                          timeout=60)
+    r = subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        *args], cwd=str(cwd), capture_output=True, text=True,
+                       timeout=60)
+    # A silently-failing fixture step degrades the shape under test (the
+    # gate would resolve "" refs against the index), so every step asserts.
+    unittest.TestCase().assertEqual(r.returncode, 0,
+                                    f"git {args[:2]} failed: {r.stdout} {r.stderr}")
+    return r
 
 
 def _gate(repo_root: Path, base: str):
@@ -50,6 +55,14 @@ class _Fixture(unittest.TestCase):
         _git(self.repo, "init", "-q", ".")
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "base")
+        # The base commit MUST carry an emitted release-manifest.json (PR #390
+        # review F-002): with no manifest at base, _manifest_blob(base) is
+        # "absent" and ANY re-emit at HEAD reads as "changed" — a mutant that
+        # only checks manifest PRESENCE would pass every test below. With the
+        # manifest committed at base, the tests discriminate bytes-changed.
+        self._reemit()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "base manifest")
         self.base = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
 
     def tearDown(self):
@@ -59,7 +72,7 @@ class _Fixture(unittest.TestCase):
         r = subprocess.run(
             [PYTHON, str(GATE), "--emit-manifest", "--repo-root", str(self.repo)],
             cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=120)
-        assert r.returncode == 0, r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 class EqualVersionReemitCollisionTest(_Fixture):

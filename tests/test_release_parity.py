@@ -536,7 +536,7 @@ class CiWorkflowContractTest(unittest.TestCase):
         # release-prep PR goes red on an infra-shaped error.
         import re
         step = re.search(
-            r"- name: Manifest freshness on release-prep changes"
+            r"- name: Manifest freshness[^\n]*"
             r".*?run: \|(.*?)\n      - ", self.yml, re.DOTALL)
         self.assertIsNotNone(
             step, "ci.yml lost the manifest-freshness step")
