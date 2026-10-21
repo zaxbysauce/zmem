@@ -21,9 +21,26 @@ Python 3.11, stdlib only, ASCII-only stdout/stderr.
 
 Usage:
   python ingest_harvest.py <harvest.json> [--source-ref REF] [--store PATH]
+      [--trust {authoritative,untrusted-peer}]
+      [--allow-namespace NS ...] [--attribute-host HOST]
 
-Exit code: 0 if every row in the file was stored, deduped, or quarantined
-cleanly; 1 if any row was rejected (bad shape/enum) or failed to ingest.
+Issue #373: --trust untrusted-peer gives the harvest lane the SAME trust
+boundary ingest-jsonl got in issue #282 (storelib.sync.IngestTrustPolicy /
+apply_trust_policy): every namespace is gated against --allow-namespace
+(refusals counted as namespace_refused, never fatal), row-claimed signal
+grounding is demoted to a claimed_signal tag (the store derives taint and
+confidence from the demoted signal), row-declared host:/agent: attribution
+tags are stripped under the #381-normalized tokenizer with only the caller's
+--attribute-host stamped, and provenance is caller-derived (--source-ref or
+the adapter's own session:harvest-<stem> default — a row's own source_ref is
+a claim and never wins in peer mode). Default 'authoritative' keeps the
+pre-#373 behavior byte-identically.
+
+Exit code: 0 if every row in the file was stored, deduped, quarantined, or
+(peer mode) namespace-refused cleanly; 1 if any row was rejected (bad
+shape/enum) or failed to ingest; 2 for flag-contract violations (peer mode
+without --allow-namespace, invalid namespace grammar, --attribute-host
+outside peer mode).
 """
 
 from __future__ import annotations
@@ -46,13 +63,22 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "memory" / "s
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 try:
-    from schema_meta import ALLOWED_TYPES, ALLOWED_SIGNALS, MAX_CONTENT_CHARS  # noqa: F401
+    from schema_meta import ALLOWED_TYPES, ALLOWED_SIGNALS, MAX_CONTENT_CHARS, is_valid_namespace  # noqa: F401
 except ImportError:
     # Defensive fallback (should not happen in a normal checkout): keep the
     # historical literals so a broken import never silently disables validation.
     ALLOWED_TYPES = ("fact", "lesson", "convention", "preference")
     ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
     MAX_CONTENT_CHARS = 65536
+
+    def is_valid_namespace(value):  # noqa: F811 - degraded fallback only
+        """Grammar floor for the degraded-import case: scoped prefix or the
+        canonical global namespace (schema_meta stays the single source)."""
+        return isinstance(value, str) and (
+            value == "user:global" or (
+                ":" in value and value.split(":", 1)[0] in (
+                    "project", "user", "fleet", "host", "agent", "domain")
+                and value.split(":", 1)[1].strip() != ""))
 
 
 def _ascii(value: object) -> str:
@@ -210,6 +236,31 @@ def main() -> int:
              "(default: resolve relative to this script's repo layout, "
              "<repo>/skills/memory/scripts/store.py)",
     )
+    parser.add_argument(
+        "--trust", default="authoritative",
+        choices=["authoritative", "untrusted-peer"],
+        help="issue #373: peer mode clamps every trust-bearing field a "
+             "harvest row could self-declare (signal grounding, "
+             "attribution, provenance) and gates every namespace against "
+             "--allow-namespace, exactly like ingest-jsonl's peer mode "
+             "(issue #282). Default 'authoritative' keeps the pre-#373 "
+             "behavior byte-identically.",
+    )
+    parser.add_argument(
+        "--allow-namespace", dest="allow_namespace", action="append",
+        default=[], metavar="NS",
+        help="peer mode only: namespaces this harvest may write (repeatable). "
+             "Rows outside the list are refused and counted as "
+             "namespace_refused in the summary (counted, never fatal).",
+    )
+    parser.add_argument(
+        "--attribute-host", dest="attribute_host", default=None,
+        help="peer mode only: stamp host:<value> on every ingested row's "
+             "tags (row-carried host:/agent: tags are stripped); with "
+             "--source-ref the caller's ref wins, otherwise each row's "
+             "source_ref is stamped peer:<value> (an explicit --source-ref "
+             "overrides the stamp).",
+    )
     args = parser.parse_args()
 
     harvest_path = Path(args.harvest_file)
@@ -252,11 +303,42 @@ def main() -> int:
 
     source_ref = args.source_ref or f"session:harvest-{harvest_path.stem}"
 
+    trust_policy = None
+    apply_trust_policy = None
+    if args.trust == "untrusted-peer":
+        # Flag contract mirrors store.py's ingest-jsonl validation
+        # (storelib/cli.py, issue #282) so both importers reject the same
+        # misuse with the same exit code.
+        if not args.allow_namespace:
+            parser.error(
+                "--trust untrusted-peer requires at least one "
+                "--allow-namespace (a peer harvest must be scoped; refusing "
+                "everything silently is not an import)")
+        for _ns in args.allow_namespace:
+            if not is_valid_namespace(_ns):
+                parser.error(
+                    "--allow-namespace values must be namespaces the store "
+                    "itself admits (scoped, e.g. project:foo or host:box), "
+                    f"got {_ns!r}")
+        # Lazy import: the default (authoritative) run stays stdlib-only at
+        # startup; storelib.sync has no import cycle and the scripts dir is
+        # already on sys.path (schema_meta import above).
+        from storelib.sync import IngestTrustPolicy, apply_trust_policy
+        trust_policy = IngestTrustPolicy(
+            allowed_namespaces=args.allow_namespace,
+            attribute_host=args.attribute_host)
+    elif args.attribute_host:
+        parser.error(
+            "--attribute-host only applies to --trust untrusted-peer "
+            "(issue #373)")
+
     total = len(data)
     stored = 0
     deduped = 0
     quarantined = 0
     failed = 0
+    namespace_refused = 0
+    trust_clamped = 0
 
     for i, raw_row in enumerate(data, start=1):
         row, err = validate_row(raw_row, i)
@@ -264,6 +346,28 @@ def main() -> int:
             _print(f"[ingest-harvest] REJECTED: {err}", err=True)
             failed += 1
             continue
+
+        if trust_policy is not None:
+            # Issue #373: the namespace allow-list rejects (never clamps) —
+            # counted, not fatal, exactly like ingest-jsonl's legacy peer
+            # lane. The row dies here: nothing of it is forwarded.
+            if not trust_policy.namespace_allowed(row["namespace"]):
+                namespace_refused += 1
+                _print(
+                    f"[ingest-harvest] NAMESPACE-REFUSED row {i}: "
+                    f"[{row['namespace']}] {row['type']}", err=True)
+                continue
+            # Provenance is caller-derived (issue #373, mirroring the lanes):
+            # apply_trust_policy never writes caller_source_ref into the row
+            # (it only skips its own stamp), so the adapter applies the
+            # caller ref itself. `source_ref` here is --source-ref or the
+            # adapter's own session:harvest-<stem> default — both are
+            # locally derived, never row-claimed, so both are trusted input
+            # and a row's own source_ref can never win in peer mode.
+            row["source_ref"] = source_ref
+            if apply_trust_policy(row, trust_policy,
+                                  caller_source_ref=source_ref):
+                trust_clamped += 1
 
         status, message = ingest_row(store_py, row, source_ref)
         if status == "stored":
@@ -282,9 +386,16 @@ def main() -> int:
             failed += 1
             _print(f"[ingest-harvest] FAILED row {i}: {message}", err=True)
 
-    _print(f"[ingest-harvest] summary: {total} row(s) in file, "
-           f"{stored} stored, {deduped} deduped, "
-           f"{quarantined} quarantined, {failed} failed/rejected")
+    if trust_policy is not None:
+        _print(f"[ingest-harvest] summary: {total} row(s) in file, "
+               f"{stored} stored, {deduped} deduped, "
+               f"{quarantined} quarantined, {failed} failed/rejected, "
+               f"namespace_refused={namespace_refused}, "
+               f"trust_clamped={trust_clamped}")
+    else:
+        _print(f"[ingest-harvest] summary: {total} row(s) in file, "
+               f"{stored} stored, {deduped} deduped, "
+               f"{quarantined} quarantined, {failed} failed/rejected")
 
     return 1 if failed else 0
 

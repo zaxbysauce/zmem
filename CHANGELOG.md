@@ -5,6 +5,60 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.115.0] - 2026-10-21
+
+### Security (peer trust boundary)
+
+- **Peer attribution strip now runs under the consumer's tokenizer** (issue
+  #381). The untrusted-peer tag strip in `storelib/sync.py` split on commas
+  only and matched `host:`/`agent:` case-sensitively, while entity
+  extraction splits on comma/semicolon/whitespace and folds prefix case —
+  so a peer row carrying `Host:forged`, `AGENT:ghost` or `x;host:forged`
+  kept its forged attribution and minted first-class host entities from
+  claims the strip existed to remove. The grammar now lives in one place
+  (`storelib.entity.split_tag_tokens`, exported and used by both the
+  extractor and the strip), prefixes compare case-insensitively, the
+  `--attribute-host` stamp is idempotent case-insensitively, and no
+  attribution token can survive in any case/delimiter form.
+
+### Fixed (peer ingest lane parity, issue #378)
+
+- **Same-file lineage pointers survive both lanes.** `resolvable_ids` was a
+  pre-batch store snapshot in both lanes, so a peer row's `update_of`/
+  `merged_from` pointing at a row landing earlier in the SAME file was
+  over-cleared. The strict lane now also resolves against ids this file
+  AUTHORS (staged minus pre-existing — authored ids cannot collide with a
+  disallowed-namespace store row via a decoy staged claim), and the legacy
+  lane accumulates landed ids as the file streams. Memory pointers now
+  resolve like the episode-summary pass always did.
+- **The legacy peer lane scans the ORIGINAL row-carried source_ref** under
+  `--source-ref` (issue #378 ADV5). The caller override is no longer applied
+  before the capture-policy scan, so a secret-like original ref can no
+  longer be masked by a clean `--source-ref` on the legacy lane while the
+  strict lane refuses it. A quarantined refusal now records the PRE-policy
+  row (the original ref the refusal is about) in the ledger, as the in-code
+  contract always promised.
+- **One shared peer link-collection rule.** Both lanes' `_links` collection
+  sites route through a single `_peer_link_outcome_admitted` predicate (the
+  landed set: `added`/`tombstoned`) instead of two divergent inline
+  conditions, so the admission rule cannot drift apart again.
+
+### Added (harvest trust mode, issue #373)
+
+- **`scripts/ingest_harvest.py --trust untrusted-peer`** gives the harvest
+  importer the same trust boundary `ingest-jsonl` got in issue #282:
+  `--allow-namespace` gates every row (refusals counted as
+  `namespace_refused=` in the summary, never fatal), row-claimed signal
+  grounding is demoted to a `claimed_signal:` tag (the store derives taint
+  and confidence from the demoted signal, so a harvest claiming `test`
+  lands untrusted at peer-grade confidence), row-declared `host:`/`agent:`
+  attribution is stripped under the #381-normalized tokenizer with only
+  `--attribute-host` stamped, and provenance is caller-derived — a row's
+  own `source_ref` never wins in peer mode. Flag-contract violations
+  (peer mode without `--allow-namespace`, invalid namespace grammar,
+  `--attribute-host` outside peer mode) exit 2, mirroring `ingest-jsonl`.
+  Default `--trust authoritative` behavior is byte-identical to 0.114.0.
+
 ## [0.114.0] - 2026-10-20
 
 ### Fixed (release integrity)

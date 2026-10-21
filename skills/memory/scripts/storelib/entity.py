@@ -131,6 +131,25 @@ _ENTITY_TAG_RE = re.compile(
 # a separator or a drive prefix is a location, not an identity.
 _PATHISH_RE = re.compile(r"[\\/]|^[A-Za-z]:|://|^www\.")
 
+# The tag-string tokenizer, exported for every consumer that must agree on
+# what a "tag token" is (issue #381): the peer attribution strip in
+# storelib.sync decides tokenhood under THIS grammar — comma, semicolon and
+# whitespace separators — because it is the grammar this module's consumers
+# use to read the stored tags back. A private second tokenizer there drifted
+# (comma-only, case-sensitive) and let `Host:evil` / `x;host:evil` survive
+# the strip and mint host entities here. One grammar, every consumer.
+TAG_TOKEN_SPLIT_RE = re.compile(r"[,;\s]+")
+
+
+def split_tag_tokens(tags: str) -> list[str]:
+    """Split a tag string into its tokens under the extractor's grammar.
+
+    Empty segments (consecutive separators, leading/trailing separators)
+    yield no tokens. Pure helper: no normalization, no filtering — callers
+    decide what the tokens mean.
+    """
+    return [t for t in TAG_TOKEN_SPLIT_RE.split(tags or "") if t]
+
 
 def _eligible_name(name: str) -> bool:
     """Can `name` (raw, un-normalized) become an entity/alias at all?
@@ -188,7 +207,7 @@ def extract_entities(
     #    is classified (issue #176 — previously always `other`; an explicit
     #    typed prefix here stays authoritative). (The explicit entity: form
     #    was consumed above.)
-    for tok in re.split(r"[,;\s]+", tags or ""):
+    for tok in split_tag_tokens(tags):
         if not tok or tok.lower().startswith("entity:"):
             continue
         if ":" in tok:

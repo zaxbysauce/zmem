@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import embed_profiles as _profiles
-from storelib.entity import link_memory_entities, relink_memory
+from storelib.entity import link_memory_entities, relink_memory, split_tag_tokens
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.state_expiry import validate_inject_until
@@ -905,14 +905,25 @@ def apply_trust_policy(row: dict, policy, *, caller_source_ref=None,
     # attribution tags: caller-derived, never row-derived. With
     # --attribute-host the caller's value is stamped; without it the row's
     # host:/agent: claims are still stripped (an unattributed peer row is
-    # honest; a self-attributed one is not).
-    tags = [t for t in (row.get("tags") or "").split(",") if t.strip()]
-    kept = [t for t in tags
-            if not t.strip().startswith(_PEER_TAG_PREFIXES)]
-    if len(kept) != len(tags) or (policy.attribute_host
-                                  and f"host:{policy.attribute_host}" not in kept):
-        if policy.attribute_host:
-            kept.append(f"host:{policy.attribute_host}")
+    # honest; a self-attributed one is not). Issue #381: tokenhood is decided
+    # by the CONSUMER's tokenizer (storelib.entity.split_tag_tokens — comma,
+    # semicolon and whitespace separators) with case-insensitive prefixes,
+    # because that is the grammar entity extraction reads the stored tags
+    # back under; a private comma-only case-sensitive split here let
+    # `Host:evil` / `x;host:evil` survive and mint host entities. The stored
+    # string is rewritten (normalized to comma joins) only when a token was
+    # actually stripped or the stamp was added, preserving trust_clamped's
+    # "the policy altered this row" semantics.
+    toks = split_tag_tokens(row.get("tags") or "")
+    kept = [t for t in toks
+            if not t.lower().startswith(_PEER_TAG_PREFIXES)]
+    stamped = False
+    if policy.attribute_host:
+        stamp = f"host:{policy.attribute_host}"
+        if not any(t.lower() == stamp.lower() for t in kept):
+            kept.append(stamp)
+            stamped = True
+    if len(kept) != len(toks) or stamped:
         row["tags"] = ",".join(kept)
         changed = True
     # F22 (final-critic round 1): in-row lineage pointers are claims, not
@@ -940,6 +951,24 @@ def apply_trust_policy(row: dict, policy, *, caller_source_ref=None,
             row["source_ref"] = _stamped
             changed = True
     return changed
+
+
+def _peer_link_outcome_admitted(outcome: str) -> bool:
+    """Issue #282 F14 / #378: the SINGLE rule deciding which ingest outcomes
+    a PEER row's ``_links`` carriage may be collected from. Peer mode collects
+    edges only from rows that LANDED as this import's own rows:
+    skipped/deduped/purged_denied ids either never exist locally or were not
+    authored here (an id-collision row must not graft the victim's edges),
+    and capture-refusal outcomes (capture_refused/quarantined/
+    quarantine_failed/tombstone_refused) mean the row did not land at all.
+    LANDED SET, not an exclusion list — the exclusion form admitted
+    quarantined/capture_refused edges (reachable via _ingest_row's
+    post-redaction size-cap re-evaluation). Authoritative mode keeps the
+    historical collect-on-every-outcome-except-purged contract (this helper
+    is peer-only; both lanes' collection sites route through it so the rule
+    cannot drift apart again).
+    """
+    return outcome in ("added", "tombstoned")
 
 
 def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
@@ -1982,6 +2011,23 @@ def _strict_ingest_staged(
             r[0] for r in conn.execute(
                 "SELECT id, namespace FROM memory").fetchall()
             if trust_policy.namespace_allowed(r[1]))
+        # Issue #378 ADV1/ADV2: a lineage pointer may also resolve against
+        # rows THIS file authors. AUTHORED ids only (strict_peer_authored =
+        # staged minus pre-existing): unioning every staged id would let a
+        # decoy row CLAIMING an allowed namespace make a disallowed-namespace
+        # store id "resolvable" via id collision (the staged map holds the
+        # claimed namespace, not the store's) — re-opening the F22
+        # foreign-lineage path. Authored ids cannot collide by construction,
+        # and every staged row's namespace was gate-checked fatally above,
+        # so they sit inside the allow-list. Implementation-review round 1:
+        # PURGED ids are subtracted too — a staged id on the purged deny-list
+        # is not in `memory` (so it slips past pre_existing) but never lands
+        # at apply time (purged_denied), which would leave a kept pointer to
+        # a row that was never created. This matches the episode-summary
+        # rule below (staged consultation), so memory pointers and episode
+        # pointers resolve the same way.
+        _peer_resolvable = _peer_resolvable | (
+            strict_peer_authored - _purged_ids(conn))
         for table, obj in rows:
             if table == "memory":
                 if obj.get("superseded_at"):
@@ -2150,12 +2196,15 @@ def _strict_ingest_staged(
             if (obj.get("_links")
                     and outcome != "purged_denied"
                     and (trust_policy is None
-                         or outcome not in ("skipped", "deduped"))):
+                         or _peer_link_outcome_admitted(outcome))):
                 # Issue #282: PEER mode collects edges only from rows that
                 # landed; skipped/deduped ids never exist locally (an
                 # id-collision row must not graft the victim's edges).
-                # Authoritative keeps the historical collect-on-every-
-                # outcome-except-purged contract byte-identically (plan F14).
+                # Issue #378: the admission rule is the shared
+                # _peer_link_outcome_admitted predicate (both lanes route
+                # through it). Authoritative keeps the historical collect-
+                # on-every-outcome-except-purged contract byte-identically
+                # (plan F14).
                 pending_links.append((obj["id"], obj["_links"]))
 
         for table, obj in rows:
@@ -2650,6 +2699,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 # caller override below carries the same warn first.
                 if not source_ref:
                     warn_reserved_source_ref(obj.get("source_ref"))
+            # Issue #378 ADV5: keep the ORIGINAL row-carried ref for the
+            # peer-mode capture scan below — the caller --source-ref override
+            # (applied next) must never mask what the row itself claims as
+            # its origin. The strict lane already evaluates the original
+            # (final-critic F3: a stamp must never mask a refusal); this
+            # brings the legacy lane to the same rule.
+            _row_ref_original = obj.get("source_ref")
             if source_ref:
                 # --source-ref attributes this whole import batch to one place of
                 # origin, overriding whatever source_ref the row carried in --
@@ -2663,7 +2719,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 if _peer_resolvable is None:
                     # F22: ids whose CURRENT namespace sits inside the
                     # allow-list (lineage pointers may only reference these).
-                    _peer_resolvable = frozenset(
+                    # Issue #378 ADV1/ADV2: the set is MUTABLE — rows this
+                    # file lands are added at the landed-outcome branch below
+                    # (their namespaces were allow-list-gated above), so a
+                    # row landing EARLIER in the file is resolvable for later
+                    # rows' update_of/merged_from, matching the strict lane's
+                    # authored union and the episode pass's live re-query.
+                    _peer_resolvable = set(
                         r[0] for r in conn.execute(
                             "SELECT id, namespace FROM memory"
                         ).fetchall()
@@ -2687,7 +2749,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     if _existing_row is None and not _is_purged(conn, obj["id"]):
                         apply_capture_policy(
                             content=obj.get("content") or "",
-                            source_ref=obj.get("source_ref") or "",
+                            source_ref=_row_ref_original or "",
                             tags=obj.get("tags") or "",
                             capture_mode=capture_mode,
                         )
@@ -2695,6 +2757,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     if (exc.reason in QUARANTINE_REASONS
                             and _normalize_capture_mode(capture_mode) == "auto"):
                         try:
+                            # Issue #378 ADV5: the ledger entry keeps the
+                            # PRE-policy row (the contract above — "the
+                            # original is what was refused"), so restore the
+                            # original ref the refusal is about before the
+                            # quarantine snapshot, instead of recording the
+                            # clean caller override.
+                            obj["source_ref"] = _row_ref_original or ""
                             quarantine_import_row(
                                 os.path.dirname(STORE_PATH), obj,
                                 reason=exc.reason)
@@ -2740,6 +2809,10 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     # Authorship record for the side-record gates below: a peer
                     # is never authoritative over a row it did not author.
                     peer_ingest_state["landed"].add(obj["id"])
+                    # Issue #378 ADV1/ADV2: a landed row becomes RESOLVABLE
+                    # for later rows in this same file (its namespace passed
+                    # the allow-list gate at the top of the peer block).
+                    _peer_resolvable.add(obj["id"])
             elif outcome == "tombstoned":
                 tombstoned += 1
             elif outcome == "tombstone_refused":
@@ -2767,9 +2840,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
             # Issue #282 F14: peer mode collects edges ONLY from rows that
             # actually landed this run (skipped/refused/deduped ids never
             # exist locally, and an id-collision row must not graft the
-            # victim's edges). Authoritative mode keeps the historical
+            # victim's edges). Issue #378: the admission rule is the shared
+            # _peer_link_outcome_admitted predicate (both lanes route
+            # through it). Authoritative mode keeps the historical
             # collect-on-every-outcome semantics byte-identically.
-            if row_links and (trust_policy is None or outcome == "added"):
+            if row_links and (trust_policy is None
+                              or _peer_link_outcome_admitted(outcome)):
                 pending_links.append((obj["id"], row_links))
     except (UnicodeDecodeError, OSError) as e:
         # Invalid UTF-8 can now surface mid-iteration (streaming, not a single

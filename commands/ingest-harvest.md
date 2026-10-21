@@ -100,6 +100,31 @@ omitted, `ingest_harvest.py` defaults it to `session:harvest-<file-stem>`
 explicitly with a batch tag that actually identifies the source session,
 since the default is only as meaningful as the file name it derives from.
 
+### Untrusted-peer mode (issue #373)
+
+When the harvest comes from a machine or session you do NOT fully trust
+(a peer box's closeout, a remote agent's self-assessment), ingest it behind
+the same trust boundary `ingest-jsonl` uses (issue #282):
+
+```bash
+"$P" "$H" <harvest-file> \
+  --trust untrusted-peer \
+  --allow-namespace "project:<owner>/<repo>" \
+  --attribute-host "<originating-host>" \
+  --source-ref "session:<batch-tag>" \
+  --store "$S"
+```
+
+Peer mode clamps every trust-bearing field a row could self-declare
+(signal grounding is demoted to a `claimed_signal:` tag, so taint and
+confidence stay peer-grade), strips row-declared `host:`/`agent:`
+attribution (only `--attribute-host` is stamped), makes the caller's
+`--source-ref` win over any row-carried ref, and refuses every namespace
+outside `--allow-namespace` (counted as `namespace_refused=` in the summary,
+never fatal). Flag-contract violations exit 2. Default mode
+(`--trust authoritative`, the pre-#373 behavior) trusts the harvest file —
+use it only for your own exports or files you curated row by row.
+
 Alternatively, for a small number of survivors, call `"$P" "$S" add
 --namespace ... --type ... --content ... --tags ... --signal ... --source-ref
 "session:<batch-tag>"` per item directly — either path is fine as long as
