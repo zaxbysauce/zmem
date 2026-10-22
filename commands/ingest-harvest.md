@@ -100,6 +100,40 @@ omitted, `ingest_harvest.py` defaults it to `session:harvest-<file-stem>`
 explicitly with a batch tag that actually identifies the source session,
 since the default is only as meaningful as the file name it derives from.
 
+### Untrusted-peer mode (issue #373)
+
+When the harvest comes from a machine or session you do NOT fully trust
+(a peer box's closeout, a remote agent's self-assessment), ingest it behind
+the same trust boundary `ingest-jsonl` uses (issue #282):
+
+```bash
+"$P" "$H" <harvest-file> \
+  --trust untrusted-peer \
+  --allow-namespace "project:<owner>/<repo>" \
+  --attribute-host "<originating-host>" \
+  --source-ref "session:<batch-tag>" \
+  --store "$S"
+```
+
+Peer mode clamps every trust-bearing field a row could self-declare
+(signal grounding is demoted to a `claimed_signal:` tag, so taint and
+confidence stay peer-grade — note: confidence 0.2 sits below the 0.25
+default-recall floor, so peer rows surface via `--min-confidence` or
+keyword search), strips row-declared `host:`/`agent:` attribution (only
+`--attribute-host` is stamped; peer provenance is always the caller's
+`--source-ref` or the `session:harvest-<stem>` default), makes the caller's
+`--source-ref` win over any row-carried ref, and refuses every namespace
+outside `--allow-namespace` (counted as `namespace_refused=` in the summary,
+never fatal; the allow-list is EXACT string match, not a prefix — list the
+precise namespaces your rows use). Peer rows also carry `--no-dedup`, so a
+peer row never folds into (and mutates) one of your existing local rows.
+Flag-contract violations exit 2 at parse time — before the harvest file is
+read. Default mode (`--trust authoritative`, the pre-#373 behavior) trusts
+the harvest file — use it only for your own exports or files you curated
+row by row; note that in default mode a row's own `source_ref` still wins
+over `--source-ref` (the long-standing precedence the memory SKILL.md
+documents).
+
 Alternatively, for a small number of survivors, call `"$P" "$S" add
 --namespace ... --type ... --content ... --tags ... --signal ... --source-ref
 "session:<batch-tag>"` per item directly — either path is fine as long as
@@ -117,8 +151,10 @@ report plainly:
 - **Dropped** — count, and for each, why (already known, too narrow, one-off,
   already in docs, etc.).
 - Any **superseded** entries and what replaced them.
-- Confirm the script's summary line and exit code (0 = all surviving rows
-  ingested cleanly; 1 = at least one row failed — report which and why).
+- Confirm the script's summary line and exit code (0 = every row stored,
+  deduped, quarantined, or — in peer mode — namespace-refused cleanly;
+  1 = at least one row failed/was rejected, or a file-level error: missing
+  file, unreadable file, invalid JSON, or store.py not found).
 
 That report is the evidence the bar was applied on ingest, not just relayed
 from the remote session's own self-assessment.

@@ -1376,6 +1376,14 @@ def add_memory(
     # #179 (entity_card): lineage + card-refresh bypass.
     update_of: str | None = None,
     force_append: bool = False,
+    # PR #393 feedback (issue #373 peer harvest): the caller-driven dedup
+    # bypass. False (default) keeps dedup-on-write byte-identically; True
+    # skips the _detect_duplicate lookup so the row ALWAYS lands as its own
+    # row — the subprocess-boundary equivalent of the ingest-jsonl peer
+    # lane's in-process _peer_no_dedup marker, which exists because "the
+    # merge READS the keeper and WRITES to it (max-confidence lift, tag
+    # union, retrieval_count bump), and no field clamp can undo those".
+    skip_dedup: bool = False,
     # #178 (event + memory_occurrence): the occurrence triple.
     occurred_start: str = "",
     occurred_end: str = "",
@@ -1492,10 +1500,13 @@ def add_memory(
         # dedup-on-write semantics to incoming rows without duplicating this logic.
         _warn_fake_active_once()
         existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
-        if force_append:
+        if force_append or skip_dedup:
             # #179: the card refresh path appends unconditionally — dedup
             # would fold the replacement card into the live card it is
             # replacing (the SHA-256 no-op check already ran above it).
+            # PR #393: skip_dedup is the peer-ingest bypass — an untrusted
+            # caller-driven row must never mutate a pre-existing local
+            # keeper through the merge path.
             existing = None
 
         # v11 (issue #61, 6.2): similarity cannot distinguish "always X" from
