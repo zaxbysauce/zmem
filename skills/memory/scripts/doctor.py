@@ -2943,6 +2943,91 @@ def _check_orphan_stores(
     return checks
 
 
+def _check_fleet_remote(repo_root: Path, resolved_store: Path) -> dict:
+    """Issue #287 (Workstream T PR 8): the per-machine broker surface.
+
+    Runs only when fleet remote mode is configured (``ZMEM_REMOTE_URL`` or
+    the Hermes-side ``ZMEM_MCP_URL``): verifies the fleet package and the
+    lifted shared transport are present/importable, and surfaces the LAST
+    ``hub-unreachable`` line from the broker log so an unreachable hub is
+    observable from doctor, never silently collapsed into empty results.
+    """
+    import os
+
+    remote_url = (os.environ.get("ZMEM_REMOTE_URL", "")
+                  or os.environ.get("ZMEM_MCP_URL", "")).strip()
+    if not remote_url:
+        return _check(
+            "fleet-remote",
+            "skip",
+            "Fleet remote mode not configured (ZMEM_REMOTE_URL unset).",
+        )
+    problems: list[str] = []
+    details: dict[str, object] = {"remote_url": remote_url}
+
+    fleet_dir = repo_root / "skills" / "memory" / "scripts" / "fleet"
+    expected = ("__init__.py", "transport.py", "broker.py", "broker_cli.py")
+    for name in expected:
+        if not (fleet_dir / name).is_file():
+            problems.append(f"fleet/{name} missing")
+    transport_path = fleet_dir / "transport.py"
+    if transport_path.is_file():
+        try:
+            text = transport_path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if "hub-unreachable" not in text:
+            problems.append(
+                "fleet/transport.py lacks the distinct hub-unreachable reason")
+    # The hermes shim must still load (AC6 keeps the historical path).
+    shim = repo_root / "hermes-plugin" / "transport.py"
+    if shim.is_file():
+        try:
+            text = shim.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if "fleet" not in text:
+            problems.append(
+                "hermes-plugin/transport.py no longer re-exports the fleet "
+                "transport")
+    # Surface the last broker-log unreachable line (observability, not a
+    # failure — an unreachable hub is a legitimate transient state).
+    try:
+        log_path = Path(resolved_store).parent / "broker-log.jsonl"
+        lines = [
+            l for l in log_path.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            if "hub-unreachable" in l
+        ]
+    except OSError:
+        lines = []
+    if lines:
+        details["last_hub_unreachable"] = lines[-1][:200]
+        # Report the record's actual AGE, not an unqualified "recent" — a
+        # months-old line otherwise reads as an active outage signal.
+        try:
+            last_ts = int(json.loads(lines[-1]).get("ts", 0))
+            age_s = max(0, int(time.time()) - last_ts)
+            details["last_hub_unreachable_age_s"] = age_s
+        except (ValueError, TypeError, AttributeError):
+            pass
+    if problems:
+        return _check("fleet-remote", "fail",
+                      "; ".join(problems), details=details)
+    age_note = ""
+    if lines and isinstance(
+            details.get("last_hub_unreachable_age_s"), int):
+        age_note = (f" Last hub-unreachable record is "
+                    f"{details['last_hub_unreachable_age_s']}s old"
+                    " — check the hub if it is fresh.")
+    return _check(
+        "fleet-remote",
+        "pass",
+        "Fleet broker present; remote mode configured." + age_note,
+        details=details,
+    )
+
+
 def _check_hermes_plugin(repo_root: Path) -> dict:
     """Issue #71 B: Hermes plugin surface check (the issue's `hermes_plugin`
     doctor check, analogous to the OpenCode check in #66).
@@ -4641,6 +4726,9 @@ def build_report(
     # Issue #71 B: Hermes plugin surface — manifest parity, provider/hooks
     # files, MCP server importability, and remote-mode config when set.
     checks.append(_check_hermes_plugin(repo_root))
+    # Issue #287 (Workstream T PR 8): the per-machine broker surface when
+    # fleet remote mode is configured.
+    checks.append(_check_fleet_remote(repo_root, resolved_store))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
     # Issue #63, 8.4: store-side embedding health (profile/dim/coverage).

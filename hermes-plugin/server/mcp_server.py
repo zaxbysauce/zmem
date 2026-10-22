@@ -1960,6 +1960,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "delivery-ledger",
             "prefetch-reservations",
             "evidence-paging",
+            # issue #287 (Workstream T PR 8): the broker's hub surface.
+            "stop-evidence",
+            "tier0",
         ]
         return {
             "protocol": _PROTOCOL_MAJOR,
@@ -3015,6 +3018,184 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if not isinstance(parsed, dict) or "committed" not in parsed:
             return _error("incomplete prefetch-ack result from store.py")
         return parsed
+
+    @mcp.tool()
+    async def stop_evidence(
+        namespace: str,
+        session_id: str = "",
+        agent_id: Optional[str] = None,
+        count: int = 0,
+        details: Optional[list] = None,
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """Record bounded Stop/SubagentStop failure EVIDENCE from a remote
+        broker (issue #287, Workstream T PR 8).
+
+        The client (fleet broker) extracts failed tool calls from its OWN
+        transcript, caps and redacts them (secrets AND paths), and sends
+        them here as DATA. The hub NEVER opens a client-supplied path: any
+        string in the payload that is path-shaped (drive root, absolute or
+        UNC root, a backslash, or a ``..`` segment) is refused BEFORE any
+        store write with ``{"ok": False, "error": "path-shaped-field",
+        "field": <name>}``. Accepted evidence is namespace-guarded like
+        every mutating tool and recorded as a capture-policy-``auto``
+        lesson row (network writes force auto — the #288 AC6 intent
+        contract) with a ``session:<id>`` source-ref dedup, exactly the
+        write the local reflect hook performs for a directly-connected
+        harness.
+        """
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+
+        def _field_strings() -> list[tuple[str, str]]:
+            out = [("namespace", namespace or ""),
+                   ("session_id", session_id or ""),
+                   ("agent_id", agent_id or "")]
+            details_list = details or []
+            if not isinstance(details_list, list):
+                details_list = [str(details_list)]
+            for idx, detail in enumerate(details_list):
+                name = f"details[{idx}]"
+                if isinstance(detail, dict):
+                    for key, value in detail.items():
+                        if isinstance(key, str):
+                            out.append((f"{name}.{key}", key))
+                        if isinstance(value, str):
+                            out.append((f"{name}.{key}", value))
+                elif isinstance(detail, str):
+                    out.append((name, detail))
+            return out
+
+        import re as _re
+        _drive_root = _re.compile(r"^[A-Za-z]:[\\/]")
+        _abs_root = _re.compile(r"^[\\/]")
+
+        def _is_path_shaped(value: str) -> bool:
+            if _drive_root.match(value) or _abs_root.match(value):
+                return True
+            if "\\" in value:
+                return True
+            if value == ".." or "/../" in value or "\\..\\" in value:
+                return True
+            return False
+
+        for field, value in _field_strings():
+            if value and _is_path_shaped(value):
+                return {
+                    "ok": False,
+                    "error": "path-shaped-field",
+                    "field": field,
+                }
+        ns = (namespace or "").strip()
+        if not ns:
+            ns = (os.environ.get("ZMEM_MCP_DEFAULT_NS") or "").strip() \
+                or "user:global"
+        if not _valid_mcp_namespace(ns):
+            return _error("namespace is not valid")
+        denied = _guard_namespace(ns)
+        if denied:
+            return {"ok": False, **denied}
+        sid = (session_id or "").strip()
+        aid = (agent_id or "").strip()
+        bounded: list[dict[str, str]] = []
+        for detail in (details or [])[:5]:
+            if isinstance(detail, dict):
+                tool = str(detail.get("tool", "?"))[:100]
+                error_text = str(detail.get("error", ""))[:200]
+                bounded.append({"tool": tool, "error": error_text})
+            elif isinstance(detail, str):
+                bounded.append({"tool": "?", "error": detail[:200]})
+        total = count if isinstance(count, int) and count >= 0 else len(bounded)
+        source_ref = f"session:{sid}" + (f":{aid}" if aid else "")
+        summary_parts = [f"{d['tool']}: {d['error']}" for d in bounded]
+        content = "Remote session reported {} failed tool call(s).".format(
+            total)
+        if summary_parts:
+            content += " Details: " + "; ".join(summary_parts)[:1000]
+        exists = await _run_store_async(
+            ["source-exists", "--namespace", ns,
+             "--source-ref", source_ref, "--json"],
+            deadline=deadline, pool="read")
+        dedup = "new"
+        if isinstance(exists, dict) and exists.get("exists") is True:
+            dedup = "known"
+        else:
+            add_args = [
+                "add", "--type", "lesson",
+                "--content", content,
+                "--namespace", ns,
+                "--signal", "none",
+                "--taint", "untrusted_tool",
+                "--capture-mode", "auto",
+                "--source-ref", source_ref,
+                "--json",
+            ]
+            add_result = await _run_store_async(
+                add_args, deadline=deadline, pool="write")
+            # A failed or overloaded store write must not be announced as
+            # recorded — the broker would inject "captured for reflection"
+            # while the hub holds nothing, and no log anywhere would say so.
+            if not (isinstance(add_result, dict)
+                    and add_result.get("ok") is True):
+                return {"ok": False, "error": "store-write-failed"}
+        return {"ok": True, "recorded": True, "dedup": dedup}
+
+    @mcp.tool()
+    async def tier0_get(
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """Serve the HUB machine's canonical user-level core.md (issue #287).
+
+        In remote mode the hub owns the canonical Tier-0 ``core.md``: the
+        broker fetches this at SessionStart, caches it at
+        ``~/.zmem/broker/core.md`` with its revision, and injects the cached
+        copy while the hub is unreachable. The content is user-level
+        global, so it is served ONLY under the same scope rule every other
+        read enforces: a scoped token may read user:global content only
+        when user:global is in its allow-list (``_include_global_allowed``,
+        the :1826 invariant) — a peer token denied user:global cannot lift
+        the hub's whole instruction file. The content is bounded to the
+        same tier-0 size thresholds doctor enforces so a runaway file
+        cannot ride the wire.
+        """
+        if not _include_global_allowed():
+            return _scoped_evidence_denial(
+                "user:global",
+                "tier0 content is user-level global; user:global is not in "
+                "this token's namespace allow-list")
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+        import hashlib as _hashlib
+        override = (os.environ.get("ZMEM_CORE_MD") or "").strip()
+        if override:
+            core_path = Path(override).expanduser()
+        else:
+            store_dir = (_authoritative_store_path()
+                         or _fallback_store_path()).expanduser().parent
+            core_path = store_dir / "core.md"
+        try:
+            content = core_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {"ok": False, "error": "no-core-md"}
+        # Bound the served body (the doctor tier-0 guard treats 64 KiB as
+        # the hard ceiling; serve the head, never a runaway file).
+        if len(content) > 65536:
+            content = content[:65536]
+        revision = _hashlib.sha256(
+            content.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return {"ok": True, "revision": revision, "content": content}
 
     @mcp.tool()
     async def session_start(

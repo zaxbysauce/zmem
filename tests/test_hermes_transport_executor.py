@@ -202,7 +202,10 @@ class RealExecutorDeadlineTest(unittest.TestCase):
             "stash pop", namespace="project:parity", session_id="s",
             moment="user_prompt", ops_tokens=[])
         elapsed = time.monotonic() - started
-        self.assertEqual(envelope["reason"], "empty-pool")
+        # issue #287 (AC4): a deadline hit means the hub was not reached in
+        # budget — the distinct "hub-unreachable" reason, never the honest
+        # empty-store "empty-pool" (pre-#287 this pinned empty-pool).
+        self.assertEqual(envelope["reason"], "hub-unreachable")
         self.assertEqual(envelope["rendered"], "")
         self.assertTrue(cancelled_flag.wait(timeout=10),
                         "deadline must cancel the MCP coroutine")
