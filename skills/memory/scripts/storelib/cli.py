@@ -1993,6 +1993,13 @@ def main():
                              "auto redacts likely secrets by default before writing")
     p_add.add_argument("--evidence", default=None,
                        help="comma-separated existing evidence ids to attach")
+    p_add.add_argument("--no-dedup", dest="no_dedup", action="store_true",
+                       help="skip dedup-on-write: the row always lands as its "
+                            "own row even when a near-identical memory exists "
+                            "(PR #393, issue #373: the caller-driven equivalent "
+                            "of the ingest-jsonl peer lane's no-fold marker — "
+                            "an untrusted import must never mutate a "
+                            "pre-existing local keeper through the merge path)")
     p_add.add_argument("--json", action="store_true",
                        help="print a structured write result (id, result, warnings) "
                             "as JSON on stdout instead of the human lines "
@@ -5273,6 +5280,7 @@ def main():
                         occurred_start=args.occurred_start,
                         occurred_end=args.occurred_end,
                         mentioned_at=args.mentioned_at,
+                        skip_dedup=getattr(args, "no_dedup", False),
                     )
                 finally:
                     if _human_out is not None:

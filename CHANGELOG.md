@@ -23,21 +23,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed (peer ingest lane parity, issue #378)
 
-- **Same-file lineage pointers survive both lanes.** `resolvable_ids` was a
-  pre-batch store snapshot in both lanes, so a peer row's `update_of`/
-  `merged_from` pointing at a row landing earlier in the SAME file was
-  over-cleared. The strict lane now also resolves against ids this file
-  AUTHORS (staged minus pre-existing — authored ids cannot collide with a
-  disallowed-namespace store row via a decoy staged claim), and the legacy
-  lane accumulates landed ids as the file streams. Memory pointers now
-  resolve like the episode-summary pass always did.
+- **Same-file lineage pointers survive both lanes** (targets landing
+  EARLIER in the file). `resolvable_ids` was a pre-batch store snapshot in
+  both lanes, so a peer row's `update_of`/`merged_from` pointing at a row
+  landing earlier in the SAME file was over-cleared. The strict lane now
+  also resolves against ids this file AUTHORS (staged minus pre-existing
+  minus purged — authored ids cannot collide with a disallowed-namespace
+  store row via a decoy staged claim), and the legacy lane accumulates
+  landed ids as the file streams. Disclosed residual (PR #393 review):
+  a FORWARD reference (child listed before its target) resolves in the
+  strict lane and is still cleared in the legacy lane.
+- **Peer-authored lineage cycles are cleared, not stored** (PR #393
+  review). The authored union initially let a peer row keep a
+  self-referential `update_of` or an A<->B pair — such rows landed and
+  `purge` then refused them forever ("cyclic update_of chain"), a
+  permanent store wedge. Every authored pointer edge that closes a cycle
+  (self-loops included) is now cleared before the clamp runs, in both
+  lanes, and the rows stay purgeable.
 - **The legacy peer lane scans the ORIGINAL row-carried source_ref** under
   `--source-ref` (issue #378 ADV5). The caller override is no longer applied
   before the capture-policy scan, so a secret-like original ref can no
   longer be masked by a clean `--source-ref` on the legacy lane while the
   strict lane refuses it. A quarantined refusal now records the PRE-policy
   row (the original ref the refusal is about) in the ledger, as the in-code
-  contract always promised.
+  contract always promised — with the restored ref REDACTED first, so the
+  0600 ledger never becomes a cleartext copy of the credential shape the
+  policy just refused (PR #393 review).
 - **One shared peer link-collection rule.** Both lanes' `_links` collection
   sites route through a single `_peer_link_outcome_admitted` predicate (the
   landed set: `added`/`tombstoned`) instead of two divergent inline
@@ -54,10 +65,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   lands untrusted at peer-grade confidence), row-declared `host:`/`agent:`
   attribution is stripped under the #381-normalized tokenizer with only
   `--attribute-host` stamped, and provenance is caller-derived — a row's
-  own `source_ref` never wins in peer mode. Flag-contract violations
-  (peer mode without `--allow-namespace`, invalid namespace grammar,
-  `--attribute-host` outside peer mode) exit 2, mirroring `ingest-jsonl`.
-  Default `--trust authoritative` behavior is byte-identical to 0.114.0.
+  own `source_ref` never wins in peer mode. Peer rows carry `--no-dedup`
+  so they always land as their own row and can never fold into (and
+  mutate) a trusted local keeper through dedup-on-write — the same
+  no-fold guarantee the ingest-jsonl peer lane enforces in-process. A row
+  whose ORIGINAL `source_ref` is credential-shaped is refused (counted)
+  instead of silently masked by the caller override, and the `-` content
+  sentinel is refused in peer mode (the store child runs with no stdin).
+  Flag-contract violations — peer mode without `--allow-namespace`,
+  `--allow-namespace` or `--attribute-host` outside peer mode, an
+  allow-list value the store's grammar refuses — exit 2 at parse time,
+  before the harvest file is read, mirroring `ingest-jsonl`. One peer
+  hostile row fails only its own row; the file continues.
+  Default `--trust authoritative` behavior is byte-identical to 0.114.0,
+  except that `store.py add` gains a general `--no-dedup` flag (the first
+  dedup-on-write bypass) which the peer mode drives.
+  Recall note: peer harvest rows land at confidence 0.2 (signal demoted to
+  none), which is below the 0.25 default-recall floor — they are visible
+  via `--min-confidence` and keyword search by design.
 
 ## [0.114.0] - 2026-10-20
 

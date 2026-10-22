@@ -2023,9 +2023,55 @@ def _strict_ingest_staged(
         # PURGED ids are subtracted too — a staged id on the purged deny-list
         # is not in `memory` (so it slips past pre_existing) but never lands
         # at apply time (purged_denied), which would leave a kept pointer to
-        # a row that was never created. This matches the episode-summary
-        # rule below (staged consultation), so memory pointers and episode
-        # pointers resolve the same way.
+        # a row that was never created. PR #393 review V10-note: the
+        # EPISODE-summary rule below is NOT this rule — it still consults
+        # the full staged CLAIMED-namespace map, so an episode pointer can
+        # resolve a decoy-collided foreign id that a memory pointer here
+        # would refuse; that pre-existing gap is filed separately and the
+        # old "the rules resolve the same way" claim was false.
+        # PR #393 review V1: the authored union must never let a peer author
+        # a lineage CYCLE. A self-pointer (update_of == own id) or an A<->B
+        # pair inside the authored set would survive the clamp below and
+        # land, and purge then refuses the rows FOREVER ("cyclic update_of
+        # chain", purge.py's path_seen walk) — a peer-controllable,
+        # permanent store wedge. Base cleared these pointers (own and
+        # not-yet-landed ids were never in the store snapshot); keep that
+        # guarantee by clearing every pointer edge that closes a cycle over
+        # the authored set (self-loops included) BEFORE the clamp runs.
+        _staged_row_by_id = {o["id"]: o for t, o in rows
+                             if t == "memory" and o["id"] in strict_peer_authored}
+        _staged_ptrs: dict[str, dict[str, str]] = {}
+        for _oid, _obj in _staged_row_by_id.items():
+            _edges = {}
+            for _field in ("update_of", "merged_from"):
+                _target = _obj.get(_field) or ""
+                if _target and _target in strict_peer_authored:
+                    _edges[_field] = _target
+            if _edges:
+                _staged_ptrs[_oid] = _edges
+
+        def _edge_closes_cycle(own: str, target: str) -> bool:
+            # The edge own->target lies on a cycle iff own is reachable
+            # from target by following authored pointers (a self-pointer
+            # returns True immediately).
+            seen: set[str] = set()
+            stack = [target]
+            while stack:
+                cur = stack.pop()
+                if cur == own:
+                    return True
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                nxt = _staged_ptrs.get(cur)
+                if nxt:
+                    stack.extend(nxt.values())
+            return False
+
+        for _oid, _edges in _staged_ptrs.items():
+            for _field, _target in _edges.items():
+                if _edge_closes_cycle(_oid, _target):
+                    _staged_row_by_id[_oid][_field] = ""
         _peer_resolvable = _peer_resolvable | (
             strict_peer_authored - _purged_ids(conn))
         for table, obj in rows:
@@ -2720,11 +2766,17 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     # F22: ids whose CURRENT namespace sits inside the
                     # allow-list (lineage pointers may only reference these).
                     # Issue #378 ADV1/ADV2: the set is MUTABLE — rows this
-                    # file lands are added at the landed-outcome branch below
+                    # file LANDS are added at the landed-outcome branch below
                     # (their namespaces were allow-list-gated above), so a
                     # row landing EARLIER in the file is resolvable for later
-                    # rows' update_of/merged_from, matching the strict lane's
-                    # authored union and the episode pass's live re-query.
+                    # rows' update_of/merged_from. PR #393 review V8: this
+                    # rule is deliberately ORDER-DEPENDENT and is NOT the
+                    # strict lane's authored union — a pointer to a row that
+                    # lands LATER in the file (a forward reference) resolves
+                    # in the strict lane but is cleared here, and self/cycle
+                    # pointers are cleared in both lanes (the strict lane
+                    # clears them explicitly above). Disclosed residual; the
+                    # frozen AC2 contract covers earlier-in-file targets.
                     _peer_resolvable = set(
                         r[0] for r in conn.execute(
                             "SELECT id, namespace FROM memory"
@@ -2762,8 +2814,18 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                             # original is what was refused"), so restore the
                             # original ref the refusal is about before the
                             # quarantine snapshot, instead of recording the
-                            # clean caller override.
-                            obj["source_ref"] = _row_ref_original or ""
+                            # clean caller override. PR #393 review V7: the
+                            # restored value is REDACTED first — the ledger
+                            # is a durable 0600 file and must not become a
+                            # cleartext copy of the credential shape the
+                            # policy just refused; the redacted ref keeps
+                            # the forensic shape without the secret.
+                            # redact_text returns (text, count) — unpack it
+                            # (review round 2: the tuple leaked into the
+                            # ledger as a JSON array and broke re-ingest).
+                            _redacted_ref, _n = redact_text(
+                                _row_ref_original or "")
+                            obj["source_ref"] = _redacted_ref
                             quarantine_import_row(
                                 os.path.dirname(STORE_PATH), obj,
                                 reason=exc.reason)

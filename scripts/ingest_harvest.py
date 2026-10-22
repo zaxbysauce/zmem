@@ -31,16 +31,26 @@ apply_trust_policy): every namespace is gated against --allow-namespace
 grounding is demoted to a claimed_signal tag (the store derives taint and
 confidence from the demoted signal), row-declared host:/agent: attribution
 tags are stripped under the #381-normalized tokenizer with only the caller's
---attribute-host stamped, and provenance is caller-derived (--source-ref or
+--attribute-host stamped, provenance is caller-derived (--source-ref or
 the adapter's own session:harvest-<stem> default — a row's own source_ref is
-a claim and never wins in peer mode). Default 'authoritative' keeps the
-pre-#373 behavior byte-identically.
+a claim and never wins in peer mode), and peer rows carry --no-dedup so they
+always land as their own row and can never fold into (and mutate) a trusted
+local keeper through the writer's dedup-on-write. The row's ORIGINAL
+source_ref is capture-scanned before the caller override replaces it: a
+credential-shaped row ref fails the row instead of vanishing silently (the
+same "a stamp must never mask a refusal" rule the ingest lanes enforce).
+Default 'authoritative' keeps the pre-#373 behavior byte-identically.
+
+Flag-contract violations exit 2 at parse time, before the harvest file is
+read (peer mode without --allow-namespace, an --allow-namespace value the
+store's grammar refuses, --allow-namespace or --attribute-host outside peer
+mode).
 
 Exit code: 0 if every row in the file was stored, deduped, quarantined, or
 (peer mode) namespace-refused cleanly; 1 if any row was rejected (bad
-shape/enum) or failed to ingest; 2 for flag-contract violations (peer mode
-without --allow-namespace, invalid namespace grammar, --attribute-host
-outside peer mode).
+shape/enum, a source_ref the capture policy refused, a peer clamp failure)
+or failed to ingest, or a file-level error (missing/unreadable file, invalid
+JSON, store.py not found).
 """
 
 from __future__ import annotations
@@ -72,13 +82,22 @@ except ImportError:
     MAX_CONTENT_CHARS = 65536
 
     def is_valid_namespace(value):  # noqa: F811 - degraded fallback only
-        """Grammar floor for the degraded-import case: scoped prefix or the
-        canonical global namespace (schema_meta stays the single source)."""
-        return isinstance(value, str) and (
-            value == "user:global" or (
-                ":" in value and value.split(":", 1)[0] in (
-                    "project", "user", "fleet", "host", "agent", "domain")
-                and value.split(":", 1)[1].strip() != ""))
+        """Grammar floor for the degraded-import case: mirrors the shape of
+        schema_meta's NAMESPACE_RE (scoped prefix with a whitespace-free,
+        colon-free tail, or the canonical user:global) and rejects control
+        characters. Degraded by design — it cannot reproduce the near-miss
+        heuristics — but it must not accept values the real grammar refuses
+        (PR #393 review K16: the loose prefix-only copy had drifted, the
+        exact class PR #379 removed from cli.py)."""
+        if not isinstance(value, str) or value == "user:global":
+            return isinstance(value, str)
+        if any(ord(c) < 32 for c in value) or "*" in value:
+            return False
+        head, sep, tail = value.partition(":")
+        return bool(sep) and tail != "" and (
+            head in ("project", "user")
+            or (head in ("fleet", "host", "agent", "domain")
+                and not any(c.isspace() or c == ":" for c in tail)))
 
 
 def _ascii(value: object) -> str:
@@ -142,7 +161,8 @@ def validate_row(row: object, index: int) -> tuple[dict | None, str | None]:
     return row, None
 
 
-def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[str, str]:
+def ingest_row(store_py: Path, row: dict, source_ref: str,
+               no_dedup: bool = False) -> tuple[str, str]:
     """Call `store.py add --capture-mode auto --json` for one row.
 
     Issue #180: the harvest lane runs the SAME capture policy as every other
@@ -153,6 +173,20 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[str, str]:
     exact public message. A row carrying its own ``source_ref`` forwards it
     (the caller-supplied uniform ref is the fallback); a child failure,
     timeout, or malformed JSON is ``failed``.
+
+    PR #393 review V2 (issue #373): ``no_dedup=True`` (peer mode) passes the
+    child ``--no-dedup`` so an untrusted row ALWAYS lands as its own row —
+    the subprocess-boundary equivalent of the ingest-jsonl peer lane's
+    ``_peer_no_dedup`` marker. Without it a peer row whose content is
+    near-identical to a trusted local row is merged INTO that keeper
+    (max-confidence lift, worst-of taint, tag union, retrieval_count bump,
+    entity relink) — a trust-laundering write to a row the peer does not
+    own.
+
+    PR #393 review V6: the child runs with ``stdin=DEVNULL``. The child's
+    ``--content -`` sentinel reads stdin; a peer row whose content is exactly
+    ``-`` would otherwise make the child inherit and store the OPERATOR's
+    stdin (or block on a TTY until the timeout).
 
     Deliberately does NOT pass --confidence: the signal-derived default in
     store.py's add_memory() is intentional, and hand-setting it here would
@@ -190,12 +224,14 @@ def ingest_row(store_py: Path, row: dict, source_ref: str) -> tuple[str, str]:
         "--capture-mode", "auto",
         "--json",
     ]
+    if no_dedup:
+        cmd.append("--no-dedup")
     child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", env=child_env,
-            timeout=120,
+            timeout=120, stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         return "failed", "store.py add timed out after 120s"
@@ -256,12 +292,42 @@ def main() -> int:
     parser.add_argument(
         "--attribute-host", dest="attribute_host", default=None,
         help="peer mode only: stamp host:<value> on every ingested row's "
-             "tags (row-carried host:/agent: tags are stripped); with "
-             "--source-ref the caller's ref wins, otherwise each row's "
-             "source_ref is stamped peer:<value> (an explicit --source-ref "
-             "overrides the stamp).",
+             "tags (row-carried host:/agent: tags are stripped). Provenance "
+             "in peer mode is always the caller's --source-ref or the "
+             "adapter's session:harvest-<stem> default — a row's own "
+             "source_ref never wins (PR #393 review K10: there is no "
+             "peer:<value> provenance stamp on this adapter).",
     )
     args = parser.parse_args()
+
+    # Flag-contract validation runs at PARSE time (PR #393 review V3/K15:
+    # before any file access, so a flag violation exits 2 regardless of the
+    # harvest file's state — the ordering ingest-jsonl has at cli.py, where
+    # the flags are validated before --in is opened). V3: --allow-namespace
+    # outside peer mode is a hard error, not a silently ignored flag — an
+    # operator who scopes a run but omits --trust must not get an ungated
+    # authoritative import that exits 0.
+    if args.trust == "untrusted-peer" and not args.allow_namespace:
+        parser.error(
+            "--trust untrusted-peer requires at least one "
+            "--allow-namespace (a peer harvest must be scoped; refusing "
+            "everything silently is not an import)")
+    for _ns in args.allow_namespace:
+        if not is_valid_namespace(_ns):
+            parser.error(
+                "--allow-namespace values must be namespaces the store "
+                "itself admits (scoped, e.g. project:foo or host:box), "
+                f"got {_ns!r}")
+    if args.trust != "untrusted-peer":
+        if args.allow_namespace:
+            parser.error(
+                "--allow-namespace only applies to --trust untrusted-peer "
+                "(issue #373); without it the harvest is authoritative and "
+                "the allow-list would be silently ignored")
+        if args.attribute_host:
+            parser.error(
+                "--attribute-host only applies to --trust untrusted-peer "
+                "(issue #373)")
 
     harvest_path = Path(args.harvest_file)
     if not harvest_path.is_file():
@@ -305,32 +371,29 @@ def main() -> int:
 
     trust_policy = None
     apply_trust_policy = None
+    apply_capture_policy = None
+    CapturePolicyRefusal = None
     if args.trust == "untrusted-peer":
-        # Flag contract mirrors store.py's ingest-jsonl validation
-        # (storelib/cli.py, issue #282) so both importers reject the same
-        # misuse with the same exit code.
-        if not args.allow_namespace:
-            parser.error(
-                "--trust untrusted-peer requires at least one "
-                "--allow-namespace (a peer harvest must be scoped; refusing "
-                "everything silently is not an import)")
-        for _ns in args.allow_namespace:
-            if not is_valid_namespace(_ns):
-                parser.error(
-                    "--allow-namespace values must be namespaces the store "
-                    "itself admits (scoped, e.g. project:foo or host:box), "
-                    f"got {_ns!r}")
+        # Flag contract was validated at parse time above (mirrors
+        # store.py's ingest-jsonl validation, storelib/cli.py, issue #282).
         # Lazy import: the default (authoritative) run stays stdlib-only at
         # startup; storelib.sync has no import cycle and the scripts dir is
-        # already on sys.path (schema_meta import above).
-        from storelib.sync import IngestTrustPolicy, apply_trust_policy
+        # already on sys.path (schema_meta import above). PR #393 review
+        # K17b: guarded so a broken store stack surfaces as a clean error
+        # line, not a raw traceback.
+        try:
+            from storelib.sync import IngestTrustPolicy, apply_trust_policy
+            from storelib.write import (
+                CapturePolicyRefusal, apply_capture_policy)
+        except Exception as exc:  # noqa: BLE001 - operator-facing error
+            _print(
+                f"[ingest-harvest] ERROR: the peer trust mode needs the "
+                f"store library (storelib.sync) and it failed to import: "
+                f"{type(exc).__name__}: {exc}", err=True)
+            return 1
         trust_policy = IngestTrustPolicy(
             allowed_namespaces=args.allow_namespace,
             attribute_host=args.attribute_host)
-    elif args.attribute_host:
-        parser.error(
-            "--attribute-host only applies to --trust untrusted-peer "
-            "(issue #373)")
 
     total = len(data)
     stored = 0
@@ -351,25 +414,90 @@ def main() -> int:
             # Issue #373: the namespace allow-list rejects (never clamps) —
             # counted, not fatal, exactly like ingest-jsonl's legacy peer
             # lane. The row dies here: nothing of it is forwarded.
+            # PR #393 review K17c: the echoed namespace is whitespace-folded
+            # so a peer-controlled newline cannot forge operator status
+            # lines in this stream.
             if not trust_policy.namespace_allowed(row["namespace"]):
                 namespace_refused += 1
+                ns_disp = " ".join(str(row["namespace"]).split())
                 _print(
                     f"[ingest-harvest] NAMESPACE-REFUSED row {i}: "
-                    f"[{row['namespace']}] {row['type']}", err=True)
+                    f"[{ns_disp}] {row['type']}", err=True)
                 continue
-            # Provenance is caller-derived (issue #373, mirroring the lanes):
-            # apply_trust_policy never writes caller_source_ref into the row
-            # (it only skips its own stamp), so the adapter applies the
-            # caller ref itself. `source_ref` here is --source-ref or the
-            # adapter's own session:harvest-<stem> default — both are
-            # locally derived, never row-claimed, so both are trusted input
-            # and a row's own source_ref can never win in peer mode.
-            row["source_ref"] = source_ref
-            if apply_trust_policy(row, trust_policy,
-                                  caller_source_ref=source_ref):
-                trust_clamped += 1
+            # PR #393 review V4: one hostile row must not abort the file.
+            # The peer clamp and provenance override run inside a per-row
+            # guard — a row whose extra keys (never validated by
+            # validate_row, which type-checks only the six REQUIRED keys)
+            # crash apply_trust_policy is counted as failed like any other
+            # rejection and the file continues.
+            try:
+                # PR #393 review V6: '-' is the child writer's stdin
+                # sentinel. The child runs with stdin=DEVNULL (no operator
+                # capture), but the sentinel would still swallow the peer's
+                # declared content and store an empty row — refuse the
+                # shape outright in peer mode.
+                if row["content"] == "-":
+                    failed += 1
+                    _print(
+                        f"[ingest-harvest] FAILED row {i}: content '-' is "
+                        f"the child writer's stdin sentinel and is refused "
+                        f"in peer mode", err=True)
+                    continue
+                # PR #393 review V5: scan the row's ORIGINAL source_ref
+                # BEFORE the caller override replaces it. The PR's own ADV5
+                # rule (issue #378) is that a caller-supplied ref must never
+                # mask a refusal — applying it in the adapter only (the
+                # child never sees the original ref) would let a peer row
+                # carry a credential-shaped ref past the capture scan in
+                # perfect silence. Refusal fails the row (counted, exit
+                # contract unchanged); the original ref is never stored.
+                _row_original_ref = row.get("source_ref")
+                if _row_original_ref:
+                    apply_capture_policy(
+                        content="", source_ref=_row_original_ref,
+                        tags="", capture_mode="auto")
+                # Provenance is caller-derived (issue #373, mirroring the
+                # lanes): apply_trust_policy never writes caller_source_ref
+                # into the row (it only skips its own stamp), so the adapter
+                # applies the caller ref itself. `source_ref` here is
+                # --source-ref or the adapter's own session:harvest-<stem>
+                # default — both are locally derived, never row-claimed, so
+                # both are trusted input and a row's own source_ref can
+                # never win in peer mode.
+                row["source_ref"] = source_ref
+                if apply_trust_policy(row, trust_policy,
+                                      caller_source_ref=source_ref):
+                    trust_clamped += 1
+            except CapturePolicyRefusal as exc:
+                failed += 1
+                _print(
+                    f"[ingest-harvest] FAILED row {i}: the capture policy "
+                    f"refused the row's own source_ref ({exc.reason}); the "
+                    f"ref was dropped, the row was not ingested", err=True)
+                continue
+            except Exception as exc:  # noqa: BLE001 - counted, not fatal
+                failed += 1
+                _print(
+                    f"[ingest-harvest] FAILED row {i}: peer clamp could not "
+                    f"apply ({type(exc).__name__}); the row was not "
+                    f"ingested", err=True)
+                continue
 
-        status, message = ingest_row(store_py, row, source_ref)
+        # PR #393 review V4 round 2: the child spawn sits under the same
+        # per-row guard as the clamp — a peer-controlled value that makes
+        # the subprocess call itself raise (a NUL byte in content/tags
+        # raises ValueError at argv build) fails its own row instead of
+        # aborting the file with no summary.
+        try:
+            status, message = ingest_row(store_py, row, source_ref,
+                                         no_dedup=trust_policy is not None)
+        except Exception as exc:  # noqa: BLE001 - counted, not fatal
+            failed += 1
+            _print(
+                f"[ingest-harvest] FAILED row {i}: the row could not be "
+                f"delivered to the store ({type(exc).__name__}); the row "
+                f"was not ingested", err=True)
+            continue
         if status == "stored":
             stored += 1
             # No content preview: the raw row text can carry the very
