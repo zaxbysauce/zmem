@@ -2703,10 +2703,11 @@ def _annotate_virtual_expiry(conn: sqlite3.Connection, rows: list) -> None:
     (live — the missing-side-row law) — so a later `_annotate_expiry` call
     finds nothing left to do for these rows and can never mislabel a
     resolved head, even if its own read fails. A head with no/empty
-    ``source_ids`` is left unstamped (its expiry state is genuinely
-    unknown-by-id; the follow-up annotate keeps the legacy miss → live).
-    Absent side table → all live; a failed read marks the un-stamped
-    remainder ``_expiry_unread`` (the #342 law).
+    ``source_ids`` is left unstamped: the follow-up annotate's synthetic-id
+    miss keeps it live when that read SUCCEEDS, and if that read FAILS the
+    #342 marker law applies (withheld, not silently live). Absent side
+    table → all live; a failed read marks the un-stamped remainder
+    ``_expiry_unread`` (the #342 law).
     """
     virt = [r for r in rows
             if isinstance(r.get("id"), str)
@@ -2765,6 +2766,10 @@ def _gate_passive_expiry(
         row = pair[1]
         if row.get("_expiry_unread"):
             # Issue #342: unknown expiry state never spends a live slot.
+            # Same removal law as the _gone arrival sites: expired counts
+            # every id the gate removed for an expiry-read reason, and
+            # unread_ids additionally names the read-failure subset.
+            acc["expired_ids"].add(row["id"])
             acc.setdefault("unread_ids", set()).add(row["id"])
         else:
             iu = row.get("inject_until")
@@ -3618,7 +3623,10 @@ def _recall_memory_impl(
             gated: list = []
             for pair in kept_cross:
                 if pair[1].get("_expiry_unread"):
-                    # Issue #342: unknown expiry state never rides the splice.
+                    # Issue #342: unknown expiry state never rides the
+                    # splice; it still counts as a gate removal (the same
+                    # removal law as every other annotate/gate site).
+                    expiry_acc["expired_ids"].add(pair[1]["id"])
                     continue
                 iu = pair[1].get("inject_until")
                 if iu and _parse_iso_to_epoch(iu) <= now_e:
