@@ -587,6 +587,12 @@ class SourceRefOverrideTest(_TwoStoreCase):
 
     def test_without_override_keeps_original_source_ref(self):
         missing_path = os.path.join(self.a.tmp, "notes-that-do-not-exist-on-b.md")
+        # issue #288 AC6 companion: explicit CLI writes now default to the
+        # auto capture intent, whose _file_ref_absolute guard refuses an
+        # ABSOLUTE file: source_ref. This setup deliberately seeds an
+        # absolute file: provenance row, so pin the manual intent for the
+        # seed leg (the sibling discipline at :2263/:2411).
+        self.a.env["ZMEM_CAPTURE_MODE"] = "manual"
         self.a.add(NS, "row referencing a file: source_ref", confidence=0.9,
                   source_ref=f"file:{missing_path}")
         export_a = os.path.join(self.a.tmp, "export.jsonl")

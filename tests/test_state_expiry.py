@@ -217,8 +217,8 @@ class StateSchemaTest(_StoreCase):
         # renumbers to 18 and REOPENS the forward window at parity, so
         # FORWARD follows SUPPORTED up from 15. (v17 was #179's stamp-only
         # bump, which deliberately held FORWARD at 15.)
-        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 18)
-        self.assertEqual(FORWARD_COMPAT_SCHEMA_VERSION, 18)
+        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 19)
+        self.assertEqual(FORWARD_COMPAT_SCHEMA_VERSION, 19)
         self.assertIn("state", ALLOWED_TYPES)
         tabs = [r[0] for r in self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")]

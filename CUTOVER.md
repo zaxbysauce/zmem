@@ -29,7 +29,7 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - local/non-OneDrive path safety
 - Python, SQLite FTS5, Node, and Windows shell prerequisites
 - best-effort read/write access to the target path
-- schema compatibility against current v18
+- schema compatibility against current v19
 - `embeddings_health` check: active profile vs stored vector dimension,
   rows with/without embeddings, shipped-profile inventory, and warnings
   when a non-temporary store runs `ZMEM_EMBED_PROFILE=fake` (issue #63)
@@ -271,10 +271,13 @@ changes no `memory` column or constraint). Fresh stores and the
 `ver < 18` migration both create `memory_occurrence` +
 `idx_memory_occurrence_range` in one transaction, version advanced only
 after both statements succeed. A v16 maintenance client raised to
-FORWARD 18 reads/writes a v18 store with one NOTICE. Clients still at
-FORWARD 15 (every 0.10x-era install) refuse a migrated v18 store —
-update ALL zmem clients on shared-store machines before the first v18
-client opens the store (`ZMEM_ALLOW_NEWER_SCHEMA=1` stopgap).
+FORWARD 18 reads/writes a v18 store with one NOTICE. Schema 19 (issue #288,
+applied_ops) reopened FORWARD to 19. The compat gate refuses any store
+newer than the client's FORWARD ceiling: clients still at FORWARD 18
+(every 0.116-era install) REFUSE a migrated v19 store with the standard
+`ZMEM_ALLOW_NEWER_SCHEMA=1` message — update ALL zmem clients on
+shared-store machines before the first v19 client opens the store
+(a FORWARD-15 client refuses it the same way).
 NUMBERING: #179's `entity_card` bump owns 17 as a STAMP-ONLY step; this
 PR's occurrence DDL renumbered 17 -> 18 at rebase because one integer can
 never carry two schema definitions (a `ver < 17` guard would skip the DDL

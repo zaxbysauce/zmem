@@ -655,7 +655,8 @@ class MigrationTest(V16SchemaTestMixin, _Store):
         # v18 (issue #178): the chain continues past the v16 entity rebuild —
         # the additive `memory_occurrence` side table lands and the marker
         # advances to 17 (recorded in the fixture's post.tables above).
-        self.assertEqual(post["schema_version"], 18)
+        # issue #288 bump: migrate() walks the full chain to 19.
+        self.assertEqual(post["schema_version"], 19)
 
         # PR #355 review PRR-007: the fixture's five legacy rows cannot prove
         # the MIGRATED table carries the new vocabulary — on a real v15 store
@@ -699,7 +700,7 @@ class MigrationTest(V16SchemaTestMixin, _Store):
         self.assertEqual(first, second, "second migration changed state")
         # v18 (issue #178): idempotent chain end state is 18 after the
         # renumber (#179 owns 17 as a stamp-only step).
-        self.assertEqual(second["schema_version"], 18)
+        self.assertEqual(second["schema_version"], 19)
         conn = sqlite3.connect(str(store))
         try:
             self.assertEqual(

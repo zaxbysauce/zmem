@@ -92,7 +92,7 @@ class EpisodeIsolationTest(unittest.TestCase):
         # v16 (#175): entity kinds v2 — the constrained-table rebuild release.
         # v17 (PR #385 review F-1/PRR-006, 2026-10-18): stamp-only bump for
         # the entity_card type; FORWARD stays 15 (upgrade-required).
-        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 18)
+        self.assertEqual(SUPPORTED_SCHEMA_VERSION, 19)
         conn = sqlite3.connect(self.store)
         try:
             names = {r[0] for r in conn.execute(

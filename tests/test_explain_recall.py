@@ -584,8 +584,8 @@ class ExplainSafetyTests(ExplainFixtureBase):
         # forward ceiling deliberately stayed 15 for the constrained rebuild.
         # v17 (#178): the additive `event`/`memory_occurrence` release — the
         # same disclosed-bump rule; the additive window reopens at parity.
-        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 18)
-        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 18)
+        self.assertEqual(schema_meta.SUPPORTED_SCHEMA_VERSION, 19)
+        self.assertEqual(schema_meta.FORWARD_COMPAT_SCHEMA_VERSION, 19)
 
 
 class ExplainTemporalArmTest(unittest.TestCase):

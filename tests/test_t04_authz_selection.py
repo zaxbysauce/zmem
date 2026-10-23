@@ -120,9 +120,15 @@ def _pinned_scratch(prefix: str):
 
 
 def _run_store(*args: str) -> subprocess.CompletedProcess:
+    # issue #288 AC6 companion: CLI writes now default to the AUTO capture
+    # intent whose redactor rewrites the 32-hex uuid tokens seeded INTO the
+    # content — the rows then no longer match their own queries. The seeding
+    # legs pin the MANUAL intent so content stays verbatim.
+    env = dict(os.environ)
+    env.setdefault("ZMEM_CAPTURE_MODE", "manual")
     return subprocess.run(
         [sys.executable, STORE_PY, *args],
-        env=dict(os.environ), capture_output=True, text=True,
+        env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=120,
     )
 

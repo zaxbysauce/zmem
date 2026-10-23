@@ -66,7 +66,7 @@ store or host config. Checks:
 - Python version (supported floor 3.11) + SQLite FTS5
 - Node and a usable Git Bash/Cygwin shell on Windows
 - best-effort read/write access to the store path
-- schema compatibility against current v18
+- schema compatibility against current v19
 - v9 append-only lineage columns present (`valid_until`/`update_of`/`taint`)
 - v10 entity identity tables present and non-vacuous (`entity`/`entity_alias`/
   `memory_entity`); inspect deeper with `store.py entity-list`
@@ -897,6 +897,14 @@ still 15 (every 0.10x-era install) refuse a migrated v18 store until
 updated — on shared-store machines, update every zmem client before the
 first v18 client opens the store (`ZMEM_ALLOW_NEWER_SCHEMA=1` is the
 stopgap; see CUTOVER.md and the CHANGELOG operator note).
+
+Schema 19 (issue #288) adds the `applied_ops` op-queue table —
+purely additive, so SUPPORTED and FORWARD both moved to 19. The compat
+gate refuses any store newer than the client's FORWARD ceiling: a
+0.116-era client (FORWARD 18) REFUSES a v19 store with the standard
+`ZMEM_ALLOW_NEWER_SCHEMA=1` message — update all zmem clients on
+shared-store machines before the first v19 client opens the store
+(a FORWARD-15 client refuses it the same way).
 NUMBERING: #179's `entity_card` bump owns schema 17 as a STAMP-ONLY step
 (no DDL); this PR's `memory_occurrence` DDL therefore renumbered to 18 at
 rebase — one integer can never carry two schema definitions, or the

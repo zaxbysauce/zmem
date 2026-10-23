@@ -138,7 +138,7 @@ def normalize_content(s: str) -> str:
 # raises only its FORWARD keeps working with a one-time NOTICE, while every
 # deployed client still on FORWARD 15 refuses the migrated store until it is
 # updated — see the CHANGELOG operator note.
-SUPPORTED_SCHEMA_VERSION = 18
+SUPPORTED_SCHEMA_VERSION = 19
 
 # Forward-compat window (issue #65 follow-up): a client refuses a store whose
 # schema_version exceeds its SUPPORTED_SCHEMA_VERSION. For ADDITIVE-ONLY bumps
@@ -150,7 +150,7 @@ SUPPORTED_SCHEMA_VERSION = 18
 # SUPPORTED and FORWARD_COMPAT the client prints a one-time stderr NOTICE and
 # proceeds; above FORWARD_COMPAT it still refuses (ZMEM_ALLOW_NEWER_SCHEMA=1
 # overrides, at the operator's own risk).
-FORWARD_COMPAT_SCHEMA_VERSION = 18
+FORWARD_COMPAT_SCHEMA_VERSION = 19
 # (PR #385 review F-1, 2026-10-18) held FORWARD at 15 across the v17 bump
 # because that bump was STAMP-ONLY, not additive: there was nothing an older
 # client could safely do with a v17 store, so it had to refuse loudly. This
