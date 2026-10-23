@@ -115,8 +115,18 @@ def _restore_class_env(cls) -> None:
 
 
 def _store_env() -> dict:
-    """Child env for store.py subprocesses (inherits the class pin)."""
-    return dict(os.environ)
+    """Child env for store.py subprocesses (inherits the class pin).
+
+    issue #288 AC6 companion: explicit CLI writes now default to the AUTO
+    capture intent, whose secret redactor rewrites the 32-hex uuid tokens
+    this suite seeds INTO its content — the seeded row then no longer
+    matches its own query and the relevance gate drops it (below-relevance).
+    The seeding legs pin the MANUAL intent so the content stays verbatim;
+    the capture machinery itself is pinned by tests/test_capture_policy*.
+    """
+    env = dict(os.environ)
+    env.setdefault("ZMEM_CAPTURE_MODE", "manual")
+    return env
 
 
 def _run_store(*args: str) -> subprocess.CompletedProcess:

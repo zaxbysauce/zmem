@@ -1405,6 +1405,27 @@ _MEMORY_OCCURRENCE_SCHEMA_DDL = (
 )
 
 
+# Issue #288 (Workstream T PR 9): the op-queue idempotency table. One row per
+# COMMITTED op; the op_id PRIMARY KEY is the at-most-once record (a replayed
+# op_id reads its verdict from here and writes nothing). Purely additive —
+# no memory column or constraint changes — so schema 19 reopens the
+# FORWARD-compat window (both constants move; see schema_meta.py).
+_APPLIED_OPS_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS applied_ops (
+        op_id TEXT NOT NULL,
+        principal TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        canonical_id TEXT,
+        applied_at TEXT NOT NULL,
+        PRIMARY KEY (op_id, principal)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_applied_ops_principal "
+    "ON applied_ops(principal, applied_at)",
+)
+
+
 def _migrate_v18(conn: sqlite3.Connection) -> None:
     """Create the `memory_occurrence` side table and advance to v18 atomically.
 
@@ -1461,6 +1482,42 @@ _MEMORY_EXPIRY_SCHEMA_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_memory_expiry_until "
     "ON memory_expiry(inject_until)",
 )
+
+
+
+def _migrate_v19(conn: sqlite3.Connection) -> None:
+    """Schema 19 (issue #288): the applied_ops op-queue table.
+
+    Same discipline as v18: one transaction (savepoint when a caller
+    already holds one), DDL + version marker advance atomically,
+    purely additive, idempotent under the ver < N guard.
+    """
+    savepoint = "zmem_v19_applied_ops"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        for ddl in _APPLIED_OPS_SCHEMA_DDL:
+            conn.execute(ddl)
+        conn.execute(
+            "UPDATE meta SET value='19' WHERE key=?",
+            (SCHEMA_VERSION_KEY,),
+        )
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
 
 
 def _migrate_v15(conn: sqlite3.Connection) -> None:
@@ -2551,6 +2608,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         # missing table. Two definitions behind one integer is precisely what
         # the version gate exists to prevent.
         _migrate_v18(conn)
+
+    # Issue #288 (Workstream T PR 9): the op-queue idempotency table —
+    # additive, v18-template discipline.
+    if ver < 19:
+        _migrate_v19(conn)
 
     # Version-independent evidence-first lookup index: this repairs existing
     # v14 stores without a version bump and is idempotent on every open.

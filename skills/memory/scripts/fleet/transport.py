@@ -581,6 +581,26 @@ class McpHttp:
         return payload if isinstance(payload, dict) else {
             "ok": False, "reason": REASON_EMPTY_POOL}
 
+    def apply_ops(self, ops: list, principal: str = "",
+                  client_protocol: int = CLIENT_PROTOCOL_MAJOR,
+                  deadline_ms: int | None = None) -> dict[str, Any]:
+        """Issue #288: send a typed-op batch to the hub's ``apply_ops``."""
+        arguments: dict[str, Any] = {
+            "ops": list(ops),
+            "principal": principal,
+            "client_protocol": client_protocol,
+            "deadline_ms": deadline_ms,
+        }
+        try:
+            payload = self._run_tool("apply_ops", arguments)
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+            logger.debug("zmem transport: apply_ops failed open: %s", exc)
+            if _is_unreachable_exception(exc):
+                return {"ok": False, "reason": REASON_HUB_UNREACHABLE}
+            return {"ok": False, "reason": "empty-pool"}
+        return payload if isinstance(payload, dict) else {
+            "ok": False, "reason": REASON_HUB_UNREACHABLE}
+
     def tier0_get(self, client_protocol: int = CLIENT_PROTOCOL_MAJOR,
                   deadline_ms: int | None = None) -> dict[str, Any]:
         """Issue #287: fetch the hub-owned canonical user-level core.md

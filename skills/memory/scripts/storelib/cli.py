@@ -531,6 +531,91 @@ def _trusted_review_fields(payload: Mapping[str, object]) -> tuple[str, tuple[st
     return caller, configured
 
 
+
+
+def _intent_capture_mode() -> str:
+    """Issue #288 AC6: the intent default for explicit agent/user tool
+    writes — the operator's ZMEM_CAPTURE_MODE override wins (normalized
+    through the same lower+clamp normalize applies: a mixed-case spelling
+    of a known mode is lowered to that mode; an unknown value degrades to
+    manual), and an UNSET env means ``auto``."""
+    raw = (os.environ.get("ZMEM_CAPTURE_MODE", "") or "").strip().lower()
+    if not raw:
+        return "auto"
+    return raw if raw in CAPTURE_MODES else "manual"
+
+
+def _cmd_apply_ops(conn, args) -> int:
+    """Issue #288: apply a typed-op batch; per-op receipts; idempotent."""
+    import json as _json
+    import sys as _sys
+    from storelib import ops as opslib
+
+    raw = ""
+    if args.in_path == "-":
+        # The hub writes the batch as UTF-8 bytes; a bare sys.stdin.read()
+        # decodes with the process locale codec — cp1252 on a default
+        # Windows install — mojibake-ing non-ASCII ops and discarding the
+        # whole batch on a cp1252-undefined byte. Same rationale as
+        # _retain_read_stdin (the retain readers).
+        raw = _sys.stdin.buffer.read().decode("utf-8", errors="replace")
+        # A UTF-8 BOM (Windows-authored JSONL) would kill line 1's parse.
+        raw = raw.lstrip("﻿")
+    else:
+        try:
+            raw = Path(args.in_path).read_text(encoding="utf-8-sig",
+                                               errors="replace")
+        except OSError as exc:
+            print(f"[zmem] apply-ops: unreadable input: {exc}", file=_sys.stderr)
+            return 2
+    parsed = []
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            parsed.append(opslib.parse_ops_line(line))
+        except ValueError as exc:
+            # Content-free refusal: line number only, never the line body.
+            print(f"[zmem] apply-ops: line {lineno}: {exc}", file=_sys.stderr)
+            return 2
+
+    # The CLI route is the operator/legacy identity: an explicit empty
+    # --principal means legacy (capabilities None => allowed), mirroring the
+    # MCP layer's current_principal() legacy-mode semantics.
+    default_principal = opslib.LegacyPrincipal()
+    lookup = opslib.principal_lookup_from_env()
+    if len(parsed) > 256:
+        print("[zmem] apply-ops: batch exceeds the 256-op limit",
+              file=_sys.stderr)
+        return 2
+
+    # stdout purity under --json: the write path prints human progress lines
+    # to stdout (add notices, dedup notices); swap for the duration (the
+    # cmd_add precedent).
+    if args.json:
+        _stdout, _stderr = _sys.stdout, _sys.stderr
+        _sys.stdout = _stderr
+        try:
+            result = opslib.apply_ops(conn, parsed, principal=args.principal,
+                                      principal_lookup=lookup,
+                                      default_principal=default_principal)
+        finally:
+            _sys.stdout = _stdout
+    else:
+        result = opslib.apply_ops(conn, parsed, principal=args.principal,
+                                  principal_lookup=lookup,
+                                  default_principal=default_principal)
+
+    if args.json:
+        _sys.stdout.write(_json.dumps(result, ensure_ascii=False) + "\n")
+    else:
+        for receipt in result["receipts"]:
+            _sys.stderr.write(
+                "[zmem] apply-ops: {op_id} {op} -> {status}".format(**receipt)
+                + "\n")
+    return 0
+
+
 def cmd_hermes_reflect(*, payload: object) -> int:
     """Capture one Hermes payload and return one prepare result as JSON.
 
@@ -3252,6 +3337,23 @@ def main():
     _qc_grp.add_argument("--drop-stale", action="store_true",
                          help="remove stale items with confidence < 0.6")
 
+
+    # Issue #288 (Workstream T PR 9): the typed operation-queue batch
+    # entry point. One JSONL line per op; one receipt per op; idempotent
+    # by op_id via the applied_ops PRIMARY KEY.
+    ap_ops = _add_parser(
+        "apply-ops",
+        help="apply a batch of typed ops (add/update/supersede/invalidate)"
+             " with per-op receipts, idempotent by op_id",
+    )
+    ap_ops.add_argument("--in", dest="in_path", required=True,
+                        help="input JSONL path, or - for stdin")
+    ap_ops.add_argument("--principal", default="",
+                        help="principal id the batch applies as (empty ="
+                             " the legacy/operator identity)")
+    ap_ops.add_argument("--json", action="store_true",
+                        help="emit the receipt envelope as one JSON document")
+
     # queue-add (issue #260): the write-side sibling of queue-list/queue-clear.
     # Cheap closeout note — never touches the store (no connect/embedding/dedup).
     p_queue_add = _add_parser(
@@ -4875,7 +4977,7 @@ def main():
     # memory_vec, so an unmatched active profile could previously write
     # wrong-dim blobs with the vec-row insert silently swallowed.
     if args.cmd in {"add", "update", "recall", "search", "consolidate",
-                    "organize", "ingest-jsonl"} or args.cmd == "reembed" \
+                    "organize", "ingest-jsonl", "apply-ops"} or args.cmd == "reembed" \
             or args.cmd == "entity-card" \
             or (args.cmd == "episode-close" and args.summary):
         # PR-review F1 (PR #81 round 2): episode-close --summary embeds via
@@ -4893,6 +4995,7 @@ def main():
 
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl",
+        "apply-ops",
                      "capture-training-delivery", "capture-training-acknowledge",
                      "capture-training-completion", "capture-training-review",
                      "capture-training-revoke", "purge-training-captures"}
@@ -5252,6 +5355,8 @@ def main():
         elif args.cmd == "hermes-convention":
             payload = hermes_payload if hermes_payload is not None else {}
             sys.exit(cmd_hermes_convention(conn, payload=payload))
+        elif args.cmd == "apply-ops":
+            sys.exit(_cmd_apply_ops(conn, args))
         elif args.cmd == "add":
             try:
                 # Under --json the human progress lines ([zmem] added …,
@@ -5273,7 +5378,8 @@ def main():
                         confidence=args.confidence,
                         signal=args.signal,
                         taint=args.taint,
-                        capture_mode=args.capture_mode,
+                        capture_mode=(args.capture_mode if args.capture_mode
+                                    else _intent_capture_mode()),
                         evidence_ids=args.evidence_ids,
                         expiry_class=args.expiry_class,
                         inject_until=args.inject_until,
@@ -5304,9 +5410,15 @@ def main():
                 # ORIGINAL input row in the quarantine JSONL and reports
                 # success-with-quarantine (exit 0) — the durable record replaces
                 # the silent drop. Every other refusal (reviewed-mode raise,
-                # namespace validation) keeps exit 2.
+                # namespace validation) keeps exit 2. The test uses the
+                # EFFECTIVE mode (the intent-resolved default), not the raw
+                # flag — under the shipped auto default the raw flag is
+                # unset and would normalize to "manual", killing the branch.
                 if (exc.reason in QUARANTINE_REASONS
-                        and _normalize_capture_mode(args.capture_mode) == "auto"):
+                        and _normalize_capture_mode(
+                            args.capture_mode
+                            if args.capture_mode
+                            else _intent_capture_mode()) == "auto"):
                     quarantine_row = {
                         "namespace": args.namespace,
                         "type": args.type,
@@ -5406,7 +5518,8 @@ def main():
                         confidence=args.confidence,
                         signal=args.signal,
                         taint=args.taint,
-                        capture_mode=args.capture_mode,
+                        capture_mode=(args.capture_mode if args.capture_mode
+                                else _intent_capture_mode()),
                         expected_old_namespace=args.expected_old_namespace,
                         supersede_reason=args.reason,
                         evidence_ids=args.evidence_ids,

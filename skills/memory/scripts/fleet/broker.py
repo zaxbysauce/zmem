@@ -285,6 +285,52 @@ def _http(env: Mapping[str, str]) -> transport.McpHttp:
     )
 
 
+# --- T-09 durable op queue: read-your-writes overlay + flush -----------
+
+def pending_overlay(principal: str, env=None) -> str:
+    """Read-your-writes (issue #288 AC3): the principal's pending op-queue
+    entries rendered as bounded ``[PENDING]`` lines (empty when none)."""
+    try:
+        from fleet import opqueue  # noqa: PLC0415 - lazy import
+        return opqueue.render_pending("", principal, env)
+    except Exception:  # noqa: BLE001 - overlay is fail-open
+        return ""
+
+
+def _flush_queue(http: transport.McpHttp, env: Mapping[str, str],
+                 started: float) -> None:
+    """Fire-and-forget op-queue flush under the REMAINING deadline; broker-log
+    lines carry reason + op count only, never op content."""
+    try:
+        from fleet import opqueue  # noqa: PLC0415 - lazy import
+        remaining_ms = _remaining_ms(started, env)
+        if remaining_ms <= 0:
+            return
+        rows = opqueue.pending("local", env)
+        if not rows:
+            return
+        result = opqueue.flush("local", http, env,
+                               deadline_ms=remaining_ms)
+        if isinstance(result, dict) and result.get("ok") is not True:
+            # The hub's refusal shapes carry `error` (not `reason`) — log
+            # whichever is present so a stuck queue is diagnosable.
+            reason = str(result.get("error") or result.get("reason")
+                         or "flush-failed")[:80]
+            _log_record({
+                "ts": int(time.time()), "event": "opqueue-flush",
+                "reason": reason,
+                "pending": len(rows),
+                "elapsed_ms": int((time.monotonic() - started) * 1000.0),
+            })
+    except Exception as exc:  # noqa: BLE001 - fire-and-forget
+        _log_record({
+            "ts": int(time.time()), "event": "opqueue-flush",
+            "reason": "flush-error",
+            "detail": type(exc).__name__,
+            "elapsed_ms": int((time.monotonic() - started) * 1000.0),
+        })
+
+
 def _fail_open(event: str, reason: str, detail: str,
                started: float) -> dict[str, str]:
     _log_record({
@@ -344,11 +390,27 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
                 deadline_ms=remaining_ms)
     except Exception as exc:  # noqa: BLE001 - fail open
         return _fail_open(event, "broker-error", str(exc), started)
+    # Read-your-writes (issue #288 AC3) holds in BOTH hub states: render
+    # the pending overlay FIRST, flush (which may clear some entries), then
+    # compose — the overlay is what the operator queued and every line is
+    # neutralized, so the hub being unreachable never suppresses it.
+    overlay = pending_overlay("local", env)
     if envelope.get("reason") == transport.REASON_HUB_UNREACHABLE:
-        return _fail_open(event, transport.REASON_HUB_UNREACHABLE,
+        fail = _fail_open(event, transport.REASON_HUB_UNREACHABLE,
                           "read moment hub call unreachable", started)
+        if overlay:
+            fail["additionalContext"] = _neutralize(
+                overlay) if not fail["additionalContext"] else _neutralize(
+                    fail["additionalContext"] + "\n" + overlay)
+        return fail
     _ack_reservation(http, env, envelope, started)
-    return _emit_envelope(envelope)
+    result = _emit_envelope(envelope)
+    _flush_queue(http, env, started)
+    if overlay:
+        base_text = result.get("additionalContext", "")
+        result = {"additionalContext": _neutralize(
+            (base_text + "\n" + overlay) if base_text else overlay)}
+    return result
 
 
 # --- Stop / SubagentStop evidence --------------------------------------

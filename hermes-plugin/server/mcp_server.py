@@ -1963,6 +1963,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # issue #287 (Workstream T PR 8): the broker's hub surface.
             "stop-evidence",
             "tier0",
+            # issue #288 (Workstream T PR 9): the op queue.
+            "apply-ops",
         ]
         return {
             "protocol": _PROTOCOL_MAJOR,
@@ -3018,6 +3020,147 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if not isinstance(parsed, dict) or "committed" not in parsed:
             return _error("incomplete prefetch-ack result from store.py")
         return parsed
+
+    @mcp.tool()
+    async def apply_ops(
+        ops: list,
+        principal: str = "",
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """Apply a batch of typed ops with per-op receipts (issue #288).
+
+        Each op is ``{"op_id", "op": add|update|supersede|invalidate,
+        "args", "depends_on"?, "client_seq"?}``. Idempotent by ``op_id``
+        (the store-side ``applied_ops`` PRIMARY KEY is the at-most-once
+        record); receipts echo the op kind and carry
+        ``status: committed | rejected | duplicate | blocked`` plus the
+        canonical id the hub actually assigned (a dedup fold is
+        ``committed`` + ``deduped: true``; ``duplicate`` is only a replay).
+
+        Capability enforcement (issue #281's deferred rule): the EFFECTIVE
+        principal is the authenticated REQUEST context; the tool-level
+        ``principal`` parameter is bound to it — naming a DIFFERENT
+        principal id is refused (an identity switch would let any caller
+        inherit another principal's capabilities and namespace allow-list).
+        The per-op ``principal`` field is advisory metadata recorded in
+        ``applied_ops``, NEVER an identity switch. ``update``/``supersede``/
+        ``invalidate`` require the ``mutate`` (or ``admin``) capability for
+        non-legacy principals; revoked or unknown principals deny; ``add``
+        is never capability-gated. Namespace scope is enforced engine-side
+        for every op — declared namespaces AND each mutation target row's
+        own namespace, including omitted-namespace defaults.
+        """
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+        if not isinstance(ops, list) or not ops:
+            return _error("ops must be a non-empty list")
+        if len(ops) > 256:
+            # Refuse BEFORE serializing the payload (the batch cap is a
+            # resource guard, not a post-hoc check).
+            return _error("ops batch exceeds the 256-op limit")
+
+        # Guard caller resolution: with an AUTHENTICATED request (the
+        # production MCP server always requires a bearer token) the request
+        # context IS the identity — a tool-level ``principal`` claim that
+        # names a DIFFERENT principal is an impersonation attempt and is
+        # refused outright. Without an auth context (in-process callers and
+        # tests; unreachable on the wire) the explicit principal parameter
+        # names the map entry, resolved with the same fail-closed rules.
+        try:
+            from mcp.server.auth.middleware.auth_context import (
+                get_access_token as _get_access_token,
+            )
+            _auth_token = _get_access_token()
+        except Exception:
+            _auth_token = None
+        request_principal = current_principal()
+        if _auth_token is not None:
+            if getattr(request_principal, "revoked", False):
+                return {"ok": False, "error": "capability_denied"}
+            claimed_id = getattr(request_principal, "principal_id", "") or ""
+            cli_principal = principal.strip()
+            if cli_principal:
+                if not claimed_id or cli_principal != claimed_id:
+                    return {"ok": False, "error": "principal_mismatch",
+                            "detail": "the tool-level principal must name "
+                                      "the authenticated request principal"}
+                resolved = request_principal
+            else:
+                resolved = request_principal
+                # The capability gate runs in the store subprocess; an
+                # EMPTY --principal there degrades to the legacy-allow
+                # identity. Route the authenticated principal's id through
+                # so a map-mode no-mutate caller cannot bypass the gate by
+                # omitting the optional param (review finding F3).
+                if (getattr(resolved, "capabilities", None) is not None
+                        and getattr(resolved, "principal_id", "legacy")
+                        not in ("", "legacy")):
+                    cli_principal = str(resolved.principal_id)
+        else:
+            cli_principal = principal.strip()
+            if cli_principal:
+                if principal_map is None:
+                    return _error(
+                        "principal routing requires a principal map")
+                resolved = principal_map.by_principal_id(cli_principal)
+                if resolved is None:
+                    return _error("unknown principal")
+            else:
+                resolved = request_principal
+                if getattr(resolved, "revoked", False):
+                    return {"ok": False, "error": "capability_denied"}
+                if (getattr(resolved, "capabilities", None) is not None
+                        and getattr(resolved, "principal_id", "legacy")
+                        not in ("", "legacy")):
+                    cli_principal = str(resolved.principal_id)
+        for op in ops:
+            if not isinstance(op, dict):
+                return _error("each op must be an object")
+            ns = (op.get("args") or {}).get("namespace") if isinstance(
+                op.get("args"), dict) else None
+            if ns:
+                denied = _guard_namespace(str(ns), caller=resolved)
+                if denied:
+                    return {"ok": False, **denied}
+
+        payload_lines = []
+        for op in ops:
+            payload_lines.append(json.dumps(op, ensure_ascii=False))
+        input_text = "\n".join(payload_lines) + "\n"
+        args = ["apply-ops", "--in", "-", "--json"]
+        if cli_principal:
+            args += ["--principal", cli_principal]
+        result = await _run_store_async(
+            args, input_text=input_text, deadline=deadline, pool="write")
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "store_failure",
+                    "detail": str(result)[:200]}
+        # The store layer prints the receipt envelope on stdout; the async
+        # wrapper returns the parsed stdout when --json is present.
+        receipts = result.get("receipts")
+        if receipts is None and isinstance(result.get("stdout"), str):
+            try:
+                parsed = json.loads(result["stdout"])
+                receipts = parsed.get("receipts")
+            except ValueError:
+                receipts = None
+        if receipts is None:
+            # Surface the store's attributed (content-free) refusal line —
+            # e.g. "[zmem] apply-ops: line 3: ..." — instead of a generic
+            # store_failure with no diagnostics.
+            stderr_line = ""
+            if isinstance(result.get("stderr"), str) \
+                    and result["stderr"].strip():
+                stderr_line = result["stderr"].strip().splitlines()[-1][:200]
+            return {"ok": False, "error": "store_failure",
+                    "detail": stderr_line or "no receipts in store output"}
+        return {"ok": True, "receipts": receipts}
 
     @mcp.tool()
     async def stop_evidence(

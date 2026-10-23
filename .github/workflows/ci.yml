@@ -206,6 +206,32 @@ jobs:
           fi
           echo "t08 broker python checks green (frozen + supp)"
 
+      # Issue #288 (Workstream T PR 9): the op-queue checks are python-only
+      # (frozen C1-C6 + supp) and SKIP without mcp — guarded like t06-t08.
+      - name: Fleet op-queue checks (skip-guarded)
+        shell: bash
+        run: |
+          set -e
+          out="$(python tests/test_t09_op_queue.py 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out"
+          if [ -f tests/test_t09_op_queue_supp.py ]; then
+            out2="$(python tests/test_t09_op_queue_supp.py 2>&1)" || {
+              printf '%s\n' "$out2"
+              exit 1
+            }
+            printf '%s\n' "$out2"
+          else
+            out2=""
+          fi
+          if printf '%s\n' "$out" | grep -Eq '^SKIP:' || printf '%s\n' "$out2" | grep -Eq '^SKIP:'; then
+            echo "::error::t09 op-queue checks skipped — the mcp dependency must be installed and exercised on every matrix leg (issues #159/#288)"
+            exit 1
+          fi
+          echo "t09 op-queue checks green (frozen + supp)"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

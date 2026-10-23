@@ -52,7 +52,7 @@ when the hub is unreachable.**
 | Inject | SessionStart, UserPromptSubmit (recall), PreToolUse, PostToolBatch, SubagentStart, PreCompact, PostCompact, hermes `pre_llm_call` | Inject from a valid, unexpired broker snapshot labelled `[OFFLINE SNAPSHOT r<rev>, <age> old]` (T-11); if no valid unexpired snapshot exists, inject nothing and record `reason: "hub-unreachable"`. |
 | Reflect | Stop, SubagentStop, hermes `pre_verify` | Compute failure evidence locally, queue it to the durable op queue (T-09), and render the reflection nudge locally. |
 | Capture | PostToolUse, PostToolUseFailure, UserPromptSubmit (capture-correction), hermes `post_tool_call`, every explicit write | Capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect. |
-| Session end | SessionEnd | Flush the durable op queue best-effort; never block session teardown. |
+| Session end | SessionEnd | No broker moment (session-end routing stays local by design); queued ops flush at the next read moment. Never blocks session teardown. |
 | Explicit recall | `store.py recall` / explicit memory tools | Answer from the valid, unexpired broker snapshot with the same `[OFFLINE SNAPSHOT r<rev>, <age> old]` label; if none, return no rows with `reason: "hub-unreachable"`. |
 
 Two notes on this table. **PostCompact is registered but inert today:**
@@ -348,6 +348,69 @@ codex and zcode against the vsan-1 hub is captured as transcript evidence
 per harness by the operator; the frozen checks C1-C6 prove the wired
 equivalence, the matrix rows stay `capability_gap → registered` as each
 harness's evidence lands.
+
+## T-09 delivery: durable typed operation queue (issue #288)
+
+Remote-mode writes travel as TYPED OPERATIONS, not exported rows. The
+correction-capture hook enqueues `{op_id, op: add|update|supersede|
+invalidate|capture, args, depends_on?, client_seq}` entries into an
+append-only JSONL queue under `<data dir>/queue/ops-<principal>.jsonl` —
+redacted BEFORE disk (EVERY string arg through `redact_training_text`),
+owner-only, ASCII-escaped on write and read on `\n` boundaries only (a
+U+2028 in content cannot tear the journal), with a monotonic
+per-principal `client_seq` and a projected 10 MB / 7-day bound (overflow
+REFUSES loudly). The broker's read moments flush pending ops to the hub
+in 256-op chunks (the hub batch limit) under the moment's REMAINING
+deadline. The hub's `apply_ops` (MCP tool and
+`store.py apply-ops --in <jsonl-or-->`) applies each batch under ONE
+transaction, idempotently by `(op_id, principal)` (the schema-19
+`applied_ops` primary key is the at-most-once record — ids are scoped
+per principal, so one caller cannot pre-claim or disclose another's
+canonical id), returning per-op receipts
+`{op_id, op, status: committed|rejected|duplicate|blocked, canonical_id,
+deduped}` — a dedup FOLD is `committed` + `deduped: true`; `duplicate` is
+only a replay. A dependent op names `id_or_dep` = an op_id, resolved
+through the canonical-id map so a supersede follows the id the hub
+actually assigned (within the same batch; a dependency committed by an
+EARLIER batch is `blocked`, and the queue entry is retired with that
+receipt rather than retried).
+
+Capabilities (#281's deferred enforcement): `update`/`supersede`/
+`invalidate` require `mutate` (or `admin`) for non-legacy principals —
+revoked or unknown principals deny everything, an explicitly empty
+capability set denies, legacy (`capabilities` absent) keeps today's
+behavior; `add` is never capability-gated. The effective principal is
+the authenticated request context: the MCP tool's `principal` parameter
+must name THAT principal (a mismatch is refused — no identity switch) and
+is only honored unbound for no-auth-context in-process callers; the CLI
+`--principal` is the local operator's assertion on their own machine.
+The per-op `principal` field is advisory metadata, never an identity
+switch. Namespace scope is enforced engine-side for EVERY op: a scoped
+principal's declared namespace AND each mutation target row's own
+namespace must be in the allow-list — an op that omits the namespace
+defaults to `user:global` and is refused for a scoped principal unless
+that is allow-listed (the sibling tools' #109 rule).
+
+Read-your-writes: pending ops overlay the broker's read-moment envelopes
+as bounded, fence-neutralized `[PENDING]` lines — in BOTH hub states,
+including while the hub is unreachable (the offline-recall scenario is
+exactly when an operator needs to see their un-landed write) — and a
+fire-and-forget flush sends the batch in chunks under the remaining
+deadline. The local correction-queue feed reroutes to this queue in
+remote mode (capture intent = `auto`), carrying the candidate's
+namespace, type and confidence, and FALLS BACK to the local correction
+queue when the enqueue itself fails (never a silent drop).
+
+Capture mode is chosen by INTENT, identically on both routes (issue AC6):
+explicit agent/user tool writes (`add`/`update` — CLI defaults included)
+run `auto`; the operator's `ZMEM_CAPTURE_MODE` override still wins
+(normalized); operator restore (`ingest-jsonl --allow-tombstones` without
+`--trust`) stays `manual`. Schema 19 is purely additive. The compat gate
+refuses any store whose version exceeds the client's FORWARD ceiling: a
+0.116-era client (FORWARD 18) REFUSES a v19 store with the standard
+`ZMEM_ALLOW_NEWER_SCHEMA=1` message — update all clients on shared-store
+machines BEFORE the first v19 client opens the store (a FORWARD-15 client
+refuses it the same way).
 
 ## Peer ingest trust mode (issue #282)
 

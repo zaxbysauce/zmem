@@ -175,7 +175,44 @@ item = cq.make_item(
     namespace=sys.argv[3],
     host=sys.argv[4],
 )
-_ok = cq.append_queue(sys.argv[3], item)
+if os.environ.get("ZMEM_REMOTE_URL", "").strip():
+    # issue #288: in remote mode the correction candidate feeds the
+    # durable op queue (capture intent = auto) instead of the local
+    # correction-queue sidecar; the broker flushes it to the hub.
+    # scripts_dir (sys.argv[1]) is already on sys.path above.
+    # NOTE: keep every string below DOUBLE-quoted - this python block
+    # rides inside a bash single-quoted string.
+    try:
+        from fleet import opqueue as _oq
+        from redaction import redact_training_text as _rt
+        _v = (os.environ.get("ZMEM_CAPTURE_MODE", "") or "").strip().lower()
+        _mode = (_v if _v in ("auto", "reviewed", "manual") else "manual") if _v else "auto"
+        _msg, _cnt = _rt(item.get("message", ""))
+        _oq.enqueue("local", "capture",
+                    {"content": _msg, "capture_mode": _mode,
+                     "namespace": sys.argv[3],
+                     "type": item_type,
+                     "signal": "user",
+                     "confidence": confidence,
+                     "source_ref": "session:" + sys.argv[2]},
+                    env=dict(os.environ))
+        _ok = True
+    except Exception as _exc:
+        # The enqueue failed (overflow, a local-disk problem, an import
+        # failure): fall back to the LOCAL correction-queue sidecar so the
+        # candidate is still durably held for review - a failed remote
+        # enqueue must degrade to the local sink, never to a silent drop.
+        # stderr carries the reason (the 2>/dev/null below keeps it out of
+        # the model context; the hook log shows it to an operator).
+        try:
+            _ok = cq.append_queue(sys.argv[3], item)
+        except Exception:
+            _ok = False
+        print("zmem capture-correction: op-queue enqueue failed ("
+              + type(_exc).__name__ + "); fell back to the local "
+              "correction queue", file=sys.stderr)
+else:
+    _ok = cq.append_queue(sys.argv[3], item)
 
 # Silent by default (empty {} — preserve the context budget). ZMEM_CAPTURE_FEEDBACK=1
 # emits a one-line acknowledgment (the claude-reflect "Learning captured" behavior);
