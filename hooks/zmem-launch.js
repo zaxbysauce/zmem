@@ -76,6 +76,24 @@ const TRANSLATED_HOOKS = new Set([
     "precompact",
 ]);
 
+// Issue #287 (Workstream T PR 8): remote-mode broker routing. VERB-keyed
+// (argv[2]), deliberately NOT EVENT_MAP-keyed — EVENT_MAP lacks entries
+// like session-end, and the routing must never guess. When ZMEM_REMOTE_URL
+// is set and the verb is broker-covered, the launcher spawns the fleet
+// broker CLI instead of the bash hook; every other verb (the capture
+// moments, session-end — which never recalls and whose Codex fast path
+// keeps precedence — and anything unknown) takes the unchanged local path.
+const BROKER_VERB_EVENTS = new Map([
+    ["recall", "UserPromptSubmit"],
+    ["pretool-recall", "PreToolUse"],
+    ["posttoolbatch-recall", "PostToolBatch"],
+    ["subagent-recall", "SubagentStart"],
+    ["precompact", "PreCompact"],
+    ["session-start", "SessionStart"],
+    ["reflect", "Stop"],
+    ["subagent-reflect", "SubagentStop"],
+]);
+
 // Hooks whose scripts actually read $ZMEM_NAMESPACE. Resolving the namespace
 // spawns a python + git subprocess (~100ms cold-start); every OTHER hook gets
 // ZMEM_NAMESPACE left EMPTY so that cost is never paid. This set is
@@ -2045,8 +2063,53 @@ async function main() {
     } catch {
         // Observational evidence is fail-open by contract.
     }
-    const bashPath = resolveShell();
-    const bashScriptPath = toBashPath(scriptPath);
+
+    // Issue #287: in remote mode the broker-covered verbs spawn the fleet
+    // broker CLI instead of the bash hook. The broker resolves identity
+    // client-side, calls the hub under the watchdog budget, and prints the
+    // SAME sentinel-wrapped envelope shape the bash hooks print. Fail-open
+    // routing: no resolvable python or a missing broker module falls back
+    // to the unchanged local bash path (remote mode degrades, never
+    // blocks).
+    //
+    // Kill switches route remote moments to the LOCAL path (which honors
+    // them and no-ops) exactly as the local hooks gate them: recall verbs
+    // under ZMEM_INJECT, reflection verbs under ZMEM_REFLECT/ZMEM_CAPTURE.
+    // The remote branch must re-apply every consent gate the local hook
+    // would have applied BEFORE anything leaves the machine.
+    const remoteKillSwitchOff = (() => {
+        const flag = (name) => {
+            const raw = (process.env[name] || "").trim().toLowerCase();
+            return raw === "0" || raw === "false" || raw === "off";
+        };
+        if (hookName === "reflect" || hookName === "subagent-reflect") {
+            return flag("ZMEM_REFLECT") || flag("ZMEM_CAPTURE");
+        }
+        return flag("ZMEM_INJECT");
+    })();
+    let brokerEvent = null;
+    let brokerChild = null;
+    if (!remoteKillSwitchOff
+        && (process.env.ZMEM_REMOTE_URL || "").trim()
+        && BROKER_VERB_EVENTS.has(hookName)) {
+        const brokerCli = join(getPluginRoot(), "skills", "memory",
+            "scripts", "fleet", "broker_cli.py");
+        const py = resolvePython();
+        if (py && existsSync(brokerCli)) {
+            brokerEvent = BROKER_VERB_EVENTS.get(hookName);
+            brokerChild = { py, brokerCli };
+        } else {
+            process.stderr.write("zmem: remote mode set but the fleet "
+                + "broker is unavailable; using the local path\n");
+        }
+    }
+
+    // The bash resolver (including a synchronous `where git` probe with a
+    // 3 s timeout) only serves the LOCAL spawn — the broker child never
+    // executes a bash script, so a remote-routed moment skips the probe
+    // and keeps its whole watchdog budget for hub legs.
+    const bashPath = brokerEvent ? null : resolveShell();
+    const bashScriptPath = brokerEvent ? null : toBashPath(scriptPath);
 
     // Translated hooks: buffer child stdout so we can rewrap it. Pass-through
     // hooks: inherit stdout/stderr so their output reaches the runner
@@ -2064,18 +2127,33 @@ async function main() {
     // stdout) on this path.
     let child;
     try {
-        child = spawn(bashPath, [bashScriptPath], {
-            stdio: ["pipe", translated ? "pipe" : "inherit", translated ? "pipe" : "inherit"],
-            env: buildChildEnv(env, bashPath),
-            // POSIX watchdogs kill the complete detached process group;
-            // Windows uses taskkill /T /F for the process tree.
-            detached: process.platform !== "win32",
-            // Issue #186: bashScriptPath is plugin-root-relative on Windows, so
-            // the child must resolve it against the plugin root. The wrappers
-            // self-locate via $(dirname "$0")/BASH_SOURCE, so every downstream
-            // absolute recomputation still lands on the plugin tree.
-            cwd: getPluginRoot(),
-        });
+        if (brokerEvent) {
+            // Issue #287: the broker child replaces the bash hook. Same
+            // stdio contract (stdin payload, piped stdout for the sentinel
+            // extraction), same env, same watchdog binding below.
+            child = spawn(brokerChild.py,
+                [brokerChild.brokerCli, brokerEvent], {
+                    stdio: ["pipe", translated ? "pipe" : "inherit",
+                        translated ? "pipe" : "inherit"],
+                    env: buildChildEnv(env, bashPath),
+                    detached: process.platform !== "win32",
+                    cwd: getPluginRoot(),
+                });
+        } else {
+            child = spawn(bashPath, [bashScriptPath], {
+                stdio: ["pipe", translated ? "pipe" : "inherit",
+                    translated ? "pipe" : "inherit"],
+                env: buildChildEnv(env, bashPath),
+                // POSIX watchdogs kill the complete detached process group;
+                // Windows uses taskkill /T /F for the process tree.
+                detached: process.platform !== "win32",
+                // Issue #186: bashScriptPath is plugin-root-relative on Windows, so
+                // the child must resolve it against the plugin root. The wrappers
+                // self-locate via $(dirname "$0")/BASH_SOURCE, so every downstream
+                // absolute recomputation still lands on the plugin tree.
+                cwd: getPluginRoot(),
+            });
+        }
     } catch (spawnErr) {
         if (watchdog) watchdog.clear();
         process.stdout.write("{}\n");

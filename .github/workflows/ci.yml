@@ -179,6 +179,33 @@ jobs:
           fi
           echo "t07 deadline checks green (frozen + supp)"
 
+      # Issue #287 (Workstream T PR 8): the broker checks span the python
+      # lane (frozen C2-C4 + the supp file, both SKIP without mcp) and the
+      # node lane (frozen C1 drives the real launcher against a real hub).
+      - name: Fleet broker checks (skip-guarded)
+        shell: bash
+        run: |
+          set -e
+          out="$(python tests/test_t08_broker_events.py 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out"
+          if [ -f tests/test_t08_broker_supp.py ]; then
+            out2="$(python tests/test_t08_broker_supp.py 2>&1)" || {
+              printf '%s\n' "$out2"
+              exit 1
+            }
+            printf '%s\n' "$out2"
+          else
+            out2=""
+          fi
+          if printf '%s\n' "$out" | grep -Eq '^SKIP:' || printf '%s\n' "$out2" | grep -Eq '^SKIP:'; then
+            echo "::error::t08 broker checks skipped — the mcp dependency must be installed and exercised on every matrix leg (issues #159/#287)"
+            exit 1
+          fi
+          echo "t08 broker python checks green (frozen + supp)"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

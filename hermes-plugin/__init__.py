@@ -2500,7 +2500,12 @@ class ZmemMemoryProvider(MemoryProvider):
                 store_py=str(store_py), executor=executor,
                 deadline_s=deadline_s)
         else:
-            url = str(env.get("ZMEM_MCP_URL", "") or "").strip()
+            # ZMEM_REMOTE_URL is the fleet-wide alias (the launcher, the
+            # broker and the shared transport all honor it) — a box
+            # configured with only ZMEM_REMOTE_URL must not silently
+            # resolve to an empty-URL MCP client here.
+            url = (str(env.get("ZMEM_MCP_URL", "") or "").strip()
+                   or str(env.get("ZMEM_REMOTE_URL", "") or "").strip())
             self._transport = _transport.McpHttp(
                 url=url, executor=executor, deadline_s=deadline_s)
 

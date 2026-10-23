@@ -261,6 +261,94 @@ mode gates every record kind against `--allow-namespace` — while T-09
 trust inflation as the known gap the follow-up issue tracks.
 
 
+## T-08 delivery: remote passive memory through the per-machine broker (issue #287)
+
+Remote mode is selected by `ZMEM_REMOTE_URL` (plus the same token
+resolution the hub already uses: `ZMEM_MCP_TOKEN` / `ZMEM_MCP_TOKEN_FILE` /
+per-machine principal map `ZMEM_MCP_TOKENS_FILE`). With the variable set,
+the launcher routes the broker-covered moments through
+`skills/memory/scripts/fleet/broker_cli.py` — a library entry, never a
+daemon — which resolves identity CLIENT-SIDE (git-derived namespace, session
+id, Tier-0), calls the hub under the propagated deadline (`deadline_ms`,
+T-07) with a T-05 reservation, emits the hub envelope's `rendered` member
+(fence-neutralized exactly like the local bash wrappers), and acknowledges
+delivery. With the variable unset, every hook takes the unchanged local
+path.
+
+Routing (launcher verb → moment): `recall` → UserPromptSubmit,
+`pretool-recall` → PreToolUse, `posttoolbatch-recall` → PostToolBatch,
+`subagent-recall` → SubagentStart, `precompact` → PreCompact,
+`session-start` → SessionStart, `reflect` → Stop, `subagent-reflect` →
+SubagentStop. Stop/SubagentStop send bounded, redacted failure EVIDENCE
+(the subagent's own transcript for SubagentStop — the parent transcript is
+never opened) to the hub's `stop_evidence` tool as data: count plus at most
+5 details, each whitespace-collapsed and capped at 200 chars, with secrets
+AND email AND filesystem paths scrubbed (`redact_training_text`). The hub
+rejects any path-shaped string in the payload before any store write — the
+hub never opens a client-supplied path.
+
+Disclosed divergences from the local path (all deliberate):
+
+- **Capture moments stay local.** `capture-correction`,
+  `capture-failure`, and `convention-capture` keep their local behavior in
+  remote mode (their queue writes land in the local correction queue);
+  routing those writes through the durable typed operation queue is T-09
+  (issue #288).
+- **`session-end` stays local.** The local session-end never recalls
+  (delivery-clear + empty envelope) and the Codex fast path keeps
+  precedence; hub-side ledger hygiene is owned by T-05 acks plus lazy
+  reaping, which already shipped.
+- **Query rewrite does not travel.** The local UserPromptSubmit path's
+  best-effort `query-rewrite` (fail-open, 1 s budget) is not replicated —
+  the remote leg passes the prompt verbatim and the hub selector owns
+  relevance. The T-04 parity fixture asserts envelope equality holds for
+  the recorded prompts.
+- **Hub knobs do not travel.** Per-call limits, the recall-vs-recent
+  choice, `--delegation-prompt`, and per-call cross-project flags have no
+  hub-tool arguments; in remote mode the hub selector's own limits and
+  policy govern (the #159 selector contract: the store-side selector owns
+  the relevance gate, the 1,500-token budget, and the delivery ledger).
+- **Tier 0 is hub-owned.** In remote mode the broker fetches the hub's
+  canonical user-level `core.md` (`tier0_get`) at SessionStart, caches it
+  at `<data dir>/broker/core.md` with its revision, and injects the cached
+  copy while the hub is unreachable; a local `~/.zmem/core.md` is ignored
+  in remote mode. The hub serves `tier0_get` under the standing read scope
+  rule (a scoped token may read user-level content only when `user:global`
+  is in its allow-list), the broker never clobbers a good cache with an
+  empty body, and a hub `no-core-md` answer invalidates a stale cache.
+- **Kill switches travel with the moment.** The launcher re-applies the
+  local consent gates BEFORE routing remote: `ZMEM_INJECT=0` keeps the
+  recall verbs on the local path (which no-ops), and
+  `ZMEM_REFLECT=0`/`ZMEM_CAPTURE=0` keep the reflection verbs local —
+  remote mode adds reach, never overrides an operator's capture or
+  injection opt-out.
+- **Stop evidence fires only on failures.** A Stop/SubagentStop with zero
+  extracted failures sends nothing (the local gate never emits a
+  "0 failed tool call(s)" line); the hub summary carries the TRUE failure
+  count with at most five redacted details, redaction applied BEFORE the
+  cap. SubagentStop never injects `additionalContext` (the #204 re-loop
+  hazard) — its evidence is delivered to the hub silently.
+
+Failure observability: an unreachable hub or deadline hit fails open within
+the launcher budget — every hub leg of a moment shares that moment's
+REMAINING budget, so a hung hub trips the broker's own fail-open path
+before the launcher watchdog — and reports the DISTINCT reason
+`hub-unreachable` in one JSON line appended to
+`<data_dir>/broker-log.jsonl` and in `zmem doctor`'s remote surface check
+(which reports the record's age), never the honest empty-store
+`empty-pool` (issue #287 claim 5). A structured hub refusal (path-shaped
+field, namespace guard, store-write failure) is logged as `hub-refused`;
+a LOCAL misconfiguration (missing `mcp` package, malformed token file)
+keeps the historical `empty-pool` — only a connect-level failure claims
+an outage.
+
+Host-gate evidence obligation (AC7, HOST_ONLY): per-harness model-visible
+injection at SessionStart, UserPromptSubmit and PreToolUse for claude,
+codex and zcode against the vsan-1 hub is captured as transcript evidence
+per harness by the operator; the frozen checks C1-C6 prove the wired
+equivalence, the matrix rows stay `capability_gap → registered` as each
+harness's evidence lands.
+
 ## Peer ingest trust mode (issue #282)
 
 Every machine importing rows it did not author runs

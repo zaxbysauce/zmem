@@ -145,9 +145,15 @@ class AdapterScanTest(unittest.TestCase):
         )
         transport = (REPO_ROOT / "hermes-plugin" / "transport.py").read_text(
             encoding="utf-8")
+        # Issue #287: the transport implementation was lifted to
+        # skills/memory/scripts/fleet/transport.py (hermes-plugin/
+        # transport.py is the compatibility re-export shim), so the
+        # #159 passive no-bump prefetch argv now lives in the fleet module.
+        lifted = (REPO_ROOT / "skills" / "memory" / "scripts" / "fleet"
+                  / "transport.py").read_text(encoding="utf-8")
         self.assertIn(
             '"prefetch"',
-            transport,
+            lifted,
             "the transport's local path must run the passive store.py "
             "prefetch command (issue #159 — no retrieval bump by "
             "construction)",
