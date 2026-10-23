@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "ad01742490ed43e15fa21c9c735da2dec80906891e00234685be6ad40d32d691",
+  "digest": "e56796f0eef818f6196750cf632c80bc44582efd19bd6dadb2d69611502bd34b",
   "files": {
     ".agents/plugins/marketplace.json": "f6f1c6b5b8c631a9065e4ca7d563e8765343b382ee6a40abbc4769aa27a32b4d",
     ".claude-plugin/marketplace.json": "106af6256cbda42357934eb1d42bb712e4a9b6a6019e0f253abc4878bc78effb",
@@ -116,7 +116,7 @@
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
     "skills/memory/scripts/storelib/purge.py": "617f8694b1815a1663725dace98c57ab60c5e0bc6516b506fd5cf1a2b099a470",
     "skills/memory/scripts/storelib/query_ambiguity.py": "7c22244534e72977a05de600b7601a0652a471c705f29fcde27b47dcc65aa325",
-    "skills/memory/scripts/storelib/recall.py": "206fa762524a39b50b81dba9b69b7fd6a3aa6d4fe788d8e2916b9e3a011af7b0",
+    "skills/memory/scripts/storelib/recall.py": "99a37314bce3044fc9ce4cb41477fdb2c6245cf52ed233b585440d33bc1a67e6",
     "skills/memory/scripts/storelib/rekey.py": "ed7e38f9660c2aa3aa6b2251e133f06d574bd87f3bd23c714fd585472ec6dfb3",
     "skills/memory/scripts/storelib/retain.py": "6b950fc9f8613206c2c2c688faf8b652bddd8d4d0d2f9752eadc3f58c443e111",
     "skills/memory/scripts/storelib/schema.py": "5ea6ed8cbf7055627152d0af80ef28c4a9a6287ecc27c862702c554564c59a62",
