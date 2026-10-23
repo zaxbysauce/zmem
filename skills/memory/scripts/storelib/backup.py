@@ -534,7 +534,11 @@ def cmd_sweep(marker_dir: str | None = None,
                 # Issue #284 (T-05): the reservation sidecar family
                 # (resv-*.reserve) joins the sweep so an unacked/expired
                 # reservation can never linger past the max-age policy.
-                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals", ".reserve"))
+                # Issue #315 (0.118.0): the feedback lock leaf joins too —
+                # transient by lifecycle (released after each write), and a
+                # killed writer's orphan is phantom-broken by liveness before
+                # this age backstop ever matters.
+                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals", ".reserve", ".feedback.lock"))
                         and ".ledger.seg." not in rname
                         and ".ledger.tmp." not in rname
                         and ".reserve.tmp." not in rname):

@@ -1530,9 +1530,19 @@ def select_and_budget_for_injection(
                     bump_eligible_ids=[r["id"] for r in bump_rows],
                     principal=principal, harness=harness)
             else:
-                ledger.record(resolved_data, session_id, ledger_rows, moment,
-                              bump_eligible_ids=[r["id"] for r in bump_rows],
-                              principal=principal, harness=harness)
+                # Issue #362 remainder (0.118.0): the non-reserve record path
+                # goes through the admit-once admission (exactly one winner
+                # per (session, memory) pair, loser observes
+                # already-delivered) with refresh_delivered=True so the
+                # escalation re-delivery and the bridged-subagent re-record
+                # still refresh their ledger entries under the shared upsert
+                # law. The emission-side window (render before record) stays
+                # the disclosed residual bounded by next-turn suppression.
+                ledger.record_undelivered(
+                    resolved_data, session_id, ledger_rows, moment,
+                    bump_eligible_ids=[r["id"] for r in bump_rows],
+                    principal=principal, harness=harness,
+                    refresh_delivered=True)
         except Exception:
             # Rendering has already produced safe fenced text; a delivery
             # write failure is fail-open and must not discard that text.

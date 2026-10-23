@@ -104,10 +104,16 @@ contract. The dedupe rests on the delivery ledger. T-05 closed the
 cross-process double-fire window on the reserve→ack path (the admit-once
 `record_undelivered` API serializes the check+publish under the
 delivery-state lock) and the reservations below carry the remote-caller
-case; the non-reserve local path — every hook and the default MCP
-prefetch — still records through the lock-free `record()`, where the
-pre-existing cross-process gap (issue #362) remains open in its
-documented fail-open posture.
+case. Issue #362's general case is closed as of 0.118.0 on the RECORD
+side: the non-reserve local path — every hook and the default MCP prefetch
+— records through the same admit-once `record_undelivered` API
+(`refresh_delivered=True`, so escalation and bridged-subagent re-deliveries
+keep refreshing their entries), and two concurrent fires can no longer both
+admit — except the disclosed lock-pathology corner (both callers exhausting
+the retry behind a crashed holder fall back lock-free, the module
+docstring's fail-open posture). The remaining emission-side window (render
+before record) stays the documented residual, bounded by next-turn
+suppression.
 
 ## Reservations and delivery commitment (T-05, issue #284)
 
@@ -123,11 +129,17 @@ ledger is keyed by `principal|harness|session` when the caller carries
 identity (the MCP server forwards it for map-mode principals), so two
 machines or harnesses sharing a native session id never share a ledger;
 local hooks keep the one-step session-keyed behavior byte-identically.
-On the reserve→ack path the cross-process record race (#362) is closed
-by the admit-once `record_undelivered` ledger API (the delivery-state
-lock serializes the check+publish); the non-reserve path keeps the
-pre-existing lock-free `record()` posture and issue #362 stays open for
-that general case.
+The cross-process record race (#362) is closed on every 0.118.0 path by
+the admit-once `record_undelivered` ledger API (the delivery-state lock
+serializes the check+publish; the non-reserve local path routes through it
+too, with `refresh_delivered=True` preserving the escalation/bridged upsert
+law). Two disclosed boundaries: during a mixed-version window — a live
+pre-0.118.0 process beside a 0.118.0 one on the same data dir — the old
+process still records lock-free, so admit-once holds only between new
+processes until it exits; and in the lock-pathology corner (both callers
+exhausting the retry behind a crashed holder) both fall back lock-free, per
+`record_undelivered`'s docstring. The emission-side window remains the
+documented residual bounded by next-turn suppression.
 
 **Disclosed residual — the ack-vs-ingestion gap:** the broker can
 acknowledge only what its adapter EMITTED, never what the model actually

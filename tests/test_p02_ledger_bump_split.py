@@ -66,6 +66,12 @@ def _assigned_value(node: ast.AST) -> ast.AST | None:
     return None
 
 
+# The selector's ledger sink. Issue #362 (0.117.0) renamed it from a bare
+# "record" call to the admit-once "record_undelivered" API; the guardrails
+# below must follow the SINK, not a spelling of it.
+_LEDGER_SINK = "record_undelivered"
+
+
 def _call_arg_names(func: ast.FunctionDef, dotted: str) -> list[ast.Call]:
     """Every Call node in ``func`` whose callee name is ``dotted``."""
     out: list[ast.Call] = []
@@ -136,10 +142,12 @@ class LedgerBumpSetsAreDistinctTest(unittest.TestCase):
 
     def test_ledger_record_and_bump_telemetry_receive_distinct_lists(self):
         """The two sinks must not receive the same row set."""
-        record_calls = _call_arg_names(self.func, "record")
+        record_calls = _call_arg_names(self.func, _LEDGER_SINK)
         bump_calls = _call_arg_names(self.func, "_bump_telemetry")
 
-        self.assertTrue(record_calls, "ledger.record call not found in the selector")
+        self.assertTrue(record_calls,
+                        f"the ledger sink ({_LEDGER_SINK}) call not found in "
+                        "the selector")
         self.assertTrue(bump_calls, "_bump_telemetry call not found in the selector")
 
         recorded = {n for n in (_consumed_rowset(self.func, c) for c in record_calls) if n}
@@ -188,11 +196,11 @@ class LedgerBumpSetsAreDistinctTest(unittest.TestCase):
     def test_ledger_set_is_still_bounded_by_the_rendered_fence(self):
         """#114: the rendered fence is the ceiling. Never record a row the model
         did not see, e.g. a budget-dropped candidate."""
-        record_calls = _call_arg_names(self.func, "record")
+        record_calls = _call_arg_names(self.func, _LEDGER_SINK)
         self.assertTrue(record_calls)
         self.assertEqual(
             _consumed_rowset(self.func, record_calls[0]), "ledger_rows",
-            "ledger.record must consume ledger_rows",
+            f"the ledger sink ({_LEDGER_SINK}) must consume ledger_rows",
         )
         chain = _assignment_chain(self.func, "ledger_rows")
         self.assertTrue(chain, "no assignment to ledger_rows found")
@@ -266,12 +274,12 @@ class LedgerBumpSetsAreDistinctTest(unittest.TestCase):
         self.assertFalse(
             any(isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "record"
+                and node.func.attr in ("record", _LEDGER_SINK)
                 and isinstance(node.func.value, ast.Name)
                 and "ledger" in node.func.value.id.lower()
                 for node in ast.walk(funcs[0])),
-            "recall_memory must not call a ledger record function; the plain "
-            "lane is not a delivery surface",
+            "recall_memory must not call a ledger record function (either "
+            "spelling); the plain lane is not a delivery surface",
         )
 
 
