@@ -382,10 +382,13 @@ class EnvelopeContractTest(unittest.TestCase):
         # tier floor withheld a candidate); issue #174 adds expired the same
         # way (present only when the live-expiry gate engaged); issue #284
         # (T-05) adds reservation the same way (present only in reserve
-        # mode; mirrored in hermes-plugin/__init__.py's fallback set).
+        # mode; mirrored in hermes-plugin/__init__.py's fallback set);
+        # issue #342 adds expiry_read_failed the same way (present only when
+        # a side-table read failure withheld at least one candidate).
         expected_optional = {
             "injection_risk", "candidate_lanes", "budget_note", "effective_ops",
             "secret_withheld", "global_withheld", "expired", "reservation",
+            "expiry_read_failed",
         }
         self.assertEqual(set(INJECTION_ENVELOPE_REQUIRED), expected_required)
         self.assertEqual(set(INJECTION_ENVELOPE_OPTIONAL), expected_optional)

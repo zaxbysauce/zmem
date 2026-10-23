@@ -68,6 +68,12 @@ INJECTION_ENVELOPE_OPTIONAL = frozenset({
     # commit the delivery. Keyed-only-when-present keeps the legacy wire
     # unchanged; mirrored in hermes-plugin/__init__.py's fallback set.
     "reservation",
+    # Issue #342: present only when at least one candidate was withheld
+    # because the live-expiry side-table read FAILED with the table present
+    # (lock contention, interruption) — the count of rows whose expiry
+    # state is unknown. Keyed-only-when-present keeps the legacy wire
+    # unchanged; mirrored in hermes-plugin/__init__.py's fallback set.
+    "expiry_read_failed",
 })
 
 def _capture_envelope_enabled() -> bool:
@@ -1571,6 +1577,10 @@ def select_and_budget_for_injection(
             # when-engaged — the store lane keys it only when it saw a
             # memory_expiry side row, and None keeps the wire unchanged.
             expired=parsed.get("expired"),
+            # Issue #342: forward the withheld-because-unreadable count
+            # keyed-only-when-present (a side-table read failure with the
+            # table present); None keeps the wire unchanged.
+            expiry_read_failed=parsed.get("expiry_read_failed"),
             # Issue #284 (T-05): the reservation id rides the envelope
             # keyed-only-when-present (registered above); the caller
             # acknowledges it via `prefetch-ack` to commit delivery.

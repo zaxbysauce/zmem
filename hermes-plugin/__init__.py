@@ -3494,7 +3494,12 @@ class ZmemMemoryProvider(MemoryProvider):
                            "expired",
                            # Issue #284 (T-05): the reservation id, keyed
                            # only in reserve mode. Same keep-in-step rule.
-                           "reservation")))
+                           "reservation",
+                           # Issue #342: the count of candidates withheld
+                           # because the live-expiry side-table read failed
+                           # with the table present, keyed only when
+                           # nonzero. Same keep-in-step rule.
+                           "expiry_read_failed")))
 
     def pre_verify(self, **kwargs: Any) -> Dict[str, Any]:
         """Reflect-before-stop probe (issue #163): when the session captured

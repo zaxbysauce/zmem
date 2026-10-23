@@ -3948,7 +3948,13 @@ def _render_human(report: dict) -> str:
         lines.append(f"[{check['status'].upper()}] {check['id']}: {check['summary']}")
     # PR #341 review (PRR-012): --expiring was computed but never rendered,
     # and --format defaults to `human`, so the documented invocation printed
-    # nothing about expiring rows. Render the section here.
+    # nothing about expiring rows. Render the section here. Issue #342: a
+    # FAILED read renders as a failure line, never as "0 expiring". Issue
+    # #349: unparseable deadlines get their own section.
+    expiry_read_error = report.get("expiry_read_error")
+    if expiry_read_error:
+        lines.append("")
+        lines.append(f"Expiring: read failed ({expiry_read_error})")
     expiring_states = report.get("expiring_states")
     if expiring_states is not None:
         lines.append("")
@@ -3956,6 +3962,16 @@ def _render_human(report: dict) -> str:
         for row in expiring_states:
             lines.append(
                 f"- {row['inject_until']} {row['memory_id']} "
+                f"({row['expiry_class']}) {row['namespace']} "
+                f"{row['content_preview']}"
+            )
+    unreadable_states = report.get("unreadable_expiry_states")
+    if unreadable_states:
+        lines.append("")
+        lines.append(f"Unreadable deadlines: {len(unreadable_states)}")
+        for row in unreadable_states:
+            lines.append(
+                f"- {row['inject_until']!r} {row['memory_id']} "
                 f"({row['expiry_class']}) {row['namespace']} "
                 f"{row['content_preview']}"
             )
@@ -4795,18 +4811,58 @@ def build_report(
     # PARSED INSTANT (#327): fractional inject_until forms order by their
     # true time, never lexically — the SQL fetch carries no inject_until
     # predicate at all and Python decides the window and the order.
+    # Issue #342: a FAILED side-table read (table present) surfaces as
+    # `expiry_read_error` instead of a silent [] indistinguishable from
+    # "nothing expires"; `expiring_states` is not keyed on failure —
+    # unknown is not empty. Issue #349: side rows whose inject_until does
+    # not parse are named in `unreadable_expiry_states` (keyed only when
+    # nonempty) — the one row an operator most needs to see is no longer
+    # simultaneously withheld by the gate and invisible here.
     if expiring is not None:
-        report["expiring_states"] = _expiring_states(
-            resolved_store, expiring, now)
+        try:
+            expiring_rows = _expiring_states(resolved_store, expiring, now)
+            unreadable_rows = _unreadable_expiry_states(resolved_store, now)
+        except sqlite3.Error as exc:
+            report["expiry_read_error"] = str(exc)[:200]
+        else:
+            report["expiring_states"] = expiring_rows
+            if unreadable_rows:
+                report["unreadable_expiry_states"] = unreadable_rows
     return report
 
 
-def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
-    """Rows with now < inject_until <= now + N days, parsed-instant ordered.
+def _iso_parseable(ts: object) -> bool:
+    """True when the GATE parser's full parse steps succeed on `ts`.
 
-    Read-only (mode=ro); a missing store, a pre-v15 store without the side
-    table, or a zero-match horizon all yield []. A content preview is the
-    first 80 characters with newlines collapsed to spaces.
+    Mirrors storelib.schema._parse_iso_to_epoch exactly (issue #349):
+    non-str is unparseable, naive values read as UTC, and the timestamp()
+    step's guarded failures count as unparseable — so this predicate and
+    the gate can never disagree about what "unreadable" means.
+    """
+    from datetime import datetime, timezone
+    if not isinstance(ts, str):
+        return False
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        dt.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return False
+    return True
+
+
+def _scan_expiry_states(store_path: Path, horizon: str, now: str | None) -> tuple:
+    """Read the expiry side table once: (expiring rows, unreadable rows).
+
+    Issue #342/#349 seam. Absent side table (pre-v15) yields ([], []); any
+    OTHER read error RAISES sqlite3.Error (fail-closed — the caller keys
+    `expiry_read_error` rather than reporting a silent empty horizon).
+    Unreadable rows (inject_until that fails the gate parser's steps) are
+    named separately and never listed among the expiring rows.
     """
     import re as _re
     from storelib.schema import _parse_iso_to_epoch, now_iso
@@ -4830,14 +4886,15 @@ def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
     now_str = now if now is not None else now_iso()
     now_e = _parse_iso_to_epoch(now_str)
     if now_e <= 0:
-        return []
+        return ([], [])
     horizon_e = now_e + days * 86400.0
     if not store_path.is_file():
-        return []
+        return ([], [])
     uri = store_path.resolve().as_uri() + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     out: list[dict] = []
+    unreadable: list[dict] = []
     try:
         conn.execute("PRAGMA query_only=1")
         rows = conn.execute(
@@ -4845,14 +4902,34 @@ def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
             "m.namespace, m.content, m.superseded_at "
             "FROM memory_expiry me JOIN memory m ON m.id = me.memory_id"
         ).fetchall()
-    except sqlite3.Error:
-        return []
-    finally:
+    except sqlite3.Error as exc:
+        if "no such table" in str(exc).lower():
+            conn.close()
+            return ([], [])
         conn.close()
+        raise
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
     for row in rows:
         if row["superseded_at"]:
             continue
-        until_e = _parse_iso_to_epoch(row["inject_until"] or "")
+        raw_until = row["inject_until"] or ""
+        if not _iso_parseable(raw_until):
+            # Issue #349: the gate withholds such rows (fail-closed,
+            # deliberate #174) — the operator report must still NAME them.
+            preview = " ".join((row["content"] or "").split())[:80]
+            unreadable.append({
+                "memory_id": row["memory_id"],
+                "namespace": row["namespace"],
+                "content_preview": preview,
+                "expiry_class": row["expiry_class"],
+                "inject_until": row["inject_until"],
+            })
+            continue
+        until_e = _parse_iso_to_epoch(raw_until)
         if until_e <= 0 or not (now_e < until_e <= horizon_e):
             continue
         preview = " ".join((row["content"] or "").split())[:80]
@@ -4867,7 +4944,30 @@ def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
     out.sort(key=lambda r: (r["_until_e"], r["memory_id"]))
     for r in out:
         del r["_until_e"]
-    return out
+    return (out, unreadable)
+
+
+def _unreadable_expiry_states(store_path: Path, now: str | None) -> list:
+    """Side rows whose inject_until fails the gate parser (issue #349).
+
+    Thin half of `_scan_expiry_states` (the horizon is irrelevant to the
+    unreadable set, but the shared scan keeps one read law); raises on a
+    failed read exactly like `_expiring_states` so the caller's single
+    guard covers both.
+    """
+    return _scan_expiry_states(store_path, "36500d", now)[1]
+
+
+def _expiring_states(store_path: Path, horizon: str, now: str | None) -> list:
+    """Rows with now < inject_until <= now + N days, parsed-instant ordered.
+
+    Read-only (mode=ro); a missing store, a pre-v15 store without the side
+    table, or a zero-match horizon all yield []. A content preview is the
+    first 80 characters with newlines collapsed to spaces. Issue #342: a
+    FAILED read with the table present RAISES sqlite3.Error instead of
+    returning a silent [] — the doctor report keys `expiry_read_error`.
+    """
+    return _scan_expiry_states(store_path, horizon, now)[0]
 
 
 def _report_lane_status(resolved_store: Path) -> dict:
