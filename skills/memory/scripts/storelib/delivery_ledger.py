@@ -32,21 +32,44 @@ cannot run, segments persist and every read merges them instead. Ledger
 clears, the legacy pending sidecar, and compaction remain serialized by the
 shared ``ops/.delivery-state.lock``; legacy helpers remain fail-open when
 that lock cannot be acquired, and the terminal ``end_delivery_state`` path
-still propagates the failure so the CLI cannot claim a cleanup that did not
-happen. Residual, stated plainly: a segment lost to a genuine filesystem
-failure (ENOSPC, unusable dir) is still lost — the fail-open posture this
-module has always had — and a segment published while a marker-less
+still reports failure when the LOCK cannot be acquired — unlink failures
+degrade to sweep-deferred best effort (review round 2: the previous claim
+that unlink failures propagate is no longer true). Residual, stated plainly:
+a segment lost to a genuine filesystem failure (ENOSPC, unusable dir) is
+still lost — the fail-open posture this module has always had — and a
+segment published while a marker-less
 ``clear()`` is mid-flight (after the clear's unlink glob) survives that
 clear, leaving already-delivered rows visible (over-suppression only; the
 6 h window prune self-heals it).
+
+Issue #362 / #315 / #320 / #321 (0.118.0) hardening, in one place: the
+non-reserve record path is admitted through :func:`record_undelivered`
+(exactly-one first admission, refresh-on-re-delivery via the shared upsert
+law) — since 0.118.0 ``record()`` has no production caller and is retained
+only for compatibility with direct storelib callers and the installed test
+pins; the feedback
+sidecar's rewrite is serialized by a per-session leaf lock that fails
+closed; segment reads refuse non-regular files; fully-expired segments are
+reaped on the write path even when compaction cannot run; a failed
+publication no longer skips the compaction drain; corrupt (including
+non-finite) terminal markers follow the st_mtime fallback law instead of
+escaping; the drain is a loop of bounded passes that stops at the first
+failed acquire; compaction revalidates its merge against base changes,
+defers unlinks when its acquire may have broken a stale lock, and verifies
+its write; unlink failures degrade to sweep-deferred best effort; a lock
+whose holder PID is provably dead and aged past the grace is broken instead
+of waited out; and a retried ack of an already-committed admission reports
+the honest duplicate label.
 
 Bounding: entries older than the suppression window are pruned on every
 reduce and the store is capped (oldest dropped) on every reduce, so the
 merged view can never grow without bound; the backup sweep reaps orphans
 (``.ledger``, ``.ledger.seg.`` and ``.delivery-ended`` joined the swept ops
 names). Segment growth between successful compactions is bounded by the
-number of ``record()`` calls since the last one (one segment per call), and
-compaction is re-attempted on every record. The base ledger's mtime
+number of record-path calls since the last one (one segment per call), and
+compaction is re-attempted on every record-path call (record() and
+record_undelivered() alike — review round 2 restored the drain on
+refresh-only admissions). The base ledger's mtime
 refreshes on every successful compaction; liveness of an actively-recording
 session is carried by its fresh segments, which keep ``delivered()``
 correct even while the base sits untouched. Terminal markers suppress
@@ -80,8 +103,10 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
+import stat
 import sys
 import time
 import uuid
@@ -109,6 +134,30 @@ _DELIVERY_LOCK_POLL_S = 0.005
 _DELIVERY_LOCK_STALE_S = 30.0
 _DELIVERY_END_MARKER_TTL_S = 120.0
 
+# Issue #321 (PR review crosslink, 0.118.0): a holder whose PID is provably
+# dead leaves the lock file orphaned for the whole stale window; with
+# caller-deadline kills (issue #286) that window is reachable from routine
+# operation. A lock aged past this grace whose recorded holder is dead is
+# broken via the host's phantom-lock path (the schema maintenance-lock
+# precedent). Default 2.0 s: at or under record_undelivered's 2 s retry
+# ladder, so a phantom past the grace breaks in-moment; younger orphans are
+# covered by the ladder's lock-free fallback (and the feedback path's
+# fail-closed re-apply).
+_DELIVERY_LOCK_GRACE_DEFAULT_S = 2.0
+
+# Issue #315 (0.118.0): the feedback sidecar's read-modify-write is
+# serialized by a per-session leaf lock with its own bounded wait; on timeout
+# the write fails closed (FeedbackSidecarError) — a lost verdict is worse
+# than a loud failure, though the failure is NOT always re-appliable: rows
+# whose sidecar records landed before a mid-loop failure keep those records
+# while their counter bumps roll back, so a retry skips them. 5.0 s: wide
+# enough that the parallel-
+# subagent contention shape (each sibling holding ~50 ms per event across a
+# 30-event burst, times CI-class load slowdown) cannot starve a writer into
+# the fail-closed path (review round 1, C3 stability).
+_FEEDBACK_LOCK_TIMEOUT_S = 5.0
+_FEEDBACK_LOCK_POLL_S = 0.005
+
 # Issue #252: per-call ledger segments. ``record()`` publishes one JSONL
 # segment (``<hash>.ledger.seg.<hex>``) per call with NO lock held — the
 # write path's durability no longer depends on acquiring
@@ -129,6 +178,13 @@ _LEDGER_TMP_INFIX = ".ledger.tmp."
 # reads + fsync replace + unlinks) well below the stale-lock window; a
 # larger backlog drains across subsequent record() calls.
 _MAX_SEGMENTS_PER_COMPACT = 64
+
+# Issue #321 (0.118.0): the drain re-enters the bounded pass above at most
+# this many times per _try_compact call (8 x 64 = 512 segments), each pass in
+# its OWN bounded acquisition; the loop stops at the first failed acquire, so
+# a wedged lock adds exactly one bounded wait to the caller. Every pass runs
+# the merge revalidation; the per-pass hold bound is unchanged.
+_MAX_COMPACT_PASSES = 8
 
 
 def _entry_ts(entry: Dict[str, Any]) -> float:
@@ -250,6 +306,46 @@ def _delivery_lock_path(data_dir: str) -> str:
     return os.path.join(data_dir, "ops", ".delivery-state.lock")
 
 
+def _delivery_lock_grace_s() -> float:
+    raw = os.environ.get("ZMEM_DELIVERY_LOCK_GRACE_S", "")
+    try:
+        value = float(raw) if raw else _DELIVERY_LOCK_GRACE_DEFAULT_S
+    except ValueError:
+        return _DELIVERY_LOCK_GRACE_DEFAULT_S
+    return value if value >= 0 else _DELIVERY_LOCK_GRACE_DEFAULT_S
+
+
+def _maybe_break_phantom_lock(lock_path: str) -> bool:
+    """Break the named lock when its holder is PROVABLY dead and the lock's
+    age already exceeds the grace window (issue #321; the schema
+    maintenance-lock liveness precedent). Only a dead PID implicates: a live
+    slow holder is never broken here. Returns True when a break was
+    attempted (the next acquire should proceed)."""
+    try:
+        import host
+    except ImportError:
+        return False
+    try:
+        lock_age = time.time() - os.stat(lock_path).st_mtime
+    except OSError:
+        return False
+    if lock_age <= _delivery_lock_grace_s():
+        return False
+    holder = host.read_lock_holder_pid(lock_path)
+    if not holder:
+        return False
+    holder_token, holder_pid = holder
+    if holder_pid is None or host.process_alive(holder_pid) is not False:
+        return False
+    # expected-token form: the FULL stripped lock content, exactly the
+    # maintenance lock's usage — an acquire-side token would never match.
+    # Review round 2 (PR #396): the host's result is honored — False (claim
+    # held, token changed hands, rename lost) means the break did NOT happen,
+    # and the caller must back off instead of hot-spinning on syscalls.
+    return bool(host.break_phantom_lock(lock_path, holder_token,
+                                        _delivery_lock_grace_s()))
+
+
 @contextlib.contextmanager
 def _delivery_state_lock(data_dir: str):
     """Serialize delivery mutations per ZMEM_DATA without unlocked fallback.
@@ -257,7 +353,10 @@ def _delivery_state_lock(data_dir: str):
     ``host.acquire_lock`` supplies the repository's cross-platform exclusive
     lock implementation.  It is deliberately wrapped with a short retry
     window and its unusable-lock sentinel is rejected instead of degrading to
-    an unlocked mutation.
+    an unlocked mutation. Issue #321: a losing acquire checks for a PHANTOM
+    holder (recorded PID provably dead, lock aged past the grace) and breaks
+    it via the host's identity-checked path instead of waiting out the full
+    stale window.
     """
     try:
         import host
@@ -278,11 +377,18 @@ def _delivery_state_lock(data_dir: str):
                 )
             if token is not None:
                 break
+            # The deadline check comes FIRST: the loop is wall-clock bounded
+            # no matter what. A SUCCESSFUL phantom break re-enters the
+            # acquire immediately; a FAILED one (break claim held, token
+            # changed hands) backs off one poll interval instead of
+            # hot-spinning on stat/read/process syscalls (review round 2).
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise DeliveryStateLockError(
                     f"timed out acquiring delivery lock: {lock_path}"
                 )
+            if _maybe_break_phantom_lock(lock_path):
+                continue
             time.sleep(min(_DELIVERY_LOCK_POLL_S, remaining))
         yield
     finally:
@@ -296,8 +402,26 @@ def _delivery_state_ended(data_dir: str, session_id: str) -> bool:
         return False
     try:
         with open(path, "r", encoding="utf-8") as marker:
-            ended_at = float(json.load(marker).get("ended_at", 0))
-    except (OSError, TypeError, ValueError, AttributeError):
+            raw = json.load(marker)
+        if not isinstance(raw, dict) or "ended_at" not in raw:
+            # Review round 2 (PR #396): a MISSING key is corrupt like any
+            # other shape — float(0) would parse as finite, read as
+            # long-expired, and skip the st_mtime fallback the other corrupt
+            # shapes take.
+            raise ValueError("missing or non-object ended_at")
+        ended_at = float(raw.get("ended_at", 0))
+        if not math.isfinite(ended_at):
+            # Issue #320 (0.118.0): json parses 1e400/Infinity to inf
+            # WITHOUT raising; a non-finite marker would read as ended
+            # forever ((time.time() - inf) <= ttl is always True). Corrupt
+            # per the same law below.
+            raise ValueError("non-finite ended_at")
+    except (OSError, TypeError, ValueError, AttributeError, OverflowError):
+        # OverflowError joins the tuple (issue #320): float() of a huge JSON
+        # integer raises it, and it is not a ValueError subclass — without
+        # this the corrupt-marker law (fall back to st_mtime, self-healing
+        # via the TTL) leaks an exception through record()'s terminal
+        # re-check and out of its documented fail-open boundary.
         try:
             ended_at = os.stat(path).st_mtime
         except OSError:
@@ -308,10 +432,22 @@ def _delivery_state_ended(data_dir: str, session_id: str) -> bool:
 def _unlink_delivery_path(path: Optional[str]) -> None:
     if not path:
         return
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
+    # Issue #321 (0.118.0): on Windows a concurrent reader holding the file
+    # open (plain open() does not request FILE_SHARE_DELETE) makes the unlink
+    # raise PermissionError (winerror 32/33). Bounded retry, then give up
+    # SILENTLY — the state is deferred to the 7-day sweep, and
+    # end_delivery_state's terminal contract (marker atomic with the outcome,
+    # no unlink failure escaping after the marker) holds.
+    for _attempt in range(3):
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if _attempt == 2:
+                return
+            time.sleep(0.01)
 
 
 def _clear_delivery_sidecars_locked(data_dir: str, session_id: str) -> None:
@@ -335,6 +471,24 @@ def _seg_prefix(session_id: str) -> Optional[str]:
     return name + _LEDGER_SEG_INFIX
 
 
+def _seg_file_readable(path: str) -> bool:
+    """True only for a REGULAR file (issue #320, 0.118.0).
+
+    Symlinks fail on POSIX (lstat mode is S_ISLNK); on Windows any reparse
+    point — symlink or junction — fails via FILE_ATTRIBUTE_REPARSE_POINT, and
+    directories/FIFOs/device nodes fail S_ISREG everywhere. The ops dir is a
+    shared directory: a planted name must never be followed or parsed.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if os.name == "nt" and (st.st_file_attributes
+                            & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        return False
+    return stat.S_ISREG(st.st_mode)
+
+
 def _seg_paths(data_dir: str, session_id: str) -> List[str]:
     """This session's live segment files, oldest-written first.
 
@@ -342,6 +496,8 @@ def _seg_paths(data_dir: str, session_id: str) -> List[str]:
     reducer resolve to the LATEST-WRITTEN entry (the refresh law the
     locked read-modify-write used to provide); the name is only a
     deterministic tie-break for segments written within one clock tick.
+    Issue #320: names that are not regular files (planted symlinks, reparse
+    points, FIFOs, directories) are skipped, never followed.
     """
     prefix = _seg_prefix(session_id)
     if not prefix:
@@ -356,6 +512,8 @@ def _seg_paths(data_dir: str, session_id: str) -> List[str]:
         if not n.startswith(prefix):
             continue
         p = os.path.join(ops, n)
+        if not _seg_file_readable(p):
+            continue
         try:
             hits.append((os.stat(p).st_mtime_ns, n, p))
         except OSError:
@@ -366,10 +524,15 @@ def _seg_paths(data_dir: str, session_id: str) -> List[str]:
 
 def _read_seg_file(path: str) -> Optional[List[Dict[str, Any]]]:
     """Parse one JSONL segment. Returns None when the file is unreadable
-    (caller skips it — a crashed writer must never break a read). Lines are
-    decoded per-line with ``errors="replace"`` (issue #252 review group D):
-    a crash-torn multi-byte tail corrupts only its own line, and the intact
-    lines before it stay usable — the torn line simply fails json.loads."""
+    (caller skips it — a crashed writer must never break a read) or is not a
+    regular file (issue #320: defense in depth — a planted symlink/reparse/
+    FIFO is refused before the open, not merely tolerated on error). Lines
+    are decoded per-line with ``errors="replace"`` (issue #252 review group
+    D): a crash-torn multi-byte tail corrupts only its own line, and the
+    intact lines before it stay usable — the torn line simply fails
+    json.loads."""
+    if not _seg_file_readable(path):
+        return None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             raw = f.read()
@@ -386,6 +549,20 @@ def _read_seg_file(path: str) -> Optional[List[Dict[str, Any]]]:
         if isinstance(e, dict) and isinstance(e.get("id"), str):
             out.append(e)
     return out
+
+
+def _entry_replaces(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+    """The shared upsert law: a candidate entry replaces the stored one when
+    its ts is >= the stored one (equal-ts refresh from a later-written
+    segment wins), and a ts that fails float coercion counts as newer
+    (keep-on-failure — issue #252 review P-001). This is THE implementation:
+    the reducer and the admission path (record_undelivered's
+    refresh_delivered split) must never grow a second ts comparison."""
+    try:
+        return (float(candidate.get("ts", 0) or 0)
+                >= float(existing.get("ts", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 
 def _reduce_entries(base: List[Dict[str, Any]],
@@ -417,12 +594,7 @@ def _reduce_entries(base: List[Dict[str, Any]],
             if cur is None:
                 by_id[eid] = e
                 continue
-            try:
-                newer = (float(e.get("ts", 0) or 0)
-                         >= float(cur.get("ts", 0) or 0))
-            except (TypeError, ValueError, OverflowError):
-                newer = True
-            if newer:
+            if _entry_replaces(cur, e):
                 by_id[eid] = e
     cutoff = now - _window_s()
     merged: List[Dict[str, Any]] = []
@@ -486,6 +658,149 @@ def _publish_segment(data_dir: str, session_id: str,
     return None
 
 
+def _base_identity(path: Optional[str]) -> Optional[tuple]:
+    """The base ledger's (st_mtime_ns, st_size) identity for merge
+    revalidation, or None when it does not exist."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _load_entries_checked(path: Optional[str],
+                          now: float) -> Optional[List[Dict[str, Any]]]:
+    """:func:`_load_entries` plus failure discrimination for the compaction
+    write path (PR #396 review round 2): "base is empty" must be distinct
+    from "the base could not be read" — the swallowing variant would let a
+    transient read failure re-merge from an authoritative-looking empty base
+    and permanently drop base-only rows. Delegates to ``_load_entries`` first
+    (so interleaving hooks that patch it keep firing — pinned by
+    test_p04_ledger_reducer) and re-validates only an EMPTY result for an
+    EXISTING file: a missing file is a legitimate empty base (first
+    compaction), while an existing file that fails the checked re-read means
+    "unreadable" → None (defer the pass)."""
+    if not path:
+        return []
+    result = _load_entries(path, now)
+    if result or not os.path.exists(path):
+        return result
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+    except FileNotFoundError:
+        return result
+    except (OSError, ValueError):
+        return None
+    return result
+
+
+def _compact_one_pass(data_dir: str, session_id: str, now: float,
+                      defer_unlinks: bool) -> None:
+    """One in-lock compaction pass (at most _MAX_SEGMENTS_PER_COMPACT
+    segments — the P-003/P-005 hold bound, unchanged). Issue #321
+    (0.118.0): three ordered defenses against a stale-broken second
+    compactor:
+    - merge-intent revalidation: if the base file's identity changed between
+      our read and our write, re-read the base and re-merge (bounded rounds);
+    - unlink-deferral: when the caller's pre-acquire stat showed a lock
+      already past the stale window (our acquire may have broken a live-slow
+      holder), the merge lands but NOTHING is unlinked — every writer's
+      merge inputs survive for a later safe pass;
+    - post-write verify: re-read the base and confirm every merged entry is
+      present; on a torn/lost write, re-merge from the current base once.
+    Review round 2 (PR #396): every base read on this path uses the checked
+    loader — a read FAILURE degrades to "skip the write / skip the unlinks,
+    segments linger for the next pass", never to "re-merge from an
+    authoritative-looking empty base".
+    Residual, disclosed: the microscopic stat->replace gap cannot be closed
+    without a compare-and-swap primitive; the revalidation + deferral +
+    phantom-liveness layers close every demonstrated interleaving.
+    """
+    segs = _seg_paths(data_dir, session_id)
+    base_path = ledger_path(data_dir, session_id)
+    base_stat = _base_identity(base_path)
+    base = _load_entries_checked(base_path, now)
+    if base is None:
+        return  # base unreadable: merge nothing, unlink nothing this pass
+    seg_lists: List[List[Dict[str, Any]]] = []
+    read_ok: List[str] = []
+    for p in segs[:_MAX_SEGMENTS_PER_COMPACT]:
+        entries = _read_seg_file(p)
+        if entries is None:
+            continue
+        seg_lists.append(entries)
+        read_ok.append(p)
+    if not read_ok:
+        return
+    merged = _reduce_entries(base, seg_lists, now)
+    for _ in range(3):
+        current = _base_identity(base_path)
+        if current == base_stat:
+            break
+        base_stat = current
+        reread = _load_entries_checked(base_path, now)
+        if reread is None:
+            return  # cannot revalidate: leave segments for the next pass
+        base = reread
+        merged = _reduce_entries(base, seg_lists, now)
+    _atomic_write_json(base_path, {"entries": merged})
+    final = _load_entries_checked(base_path, now)
+    if final is not None:
+        want = {e.get("id") for e in merged if isinstance(e, dict)}
+        have = {e.get("id") for e in final if isinstance(e, dict)}
+        if not want.issubset(have):
+            merged = _reduce_entries(final, seg_lists, now)
+            _atomic_write_json(base_path, {"entries": merged})
+    if defer_unlinks:
+        return
+    for p in read_ok:
+        _unlink_delivery_path(p)
+
+
+def _reap_dead_segments(data_dir: str, session_id: str, now: float,
+                        limit: int = _MAX_SEGMENTS_PER_COMPACT) -> None:
+    """Lock-free best-effort reaper (issue #320, 0.118.0): unlink segments
+    whose EVERY entry is out-of-window under the reducer's own freshness
+    rule (in-window iff float(ts) succeeds AND ts >= cutoff; a coercion
+    failure keeps the segment; NaN compares False so it is out-of-window
+    exactly as the reducer drops it). Deleting dead state only: no reader
+    depends on the unlinked rows. Unlinks are sharing-violation-tolerant
+    (best-effort; the 7-day sweep remains the backstop).
+
+    Review bound (PR #396 review round 1): the scan reads at most ``limit``
+    segments per call — OLDEST-FIRST, so aged segments are examined before
+    fresh ones. Honest cost statement (review round 2): the cap bounds the
+    segment READS; the preceding ``_seg_paths`` listing still stats every
+    live segment, so a call's cost is O(live segments) in listing work —
+    the remainder converges across subsequent calls and the drain, and the
+    7-day sweep is the backstop."""
+    cutoff = now - _window_s()
+    for p in _seg_paths(data_dir, session_id)[:max(0, limit)]:
+        entries = _read_seg_file(p)
+        if entries is None or not entries:
+            # None: unreadable/non-regular. []: no valid entries — "no
+            # entries" is not evidence that every entry is dead (review
+            # round 2), so a vacuous-empty segment is left for the sweep.
+            continue
+        dead = True
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            try:
+                ts = float(e.get("ts", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                dead = False
+                break
+            if ts >= cutoff:
+                dead = False
+                break
+        if dead:
+            _unlink_delivery_path(p)
+
+
 def _try_compact(data_dir: str, session_id: str, now: float) -> None:
     """Best-effort merge of published segments into the base ledger.
 
@@ -502,37 +817,35 @@ def _try_compact(data_dir: str, session_id: str, now: float) -> None:
 
     Issue #252 review (P-003/P-005): one pass merges at most
     ``_MAX_SEGMENTS_PER_COMPACT`` segments, so the in-lock hold stays far
-    below the stale-lock window even under a large backlog (a live holder
-    whose lock is broken mid-section would let a second compactor
-    last-writer-wins the base); a bigger backlog is drained by subsequent
+    below the stale-lock window; a bigger backlog is drained by subsequent
     record() calls. When the glob found segments but NONE were readable,
     the base is left untouched (nothing to merge; no pointless replace).
-    """
+
+    Issue #321 (0.118.0): the backlog drain is a loop of such passes — each
+    pass in its OWN bounded acquisition (the per-pass hold bound is
+    unchanged), at most ``_MAX_COMPACT_PASSES`` passes per call, STOPPING at
+    the first failed acquire so a wedged lock adds exactly one bounded wait
+    to the caller. Every pass runs the merge revalidation and honors
+    unlink-deferral (see _compact_one_pass)."""
     try:
-        with _delivery_state_lock(data_dir):
-            if _delivery_state_ended(data_dir, session_id):
-                for p in _seg_paths(data_dir, session_id):
-                    _unlink_delivery_path(p)
+        for _pass in range(_MAX_COMPACT_PASSES):
+            defer_unlinks = _delivery_lock_looks_stale(data_dir)
+            try:
+                with _delivery_state_lock(data_dir):
+                    if _delivery_state_ended(data_dir, session_id):
+                        for p in _seg_paths(data_dir, session_id):
+                            _unlink_delivery_path(p)
+                        return
+                    if not _seg_paths(data_dir, session_id):
+                        return
+                    _compact_one_pass(data_dir, session_id, now,
+                                      defer_unlinks=defer_unlinks)
+            except DeliveryStateLockError:
+                # Wedged lock: stop draining — the caller has already paid
+                # exactly one bounded wait for this pass's attempt.
                 return
-            segs = _seg_paths(data_dir, session_id)
-            if not segs:
+            if len(_seg_paths(data_dir, session_id)) <= _MAX_SEGMENTS_PER_COMPACT:
                 return
-            base = _load_entries(ledger_path(data_dir, session_id), now)
-            seg_lists: List[List[Dict[str, Any]]] = []
-            read_ok: List[str] = []
-            for p in segs[:_MAX_SEGMENTS_PER_COMPACT]:
-                entries = _read_seg_file(p)
-                if entries is None:
-                    continue
-                seg_lists.append(entries)
-                read_ok.append(p)
-            if not read_ok:
-                return
-            merged = _reduce_entries(base, seg_lists, now)
-            _atomic_write_json(ledger_path(data_dir, session_id),
-                               {"entries": merged})
-            for p in read_ok:
-                _unlink_delivery_path(p)
     except (OSError, ValueError, TypeError, OverflowError,
             DeliveryStateLockError):
         # ValueError/TypeError/OverflowError: a corrupt ts reaching an
@@ -540,6 +853,17 @@ def _try_compact(data_dir: str, session_id: str, now: float) -> None:
         # (issue #252 review P-001), never escape toward record()'s
         # fail-open boundary.
         pass
+
+
+def _delivery_lock_looks_stale(data_dir: str) -> bool:
+    """True when the delivery-state lock file already exists past the stale
+    window — the caller's acquire is about to (or just did) break a possibly
+    live holder, so this pass must defer its segment unlinks (issue #321)."""
+    try:
+        st = os.stat(_delivery_lock_path(data_dir))
+    except OSError:
+        return False
+    return (time.time() - st.st_mtime) > _DELIVERY_LOCK_STALE_S
 
 
 def entry_text(row: Dict[str, Any]) -> str:
@@ -745,10 +1069,13 @@ def record(data_dir: str, session_id: str, rows: List[Dict[str, Any]],
     if not entries:
         return
     seg = _publish_segment(data_dir, key, entries)
-    if seg is None:
-        return
+    # Issue #320 (0.118.0): the compaction drain runs even when THIS call's
+    # publication failed — a failed step cancels nothing else; segments
+    # already on disk still merge. The lock-free reaper then bounds on-disk
+    # retention of fully-expired segments even when compaction cannot run.
     _try_compact(data_dir, key, now)
-    if _delivery_state_ended(data_dir, key):
+    _reap_dead_segments(data_dir, key, now)
+    if seg is not None and _delivery_state_ended(data_dir, key):
         # Self-unlink after a fresh terminal marker. Wrapped (issue #252
         # review group G): a Windows sharing violation on the unlink must
         # degrade to "the segment lingers for the sweep", never escape
@@ -765,14 +1092,15 @@ def record_undelivered(data_dir: str, session_id: str,
                        now: Optional[float] = None,
                        bump_eligible_ids: Optional[Iterable[str]] = None,
                        principal: Optional[str] = None,
-                       harness: Optional[str] = None) -> List[str]:
+                       harness: Optional[str] = None,
+                       refresh_delivered: bool = False) -> List[str]:
     """Admit-once record (issue #362 via issue #284, T-05).
 
-    Returns the ids THIS call admitted; a concurrent winner's ids come
-    back as [] (the loser observes already-delivered). LOCKING CONTRACT:
-    the delivery-state lock is acquired once and the in-lock critical
-    section is the delivered() read + `_publish_segment` for the
-    not-yet-delivered entries ONLY — never `_try_compact` (host.acquire_lock
+    Returns the ids THIS call admitted (first deliveries); a concurrent
+    winner's ids come back as [] (the loser observes already-delivered).
+    LOCKING CONTRACT: the delivery-state lock is acquired once and the
+    in-lock critical section is the delivered() read + `_publish_segment`
+    for the kept entries ONLY — never `_try_compact` (host.acquire_lock
     is O_EXCL and non-reentrant; a nested acquire would burn the bounded
     wait). Compaction runs after release, exactly as record() does. On
     lock-timeout the acquire retries for up to 2 s total, then proceeds
@@ -781,7 +1109,16 @@ def record_undelivered(data_dir: str, session_id: str,
     winner's entries, or the retry acquired; in the lock-pathology corner
     (both callers exhausting the retry behind a crashed holder) the call
     degrades to record()-level behavior, the module's documented fail-open
-    posture. The child can never crash on the lock path.
+    posture. The child can never crash on the lock path. A dead lock holder
+    is broken in-moment by the phantom-liveness check (issue #321).
+
+    ``refresh_delivered`` (issue #362 remainder, 0.118.0): when True the
+    call also publishes REFRESH entries — ids ALREADY delivered whose new
+    entry replaces the stored one under the shared upsert law
+    (:func:`_entry_replaces`) — so the escalation re-delivery and the
+    bridged-subagent paths keep refreshing suppression through the
+    serialized admission. They are NOT counted as admitted. Default False
+    keeps the T-05 admit-once contract byte-identical.
     """
     if not rows:
         return []
@@ -795,11 +1132,21 @@ def record_undelivered(data_dir: str, session_id: str,
         return []
 
     def _critical() -> List[str]:
-        current = {e["id"] for e in delivered(data_dir, key, now=now)}
-        fresh = [e for e in entries if e["id"] not in current]
-        if not fresh:
+        current = {e["id"]: e
+                   for e in delivered(data_dir, key, now=now)
+                   if isinstance(e, dict) and isinstance(e.get("id"), str)}
+        fresh: List[Dict[str, Any]] = []
+        refresh: List[Dict[str, Any]] = []
+        for e in entries:
+            cur = current.get(e["id"])
+            if cur is None:
+                fresh.append(e)
+            elif refresh_delivered and _entry_replaces(cur, e):
+                refresh.append(e)
+        keep = fresh + refresh if refresh_delivered else fresh
+        if not keep:
             return []
-        seg = _publish_segment(data_dir, key, fresh)
+        seg = _publish_segment(data_dir, key, keep)
         if seg is None:
             # Publication failed (the module's fail-open posture): report
             # the ids as admitted so the caller does not retry-record.
@@ -817,8 +1164,15 @@ def record_undelivered(data_dir: str, session_id: str,
                 admitted = _critical()  # lock-free fallback, fresh re-read
                 break
             time.sleep(0.05)
-    if admitted:
-        _try_compact(data_dir, key, now)
+    # PR #396 review round 2: the drain runs on EVERY routed record call —
+    # including refresh-only calls (escalation / bridged-subagent re-records
+    # admit nothing), whose segments otherwise accumulated one per fire with
+    # zero compaction for the whole session. record()'s cadence — compact
+    # after every record — is the restored law; a failed lock acquisition
+    # still costs exactly one bounded wait, and correctness never depends on
+    # the drain running (reads merge segments).
+    _try_compact(data_dir, key, now)
+    _reap_dead_segments(data_dir, key, now)
     return admitted
 
 
@@ -1005,6 +1359,13 @@ def commit_reservation(data_dir: str, reservation_id: str,
     sidecar_rows = [row for row in data.get("rows", [])
                     if isinstance(row, dict)
                     and isinstance(row.get("id"), str)]
+    if not sidecar_rows:
+        # Review round 2 (PR #396): a sidecar with no admissible rows is
+        # degenerate (reserve() never mints one) — refusing it keeps the
+        # honest-duplicate label below unambiguous (empty admission can then
+        # only mean the ids are already delivered). Exit-2 refusal
+        # convention; the sidecar is NOT marked committed.
+        raise ValueError("reservation has no committable rows")
     rows = [{"id": row.get("id"), "content": row.get("text", "")}
             for row in sidecar_rows]
     # Reconstruct the #136/#250 query-matched subset from the sidecar's
@@ -1022,12 +1383,19 @@ def commit_reservation(data_dir: str, reservation_id: str,
         str(data.get("moment", "")), now=now,
         bump_eligible_ids=bump_ids,
         principal=data.get("principal"), harness=data.get("harness"))
+    # Issue #321 (0.118.0): an empty admission on an UNCOMMITTED sidecar can
+    # only mean the ids are already delivered — a previous incarnation of
+    # this same ack died (caller-deadline kill) between its ledger admission
+    # and the marker write, or another path delivered them. The honest label
+    # for the retry is the duplicate no-op, not a fresh empty commit.
     data["committed"] = True
     data["committed_ts"] = now
     try:
         _atomic_write_json(path, data)
     except OSError:
         pass  # the ledger commit already holds; the marker is best-effort
+    if not admitted:
+        return {"committed": [], "duplicate": True, "expired": False}
     return {"committed": admitted, "duplicate": False, "expired": False}
 
 
@@ -1177,16 +1545,16 @@ def snapshot_for_compact(data_dir: str, session_id: str,
 
     Retained for older direct storelib callers. The #158 PreCompact adapter
     intentionally uses ``ledger-clear`` instead and never calls this helper.
-    Issue #252 note: this reads the BASE ledger only — rows still sitting in
-    unpublished segments (compaction skipped) are not snapshotted. Legacy-
-    only path, disclosed, not carried further."""
+    Issue #320 (0.118.0): the snapshot covers the MERGED view (base ledger
+    plus any live segments) — the base-only read under-reported while
+    segments lingered."""
     path = compact_path(data_dir, session_id)
     if not path:
         return
     if now is None:
         now = time.time()
     try:
-        entries = _load_entries(ledger_path(data_dir, session_id), now)
+        entries = delivered(data_dir, session_id, now=now)
         _atomic_write_json(path, {
             "entries": entries,
             "summary": None,
@@ -1506,6 +1874,67 @@ def feedback_event_path(data_dir: str, session_id: str) -> str:
     return os.path.join(data_dir, "ops", name)
 
 
+def feedback_lock_path(data_dir: str, session_id: str) -> str:
+    """Per-session leaf lock for the feedback sidecar's read-modify-write
+    (issue #315, 0.118.0). Per-session granularity: feedback for different
+    sessions never contends, and this lock is a LEAF — never held while
+    taking another lock."""
+    name = _hashed_name(session_id, ".feedback.lock")
+    if not name:
+        raise ValueError("session_id must be non-empty")
+    return os.path.join(data_dir, "ops", name)
+
+
+@contextlib.contextmanager
+def _feedback_state_lock(data_dir: str, session_id: str):
+    """Serialize one session's feedback-sidecar rewrite (issue #315).
+
+    WITHOUT this lock two hook processes applying operation feedback for the
+    same session (parallel subagents share the session id) race the
+    load-replace and silently lose a verdict — the #252 defect class on the
+    feedback surface. Bounded wait, then FAIL CLOSED
+    (FeedbackSidecarError): unlike the delivery ledger this sidecar is a
+    correctness signal, and a lost merge is worse than a loud failure —
+    though the failure is NOT always re-appliable: rows whose sidecar
+    records landed before a mid-loop failure keep those records while their
+    counter bumps roll back, so a retry skips them (review round 2, PR
+    #396). A killed writer's orphan is broken by
+    the same phantom-liveness check the delivery lock uses (issue #321), so
+    the orphan window is the grace, not the stale window."""
+    try:
+        import host
+    except ImportError as exc:
+        raise FeedbackSidecarError("host lock support unavailable") from exc
+    path = feedback_lock_path(data_dir, session_id)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    deadline = time.monotonic() + _FEEDBACK_LOCK_TIMEOUT_S
+    token = None
+    try:
+        while token is None:
+            token = host.acquire_lock(path, _DELIVERY_LOCK_STALE_S)
+            if token == getattr(host, "_NO_LOCK_TOKEN", "unlocked"):
+                raise FeedbackSidecarError(
+                    f"could not safely acquire feedback lock: {path}")
+            if token is not None:
+                break
+            # Deadline first, then the phantom-break attempt; a FAILED break
+            # backs off one poll interval (see the delivery lock loop — the
+            # bounded wait is the wall-clock bound, the sleep is the yield).
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise FeedbackSidecarError(
+                    f"timed out acquiring feedback lock: {path}")
+            if _maybe_break_phantom_lock(path):
+                continue
+            time.sleep(min(_FEEDBACK_LOCK_POLL_S, remaining))
+        yield
+    finally:
+        if token is not None:
+            host.release_lock(path, token)
+
+
 def _load_feedback_records(path: str) -> list:
     """Read feedback sidecar records. A malformed file is treated as empty
     with exactly one stderr warning per path per command (issue #124)."""
@@ -1599,22 +2028,45 @@ def record_feedback_event(data_dir: str, session_id: str, event_id: str,
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp." + uuid.uuid4().hex
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            existing = _load_feedback_records(path)
-            for rec in existing:
-                f.write(json.dumps(rec, sort_keys=True,
-                                   separators=(",", ":"),
-                                   ensure_ascii=False) + "\n")
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except OSError as exc:
+    # Issue #315 (0.118.0): the load-all + rewrite-all + replace sequence is
+    # serialized per session — the unlocked form lost whole verdicts to the
+    # read-modify-write race (the #252 class on this surface).
+    with _feedback_state_lock(data_dir, session_id):
+        # Review round 2 (PR #396): the existing records load BEFORE the tmp
+        # file exists — a FeedbackSidecarError from an unreadable sidecar
+        # can no longer strand an empty *.tmp.* residue that no sweep owns.
+        existing = _load_feedback_records(path)
+        tmp = path + ".tmp." + uuid.uuid4().hex
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise FeedbackSidecarError(f"feedback sidecar write failed: {exc}") from exc
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                for rec in existing:
+                    f.write(json.dumps(rec, sort_keys=True,
+                                       separators=(",", ":"),
+                                       ensure_ascii=False) + "\n")
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.replace(tmp, path)
+            except OSError:
+                # Bounded sharing-violation retry (concurrent AV/indexer
+                # holds), then the fail-closed FeedbackSidecarError.
+                replaced = False
+                for _ in range(2):
+                    time.sleep(0.01)
+                    try:
+                        os.replace(tmp, path)
+                        replaced = True
+                        break
+                    except OSError:
+                        continue
+                if not replaced:
+                    raise
+        except OSError as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise FeedbackSidecarError(
+                f"feedback sidecar write failed: {exc}") from exc

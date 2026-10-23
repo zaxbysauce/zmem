@@ -142,7 +142,13 @@ class PassiveEnvelopeBoundaryTest(unittest.TestCase):
             selector = getattr(storelib, "select_and_budget_for_injection", None)
             self.assertTrue(callable(selector), "public selector seam missing")
             ledger = importlib.import_module("storelib.delivery_ledger")
-            with mock.patch.object(ledger, "record", side_effect=OSError("write")):
+            # 0.117.0 routing: the non-reserve selector writes through the
+            # admit-once API, so the write-failure sabotage targets
+            # record_undelivered - the property under test ("a post-render
+            # delivery-write failure must not discard safe text AND must not
+            # record") rides the production seam.
+            with mock.patch.object(ledger, "record_undelivered",
+                                   side_effect=OSError("write")):
                 payload = selector(
                     conn,
                     query="stash pop", namespace=NAMESPACE,
