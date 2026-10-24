@@ -354,12 +354,18 @@ a LOCAL misconfiguration (missing `mcp` package, malformed token file)
 keeps the historical `empty-pool` — only a connect-level failure claims
 an outage.
 
-Host-gate evidence obligation (AC7, HOST_ONLY): per-harness model-visible
-injection at SessionStart, UserPromptSubmit and PreToolUse for claude,
-codex and zcode against the vsan-1 hub is captured as transcript evidence
-per harness by the operator; the frozen checks C1-C6 prove the wired
-equivalence, the matrix rows stay `capability_gap → registered` as each
-harness's evidence lands.
+Host-gate evidence (AC7, HOST_ONLY): CAPTURED 2026-10-24 — the operator
+ran the T-01 harnesses against the vsan hub (http://192.168.1.148:8765/mcp,
+zmem 0.120.0, schema 19). Per-harness model-visible injection at
+SessionStart, UserPromptSubmit and PreToolUse for claude, codex and zcode
+is recorded in `docs/host-gate-evidence/287-ac7/`: launcher-contract
+captures for all three harnesses at all three moments (every capture shows
+the untrusted-fence block; the UserPromptSubmit captures additionally show
+the hub-seeded canary, and the SessionStart captures carry the hub-owned
+Tier-0 core.md), plus a verbatim `codex exec` transcript in which the
+model itself confirms the injected memories block. The frozen checks
+C1-C6 prove the wired equivalence; the matrix rows for these moments are
+`registered`.
 
 ## T-09 delivery: durable typed operation queue (issue #288)
 
