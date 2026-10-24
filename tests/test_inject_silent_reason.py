@@ -418,9 +418,13 @@ class StorelibClassifierContractTests(unittest.TestCase):
         cls.inject = inject
 
     def test_closed_vocabularies_and_gold_translation(self):
+        # Issue #290 (T-11, 0.122.0): the remote-mode degrade pair joins
+        # the closed set — hub-unreachable (T-08's transport token, now
+        # tally-able) and snapshot-expired (the AC2 broker-log reason).
         expected_reasons = (
             "empty-pool", "omitted", "below-bar", "budget-drop",
             "below-relevance", "already-delivered", "expired",
+            "hub-unreachable", "snapshot-expired",
         )
         expected_lanes = (
             "claude", "codex", "zcode", "hermes-provider", "hermes-compat",

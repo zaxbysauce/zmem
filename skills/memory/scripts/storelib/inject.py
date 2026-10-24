@@ -108,7 +108,8 @@ try:  # pragma: no cover - trivial import guard
     INJECT_SILENT_REASONS = tuple(getattr(
         _schema_meta, "INJECT_SILENT_REASONS",
         ("empty-pool", "omitted", "below-bar", "budget-drop",
-         "below-relevance", "already-delivered", "expired"),
+         "below-relevance", "already-delivered", "expired",
+         "hub-unreachable", "snapshot-expired"),
     ))
 except Exception:  # noqa: BLE001 - partially-deployed tree: use the literals
     _schema_meta = None
@@ -119,7 +120,7 @@ except Exception:  # noqa: BLE001 - partially-deployed tree: use the literals
                       "precompact")
     INJECT_SILENT_REASONS = (
         "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
-        "already-delivered", "expired",
+        "already-delivered", "expired", "hub-unreachable", "snapshot-expired",
     )
 
 DEFAULT_INJECT_TOKEN_BUDGET = 1500
@@ -970,6 +971,7 @@ def select_and_budget_for_injection(
     reserve: bool = False,
     principal: str | None = None,
     harness: str | None = None,
+    no_telemetry: bool = False,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -1002,6 +1004,12 @@ def select_and_budget_for_injection(
     explicit argument that is not a finite number is treated as unset
     (the env/default resolution applies); a negative value clamps to 0.0
     (floor disabled) — the passive lane never raises on a bad floor value.
+
+    no_telemetry (issue #290, T-11): the zero-write mode for serving
+    from a read-only snapshot conn — skips the surfaced-count bump AND
+    every delivery-ledger write (reserve/record alike).  Offline serves
+    are advisory by contract: a row served offline may be re-delivered
+    live after reconnect.
     """
     if moment not in INJECTION_MOMENTS:
         raise ValueError("invalid injection moment: {!r}".format(moment))
@@ -1510,7 +1518,7 @@ def select_and_budget_for_injection(
         bump_rows = [row for row in ledger_rows
                      if not row.get("link_relation")
                      and not row.get("_graph_arrival_only")]
-        if bump_rows and not reserve:
+        if bump_rows and not reserve and not no_telemetry:
             try:
                 recall_module._bump_telemetry(
                     conn, [r["id"] for r in bump_rows], no_bump=True)
@@ -1523,7 +1531,7 @@ def select_and_budget_for_injection(
             # query-matched subset so a downstream consumer (operation
             # feedback, the #249 report) can tell the two apart from the entry
             # instead of re-deriving arrival shape.
-            if reserve:
+            if reserve and not no_telemetry:
                 # Issue #284 (T-05): the reserving caller acknowledges the
                 # reservation via prefetch-ack; delivery is NOT committed
                 # here. The sidecar carries the ledger_rows ids and their
@@ -1535,7 +1543,7 @@ def select_and_budget_for_injection(
                     resolved_data, session_id, ledger_rows, moment,
                     bump_eligible_ids=[r["id"] for r in bump_rows],
                     principal=principal, harness=harness)
-            else:
+            elif not no_telemetry:
                 # Issue #362 remainder (0.118.0): the non-reserve record path
                 # goes through the admit-once admission (exactly one winner
                 # per (session, memory) pair, loser observes

@@ -542,6 +542,26 @@ class McpHttp:
             return {"ok": False, "reason": REASON_EMPTY_POOL}
         return payload
 
+    def snapshot(self, client_protocol: int = CLIENT_PROTOCOL_MAJOR,
+                 deadline_ms: int | None = None) -> dict[str, Any]:
+        """T-11 (#290): pull the hub's scoped snapshot payload (rows +
+        revocations + advisory revision), NOT an injection envelope.
+
+        Best-effort like hello: a failure returns ``{"ok": False}`` and
+        the caller (fleet.snapshot._refresh) keeps any existing snapshot.
+        """
+        try:
+            payload = self._run_tool("snapshot", {
+                "client_protocol": client_protocol,
+                "deadline_ms": deadline_ms,
+            })
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - fail open
+            logger.debug("zmem transport: snapshot failed open: %s", exc)
+            return {"ok": False, "reason": _failure_reason(exc)}
+        if not isinstance(payload, dict):
+            return {"ok": False, "reason": REASON_EMPTY_POOL}
+        return payload
+
     def prefetch_ack(self, reservation: str,
                      client_protocol: int = CLIENT_PROTOCOL_MAJOR,
                      deadline_ms: int | None = None) -> dict[str, Any]:

@@ -111,7 +111,9 @@
       "budget-drop": 0,
       "below-relevance": 1,
       "already-delivered": 0,
-      "expired": 0
+      "expired": 0,
+      "hub-unreachable": 0,
+      "snapshot-expired": 0
     }
   },
   "per_moment": {

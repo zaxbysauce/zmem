@@ -442,6 +442,13 @@ INJECT_FLOOR_USER_GLOBAL_ENV = "ZMEM_INJECT_FLOOR_USER_GLOBAL"
 #                 EVERY query-matched candidate failed a per-lane relevance
 #                 floor: "nothing relevant", distinct from below-bar's
 #                 "nothing trusted" so the #94 report can separate the two.
+#   hub-unreachable / snapshot-expired (issue #290, T-11) — the remote-mode
+#                 degrade pair: the hub could not be contacted and no valid
+#                 snapshot existed (hub-unreachable, the T-08 transport
+#                 token joined to the closed tally), or a snapshot existed
+#                 but its 72 h window had passed (snapshot-expired, the AC2
+#                 broker-log reason). Remote-mode producers only; the
+#                 classifier never emits either.
 # The hook body, Hermes session_start, and the MCP twin import this tuple as
 # the single source (PRR-017 discipline). Do not invent extra reasons.
 # Closed attribution vocabularies for passive injection decisions (issue #153,
@@ -453,7 +460,7 @@ INJECT_MOMENTS = ("session_start", "user_prompt", "pretool", "subagent",
                   "precompact")
 INJECT_SILENT_REASONS = (
     "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
-    "already-delivered", "expired",
+    "already-delivered", "expired", "hub-unreachable", "snapshot-expired",
 )
 
 # Success-line reason (not a silent reason): logged alongside status=injected
