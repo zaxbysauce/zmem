@@ -343,7 +343,9 @@ def _injection_silent_reasons() -> tuple:
 
     # Keep the partial-deployment fallback byte-identical to schema_meta and
     # storelib.inject.  ``expired`` names a pool the live-expiry gate drained
-    # (producer since #174; the vocabulary was reserved by #153).
+    # (producer since #174; the vocabulary was reserved by #153).  The T-11
+    # remote-mode pair (hub-unreachable, snapshot-expired; issue #290) joins
+    # the tally since 0.122.0.
     return tuple(
         getattr(
             _sm,
@@ -356,6 +358,8 @@ def _injection_silent_reasons() -> tuple:
                 "below-relevance",
                 "already-delivered",
                 "expired",
+                "hub-unreachable",
+                "snapshot-expired",
             ),
         )
     )

@@ -68,6 +68,19 @@ every `store.py` subcommand routes through the fleet backend — no local
   configuration error (exit 2). `ZMEM_DATA` alone is fine — it names the
   local data dir (op queue, sidecars).
 
+**Offline degrade (issue #290):** when the hub is unreachable, reads fall
+back to the machine's broker snapshot — a read-only, principal-scoped
+copy under `<data>/broker/snapshot.sqlite` that expires 72 h after issue
+and is refreshed hourly and on every hub reconnect by the broker (never
+by hooks). A served answer carries the label
+`[OFFLINE SNAPSHOT r<rev>, <age> old]` (broker-emitted fence header on
+the Inject path; an additive `offline_snapshot` provenance key on CLI
+reads, with a stderr note — stdout stays JSON-parseable). An expired or
+missing snapshot keeps the plain `hub-unreachable` error on the CLI; the
+Inject path logs `snapshot-expired` instead. A row served offline is
+advisory and may be re-delivered live after reconnect; the snapshot never
+merges with live data — a reconnect supersedes it.
+
 With `ZMEM_REMOTE_URL` unset, every command is local and unchanged.
 
 ## When to use

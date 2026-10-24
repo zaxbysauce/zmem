@@ -409,6 +409,14 @@ for a project into a single markdown file, commit it, and point the repo's
 `CLAUDE.md` at it. Any session that can read the repo — cloud or local — then
 gets that memory for free, with no store connection at all.
 
+Scope note: this Tier-1 pack is repo-committed CONTEXT for sessions without
+a store connection — it is NOT the fleet's offline fallback. When a machine
+runs against a hub (`ZMEM_REMOTE_URL`), hub unavailability is served by
+T-11's broker snapshot (issue #290: revisioned, 72 h-expiring,
+principal-scoped, refreshed on reconnect — see `docs/FLEET.md`), and hub
+disaster recovery is T-12's Litestream replication (issue #291) — neither
+reads this pack.
+
 ```bash
 <interpreter> <store.py> export-pack \
   --namespace project:github.com/<org>/<repo> \

@@ -77,17 +77,19 @@ captured row forge it (the marker-grammar discipline of
 possibly skewed clock, so it is advisory.
 
 The `reason: "hub-unreachable"` token (and #290 AC2's `snapshot-expired`)
-are **new contract tokens, not members of today's closed vocabulary**:
-`INJECT_SILENT_REASONS` (`skills/memory/scripts/schema_meta.py`) currently holds
+are **contract tokens of the closed vocabulary since T-11 (0.122.0)**:
+`INJECT_SILENT_REASONS` (`skills/memory/scripts/schema_meta.py`) now holds
 exactly `empty-pool`, `omitted`, `below-bar`, `budget-drop`,
-`below-relevance`, `already-delivered`, `expired`, and the classifier
-rewrites an unrecognised reason to `empty-pool`. T-11 must therefore add
-both tokens to that tuple (and to the consumers that tally it —
-`storelib/eval_gold.py`'s silent-reason counters and the launcher's
-`reason=` status line) in the same change that first emits them;
-until then a degraded-mode reason recorded today would be silently
-rewritten, which is why the obligation is stated here rather than
-assumed.
+`below-relevance`, `already-delivered`, `expired`, `hub-unreachable`,
+`snapshot-expired`, with byte-identical fallback literals in
+`storelib/inject.py`, `storelib/eval_gold.py`, and the MCP server twin —
+the exact-equality pin in `tests/test_inject_silent_reason.py` (both the
+schema_meta arm and the partial-deployment fallback arm) is the guardrail.
+The classifier still never emits either remote-mode token (both are
+produced by the broker/transport layer only). The launcher's outer-timeout
+`reason=omitted` decision-log lines are a single pre-existing vocabulary
+token by design and stay as-is (they name a watchdog event, never a
+silent-reason tally).
 
 ## Codex first-prompt double-fire policy
 
@@ -524,6 +526,100 @@ reproduced and the strip pinned by
 Envelope passthrough: `_parse_results` now passes the retrieval-telemetry
 `arms` member (and `excluded`) through and int-normalizes the token
 counts, so a remote read prints the same key set as its local twin.
+
+## T-11 delivery: declared offline mode — the revisioned, expiring, revocable broker snapshot (issue #290)
+
+`skills/memory/scripts/fleet/snapshot.py` owns the offline artifacts under
+`<data>/broker/`: `snapshot.sqlite` + `snapshot.meta.json` (one rollover
+pair `snapshot.prev.sqlite` kept; a meta-write failure after a successful
+sqlite replace restores the previous pair). The PUBLIC build seam is
+`build_snapshot` — the only `…snapshot…`-named public callable in fleet
+(the T-10 probe shape); it reads a source store read-only, applies the AC5
+dual scope law IN THE BUILDER (`user:global` unconditionally plus
+authorized PROJECT namespaces with read-or-wrote activity in the last 30
+days — authorization AND recency), writes the scoped pair atomically with
+owner-only permissions, and refuses a payload over 64 MB (the old pair
+survives). `_load` opens the snapshot `mode=ro` + `PRAGMA query_only=1`
+with `row_factory=sqlite3.Row` (raw tuples TypeError in the selector's
+row consumers); `_state(meta)` settles none | expired | valid against the
+72 h default window.
+
+Three lanes serve from it, and every one runs the SAME selector
+(`select_and_budget_for_injection`) in the NEW zero-write mode
+(`reserve=False` + `no_telemetry=True` — the surfaced-count bump AND both
+delivery-ledger writes are skipped; offline serves are advisory, so a row
+served offline may be re-delivered live after reconnect by design):
+
+- **Broker/Inject lane** (`fleet/broker.py::_handle_read`): on the
+  unreachable branch, a valid snapshot is served as the standard #158
+  envelope with the `[OFFLINE SNAPSHOT r<rev>, <age> old]` label as a
+  broker-emitted fence header (never row content) plus the pending T-09
+  overlay; an EXPIRED snapshot serves nothing and logs the distinct
+  `reason: "snapshot-expired"`; state none keeps the exact T-08 fail-open.
+  Every unreachable moment writes the persisted
+  `<data>/broker/hub-unreachable.stamp` — the only cross-moment memory in
+  a per-moment-subprocess fleet. On a SUCCESSFUL hub read the broker
+  best-effort refreshes under `min(2000 ms, remaining // 4)` AFTER the
+  live result is chosen: refresh fires on none / stale (hourly cadence,
+  `ZMEM_SNAPSHOT_REFRESH_S` override) / the persisted
+  unreachable→reachable transition, and the stamp clears ONLY when a
+  refresh completed (a skipped or failed refresh re-arms it for the next
+  moment).
+- **Hermes provider lane** (`hermes-plugin/__init__.py::pre_llm_call`): an
+  McpHttp-prefetch `hub-unreachable` failure serves through
+  `fleet.snapshot._serve_offline_read` (the module is loaded beside the
+  checkout's scripts dir under a unique name with a scoped, restored
+  `sys.path` entry — the provider never imports storelib in-process
+  otherwise, and no zero-write CLI surface exists for a subprocess
+  serve). The served envelope is the STANDARD #158 key set — the label
+  rides inside `rendered`, no `offline_snapshot` key, and it passes the
+  strict `_envelope_is_valid` unknown-key rejection; it is NOT a failure
+  envelope, so the transport-failure cache never suppresses subsequent
+  recall. This lane writes no stamp and runs no refresh (a hermes-only
+  deployment has no refresh writer — its matrix "if none …
+  hub-unreachable" degrade is the documented behavior; a broker-bearing
+  machine refreshes); state expired degrades to `{}`.
+- **CLI lane** (`storelib/remote_gate.py::_offline_read`): on
+  hub-unreachable, a VALID snapshot answers `recall`/`search`/`recent`
+  with the live envelope key set PLUS exactly one additive
+  `offline_snapshot` provenance key (the label string) and a stderr note
+  — stdout stays JSON-parseable; `list` prints its 3-key object plus the
+  provenance key; `get` prints the row JSON plus the provenance key. An
+  expired or missing snapshot keeps the CURRENT error contract — the CLI
+  reports `hub-unreachable` (a deliberate asymmetry, not a bug: AC2's
+  `snapshot-expired` reason belongs to the passive Inject path; this
+  row's "if none" is the explicit-read contract).
+
+The hub side is one additive prefetch-shaped MCP tool, `snapshot`
+(`hermes-plugin/server/mcp_server.py`): protocol + deadline gates, a
+principal-bound scope (the caller's token allow-list — unscoped operator:
+all namespaces — intersected with the same 30-day activity law), one
+consistent SQLite read emitting live rows (selector-relevant columns,
+embedding blobs base64 for the hub's ACTIVE profile; a broker-side
+profile mismatch degrades the snapshot to lexical retrieval, never fails
+the serve — the payload ships embedding blobs in `memory.embedding` only,
+with no vector chunks, so the vec lane finds nothing and every serve is
+lexical), the revocation list (currently-superseded ids in scope —
+superseded-only by the scope law: purged ids are unnamespaced post-purge,
+so emitting or copying them would leak other principals' row identifiers;
+a purged row's absence from the live rows IS its revocation — replacement
+semantics make AC3 hold: a row purged after r1 is absent from r2), an
+advisory `snapshot_revision` (live + revoked count; the broker's
+receive-time `issued_at` disambiguates), and a > 64 MB structured
+refusal. The transport wrapper is `McpHttp.snapshot` (best-effort like
+`hello`). A hub-ANSWERED refusal (any payload without an explicit
+`ok: true`) never destroys the previous pair and never clears the stamp —
+the refresh retries on a later moment. Deliberate deviation from the
+issue's advisory file list: there is NO separate `store.py snapshot` CLI
+subcommand — the hub-side build lives in the MCP tool and
+`fleet.snapshot.build_snapshot`. One disclosed degrade shape: an offline
+SessionStart serves through the query-shaped selector (no query exists
+for the moment), so it degrades to the fail-open envelope plus the
+pending overlay rather than a recency-shaped serve.
+
+The capability-matrix rows for the Inject and explicit-recall degrade
+cells move from obligation to shipped with this delivery; the T-12
+`doctor --fleet` snapshot-age report (issue #291) remains open.
 
 ## Peer ingest trust mode (issue #282)
 

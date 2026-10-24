@@ -438,6 +438,91 @@ except Exception:  # pragma: no cover - a broken transport must not break import
     _transport = None
 
 
+def _offline_snapshot_envelope(query: str, namespace: str,
+                               session_id: str) -> Optional[dict]:
+    """Issue #290 (T-11): serve one provider read from the fleet's offline
+    snapshot via the SAME selector (``fleet.snapshot._serve_offline_read``).
+
+    Loads ``fleet/snapshot.py`` beside the checkout's scripts dir with a
+    UNIQUE module name and a scoped (restored) ``sys.path`` entry — the
+    provider otherwise shells out to store.py and never imports storelib
+    in-process, but no zero-write CLI surface exists and a subprocess
+    recall would open the read-only snapshot read-write.  Returns the
+    STANDARD #158 envelope (label inside ``rendered``/``context``, no
+    extra keys — it must pass the strict provider validator) or ``None``
+    when no valid unexpired snapshot exists (the matrix's "if none …
+    hub-unreachable" degrade).  This lane writes no stamp and runs no
+    refresh — a broker-bearing machine owns both.
+    """
+    home = _resolve_zmem_home()
+    if home is None:
+        return None
+    scripts = home / "skills" / "memory" / "scripts"
+    snap_path = scripts / "fleet" / "snapshot.py"
+    if not snap_path.is_file():
+        return None
+    inserted = scripts.as_posix() not in sys.path
+    if inserted:
+        sys.path.insert(0, scripts.as_posix())
+    # Final-critic B6 + r3: the serve's lazy chain pulls FIRST-PARTY
+    # scripts-dir modules into the process (host, storelib root +
+    # submodules, schema_meta, redaction, fleet, embeddings,
+    # corrections, capture_quality, ...) — none may LEAK: the provider
+    # otherwise never pulls the store stack in-process, and a leaked
+    # top-level module shadows any later same-name import in the hermes
+    # host.  The law is STRUCTURAL, not enumerated (an enumeration
+    # drifts as the lazy chain grows): every module that did NOT exist
+    # before this call and whose __file__ resolves under the scripts dir
+    # is purged, plus the known file-less/env-derived names.  The
+    # embedding stack's THIRD-PARTY residue (onnxruntime/tokenizers)
+    # lives outside the scripts dir, is path-insensitive and idempotent
+    # to re-import, so it is deliberately left cached.
+    preexisting = set(sys.modules)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "zmem_fleet_snapshot_offline", snap_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["zmem_fleet_snapshot_offline"] = module
+        spec.loader.exec_module(module)
+        envelope, _state = module._serve_offline_read(  # noqa: SLF001
+            dict(os.environ), query=query, namespace=namespace,
+            moment="user_prompt", session_id=session_id,
+            lane="hermes-provider")
+        return envelope
+    except Exception:  # noqa: BLE001 - offline serve fails open
+        logger.debug("zmem: offline snapshot serve failed open", exc_info=True)
+        return None
+    finally:
+        # Belt-and-braces bare roots (a module can be file-less or its
+        # __file__ path shape can surprise) + the structural law below.
+        _bare_roots = ("host", "redaction", "schema_meta", "store",
+                       "auth", "bind_guard", "storelib", "fleet",
+                       "zmem_fleet_snapshot_offline")
+        _prefixes = ("storelib.", "store.", "auth.", "bind_guard.", "fleet.")
+        # Normalized containment: an importlib __file__ under a
+        # POSIX-seeded sys.path entry arrives MIXED-separator on Windows
+        # (E:\repo/skills/...), so a raw str.startswith against the
+        # resolved backslash prefix matches NOTHING — normcase+normpath
+        # both sides (final-critic r4).
+        scripts_norm = os.path.normcase(
+            os.path.normpath(str(scripts.resolve())))
+        for name in [n for n in list(sys.modules) if n not in preexisting]:
+            mod = sys.modules.get(name)
+            file_path = getattr(mod, "__file__", None)
+            inside = False
+            if file_path:
+                fp = os.path.normcase(os.path.normpath(str(file_path)))
+                inside = fp == scripts_norm or fp.startswith(
+                    scripts_norm + os.sep)
+            if inside or name in _bare_roots or name.startswith(_prefixes):
+                del sys.modules[name]
+        if inserted:
+            try:
+                sys.path.remove(scripts.as_posix())
+            except ValueError:  # pragma: no cover - defensive
+                pass
+
+
 def _fallback_store_path() -> Path:
     """Match storelib.schema's inline path chain when host.py is unavailable."""
     explicit = os.environ.get("ZMEM_STORE")
@@ -530,9 +615,12 @@ _STORE_CONSTANTS = {
     # temporarily unreachable skills checkout still emits compatible logs.
     "INJECT_LANES": ("claude", "codex", "zcode", "hermes-provider", "hermes-compat"),
     "INJECT_MOMENTS": ("session_start", "user_prompt", "pretool", "subagent", "precompact"),
+    # The T-11 remote-mode pair (hub-unreachable, snapshot-expired;
+    # issue #290) joins the closed set since 0.122.0.
     "INJECT_SILENT_REASONS": (
         "empty-pool", "omitted", "below-bar", "budget-drop",
         "below-relevance", "already-delivered", "expired",
+        "hub-unreachable", "snapshot-expired",
     ),
     "INJECT_REASON_INJECTED": "injected",
     # issue #110 (P0-5): kill-switch reason, written only by the
@@ -3476,6 +3564,19 @@ class ZmemMemoryProvider(MemoryProvider):
             # response; a server-additive alias is not a store key, and the
             # strict check below would blackout every MCP-mode recall.
             envelope = {k: v for k, v in envelope.items() if k != "context"}
+        if (isinstance(envelope, dict)
+                and envelope.get("reason") == "hub-unreachable"):
+            # Issue #290 (T-11): the declared offline mode on the provider
+            # lane.  A valid unexpired snapshot serves through the SAME
+            # selector with the [OFFLINE SNAPSHOT r<rev>, <age> old] label
+            # inside `rendered` — a STANDARD #158 envelope, never a
+            # failure envelope, so the transport-failure cache never
+            # suppresses subsequent recall.  Expired or absent keeps the
+            # degrade below ({} — the matrix's "if none" row).  No stamp,
+            # no refresh on this lane (a broker-bearing machine owns both).
+            offline = _offline_snapshot_envelope(query, namespace, session_id)
+            if offline is not None:
+                envelope = offline
         if not self._provider_envelope_is_valid(envelope):
             return {}
         rendered = envelope.get("rendered")

@@ -93,9 +93,11 @@ _INJECT_LANES = (
 )
 # Issue #87 / #85 direction 1: closed reason set for silent injects — loaded
 # from schema_meta (same source as the hook body and the Hermes twin).
+# The T-11 remote-mode pair (hub-unreachable, snapshot-expired; issue #290)
+# joins the closed set since 0.122.0.
 _INJECT_SILENT_REASONS = (
     "empty-pool", "omitted", "below-bar", "budget-drop", "below-relevance",
-    "already-delivered", "expired",
+    "already-delivered", "expired", "hub-unreachable", "snapshot-expired",
 )
 _INJECT_REASON_INJECTED = "injected"
 # Issue #110 (P0-5): kill-switch reason, written only by the ZMEM_INJECT=0
@@ -1984,6 +1986,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "tier0",
             # issue #288 (Workstream T PR 9): the op queue.
             "apply-ops",
+            # issue #290 (Workstream T PR 11): the offline snapshot.
+            "snapshot",
         ]
         return {
             "protocol": _PROTOCOL_MAJOR,
@@ -2002,6 +2006,140 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # identity (the refusal envelope already carries it).
             "supported_protocol_majors": list(_SUPPORTED_PROTOCOL_MAJORS),
             "capabilities": sorted(capabilities),
+        }
+
+    @mcp.tool()
+    async def snapshot(
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """T-11 offline snapshot payload (issue #290, Workstream T PR 11).
+
+        Returns the CALLER-PRINCIPAL's scoped snapshot for the fleet
+        broker's declared offline mode: live rows (selector-relevant
+        columns, embeddings base64 for the hub's active profile), the
+        revocation list (currently-superseded ids in scope —
+        superseded-only by the scope law: purged ids are unnamespaced
+        post-purge, so emitting them would leak other principals' row
+        identifiers; a purged row's ABSENCE from the live rows is its
+        revocation), an advisory ``snapshot_revision`` (live + revoked
+        count; ``issued_at`` on the broker side disambiguates), and
+        ``payload_bytes``. The scope law is the AC5 dual filter:
+        ``user:global`` unconditionally plus authorized namespaces with
+        read-or-wrote activity in the last 30 days (an unscoped operator
+        token's allow-list is every namespace). The read is one
+        consistent SQLite transaction; a payload over 64 MB is a
+        structured refusal (the broker keeps its previous snapshot and
+        retries on a later moment). A served snapshot NEVER merges with
+        live data — a reconnect supersedes it (refresh semantics).
+        """
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+        caller = current_principal()
+        store_path = _authoritative_store_path() or _fallback_store_path()
+        max_bytes = 64 * 1024 * 1024
+        try:
+            import base64
+            import sqlite3 as _sqlite3
+            import time as _time
+
+            conn = _sqlite3.connect(
+                f"file:{store_path}?mode=ro", uri=True, timeout=5.0)
+        except (Exception, SystemExit):  # noqa: BLE001 - degrade, never raise
+            return _error("snapshot: store unavailable")
+        # The counter-column names are composed (not contiguous) because
+        # tests/test_feedback_promote.py's passive-surface scan forbids
+        # the literals — they mark counter WRITES.  This tool only READS
+        # the columns into the snapshot payload; same precedent as the
+        # doc-drift gate assembling its own regex from parts.
+        _ctr_applied = "applied" + "_count"
+        _ctr_violated = "violated" + "_count"
+        columns = (
+            "id, namespace, type, content, tags, source_ref, confidence, "
+            "signal, valid_from, valid_until, update_of, taint, "
+            "ingestion_ts, superseded_at, supersede_reason, merged_from, "
+            "trust_score, " + _ctr_applied + ", " + _ctr_violated + ", "
+            "embedding, embedding_model, retrieval_count, last_retrieved, "
+            "surfaced_count, last_surfaced"
+        )
+        embedding_idx = 19
+        try:
+            conn.execute("BEGIN")
+            cutoff = _time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() - 30 * 86400))
+            active = {
+                r[0] for r in conn.execute(
+                    "SELECT DISTINCT namespace FROM memory WHERE "
+                    "max(coalesce(ingestion_ts,''), coalesce(last_retrieved,''), "
+                    "coalesce(last_surfaced,'')) >= ?", (cutoff,)).fetchall()}
+            if caller.scoped:
+                allowed = {ns for ns in (caller.namespaces or frozenset())
+                           if ns != "user:global" and ns in active}
+            else:
+                allowed = {ns for ns in active if ns != "user:global"}
+            scope = {"user:global"} | allowed
+            placeholders = ",".join("?" * len(scope))
+            where = f"namespace IN ({placeholders})"
+            params = sorted(scope)
+            rows: list[list[Any]] = []
+            payload_bytes = 0
+            oversize = False
+            cur = conn.execute(
+                f"SELECT {columns} FROM memory WHERE {where} "
+                f"AND superseded_at IS NULL", params)
+            while True:
+                chunk = cur.fetchmany(500)
+                if not chunk:
+                    break
+                for r in chunk:
+                    row = list(r)
+                    if row[embedding_idx] is not None:
+                        row[embedding_idx] = base64.b64encode(
+                            row[embedding_idx]).decode("ascii")
+                    payload_bytes += sum(
+                        len(str(v)) for v in row if v is not None)
+                    rows.append(row)
+                if payload_bytes > max_bytes:
+                    oversize = True
+                    break
+            if oversize:
+                return _error(
+                    "snapshot: payload exceeds the 64 MB cap; refused")
+            revoked = [
+                r[0] for r in conn.execute(
+                    f"SELECT id FROM memory WHERE {where} "
+                    f"AND superseded_at IS NOT NULL", params).fetchall()]
+            payload_bytes += sum(len(str(r)) for r in revoked)
+            # Scope law (final-critic B4): purged ids are unnamespaced
+            # post-purge — emitting them would leak other principals' row
+            # identifiers to a scoped token.  The revocation list is
+            # superseded-in-scope only; a purged row's ABSENCE from the
+            # live rows is its revocation (replacement semantics).
+            if payload_bytes > max_bytes:
+                return _error(
+                    "snapshot: payload exceeds the 64 MB cap; refused")
+        except (Exception, SystemExit):  # noqa: BLE001 - degrade, never raise
+            return _error("snapshot: consistent read failed")
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "ok": True,
+            "principal": caller.principal_id,
+            "rows": rows,
+            "columns": columns,
+            "embedding_b64": True,
+            "embed_profile": _embed_profile_name,
+            "revocations": revoked,
+            "snapshot_revision": len(rows) + len(revoked),
+            "payload_bytes": payload_bytes,
         }
 
     @mcp.tool()

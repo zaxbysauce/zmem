@@ -130,6 +130,62 @@ def _import_fleet():
     return opqueue, transport
 
 
+_LIVE_READ_KEYS = ("results", "count", "omitted", "injection_risk",
+                   "tokens_used", "tokens_budget", "arms", "excluded")
+
+
+def _offline_read(cmd: str, args: Any):
+    """Issue #290 (T-11): the CLI offline serve.  A VALID unexpired broker
+    snapshot answers a hub-unreachable read with the live envelope key set
+    PLUS exactly one ``offline_snapshot`` provenance key (the label) and a
+    stderr note (stdout stays JSON-parseable).  An expired or missing
+    snapshot keeps the CURRENT error contract — the CLI reports
+    ``hub-unreachable`` (the disclosed asymmetry vs the Inject path's
+    snapshot-expired reason).  Returns the payload dict or None.
+    """
+    from fleet import snapshot as fleet_snapshot  # noqa: PLC0415
+    env = dict(os.environ)
+    label = fleet_snapshot.offline_label(env)
+    if label is None:
+        return None
+    payload = None
+    try:
+        limit = max(1, min(int(getattr(args, "limit", 0) or 5), 50))
+    except (TypeError, ValueError):
+        limit = 5
+    if cmd in ("recall", "search"):
+        query = args.query if cmd == "recall" else args.text
+        payload, _state = fleet_snapshot._serve_offline_read(  # noqa: SLF001
+            env, query=query, namespace=args.namespace or "",
+            moment="user_prompt", session_id="cli-offline", lane=None,
+            limit=limit)
+    elif cmd == "recent":
+        payload = fleet_snapshot._serve_offline_recent(  # noqa: SLF001
+            env, args.namespace, limit=limit)
+    elif cmd == "list":
+        payload = fleet_snapshot._serve_offline_list(  # noqa: SLF001
+            env, args.namespace, limit=args.limit,
+            include_superseded=bool(getattr(
+                args, "include_superseded", False)))
+    elif cmd == "get":
+        payload = fleet_snapshot._serve_offline_get(  # noqa: SLF001
+            env, args.id)
+    if not isinstance(payload, dict) or not payload:
+        return None
+    if cmd in ("recall", "search", "recent"):
+        # Project the selector's internal envelope down to the LIVE
+        # envelope key set (store.py recall --json shape) so the offline
+        # answer carries exactly the live keys + the one provenance key.
+        payload = {k: v for k, v in payload.items() if k in _LIVE_READ_KEYS}
+        if not payload.get("excluded"):
+            # Live parity: an empty `excluded` is omitted entirely.
+            payload.pop("excluded", None)
+    payload["offline_snapshot"] = label
+    print(f"[zmem] hub unreachable; answering from {label}",
+          file=sys.stderr)
+    return payload
+
+
 def _refuse(msg: str) -> "NoReturn":  # type: ignore[name-defined]
     print(f"[zmem] {msg}", file=sys.stderr)
     sys.exit(2)
@@ -244,6 +300,9 @@ def _hub(transport_module: Any) -> Any:
 
 
 def _expected_read_keys(cmd: str, envelope: dict[str, Any]) -> bool:
+    # Issue #290 (T-11): subset semantics — an offline-served payload
+    # (live keys + exactly one additive `offline_snapshot` provenance
+    # key) is accepted by construction; no extension needed.
     if cmd == "list":
         # The hub list_memories tool returns the list --json object
         # (recall.py list_memory), never a recall envelope.
@@ -312,6 +371,13 @@ def _route_read(cmd: str, args: Any) -> None:
         # refusals (not found / namespace-guard denial).
         if result.get("ok") is False:
             reason = str(result.get("reason") or "hub-refused")
+            if reason == "hub-unreachable":
+                # Issue #290 (T-11): a valid snapshot answers offline —
+                # row JSON + the offline_snapshot provenance key (exit 0).
+                offline = _offline_read(cmd, args)
+                if offline is not None:
+                    print(json.dumps(offline, indent=2))
+                    sys.exit(0)
             _read_error(reason, f"hub get failed: {result}")
         if result.get("error"):
             _read_error("hub-refused",
@@ -322,6 +388,14 @@ def _route_read(cmd: str, args: Any) -> None:
         reason = ("hub-unreachable"
                   if result.get("reason") == "hub-unreachable"
                   else "hub-response-invalid")
+        if reason == "hub-unreachable":
+            # Issue #290 (T-11): a valid unexpired snapshot answers with
+            # the live envelope key set + exactly one offline_snapshot
+            # provenance key (expired/missing keeps this error contract).
+            offline = _offline_read(cmd, args)
+            if offline is not None and _expected_read_keys(cmd, offline):
+                print(json.dumps(offline, indent=2))
+                sys.exit(0)
         _read_error(reason, f"hub {cmd} failed: {json.dumps(result)[:300]}")
     print(json.dumps(result, indent=2))
     if overlay:

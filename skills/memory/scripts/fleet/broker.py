@@ -376,6 +376,11 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
     moment = _moment_for(event)
     ns = namespace or _namespace(payload, env)
     remaining_ms = _remaining_ms(started, env)
+    # Bound for EVERY event before the branch below: the unreachable
+    # serve (issue #290) references it on the SessionStart path too,
+    # where no query exists (the live leg pulls recency, not a query —
+    # the offline serve degrades to the empty-pool envelope there).
+    query = ""
     try:
         if event == "SessionStart":
             envelope = http.session_start(ns, session_id or "", lane=lane,
@@ -396,6 +401,36 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
     # neutralized, so the hub being unreachable never suppresses it.
     overlay = pending_overlay("local", env)
     if envelope.get("reason") == transport.REASON_HUB_UNREACHABLE:
+        # Issue #290 (T-11): the declared offline mode.  Record the
+        # failure for the reconnect transition (the persisted stamp is
+        # the only cross-moment memory — every broker moment is a fresh
+        # broker_cli subprocess), then serve from the snapshot when one
+        # is valid: state none keeps the exact T-08 fail-open contract.
+        from fleet import snapshot as fleet_snapshot  # noqa: PLC0415
+        try:
+            fleet_snapshot.write_stamp(env)
+        except OSError:
+            pass
+        envelope_off, state = fleet_snapshot._serve_offline_read(  # noqa: SLF001
+            env, query=query, namespace=ns, moment=moment,
+            session_id=session_id or "", lane=lane)
+        if state == "expired":
+            _log_record({
+                "ts": time.time(), "event": event,
+                "reason": "snapshot-expired",
+                "detail": "offline snapshot past expires_at; serving nothing",
+                "elapsed_ms": int((time.monotonic() - started) * 1000)})
+            text = ""
+            if overlay:
+                text = _neutralize(overlay)
+            return {"additionalContext": text}
+        if envelope_off is not None and state == "valid":
+            served = _emit_envelope(envelope_off)
+            if overlay:
+                base_text = served.get("additionalContext", "")
+                served["additionalContext"] = _neutralize(
+                    base_text + "\n" + overlay if base_text else overlay)
+            return served
         fail = _fail_open(event, transport.REASON_HUB_UNREACHABLE,
                           "read moment hub call unreachable", started)
         if overlay:
@@ -406,6 +441,21 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
     _ack_reservation(http, env, envelope, started)
     result = _emit_envelope(envelope)
     _flush_queue(http, env, started)
+    # Issue #290 (T-11): a successful hub contact is a (re)connection —
+    # best-effort snapshot refresh under a bounded slice AFTER the live
+    # result was chosen (never blocks the moment).  _maybe_refresh fires
+    # only on none/stale/the persisted transition, and clears the stamp
+    # only when a refresh completed.
+    from fleet import snapshot as fleet_snapshot  # noqa: PLC0415
+    try:
+        # Recompute the slice AFTER the live read: the entry-time
+        # remaining_ms is stale by the hub call's duration and would let
+        # the refresh run past the moment's own deadline.
+        fleet_snapshot._maybe_refresh(  # noqa: SLF001
+            http, env,
+            budget_ms=max(1, min(2000, _remaining_ms(started, env) // 4)))
+    except Exception:  # noqa: BLE001 - refresh is best-effort, never fatal
+        pass
     if overlay:
         base_text = result.get("additionalContext", "")
         result = {"additionalContext": _neutralize(
