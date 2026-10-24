@@ -308,6 +308,7 @@ def build_injection_envelope(
     effective_ops: list[str] | None = None,
     expired: int | None = None,
     reservation: str | None = None,
+    expiry_read_failed: int | None = None,
 ) -> dict:
     """Build the closed passive-injection envelope shared by adapters."""
     envelope = {
@@ -355,6 +356,13 @@ def build_injection_envelope(
     # ran in reserve mode — every legacy envelope keeps its exact bytes.
     if reservation is not None:
         envelope["reservation"] = reservation
+    # Issue #342: the count of candidates withheld because their expiry
+    # state could not be READ (side-table read failure with the table
+    # present), keyed ONLY when at least one such candidate existed —
+    # registered in INJECTION_ENVELOPE_OPTIONAL and mirrored in the Hermes
+    # fallback set, so it never blackouts a validator.
+    if expiry_read_failed is not None:
+        envelope["expiry_read_failed"] = expiry_read_failed
     return envelope
 
 
@@ -2600,11 +2608,21 @@ def _annotate_expiry(conn: sqlite3.Connection, rows: list) -> None:
     idempotent. Works on the dict rows the tier builders produce and on the
     appended arrivals (link expansion, virtual heads) alike. The key is
     diagnostic-only: every emit path strips it before the wire.
+
+    Issue #342: absence is not failure. A pre-v15 store (no side table)
+    keeps today's every-row-live law, but a read that FAILS while the table
+    is present (lock contention, interruption) must never stamp the un-read
+    pool as live — the un-read, unstamped remainder carries
+    ``row["_expiry_unread"] = True`` instead and the gate withholds it
+    (fail-closed, the same direction unreadable deadlines take). Rows
+    already stamped — by an earlier successful chunk or by a caller such as
+    ``_annotate_virtual_expiry`` — are never re-marked.
     """
     need = [r["id"] for r in rows if "inject_until" not in r]
     if not need:
         return
     found: dict[str, str] = {}
+    read_failed = False
     for start in range(0, len(need), 500):
         chunk = need[start:start + 500]
         placeholders = ",".join("?" * len(chunk))
@@ -2613,11 +2631,21 @@ def _annotate_expiry(conn: sqlite3.Connection, rows: list) -> None:
                 f"SELECT memory_id, inject_until FROM memory_expiry "
                 f"WHERE memory_id IN ({placeholders})", chunk):
                 found[row["memory_id"]] = row["inject_until"]
-        except sqlite3.OperationalError:
-            # A pre-v15 store (or a torn read) has no side table: every row
-            # is live, exactly like a missing side row.
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                # A pre-v15 store has no side table: every row is live,
+                # exactly like a missing side row.
+                break
+            # The table exists but the read failed: the un-read pool must
+            # not read as live (issue #342). Stamps already collected from
+            # earlier chunks stay; the trailing pass marks the remainder.
+            read_failed = True
             break
     for r in rows:
+        if (read_failed and "inject_until" not in r
+                and r["id"] not in found):
+            r["_expiry_unread"] = True
+            continue
         r.setdefault("inject_until", found.get(r["id"]))
 
 
@@ -2626,20 +2654,94 @@ def _expiry_filter(rows: list[dict], *, now_iso: str) -> tuple[list[dict], int]:
 
     ``inject_until <= now`` (parsed to a true instant, never a lexical
     compare — #327: fractional forms must order by their real time) is
-    expired; a missing/None timestamp (no side-table row) is live. Returns
-    the surviving rows in fetch order and the exact removed count. Pure: no
-    store I/O, no mutation of the input list.
+    expired; a missing/None timestamp (no side-table row) is live. A row
+    whose expiry state could not be READ (``_expiry_unread``, issue #342)
+    counts as removed too — the gate fails closed on unknown state, never
+    open. Returns the surviving rows in fetch order and the exact removed
+    count. Pure: no store I/O, no mutation of the input list.
     """
     now_epoch = _parse_iso_to_epoch(now_iso)
     live: list[dict] = []
     removed = 0
     for r in rows:
+        if r.get("_expiry_unread"):
+            removed += 1
+            continue
         iu = r.get("inject_until")
         if iu and _parse_iso_to_epoch(iu) <= now_epoch:
             removed += 1
         else:
             live.append(r)
     return live, removed
+
+
+def _record_unread(acc: dict, pool: list) -> None:
+    """Track ids whose expiry state could not be read (issue #342).
+
+    Called at every passive annotate/gate site beside the existing
+    ``expired_ids`` bookkeeping; old-shape accumulators (no ``unread_ids``
+    key) keep working via setdefault.
+    """
+    unread = [r["id"] for r in pool if r.get("_expiry_unread")]
+    if unread:
+        acc.setdefault("unread_ids", set()).update(unread)
+
+
+def _annotate_virtual_expiry(conn: sqlite3.Connection, rows: list) -> None:
+    """Resolve virtual (belief) rows' expiry through their SOURCES (#343).
+
+    A belief head's synthetic ``belief:<head_id>`` id never matches
+    ``memory_expiry.memory_id`` (which references real memory rows), so the
+    plain annotate lookup always misses and the head reads as live even
+    when every source expired. This helper resolves the head's effective
+    deadline from its provenance — the EARLIEST parsed inject_until among
+    the LIVE source rows' side rows (the belief loader excludes superseded
+    sources upstream, beliefs.py F-005, so the basis is live-source-only).
+
+    Every processed head leaves with an explicit stamp: the earliest source
+    stamp, or ``inject_until = None`` when no source carries a side row
+    (live — the missing-side-row law) — so a later `_annotate_expiry` call
+    finds nothing left to do for these rows and can never mislabel a
+    resolved head, even if its own read fails. A head with no/empty
+    ``source_ids`` is left unstamped: the follow-up annotate's synthetic-id
+    miss keeps it live when that read SUCCEEDS, and if that read FAILS the
+    #342 marker law applies (withheld, not silently live). Absent side
+    table → all live; a failed read marks the un-stamped remainder
+    ``_expiry_unread`` (the #342 law).
+    """
+    virt = [r for r in rows
+            if isinstance(r.get("id"), str)
+            and r["id"].startswith(_beliefs.BELIEF_ROW_PREFIX)
+            and "inject_until" not in r]
+    if not virt:
+        return
+    src_ids = sorted({s for r in virt for s in (r.get("source_ids") or [])})
+    found: dict[str, str] = {}
+    read_failed = False
+    if src_ids:
+        for start in range(0, len(src_ids), 500):
+            chunk = src_ids[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            try:
+                for row in conn.execute(
+                    f"SELECT memory_id, inject_until FROM memory_expiry "
+                    f"WHERE memory_id IN ({placeholders})", chunk):
+                    found[row["memory_id"]] = row["inject_until"]
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    break
+                read_failed = True
+                break
+    for r in virt:
+        if not (r.get("source_ids") or []):
+            continue  # no provenance: legacy synthetic-id miss stays live
+        stamps = [found[s] for s in r["source_ids"] if found.get(s)]
+        if stamps:
+            r["inject_until"] = min(stamps, key=_parse_iso_to_epoch)
+        elif read_failed:
+            r["_expiry_unread"] = True
+        else:
+            r["inject_until"] = None
 
 
 def _gate_passive_expiry(
@@ -2662,11 +2764,19 @@ def _gate_passive_expiry(
     live: list = []
     for pair in scored:
         row = pair[1]
-        iu = row.get("inject_until")
-        if iu and _parse_iso_to_epoch(iu) <= now_epoch:
+        if row.get("_expiry_unread"):
+            # Issue #342: unknown expiry state never spends a live slot.
+            # Same removal law as the _gone arrival sites: expired counts
+            # every id the gate removed for an expiry-read reason, and
+            # unread_ids additionally names the read-failure subset.
             acc["expired_ids"].add(row["id"])
+            acc.setdefault("unread_ids", set()).add(row["id"])
         else:
-            live.append(pair)
+            iu = row.get("inject_until")
+            if iu and _parse_iso_to_epoch(iu) <= now_epoch:
+                acc["expired_ids"].add(row["id"])
+            else:
+                live.append(pair)
     acc["pre_ids"].extend(r["id"] for r in pre_rows)
     acc["pre_rows"].extend(pre_rows)
     if any(row.get("inject_until") for _, row in scored):
@@ -2922,10 +3032,30 @@ def _recall_injection_details(
     # every store without state rows keeps the exact 0.97.0 envelope bytes —
     # the committed #158/#183 parity wires stay byte-identical. Engaged
     # envelopes report the pre-expiry candidate ids in arrival order plus
-    # the integer expired count (distinct expired ids).
+    # the integer expired count (distinct expired ids). Issue #344: on an
+    # engaged envelope, candidate_ids AND candidate_lanes describe ONE
+    # population — the same deduped pre-gate arrival pool — so an id the
+    # gate removed appears in both fields, never in one without the other.
     if expiry_acc is not None and expiry_acc["engaged"]:
         details["expired"] = len(expiry_acc["expired_ids"])
+        pool = {r["id"]: r for r in expiry_acc["pre_rows"]}
         details["candidate_ids"] = list(dict.fromkeys(expiry_acc["pre_ids"]))
+        details["candidate_lanes"] = {
+            rid: {"lex": row.get("_rel_lex"), "cos": row.get("_rel_cos"),
+                  "ent": row.get("_rel_ent"), "graph": row.get("_rel_graph"),
+                  "trust": _row_trust(row)}
+            for rid, row in pool.items()}
+    # Issue #342: a side-table read failure surfaces independently of the
+    # engaged flag (a read can fail on a store whose gate never engaged) —
+    # keyed ONLY when at least one row's expiry state could not be read.
+    if expiry_acc is not None and expiry_acc.get("unread_ids"):
+        details["expiry_read_failed"] = len(expiry_acc["unread_ids"])
+        try:
+            print("zmem: live-expiry side-table read failed; "
+                  f"{len(expiry_acc['unread_ids'])} candidate(s) withheld "
+                  "(expiry state unknown)", file=sys.stderr)
+        except OSError:
+            pass
     if margin_observed is not None:
         details["margin"] = format(margin_observed, ".6f")
         details["margin_pruned_ids"] = margin_pruned_ids
@@ -3421,6 +3551,7 @@ def _recall_memory_impl(
             # pre-#174 lane reported plus the ids the gate removed.
             expiry_acc["pre_ids"].extend(r["id"] for r in _expanded)
             expiry_acc["pre_rows"].extend(_expanded)
+            _record_unread(expiry_acc, _expanded)
             _live_exp, _removed = _expiry_filter(
                 _expanded, now_iso=expiry_now_iso)
             if _removed:
@@ -3488,8 +3619,15 @@ def _recall_memory_impl(
             # R3-3: every kept cross arrival enters the pre-gate pool.
             expiry_acc["pre_ids"].extend(item["id"] for _, item in kept_cross)
             expiry_acc["pre_rows"].extend(item for _, item in kept_cross)
+            _record_unread(expiry_acc, [item for _, item in kept_cross])
             gated: list = []
             for pair in kept_cross:
+                if pair[1].get("_expiry_unread"):
+                    # Issue #342: unknown expiry state never rides the
+                    # splice; it still counts as a gate removal (the same
+                    # removal law as every other annotate/gate site).
+                    expiry_acc["expired_ids"].add(pair[1]["id"])
+                    continue
                 iu = pair[1].get("inject_until")
                 if iu and _parse_iso_to_epoch(iu) <= now_e:
                     expiry_acc["expired_ids"].add(pair[1]["id"])
@@ -3565,13 +3703,18 @@ def _recall_memory_impl(
             _merged.append(_b)
         # Issue #174: virtual-head arrivals pass the expiry gate at append
         # time on the passive lane — an expired belief head must not ride
-        # into the delivered fence either.
+        # into the delivered fence either. Issue #343: the head's deadline
+        # resolves through its SOURCE rows first (the synthetic id never
+        # matches the side table), then any still-unstamped head takes the
+        # legacy annotate pass.
         if expiry_active and expiry_acc is not None and _merged:
+            _annotate_virtual_expiry(conn, _merged)
             _annotate_expiry(conn, _merged)
             # R3-3 (as with link arrivals): every arrival enters the
             # pre-gate pool before the gate removes anything.
             expiry_acc["pre_ids"].extend(r["id"] for r in _merged)
             expiry_acc["pre_rows"].extend(_merged)
+            _record_unread(expiry_acc, _merged)
             _live_heads, _removed = _expiry_filter(
                 _merged, now_iso=expiry_now_iso)
             if _removed:
@@ -3606,6 +3749,7 @@ def _recall_memory_impl(
             # the raw timestamp never appears in a result row (every
             # pre-#174 envelope stays byte-identical).
             _r.pop("inject_until", None)
+            _r.pop("_expiry_unread", None)
 
     injection_details = None
     if for_injection:
@@ -3624,6 +3768,7 @@ def _recall_memory_impl(
             # Diagnostic-only annotation (see the marker pass): never on
             # the delivered wire.
             _r.pop("inject_until", None)
+            _r.pop("_expiry_unread", None)
         # Issue #114: surfaced telemetry covers ONLY the rendered rows that
         # were also QUERY-MATCHED — the pre-expansion bump set (same law as
         # ever: link neighbors render but never feed the counters;
@@ -4813,11 +4958,15 @@ def _recent_one_tier(
         # The recent lane counts expired rows inside the pre-gate top-
         # `limit` window (what this tier would have returned), not the
         # whole fetched pool — the recall lane counts its whole scored
-        # pool; both equal the fixture pools every oracle pins.
+        # pool; both equal the fixture pools every oracle pins. This
+        # per-lane window IS the documented population for the recent
+        # lane's `expired` (issue #344: one documented population per
+        # lane; the recall-lane envelope carries the pre-gate pool law).
         pre_rows = results[:limit]
         live, removed = _expiry_filter(results, now_iso=expiry_now_iso)
         expiry_acc["pre_ids"].extend(r["id"] for r in pre_rows)
         expiry_acc["pre_rows"].extend(pre_rows)
+        _record_unread(expiry_acc, pre_rows)
         if removed:
             _pre_ids = {r["id"] for r in pre_rows}
             _live_ids = {r["id"] for r in live}
@@ -5040,6 +5189,7 @@ def _recent_memory_impl(
             # R3-3: every cross arrival enters the pre-gate pool.
             expiry_acc["pre_ids"].extend(r["id"] for r in _items)
             expiry_acc["pre_rows"].extend(_items)
+            _record_unread(expiry_acc, _items)
             _live_items, _removed = _expiry_filter(_items, now_iso=expiry_now)
             if _removed:
                 _live_ids = {r["id"] for r in _live_items}
@@ -5079,6 +5229,7 @@ def _recent_memory_impl(
         results = injection_details["results"]
         for _r in results:
             _r.pop("inject_until", None)
+            _r.pop("_expiry_unread", None)
         if results:
             # no_telemetry (the eval harness) records nothing; the filters
             # above still ran.
