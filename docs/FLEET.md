@@ -424,6 +424,101 @@ refuses any store whose version exceeds the client's FORWARD ceiling: a
 machines BEFORE the first v19 client opens the store (a FORWARD-15 client
 refuses it the same way).
 
+## T-10 delivery: the CLI and explicit tools route through the backend (issue #289)
+
+When `ZMEM_REMOTE_URL` is set, `store.py` gains a remote-mode gate (one
+choke point after argparse, before any store access) that sorts every
+subcommand into four bands — no split-brain local store on a remote box:
+
+- **ROUTE-WRITE** (`add`, `update`, `supersede`, `invalidate`): enqueue a
+  T-09 typed op (`fleet/opqueue`, principal `local`) and print one JSON
+  receipt line `{ok, op_id, op, status: pending, queue, result: queued}`;
+  never open a local store. The routed write carries ONLY the flags the
+  T-09 applier honors (`--namespace/--type/--content/--tags/--signal/
+  --source-ref/--capture-mode` for add; `--id/--content` + the same
+  metadata set for update; `--id/--reason` for supersede/invalidate).
+  Everything else — `--confidence`, `--taint`, `--evidence`,
+  `--no-dedup`, expiry/occurrence flags, `--expected-namespace`,
+  `--type state|event` (whose expiry semantics do not travel) — is
+  REFUSED with exit 2 naming the flag rather than silently dropped.
+  `--content -` reads stdin before enqueue; capture-mode resolves the
+  `ZMEM_CAPTURE_MODE` intent exactly like the local dispatch.
+- **ROUTE-READ** (`recall`, `search`, `recent`, `list`, `get`): call the
+  hub's MCP tools (`recall`/`search`/`recent` exist; the new
+  `list_memories`/`get_memory` tools serve list/get, backed by the new
+  additive `store.py list --json`). Reads print the JSON envelope — with
+  or without `--json` — plus a `[PENDING]` overlay rendered BEFORE the
+  best-effort queue flush, so the overlay names the ops that were pending
+  when the command started (a flush inside the call may commit them
+  first). Per-command envelope parity: recall/search carry `arms`; recent
+  does not (its local envelope has none). `--text` is search's query
+  flag. Any flag beyond each command's allow list (query/namespace/limit
+  for recall/search/recent, plus --include-superseded for list and --id
+  for get) is refused with exit 2.
+  Failures print `{"ok": false, "reason": <r>}` and exit 1:
+  `hub-unreachable` for connect-level failures ONLY,
+  `hub-response-invalid` for a reachable-but-degraded hub response, and
+  (the `get` route only) `hub-refused` for hub-ANSWERED refusals
+  (not found / namespace-guard denial) — the transport's reason is
+  preserved through every branch.
+- **ALLOW-LOCAL** (verified store-independent or read-only-no-create):
+  `failures`, `signals`, `corrections`, `queue-list`, `queue-clear`,
+  `queue-add`, `source-exists`, `source-ref-exists`, `ops-append`,
+  `retain`, `retain-adapt`, `ledger-clear`, `delivery-clear`,
+  `hermes-reflect`, `hermes-context --action commit-cursor`. These keep
+  every remote-mode hook consumer alive (the capture-failure dedup probe
+  and nudge, the convention ring, session-end retention, the delivery
+  ledger, the compat bridges). Standing divergence: `source-exists`/
+  `source-ref-exists` answer from the LOCAL table when one exists
+  (base-identical; the hub-side equivalent is the apply-time dedup).
+- **REFUSE** (everything else): exit 2 with `this command runs on the
+  hub; ZMEM_REMOTE_URL is set` before touching anything — the admin six
+  (`consolidate`, `organize`, `reembed`, `purge`, `export-dataset`,
+  `init`) plus every other memory-table surface (`evidence`, `backup`,
+  `operation-feedback` — its caller ignores the rc, a disclosed
+  telemetry gap — `apply-ops`, `prefetch`, `hermes-convention`,
+  `hermes-context --action ack-failure`, exports, entity/episode tools,
+  …). The broker-fallback family (launcher cannot route to the broker →
+  local hook bodies run under remote mode) fails OPEN on the refusal:
+  empty envelope, no store creation — strictly better than base, which
+  created a local store on those paths.
+
+Configuration error: `ZMEM_STORE` set together with `ZMEM_REMOTE_URL`
+exits 2 naming `ZMEM_STORE`, `ZMEM_DATA` and `ZMEM_REMOTE_URL`. `ZMEM_DATA`
+ALONE is legal in remote mode — it names the local data dir (op queue,
+sidecars, broker cache); the launcher itself exports it to every hook
+child, so it cannot be part of the hard error. (The issue text reads the
+constraint over both variables; this narrowing is the reconciliation that
+keeps hooks alive and is disclosed here and in the PR.)
+
+Hermes provider: in MCP mode (`ZMEM_MCP_URL`/`ZMEM_REMOTE_URL`) every
+explicit tool routes through the transport — `zmem_add`/`zmem_supersede`/
+`zmem_update`/`zmem_invalidate` to the hub's write tools, `zmem_search`
+to the hub `search` tool (shared row projection with the local leg), the
+session-start pull to the hub `session_start` tool (the caller's `limit`
+is forwarded; the hub's include-global policy gate is the remote semantic
+for the local `--include-global --global-limit 2`), and the session-end
+note to the hub `add` tool. A transport failure returns a structured
+agent-visible error, never a silent success. Local-maintenance legs skip
+in MCP mode with a log line (session-end `organize`/`backup`; the native
+and delegation evidence writes — evidence rows live in the hub's store).
+The compat hooks (`zmem-hermes-reflect.py`, `zmem-hermes-convention.py`)
+carry per-call remote guards: only the memory-table calls skip
+(ack-failure, hermes-convention, the evidence writes, the MCP-url-less
+prefetch); the sidecar calls pass through.
+
+Hub constraint (self-enforced): the hub's `_run_store` strips
+`ZMEM_REMOTE_URL` from its own `store.py` children — the hub IS the store
+owner, so its tool subprocesses always run local even when the hub process
+itself carries the variable (self-referential or stale operator env would
+otherwise refuse every hub-side tool call; the pre-fix wedge was
+reproduced and the strip pinned by
+`test_hub_run_store_strips_remote_url_from_children`).
+
+Envelope passthrough: `_parse_results` now passes the retrieval-telemetry
+`arms` member (and `excluded`) through and int-normalizes the token
+counts, so a remote read prints the same key set as its local twin.
+
 ## Peer ingest trust mode (issue #282)
 
 Every machine importing rows it did not author runs

@@ -506,6 +506,7 @@ class McpHttp:
 
     def session_start(self, namespace: str, session_id: str,
                       lane: str = "hermes-provider",
+                      limit: int | None = None,
                       client_protocol: int = CLIENT_PROTOCOL_MAJOR,
                       deadline_ms: int | None = None) -> dict[str, Any]:
         arguments: dict[str, Any] = {
@@ -515,6 +516,11 @@ class McpHttp:
             "client_protocol": client_protocol,
             "deadline_ms": deadline_ms,
         }
+        if limit is not None:
+            # Issue #289: forward the caller's row cap (the provider's
+            # session-start pull clamps 1..50; without this the hub would
+            # silently serve its own default).
+            arguments["limit"] = limit
         return self._envelope_call("session_start", arguments)
 
     def hello(self, client_protocol: int = CLIENT_PROTOCOL_MAJOR,
@@ -615,6 +621,124 @@ class McpHttp:
             return {"ok": False, "reason": _failure_reason(exc)}
         return payload if isinstance(payload, dict) else {
             "ok": False, "reason": REASON_EMPTY_POOL}
+
+    # ---- Issue #289 (T-10): explicit-tool routing -------------------------
+    #
+    # Thin wrappers over the hub's existing MCP tools plus the two new
+    # read tools (list_memories / get_memory).  Every wrapper fails open
+    # with {"ok": False, "reason": <r>} — the CLI gate and the Hermes
+    # provider surface the reason instead of guessing.
+
+    def _explicit_call(self, tool: str, arguments: dict[str, Any],
+                       default_reason: str) -> dict[str, Any]:
+        arguments.setdefault("client_protocol", CLIENT_PROTOCOL_MAJOR)
+        arguments.setdefault("deadline_ms", None)
+        try:
+            payload = self._run_tool(tool, arguments)
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+            logger.debug("zmem transport: %s failed open: %s", tool, exc)
+            return {"ok": False, "reason": _failure_reason(exc)}
+        return payload if isinstance(payload, dict) else {
+            "ok": False, "reason": default_reason}
+
+    def recall(self, query: str, *, namespace: str | None = None,
+               limit: int | None = None,
+               deadline_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {"query": query, "deadline_ms": deadline_ms}
+        if namespace is not None:
+            args["namespace"] = namespace
+        if limit is not None:
+            args["limit"] = limit
+        return self._explicit_call("recall", args, "hub-response-invalid")
+
+    def search(self, query: str, *, namespace: str | None = None,
+               limit: int | None = None,
+               deadline_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {"query": query, "deadline_ms": deadline_ms}
+        if namespace is not None:
+            args["namespace"] = namespace
+        if limit is not None:
+            args["limit"] = limit
+        return self._explicit_call("search", args, "hub-response-invalid")
+
+    def recent(self, *, namespace: str | None = None,
+               limit: int | None = None,
+               deadline_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {"deadline_ms": deadline_ms}
+        if namespace is not None:
+            args["namespace"] = namespace
+        if limit is not None:
+            args["limit"] = limit
+        return self._explicit_call("recent", args, "hub-response-invalid")
+
+    def list_memories(self, *, namespace: str | None = None,
+                      limit: int | None = None, include_superseded: bool = False,
+                      deadline_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "include_superseded": include_superseded,
+            "deadline_ms": deadline_ms,
+        }
+        if namespace is not None:
+            args["namespace"] = namespace
+        if limit is not None:
+            args["limit"] = limit
+        return self._explicit_call("list_memories", args,
+                                   "hub-response-invalid")
+
+    def get_memory(self, memory_id: str,
+                   deadline_ms: int | None = None) -> dict[str, Any]:
+        return self._explicit_call(
+            "get_memory", {"id": memory_id, "deadline_ms": deadline_ms},
+            "hub-response-invalid")
+
+    def add(self, content: str, *, type_: str = "fact",
+            namespace: str | None = None, signal: str = "none",
+            source_ref: str = "", tags: str = "", taint: str = "untrusted_tool",
+            deadline_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "content": content, "type": type_, "signal": signal,
+            "source_ref": source_ref or None, "tags": tags or None,
+            "taint": taint, "deadline_ms": deadline_ms,
+        }
+        if namespace is not None:
+            args["namespace"] = namespace
+        return self._explicit_call("add", args, "empty-pool")
+
+    def supersede(self, memory_id: str, reason: str = "",
+                  deadline_ms: int | None = None) -> dict[str, Any]:
+        return self._explicit_call(
+            "supersede",
+            {"id": memory_id, "reason": reason or None,
+             "deadline_ms": deadline_ms},
+            "empty-pool")
+
+    def update(self, memory_id: str, content: str, *,
+               namespace: str | None = None, type_: str | None = None,
+               tags: str | None = None, source_ref: str | None = None,
+               signal: str | None = None, taint: str = "untrusted_tool",
+               deadline_ms: int | None = None) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "id": memory_id, "content": content, "taint": taint,
+            "deadline_ms": deadline_ms,
+        }
+        if namespace is not None:
+            args["namespace"] = namespace
+        if type_ is not None:
+            args["type"] = type_
+        if tags is not None:
+            args["tags"] = tags
+        if source_ref is not None:
+            args["source_ref"] = source_ref
+        if signal is not None:
+            args["signal"] = signal
+        return self._explicit_call("update", args, "empty-pool")
+
+    def invalidate(self, memory_id: str, reason: str,
+                   deadline_ms: int | None = None) -> dict[str, Any]:
+        return self._explicit_call(
+            "invalidate",
+            {"id": memory_id, "reason": reason, "deadline_ms": deadline_ms},
+            "empty-pool")
 
 
 class LocalSubprocess:

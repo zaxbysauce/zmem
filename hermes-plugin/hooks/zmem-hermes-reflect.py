@@ -232,6 +232,11 @@ def _run_hermes_context(args: list[str]) -> dict:
     env, so ZMEM_DATA/ZMEM_STORE resolve identically) and return one JSON
     object; {} on timeout, nonzero exit, malformed JSON, or an error
     object."""
+    # Issue #289 (T-10): ack-failure deletes memory meta rows — hub-side
+    # only.  commit-cursor is sidecar-only and keeps running locally.
+    if ((os.environ.get("ZMEM_REMOTE_URL", "") or "").strip()
+            and "ack-failure" in args):
+        return {}
     scripts = _scripts_dir()
     if scripts is None:
         return {}
@@ -344,6 +349,11 @@ def _prefetch(user_message: str, namespace: str, session_id: str,
             return {}
         base = [sys.executable, str(client), "--url", url, "call", "prefetch"]
     else:
+        # Issue #289 (T-10): with ZMEM_REMOTE_URL set (and no MCP url) the
+        # local prefetch lane is hub-side; skip rather than spawn a
+        # refused subprocess.  The broker serves this moment instead.
+        if (os.environ.get("ZMEM_REMOTE_URL", "") or "").strip():
+            return {}
         scripts = _scripts_dir()
         if scripts is None:
             return {}
