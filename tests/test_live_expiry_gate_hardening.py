@@ -217,14 +217,17 @@ class AnnotateFailOpenTest(GateHardeningBase):
         """The unit seam: _annotate_expiry on a reader whose side-table read
         fails (EXCLUSIVE holder, table PRESENT) must not stamp the un-read
         rows inject_until=None-as-live — they carry _expiry_unread=True
-        instead (or no stamp at all). RED at base (base stamps None)."""
+        (asserted positively: a no-stamp-no-marker fail-open shape must
+        fail here; review round G30). RED at base (base stamps None)."""
         d = self.scratch / "failopen"
         d.mkdir()
         conn = self._seed_two_sided_rows(d)
-        holder = self.hold_exclusive(d)
-        reader = sqlite3.connect(str(d / "store.sqlite"), timeout=0.05)
-        reader.row_factory = sqlite3.Row
+        holder = None
+        reader = None
         try:
+            holder = self.hold_exclusive(d)
+            reader = sqlite3.connect(str(d / "store.sqlite"), timeout=0.05)
+            reader.row_factory = sqlite3.Row
             if str(SCRIPTS_DIR) not in sys.path:
                 sys.path.insert(0, str(SCRIPTS_DIR))
             from storelib.recall import _annotate_expiry
@@ -232,16 +235,18 @@ class AnnotateFailOpenTest(GateHardeningBase):
             _annotate_expiry(reader, rows)
             for row in rows:
                 self.assertTrue(
-                    "inject_until" not in row
-                    or row.get("_expiry_unread") is True,
+                    row.get("_expiry_unread") is True,
                     f"row {row['id']}: a FAILED side-table read (memory_expiry "
                     f"present, EXCLUSIVE holder) stamped inject_until="
-                    f"{row.get('inject_until')!r} — the un-read pool must "
-                    f"carry _expiry_unread=True and no live stamp (issue #342)")
+                    f"{row.get('inject_until')!r} without the _expiry_unread "
+                    f"marker — the un-read pool must carry _expiry_unread=True "
+                    f"and no live stamp (issue #342)")
         finally:
-            holder.rollback()
-            holder.close()
-            reader.close()
+            if holder is not None:
+                holder.rollback()
+                holder.close()
+            if reader is not None:
+                reader.close()
             conn.close()
 
     def test_gate_withholds_rows_whose_expiry_read_failed(self):
@@ -253,10 +258,12 @@ class AnnotateFailOpenTest(GateHardeningBase):
         d = self.scratch / "gateseam"
         d.mkdir()
         conn = self._seed_two_sided_rows(d)
-        holder = self.hold_exclusive(d)
-        reader = sqlite3.connect(str(d / "store.sqlite"), timeout=0.05)
-        reader.row_factory = sqlite3.Row
+        holder = None
+        reader = None
         try:
+            holder = self.hold_exclusive(d)
+            reader = sqlite3.connect(str(d / "store.sqlite"), timeout=0.05)
+            reader.row_factory = sqlite3.Row
             if str(SCRIPTS_DIR) not in sys.path:
                 sys.path.insert(0, str(SCRIPTS_DIR))
             from storelib.recall import _gate_passive_expiry
@@ -271,17 +278,26 @@ class AnnotateFailOpenTest(GateHardeningBase):
             live = _gate_passive_expiry(
                 reader, scored, limit=5, now_iso=NOW, acc=acc)
             survivor_ids = [row["id"] for _, row in live]
-            self.assertNotIn(
-                self.DEAD_ID, survivor_ids,
-                f"the gate returned {self.DEAD_ID} (whose memory_expiry row "
-                f"says long-elapsed at {NOW}) as LIVE because the side-table "
-                f"read failed under an EXCLUSIVE holder — the gate must fail "
-                f"closed on unread expiry state, not fail open (issue #342); "
-                f"survivors={survivor_ids}")
+            self.assertEqual(
+                survivor_ids, [],
+                f"the gate returned survivors {survivor_ids} from a FAILED "
+                f"side-table read (EXCLUSIVE holder, both rows never read) — "
+                f"the gate must fail closed on unread expiry state, not "
+                f"fail open (issue #342)")
+            self.assertEqual(
+                acc.get("unread_ids"), {self.DEAD_ID, self.LIVE_ID},
+                "the never-read rows are counted in unread_ids (the "
+                "uniform removal law, review round R32)")
+            self.assertEqual(
+                acc["expired_ids"], {self.DEAD_ID, self.LIVE_ID},
+                "expired counts every candidate id removed for an "
+                "expiry-read reason")
         finally:
-            holder.rollback()
-            holder.close()
-            reader.close()
+            if holder is not None:
+                holder.rollback()
+                holder.close()
+            if reader is not None:
+                reader.close()
             conn.close()
 
     def test_absent_side_table_stamps_every_row_live(self):
