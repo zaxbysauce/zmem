@@ -2616,12 +2616,17 @@ def _annotate_expiry(conn: sqlite3.Connection, rows: list) -> None:
     ``row["_expiry_unread"] = True`` instead and the gate withholds it
     (fail-closed, the same direction unreadable deadlines take). Rows
     already stamped — by an earlier successful chunk or by a caller such as
-    ``_annotate_virtual_expiry`` — are never re-marked.
+    ``_annotate_virtual_expiry`` — are never re-marked. The read-receipt
+    set (``read_ids``) records every id whose chunk was successfully read,
+    so a side-row-LESS row from a successful chunk stays live (the
+    missing-side-row law) even when a LATER chunk fails — only rows that
+    were genuinely never read are marked.
     """
     need = [r["id"] for r in rows if "inject_until" not in r]
     if not need:
         return
     found: dict[str, str] = {}
+    read_ids: set[str] = set()
     read_failed = False
     for start in range(0, len(need), 500):
         chunk = need[start:start + 500]
@@ -2631,8 +2636,9 @@ def _annotate_expiry(conn: sqlite3.Connection, rows: list) -> None:
                 f"SELECT memory_id, inject_until FROM memory_expiry "
                 f"WHERE memory_id IN ({placeholders})", chunk):
                 found[row["memory_id"]] = row["inject_until"]
+            read_ids.update(chunk)
         except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
+            if "no such table: memory_expiry" in str(exc).lower():
                 # A pre-v15 store has no side table: every row is live,
                 # exactly like a missing side row.
                 break
@@ -2643,7 +2649,7 @@ def _annotate_expiry(conn: sqlite3.Connection, rows: list) -> None:
             break
     for r in rows:
         if (read_failed and "inject_until" not in r
-                and r["id"] not in found):
+                and r["id"] not in read_ids):
             r["_expiry_unread"] = True
             continue
         r.setdefault("inject_until", found.get(r["id"]))
@@ -2708,6 +2714,14 @@ def _annotate_virtual_expiry(conn: sqlite3.Connection, rows: list) -> None:
     #342 marker law applies (withheld, not silently live). Absent side
     table → all live; a failed read marks the un-stamped remainder
     ``_expiry_unread`` (the #342 law).
+
+    Partial reads (PR review R02): when a LATER chunk fails, sources in the
+    successful chunks were read but sources in the failed chunk were NOT —
+    a head with any never-read source has unknown state and is marked
+    ``_expiry_unread`` even when the readable sources produced stamps
+    (stamping from a partial read could deliver a head whose only expired
+    source sat in the failed chunk). The read-receipt set (``read_ids``)
+    records every id whose chunk was successfully read.
     """
     virt = [r for r in rows
             if isinstance(r.get("id"), str)
@@ -2717,6 +2731,7 @@ def _annotate_virtual_expiry(conn: sqlite3.Connection, rows: list) -> None:
         return
     src_ids = sorted({s for r in virt for s in (r.get("source_ids") or [])})
     found: dict[str, str] = {}
+    read_ids: set[str] = set()
     read_failed = False
     if src_ids:
         for start in range(0, len(src_ids), 500):
@@ -2727,19 +2742,28 @@ def _annotate_virtual_expiry(conn: sqlite3.Connection, rows: list) -> None:
                     f"SELECT memory_id, inject_until FROM memory_expiry "
                     f"WHERE memory_id IN ({placeholders})", chunk):
                     found[row["memory_id"]] = row["inject_until"]
+                read_ids.update(chunk)
             except sqlite3.OperationalError as exc:
-                if "no such table" in str(exc).lower():
+                if "no such table: memory_expiry" in str(exc).lower():
                     break
                 read_failed = True
                 break
     for r in virt:
         if not (r.get("source_ids") or []):
             continue  # no provenance: legacy synthetic-id miss stays live
-        stamps = [found[s] for s in r["source_ids"] if found.get(s)]
+        if read_failed and any(s not in read_ids for s in r["source_ids"]):
+            r["_expiry_unread"] = True
+            continue
+        # Final-critic round: an empty-string stamp is excluded from the
+        # competition (the gate reads '' as LIVE, so letting it win min()
+        # would deliver a head whose SIBLING source expired — the exact
+        # AC5 mixed-source law). Sources with side rows the gate would
+        # withhold (unparseable → epoch 0) still compete and win, keeping
+        # the head's fate consistent with its own source rows.
+        stamps = [found[s] for s in r["source_ids"]
+                  if s in found and found[s]]
         if stamps:
             r["inject_until"] = min(stamps, key=_parse_iso_to_epoch)
-        elif read_failed:
-            r["_expiry_unread"] = True
         else:
             r["inject_until"] = None
 
@@ -2756,10 +2780,19 @@ def _gate_passive_expiry(
     scored pool so the subsequent ``[:limit]`` cut never spends a slot on
     an expired row (issue #174 Design step 1; the ``limit * 2`` over-fetch
     upstream keeps the live window full).
+
+    Issue #344 AC1 (one population per lane): ``expired_ids`` and
+    ``unread_ids`` count only ids inside the candidate population this lane
+    reports — the pre-gate window (``pre_rows``) plus every gated arrival
+    (the link/cross/belief sites extend ``pre_rows`` before gating). Rows
+    beyond the window are dropped by the gate exactly as at base but are
+    NOT candidates and are NOT counted (the recent lane's documented window
+    law, now the law on every lane).
     """
     _annotate_expiry(conn, [row for _, row in scored])
     pre_cut = scored[:limit]
     pre_rows = [row for _, row in pre_cut]
+    window_ids = {r["id"] for r in pre_rows}
     now_epoch = _parse_iso_to_epoch(now_iso)
     live: list = []
     for pair in scored:
@@ -2767,14 +2800,17 @@ def _gate_passive_expiry(
         if row.get("_expiry_unread"):
             # Issue #342: unknown expiry state never spends a live slot.
             # Same removal law as the _gone arrival sites: expired counts
-            # every id the gate removed for an expiry-read reason, and
-            # unread_ids additionally names the read-failure subset.
-            acc["expired_ids"].add(row["id"])
-            acc.setdefault("unread_ids", set()).add(row["id"])
+            # every CANDIDATE id the gate removed for an expiry-read reason
+            # (the pre-gate window + gated arrivals), and unread_ids
+            # additionally names the read-failure subset.
+            if row["id"] in window_ids:
+                acc["expired_ids"].add(row["id"])
+                acc.setdefault("unread_ids", set()).add(row["id"])
         else:
             iu = row.get("inject_until")
             if iu and _parse_iso_to_epoch(iu) <= now_epoch:
-                acc["expired_ids"].add(row["id"])
+                if row["id"] in window_ids:
+                    acc["expired_ids"].add(row["id"])
             else:
                 live.append(pair)
     acc["pre_ids"].extend(r["id"] for r in pre_rows)
@@ -3038,7 +3074,13 @@ def _recall_injection_details(
     # gate removed appears in both fields, never in one without the other.
     if expiry_acc is not None and expiry_acc["engaged"]:
         details["expired"] = len(expiry_acc["expired_ids"])
-        pool = {r["id"]: r for r in expiry_acc["pre_rows"]}
+        pool: dict = {}
+        for r in expiry_acc["pre_rows"]:
+            # First occurrence wins: pre_rows can carry a duplicated id
+            # (a cross arrival appended after its tier row, deduped later
+            # at the splice) and only the tier row carries the measured
+            # _rel_* lane scores.
+            pool.setdefault(r["id"], r)
         details["candidate_ids"] = list(dict.fromkeys(expiry_acc["pre_ids"]))
         details["candidate_lanes"] = {
             rid: {"lex": row.get("_rel_lex"), "cos": row.get("_rel_cos"),
@@ -3051,10 +3093,14 @@ def _recall_injection_details(
     if expiry_acc is not None and expiry_acc.get("unread_ids"):
         details["expiry_read_failed"] = len(expiry_acc["unread_ids"])
         try:
-            print("zmem: live-expiry side-table read failed; "
-                  f"{len(expiry_acc['unread_ids'])} candidate(s) withheld "
-                  "(expiry state unknown)", file=sys.stderr)
-        except OSError:
+            err = sys.stderr
+            if err is not None:
+                print("[zmem] live-expiry side-table read failed; "
+                      f"{len(expiry_acc['unread_ids'])} candidate(s) "
+                      "withheld (expiry state unknown)", file=err)
+        except Exception:
+            # A diagnostic must never abort the recall (any stderr failure
+            # mode, including a closed stream raising ValueError).
             pass
     if margin_observed is not None:
         details["margin"] = format(margin_observed, ".6f")

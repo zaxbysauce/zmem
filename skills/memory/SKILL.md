@@ -1304,11 +1304,30 @@ Since 0.98.0 (issue #174) the recorded expiry is ENFORCED on read: passive
 injection (`recall --for-injection`, `recent --for-injection`, the Hermes
 prefetch lane) never delivers a row whose `inject_until <= now` — the
 comparison is by parsed true instant (fractional seconds order by their real
-time), inclusive at the boundary. Expired rows never reach results, candidate
-lanes, budget accounting, or surfaced/retrieval telemetry; the envelope keeps
-the pre-expiry `candidate_ids` and reports an `expired` count (keyed only when
-the gate engaged), and a fully-expired-but-eligible pool names the `expired`
-silent reason. Present-time explicit `recall`/`search` return expired rows
+time), inclusive at the boundary. Expired rows never reach results, budget
+accounting, or surfaced/retrieval telemetry; on an engaged lane the envelope
+reports the pre-expiry candidate pool — `candidate_ids` (arrival order) and
+`candidate_lanes` over the SAME population — plus an `expired` count over
+that population, and a fully-expired-but-eligible pool names the `expired`
+silent reason. Since 0.119.0 (issues #342/#343/#349) the gate also fails
+CLOSED on unknown expiry state: a side-table read failure (lock/interrupt
+with the table present) withholds the un-read candidates, keys
+`expiry_read_failed: <count>` into the envelope (registered in
+`INJECTION_ENVELOPE_OPTIONAL`; mirrored in the Hermes fallback set; keyed
+only when nonzero — a store without the failure keeps byte-identical wire),
+and prints one `[zmem]` stderr line; belief heads resolve their deadline
+through their source rows' earliest `inject_until` (a head whose sources
+are all live still delivers; an all-sources-expired head is withheld and
+counted). `doctor --expiring` keys `expiry_read_error` on a failed
+side-table read (the scan is per-leg guarded, so a successful first read is
+never discarded) and names unparseable deadlines in
+`unreadable_expiry_states` (memory_id, raw value, namespace, preview;
+keyed only when nonempty; both keys scoped to `--expiring` invocations).
+A pool whose every candidate was withheld by a read failure reports
+`expiry_read_failed` carrying the explanation; the `reason` label follows
+the pre-existing classifier (a never-engaged gate names `empty-pool`, an
+engaged drained gate may name `expired` — the read-failure count is the
+authoritative disambiguator). Present-time explicit `recall`/`search` return expired rows
 marked `[EXPIRED] ` with `expired: true` instead of filtering; `--as-of`
 neither filters nor marks. `--for-injection` + `--as-of` is refused exit 2
 before the store opens. Two read-only operators complete the surface:

@@ -1342,11 +1342,19 @@ TTL. The side table is injection-only: since 0.98.0 (issue #174) **passive
 injection stops delivering an expired row** — `inject_until <= now`, compared
 by the parsed true instant — at an inclusive boundary, on `recall
 --for-injection`, `recent --for-injection`, and the Hermes prefetch lane
-alike. Expired rows never enter delivered results, candidate lanes, budget
-accounting, or surfaced/retrieval telemetry; the injection envelope keeps the
-pre-expiry `candidate_ids` (arrival order) and reports an integer `expired`
-count (keyed only when the gate engaged), and a fully-expired-but-eligible
-pool names the `expired` silent reason. The row itself is never deleted:
+alike. Expired rows never enter delivered results, budget accounting, or
+surfaced/retrieval telemetry; on an engaged lane the envelope reports the
+pre-expiry candidate pool (`candidate_ids` in arrival order plus
+`candidate_lanes` over the same population) and an integer `expired` count
+over that same population — an id the gate removed appears in both fields,
+never one without the other — and a fully-expired-but-eligible pool names
+the `expired` silent reason. Since 0.119.0 (issues #342/#343/#349) the gate
+also fails closed on UNKNOWN expiry state: a side-table read failure
+withholds the un-read candidates and keys `expiry_read_failed` into the
+envelope (count only when nonzero); belief heads resolve their deadline
+through their source rows' earliest `inject_until`; and
+`doctor --expiring` keys `expiry_read_error` on a failed read and names
+unparseable deadlines in `unreadable_expiry_states`. The row itself is never deleted:
 explicit present-time `recall`/`search` keep returning it with an
 `[EXPIRED] ` content prefix and an `expired: true` flag, and `--as-of` views
 neither filter nor mark. `--for-injection` combined with `--as-of` is refused
