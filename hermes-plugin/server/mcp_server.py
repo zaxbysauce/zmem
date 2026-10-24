@@ -1111,6 +1111,13 @@ def _run_store(
     and the historical TimeoutExpired shape byte-identically."""
     store_py = _resolve_store_py()
     cmd = [sys.executable, str(store_py), *args]
+    # PR #400 feedback: the hub's OWN store.py children must never inherit
+    # ZMEM_REMOTE_URL — the T-10 remote gate (issue #289) would refuse every
+    # hub-side tool call with exit 2 when the hub process itself carries the
+    # variable (self-referential or stale operator env), wedging the whole
+    # hub.  The hub IS the store owner: its children always run local.
+    hub_child_env = {k: v for k, v in os.environ.items()
+                     if k != "ZMEM_REMOTE_URL"}
     # Start at the exact subprocess boundary.  Resolving paths and waiting for
     # the async semaphore happen outside this interval.
     started = time.perf_counter()
@@ -1128,6 +1135,7 @@ def _run_store(
             encoding="utf-8",
             errors="replace",
             timeout=_STORE_TIMEOUT_S if timeout is None else timeout,
+            env=hub_child_env,
         )
         _record_timing()
         return {
@@ -1576,14 +1584,25 @@ def _parse_results(r: dict[str, Any]) -> dict[str, Any]:
         results = parsed.get("results", [])
         if not isinstance(results, list):
             results = []
-        return {
+        envelope: dict[str, Any] = {
             "results": results,
             "count": parsed.get("count", len(results)),
             "omitted": parsed.get("omitted", 0),
             "injection_risk": parsed.get("injection_risk", 0),
-            "tokens_used": parsed.get("tokens_used"),
-            "tokens_budget": parsed.get("tokens_budget"),
+            # Issue #289 (T-10): int-normalize the token accounting (older
+            # store.py legs emit None) and pass the retrieval-telemetry
+            # ``arms`` and ``excluded`` members through when present, so a
+            # remote `store.py recall/search --json` prints the SAME key
+            # set the local command prints (per-command parity: recent
+            # emits no arms locally and gains none here).
+            "tokens_used": parsed.get("tokens_used") or 0,
+            "tokens_budget": parsed.get("tokens_budget") or 0,
         }
+        if isinstance(parsed.get("arms"), dict):
+            envelope["arms"] = parsed["arms"]
+        if "excluded" in parsed:
+            envelope["excluded"] = parsed.get("excluded")
+        return envelope
     results = parsed if isinstance(parsed, list) else []
     return {"results": results, "count": len(results), "omitted": 0,
             "injection_risk": 0}
@@ -2807,6 +2826,99 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
         return _parse_results(await _run_store_async(args, deadline=deadline, pool="read"))
+
+    @mcp.tool()
+    async def list_memories(
+        namespace: Optional[str] = None,
+        limit: int = _DEFAULT_LIMIT,
+        include_superseded: bool = False,
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """List memories newest-first (issue #289, T-10 remote read route).
+
+        Serves the remote ``store.py list`` subcommand: returns the JSON
+        object shape of ``store.py list --json`` (namespace, count,
+        memories[]).  Namespace-guarded like every read tool: scoped tokens
+        must pass an allowed namespace explicitly.
+        """
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+        denied = _guard_namespace(namespace)
+        if denied:
+            return denied
+        n = _clamp_limit(limit)
+        args = ["list", "--limit", str(n), "--json"]
+        if include_superseded:
+            args.append("--include-superseded")
+        args += _namespace_flag(namespace)
+        r = await _run_store_async(args, deadline=deadline, pool="read")
+        if not r["ok"]:
+            return _store_failure(r)
+        stdout = (r["stdout"] or "").strip()
+        if not stdout:
+            return _error("empty response from store.py list")
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            return _error(f"non-JSON from store.py list: {exc}")
+        return parsed if isinstance(parsed, dict) else _error(
+            "unexpected list payload shape")
+
+    @mcp.tool()
+    async def get_memory(
+        id: str,
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """Show one memory row by id (issue #289, T-10 remote read route).
+
+        Serves the remote ``store.py get`` subcommand.  For a SCOPED token
+        the target row's namespace is read first and must be in the token's
+        allow-list (the supersede tool's get-first guard, read-only variant).
+        """
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+        mid = (id or "").strip()
+        if not mid:
+            return _error("id is required")
+        caller = current_principal()
+        if caller.scoped:
+            gr = await _run_store_async(["get", "--id", mid],
+                                        deadline=deadline, pool="read")
+            if not gr["ok"]:
+                return _error(
+                    _sanitize_store_error(gr) or f"memory id {mid} not found")
+            try:
+                target_ns = (json.loads((gr["stdout"] or "").strip())
+                             .get("namespace") or "")
+            except (json.JSONDecodeError, AttributeError):
+                target_ns = ""
+            denied = _guard_namespace(target_ns)
+            if denied:
+                return denied
+        r = await _run_store_async(["get", "--id", mid],
+                                   deadline=deadline, pool="read")
+        if not r["ok"]:
+            sanitized = _sanitize_store_error(r)
+            return _error(sanitized or f"memory id {mid} not found")
+        stdout = (r["stdout"] or "").strip()
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except json.JSONDecodeError as exc:
+            return _error(f"non-JSON from store.py get: {exc}")
+        return parsed if isinstance(parsed, dict) else _error(
+            "unexpected get payload shape")
 
     @mcp.tool()
     async def prefetch(

@@ -1,6 +1,6 @@
 {
   "name": "zmem",
-  "version": "0.120.0",
+  "version": "0.121.0",
   "description": "Local-first shared memory, recall, and reflection hooks for Codex.",
   "author": {
     "name": "Brett",

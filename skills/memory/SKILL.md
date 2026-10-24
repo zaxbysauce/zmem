@@ -34,6 +34,42 @@ If you cannot find the injected path, the script is at the plugin root under
 resolved interpreter (`py -3` on Windows, `python3` on macOS/Linux), never
 as a bare path and never bare `python3` on Windows (Store stub).
 
+## Local vs remote mode (issue #289)
+With `ZMEM_REMOTE_URL` set, this machine's memory store lives on a hub and
+every `store.py` subcommand routes through the fleet backend — no local
+`store.sqlite` is ever created or read:
+
+- **Writes** (`add`, `update`, `supersede`, `invalidate`) enqueue a durable
+  op and print a receipt line `{"ok": true, "op_id": ..., "status":
+  "pending", ...}` — the op flushes to the hub on the next read moment.
+  The routed write accepts only `--namespace --type --content --tags
+  --signal --source-ref --capture-mode` (add) / `--id --content` + the
+  same set (update) / `--id --reason` (supersede/invalidate); any other
+  flag — `--confidence`, `--taint`, `--evidence`, `--no-dedup`, expiry or
+  occurrence flags, `--type state|event` — exits 2 naming the flag (its
+  semantics do not travel through the queue). `--content -` still reads
+  stdin.
+- **Reads** (`recall`, `search`, `recent`, `list`, `get`) always print the
+  JSON envelope (with or without `--json`) plus a `[PENDING]` trailer for
+  ops queued but not yet confirmed by the hub. Reads accept only the
+  query flag, `--namespace`, `--limit` (and `--json`); search's query
+  flag is `--text`. On failure they print `{"ok": false, "reason":
+  "hub-unreachable"}` (or `hub-response-invalid`) and exit 1.
+- **Store-independent commands keep running locally**: `failures`,
+  `signals`, `corrections`, `queue-*`, `source-exists`,
+  `source-ref-exists`, `ops-append`, `retain`, `retain-adapt`,
+  `ledger-clear`, `delivery-clear`, `hermes-reflect`, `hermes-context
+  --action commit-cursor`.
+- **Everything else** (maintenance and admin: `consolidate`, `organize`,
+  `reembed`, `purge`, `export-*`, `init`, `backup`, `evidence`,
+  `apply-ops`, …) exits 2 with `this command runs on the hub;
+  ZMEM_REMOTE_URL is set` — run it on the hub machine.
+- Config rule: `ZMEM_STORE` together with `ZMEM_REMOTE_URL` is a
+  configuration error (exit 2). `ZMEM_DATA` alone is fine — it names the
+  local data dir (op queue, sidecars).
+
+With `ZMEM_REMOTE_URL` unset, every command is local and unchanged.
+
 ## When to use
 - **Before a non-trivial task:** `recall` relevant past lessons. High-precision-first:
   if a retrieved lesson does not clearly apply, ignore it.

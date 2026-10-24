@@ -1318,11 +1318,37 @@ def _native_evidence_row(
     return serialized
 
 
+def _remote_env_active() -> bool:
+    """Issue #289 (T-10): True when the transport configuration resolves to
+    the remote MCP mode (mirrors ``_select_transport``'s env precedence) —
+    module-level ``store.py`` consumers (evidence writes) skip rather than
+    spawn a locally-refused subprocess.  Returns False when the transport
+    module is unavailable so an import failure keeps local behavior."""
+    if _transport is None:
+        return False
+    env = os.environ
+    mode = str(env.get("ZMEM_HERMES_MODE", "") or "").strip().lower()
+    if mode == "local":
+        return False
+    if mode == "mcp":
+        return True
+    return bool((env.get("ZMEM_MCP_URL", "") or "").strip()
+                or (env.get("ZMEM_REMOTE_URL", "") or "").strip())
+
+
 def _native_evidence_worker() -> None:
     while True:
         serialized = _NATIVE_EVIDENCE_QUEUE.get()
         try:
-            _run_store(["evidence", "write"], input_text=serialized)
+            # Issue #289 (T-10): evidence rows live in the memory store —
+            # in remote mode that store is the hub's; skip rather than
+            # spawn a locally-refused subprocess (the queue drain still
+            # completes).
+            if _remote_env_active():
+                logger.debug(
+                    "zmem native evidence write skipped (remote mode)")
+            else:
+                _run_store(["evidence", "write"], input_text=serialized)
         except Exception:
             pass
         finally:
@@ -1691,6 +1717,34 @@ def _structured_write_response(r: Dict[str, Any], *, ok_result: str) -> str:
             resp["warnings"] = parsed.get("warnings")
         return _safe_json_dumps(resp) or "{}"
     return _safe_json_dumps({"result": ok_result, "raw": stdout}) or "{}"
+
+
+def _transport_write_response(resp: Any, *, ok_result: str,
+                              action: str) -> str:
+    """Issue #289 (T-10): shape a hub MCP write-tool response (an already
+    parsed dict from ``fleet.transport.McpHttp``) into the same JSON string
+    ``_structured_write_response`` produces for the local path.  A transport
+    failure (unreachable hub, refused call) is a structured agent-visible
+    error — never a silent success."""
+    if not isinstance(resp, dict):
+        return _tool_error(
+            f"{action} failed: hub returned an invalid response")
+    if resp.get("ok") is False:
+        reason = str(resp.get("reason") or "empty-pool")
+        if reason == "hub-unreachable":
+            return _tool_error(
+                f"{action} failed: hub unreachable "
+                f"(ZMEM_MCP_URL/ZMEM_REMOTE_URL target did not answer)")
+        return _tool_error(f"{action} failed: {reason}")
+    if resp.get("error"):
+        return _tool_error(f"{action} failed: {resp['error']}")
+    out: Dict[str, Any] = {
+        "result": resp.get("result", ok_result), "id": resp.get("id")}
+    if resp.get("created_new") is not None:
+        out["created_new"] = resp.get("created_new")
+    if resp.get("warnings"):
+        out["warnings"] = resp.get("warnings")
+    return _safe_json_dumps(out) or "{}"
 
 
 # -- provider ----------------------------------------------------------------
@@ -2508,6 +2562,14 @@ class ZmemMemoryProvider(MemoryProvider):
                    or str(env.get("ZMEM_REMOTE_URL", "") or "").strip())
             self._transport = _transport.McpHttp(
                 url=url, executor=executor, deadline_s=deadline_s)
+
+    def _remote_active(self) -> bool:
+        """Issue #289 (T-10): True when the provider's transport is the
+        remote MCP transport — the explicit agent tools route to the hub,
+        never to a local store.py subprocess (no split-brain store)."""
+        return (_transport is not None
+                and self._mode is _transport.TransportMode.mcp
+                and self._transport is not None)
 
     @property
     def name(self) -> str:
@@ -3612,6 +3674,27 @@ class ZmemMemoryProvider(MemoryProvider):
             cli_args += ["--legacy-unscoped"]
         # Empty namespace defaults to the session namespace above; '*' remains
         # unscoped via the compatibility marker above.
+        # Issue #289 (T-10): MCP mode routes the search through the hub's
+        # search tool (keyword-only contract enforced server-side; the
+        # include-global policy gate applies hub-side).
+        if self._remote_active():
+            if ns_arg and ns_arg != "*":
+                remote_ns: Optional[str] = ns_arg
+            elif not ns_arg:
+                remote_ns = self._namespace
+            else:
+                remote_ns = None  # '*' — legacy unscoped union
+            resp = self._transport.search(query[:_MAX_QUERY_CHARS],
+                                          namespace=remote_ns, limit=limit)
+            if not isinstance(resp, dict) or resp.get("ok") is False \
+                    or resp.get("error"):
+                detail = (resp.get("error") or resp.get("reason")
+                          if isinstance(resp, dict) else "invalid response")
+                return _tool_error(f"Search failed: {detail}")
+            raw = resp.get("results")
+            results = raw if isinstance(raw, list) else []
+            items = self._project_search_rows(results)
+            return json.dumps({"results": items, "count": len(items)})
         r = _run_store(cli_args)
         if not r["ok"]:
             return _tool_error(f"Search failed: {_sanitize_store_error(r)}")
@@ -3632,7 +3715,14 @@ class ZmemMemoryProvider(MemoryProvider):
             results = parsed
         else:
             results = []
-        items = [
+        items = self._project_search_rows(results)
+        return json.dumps({"results": items, "count": len(items)})
+
+    @staticmethod
+    def _project_search_rows(results: list) -> list:
+        """Issue #289: the public search row projection, shared by the local
+        and the remote (hub) search legs so both return the same shape."""
+        return [
             {
                 "id": it.get("id"),
                 "type": it.get("type"),
@@ -3651,7 +3741,6 @@ class ZmemMemoryProvider(MemoryProvider):
             for it in results
             if isinstance(it, dict)
         ]
-        return json.dumps({"results": items, "count": len(items)})
 
     def _tool_add(self, args: Dict[str, Any]) -> str:
         consts = _store_constants()
@@ -3704,6 +3793,15 @@ class ZmemMemoryProvider(MemoryProvider):
         source_ref = (args.get("source_ref") or "").strip()
         if not source_ref and self._session_id:
             source_ref = f"session:{self._session_id}"
+        # Issue #289 (T-10): in MCP mode the write routes to the hub's add
+        # tool through the provider transport — never a local store.py
+        # subprocess (the hub stamps attribution and clamps taint itself).
+        if self._remote_active():
+            resp = self._transport.add(
+                content, type_=mtype, namespace=ns, signal=signal,
+                source_ref=source_ref, tags=tags, taint=taint)
+            return _transport_write_response(resp, ok_result="stored",
+                                             action="Add")
         # PR-review PRR-L (issue #59 review round): Hermes writes are agent
         # surface traffic — pass --capture-mode auto so secret-like content is
         # redacted exactly as the MCP add path does (#36 M4 parity).
@@ -3741,6 +3839,15 @@ class ZmemMemoryProvider(MemoryProvider):
         if not mid:
             return _tool_error("Missing required parameter: id")
         reason = (args.get("reason") or "").strip()
+        # Issue #289 (T-10): MCP mode routes the tombstone to the hub
+        # (namespace-guarded server-side), never a local subprocess.
+        if self._remote_active():
+            resp = self._transport.supersede(mid, reason)
+            if isinstance(resp, dict) and not resp.get("error") \
+                    and resp.get("ok") is not False:
+                return json.dumps({"result": "superseded", "id": mid})
+            return _transport_write_response(resp, ok_result="superseded",
+                                             action="Supersede")
         cli_args = ["supersede", "--id", mid]
         if reason:
             cli_args += ["--reason", reason]
@@ -3806,6 +3913,16 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error(
                 "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
             )
+        # Issue #289 (T-10): MCP mode routes the update to the hub's update
+        # tool (namespace-guarded, attribution-stamped server-side).
+        if self._remote_active():
+            resp = self._transport.update(
+                mid, content, namespace=ns_override or None,
+                type_=mtype or None, tags=tags or None,
+                source_ref=source_ref or None, signal=signal or None,
+                taint=taint)
+            return _transport_write_response(resp, ok_result="updated",
+                                             action="Update")
         cli_args += ["--taint", taint]
         # PR-review PRR-L: agent-surface update redacts secrets like MCP (#36
         # M4 parity). PR-review PRR-P: oversize content is piped via stdin.
@@ -3832,6 +3949,14 @@ class ZmemMemoryProvider(MemoryProvider):
                 "Missing required parameter: reason — invalidation records why "
                 "the fact is no longer true and REQUIRES a reason (issue #59, 4.3)"
             )
+        # Issue #289 (T-10): MCP mode routes the invalidation to the hub.
+        if self._remote_active():
+            resp = self._transport.invalidate(mid, reason)
+            if isinstance(resp, dict) and not resp.get("error") \
+                    and resp.get("ok") is not False:
+                return json.dumps({"result": "invalidated", "id": mid})
+            return _transport_write_response(resp, ok_result="invalidated",
+                                             action="Invalidate")
         r = _run_store(["invalidate", "--id", mid, "--reason", reason])
         if not r["ok"]:
             # PR-review PRR-M: sanitized diagnostic (never raw stderr). The
@@ -3890,30 +4015,61 @@ class ZmemMemoryProvider(MemoryProvider):
         # interval while store-path resolution stays outside it.
         timing: Dict[str, int] = {}
         session_id = (args.get("session_id") or self._session_id or "").strip()
-        result = _run_passive_store(_passive_store_args(
-            "recent",
-            query="",
-            namespace=ns,
-            limit=limit,
-            global_limit=2,
-            session_id=session_id,
-            moment="session_start",
-            lane="hermes-provider",
-        ), timing=timing)
-        elapsed = timing.get("t_ms", 0)
-        payload = _decode_rendered_envelope(result)
-        if payload is None:
-            # A legacy or mixed-version envelope without a rendered member
-            # still feeds the structured response and the decision line; the
-            # delivered context stays empty rather than being reconstructed
-            # locally (the store owns selection and rendering).
-            stdout = ((result.get("stdout") or "").strip()
-                      if isinstance(result, dict) else "")
-            try:
-                legacy = json.loads(stdout) if stdout else {}
-            except (TypeError, json.JSONDecodeError):
-                legacy = {}
-            payload = legacy if isinstance(legacy, dict) else {}
+        # Issue #289 (T-10): in MCP mode the session-start pull routes
+        # through the hub's session_start tool (the CLI's --for-injection
+        # flags are remote-refused, so the pull must not shell out).  The
+        # hub envelope's ids/omitted/rendered members remap onto the local
+        # decision fields below; the hub's own include-global policy gate
+        # (global-limit 2 under _include_global_allowed) is the disclosed
+        # remote semantic for the local --include-global/--global-limit.
+        if self._remote_active():
+            t0 = time.monotonic()
+            envelope = self._transport.session_start(
+                ns, session_id, lane="hermes-provider", limit=limit)
+            timing["t_ms"] = int((time.monotonic() - t0) * 1000)
+            if isinstance(envelope, dict) \
+                    and envelope.get("reason") != "hub-unreachable":
+                # The hub session_start envelope carries ids/omitted/
+                # rendered, NOT results/candidate_ids — remap onto the
+                # local decision fields (issue #289 review finding 5: the
+                # client-side decision line must carry the delivered ids).
+                ids = envelope.get("ids")
+                if not isinstance(ids, list):
+                    ids = []
+                payload = dict(envelope)
+                payload["results"] = [{"id": str(mid)} for mid in ids
+                                      if isinstance(mid, str)]
+                payload["candidate_ids"] = [str(mid) for mid in ids
+                                            if isinstance(mid, str)]
+            else:
+                payload = {}
+            elapsed = timing.get("t_ms", 0)
+        else:
+            result = _run_passive_store(_passive_store_args(
+                "recent",
+                query="",
+                namespace=ns,
+                limit=limit,
+                global_limit=2,
+                session_id=session_id,
+                moment="session_start",
+                lane="hermes-provider",
+            ), timing=timing)
+            elapsed = timing.get("t_ms", 0)
+            payload = _decode_rendered_envelope(result)
+            if payload is None:
+                # A legacy or mixed-version envelope without a rendered member
+                # still feeds the structured response and the decision line;
+                # the delivered context stays empty rather than being
+                # reconstructed locally (the store owns selection and
+                # rendering).
+                stdout = ((result.get("stdout") or "").strip()
+                          if isinstance(result, dict) else "")
+                try:
+                    legacy = json.loads(stdout) if stdout else {}
+                except (TypeError, json.JSONDecodeError):
+                    legacy = {}
+                payload = legacy if isinstance(legacy, dict) else {}
         rendered = payload.get("rendered")
         if not isinstance(rendered, str):
             rendered = ""
@@ -4031,8 +4187,18 @@ class ZmemMemoryProvider(MemoryProvider):
             # F8: pipe literal '-' via stdin (CLI stdin sentinel).
             cli_args[cli_args.index("--content") + 1] = "-"
             input_text = note
-        r = _run_store(cli_args, input_text=input_text)
-        resp = _structured_write_response(r, ok_result="session_ended")
+        # Issue #289 (T-10): MCP mode routes the session-end note to the
+        # hub's add tool; the local maintenance legs never run remotely
+        # (this tool has none — "No note ⇒ no-write ack").
+        if self._remote_active():
+            r2 = self._transport.add(
+                note, type_="fact", namespace=ns, signal="none",
+                source_ref="session_end", taint="untrusted_tool")
+            resp = _transport_write_response(r2, ok_result="session_ended",
+                                             action="Add")
+        else:
+            r = _run_store(cli_args, input_text=input_text)
+            resp = _structured_write_response(r, ok_result="session_ended")
         try:
             parsed = json.loads(resp)
             if isinstance(parsed, dict) and "error" not in parsed:
@@ -4140,8 +4306,17 @@ class ZmemMemoryProvider(MemoryProvider):
                 "session_id": previous_session,
                 "namespace": previous_namespace,
             })
-            _run_store(["organize"])
-            _run_store(["backup", "--if-due"])
+            # Issue #289 (T-10): local maintenance never runs on a remote
+            # box — organize/backup are hub-side commands (the CLI gate
+            # refuses them under ZMEM_REMOTE_URL); skipping here keeps the
+            # plugin from spawning a refused subprocess.
+            if self._remote_active():
+                logger.info(
+                    "zmem on_session_end: skipping local organize/backup "
+                    "(remote mode; they run on the hub)")
+            else:
+                _run_store(["organize"])
+                _run_store(["backup", "--if-due"])
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("zmem on_session_end housekeeping failed: %s", exc)
 
@@ -4365,6 +4540,12 @@ class ZmemMemoryProvider(MemoryProvider):
         if not _DELEGATION_INFLIGHT.acquire(blocking=False):
             logger.debug(
                 "zmem delegation evidence skipped: writer saturated")
+            return
+        # Issue #289 (T-10): evidence rows live in the hub's memory store
+        # in remote mode — skip the local write.
+        if _remote_env_active():
+            _DELEGATION_INFLIGHT.release()
+            logger.debug("zmem delegation evidence skipped (remote mode)")
             return
         try:
             response = _run_store(

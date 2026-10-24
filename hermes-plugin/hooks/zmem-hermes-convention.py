@@ -302,6 +302,11 @@ def _write_post_tool_evidence(
             kwargs["start_new_session"] = True
         if not _EVIDENCE_INFLIGHT.acquire(blocking=False):
             return False
+        # Issue #289 (T-10): evidence rows live in the hub's memory store
+        # in remote mode — skip the local write (fail-open, no subprocess).
+        if (os.environ.get("ZMEM_REMOTE_URL", "") or "").strip():
+            _EVIDENCE_INFLIGHT.release()
+            return False
         try:
             child = subprocess.Popen(
                 [_python_bin(), str(store_py), "evidence", "write"], **kwargs
@@ -353,6 +358,10 @@ def _run_convention(payload: dict[str, Any], extra: dict[str, Any]) -> None:
             return
         request = _compact_json({"payload": payload, "extra": extra}).encode("utf-8")
         if len(request) > _MAX_INPUT_BYTES:
+            return
+        # Issue #289 (T-10): hermes-convention writes the memory meta
+        # table — hub-side only in remote mode; skip the local call.
+        if (os.environ.get("ZMEM_REMOTE_URL", "") or "").strip():
             return
         env = os.environ.copy()
         env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"

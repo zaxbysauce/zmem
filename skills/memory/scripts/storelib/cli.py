@@ -2559,7 +2559,7 @@ def main():
     p_upd.add_argument("--capture-mode", default=None, choices=list(CAPTURE_MODES),
                        help="same capture policy as `add` (manual/reviewed keep text "
                             "with warnings; auto redacts secrets)")
-    p_upd.add_argument("--reason", default="updated",
+    p_upd.add_argument("--reason", default=None,
                        help="lineage reason: 'updated' (default) or 'explicit correction'")
     p_upd.add_argument("--evidence", default=None,
                        help="comma-separated existing evidence ids to attach")
@@ -2590,6 +2590,10 @@ def main():
     p_list.add_argument("--namespace", default=None)
     p_list.add_argument("--limit", type=nonnegative_int, default=50)
     p_list.add_argument("--include-superseded", action="store_true")
+    p_list.add_argument(
+        "--json", action="store_true",
+        help="print the rows as a JSON object (issue #289: the remote-mode "
+             "read route and the hub list_memories tool consume this shape)")
 
     # Issue #138: curated pages are explicit filesystem artifacts.  The
     # nested grammar stays separate from ordinary memory list/read commands so
@@ -3847,6 +3851,16 @@ def main():
     if (args.cmd == "add" and getattr(args, "type", None) == "event"
             and not (args.occurred_start and args.occurred_end)):
         ap.error("--type event requires --occurred-start and --occurred-end")
+
+    # Issue #289 (T-10): in remote mode (ZMEM_REMOTE_URL set) the gate
+    # routes the user-facing subcommands through the fleet backend (op
+    # queue for writes, hub MCP tools for reads), keeps the verified
+    # store-independent sidecar commands local, and refuses everything
+    # else before any store access.  handle_remote returns only for the
+    # ALLOW-LOCAL band, letting this local path continue unchanged.
+    from storelib import remote_gate  # noqa: PLC0415 - lazy: local path free
+    if remote_gate.is_remote_mode():
+        remote_gate.handle_remote(args)
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
     # supplied --batch but ordinary reembed retains its historical default.
@@ -5521,7 +5535,13 @@ def main():
                         capture_mode=(args.capture_mode if args.capture_mode
                                 else _intent_capture_mode()),
                         expected_old_namespace=args.expected_old_namespace,
-                        supersede_reason=args.reason,
+                        # Issue #289: parser default None lets the remote
+                        # gate refuse an EXPLICIT --reason while the local
+                        # path keeps the historical "updated" default —
+                        # `is not None` preserves the "" refusal in
+                        # update_memory (write.py ValueError).
+                        supersede_reason=(args.reason if args.reason is not None
+                                          else "updated"),
                         evidence_ids=args.evidence_ids,
                         expiry_class=args.expiry_class,
                         inject_until=args.inject_until,
@@ -5813,7 +5833,9 @@ def main():
         elif args.cmd == "get":
             sys.exit(0 if get_memory(conn, args.id) else 1)
         elif args.cmd == "list":
-            list_memory(conn, namespace=args.namespace, limit=args.limit, include_superseded=args.include_superseded)
+            list_memory(conn, namespace=args.namespace, limit=args.limit,
+                        include_superseded=args.include_superseded,
+                        as_json=bool(getattr(args, "json", False)))
         elif args.cmd == "convention-drift":
             # Post-connect like `list` (needs the store AND the queue sidecar);
             # read-only and auto-rekey-exempt (see the exemption tuple above).

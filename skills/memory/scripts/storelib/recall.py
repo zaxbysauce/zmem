@@ -5694,7 +5694,8 @@ def recent_memory(
     return rows
 
 
-def list_memory(conn, *, namespace=None, limit=50, include_superseded=False):
+def list_memory(conn, *, namespace=None, limit=50, include_superseded=False,
+                as_json=False):
     params = []
     clauses = []
     if namespace:
@@ -5709,6 +5710,27 @@ def list_memory(conn, *, namespace=None, limit=50, include_superseded=False):
         f"signal, tags, superseded_at FROM memory {where} ORDER BY ingestion_ts DESC LIMIT ?",
         params,
     ).fetchall()
+    if as_json:
+        # Issue #289 (T-10): the JSON shape consumed by the remote read
+        # route and the hub list_memories tool.
+        print(json.dumps({
+            "namespace": namespace,
+            "count": len(rows),
+            "memories": [
+                {
+                    "id": r["id"],
+                    "namespace": r["namespace"],
+                    "type": r["type"],
+                    "preview": r["preview"],
+                    "confidence": r["confidence"],
+                    "signal": r["signal"],
+                    "tags": r["tags"],
+                    "superseded_at": r["superseded_at"],
+                }
+                for r in rows
+            ],
+        }, indent=2))
+        return
     if not rows:
         print("[zmem] (no memories)")
     for r in rows:
