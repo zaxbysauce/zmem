@@ -472,6 +472,16 @@ def test_principal_map_parity_corpus():
     assert any("non-empty" in p for p in problems_for(
         {"t1": {"principal": "p", "host": "h", "harness": "x",
                 "namespaces": ["  "]}}))
+    # Round-2 residual cases: empty namespaces list and non-string fields
+    # (auth exits 2 on both; issuer and doctor must too).
+    assert any("NON-EMPTY" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": []}}))
+    assert any("'host' must" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": 12, "harness": "x"}}))
+    assert any("'principal' must be a non-empty string" in p
+               for p in problems_for(
+                   {"t1": {"principal": 12, "host": "h", "harness": "x"}}))
 
 
 def test_issuer_and_doctor_match_server_auth_grammar():
@@ -526,6 +536,9 @@ def test_issuer_and_doctor_match_server_auth_grammar():
             "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa3': {{\n"
             "        'principal': 'p', 'host': 'h', 'harness': 'x',\n"
             "        'capabilities': ['root']}}}},\n"
+            "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa4': {{\n"
+            "        'principal': 'p', 'host': 12, 'harness': 'x',\n"
+            "        'namespaces': []}}}},\n"
             "]\n"
             "for m in maps:\n"
             "    hub_ok = auth_accepts(m)\n"
@@ -545,7 +558,7 @@ def test_issuer_and_doctor_match_server_auth_grammar():
         assert "CAPS True" in out, out
         assert "LIM True True True" in out, out
         agrees = [ln for ln in out.splitlines() if ln.startswith("AGREE")]
-        assert len(agrees) == 3, out
+        assert len(agrees) == 4, out
         for ln in agrees:
             # hub accepts  ==  doctor reports no problems  ==  issuer accepts
             parts = ln.split()

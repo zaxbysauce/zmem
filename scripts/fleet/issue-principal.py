@@ -117,19 +117,22 @@ def _validate_entry(entry: dict) -> list[str]:
     missing = _REQUIRED_FIELDS - set(entry)
     if missing:
         problems.append(f"missing required field(s) {sorted(missing)}")
-    pid = str(entry.get("principal", "")).strip()
-    if not pid:
+    pid = entry.get("principal")
+    if not isinstance(pid, str) or not pid.strip():
         problems.append("'principal' must be a non-empty string")
-    elif (len(pid) > _MAX_PRINCIPAL_ID_CHARS
-            or not _PRINCIPAL_ID_RE.match(pid)):
+    elif (len(pid.strip()) > _MAX_PRINCIPAL_ID_CHARS
+            or not _PRINCIPAL_ID_RE.match(pid.strip())):
         problems.append(
             f"'principal' must match [A-Za-z0-9][A-Za-z0-9._-]* and be at "
             f"most {_MAX_PRINCIPAL_ID_CHARS} characters")
     for field in ("host", "harness"):
-        value = str(entry.get(field, "")).strip()
-        if (not value
-                or len(value) > _MAX_TAG_VALUE_CHARS
-                or not _PRINCIPAL_ID_RE.match(value)):
+        value = entry.get(field)
+        if not isinstance(value, str) or not value.strip():
+            problems.append(
+                f"'{field}' must be a non-empty string matching "
+                "[A-Za-z0-9][A-Za-z0-9._-]*")
+        elif (len(value.strip()) > _MAX_TAG_VALUE_CHARS
+                or not _PRINCIPAL_ID_RE.match(value.strip())):
             problems.append(
                 f"'{field}' must match [A-Za-z0-9][A-Za-z0-9._-]* and be at "
                 f"most {_MAX_TAG_VALUE_CHARS} characters")
@@ -138,8 +141,10 @@ def _validate_entry(entry: dict) -> list[str]:
     namespaces = entry.get("namespaces")
     if namespaces is not None and (
             not isinstance(namespaces, list)
+            or not namespaces
             or not all(isinstance(n, str) and n.strip() for n in namespaces)):
-        problems.append("'namespaces' must be a list of non-empty strings")
+        problems.append(
+            "'namespaces' must be a NON-EMPTY list of non-empty strings")
     capabilities = entry.get("capabilities")
     if capabilities is not None and (
             not isinstance(capabilities, list) or not capabilities
@@ -174,8 +179,12 @@ def main(argv: list[str] | None = None) -> int:
         "harness": args.harness.strip(),
     }
     if args.namespaces.strip():
-        entry["namespaces"] = [
-            n.strip() for n in args.namespaces.split(",") if n.strip()]
+        ns_list = [n.strip() for n in args.namespaces.split(",") if n.strip()]
+        if not ns_list:
+            return _refuse(
+                "--namespaces parsed to an empty list (only separators?) — "
+                "omit the flag or name at least one namespace")
+        entry["namespaces"] = ns_list
     caps = ([c.strip() for c in args.capabilities.split(",") if c.strip()]
             if args.capabilities.strip() else [])
     if args.preset == "off-tailnet":

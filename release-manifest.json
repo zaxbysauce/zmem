@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "c5378b2d8bfd8dfdbce670f5fc4d4b6282695d31f9237e13b8c492dc85d3b32f",
+  "digest": "c8d91fbf9c6f2bc323759492a418c5d58ef3580527d73dfed5478f6df8ea2d70",
   "files": {
     ".agents/plugins/marketplace.json": "90b71068f89eb5c701312e1c2c30a285aff86d6b52264626fecdea6924b3d76d",
     ".claude-plugin/marketplace.json": "202b009c20e1234ec1d7f61a90a96b532f1f871af7789070a4b633de24546538",
@@ -57,7 +57,7 @@
     "scripts/fleet/install-broker.sh": "b5c9bece0f07afdb5a83636c0496949c111c9ef4c2251a5ff60c267a7aafef42",
     "scripts/fleet/install-hub.ps1": "08b43c840393edfc8375a8b8ccdb0df68b9f7ea69c02b6d466a0e62014ea4e92",
     "scripts/fleet/install-hub.sh": "3ffece3d555eedbb74c5dde091d3a681d7179ddccdb0ada2d7fba3fa37789b49",
-    "scripts/fleet/issue-principal.py": "845e25e0a8bea6305c60d1866277ee823bcfda67b0761bd05df05b218488888f",
+    "scripts/fleet/issue-principal.py": "24a5b9a7656b6cf52b691abfffae3e7c42510db40f83d933feeb419b7c7f2ce7",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
     "scripts/host_canary.py": "d7e39adc0eba0b3d559fbe4f3d5883b5413e98cbc247e79eaec2448c1e7f3616",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
@@ -73,7 +73,7 @@
     "skills/memory/scripts/correction_queue.py": "b9306cab8e1a4a035581093d91ad2acf34926fdac02b853c8c4384d7ef4bbf9f",
     "skills/memory/scripts/corrections.py": "a7ef6bef89859da942733eba362a04e4268c8bf5c9496fe8d14c596ac6c2199b",
     "skills/memory/scripts/cross_encoder_profiles.py": "5fbf8dec9f660b76234e4254a8964e4b5756bfec4f88df6483d71b6b8250b42d",
-    "skills/memory/scripts/doctor.py": "d3e6c483609e1ae9dc2bdabcffa90b4b2318e877b2ffa3f42cacd8845ec970b3",
+    "skills/memory/scripts/doctor.py": "f535355cbb8355e9c630ca3dc3cdff95225e366f340f604076ab3c5c8e4d3d42",
     "skills/memory/scripts/drift.py": "c6ba2148f71671275b4096c747942411fa2ac48558ed8420cbe8abfbdffe356e",
     "skills/memory/scripts/embed_profiles.py": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c",
     "skills/memory/scripts/embeddings.py": "5e6016f10a0b1903885a9a9d8419398922ce988911c915a35eac28124034ce80",

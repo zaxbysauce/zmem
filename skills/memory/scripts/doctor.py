@@ -4927,7 +4927,13 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
             problems.append("'principal' must be a non-empty string")
         for field in ("host", "harness"):
             value = entry.get(field)
-            if isinstance(value, str):
+            if not isinstance(value, str):
+                if field in entry:
+                    problems.append(
+                        f"'{field}' must be a string matching "
+                        "[A-Za-z0-9][A-Za-z0-9._-]* (at most "
+                        f"{_FLEET_MAX_TAG_VALUE_CHARS} characters)")
+            else:
                 value = value.strip()
                 if (not value
                         or len(value) > _FLEET_MAX_TAG_VALUE_CHARS
@@ -4941,9 +4947,11 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
             problems.append("'revoked' must be a boolean when present")
         namespaces = entry.get("namespaces")
         if namespaces is not None:
-            if not isinstance(namespaces, list) or not all(
-                    isinstance(n, str) for n in namespaces):
-                problems.append("'namespaces' must be a list of strings")
+            if (not isinstance(namespaces, list)
+                    or not namespaces
+                    or not all(isinstance(n, str) for n in namespaces)):
+                problems.append(
+                    "'namespaces' must be a NON-EMPTY list of strings")
             else:
                 if any(not n.strip() for n in namespaces):
                     problems.append("'namespaces' entries must be non-empty")
