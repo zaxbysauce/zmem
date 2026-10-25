@@ -609,7 +609,23 @@ def _serve_offline_read(env: dict[str, str], *, query: str,
     ``no_telemetry=True``; the label is prepended to the rendered fence
     as a broker-emitted header line.
     """
-    conn, meta = _load(env)
+    try:
+        conn, meta = _load(env)
+    except ValueError as exc:
+        # Issue #291: a StoreConfigError (a directory variable naming an
+        # existing file) reaches _load through _data_dir's env-synced
+        # resolver call, which sits BEFORE the local try below — the
+        # fail-open contract (envelope None, state none) must hold for the
+        # hermes provider's in-process lane too, not just broker_cli's
+        # outer catch. Only the config-refusal ValueError degrades; any
+        # other ValueError is a real defect and still raises.
+        try:
+            import host as _host  # noqa: PLC0415
+            if not isinstance(exc, _host.StoreConfigError):
+                raise
+        except ImportError:
+            raise
+        return None, "none"
     if conn is None:
         return None, "none"
     state = _state(meta)

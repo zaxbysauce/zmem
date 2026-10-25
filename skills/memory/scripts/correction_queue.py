@@ -208,7 +208,17 @@ def _resolve_data_dir() -> Path:
     try:
         import host as _host
         return _host.resolve_store_path().parent
-    except Exception:
+    except Exception as exc:
+        try:
+            import host as _host_check
+            if isinstance(exc, _host_check.StoreConfigError):
+                # Issue #291: a REFUSED configuration (a directory variable
+                # naming an existing file) must fail loudly — the ~/.zmem
+                # fallback below is for an UNAVAILABLE resolver, never a
+                # reason to silently relocate correction sidecars.
+                raise
+        except ImportError:
+            pass
         # Fail-open location: default box-wide data dir.
         return Path(os.path.expanduser("~")) / ".zmem"
 

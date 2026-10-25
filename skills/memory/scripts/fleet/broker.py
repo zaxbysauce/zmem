@@ -677,6 +677,26 @@ def handle_event(event: str, payload: Mapping[str, Any],
         return {"additionalContext": ""}
     if not is_remote_mode(source):
         return {"additionalContext": ""}
+    try:
+        return _handle_event_inner(event, payload, source, started)
+    except ValueError as exc:
+        # Issue #291: a StoreConfigError (a directory variable naming an
+        # existing file) can surface from ANY of the seam calls below
+        # (pending_overlay's opqueue, the snapshot lane, the queue flush) —
+        # the direct-API fail-open contract requires the envelope, never a
+        # traceback. Only the config-refusal ValueError degrades; any other
+        # ValueError is a real defect and still raises.
+        try:
+            import host as _host  # noqa: PLC0415
+            if not isinstance(exc, _host.StoreConfigError):
+                raise
+        except ImportError:
+            raise
+        return _fail_open(event, "store-config-refused", str(exc), started)
+
+
+def _handle_event_inner(event: str, payload: Mapping[str, Any],
+                        source: dict[str, str], started: float) -> dict[str, str]:
     http = _http(source)
     if event == "Stop" or event == "SubagentStop":
         return _handle_stop(http, source, event, payload, started)

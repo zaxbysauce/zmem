@@ -46,7 +46,17 @@ def _store_dir() -> Path:
         from storelib.schema import STORE_PATH
 
         return Path(STORE_PATH).resolve().parent
-    except Exception:
+    except Exception as exc:
+        try:
+            import host as _host_check
+            if isinstance(exc, _host_check.StoreConfigError):
+                # Issue #291: a REFUSED configuration (a directory variable
+                # naming an existing file) must fail loudly — never fall
+                # through to the env chain/cwd fallback below, which would
+                # silently activate an unrelated config location.
+                raise
+        except ImportError:
+            pass
         # Unresolvable store (host helpers unavailable) -> fall back to the
         # env chain the store itself uses, then cwd.  Read-only either way.
         store = os.environ.get("ZMEM_STORE", "").strip()

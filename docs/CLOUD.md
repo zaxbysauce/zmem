@@ -1132,3 +1132,14 @@ bound is promised. If the snapshot or artifact scan cannot complete, purge
 refuses before live row deletion. Passive credential withholding is a delivery
 decision and does not claim at-rest encryption or redaction of the stored page
 content.
+
+## Off-tailnet runners — the fleet path (issue #291)
+
+The tier system above is the fallback for boxes that cannot join the
+tailnet. A runner that CAN join (GitHub Actions with Tailscale, cloud
+sessions) gets a least-privilege fleet principal instead: ephemeral
+tagged auth keys join the tailnet, and `scripts/fleet/issue-principal.py
+--preset off-tailnet` issues a `read,passive`-capability principal — the
+hub map stays on the hub, the runner carries only its own token file
+(`scripts/fleet/install-broker.sh`). See
+[docs/FLEET.md](FLEET.md) for the full fleet contract.
