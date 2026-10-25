@@ -48,7 +48,7 @@ _ALLOWED_FIELDS = frozenset({
     "revoked",
 })
 _REQUIRED_FIELDS = {"principal", "host", "harness"}
-_MAX_PRINCIPALS = 64
+_MAX_PRINCIPALS = 256
 _LOCK_STALE_S = 120
 # Hub-parser grammar parity (review round 1): the hub refuses maps on these
 # rules, so the issuer enforces the same ones — it must never mint an entry
@@ -147,11 +147,26 @@ def _validate_entry(entry: dict) -> list[str]:
         problems.append(
             "'namespaces' must be a NON-EMPTY list of non-empty strings")
     elif namespaces is not None:
+        ns_total = 0
         for ns in namespaces:
             if not is_valid_namespace(ns):
                 problems.append(
                     f"namespace {ns[:40]!r} is not a valid scoped "
                     "namespace (the hub parser would refuse it)")
+            ns_bytes = len(ns.encode("utf-8"))
+            if ns_bytes > 256:
+                problems.append(
+                    f"a namespace exceeds 256 UTF-8 bytes (the hub parser "
+                    "would refuse it)")
+            ns_total += ns_bytes
+        if len(namespaces) > 128:
+            problems.append(
+                "'namespaces' exceeds the maximum of 128 entries (the hub "
+                "parser would refuse it)")
+        if ns_total > 8192:
+            problems.append(
+                "'namespaces' exceeds the per-entry aggregate of 8192 "
+                "UTF-8 bytes (the hub parser would refuse it)")
     capabilities = entry.get("capabilities")
     if capabilities is not None and (
             not isinstance(capabilities, list) or not capabilities
@@ -239,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
                     "refuse (grammar/shape); fix the map first — the issuer "
                     "never appends onto a map the hub would exit on")
         if len(existing) + 1 > _MAX_PRINCIPALS:
-            return _refuse(f"map would exceed {_MAX_PRINCIPALS} principals")
+            return _refuse(f"map would exceed the hub maximum of {_MAX_PRINCIPALS} principals")
     else:
         existing = {}
 

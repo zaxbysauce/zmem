@@ -498,6 +498,76 @@ def test_principal_map_parity_corpus():
     assert _mod._validate_entry(
         {"principal": "p", "host": "h", "harness": "x", "comment": "c"}), (
         "issuer must refuse the hub-unknown 'comment' field")
+    # Final-critic round 1: the LIMIT axes (the hub exits 2 on all three).
+    assert any("exceeds the maximum of 128" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["project:n%d" % i for i in range(129)]}}))
+    assert any("exceeds 256 UTF-8 bytes" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["project:" + "a" * 250]}}))
+    assert any("per-entry aggregate" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["project:" + "b" * 241
+                               for _ in range(34)]}}))
+    # Per-entry (not map-global) budget: five hub-legal entries are legal.
+    big_but_legal = {
+        "tok-%048d" % i: {
+            "principal": "p%d" % i, "host": "h", "harness": "x",
+            "namespaces": ["project:" + "c" * 241 for _ in range(32)]}
+        for i in range(5)}
+    assert problems_for(big_but_legal) == [], (
+        "the aggregate budget is PER-ENTRY (hub scope); a map of several "
+        "hub-legal entries must report no problems")
+    assert _mod._MAX_PRINCIPALS == 256, (
+        "the issuer cap must mirror the hub's 256, not diverge")
+    # Round-3: namespace SHAPE (auth exits 2 on an unscoped namespace).
+    assert any("not a valid scoped namespace" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["banana"]}}))
+    # Round-4: issuer field-set alignment + token-key rules.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "issue_principal_mod", str(ISSUE_PRINCIPAL_PY))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    assert _mod._ALLOWED_FIELDS == frozenset(
+        {"principal", "host", "harness", "namespaces", "capabilities",
+         "revoked"}), _mod._ALLOWED_FIELDS
+    assert _mod._validate_entry(
+        {"principal": "p", "host": "h", "harness": "x", "comment": "c"}), (
+        "issuer must refuse the hub-unknown 'comment' field")
+    # Final-critic round 1: the LIMIT axes (the hub exits 2 on all three).
+    assert any("exceeds the maximum of 128" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["project:n%d" % i for i in range(129)]}}))
+    assert any("exceeds 256 UTF-8 bytes" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["project:" + "a" * 250]}}))
+    assert any("per-entry aggregate" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["project:" + "b" * 241
+                               for _ in range(34)]}}))
+    # Per-entry (not map-global) budget: five hub-legal entries are legal.
+    big_but_legal = {
+        "tok-%048d" % i: {
+            "principal": "p%d" % i, "host": "h", "harness": "x",
+            "namespaces": ["project:" + "c" * 241 for _ in range(32)]}
+        for i in range(5)}
+    assert problems_for(big_but_legal) == [], (
+        "the aggregate budget is PER-ENTRY (hub scope); a map of several "
+        "hub-legal entries must report no problems")
+    assert _mod._MAX_PRINCIPALS == 256, (
+        "the issuer cap must mirror the hub's 256, not diverge")
+    # Issuer limit parity on the same three axes.
+    assert _mod._validate_entry({
+        "principal": "p", "host": "h", "harness": "x",
+        "namespaces": ["project:n%d" % i for i in range(129)]})
+    assert _mod._validate_entry({
+        "principal": "p", "host": "h", "harness": "x",
+        "namespaces": ["project:" + "a" * 250]})
+    assert _mod._validate_entry({
+        "principal": "p", "host": "h", "harness": "x",
+        "namespaces": ["project:" + "b" * 241 for _ in range(34)]})
 
 
 def test_issuer_and_doctor_match_server_auth_grammar():
@@ -800,3 +870,204 @@ def test_installer_statics():
             ["bash", "-n", str(REPO_ROOT / "scripts" / "fleet" / sh)],
             capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, (sh, result.stderr)
+
+
+def test_fleet_skip_warn_matrix_and_numeric_ages():
+    """Plan item (d)/(f) pins the final critic found silently dropped: the
+    skip/warn matrix (no URL, corrupt meta, single-half snapshot, expired
+    snapshot, invalid FDE seam, malformed/future queue timestamps,
+    receipt-flipped entries) and the NUMERIC age pins — driven directly at
+    the check functions with staged fixtures (deterministic, no network)."""
+    import sqlite3
+
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import doctor
+
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-matrix-") as td:
+        tmp = Path(td)
+        data = tmp / "data"
+        data.mkdir()
+        now = time.time()
+
+        def status(fn, *a, **kw):
+            return fn(*a, **kw)["status"]
+
+        # No URL: hub checks skip.
+        os.environ.pop("ZMEM_REMOTE_URL", None)
+        os.environ.pop("ZMEM_MCP_URL", None)
+        assert status(doctor._check_fleet_hub_reachable) == "skip"
+        # Corrupt meta -> warn; single-half -> warn; expired -> warn; the
+        # numeric ages on the fresh leg.
+        broker = data / "broker"
+        broker.mkdir()
+        conn = sqlite3.connect(str(broker / "snapshot.sqlite"))
+        conn.execute("CREATE TABLE memory (id TEXT)")
+        conn.commit()
+        conn.close()
+        # Corrupt meta with the sqlite half present -> corrupt (a meta-only
+        # file would read as the incomplete pair instead).
+        (broker / "snapshot.meta.json").write_text("{not json",
+                                                   encoding="utf-8")
+        snap_state = doctor._fleet_snapshot_state(data / "store.sqlite")
+        assert snap_state[0] == "corrupt", snap_state
+        assert status(doctor._check_fleet_snapshot_age,
+                      data / "store.sqlite") == "warn"
+        (broker / "snapshot.meta.json").unlink()
+        assert doctor._fleet_snapshot_state(data / "store.sqlite")[
+            0] == "incomplete"
+        (broker / "snapshot.sqlite").unlink()
+        meta = {"snapshot_revision": 3, "issued_at": now - 10,
+                "expires_at": now - 5, "row_count": 1, "principal": "p"}
+        (broker / "snapshot.meta.json").write_text(
+            json.dumps(meta), encoding="utf-8")
+        conn = sqlite3.connect(str(broker / "snapshot.sqlite"))
+        conn.execute("CREATE TABLE memory (id TEXT)")
+        conn.commit()
+        conn.close()
+        expired = doctor._check_fleet_snapshot_age(data / "store.sqlite")
+        assert expired["status"] == "warn"
+        meta2 = dict(meta, expires_at=now + 3600)
+        (broker / "snapshot.meta.json").write_text(
+            json.dumps(meta2), encoding="utf-8")
+        fresh = doctor._check_fleet_snapshot_age(data / "store.sqlite")
+        assert fresh["status"] == "pass"
+        assert isinstance(fresh["details"]["age_s"], int)
+        assert fresh["details"]["age_s"] >= 0
+        assert fresh["details"]["expires_in_s"] > 3500
+        # Invalid FDE seam value -> warn, never crash.
+        os.environ["ZMEM_FLEET_FDE_PROBE"] = "garbage"
+        assert status(doctor._check_fleet_disk_encryption,
+                      data / "store.sqlite") == "warn"
+        os.environ.pop("ZMEM_FLEET_FDE_PROBE")
+
+        # Queue: pending vs receipt-flipped, numeric oldest_age_s,
+        # malformed and FUTURE timestamps counted, not oldest.
+        queue = data / "queue"
+        queue.mkdir()
+        entries = [
+            {"status": "pending", "enqueued_at": now - 600},
+            {"status": "committed", "enqueued_at": now - 9999},
+            {"status": "pending", "enqueued_at": now - 1200},
+            {"status": "pending", "enqueued_at": "not-a-number"},
+            {"status": "pending", "enqueued_at": now + 9999},
+        ]
+        (queue / "ops-local.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        opq = doctor._check_fleet_op_queue(data / "store.sqlite")
+        d = opq["details"]
+        assert opq["status"] == "warn"
+        # depth counts EVERY pending entry (the future-timestamped one
+        # included); oldest excludes malformed/future timestamps, which are
+        # counted separately.
+        assert d["depth"] == 4, d
+        assert d["retired"] == 1, d
+        assert d["oldest_age_s"] >= 1200, d
+        assert d["malformed_timestamps"] == 2, d
+
+
+def test_issue_principal_append_gate_pinned():
+    """Final-critic round 2 item 1: the round-4 append gate, pinned — an
+    existing map carrying a token key the hub refuses (empty / >4096 bytes /
+    whitespace) or a hub-refused ENTRY refuses the append (rc=2, nothing
+    written, no token printed); a valid map still appends."""
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-gate-") as td:
+        tmp = Path(td)
+        good_entry = {"principal": "ok1", "host": "h", "harness": "x"}
+        bad_maps = {
+            "empty-key.json": {"": good_entry},
+            "oversized-key.json": {"t" * 5000: good_entry},
+            "whitespace-key.json": {"   ": good_entry},
+            "hub-refused-entry.json": {
+                "tok-ok-0000000000000000000001": {
+                    "principal": "p", "host": 12, "harness": "x"}},
+        }
+        for name, seed in bad_maps.items():
+            map_path = tmp / name
+            # Seed through the issuer (hardened DACL), then overwrite the
+            # CONTENT in place with the bad map (the DACL survives the
+            # rewrite, so the refusal exercised is the KEY/ENTRY gate, not
+            # the ACL check a hand-written temp file would trip first).
+            seeded = _run_issue(
+                map_path, "--principal", "seedp", "--host", "h",
+                "--harness", "x")
+            assert seeded.returncode == 0, seeded.stderr
+            map_path.write_text(json.dumps(seed), encoding="utf-8")
+            result = _run_issue(
+                map_path, "--principal", "newp", "--host", "h",
+                "--harness", "x")
+            assert result.returncode == 2, (name, result.stdout, result.stderr)
+            assert not any(ln.strip() for ln in result.stdout.splitlines()), (
+                name, result.stdout)
+            data = json.loads(map_path.read_text(encoding="utf-8"))
+            assert len(data) == 1 and "newp" not in str(data), (name, data)
+        # Positive control: a map the ISSUER itself wrote (hardened DACL —
+        # a hand-written temp file inherits the temp dir's broad Users ACE
+        # and is correctly refused) still accepts a second append.
+        ok_map = tmp / "ok.json"
+        first = _run_issue(
+            ok_map, "--principal", "ok1", "--host", "h", "--harness", "x")
+        assert first.returncode == 0, first.stderr
+        result = _run_issue(
+            ok_map, "--principal", "newp", "--host", "h", "--harness", "x")
+        assert result.returncode == 0, result.stderr
+        data = json.loads(ok_map.read_text(encoding="utf-8"))
+        assert any(v.get("principal") == "newp" for v in data.values())
+
+def _unused_removed():
+    pass
+
+
+def test_limit_parity_bound_to_hub_constants():
+    """Final-critic round 2 item 2: issuer limit literals == auth constants
+    and the hub leg of the limit cases is asserted literally."""
+    import importlib.util as ilu
+    spec = ilu.spec_from_file_location("ipm", str(ISSUE_PRINCIPAL_PY))
+    mod = ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-limb-") as td:
+        code = (
+            "import sys\n"
+            "sys.path.insert(0, {a!r})\n"
+            "import auth as A\n"
+            "print('LIM', A._MAX_TOKEN_NAMESPACES, "
+            "A._MAX_TOKEN_NAMESPACE_UTF8_BYTES, "
+            "A._MAX_TOKEN_NAMESPACES_TOTAL_UTF8_BYTES)\n"
+            "import json as J\n"
+            "maps = [\n"
+            "    {{'k1': {{'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': ['project:n%d' % i "
+            "for i in range(129)]}}}},\n"
+            "    {{'k2': {{'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': ['project:' + 'a' * 250]}}}},\n"
+            "    {{'k3': {{'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': ['project:' + 'b' * 241 "
+            "for _ in range(34)]}}}},\n"
+            "]\n"
+            "for m in maps:\n"
+            "    try:\n"
+            "        A._parse_principal_map(J.dumps(m), 'probe')\n"
+            "        print('HUB', True)\n"
+            "    except SystemExit:\n"
+            "        print('HUB', False)\n"
+        ).format(a=str(HERMES_SERVER_DIR))
+        result = _py(code, T12._base_env(Path(td) / "home"))
+        out = result.stdout
+        if "LIM" not in out:
+            import pytest
+            pytest.skip(f"server auth unavailable: {out[:160]!r}")
+        lim = [ln for ln in out.splitlines() if ln.startswith("LIM ")]
+        assert lim and lim[0].split() == ["LIM", "128", "256", "8192"], out
+        hub = [ln.split() for ln in out.splitlines()
+               if ln.startswith("HUB ")]
+        assert len(hub) == 3, out
+        assert all(row[1] == "False" for row in hub), out
+        # The issuer literals equal the auth constants the probe printed.
+        assert mod._validate_entry({
+            "principal": "p", "host": "h", "harness": "x",
+            "namespaces": ["project:n%d" % i for i in range(129)]})
+        assert mod._validate_entry({
+            "principal": "p", "host": "h", "harness": "x",
+            "namespaces": ["project:" + "a" * 250]})
+        assert mod._validate_entry({
+            "principal": "p", "host": "h", "harness": "x",
+            "namespaces": ["project:" + "b" * 241 for _ in range(34)]})

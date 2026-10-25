@@ -4891,7 +4891,6 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
     required = _FLEET_PRINCIPAL_REQUIRED_FIELDS
     seen_ids: set[str] = set()
     seen_tokens: set[str] = set()
-    total_ns_bytes = 0
     for token, entry in obj.items():
         if not isinstance(token, str) or not token.strip():
             problems.append("map keys must be non-empty token strings")
@@ -4912,6 +4911,7 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
         missing = required - set(entry)
         if missing:
             problems.append(f"missing required field(s) {sorted(missing)}")
+        entry_ns_bytes = 0
         pid = entry.get("principal")
         if isinstance(pid, str) and pid.strip():
             pid = pid.strip()
@@ -4970,7 +4970,11 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
                         problems.append(
                             f"a namespace exceeds {_FLEET_MAX_NS_UTF8_BYTES} "
                             "UTF-8 bytes")
-                    total_ns_bytes += ns_bytes
+                    entry_ns_bytes += ns_bytes
+        if entry_ns_bytes > _FLEET_MAX_NS_TOTAL_UTF8_BYTES:
+            problems.append(
+                f"an entry's namespaces exceed the per-entry aggregate of "
+                f"{_FLEET_MAX_NS_TOTAL_UTF8_BYTES} UTF-8 bytes")
         capabilities = entry.get("capabilities")
         if capabilities is not None:
             if (not isinstance(capabilities, list) or not capabilities
@@ -4983,10 +4987,6 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
     if len(obj) > _FLEET_MAX_PRINCIPALS:
         problems.append(
             f"map exceeds the maximum of {_FLEET_MAX_PRINCIPALS} principals")
-    if total_ns_bytes > _FLEET_MAX_NS_TOTAL_UTF8_BYTES:
-        problems.append(
-            f"aggregate namespace UTF-8 budget of "
-            f"{_FLEET_MAX_NS_TOTAL_UTF8_BYTES} bytes exceeded")
     return (problems, len(obj))
 
 
@@ -5043,7 +5043,7 @@ def _check_fleet_op_queue(resolved_store: Path) -> dict:
                       "Op queue drained (no pending entries).", **details)
     if oldest is not None:
         details["oldest_age_s"] = int(now - oldest)
-    elif malformed_ts:
+    if malformed_ts:
         details["malformed_timestamps"] = malformed_ts
     return _check("fleet-op-queue", "warn",
                   f"{depth} pending op-queue entrie(s); oldest age in "
