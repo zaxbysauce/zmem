@@ -486,6 +486,18 @@ def test_principal_map_parity_corpus():
     assert any("not a valid scoped namespace" in p for p in problems_for(
         {"t1": {"principal": "p", "host": "h", "harness": "x",
                 "namespaces": ["banana"]}}))
+    # Round-4: issuer field-set alignment + token-key rules.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        "issue_principal_mod", str(ISSUE_PRINCIPAL_PY))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    assert _mod._ALLOWED_FIELDS == frozenset(
+        {"principal", "host", "harness", "namespaces", "capabilities",
+         "revoked"}), _mod._ALLOWED_FIELDS
+    assert _mod._validate_entry(
+        {"principal": "p", "host": "h", "harness": "x", "comment": "c"}), (
+        "issuer must refuse the hub-unknown 'comment' field")
 
 
 def test_issuer_and_doctor_match_server_auth_grammar():

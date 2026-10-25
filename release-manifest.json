@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "58e959aac52be5fce0f268583f8f02a8dbf358accc37d8ddde4db016c9d2d935",
+  "digest": "66adc95ae1d533a40e742c0eeaff27c0aef65ccf54a0d51cc54f2e8ad5d0578d",
   "files": {
     ".agents/plugins/marketplace.json": "90b71068f89eb5c701312e1c2c30a285aff86d6b52264626fecdea6924b3d76d",
     ".claude-plugin/marketplace.json": "202b009c20e1234ec1d7f61a90a96b532f1f871af7789070a4b633de24546538",
@@ -57,7 +57,7 @@
     "scripts/fleet/install-broker.sh": "b5c9bece0f07afdb5a83636c0496949c111c9ef4c2251a5ff60c267a7aafef42",
     "scripts/fleet/install-hub.ps1": "08b43c840393edfc8375a8b8ccdb0df68b9f7ea69c02b6d466a0e62014ea4e92",
     "scripts/fleet/install-hub.sh": "3ffece3d555eedbb74c5dde091d3a681d7179ddccdb0ada2d7fba3fa37789b49",
-    "scripts/fleet/issue-principal.py": "361b2f8cf41dd6d466177abb108524eaf134785f6e55f6db4f42717febf12d9a",
+    "scripts/fleet/issue-principal.py": "d5eab52522c59f9fa9e294ec294df75f2624f1793ce4a776004203e9cc1d1721",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
     "scripts/host_canary.py": "d7e39adc0eba0b3d559fbe4f3d5883b5413e98cbc247e79eaec2448c1e7f3616",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",

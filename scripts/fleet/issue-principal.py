@@ -43,10 +43,10 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import host  # noqa: E402
 from schema_meta import is_valid_namespace  # noqa: E402
 
-_ALLOWED_FIELDS = {
+_ALLOWED_FIELDS = frozenset({
     "principal", "host", "harness", "namespaces", "capabilities",
-    "revoked", "expires_at", "comment",
-}
+    "revoked",
+})
 _REQUIRED_FIELDS = {"principal", "host", "harness"}
 _MAX_PRINCIPALS = 64
 _LOCK_STALE_S = 120
@@ -222,6 +222,12 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(existing, dict):
             return _refuse("existing map must be a JSON object")
         for tok, other in existing.items():
+            if (not isinstance(tok, str) or not tok.strip()
+                    or len(tok.encode("utf-8")) > 4096):
+                return _refuse(
+                    "existing map carries a token key the hub parser "
+                    "would refuse (empty or over 4096 UTF-8 bytes); fix "
+                    "the map first")
             if (isinstance(other, dict)
                     and other.get("principal") == entry["principal"]):
                 return _refuse(
