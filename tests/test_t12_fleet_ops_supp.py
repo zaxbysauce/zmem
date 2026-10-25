@@ -1160,3 +1160,76 @@ def _main() -> int:
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+def test_hermes_store_config_refusal_propagates():
+    """Review-required pin (PRR-010): the hermes provider's data-dir and
+    core-md resolvers must PROPAGATE a refused store configuration - the
+    legacy fallback would silently relocate store/core.md/decision-log to
+    an unrelated path (the gate shipped re-caught twice; this test is the
+    durable discriminator: RED at the re-caught shape, GREEN at the
+    sentinel-escape shape). The plugin is loaded with the scripts dir NOT
+    on sys.path, the way the Hermes host loads it."""
+    import importlib.util
+    import io
+    import logging
+
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-herm-") as td:
+        tmp = Path(td)
+        refused_file = tmp / "a-regular-file.txt"
+        refused_file.write_text("not a dir", encoding="utf-8")
+        env = T12._base_env(tmp / "home")
+        env["ZMEM_DATA"] = str(refused_file)
+        env["PYTHONPATH"] = ""
+
+        code = (
+            "import io, json, logging, os, sys, types\n"
+            "sys.path = [p for p in sys.path if 'skills' not in p]\n"
+            "for name in ('agent', 'agent.memory_provider'):\n"
+            "    if name not in sys.modules:\n"
+            "        sys.modules[name] = types.ModuleType(name)\n"
+            "stub = types.ModuleType('agent.memory_provider')\n"
+            "class MemoryProvider: pass\n"
+            "stub.MemoryProvider = MemoryProvider\n"
+            "sys.modules['agent.memory_provider'] = stub\n"
+            "sys.modules['agent'].memory_provider = stub\n"
+            "sys.path.insert(0, r'{hermes}')\n"
+            "captured = []\n"
+            "class _Cap(logging.Handler):\n"
+            "    def emit(self, record):\n"
+            "        captured.append(record.getMessage())\n"
+            "logging.getLogger().addHandler(_Cap())\n"
+            "logging.getLogger('zmem').addHandler(_Cap())\n"
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location(\n"
+            "    'zmem_hermes_plugin', r'{init}')\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "for fn in (mod._resolve_store_data_dir, mod._resolve_core_md):\n"
+            "    try:\n"
+            "        result = fn()\n"
+            "        print('RELOCATED', result)\n"
+            "    except Exception as exc:\n"
+            "        text = str(exc)\n"
+            "        print('PROPAGATED', 'ZMEM_STORE' in text,\n"
+            "              type(exc).__name__)\n"
+            "print('WARNINGS', [w for w in captured\n"
+            "                   if 'falling back' in w])\n"
+        ).format(hermes=str(HERMES_SERVER_DIR.parent), init=str(
+            REPO_ROOT / "hermes-plugin" / "__init__.py"))
+        result = _py(code, env, timeout=120)
+        out = result.stdout
+        assert "RELOCATED" not in out, (
+            f"the refusal must NOT silently relocate to the legacy "
+            f"fallback: {out!r} {result.stderr[-300:]!r}")
+        propagated = [ln for ln in out.splitlines()
+                      if ln.startswith("PROPAGATED")]
+        assert len(propagated) == 2, out
+        for ln in propagated:
+            parts = ln.split()
+            assert parts[1] == "True", ln
+            assert ("_ConfigRefusal" in ln
+                    or "StoreConfigError" in ln), ln
+        warnings = [ln for ln in out.splitlines()
+                    if ln.startswith("WARNINGS")]
+        assert warnings and "falling back" not in warnings[0], out
