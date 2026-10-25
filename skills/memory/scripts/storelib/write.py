@@ -1088,6 +1088,147 @@ _GLOBAL_NEAR_MISS_STEMS = {
 
 
 
+# Issue #398: closed marker set for trigger-condition structure. Shared by
+# the write-time phrasing advisory (lesson rows without a marker) and the
+# write-time conditional-contradiction scan (the NEW row must carry one).
+TRIGGER_CONDITION_MARKERS = (
+    "when", "whenever", "if", "while", "before", "after", "until",
+)
+_TRIGGER_MARKER_RE = re.compile(
+    r"\b(?:" + "|".join(TRIGGER_CONDITION_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Issue #398 item 1: significant-token stoplist for the opposition scan's
+# overlap gate (short glue words never count as shared subject matter).
+_OPPOSITION_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "not", "never", "always", "with",
+    "use", "using", "instead", "your", "you", "we", "it", "its", "this",
+    "that", "these", "those", "for", "to", "of", "in", "on", "at", "from",
+    "every", "each", "any", "all", "is", "are", "was", "were", "be", "been",
+    "verify", "check", "first", "then", "than", "so", "such", "when",
+    "whenever", "while", "before", "after", "until", "if",
+})
+
+
+def _hostless_project_warning(warns: list, namespace: str) -> None:
+    """Issue #246 WARNING-only guard: flag `project:<owner>/<repo>` keys
+    that lack a host segment. Rejection was rejected by review (assumption
+    A7): hierarchical two-component namespaces are in legitimate suite use.
+    The row stores; the structured warning names the canonical form so the
+    silent-strand harm (rows unreachable from scope-resolved recall) is at
+    least loud. Fail-open by construction (pure string work)."""
+    if not namespace.startswith("project:"):
+        return
+    value = namespace[len("project:"):]
+    parts = value.split("/")
+    if len(parts) != 2:
+        return
+    first = parts[0]
+    if not first or "." in first or not parts[1]:
+        return  # host present (dotted) or not the owner/repo shape
+    if any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+           "0123456789_.-" for c in first + parts[1]):
+        return  # unexpected characters: do not guess intent
+    canonical = f"project:github.com/{value}"
+    warns.append({
+        "type": "namespace_project_near_miss",
+        "canonical": canonical,
+        "message": (
+            f"namespace {namespace!r} has no host segment and is unreachable "
+            f"from scope-resolved recall; the canonical form is "
+            f"{canonical!r} (issue #246)"),
+    })
+    print(
+        f"[zmem] namespace near-miss: {namespace!r} has no host segment and "
+        f"is unreachable from scope-resolved recall; the canonical form is "
+        f"{canonical!r} (the row still stores; see issue #246)",
+        file=sys.stderr,
+    )
+
+
+def _conditional_contradiction_scan(conn, namespace: str, content: str,
+                                    warns: list) -> None:
+    """Issue #398 item 1: notice-only conditional-opposition detection.
+
+    Fires when the NEW row opposes an existing same-namespace row under a
+    condition: negation-polarity disagreement (the v11 write-time guard's
+    heuristic, reused) AND the new row carries a trigger-condition marker
+    AND the pair shares >= 2 significant tokens. Notice-only by design: no
+    edge insert, no trust delta, no row rewrite (an untrusted caller-driven
+    row must never mutate a pre-existing keeper — PR #393 / issue #373).
+    Bounded: the 200 most recent live rows in the namespace."""
+    from storelib.consolidate import _polarity_signature
+    if not _TRIGGER_MARKER_RE.search(content or ""):
+        return
+    if not _polarity_signature(content):
+        return  # the incident shape pairs a negated conditional against an
+        # affirmative unconditional row; require the NEW row to be the
+        # negated, conditional one
+    new_tokens = {
+        t for t in re.split(r"[^A-Za-z0-9_.-]+", (content or "").lower())
+        if len(t) > 3 and t not in _OPPOSITION_STOPWORDS
+    }
+    if len(new_tokens) < 2:
+        return
+    try:
+        rows = conn.execute(
+            "SELECT id, content FROM memory "
+            "WHERE namespace=? AND superseded_at IS NULL "
+            "ORDER BY rowid DESC LIMIT 200",
+            (namespace,),
+        ).fetchall()
+    except Exception:
+        return  # fail-open: the notice is advisory, never load-bearing
+    for row in rows:
+        existing_content = row["content"] or ""
+        if _polarity_signature(existing_content):
+            continue  # agreeing polarity is corroboration, not opposition
+        existing_tokens = {
+            t for t in re.split(r"[^A-Za-z0-9_.-]+", existing_content.lower())
+            if len(t) > 3 and t not in _OPPOSITION_STOPWORDS
+        }
+        if len(new_tokens & existing_tokens) < 2:
+            continue
+        warns.append({
+            "type": "contradiction_link",
+            "opposes": row["id"],
+            "message": (
+                f"the new row conditionally opposes existing memory "
+                f"{row['id']} (both stay live; review with "
+                f"`store.py contradict` if deliberate)"),
+        })
+        print(
+            f"[zmem] contradiction-link: the new row conditionally opposes "
+            f"existing memory {row['id']} (both stay live; review with "
+            f"`store.py contradict` if the opposition is deliberate)",
+            file=sys.stderr,
+        )
+        return  # first match only: one notice, bounded output
+
+
+def _phrasing_advisory(type_: str, content: str, warns: list) -> None:
+    """Issue #398 item 2: non-blocking trigger-condition lint for lesson
+    rows. Facts/preferences are exempt (their shape is legitimately
+    narrative); the advisory suggests the `When X, do Y, because Z` form
+    through the existing structured warnings channel and never blocks."""
+    if type_ != "lesson":
+        return
+    if _TRIGGER_MARKER_RE.search(content or ""):
+        return
+    warns.append({
+        "type": "phrasing_advisory",
+        "detail": "lesson has no trigger-condition marker "
+                  "(when/whenever/if/while/before/after/until); prefer the "
+                  "'When X, do Y, because Z' form so the row can win the "
+                  "retrieval races it was written for",
+        "message": (
+            "lesson has no trigger-condition marker "
+            "(when/whenever/if/while/before/after/until); prefer the "
+            "'When X, do Y, because Z' form"),
+    })
+
+
 def _global_near_miss_key(ns: str) -> str:
     """Normalize a namespace for global-near-miss comparison: lowercase, then
     strip separators (space, _, -, :, and .) so the common typos collapse
@@ -1444,6 +1585,16 @@ def add_memory(
     # automatic hook (issue #18 "Related observation"). Whitespace is trimmed
     # (intentional — `add --namespace "  user:global  "` canonicalizes).
     namespace = _validate_namespace(conn, namespace)
+    # Host-less project near-miss (issue #246, WARNING-only per its
+    # resolution): `project:<owner>/<repo>` with no host segment is
+    # unreachable from every scope-resolved recall (which derives
+    # `project:github.com/<owner>/<repo>`), but REJECTING it would break the
+    # legitimate hierarchical namespaces already in suite use (e.g.
+    # `project:t03/harvest` fixtures) — the row stores, loudly: a structured
+    # warning names the canonical form. Only the exactly-two-component shape
+    # with a dotless first component is flagged (a dotted first component is
+    # a host; one component is a plain project name).
+    _hostless_project_warning(warns, namespace)
     if confidence is None:
         confidence = SIGNAL_CONFIDENCE.get(signal, SIGNAL_CONFIDENCE["none"])
 
@@ -1672,6 +1823,18 @@ def add_memory(
         if normalized_evidence_ids:
             from storelib.evidence import attach_memory_evidence
             attach_memory_evidence(conn, memory_id=mid, evidence_ids=normalized_evidence_ids)
+        # Issue #398 write-time guards (advisory/notice-only, bounded,
+        # fail-open): conditional-contradiction notice + lesson phrasing
+        # advisory. The row has already been inserted; these never block,
+        # never mutate other rows, and ride the structured warnings channel.
+        try:
+            _conditional_contradiction_scan(conn, namespace, content, warns)
+        except Exception:
+            pass
+        try:
+            _phrasing_advisory(type_, content, warns)
+        except Exception:
+            pass
         if started_tx:
             _commit(conn)
         print(f"[zmem] added memory {mid} (ns={namespace}, type={type_}, signal={signal}, conf={confidence}"

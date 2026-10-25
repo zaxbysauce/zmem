@@ -205,6 +205,7 @@ def _log_inject_decision(
     tool_names=None, path_basenames=None, margin=None,
     margin_pruned_ids=None, store_timeout=False,
     lane=None, version=None, t_ms=None, rewrite=False,
+    repo_state=None,
 ) -> None:
     """Append a sanitized decision line; sid and moment are audit joins.
 
@@ -309,6 +310,11 @@ def _log_inject_decision(
             fields.append("store_timeout=1")
         if rewrite is True or (type(rewrite) is int and rewrite == 1):
             fields.append("rewrite=1")
+        if repo_state in ("dirty", "clean", "unavailable"):
+            # Issue #398/#397 audit tail: the repository-state predicate's
+            # outcome for the pretool lane. Additive last field; legacy
+            # lines (and lines from other lanes) never carry it.
+            fields.append("state=" + repo_state)
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(" ".join(fields) + "\n")
     except Exception:
@@ -630,6 +636,65 @@ def _rewrite_query(store_py: str, namespace: str, session_id: str,
         return original, False
 
 
+# Issue #397: the restore/destructive verbs that arm the repository-state
+# probe. Anything else keeps the pretool lane state-blind (and free of the
+# extra git subprocess).
+_STATE_PROBE_VERBS = (
+    "checkout", "restore", "reset", "stash", "clean", "rebase", "merge",
+    "push", "cherry-pick", "revert", "filter-branch",
+)
+
+
+def _pretool_repo_state(event: dict, query: str) -> str:
+    """Issue #397: bounded, fail-open repository-state predicate.
+
+    Returns "dirty" | "clean" | "unavailable". The TEST SEAM
+    ZMEM_TEST_REPO_STATE (closed set) overrides everything; in production
+    the probe runs only when the tool-input material carries a
+    restore/destructive verb. `git status --porcelain --untracked-files=no`
+    reports only TRACKED-change dirt — the #397 hazard is uncommitted
+    tracked work being wiped by git checkout -- / git restore. The probe
+    runs in the EVENT cwd when it names an existing directory (falling
+    back to the hook process cwd), with a hard line cap, and a timeout
+    read from ZMEM_STATE_PROBE_TIMEOUT_S (float seconds, default 2.0;
+    malformed/negative/non-finite fall back to the default). Every failure
+    path returns "unavailable" — the hook never blocks on this probe."""
+    seam = os.environ.get("ZMEM_TEST_REPO_STATE", "").strip()
+    if seam in ("dirty", "clean", "unavailable"):
+        return seam
+    if seam:
+        pass  # unknown seam values fall through to the production probe
+    lowered = (query or "").lower()
+    if not any(verb in lowered for verb in _STATE_PROBE_VERBS):
+        return "unavailable"  # not a state-hazardous command: no probe
+    cwd = None
+    raw_cwd = event.get("cwd")
+    if isinstance(raw_cwd, str) and raw_cwd.strip() and os.path.isdir(raw_cwd):
+        cwd = raw_cwd
+    try:
+        timeout_s = 2.0
+        raw_t = os.environ.get("ZMEM_STATE_PROBE_TIMEOUT_S", "").strip()
+        if raw_t:
+            try:
+                val = float(raw_t)
+                if val > 0.0 and val != float("inf") and val == val:
+                    timeout_s = val
+            except ValueError:
+                pass  # malformed knob -> default (fail-open, not fail-closed)
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=timeout_s, cwd=cwd,
+            errors="replace")
+        if proc.returncode != 0:
+            return "unavailable"
+        lines = (proc.stdout or "").splitlines()
+        if len(lines) > 200:
+            return "dirty"  # enormous churn is still just dirty
+        return "dirty" if any(l.strip() for l in lines) else "clean"
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "unavailable"
+
+
 def _query_for(mode: str, event: dict) -> str:
     if mode == "posttoolbatch":
         return build_posttoolbatch_query(event)
@@ -739,6 +804,29 @@ def main() -> int:
         log_session_id = event_session_id
     if mode == "session_end":
         _clear_delivery_state(store_py, session_id, "delivery-clear")
+        # Issue #398 item 3: the closeout nudge. Consults ONLY the
+        # per-session ops markers (.wrote stamped by the write path,
+        # .closeout stamped by `store.py closeout-ack`); never opens the
+        # store. When the session wrote rows and no closeout was recorded,
+        # surface exactly one bounded reminder line. Fail-open by design.
+        try:
+            import hashlib as _hashlib
+            _sid = session_id or ""
+            _stem = _hashlib.sha256(
+                _sid.encode("utf-8")).hexdigest()[:32] if _sid else ""
+            _ops = os.path.join(_data_dir(), "ops")
+            _wrote = _stem and os.path.exists(
+                os.path.join(_ops, _stem + ".wrote"))
+            _closed = _stem and os.path.exists(
+                os.path.join(_ops, _stem + ".closeout"))
+            if _wrote and not _closed:
+                _emit("[zmem] this session wrote memories but no closeout "
+                      "was recorded - run the closeout skill (or "
+                      "`store.py closeout-ack --session-id <id>`) so the "
+                      "session's captures get their formal review.")
+                return 0
+        except Exception:
+            pass
         _emit("")
         return 0
     if not lane or not os.path.isfile(store_py):
@@ -763,6 +851,15 @@ def main() -> int:
             f"--session-id={session_id}", "--moment", moment, "--lane", lane]
     if command == "recall":
         args[1:1] = _free_text_arg("--query", query)
+    # Issue #397: pretool-only repository-state hint. Computed once per
+    # invocation; the flag is omitted entirely when the state is
+    # "unavailable" (fail-open: the store never sees an unknown value and
+    # the recall proceeds exactly as today).
+    repo_state = ""
+    if mode == "pretool" and command == "recall":
+        repo_state = _pretool_repo_state(event, query)
+        if repo_state in ("dirty", "clean"):
+            args.append(f"--state-hint={repo_state}")
     # Issue #253: a delegating PreToolUse(Agent/Task) parks its prompt
     # store-side so the child's prompt-less SubagentStart (Claude Code's real
     # payload carries no task text) gets a task-keyed recall query. The park
@@ -886,6 +983,7 @@ def main() -> int:
         lane=attribution_lane, version=attribution_version,
         t_ms=attribution_t_ms,
         rewrite=rewrite_applied,
+        repo_state=repo_state or None,
     )
     _emit(rendered, envelope.get("effective_ops"))
     # Issue #131: bounded lane-health probe AFTER the context was emitted —

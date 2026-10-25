@@ -159,6 +159,12 @@ if not corrections.should_include_message(prompt):
     print("{}")
     sys.exit(0)
 
+# Issue #247: a pasted closeout-remote/harvest block is bulk import data
+# for /ingest-harvest, never a correction candidate.
+if corrections.is_harvest_paste(prompt):
+    print("{}")
+    sys.exit(0)
+
 item_type, patterns, confidence, sentiment, decay_days = corrections.detect_patterns(prompt)
 if not item_type:
     print("{}")

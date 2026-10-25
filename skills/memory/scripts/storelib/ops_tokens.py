@@ -65,6 +65,7 @@ _RUNNER_HEADS = frozenset({
     "cargo", "go", "mvn", "gradle", "make", "cmake",
     "docker", "kubectl", "helm", "terraform",
     "python", "python3", "pytest", "py.test", "tox", "nox",
+    "py",  # Windows launcher; canonicalized to "python" at normalization
     "node", "npx", "tsc", "eslint", "biome", "prettier", "ruff", "mypy",
     "robocopy", "rsync", "curl",
 })
@@ -219,7 +220,19 @@ def derive_ops_tokens(*events: str) -> List[str]:
         if not words:
             continue
         head = words[0].strip().strip("\"'`").lower()
+        # Windows-shaped heads (issue #314 AC2): normalize BOTH path
+        # separators and a trailing .exe/.bat/.cmd extension before the
+        # membership test, then canonicalize the Windows Python launcher
+        # `py` (and its extension forms) to `python` so its token shape
+        # matches the POSIX alias exactly.
+        head = head.rsplit("\\", 1)[-1]
         head = head.rsplit("/", 1)[-1] or head  # /usr/bin/git → git
+        for _ext in (".exe", ".bat", ".cmd"):
+            if head.endswith(_ext):
+                head = head[: -len(_ext)]
+                break
+        if head == "py":
+            head = "python"
         if head in _RUNNER_HEADS:
             # Keep the runner plus a bounded subcommand window — but only
             # tokens that are STRUCTURAL, not argument values: the primary
@@ -300,6 +313,37 @@ def derive_ops_tokens(*events: str) -> List[str]:
     return tail
 
 
+def _sanitize_derived_tokens(ops: str) -> List[str]:
+    """Safety-only filter for an ALREADY-DERIVED token string (issue #314).
+
+    ``ops`` here is the whitespace-joined output of ``derive_ops_tokens``
+    (the only production caller composes exactly that). Every token already
+    passed the derivation chokepoint's guards, so NO shape or vocabulary
+    filtering is re-applied — that re-derivation was the #314 defect (a
+    non-runner-headed join reduced to ``[]`` and a runner-headed join lost
+    tokens past the ``words[1:5]`` window). Only the per-token SAFETY
+    guards are enforced again, cheaply, because this string boundary should
+    not become a bypass: the character allowlist (via ``_clean_token``),
+    the secret-shape rejection, the leading-dash guard, dedup, and the
+    existing caps.
+    """
+    out: List[str] = []
+    seen = set()
+    for tok in ops.split():
+        t = _clean_token(tok)
+        if not t or t in seen:
+            continue
+        if t.startswith("-"):
+            continue
+        if _SECRET_SHAPE_RE.match(t):
+            continue
+        if len(out) >= _MAX_TOKENS:
+            break
+        seen.add(t)
+        out.append(t)
+    return out
+
+
 def compose_inject_query(prompt: str, ops: str, checkpoint: str = "") -> str:
     """Compose the passive inject query: prose + derived ops tokens, with
     the ops tail occupying a fixed reserved slice INSIDE the 500-char cap
@@ -318,7 +362,7 @@ def compose_inject_query(prompt: str, ops: str, checkpoint: str = "") -> str:
     base = (prompt or "").strip()[:_PROMPT_KEEP_CHARS]
     valid_checkpoints = {phrase for _, phrase in CHECKPOINT_PHRASES}
     checkpoint = checkpoint if checkpoint in valid_checkpoints else ""
-    tokens = derive_ops_tokens(ops) if ops else []
+    tokens = _sanitize_derived_tokens(ops) if ops else []
     if not tokens:
         if not checkpoint:
             return base

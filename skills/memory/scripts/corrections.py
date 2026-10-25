@@ -277,6 +277,48 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
     return (None, "", 0.0, "correction", 90)
 
 
+def is_harvest_paste(text: str) -> bool:
+    """Issue #247: True for a user message that is really a pasted
+    closeout-remote/harvest block — a fenced JSON array whose objects carry
+    the harvest keys, dominating the message. Those blocks belong to
+    /ingest-harvest, not the correction queue; capturing them produced a
+    multi-KB `message` per item and a per-session nag until manual
+    queue-clear. Bounded and fail-closed (only a strict shape matches)."""
+    if not text or len(text) <= 400:
+        return False
+    import json as _json
+    import re as _re
+    fences = _re.findall("```[a-zA-Z]*" + chr(10) + r"(.*?)" + "```",
+                      text, _re.DOTALL)
+    if not fences:
+        return False
+    body = max(fences, key=len)
+    if len(body) * 2 < len(text):
+        return False  # fenced block is not the dominant content
+    probe = body.strip()
+    if probe.startswith("["):
+        start, cand = 0, probe
+    elif probe.startswith("{"):
+        start, cand = 1, "[" + probe + "]"
+    else:
+        return False
+    try:
+        parsed = _json.loads(cand)
+    except ValueError:
+        # tolerant fallback: substring key match over the block head
+        head = probe[:2000]
+        hits = sum(k in head for k in
+                   ('"namespace"', '"type"', '"content"', '"signal"'))
+        return hits >= 3
+    if not isinstance(parsed, list) or not parsed:
+        return False
+    first = parsed[start] if start else parsed[0]
+    if not isinstance(first, dict):
+        return False
+    return sum(k in first for k in
+               ("namespace", "type", "content", "signal")) >= 3
+
+
 def should_include_message(text: str) -> bool:
     """Check if a message should be included in correction detection.
 

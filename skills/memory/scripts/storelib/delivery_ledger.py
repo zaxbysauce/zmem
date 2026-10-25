@@ -1517,6 +1517,18 @@ def end_delivery_state(data_dir: str, session_id: str,
     with _delivery_state_lock(data_dir):
         _write_delivery_ended_locked(data_dir, key)
         _clear_delivery_sidecars_locked(data_dir, key)
+    # Issue #336 AC1: the session is OVER, so the raw-id-keyed .tasktext
+    # stash dies with it. Keyed on the RAW session id (tasktext_path hashes
+    # the raw id at park time — cli passes args.session_id raw), NOT the
+    # composite ledger key above; a keyed-session clear that derived the
+    # hash from principal|harness|sid would silently miss the parked file.
+    # Fail-open: an unlink failure never fails the terminal clear.
+    try:
+        tp = tasktext_path(data_dir, session_id)
+        if tp and os.path.exists(tp):
+            os.unlink(tp)
+    except OSError:
+        pass
 
 
 def _load_compact(path: Optional[str]) -> Dict[str, Any]:
@@ -1721,6 +1733,15 @@ def consume_task_text(data_dir: str, session_id: str,
     now = time.time()
     entries = _load_tasktext(path, now)
     if not entries:
+        # Issue #336 AC2: every entry expired. The in-memory prune above is
+        # the only expiry mechanism, so an all-expired stash would otherwise
+        # keep its stale payload on disk until the age sweep; unlink it now
+        # (fail-open — the next park rewrites the file regardless).
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
         return ""
     idx = 0
     if agent_id:

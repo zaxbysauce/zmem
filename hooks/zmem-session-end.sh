@@ -5,7 +5,9 @@
 # Clears the session delivery ledger (and any fallback pending sidecar)
 # for the ending session: "already delivered" is false once the session
 # is gone, so nothing survives past session end except the backup
-# sweep orphan reaper. Never recalls; runs BEFORE the ZMEM_INJECT=0
+# sweep orphan reaper. The store-side terminal clear also removes the
+# session's .tasktext stash (issue #336) and the closeout nudge consults
+# the .wrote/.closeout session markers (issue #398) - see the body. Never recalls; runs BEFORE the ZMEM_INJECT=0
 # kill switch inside the body (cleanup is not an injection).
 # Fail-open: every error path exits 0 and emits "{}".
 #

@@ -714,6 +714,31 @@ capture-mode/interval controls. Complete
 are removed before transcript-derived content reaches deduplication, queue
 synthesis, or closeout review.
 
+#### Pre-tool repository-state predicate — issue #397
+
+Since 0.123.0 the pretool lane carries a bounded, fail-open
+repository-state predicate. When the tool-input material names a
+restore/destructive verb (checkout, restore, reset, stash, clean, rebase,
+merge, push, cherry-pick, revert, filter-branch), the hook body runs
+`git status --porcelain --untracked-files=no` once — TRACKED-change dirt
+only, exactly the wiped-by-`git checkout --` hazard — in the EVENT cwd
+when it names an existing directory (process cwd otherwise), capped at
+200 output lines, with the timeout read from `ZMEM_STATE_PROBE_TIMEOUT_S`
+(float seconds, default 2.0; malformed values fall back to the default).
+The outcome travels as `--state-hint dirty|clean` on the pretool recall
+argv (omitted entirely when the probe fails — never an unknown value) and
+is recorded on the decision line as `state=dirty|clean|unavailable`.
+Store-side, a candidate row receives a +0.15 rank bump — on both the sort
+score and `_score` — ONLY when the hint is exactly `dirty` AND the row's
+content matches the closed hazard lexicon (`uncommitted`, `dirty tree`,
+`dirty working tree`) AND carries a condition marker AND negation
+polarity. Clean, unavailable, and absent hints are byte-identical to
+today; the global relevance floor and trust gates still withhold gated
+rows (a bump never rescues them). The hint rides the recall query branch
+only — the queryless `recent` lane stays state-blind. Test seam:
+`ZMEM_TEST_REPO_STATE=dirty|clean|unavailable` overrides the probe
+entirely.
+
 #### Pre-tool inject — issue #90 / #85 direction C
 
 On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;

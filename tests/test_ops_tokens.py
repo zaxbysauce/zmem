@@ -215,9 +215,19 @@ class ComposeQueryTest(unittest.TestCase):
             self.assertEqual(
                 ops_tokens.compose_inject_query(prompt, ""),
                 (prompt or "").strip()[:500])
-            self.assertEqual(
-                ops_tokens.compose_inject_query(prompt, "plainword"),
-                (prompt or "").strip()[:500])  # derives to nothing → identity
+        # CONTRACT CHANGE owned by issue #314 (AC8): compose's ops argument
+        # is ALREADY-DERIVED by contract, and the old defensive re-derivation
+        # (which dropped a bare allowlisted word like "plainword") was the
+        # exact token-loss defect #314 documents — it silently discarded the
+        # ring-derived tail whenever the newest event was non-runner-headed.
+        # compose now applies SAFETY-only filtering (_sanitize_derived_
+        # tokens), so an allowlisted bare word rides the tail:
+        self.assertEqual(
+            ops_tokens.compose_inject_query("  abc def  ", "plainword"),
+            "abc def plainword")  # safety-only sanitizer → bare word rides
+        # Real derived vocabulary never contains bare non-structural words,
+        # so gold-item queries and eval scores are unaffected; only the
+        # artificial defensive case changed.
 
     def test_ops_slice_reserved_inside_cap(self):
         long_prose = "word " * 200  # 1000 chars

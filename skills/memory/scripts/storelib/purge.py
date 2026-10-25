@@ -810,8 +810,9 @@ def scrub_ledgers(data_dir: Path, drop_ids: set[str],
     # live writer (review PRR-002).
     # Issue #253: park_task_text stages through the same uuid-suffixed tmp
     # pattern inside _atomic_write_json, and a launcher watchdog SIGKILL
-    # between os.open and os.replace orphans it permanently (neither this
-    # scrub nor the backup age sweep matches a name ending in bare hex).
+    # between os.open and os.replace orphans it until a reaper collects
+    # it: THIS scrub matches *.tasktext.tmp.* immediately (issue #336) and
+    # the backup age sweep matches the same shapes as a backstop.
     for path in ops.glob("*.tasktext.tmp.*"):
         try:
             path.unlink()
