@@ -299,7 +299,7 @@ def is_harvest_paste(text: str) -> bool:
     if probe.startswith("["):
         start, cand = 0, probe
     elif probe.startswith("{"):
-        start, cand = 1, "[" + probe + "]"
+        start, cand = 0, "[" + probe + "]"
     else:
         return False
     try:
@@ -312,7 +312,7 @@ def is_harvest_paste(text: str) -> bool:
         return hits >= 3
     if not isinstance(parsed, list) or not parsed:
         return False
-    first = parsed[start] if start else parsed[0]
+    first = parsed[0]
     if not isinstance(first, dict):
         return False
     return sum(k in first for k in

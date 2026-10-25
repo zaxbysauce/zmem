@@ -252,7 +252,6 @@ def _hermes_capture_correction(namespace: str, session_id: str,
         # lane either (same modules, same shape rule).
         if corrections.is_harvest_paste(text):
             return False
-            return False
         item_type, patterns, confidence, sentiment, decay_days = \
             corrections.detect_patterns(text)
         if not item_type:
@@ -5589,6 +5588,8 @@ def main():
                 # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
+            if ok:
+                _session_write_marker("")
             sys.exit(0 if ok else 1)
         elif args.cmd == "update":
             try:
@@ -5599,7 +5600,6 @@ def main():
                     _human_out = None
                 try:
                     _warn_reserved_source_ref(args.source_ref)
-                    _session_write_marker(args.source_ref)
                     res, created_new = update_memory(
                         conn,
                         mid=args.id,
@@ -5628,6 +5628,8 @@ def main():
                 finally:
                     if _human_out is not None:
                         sys.stdout = _human_out
+                # Issue #398: stamp ONLY after a successful update.
+                _session_write_marker(args.source_ref)
                 if args.json:
                     print(json.dumps({
                         "id": str(res),
@@ -5657,6 +5659,13 @@ def main():
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
         elif args.cmd == "recall":
+            if getattr(args, "state_hint", None) and not (
+                    args.for_injection and args.json and args.session_id):
+                # W1.2: the hint is a passive-only ranking lever; any other
+                # combination exits 2 instead of silently ignoring it.
+                print("[zmem] --state-hint requires --for-injection --json "
+                      "with --session-id", file=sys.stderr)
+                sys.exit(2)
             if args.for_injection and args.json and args.session_id:
                 if getattr(args, "state_hint", None) and args.moment != "pretool":
                     print("[zmem] --state-hint requires --moment pretool",
@@ -6299,7 +6308,6 @@ def main():
             sys.exit(rc)
         elif args.cmd == "ingest-jsonl":
             _warn_reserved_source_ref(args.source_ref)
-            _session_write_marker("")
             if args.trust == "untrusted-peer" and args.allow_tombstones:
                 p_ingest_jsonl.error(
                     "--allow-tombstones cannot be combined with "
@@ -6396,6 +6404,7 @@ def main():
                       f"id={card_result['id']} "
                       f"entity_id={card_result['entity_id']} "
                       f"source_ref={card_result['source_ref']}")
+            _session_write_marker("")
             sys.exit(0)
         elif args.cmd == "links":
             sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,

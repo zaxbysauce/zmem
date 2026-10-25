@@ -360,5 +360,29 @@ class HermesLaneWiringTest(_PinnedEnvTestCase):
             "no new queue item may appear for the harvest paste")
 
 
+class FencedObjectShapeTest(unittest.TestCase):
+    """Round-1 implementation-review follow-up: the fenced SINGLE-object
+    shape (a closeout-remote harvest block carrying one object) must never
+    raise and must classify correctly (an earlier wrap-indexing bug raised
+    IndexError on this shape)."""
+
+    HARVEST_OBJ = {"namespace": "p:x", "type": "lesson",
+                   "content": "c" * 400, "signal": "test"}
+    NON_HARVEST_OBJ = {"name": "x", "value": 42, "extra": "y", "pad": "z" * 400}
+
+    def test_harvest_not_captured_fenced_single_object(self):
+        import corrections
+        msg = ("see below\n```json\n"
+               + json.dumps(self.HARVEST_OBJ) + "\\n```")
+        self.assertTrue(corrections.is_harvest_paste(msg))
+
+    def test_genuine_control_fenced_non_harvest_object(self):
+        import corrections
+        msg = ("look:\n```json\n"
+               + json.dumps(self.NON_HARVEST_OBJ) + "\\n```")
+        self.assertFalse(corrections.is_harvest_paste(msg))
+        self.assertFalse(corrections.is_harvest_paste(
+            "short genuine correction text without any fence"))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

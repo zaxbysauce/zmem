@@ -50,7 +50,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   trigger-condition marker get a non-blocking `phrasing_advisory`; and the
   session-end hook surfaces exactly one bounded closeout reminder when the
   session wrote rows (`<sha256(sid)[:32]>.wrote`, stamped by add/update/
-  supersede on success only) and no closeout was recorded
+  supersede/invalidate on success only — refused writes leave no marker; a
+deduped add (an attributed store write) still stamps) and no closeout was recorded
   (`store.py closeout-ack --session-id <id>` stamps `.closeout`,
   store-independent). The reminder never opens the store; the age sweep
   reaps aged `.wrote`/`.closeout` markers.
