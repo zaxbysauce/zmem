@@ -482,6 +482,10 @@ def test_principal_map_parity_corpus():
     assert any("'principal' must be a non-empty string" in p
                for p in problems_for(
                    {"t1": {"principal": 12, "host": "h", "harness": "x"}}))
+    # Round-3: namespace SHAPE (auth exits 2 on an unscoped namespace).
+    assert any("not a valid scoped namespace" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["banana"]}}))
 
 
 def test_issuer_and_doctor_match_server_auth_grammar():
@@ -539,6 +543,11 @@ def test_issuer_and_doctor_match_server_auth_grammar():
             "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa4': {{\n"
             "        'principal': 'p', 'host': 12, 'harness': 'x',\n"
             "        'namespaces': []}}}},\n"
+            "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa5': {{\n"
+            "        'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': ['banana']}}}},\n"
+            "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa6': {{\n"
+            "        'principal': 'p', 'host': 12, 'harness': 'x'}}}},\n"
             "]\n"
             "for m in maps:\n"
             "    hub_ok = auth_accepts(m)\n"
@@ -558,7 +567,7 @@ def test_issuer_and_doctor_match_server_auth_grammar():
         assert "CAPS True" in out, out
         assert "LIM True True True" in out, out
         agrees = [ln for ln in out.splitlines() if ln.startswith("AGREE")]
-        assert len(agrees) == 4, out
+        assert len(agrees) == 6, out
         for ln in agrees:
             # hub accepts  ==  doctor reports no problems  ==  issuer accepts
             parts = ln.split()

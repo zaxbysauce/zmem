@@ -4959,7 +4959,12 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
                     problems.append(
                         f"'namespaces' exceeds the maximum of "
                         f"{_FLEET_MAX_NAMESPACES} entries")
+                from schema_meta import is_valid_namespace  # noqa: PLC0415
                 for ns in namespaces:
+                    if not is_valid_namespace(ns):
+                        problems.append(
+                            f"namespace {ns[:40]!r} is not a valid scoped "
+                            "namespace (the hub parser would refuse it)")
                     ns_bytes = len(ns.encode("utf-8"))
                     if ns_bytes > _FLEET_MAX_NS_UTF8_BYTES:
                         problems.append(

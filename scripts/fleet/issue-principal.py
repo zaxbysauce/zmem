@@ -41,6 +41,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import host  # noqa: E402
+from schema_meta import is_valid_namespace  # noqa: E402
 
 _ALLOWED_FIELDS = {
     "principal", "host", "harness", "namespaces", "capabilities",
@@ -145,6 +146,12 @@ def _validate_entry(entry: dict) -> list[str]:
             or not all(isinstance(n, str) and n.strip() for n in namespaces)):
         problems.append(
             "'namespaces' must be a NON-EMPTY list of non-empty strings")
+    elif namespaces is not None:
+        for ns in namespaces:
+            if not is_valid_namespace(ns):
+                problems.append(
+                    f"namespace {ns[:40]!r} is not a valid scoped "
+                    "namespace (the hub parser would refuse it)")
     capabilities = entry.get("capabilities")
     if capabilities is not None and (
             not isinstance(capabilities, list) or not capabilities
