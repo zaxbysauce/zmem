@@ -4700,6 +4700,16 @@ _FLEET_MAX_PRINCIPALS = 256
 _FLEET_MAX_NAMESPACES = 128
 _FLEET_MAX_NS_UTF8_BYTES = 256
 _FLEET_MAX_NS_TOTAL_UTF8_BYTES = 8192
+# Grammar parity with auth (review round 1): the hub refuses maps on these
+# rules, so the doctor lane and the issuer must too — a map the hub would
+# exit-2 on must never report "valid".
+import re as _re_fleet  # noqa: E402  (module-level, beside its constant)
+_FLEET_PRINCIPAL_ID_RE = _re_fleet.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_FLEET_MAX_PRINCIPAL_ID_CHARS = 64
+_FLEET_MAX_TAG_VALUE_CHARS = 128
+_FLEET_ALLOWED_CAPABILITIES = frozenset(
+    {"read", "passive", "write", "mutate", "admin"})
+_FLEET_MAX_TOKEN_UTF8_BYTES = 4096
 
 
 def _fleet_remote_url() -> str:
@@ -4886,6 +4896,9 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
         if not isinstance(token, str) or not token.strip():
             problems.append("map keys must be non-empty token strings")
             continue
+        if len(token.encode("utf-8")) > _FLEET_MAX_TOKEN_UTF8_BYTES:
+            problems.append(
+                f"a token exceeds {_FLEET_MAX_TOKEN_UTF8_BYTES} UTF-8 bytes")
         norm = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
         if norm in seen_tokens:
             problems.append("duplicate normalized token")
@@ -4901,9 +4914,28 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
             problems.append(f"missing required field(s) {sorted(missing)}")
         pid = entry.get("principal")
         if isinstance(pid, str) and pid.strip():
-            if pid.strip() in seen_ids:
-                problems.append(f"duplicate principal id {pid.strip()!r}")
-            seen_ids.add(pid.strip())
+            pid = pid.strip()
+            if pid in seen_ids:
+                problems.append(f"duplicate principal id {pid!r}")
+            seen_ids.add(pid)
+            if (len(pid) > _FLEET_MAX_PRINCIPAL_ID_CHARS
+                    or not _FLEET_PRINCIPAL_ID_RE.match(pid)):
+                problems.append(
+                    f"'principal' must match [A-Za-z0-9][A-Za-z0-9._-]* and "
+                    f"be at most {_FLEET_MAX_PRINCIPAL_ID_CHARS} characters")
+        elif "principal" in entry:
+            problems.append("'principal' must be a non-empty string")
+        for field in ("host", "harness"):
+            value = entry.get(field)
+            if isinstance(value, str):
+                value = value.strip()
+                if (not value
+                        or len(value) > _FLEET_MAX_TAG_VALUE_CHARS
+                        or not _FLEET_PRINCIPAL_ID_RE.match(value)):
+                    problems.append(
+                        f"'{field}' must match "
+                        "[A-Za-z0-9][A-Za-z0-9._-]* and be at most "
+                        f"{_FLEET_MAX_TAG_VALUE_CHARS} characters")
         revoked = entry.get("revoked")
         if revoked is not None and not isinstance(revoked, bool):
             problems.append("'revoked' must be a boolean when present")
@@ -4913,6 +4945,8 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
                     isinstance(n, str) for n in namespaces):
                 problems.append("'namespaces' must be a list of strings")
             else:
+                if any(not n.strip() for n in namespaces):
+                    problems.append("'namespaces' entries must be non-empty")
                 if len(namespaces) > _FLEET_MAX_NAMESPACES:
                     problems.append(
                         f"'namespaces' exceeds the maximum of "
@@ -4924,6 +4958,15 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
                             f"a namespace exceeds {_FLEET_MAX_NS_UTF8_BYTES} "
                             "UTF-8 bytes")
                     total_ns_bytes += ns_bytes
+        capabilities = entry.get("capabilities")
+        if capabilities is not None:
+            if (not isinstance(capabilities, list) or not capabilities
+                    or not all(isinstance(c, str) for c in capabilities)
+                    or any(c not in _FLEET_ALLOWED_CAPABILITIES
+                           for c in capabilities)):
+                problems.append(
+                    "'capabilities' must be a NON-EMPTY list from "
+                    + ", ".join(sorted(_FLEET_ALLOWED_CAPABILITIES)))
     if len(obj) > _FLEET_MAX_PRINCIPALS:
         problems.append(
             f"map exceeds the maximum of {_FLEET_MAX_PRINCIPALS} principals")
@@ -5180,7 +5223,7 @@ def build_report(
             )
         staging_cleanup = _cleanup_training_staging(
             project,
-            repo_root,
+            training_output,
             max_age_hours=training_staging_max_age_hours,
             confirm_no_training_export=confirm_no_training_export,
         )

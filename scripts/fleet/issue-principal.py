@@ -49,6 +49,16 @@ _ALLOWED_FIELDS = {
 _REQUIRED_FIELDS = {"principal", "host", "harness"}
 _MAX_PRINCIPALS = 64
 _LOCK_STALE_S = 120
+# Hub-parser grammar parity (review round 1): the hub refuses maps on these
+# rules, so the issuer enforces the same ones — it must never mint an entry
+# the hub would exit-2 on.
+import re as _re  # noqa: E402
+
+_PRINCIPAL_ID_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_MAX_PRINCIPAL_ID_CHARS = 64
+_MAX_TAG_VALUE_CHARS = 128
+_ALLOWED_CAPABILITIES = frozenset(
+    {"read", "passive", "write", "mutate", "admin"})
 
 EXIT_OK = 0
 EXIT_REFUSED = 2
@@ -107,20 +117,37 @@ def _validate_entry(entry: dict) -> list[str]:
     missing = _REQUIRED_FIELDS - set(entry)
     if missing:
         problems.append(f"missing required field(s) {sorted(missing)}")
-    if not str(entry.get("principal", "")).strip():
+    pid = str(entry.get("principal", "")).strip()
+    if not pid:
         problems.append("'principal' must be a non-empty string")
+    elif (len(pid) > _MAX_PRINCIPAL_ID_CHARS
+            or not _PRINCIPAL_ID_RE.match(pid)):
+        problems.append(
+            f"'principal' must match [A-Za-z0-9][A-Za-z0-9._-]* and be at "
+            f"most {_MAX_PRINCIPAL_ID_CHARS} characters")
+    for field in ("host", "harness"):
+        value = str(entry.get(field, "")).strip()
+        if (not value
+                or len(value) > _MAX_TAG_VALUE_CHARS
+                or not _PRINCIPAL_ID_RE.match(value)):
+            problems.append(
+                f"'{field}' must match [A-Za-z0-9][A-Za-z0-9._-]* and be at "
+                f"most {_MAX_TAG_VALUE_CHARS} characters")
     if "revoked" in entry and not isinstance(entry["revoked"], bool):
         problems.append("'revoked' must be a boolean")
     namespaces = entry.get("namespaces")
     if namespaces is not None and (
             not isinstance(namespaces, list)
-            or not all(isinstance(n, str) for n in namespaces)):
-        problems.append("'namespaces' must be a list of strings")
+            or not all(isinstance(n, str) and n.strip() for n in namespaces)):
+        problems.append("'namespaces' must be a list of non-empty strings")
     capabilities = entry.get("capabilities")
     if capabilities is not None and (
-            not isinstance(capabilities, list)
-            or not all(isinstance(c, str) for c in capabilities)):
-        problems.append("'capabilities' must be a list of strings")
+            not isinstance(capabilities, list) or not capabilities
+            or not all(isinstance(c, str) for c in capabilities)
+            or any(c not in _ALLOWED_CAPABILITIES for c in capabilities)):
+        problems.append(
+            "'capabilities' must be a NON-EMPTY list from "
+            + ", ".join(sorted(_ALLOWED_CAPABILITIES)))
     return problems
 
 
@@ -178,12 +205,17 @@ def main(argv: list[str] | None = None) -> int:
             return _refuse(f"existing map unreadable/invalid: {exc}")
         if not isinstance(existing, dict):
             return _refuse("existing map must be a JSON object")
-        for _tok, other in existing.items():
+        for tok, other in existing.items():
             if (isinstance(other, dict)
                     and other.get("principal") == entry["principal"]):
                 return _refuse(
                     f"principal id {entry['principal']!r} already exists "
                     "in the map")
+            if not isinstance(other, dict) or _validate_entry(other):
+                return _refuse(
+                    "existing map carries an entry the hub parser would "
+                    "refuse (grammar/shape); fix the map first — the issuer "
+                    "never appends onto a map the hub would exit on")
         if len(existing) + 1 > _MAX_PRINCIPALS:
             return _refuse(f"map would exceed {_MAX_PRINCIPALS} principals")
     else:

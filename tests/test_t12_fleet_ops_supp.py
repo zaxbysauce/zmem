@@ -454,6 +454,146 @@ def test_principal_map_parity_corpus():
     many = {"tok-%032d" % i: {"principal": "p%d" % i, "host": "h",
                               "harness": "x"} for i in range(257)}
     assert any("maximum of 256" in p for p in problems_for(many))
+    # Grammar corpus (review round 1): rules the hub parser enforces.
+    assert any("principal" in p and "must match" in p for p in problems_for(
+        {"t1": {"principal": "bad id!", "host": "h", "harness": "x"}}))
+    assert any("'host' must match" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "bad host!", "harness": "x"}}))
+    assert any("'harness' must match" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": ""}}))
+    assert any("capabilities" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "capabilities": ["root"]}}))
+    assert any("capabilities" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "capabilities": []}}))
+    assert any("token exceeds" in p for p in problems_for(
+        {"t" * 5000: {"principal": "p", "host": "h", "harness": "x"}}))
+    assert any("non-empty" in p for p in problems_for(
+        {"t1": {"principal": "p", "host": "h", "harness": "x",
+                "namespaces": ["  "]}}))
+
+
+def test_issuer_and_doctor_match_server_auth_grammar():
+    """Tri-party parity: the issuer's and doctor's grammar constants equal
+    the server parser's (review round 1 — a map the hub exits-2 on must
+    never be minted or reported valid)."""
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-tri-") as td:
+        env = T12._base_env(Path(td) / "home")
+        code = (
+            "import sys\n"
+            "sys.path.insert(0, {scripts!r})\n"
+            "sys.path.insert(0, {auth!r})\n"
+            "import doctor\n"
+            "try:\n"
+            "    import auth as server_auth\n"
+            "except Exception as exc:\n"
+            "    print('AUTH-IMPORT-FAILED', type(exc).__name__)\n"
+            "    raise SystemExit(0)\n"
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location(\n"
+            "    'issue_principal', r'{ip}')\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "print('IDRE', doctor._FLEET_PRINCIPAL_ID_RE.pattern == "
+            "server_auth._PRINCIPAL_ID_RE.pattern == "
+            "mod._PRINCIPAL_ID_RE.pattern)\n"
+            "print('CAPS', doctor._FLEET_ALLOWED_CAPABILITIES == "
+            "server_auth._ALLOWED_CAPABILITIES == "
+            "mod._ALLOWED_CAPABILITIES)\n"
+            "print('LIM', doctor._FLEET_MAX_PRINCIPAL_ID_CHARS == "
+            "server_auth._MAX_PRINCIPAL_ID_CHARS == "
+            "mod._MAX_PRINCIPAL_ID_CHARS, "
+            "doctor._FLEET_MAX_TAG_VALUE_CHARS == "
+            "server_auth._MAX_PRINCIPAL_TAG_VALUE_CHARS == "
+            "mod._MAX_TAG_VALUE_CHARS, "
+            "doctor._FLEET_MAX_TOKEN_UTF8_BYTES == "
+            "server_auth._MAX_BEARER_TOKEN_UTF8_BYTES)\n"
+            "def auth_accepts(entries):\n"
+            "    try:\n"
+            "        server_auth._parse_principal_map(\n"
+            "            __import__('json').dumps(entries), 'probe')\n"
+            "        return True\n"
+            "    except SystemExit:\n"
+            "        return False\n"
+            "maps = [\n"
+            "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa1': {{\n"
+            "        'principal': 'ok-id', 'host': 'box-1', \n"
+            "        'harness': 'claude-code'}}}},\n"
+            "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa2': {{\n"
+            "        'principal': 'bad id!', 'host': 'h', \n"
+            "        'harness': 'x'}}}},\n"
+            "    {{'tok-aaaaaaaaaaaaaaaaaaaaaaaaaaaa3': {{\n"
+            "        'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'capabilities': ['root']}}}},\n"
+            "]\n"
+            "for m in maps:\n"
+            "    hub_ok = auth_accepts(m)\n"
+            "    doc_problems = bool(doctor._fleet_principal_map_problems(\n"
+            "        __import__('json').dumps(m))[0])\n"
+            "    entry = list(m.values())[0]\n"
+            "    issuer_problems = bool(mod._validate_entry(entry))\n"
+            "    print('AGREE', hub_ok, not doc_problems, not issuer_problems)\n"
+        ).format(scripts=str(SCRIPTS_DIR), auth=str(HERMES_SERVER_DIR),
+                 ip=str(ISSUE_PRINCIPAL_PY))
+        result = _py(code, env, timeout=120)
+        out = result.stdout
+        if "AUTH-IMPORT-FAILED" in out:
+            import pytest
+            pytest.skip(f"server auth import unavailable (mcp dep?): {out}")
+        assert "IDRE True" in out, out
+        assert "CAPS True" in out, out
+        assert "LIM True True True" in out, out
+        agrees = [ln for ln in out.splitlines() if ln.startswith("AGREE")]
+        assert len(agrees) == 3, out
+        for ln in agrees:
+            # hub accepts  ==  doctor reports no problems  ==  issuer accepts
+            parts = ln.split()
+            assert parts[1] == parts[2] == parts[3], ln
+
+
+def test_cleanup_training_staging_through_build_report():
+    """The CLI cleanup path drives _cleanup_training_staging with
+    TRAINING_OUTPUT (not repo_root) — pins the review-round-1 argument
+    regression: the flag must clean the --training-output parent, never the
+    repo root's parent."""
+    # SCRIPTS_DIR stays on sys.path for the whole test: doctor's LAZY
+    # storelib imports resolve at build_report call time, not import time.
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import doctor
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-clean-") as td:
+        tmp = Path(td)
+        # Disjoint parents so the correct call and the regressed call
+        # (training_output swapped for repo_root) clean DIFFERENT trees:
+        # staging siblings live beside the training-output FILE.
+        out_parent = tmp / "a"
+        repo_parent = tmp / "b"
+        project = tmp / "project"
+        out_parent.mkdir()
+        repo_parent.mkdir()
+        project.mkdir()
+        repo_root = repo_parent / "repo"
+        repo_root.mkdir()
+        stale_target = out_parent / ".training-staging-old"
+        stale_target.mkdir()
+        old_ts = time.time() - 7200
+        os.utime(stale_target, (old_ts, old_ts))
+        decoy = repo_parent / ".training-staging-decoy"
+        decoy.mkdir()
+        os.utime(decoy, (old_ts, old_ts))
+        report = doctor.build_report(
+            project, repo_root,
+            training_output=str(out_parent / "export-out"),
+            cleanup_training_staging=True,
+            training_staging_max_age_hours=0.001,
+            confirm_no_training_export=True,
+        )
+        cleanup = report.get("training_staging_cleanup") or {}
+        removed = cleanup.get("removed") or []
+        assert any("training-staging-old" in str(r) for r in removed), cleanup
+        assert not any("decoy" in str(r) for r in removed), cleanup
+        assert decoy.exists(), "the repo-root sibling must never be touched"
+        assert not stale_target.exists(), "the stale target was removed"
 
 
 # ---------------------------------------------------------------------------
