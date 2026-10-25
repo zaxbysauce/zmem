@@ -28,10 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import host as _host_preflight  # noqa: E402
 
 try:
+    _host_preflight._SUPPRESS_LEGACY_WARNING = True  # noqa: SLF001
     _host_preflight.resolve_store_path()
 except _host_preflight.StoreConfigError as _exc:
     print(f"[zmem] {_exc}", file=sys.stderr)
     raise SystemExit(2)
+finally:
+    _host_preflight._SUPPRESS_LEGACY_WARNING = False  # noqa: SLF001
 
 import storelib as _storelib  # noqa: E402
 from storelib import main  # noqa: E402

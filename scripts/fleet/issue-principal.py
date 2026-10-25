@@ -150,9 +150,13 @@ def _validate_entry(entry: dict) -> list[str]:
         ns_total = 0
         for ns in namespaces:
             if not is_valid_namespace(ns):
+                # Shape only, never the value: problem strings get pasted
+                # into operator evidence, and namespace identifiers can
+                # carry project/customer names.
+                head = ns.split(":", 1)[0] if ":" in ns else "?"
                 problems.append(
-                    f"namespace {ns[:40]!r} is not a valid scoped "
-                    "namespace (the hub parser would refuse it)")
+                    f"a {head}:* namespace (len {len(ns)}) is not a valid "
+                    "scoped namespace (the hub parser would refuse it)")
             ns_bytes = len(ns.encode("utf-8"))
             if ns_bytes > 256:
                 problems.append(
@@ -192,7 +196,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--capabilities", default="",
                     help="comma-separated capabilities (optional)")
     ap.add_argument("--preset", choices=("off-tailnet",),
-                    help="off-tailnet: capabilities read,passive")
+                    help="off-tailnet: capabilities read,passive; requires "
+                         "--namespaces (an entry without namespaces is "
+                         "UNSCOPED hub-side = every namespace allowed)")
+    ap.add_argument("--allow-unscoped", action="store_true",
+                    help="explicitly mint a principal with NO namespace "
+                         "scope (full access). Off by default: omitting "
+                         "--namespaces without this flag is a refusal.")
     args = ap.parse_args(argv)
 
     entry: dict = {
@@ -214,6 +224,20 @@ def main(argv: list[str] | None = None) -> int:
     if caps:
         entry["capabilities"] = caps
 
+    if "namespaces" not in entry and not args.allow_unscoped:
+        if args.preset == "off-tailnet":
+            return _refuse(
+                "--preset off-tailnet without --namespaces mints an "
+                "UNSCOPED principal (hub-side: every namespace allowed, "
+                "and capabilities never gate add/capture) - pass "
+                "--namespaces, or --allow-unscoped to accept full access "
+                "explicitly")
+        return _refuse(
+            "no --namespaces given: the minted principal would be "
+            "UNSCOPED (hub-side: every namespace allowed) - pass "
+            "--namespaces, or --allow-unscoped to accept full access "
+            "explicitly")
+
     problems = _validate_entry(entry)
     if problems:
         return _refuse("; ".join(problems))
@@ -232,10 +256,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             raw = map_path.read_text(encoding="utf-8")
             existing = json.loads(raw) if raw.strip() else {}
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, UnicodeDecodeError,
+                RecursionError) as exc:
             return _refuse(f"existing map unreadable/invalid: {exc}")
         if not isinstance(existing, dict):
             return _refuse("existing map must be a JSON object")
+        import hashlib as _hashlib
+        seen_norm_tokens = set()
         for tok, other in existing.items():
             if (not isinstance(tok, str) or not tok.strip()
                     or len(tok.encode("utf-8")) > 4096):
@@ -243,11 +270,20 @@ def main(argv: list[str] | None = None) -> int:
                     "existing map carries a token key the hub parser "
                     "would refuse (empty or over 4096 UTF-8 bytes); fix "
                     "the map first")
+            norm = _hashlib.sha256(tok.strip().encode("utf-8")).hexdigest()
+            if norm in seen_norm_tokens:
+                return _refuse(
+                    "existing map carries two token keys that collide "
+                    "after the hub's strip+hash normalization - the hub "
+                    "would exit on load; fix the map first")
+            seen_norm_tokens.add(norm)
             if (isinstance(other, dict)
-                    and other.get("principal") == entry["principal"]):
+                    and str(other.get("principal", "")).strip()
+                    == entry["principal"].strip()):
                 return _refuse(
                     f"principal id {entry['principal']!r} already exists "
-                    "in the map")
+                    "in the map (compared after strip normalization, like "
+                    "the hub)")
             if not isinstance(other, dict) or _validate_entry(other):
                 return _refuse(
                     "existing map carries an entry the hub parser would "
@@ -262,6 +298,10 @@ def main(argv: list[str] | None = None) -> int:
     # degraded-lock both refuse WITHOUT printing anything.
     lock_path = map_path.with_name(map_path.name + ".issue.lock")
     lock_token = host.acquire_lock(str(lock_path), _LOCK_STALE_S)
+    try:
+        os.chmod(lock_path, 0o600)
+    except OSError:
+        pass  # best-effort hardening of the lock token file
     if lock_token is None:
         print("issue-principal: another issuance holds the map lock; "
               "retry when it completes", file=sys.stderr)
@@ -271,46 +311,84 @@ def main(argv: list[str] | None = None) -> int:
               "issue unlocked", file=sys.stderr)
         return EXIT_LOCK
     try:
-        # Re-validate duplicates UNDER the lock (a concurrent issuer may
-        # have appended while we validated).
+        # Re-validate the WHOLE map under the lock (a concurrent issuer may
+        # have appended while we validated): duplicate ids, token-key rules,
+        # entry grammar, AND the principal count (two concurrent issuers on
+        # a 255-entry map could otherwise push it past the hub's 256 and
+        # brick every principal at the next hub load).
         if map_path.exists():
             try:
                 raw_now = map_path.read_text(encoding="utf-8")
                 existing = json.loads(raw_now) if raw_now.strip() else {}
                 if not isinstance(existing, dict):
                     return _refuse("map changed to a non-object under the lock")
-                for _tok, other in existing.items():
-                    if (isinstance(other, dict)
-                            and other.get("principal") == entry["principal"]):
-                        return _refuse(
-                            f"principal id {entry['principal']!r} was issued "
-                            "concurrently")
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, UnicodeDecodeError,
+                    RecursionError) as exc:
                 return _refuse(f"map re-read under lock failed: {exc}")
+            if len(existing) + 1 > _MAX_PRINCIPALS:
+                return _refuse(
+                    f"map re-read under the lock would exceed the hub "
+                    f"maximum of {_MAX_PRINCIPALS} principals - refusing")
+            for tok, other in existing.items():
+                if (not isinstance(tok, str) or not tok.strip()
+                        or len(tok.encode("utf-8")) > 4096):
+                    return _refuse(
+                        "map re-read under the lock found a token key the "
+                        "hub parser would refuse")
+                if not isinstance(other, dict) or _validate_entry(other):
+                    return _refuse(
+                        "map re-read under the lock found an entry the hub "
+                        "parser would refuse")
+                if (isinstance(other, dict)
+                        and other.get("principal") == entry["principal"]):
+                    return _refuse(
+                        f"principal id {entry['principal']!r} was issued "
+                        "concurrently")
 
         token = secrets.token_urlsafe(32)
         existing[token] = dict(entry)
 
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            dir=str(map_path.parent), prefix=".map-tmp-", suffix=".json")
-        os.close(tmp_fd)
-        tmp_path = Path(tmp_name)
+        tmp_path = None
         try:
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                dir=str(map_path.parent), prefix=".map-tmp-", suffix=".json")
+            os.close(tmp_fd)
+            tmp_path = Path(tmp_name)
             if os.name == "nt":
                 _harden_windows(tmp_path)
             else:
                 os.chmod(tmp_path, 0o600)
+            # Verify the hardening took BEFORE content lands: a broad-ACL
+            # tmp would carry its DACL onto the map via os.replace.
+            if os.name == "nt":
+                if not _windows_acl_clean(tmp_path):
+                    tmp_path.unlink(missing_ok=True)
+                    return _refuse(
+                        "post-hardening DACL check on the temp map found a "
+                        "broad ACE - refusing to write the credential "
+                        "(the map on disk is unchanged)")
+            else:
+                mode = stat.S_IMODE(tmp_path.stat().st_mode)
+                if mode & 0o077:
+                    tmp_path.unlink(missing_ok=True)
+                    return _refuse(
+                        f"post-hardening mode check on the temp map found "
+                        f"{mode:o} (want 0600) - refusing to write the "
+                        "credential (the map on disk is unchanged)")
             with tmp_path.open("w", encoding="utf-8") as fh:
                 json.dump(existing, fh, indent=2, sort_keys=True)
                 fh.write("\n")
             os.replace(tmp_path, map_path)
         except OSError as exc:
-            tmp_path.unlink(missing_ok=True)
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             print(f"issue-principal: map write failed: {exc}", file=sys.stderr)
             return EXIT_WRITE_FAILED
         if os.name == "nt" and not _windows_acl_clean(map_path):
             print("issue-principal: WARNING — post-replacement DACL check "
-                  "found a broad ACE; restrict it manually.", file=sys.stderr)
+                  "found a broad ACE; the credential was written - delete "
+                  "the map and re-run after fixing the ACL.",
+                  file=sys.stderr)
     finally:
         host.release_lock(str(lock_path), lock_token)
 

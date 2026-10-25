@@ -1,11 +1,18 @@
-# install-hub.ps1 — register the zmem hub on this Windows box (issue #291).
+﻿# install-hub.ps1 - register the zmem hub on this Windows box (issue #291).
 #
 # Contract (Workstream T PR 12, AC3):
-#   * the hub runs as a service bound to 127.0.0.1 ONLY (never a wildcard);
-#   * the tailnet exposes it via `tailscale serve` HTTPS (no wildcard bind);
-#   * a principal map with a broad ACE (Users/Everyone/Authenticated Users)
-#     is REFUSED before anything is configured;
-#   * idempotent: re-running replaces the task and re-points serve.
+#   * the hub runs as a scheduled task bound to 127.0.0.1 ONLY (never a
+#     wildcard bind), started at boot under the SYSTEM account so the
+#     AtStartup trigger actually fires without an interactive logon;
+#   * the task action is a generated wrapper that sets the hub env
+#     (principal map + data dir) before launching python - the raw task
+#     action cannot carry environment variables;
+#   * a principal map with a broad ACE (Users/Everyone/Authenticated
+#     Users, matched by well-known SID so localized Windows cannot defeat
+#     it) is REFUSED before anything is configured;
+#   * idempotent: re-running replaces the wrapper, the task, and re-points
+#     serve, and RESTARTS the task so the running hub converges onto the
+#     new configuration.
 #
 # Usage:
 #   .\install-hub.ps1 -RepoRoot C:\path\to\zmem -DataDir D:\zmem-data `
@@ -20,39 +27,66 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# --- refuse a world-readable principal map ---------------------------------
+if ($Port -lt 1 -or $Port -gt 65535) {
+    Write-Error "-Port must be 1-65535 (got: $Port)"
+}
+
+# --- refuse a broad-ACL principal map (SID-based, locale-independent) -------
 if (-not (Test-Path $TokensFile)) {
     Write-Error "principal map not found: $TokensFile (create it with issue-principal.py first)"
 }
-$acl = (Get-Acl $TokensFile).Access |
+$wellKnownSids = @("S-1-1-0", "S-1-5-32-545", "S-1-5-11")
+$broad = (Get-Acl $TokensFile).Access |
     Where-Object { $_.AccessControlType -eq "Allow" } |
     Where-Object {
-        $_.IdentityReference -match "^(BUILTIN\\Users|Everyone|BUILTIN\\Authenticated Users|NT AUTHORITY\\Authenticated Users)$"
+        $sid = $null
+        try {
+            $sid = $_.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]).Value
+        } catch {
+            $sid = $_.IdentityReference.Value
+        }
+        $wellKnownSids -contains $sid
     }
-if ($acl) {
-    Write-Error "REFUSED: $TokensFile grants a broad allow ACE (Users/Everyone/Authenticated Users). Restrict it to the hub service account first."
+if ($broad) {
+    Write-Error "REFUSED: $TokensFile grants a broad allow ACE (Everyone/Users/Authenticated Users, matched by SID). Restrict it to the hub service account first."
 }
 
-# --- data dir ---------------------------------------------------------------
+# --- data dir + wrapper script (the task action cannot carry env) -----------
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-
-# --- the service: startup scheduled task bound to 127.0.0.1 -----------------
 $serverPy = Join-Path $RepoRoot "hermes-plugin\server\mcp_server.py"
 if (-not (Test-Path $serverPy)) { Write-Error "mcp_server.py not found under $RepoRoot" }
+$pythonExe = (Get-Command python).Source
+if (-not $pythonExe) { Write-Error "python not found on PATH" }
 
-$action = New-ScheduledTaskAction -Execute "python" `
-    -Argument "-X utf8 `"$serverPy`" --host 127.0.0.1 --port $Port"
+$wrapper = Join-Path $DataDir "hub-run.cmd"
+@"
+@echo off
+set "ZMEM_MCP_TOKENS_FILE=$TokensFile"
+set "ZMEM_DATA=$DataDir"
+"$pythonExe" -X utf8 "$serverPy" --host 127.0.0.1 --port $Port
+"@ | Set-Content -Path $wrapper -Encoding ASCII
+
+# --- the service: startup scheduled task under SYSTEM ------------------------
+$action = New-ScheduledTaskAction -Execute "$wrapper"
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount
+$settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Settings $settings -Force | Out-Null
+    -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 5
+$state = (Get-ScheduledTask -TaskName $TaskName).State
+if ($state -eq "Running") {
+    Write-Host "Hub task state: Running."
+} else {
+    Write-Warning "Hub task state: $state (expected Running) - check the task history / Event Log before relying on it."
+}
 
 # --- tailscale serve: tailnet HTTPS -> localhost ONLY -----------------------
 $serve = Get-Command tailscale -ErrorAction SilentlyContinue
 if (-not $serve) {
-    Write-Warning "tailscale not found — install it, then run: tailscale serve --bg --https=443 http://127.0.0.1:$Port"
+    Write-Warning "tailscale not found - install it, then run: tailscale serve --bg --https=443 http://127.0.0.1:$Port"
 } else {
     tailscale serve --bg --https=443 "http://127.0.0.1:$Port"
     if ($LASTEXITCODE -ne 0) { Write-Error "tailscale serve failed (exit $LASTEXITCODE)" }
@@ -60,6 +94,6 @@ if (-not $serve) {
 }
 
 Write-Host ""
-Write-Host "Hub installed. Broker machines connect to this box's tailnet name."
+Write-Host "Hub installed (task $TaskName; wrapper $wrapper)."
 Write-Host "Issue one principal per broker with python scripts/fleet/issue-principal.py,"
 Write-Host "then run scripts/fleet/install-broker.ps1 on each broker machine."

@@ -422,3 +422,40 @@ def test_doctor_fleet_checks_present():
         _assert_exit_iff_no_fail(result_unset, report_unset)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# CI runner (review round: the repo's python lane executes `python "$f"` per
+# file, and this file shipped without a runner, so CI executed zero checks
+# from it). Mirrors the t06/t07 house pattern: plain-python execution with
+# PASS/FAIL lines and no pytest dependency. pytest still collects the same
+# functions for local runs.
+# ---------------------------------------------------------------------------
+
+
+def _all_checks():
+    return (
+        test_zmem_data_pointing_at_a_file_is_refused,
+        test_zmem_data_directory_still_resolves,
+        test_doctor_fleet_checks_present,
+    )
+
+
+def _main() -> int:
+    failures = []
+    for check in _all_checks():
+        try:
+            check()
+            print(f"PASS {check.__name__}")
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            failures.append((check.__name__, str(exc)))
+            print(f"FAIL {check.__name__}: {exc}")
+    if failures:
+        print(f"{len(failures)} check(s) failed")
+        return 1
+    print("all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

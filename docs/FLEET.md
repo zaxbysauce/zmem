@@ -619,14 +619,59 @@ pending overlay rather than a recency-shaped serve.
 
 The capability-matrix rows for the Inject and explicit-recall degrade
 cells move from obligation to shipped with this delivery; the T-12
-`doctor --fleet` snapshot-age report (issue #291) remains open.
+`doctor --fleet` family (issue #291) ships with the fleet-operations
+release, including the snapshot-age check.
+
+## Installing the fleet (issue #291)
+
+Surfaces shipped with the fleet-operations release (under
+`scripts/fleet/` and `skills/memory/scripts/`):
+
+- **Hub**: `install-hub.ps1` / `install-hub.sh REPO_ROOT DATA_DIR
+  TOKENS_FILE [PORT]` register the hub bound to 127.0.0.1 only, refuse a
+  broad-ACL (SID-matched) / non-0600 principal map, and configure
+  `tailscale serve --bg --https=443 http://127.0.0.1:<port>`. The Linux
+  unit runs as the invoking (sudo) user with NoNewPrivileges and verifies
+  the service came up before reporting success.
+- **Per-machine principals**: `scripts/fleet/issue-principal.py --map
+  FILE --principal ID --host H --harness X [--namespaces a,b]
+  [--capabilities c1,c2] [--preset off-tailnet]` appends to the hub's map
+  under a strict fail-closed lock and prints the token exactly once. An
+  entry WITHOUT `--namespaces` is UNSCOPED hub-side (every namespace
+  allowed; capabilities never gate add/capture) — the issuer refuses it
+  unless `--allow-unscoped` is passed. `--preset off-tailnet` means
+  capabilities `read,passive` AND requires `--namespaces`.
+- **Broker**: `install-broker.ps1` (token piped via the PowerShell
+  pipeline) / `install-broker.sh REPO_ROOT HUB_URL [NAMESPACES]` (token
+  piped via stdin) write the singular per-broker credential the CLIENT
+  transport reads, refuse conflicting effective config (ZMEM_HERMES_MODE
+  other than unset/`mcp`, a differing `ZMEM_MCP_URL`, any plural map, any
+  `ZMEM_STORE`) in BOTH the root and invoking-user scopes under sudo, and
+  validate with a fresh child asserting the transport resolves mcp BEFORE
+  persisting the configuration.
+- **Health**: `doctor --fleet` reports seven checks (hub reachable, hello
+  compatible, principal, op-queue backlog with oldest age, snapshot age,
+  stray local core.md, full-disk encryption while a complete snapshot
+  pair exists). `ZMEM_FLEET_FDE_PROBE` (`on`/`off`) overrides the
+  encryption probe for operators and tests.
+
+## Tailscale identity facts (recorded per issue #291)
+
+Two Tailscale facts bound the fleet design (from the issue's design
+critique): Serve's `Tailscale-User-*` identity headers are ABSENT for
+tagged devices, and a backend `WhoIs` lookup through Serve identifies the
+Serve PROXY, not the original node. Node identity therefore cannot be
+inferred naively from either — the bearer principal (per-machine, via the
+principal map) remains the ONLY authorization authority, and Tailscale
+identity is defence in depth at best.
 
 ## Peer ingest trust mode (issue #282)
 
 Every machine importing rows it did not author runs
-`ingest-jsonl --trust untrusted-peer --allow-namespace <ns...>
+`ingest-jsonl --trust untrusted-peer --allow-namespace <ns>
 --capture-mode auto` (add `--attribute-host <this box>` to stamp local
-attribution). Trust claims inside the rows are clamped, namespaces are
+attribution; `--allow-namespace` is repeatable, one namespace per flag).
+Trust claims inside the rows are clamped, namespaces are
 gated, and evidence records from peers are refused; see docs/CLOUD.md.
 
 ## Migrating from a peer JSONL exchange (issue #291)
@@ -641,9 +686,10 @@ the peer exchange WITHOUT losing a row.
    every machine that runs one, then let the final export finish so the
    outbox is a complete tail.
 2. **Final authoritative ingest.** On the hub, ingest each machine's
-   outbox ONCE with the T-03 peer-trust mode:
-   `store.py ingest-jsonl <outbox.jsonl> --trust untrusted-peer
-   --allow-namespace <ns...> --capture-mode auto --attribute-host <box>`.
+   outbox ONCE with the T-03 peer-trust mode (the file goes via `--in`,
+   and `--allow-namespace` is repeatable, one namespace per flag):
+   `store.py ingest-jsonl --in <outbox.jsonl> --trust untrusted-peer
+   --allow-namespace <ns> --capture-mode auto --attribute-host <box>`.
    Trust claims are clamped and namespaces gated (the #282 contract).
 3. **Re-embed on the hub** in its local context: run `store.py reembed`
    on the hub so the ingested rows are searchable on the hub's embedding

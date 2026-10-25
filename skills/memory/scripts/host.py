@@ -156,6 +156,8 @@ def _legacy_plugin_store(home: Path) -> Path | None:
         chosen = matches[0]
 
     if len(matches) > 1:
+        if _SUPPRESS_LEGACY_WARNING:
+            return chosen
         try:
             import sys as _sys
             others = "".join(
@@ -817,6 +819,11 @@ def resolve_scopes(
 # its lock broken. Timeouts are therefore set far above any realistic run
 # (see store.py's *_LOCK_STALE_SECONDS), and the worst case degrades to
 # today's behavior (two concurrent runs), not to corruption.
+
+# Set briefly by store.py's pre-import preflight so its extra resolver call
+# does not re-print the multi-legacy-store warning the other two calls in the
+# same process already printed (review PRR-031).
+_SUPPRESS_LEGACY_WARNING = False
 
 _NO_LOCK_TOKEN = "unlocked"
 

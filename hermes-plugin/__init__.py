@@ -557,6 +557,17 @@ def _resolve_store_data_dir() -> Path:
     try:
         return _host().resolve_store_path().parent
     except Exception as exc:
+        import host as _host_mod  # noqa: PLC0415
+        if isinstance(exc, _host_mod.StoreConfigError):
+            # Issue #291 (review PRR-010): a REFUSED configuration (a
+            # directory variable naming an existing file) must fail loud -
+            # the legacy fallback would silently relocate the provider's
+            # store/core.md/decision log to an unrelated path, exactly the
+            # redirect this PR refuses everywhere else.
+            raise
+        # host.py absent/broken, or a module-name collision in sys.modules.
+        # Fall back to storelib.schema's dependency-free legacy chain so the
+        # provider degrades without pointing telemetry at a different store.
         # host.py absent/broken, or a module-name collision in sys.modules.
         # Fall back to storelib.schema's dependency-free legacy chain so the
         # provider degrades without pointing telemetry at a different store.
@@ -569,7 +580,10 @@ def _resolve_core_md() -> Path:
     """Resolve core.md via host.py (honors ZMEM_CORE_MD + store-path parent)."""
     try:
         return _host().resolve_core_md_path()
-    except Exception:
+    except Exception as exc:
+        import host as _host_mod  # noqa: PLC0415
+        if isinstance(exc, _host_mod.StoreConfigError):
+            raise
         return _resolve_store_data_dir() / _CORE_MD_REL
 
 

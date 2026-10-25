@@ -1604,6 +1604,8 @@ committed snapshot up to a full sync-repo read/write loop: see
 
 - Keep **one canonical physical store path** per machine. If two hosts resolve
   to different physical stores, that is a cutover failure, not a supported mode.
+  (Fleet deployments — one authoritative hub plus broker machines — are the
+  documented exception; see [docs/FLEET.md](docs/FLEET.md).)
 - Backups and restores are first-class maintenance commands:
   `<interpreter> <store.py> backup` and `<interpreter> <store.py> restore --from <snapshot> --force`.
   Run restores when no session is actively writing.

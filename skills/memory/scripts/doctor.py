@@ -4723,6 +4723,7 @@ def _check_fleet_hub_reachable() -> dict:
     """Reachability only: ANY HTTP response (including 4xx/5xx) proves the
     endpoint answered; refused/timeout/bad URL is a fail."""
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     url = _fleet_remote_url()
@@ -4731,14 +4732,38 @@ def _check_fleet_hub_reachable() -> dict:
             "fleet-hub-reachable", "skip",
             "Fleet remote mode not configured (ZMEM_REMOTE_URL unset).")
     details: dict[str, object] = {"remote_url": url}
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        return _check(
+            "fleet-hub-reachable", "fail",
+            f"Unsupported hub URL scheme {scheme!r} (expected http/https): "
+            f"{url}", **details)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    # ProxyHandler({}) disables ambient proxies: the hub is tailnet-local,
+    # and a proxy turns "connection refused" into a proxy 502 (a false
+    # reachable-pass); the frozen fleet test depends on that determinism.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect)
     try:
-        urllib.request.urlopen(
-            urllib.request.Request(url, method="GET"),
-            timeout=_FLEET_PROBE_TIMEOUT_S)
+        resp = opener.open(urllib.request.Request(url, method="GET"),
+                           timeout=_FLEET_PROBE_TIMEOUT_S)
+        with resp:
+            resp.read(1)
         return _check("fleet-hub-reachable", "pass",
                       "Hub answered at the configured URL.", **details)
     except urllib.error.HTTPError as exc:
+        with exc:
+            exc.read(1)
         details["http_status"] = exc.code
+        if 300 <= exc.code < 400:
+            return _check(
+                "fleet-hub-reachable", "fail",
+                f"Hub URL redirects (HTTP {exc.code}) - a hub must answer "
+                "directly at the configured URL.", **details)
         note = "" if exc.code < 500 else " (backend unhealthy — 5xx)"
         return _check("fleet-hub-reachable", "pass",
                       f"Hub reachable: HTTP {exc.code}{note}.", **details)
@@ -4767,13 +4792,17 @@ def _fleet_hello_once() -> tuple[str, str, dict]:
     url = _fleet_remote_url()
     if not url:
         return ("skip", "No hub URL configured.", {})
+    deadline_s = _FLEET_PROBE_TIMEOUT_S + 3.0
     try:
         http = fleet_transport.McpHttp(
             url=url, executor=fleet_transport.DeadlineExecutor(),
-            deadline_s=_FLEET_PROBE_TIMEOUT_S + 3.0)
+            deadline_s=deadline_s)
+        _hello_started = time.monotonic()
         payload = http.hello()
+        _hello_elapsed = time.monotonic() - _hello_started
     except Exception as exc:  # noqa: BLE001 - hello itself fails open
         payload = {"ok": False, "reason": f"hello-call-error: {exc}"}
+        _hello_elapsed = 0.0
     details: dict[str, object] = {}
     if isinstance(payload, dict) and isinstance(
             payload.get("supported_protocol_majors"), list):
@@ -4790,8 +4819,18 @@ def _fleet_hello_once() -> tuple[str, str, dict]:
                 f"major {client_major}.", details)
     reason = payload.get("reason") if isinstance(payload, dict) else None
     details["reason"] = reason
+    details["elapsed_s"] = round(_hello_elapsed, 2)
     if reason == fleet_transport.REASON_HUB_UNREACHABLE:
         return ("skip", "Hub unreachable (see fleet-hub-reachable).", details)
+    if reason == fleet_transport.REASON_EMPTY_POOL and (
+            _hello_elapsed >= deadline_s * 0.95):
+        # DeadlineExecutor returns None on a deadline hit and hello maps a
+        # non-dict payload to the empty-pool envelope - a slow-but-alive
+        # hub must not be reported as an auth/compat failure (PRR-013).
+        details["timeout"] = True
+        return ("skip",
+                f"Hub did not answer the hello inside the {deadline_s:.0f}s "
+                "probe deadline (timeout, not an auth failure).", details)
     return ("fail", f"Authenticated hello unsuccessful: {reason}", details)
 
 
@@ -4824,6 +4863,14 @@ def _check_fleet_principal(hello: tuple[str, str, dict]) -> dict:
             return _check("fleet-principal", "fail",
                           f"ZMEM_MCP_TOKENS_FILE ({tok_file}) unreadable: "
                           f"{exc}")
+        except UnicodeDecodeError as exc:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) is not valid "
+                          f"UTF-8: {exc}")
+        if len(raw) > 4 * 1024 * 1024:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) exceeds the "
+                          "4 MiB diagnostic read cap.")
         problems, count = _fleet_principal_map_problems(raw)
         if problems:
             return _check("fleet-principal", "fail",
@@ -4880,6 +4927,9 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
     problems: list[str] = []
     try:
         obj = _json.loads(raw)
+    except RecursionError:
+        return (["map is nested too deeply to parse (the hub parser would "
+                 "refuse it)"], 0)
     except ValueError as exc:
         return ([f"map is not valid JSON ({exc})"], 0)
     if not isinstance(obj, dict):
@@ -4990,7 +5040,8 @@ def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
     return (problems, len(obj))
 
 
-def _check_fleet_op_queue(resolved_store: Path) -> dict:
+def _check_fleet_op_queue(resolved_store: Path,
+                          now_epoch: float | None = None) -> dict:
     """Backlog semantics: depth counts ONLY status=='pending' entries
     (receipts flip status in place — history is not backlog)."""
     import json as _json
@@ -5001,15 +5052,18 @@ def _check_fleet_op_queue(resolved_store: Path) -> dict:
     malformed_lines = 0
     malformed_ts = 0
     oldest: float | None = None
-    now = time.time()
+    now = now_epoch if now_epoch is not None else time.time()
+    unreadable_files = 0
     try:
         paths = sorted(queue_dir.glob("ops-*.jsonl"))
     except OSError:
         paths = []
+        unreadable_files = 1
     for path in paths:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            unreadable_files += 1
             continue
         for line in text.splitlines():
             line = line.strip()
@@ -5038,6 +5092,12 @@ def _check_fleet_op_queue(resolved_store: Path) -> dict:
     details: dict[str, object] = {"depth": depth, "retired": retired}
     if malformed_lines:
         details["malformed_lines"] = malformed_lines
+    if unreadable_files:
+        details["unreadable_files"] = unreadable_files
+    if depth == 0 and unreadable_files:
+        return _check("fleet-op-queue", "warn",
+                      f"{unreadable_files} queue file(s) unreadable - the "
+                      "backlog could not be measured.", **details)
     if depth == 0:
         return _check("fleet-op-queue", "pass",
                       "Op queue drained (no pending entries).", **details)
@@ -5070,6 +5130,21 @@ def _fleet_snapshot_state(resolved_store: Path) -> tuple[str, dict]:
         return ("corrupt", {})
     if not isinstance(meta, dict):
         return ("corrupt", {})
+    # The sqlite half must actually BE a snapshot: a truncated or foreign
+    # file with no memory table is corrupt, never fresh (PRR-020).
+    try:
+        _snap_conn = sqlite3.connect(f"file:{snap.resolve()}?mode=ro",
+                                     uri=True, timeout=2.0)
+        try:
+            _snap_row = _snap_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='memory'").fetchone()
+        finally:
+            _snap_conn.close()
+        if _snap_row is None:
+            return ("corrupt", {})
+    except sqlite3.Error:
+        return ("corrupt", {})
     issued = meta.get("issued_at")
     expires = meta.get("expires_at")
     if (not isinstance(issued, (int, float)) or isinstance(issued, bool)
@@ -5082,7 +5157,8 @@ def _fleet_snapshot_state(resolved_store: Path) -> tuple[str, dict]:
     return ("valid", meta)
 
 
-def _check_fleet_snapshot_age(resolved_store: Path) -> dict:
+def _check_fleet_snapshot_age(resolved_store: Path,
+                              now_epoch: float | None = None) -> dict:
     state, meta = _fleet_snapshot_state(resolved_store)
     if state == "absent":
         return _check("fleet-snapshot-age", "skip",
@@ -5095,7 +5171,7 @@ def _check_fleet_snapshot_age(resolved_store: Path) -> dict:
         return _check("fleet-snapshot-age", "warn",
                       "snapshot.meta.json is unparseable or carries "
                       "non-numeric timestamps.")
-    now = time.time()
+    now = now_epoch if now_epoch is not None else time.time()
     details = {
         "revision": meta.get("snapshot_revision"),
         "age_s": int(now - float(meta["issued_at"])),
@@ -5169,14 +5245,18 @@ def _fleet_fde_probe_mount(snapshot_dir: Path) -> str:
             return "unknown"
         if source.startswith("/dev/mapper/") or "crypt" in source.lower():
             return "on"
-        return "off"
+        # A plain source name proves nothing either way (btrfs/LVM/loop can
+        # sit on encrypted or plain volumes) - "off" would be a spurious
+        # hard FAIL making the runbook's green gate unreachable on
+        # ordinary Linux (PRR-020).
+        return "unknown"
     except Exception:  # noqa: BLE001 - probes never crash doctor
         return "unknown"
 
 
 def _check_fleet_disk_encryption(resolved_store: Path) -> dict:
     state, _meta = _fleet_snapshot_state(resolved_store)
-    if state != "valid":
+    if state not in ("valid", "expired"):
         return _check("fleet-disk-encryption", "skip",
                       "No complete snapshot pair — the encryption "
                       "requirement applies only while a snapshot exists.")
@@ -5200,18 +5280,57 @@ def _check_fleet_disk_encryption(resolved_store: Path) -> dict:
                   "(probe unavailable or undetectable).")
 
 
-def _fleet_checks(resolved_store: Path) -> list[dict]:
-    """The seven --fleet checks (issue #291 AC2)."""
+def _fleet_checks(resolved_store: Path,
+                  now_epoch: float | None = None,
+                  store_refusal: str | None = None) -> list[dict]:
+    """The seven --fleet checks (issue #291 AC2).
+
+    ``now_epoch`` is the report's pinned clock (ZMEM_TEST_NOW, parsed to
+    epoch) so age/expiry rows agree with the report under a pinned clock;
+    ``store_refusal`` (error mode) degrades the four store-path-derived
+    checks to skip-with-reason instead of false greens against a
+    fabricated path (PRR-014).
+    """
     checks: list[dict] = []
     checks.append(_check_fleet_hub_reachable())
     hello = _fleet_hello_once()
     checks.append(_check_fleet_hello_compat(hello))
     checks.append(_check_fleet_principal(hello))
-    checks.append(_check_fleet_op_queue(resolved_store))
-    checks.append(_check_fleet_snapshot_age(resolved_store))
+    if store_refusal is not None:
+        _note = "store path configuration refused: " + store_refusal
+        checks.append(_check("fleet-op-queue", "skip",
+                             "Op-queue backlog unmeasurable - " + _note))
+        checks.append(_check("fleet-snapshot-age", "skip",
+                             "Snapshot age unmeasurable - " + _note))
+        checks.append(_check("fleet-tier0-local", "skip",
+                             "Stray-core.md check unmeasurable - " + _note))
+        checks.append(_check("fleet-disk-encryption", "skip",
+                             "Encryption state unmeasurable - " + _note))
+        return checks
+    checks.append(_check_fleet_op_queue(resolved_store,
+                                        now_epoch=now_epoch))
+    checks.append(_check_fleet_snapshot_age(resolved_store,
+                                            now_epoch=now_epoch))
     checks.append(_check_fleet_tier0_local())
     checks.append(_check_fleet_disk_encryption(resolved_store))
     return checks
+
+
+def _parse_now_epoch(now: str | None) -> float | None:
+    """The report's pinned clock as epoch seconds (None = wall time)."""
+    if not now:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def build_report(
@@ -5266,7 +5385,9 @@ def build_report(
                              resolved_store=_display_path(resolved_store)))
         checks.append(_check_local_path(resolved_store))
         if fleet:
-            checks.extend(_fleet_checks(resolved_store))
+            checks.extend(_fleet_checks(
+                resolved_store, now_epoch=_parse_now_epoch(now),
+                store_refusal=store_refusal))
         checks.append(_check(
             "store-backed-checks", "skip",
             "Store path configuration refused; every store-backed check is "
@@ -5324,7 +5445,8 @@ def build_report(
     # Issue #291 (Workstream T PR 12): the operator fleet checks under
     # --fleet (seven checks; storelib-free by construction).
     if fleet:
-        checks.extend(_fleet_checks(resolved_store))
+        checks.extend(_fleet_checks(resolved_store,
+                                    now_epoch=_parse_now_epoch(now)))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
     # Issue #63, 8.4: store-side embedding health (profile/dim/coverage).

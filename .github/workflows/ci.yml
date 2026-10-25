@@ -232,6 +232,30 @@ jobs:
           fi
           echo "t09 op-queue checks green (frozen + supp)"
 
+      # Issue #291 (Workstream T PR 12): the fleet-operator checks are
+      # module-level pytest functions with a __main__ runner (added after
+      # review found CI executed zero assertions from them), guarded like
+      # t06-t09 — a visible SKIP fails the leg.
+      - name: Fleet operator checks (skip-guarded)
+        shell: bash
+        run: |
+          set -e
+          out="$(python tests/test_t12_fleet_ops.py 2>&1)" || {
+            printf '%s\n' "$out"
+            exit 1
+          }
+          printf '%s\n' "$out"
+          out2="$(python tests/test_t12_fleet_ops_supp.py 2>&1)" || {
+            printf '%s\n' "$out2"
+            exit 1
+          }
+          printf '%s\n' "$out2"
+          if printf '%s\n' "$out" | grep -Eq '^SKIP:' || printf '%s\n' "$out2" | grep -Eq '^SKIP:'; then
+            echo "::error::t12 fleet operator checks skipped - the mcp dependency must be installed and exercised on every matrix leg (issues #159/#291)"
+            exit 1
+          fi
+          echo "t12 fleet operator checks green (frozen + supp)"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:

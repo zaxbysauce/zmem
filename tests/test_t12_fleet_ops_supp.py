@@ -27,6 +27,20 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class _SuppSkip(Exception):
+    """Plain-python skip signal for the __main__ runner (pytest.skip when
+    running under pytest)."""
+
+
+def _skip_or_raise(message: str) -> None:
+    """Skip under pytest, SKIP: under the plain-python CI runner."""
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        import pytest  # noqa: PLC0415
+        pytest.skip(message)
+    raise _SuppSkip(message)
+
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS_DIR / "store.py"
 DOCTOR_PY = SCRIPTS_DIR / "doctor.py"
@@ -257,6 +271,7 @@ fake_transport.McpHttp = _Http
 fake_transport.DeadlineExecutor = lambda: None
 fake_transport.CLIENT_PROTOCOL_MAJOR = 1
 fake_transport.REASON_HUB_UNREACHABLE = 'hub-unreachable'
+fake_transport.REASON_EMPTY_POOL = 'empty-pool'
 fake.transport = fake_transport
 sys.modules['fleet'] = fake
 sys.modules['fleet.transport'] = fake_transport
@@ -408,8 +423,7 @@ def test_principal_map_parity_corpus():
         result = _py(code, env)
         out = result.stdout
         if "AUTH-IMPORT-FAILED" in out:
-            import pytest
-            pytest.skip(f"server auth import unavailable (mcp dep?): {out}")
+            _skip_or_raise(f"server auth import unavailable (mcp dep?): {out}")
         assert "FIELDS-EQ True" in out, out
         assert "MAXP-EQ True" in out, out
         assert "NS-EQ True True True" in out, out
@@ -520,44 +534,7 @@ def test_principal_map_parity_corpus():
         "hub-legal entries must report no problems")
     assert _mod._MAX_PRINCIPALS == 256, (
         "the issuer cap must mirror the hub's 256, not diverge")
-    # Round-3: namespace SHAPE (auth exits 2 on an unscoped namespace).
-    assert any("not a valid scoped namespace" in p for p in problems_for(
-        {"t1": {"principal": "p", "host": "h", "harness": "x",
-                "namespaces": ["banana"]}}))
-    # Round-4: issuer field-set alignment + token-key rules.
-    import importlib.util as _ilu
-    _spec = _ilu.spec_from_file_location(
-        "issue_principal_mod", str(ISSUE_PRINCIPAL_PY))
-    _mod = _ilu.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    assert _mod._ALLOWED_FIELDS == frozenset(
-        {"principal", "host", "harness", "namespaces", "capabilities",
-         "revoked"}), _mod._ALLOWED_FIELDS
-    assert _mod._validate_entry(
-        {"principal": "p", "host": "h", "harness": "x", "comment": "c"}), (
-        "issuer must refuse the hub-unknown 'comment' field")
-    # Final-critic round 1: the LIMIT axes (the hub exits 2 on all three).
-    assert any("exceeds the maximum of 128" in p for p in problems_for(
-        {"t1": {"principal": "p", "host": "h", "harness": "x",
-                "namespaces": ["project:n%d" % i for i in range(129)]}}))
-    assert any("exceeds 256 UTF-8 bytes" in p for p in problems_for(
-        {"t1": {"principal": "p", "host": "h", "harness": "x",
-                "namespaces": ["project:" + "a" * 250]}}))
-    assert any("per-entry aggregate" in p for p in problems_for(
-        {"t1": {"principal": "p", "host": "h", "harness": "x",
-                "namespaces": ["project:" + "b" * 241
-                               for _ in range(34)]}}))
-    # Per-entry (not map-global) budget: five hub-legal entries are legal.
-    big_but_legal = {
-        "tok-%048d" % i: {
-            "principal": "p%d" % i, "host": "h", "harness": "x",
-            "namespaces": ["project:" + "c" * 241 for _ in range(32)]}
-        for i in range(5)}
-    assert problems_for(big_but_legal) == [], (
-        "the aggregate budget is PER-ENTRY (hub scope); a map of several "
-        "hub-legal entries must report no problems")
-    assert _mod._MAX_PRINCIPALS == 256, (
-        "the issuer cap must mirror the hub's 256, not diverge")
+
     # Issuer limit parity on the same three axes.
     assert _mod._validate_entry({
         "principal": "p", "host": "h", "harness": "x",
@@ -643,8 +620,7 @@ def test_issuer_and_doctor_match_server_auth_grammar():
         result = _py(code, env, timeout=120)
         out = result.stdout
         if "AUTH-IMPORT-FAILED" in out:
-            import pytest
-            pytest.skip(f"server auth import unavailable (mcp dep?): {out}")
+            _skip_or_raise(f"server auth import unavailable (mcp dep?): {out}")
         assert "IDRE True" in out, out
         assert "CAPS True" in out, out
         assert "LIM True True True" in out, out
@@ -738,17 +714,18 @@ def test_issue_principal_duplicate_and_off_tailnet_preset():
         tmp = Path(td)
         map_path = tmp / "map.json"
         first = _run_issue(
-            map_path, "--principal", "b1", "--host", "h", "--harness", "x")
+            map_path, "--principal", "b1", "--host", "h", "--harness", "x", "--namespaces", "project:ok")
         assert first.returncode == 0, first.stderr
         dup = _run_issue(
-            map_path, "--principal", "b1", "--host", "h", "--harness", "x")
+            map_path, "--principal", "b1", "--host", "h", "--harness", "x", "--namespaces", "project:ok")
         assert dup.returncode == 2, (
             f"duplicate principal id must be refused: {dup.stdout!r}")
         assert not any(ln.strip() for ln in dup.stdout.splitlines() if
                        ln.strip()), "no token on refusal"
         preset = _run_issue(
             map_path, "--principal", "runner-1", "--host", "cloud",
-            "--harness", "gha", "--preset", "off-tailnet")
+            "--harness", "gha", "--namespaces", "project:runner",
+            "--preset", "off-tailnet")
         assert preset.returncode == 0, preset.stderr
         data = json.loads(map_path.read_text(encoding="utf-8"))
         caps = [v["capabilities"] for v in data.values()
@@ -763,7 +740,7 @@ def test_issue_principal_contention_exits_3_without_output():
         lock = map_path.with_name(map_path.name + ".issue.lock")
         lock.write_text("999999:held-by-test", encoding="utf-8")
         result = _run_issue(
-            map_path, "--principal", "b", "--host", "h", "--harness", "x")
+            map_path, "--principal", "b", "--host", "h", "--harness", "x", "--namespaces", "project:ok")
         assert result.returncode == 3, (
             f"a live lock must refuse with exit 3: rc={result.returncode} "
             f"stdout={result.stdout!r}")
@@ -782,7 +759,7 @@ def test_issue_principal_degraded_lock_refuses():
             "real = host.acquire_lock\n"
             "host.acquire_lock = lambda path, stale: host._NO_LOCK_TOKEN\n"
             "sys.argv = ['issue-principal.py', '--map', r'{mp}', "
-            "'--principal', 'b', '--host', 'h', '--harness', 'x']\n"
+            "'--principal', 'b', '--host', 'h', '--harness', 'x', '--namespaces', 'project:x']\n"
             "import importlib.util\n"
             "spec = importlib.util.spec_from_file_location("
             "'issue_principal', r'{ip}')\n"
@@ -806,7 +783,8 @@ def test_issue_principal_concurrent_distinct_ids():
         cmd = lambda pid: (  # noqa: E731
             [PYTHON, "-X", "utf8", str(ISSUE_PRINCIPAL_PY),
              "--map", str(map_path), "--principal", pid,
-             "--host", "h", "--harness", "x"])
+             "--host", "h", "--harness", "x",
+             "--namespaces", "project:" + pid])
         procs = [subprocess.Popen(cmd(p), cwd=str(REPO_ROOT), env=env,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
@@ -859,13 +837,15 @@ def test_installer_statics():
         # The syntax check needs a WORKING bash — on some Windows boxes the
         # PATH `bash` is a broken WSL relay (the CI ubuntu leg always runs
         # this; a skip here is honest, not a hole).
-        probe = subprocess.run(
-            ["bash", "-c", "echo ok"], capture_output=True, text=True,
-            timeout=30)
+        try:
+            probe = subprocess.run(
+                ["bash", "-c", "echo ok"], capture_output=True, text=True,
+                timeout=30)
+        except FileNotFoundError:
+            _skip_or_raise("no bash on PATH at all")
         if probe.returncode != 0:
-            import pytest
-            pytest.skip(f"no working bash on PATH (WSL relay broken): "
-                        f"{probe.stderr[:120]!r}")
+            _skip_or_raise(f"no working bash on PATH (WSL relay broken): "
+                           f"{probe.stderr[:120]!r}")
         result = subprocess.run(
             ["bash", "-n", str(REPO_ROOT / "scripts" / "fleet" / sh)],
             capture_output=True, text=True, timeout=30)
@@ -882,6 +862,22 @@ def test_fleet_skip_warn_matrix_and_numeric_ages():
 
     sys.path.insert(0, str(SCRIPTS_DIR))
     import doctor
+
+    # Save and restore every ambient var this test touches (review round:
+    # the pops were permanent, erasing the operator's own fleet config for
+    # the rest of the session).
+    _saved = {k: os.environ.get(k) for k in
+              ("ZMEM_REMOTE_URL", "ZMEM_MCP_URL", "ZMEM_FLEET_FDE_PROBE")}
+
+    def _restore_env():
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    stack = __import__("contextlib").ExitStack()
+    stack.callback(_restore_env)
 
     with tempfile.TemporaryDirectory(prefix="zmem-t12s-matrix-") as td:
         tmp = Path(td)
@@ -963,6 +959,7 @@ def test_fleet_skip_warn_matrix_and_numeric_ages():
         assert d["retired"] == 1, d
         assert d["oldest_age_s"] >= 1200, d
         assert d["malformed_timestamps"] == 2, d
+        stack.close()
 
 
 def test_issue_principal_append_gate_pinned():
@@ -989,12 +986,12 @@ def test_issue_principal_append_gate_pinned():
             # the ACL check a hand-written temp file would trip first).
             seeded = _run_issue(
                 map_path, "--principal", "seedp", "--host", "h",
-                "--harness", "x")
+                "--harness", "x", "--namespaces", "project:seed")
             assert seeded.returncode == 0, seeded.stderr
             map_path.write_text(json.dumps(seed), encoding="utf-8")
             result = _run_issue(
                 map_path, "--principal", "newp", "--host", "h",
-                "--harness", "x")
+                "--harness", "x", "--namespaces", "project:newp")
             assert result.returncode == 2, (name, result.stdout, result.stderr)
             assert not any(ln.strip() for ln in result.stdout.splitlines()), (
                 name, result.stdout)
@@ -1005,17 +1002,13 @@ def test_issue_principal_append_gate_pinned():
         # and is correctly refused) still accepts a second append.
         ok_map = tmp / "ok.json"
         first = _run_issue(
-            ok_map, "--principal", "ok1", "--host", "h", "--harness", "x")
+            ok_map, "--principal", "ok1", "--host", "h", "--harness", "x", "--namespaces", "project:ok")
         assert first.returncode == 0, first.stderr
         result = _run_issue(
-            ok_map, "--principal", "newp", "--host", "h", "--harness", "x")
+            ok_map, "--principal", "newp", "--host", "h", "--harness", "x", "--namespaces", "project:ok")
         assert result.returncode == 0, result.stderr
         data = json.loads(ok_map.read_text(encoding="utf-8"))
         assert any(v.get("principal") == "newp" for v in data.values())
-
-def _unused_removed():
-    pass
-
 
 def test_limit_parity_bound_to_hub_constants():
     """Final-critic round 2 item 2: issuer limit literals == auth constants
@@ -1053,8 +1046,7 @@ def test_limit_parity_bound_to_hub_constants():
         result = _py(code, T12._base_env(Path(td) / "home"))
         out = result.stdout
         if "LIM" not in out:
-            import pytest
-            pytest.skip(f"server auth unavailable: {out[:160]!r}")
+            _skip_or_raise(f"server auth unavailable: {out[:160]!r}")
         lim = [ln for ln in out.splitlines() if ln.startswith("LIM ")]
         assert lim and lim[0].split() == ["LIM", "128", "256", "8192"], out
         hub = [ln.split() for ln in out.splitlines()
@@ -1071,3 +1063,100 @@ def test_limit_parity_bound_to_hub_constants():
         assert mod._validate_entry({
             "principal": "p", "host": "h", "harness": "x",
             "namespaces": ["project:" + "b" * 241 for _ in range(34)]})
+
+
+def test_limit_accept_boundaries_pinned():
+    """Review round: only the REJECT side of the limit axes was pinned —
+    pin the ACCEPT side too (exactly-at-limit maps are hub-legal), for
+    doctor, the issuer, AND the hub parser (when importable)."""
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    try:
+        import doctor
+    finally:
+        sys.path.remove(str(SCRIPTS_DIR))
+
+    exact_ns = {"t1": {"principal": "p", "host": "h", "harness": "x",
+                       "namespaces": ["project:n%d" % i
+                                      for i in range(128)]}}
+    exact_bytes = {"t1": {"principal": "p", "host": "h", "harness": "x",
+                          "namespaces": ["project:" + "a" * 248]}}
+    assert doctor._fleet_principal_map_problems(
+        json.dumps(exact_ns))[0] == []
+    assert doctor._fleet_principal_map_problems(
+        json.dumps(exact_bytes))[0] == []
+    agg = ["project:" + "b" * 241 for _ in range(32)]
+    agg.append("project:" + "b" * (8192 - 32 * 249 - len("project:")))
+    exact_agg = {"t1": {"principal": "p", "host": "h", "harness": "x",
+                        "namespaces": agg}}
+    assert doctor._fleet_principal_map_problems(
+        json.dumps(exact_agg))[0] == [], "exactly-8192 must be accepted"
+    many_exact = {"tok-%032d" % i: {"principal": "p%d" % i, "host": "h",
+                                    "harness": "x"} for i in range(256)}
+    assert doctor._fleet_principal_map_problems(
+        json.dumps(many_exact))[0] == [], "exactly-256 must be accepted"
+
+    import importlib.util as ilu
+    spec = ilu.spec_from_file_location("ipm_acc", str(ISSUE_PRINCIPAL_PY))
+    mod = ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod._validate_entry(exact_ns["t1"]) == []
+    assert mod._validate_entry(exact_bytes["t1"]) == []
+    assert mod._validate_entry(exact_agg["t1"]) == []
+
+    # Hub accept leg (when the server parser is importable).
+    with tempfile.TemporaryDirectory(prefix="zmem-t12s-acc-") as td:
+        code = (
+            "import sys, json\n"
+            "sys.path.insert(0, {a!r})\n"
+            "import auth as A\n"
+            "agg = ['project:' + 'b' * 241 for _ in range(32)]\n"
+            "agg.append('project:' + 'b' * (8192 - 32 * 249 - 8))\n"
+            "maps = [\n"
+            "    {{'k1': {{'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': ['project:n%d' % i "
+            "for i in range(128)]}}}},\n"
+            "    {{'k2': {{'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': ['project:' + 'a' * 248]}}}},\n"
+            "    {{'k3': {{'principal': 'p', 'host': 'h', 'harness': 'x',\n"
+            "        'namespaces': agg}}}},\n"
+            "]\n"
+            "for m in maps:\n"
+            "    try:\n"
+            "        A._parse_principal_map(json.dumps(m), 'probe')\n"
+            "        print('HUB-ACCEPT', True)\n"
+            "    except SystemExit:\n"
+            "        print('HUB-ACCEPT', False)\n"
+        ).format(a=str(HERMES_SERVER_DIR))
+        result = _py(code, T12._base_env(Path(td) / "home"))
+        if "HUB-ACCEPT" not in result.stdout:
+            _skip_or_raise(f"server auth unavailable: "
+                           f"{result.stdout[:160]!r}")
+        rows = [ln.split()[-1] for ln in
+                result.stdout.splitlines() if ln.startswith("HUB-ACCEPT")]
+        assert rows == ["True", "True", "True"], result.stdout
+
+
+def _main() -> int:
+    skipped = []
+    failures = []
+    checks = [v for k, v in sorted(globals().items())
+              if k.startswith("test_") and callable(v)]
+    for check in checks:
+        try:
+            check()
+            print(f"PASS {check.__name__}")
+        except _SuppSkip as exc:
+            skipped.append(check.__name__)
+            print(f"SKIP: {check.__name__} - {exc}")
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            failures.append((check.__name__, str(exc)))
+            print(f"FAIL {check.__name__}: {exc}")
+    if failures:
+        print(f"{len(failures)} check(s) failed")
+        return 1
+    print(f"all checks passed ({len(skipped)} skipped)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

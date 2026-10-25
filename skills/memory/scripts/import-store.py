@@ -88,6 +88,19 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Issue #291 (review PRR-010): preflight the store-path configuration BEFORE
+# importing storelib (which resolves the store at import time) so a refused
+# configuration exits 2 with a message naming ZMEM_STORE instead of an
+# import-time traceback.
+import host as _host_preflight  # noqa: E402
+
+try:
+    _host_preflight.resolve_store_path()
+except _host_preflight.StoreConfigError as _exc:
+    print(f"[zmem] {_exc}", file=sys.stderr)
+    raise SystemExit(2)
+
 try:
     import host as _host
 except ImportError:

@@ -624,7 +624,7 @@ def _serve_offline_read(env: dict[str, str], *, query: str,
             if not isinstance(exc, _host.StoreConfigError):
                 raise
         except ImportError:
-            raise
+            raise exc
         return None, "none"
     if conn is None:
         return None, "none"

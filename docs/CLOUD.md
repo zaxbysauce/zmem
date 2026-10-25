@@ -1137,9 +1137,14 @@ content.
 
 The tier system above is the fallback for boxes that cannot join the
 tailnet. A runner that CAN join (GitHub Actions with Tailscale, cloud
-sessions) gets a least-privilege fleet principal instead: ephemeral
-tagged auth keys join the tailnet, and `scripts/fleet/issue-principal.py
---preset off-tailnet` issues a `read,passive`-capability principal — the
-hub map stays on the hub, the runner carries only its own token file
-(`scripts/fleet/install-broker.sh`). See
+sessions) gets a scoped fleet principal instead: ephemeral tagged auth
+keys join the tailnet, and `python scripts/fleet/issue-principal.py --map
+<principal-map.json> --principal <id> --host <runner> --harness gha
+--namespaces <ns> --preset off-tailnet` issues a `read,passive`
+capabilities entry scoped to `--namespaces` (an entry without namespaces
+is UNSCOPED hub-side = every namespace allowed; the issuer refuses it
+unless `--allow-unscoped` is passed). Capabilities gate op-queue MUTATIONS
+only — `add`/capture are never capability-gated — so the namespace scope
+is the real restriction. The hub map stays on the hub; the runner carries
+only its own token file (`scripts/fleet/install-broker.sh`). See
 [docs/FLEET.md](FLEET.md) for the full fleet contract.

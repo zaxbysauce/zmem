@@ -691,7 +691,13 @@ def handle_event(event: str, payload: Mapping[str, Any],
             if not isinstance(exc, _host.StoreConfigError):
                 raise
         except ImportError:
-            raise
+            raise exc
+        # The broker log lives under the refused data dir, so _log_record
+        # cannot persist this diagnostic (its own resolver raises the same
+        # error inside a blanket except) - stderr is the only reachable
+        # channel (review PRR-009: a silent no-op hides a broken config).
+        print(f"[zmem] broker: store path configuration refused; serving "
+              f"an empty envelope: {exc}", file=sys.stderr)
         return _fail_open(event, "store-config-refused", str(exc), started)
 
 

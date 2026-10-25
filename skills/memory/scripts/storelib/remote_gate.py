@@ -145,7 +145,21 @@ def _offline_read(cmd: str, args: Any):
     """
     from fleet import snapshot as fleet_snapshot  # noqa: PLC0415
     env = dict(os.environ)
-    label = fleet_snapshot.offline_label(env)
+    try:
+        label = fleet_snapshot.offline_label(env)
+    except ValueError as exc:
+        # Issue #291 (review PRR-024): offline_label -> _load -> the
+        # data-dir resolver, which raises StoreConfigError on a refused
+        # configuration BEFORE the guarded _serve_* calls below - the CLI
+        # offline lane must keep its hub-unreachable contract, never an
+        # import traceback.
+        try:
+            import host as _host  # noqa: PLC0415
+            if not isinstance(exc, _host.StoreConfigError):
+                raise
+        except ImportError:
+            raise exc
+        return None
     if label is None:
         return None
     payload = None
