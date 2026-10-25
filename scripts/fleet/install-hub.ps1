@@ -2,8 +2,9 @@
 #
 # Contract (Workstream T PR 12, AC3):
 #   * the hub runs as a scheduled task bound to 127.0.0.1 ONLY (never a
-#     wildcard bind), started at boot under the SYSTEM account so the
-#     AtStartup trigger actually fires without an interactive logon;
+#     wildcard bind), started at boot as the MAP OWNER via S4U logon (no
+#     password, fires without an interactive logon, and the identity can
+#     READ the issuer-hardened principal map);
 #   * the task action is a generated wrapper that sets the hub env
 #     (principal map + data dir) before launching python - the raw task
 #     action cannot carry environment variables;
@@ -67,7 +68,7 @@ set "ZMEM_DATA=$DataDir"
 "$pythonExe" -X utf8 "$serverPy" --host 127.0.0.1 --port $Port
 "@ | Set-Content -Path $wrapper -Encoding ASCII
 
-# --- the service: startup scheduled task under SYSTEM ------------------------
+# --- the service: startup scheduled task as the map owner (S4U) --------------
 $action = New-ScheduledTaskAction -Execute "$wrapper"
 $trigger = New-ScheduledTaskTrigger -AtStartup
 # Run the task as the INVOKING USER (the map owner) with S4U logon: no

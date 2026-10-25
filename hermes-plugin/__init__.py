@@ -524,9 +524,17 @@ def _offline_snapshot_envelope(query: str, namespace: str,
 
 
 class _FallbackRequested(Exception):
-    """Internal: a resolvable host raised a NON-config error, so the
-    documented legacy fallback applies (a StoreConfigError never lands
-    here - it re-raises)."""
+    """Internal: a resolvable host raised a NON-config error. Wrapped so it
+    escapes the blanket handler and PROPAGATES to the caller - the legacy
+    fallback applies only when host.py itself is unresolvable."""
+
+
+class _ConfigRefusal(Exception):
+    """Internal: the host resolver REFUSED the configuration (a directory
+    variable naming an existing file). Wrapped so it escapes the blanket
+    handler and PROPAGATES fail-loud - never redirected to the legacy
+    fallback (review PRR-010 / round-2 falsifier: a bare re-raise inside
+    the inner except was re-caught by the outer blanket handler)."""
 
 
 def _fallback_store_path() -> Path:
@@ -574,9 +582,14 @@ def _resolve_store_data_dir() -> Path:
             # loads host.py under a PRIVATE module name ("zmem_host"), so
             # `import host` here would see a DIFFERENT class object and
             # isinstance would be False (regression probe, review round 2).
+            # The refusal is re-wrapped in _ConfigRefusal because a bare
+            # re-raise from this inner except would be re-caught by the
+            # OUTER blanket handler below (review round 2 falsifier).
             if isinstance(exc, getattr(host_mod, "StoreConfigError", ())):
-                raise
+                raise _ConfigRefusal(str(exc)) from exc
             raise _FallbackRequested(exc) from exc
+    except _ConfigRefusal:
+        raise
     except _FallbackRequested:
         raise
     except Exception:
@@ -596,8 +609,10 @@ def _resolve_core_md() -> Path:
             return host_mod.resolve_core_md_path()
         except Exception as exc:
             if isinstance(exc, getattr(host_mod, "StoreConfigError", ())):
-                raise
+                raise _ConfigRefusal(str(exc)) from exc
             raise _FallbackRequested(exc) from exc
+    except _ConfigRefusal:
+        raise
     except _FallbackRequested:
         raise
     except Exception:
