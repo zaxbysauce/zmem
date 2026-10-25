@@ -70,17 +70,21 @@ set "ZMEM_DATA=$DataDir"
 # --- the service: startup scheduled task under SYSTEM ------------------------
 $action = New-ScheduledTaskAction -Execute "$wrapper"
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount
+# Run the task as the INVOKING USER (the map owner) with S4U logon: no
+# password prompt, fires without an interactive logon, and the identity
+# can READ the issuer-hardened principal map (issue-principal strips
+# inheritance and grants only the issuer - a SYSTEM principal could not
+# read it and the hub would exit 2 at startup; review round 2).
+$owner = (Get-Acl $TokensFile).Owner
+$principal = New-ScheduledTaskPrincipal -UserId $owner -LogonType S4U
 $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 5
 $state = (Get-ScheduledTask -TaskName $TaskName).State
-if ($state -eq "Running") {
-    Write-Host "Hub task state: Running."
-} else {
-    Write-Warning "Hub task state: $state (expected Running) - check the task history / Event Log before relying on it."
+if ($state -ne "Running") {
+    Write-Error "REFUSED: hub task state is '$state' (expected Running) - not configuring tailscale serve against a hub that is not up (fix the task/event-log first)"
 }
 
 # --- tailscale serve: tailnet HTTPS -> localhost ONLY -----------------------

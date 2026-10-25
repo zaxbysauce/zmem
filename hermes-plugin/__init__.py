@@ -523,6 +523,12 @@ def _offline_snapshot_envelope(query: str, namespace: str,
                 pass
 
 
+class _FallbackRequested(Exception):
+    """Internal: a resolvable host raised a NON-config error, so the
+    documented legacy fallback applies (a StoreConfigError never lands
+    here - it re-raises)."""
+
+
 def _fallback_store_path() -> Path:
     """Match storelib.schema's inline path chain when host.py is unavailable."""
     explicit = os.environ.get("ZMEM_STORE")
@@ -555,35 +561,46 @@ def _resolve_store_data_dir() -> Path:
     boxes where ``ZMEM_STORE`` / plugin-data env vars are set.
     """
     try:
-        return _host().resolve_store_path().parent
-    except Exception as exc:
-        import host as _host_mod  # noqa: PLC0415
-        if isinstance(exc, _host_mod.StoreConfigError):
+        host_mod = _host()
+        try:
+            return host_mod.resolve_store_path().parent
+        except Exception as exc:
             # Issue #291 (review PRR-010): a REFUSED configuration (a
             # directory variable naming an existing file) must fail loud -
             # the legacy fallback would silently relocate the provider's
             # store/core.md/decision log to an unrelated path, exactly the
-            # redirect this PR refuses everywhere else.
-            raise
-        # host.py absent/broken, or a module-name collision in sys.modules.
-        # Fall back to storelib.schema's dependency-free legacy chain so the
-        # provider degrades without pointing telemetry at a different store.
+            # redirect this PR refuses everywhere else. Compare against the
+            # class object of the module instance that raised: _host()
+            # loads host.py under a PRIVATE module name ("zmem_host"), so
+            # `import host` here would see a DIFFERENT class object and
+            # isinstance would be False (regression probe, review round 2).
+            if isinstance(exc, getattr(host_mod, "StoreConfigError", ())):
+                raise
+            raise _FallbackRequested(exc) from exc
+    except _FallbackRequested:
+        raise
+    except Exception:
         # host.py absent/broken, or a module-name collision in sys.modules.
         # Fall back to storelib.schema's dependency-free legacy chain so the
         # provider degrades without pointing telemetry at a different store.
         fallback = _fallback_store_path()
-        logger.warning("zmem: host.py resolution failed (%s); falling back to %s", exc, fallback)
+        logger.warning("zmem: host.py resolution failed; falling back to %s", fallback)
         return fallback.parent
 
 
 def _resolve_core_md() -> Path:
     """Resolve core.md via host.py (honors ZMEM_CORE_MD + store-path parent)."""
     try:
-        return _host().resolve_core_md_path()
-    except Exception as exc:
-        import host as _host_mod  # noqa: PLC0415
-        if isinstance(exc, _host_mod.StoreConfigError):
-            raise
+        host_mod = _host()
+        try:
+            return host_mod.resolve_core_md_path()
+        except Exception as exc:
+            if isinstance(exc, getattr(host_mod, "StoreConfigError", ())):
+                raise
+            raise _FallbackRequested(exc) from exc
+    except _FallbackRequested:
+        raise
+    except Exception:
         return _resolve_store_data_dir() / _CORE_MD_REL
 
 
