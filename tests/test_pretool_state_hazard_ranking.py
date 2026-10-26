@@ -217,6 +217,16 @@ def _clean_env(tmp: str, **extra: str) -> dict:
         "ZMEM_DATA": tmp,
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
         "PYTHONUTF8": "1",
+        # Hermeticity (CHECK_WRONG amend): cap git's upward repo search at
+        # the scratch root.  The fallback-probe leg (nonexistent event cwd)
+        # must find NO repository from a neutral scratch dir so the probe
+        # records state=unavailable deterministically -- without this pin
+        # the outcome depends on whether TMP itself sits inside a git
+        # working tree (the C4 suite loop redirects TMP into the repo; a
+        # real harness can likewise run hooks with TMP under the project).
+        # Repos the tests construct INSIDE the scratch stay visible: the
+        # ceiling only stops the walk above tmp itself.
+        "GIT_CEILING_DIRECTORIES": tmp,
     })
     env.update(extra)
     return env
