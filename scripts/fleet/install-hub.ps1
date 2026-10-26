@@ -50,7 +50,7 @@ $broad = (Get-Acl $TokensFile).Access |
         $wellKnownSids -contains $sid
     }
 if ($broad) {
-    Write-Error "REFUSED: $TokensFile grants a broad allow ACE (Everyone/Users/Authenticated Users, matched by SID). Restrict it to the hub service account first."
+    Write-Error "REFUSED: $TokensFile grants a broad allow ACE (Everyone / Users / Authenticated Users - matched by SID). Restrict it to the hub service account first."
 }
 
 # --- data dir + wrapper script (the task action cannot carry env) -----------

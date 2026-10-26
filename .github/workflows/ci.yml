@@ -234,8 +234,12 @@ jobs:
 
       # Issue #291 (Workstream T PR 12): the fleet-operator checks are
       # module-level pytest functions with a __main__ runner (added after
-      # review found CI executed zero assertions from them), guarded like
-      # t06-t09 — a visible SKIP fails the leg.
+      # review found CI executed zero assertions from them). The guard pins
+      # the transport-exercising tests to a PASS verdict — the #159/#291
+      # rule "the mcp dependency must be exercised on every matrix leg".
+      # A blanket any-SKIP-scan would false-fire on the sanctioned
+      # environment skip (the installer-statics bash probe skips on Windows
+      # runners where `bash` resolves to the non-functional WSL stub).
       - name: Fleet operator checks (skip-guarded)
         shell: bash
         run: |
@@ -250,10 +254,15 @@ jobs:
             exit 1
           }
           printf '%s\n' "$out2"
-          if printf '%s\n' "$out" | grep -Eq '^SKIP:' || printf '%s\n' "$out2" | grep -Eq '^SKIP:'; then
-            echo "::error::t12 fleet operator checks skipped - the mcp dependency must be installed and exercised on every matrix leg (issues #159/#291)"
-            exit 1
-          fi
+          for t in test_doctor_fleet_checks_present \
+                   test_hello_real_transport_401_is_a_failure \
+                   test_broker_credential_file_resolves_through_transport \
+                   test_hermes_store_config_refusal_propagates; do
+            if ! printf '%s\n%s\n' "$out" "$out2" | grep -q "^PASS $t\$"; then
+              echo "::error::t12 fleet operator checks: '$t' did not PASS - the mcp dependency must be exercised on every matrix leg (issues #159/#291)"
+              exit 1
+            fi
+          done
           echo "t12 fleet operator checks green (frozen + supp)"
 
       - name: Set up Node
