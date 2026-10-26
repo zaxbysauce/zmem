@@ -266,6 +266,11 @@ class SessionEndCloseoutNudgeTest(unittest.TestCase):
         # must attribute the session write exactly like invalidate (the
         # empty session_ref falls back to the ZMEM_SESSION knob).
         seeded = self._seeded_row_id()
+        # The seed add itself stamps the marker (the add dispatch at
+        # cli.py writes it on success), so the leg must CLEAR it first —
+        # otherwise the assert below holds even with the supersede stamp
+        # deleted (reviewer round 3's no-op control proved the vacuity).
+        _marker(self._tmp, self._sid, ".wrote").unlink(missing_ok=True)
         r = subprocess.run(
             [sys.executable, "-X", "utf8", str(STORE_PY), "supersede",
              "--id", seeded, "--reason", "closeout supersede producer probe"],
