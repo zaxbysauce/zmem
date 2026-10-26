@@ -716,7 +716,7 @@ synthesis, or closeout review.
 
 #### Pre-tool repository-state predicate — issue #397
 
-Since 0.123.0 the pretool lane carries a bounded, fail-open
+Since 0.124.0 the pretool lane carries a bounded, fail-open
 repository-state predicate. When the tool-input material names a
 restore/destructive verb (checkout, restore, reset, stash, clean, rebase,
 merge, push, cherry-pick, revert, filter-branch), the hook body runs
