@@ -341,9 +341,17 @@ def test_scoped_ops_tokens_admit_only_allowed_namespaces():
     marker = f"t04-ac3-{uuid.uuid4().hex}"
     with _pinned_scratch("ac3") as tmp:
         _run_store_ok("init")
-        _add_row("project:alpha", f"{marker} alpha current row")
-        _add_row("project:beta", f"{marker} beta allowed cross row")
-        _add_row("project:gamma", f"{marker} gamma foreign row")
+        # Issue #314 note: compose now preserves already-derived ops tokens
+        # ("stash pop") in the query, so the seeded rows name the same
+        # tokens to keep the injection relevance lanes measurable for this
+        # authz fixture (a bare one-token query dilutes below the pretool
+        # floor once the tail rides).
+        _add_row("project:alpha",
+                 f"{marker} alpha current row stash pop restore probe")
+        _add_row("project:beta",
+                 f"{marker} beta allowed cross row stash pop restore probe")
+        _add_row("project:gamma",
+                 f"{marker} gamma foreign row stash pop restore probe")
         server = _scoped_server(tmp, ["project:alpha", "project:beta"])
         result = _call_prefetch(
             server, query=marker, namespace="project:alpha",
@@ -383,9 +391,13 @@ def test_issue236_foreign_rows_never_admitted():
     marker = f"t04-ac4-{uuid.uuid4().hex}"
     with _pinned_scratch("ac4") as tmp:
         _run_store_ok("init")
+        # Issue #314 note: same fixture adjustment as AC3 — the rows name
+        # the composed ops tail so the relevance lanes stay measurable.
         own_id = _add_row(
-            "project:allowed", f"{marker} own project row")
-        _add_row("project:foreign", f"{marker} foreign secret row")
+            "project:allowed",
+            f"{marker} own project row stash pop restore probe")
+        _add_row("project:foreign",
+                 f"{marker} foreign secret row stash pop restore probe")
         server = _scoped_server(tmp, ["project:allowed", "user:global"])
         result = _call_prefetch(
             server, query=marker, namespace="project:allowed",
