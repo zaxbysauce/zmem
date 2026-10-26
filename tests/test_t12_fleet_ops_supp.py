@@ -1136,31 +1136,6 @@ def test_limit_accept_boundaries_pinned():
         assert rows == ["True", "True", "True"], result.stdout
 
 
-def _main() -> int:
-    skipped = []
-    failures = []
-    checks = [v for k, v in sorted(globals().items())
-              if k.startswith("test_") and callable(v)]
-    for check in checks:
-        try:
-            check()
-            print(f"PASS {check.__name__}")
-        except _SuppSkip as exc:
-            skipped.append(check.__name__)
-            print(f"SKIP: {check.__name__} - {exc}")
-        except Exception as exc:  # noqa: BLE001 - report and continue
-            failures.append((check.__name__, str(exc)))
-            print(f"FAIL {check.__name__}: {exc}")
-    if failures:
-        print(f"{len(failures)} check(s) failed")
-        return 1
-    print(f"all checks passed ({len(skipped)} skipped)")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(_main())
-
 
 def test_hermes_store_config_refusal_propagates():
     """Review-required pin (PRR-010): the hermes provider's data-dir and
@@ -1233,3 +1208,29 @@ def test_hermes_store_config_refusal_propagates():
         warnings = [ln for ln in out.splitlines()
                     if ln.startswith("WARNINGS")]
         assert warnings and "falling back" not in warnings[0], out
+
+
+def _main() -> int:
+    skipped = []
+    failures = []
+    checks = [v for k, v in sorted(globals().items())
+              if k.startswith("test_") and callable(v)]
+    for check in checks:
+        try:
+            check()
+            print(f"PASS {check.__name__}")
+        except _SuppSkip as exc:
+            skipped.append(check.__name__)
+            print(f"SKIP: {check.__name__} - {exc}")
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            failures.append((check.__name__, str(exc)))
+            print(f"FAIL {check.__name__}: {exc}")
+    if failures:
+        print(f"{len(failures)} check(s) failed")
+        return 1
+    print(f"all checks passed ({len(skipped)} skipped)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

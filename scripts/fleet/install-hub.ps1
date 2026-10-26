@@ -71,7 +71,8 @@ set "ZMEM_DATA=$DataDir"
 # --- the service: startup scheduled task as the map owner (S4U) --------------
 $action = New-ScheduledTaskAction -Execute "$wrapper"
 $trigger = New-ScheduledTaskTrigger -AtStartup
-# Run the task as the INVOKING USER (the map owner) with S4U logon: no
+# Run the task as the ACL OWNER of the principal map with S4U
+# logon: no
 # password prompt, fires without an interactive logon, and the identity
 # can READ the issuer-hardened principal map (issue-principal strips
 # inheritance and grants only the issuer - a SYSTEM principal could not
