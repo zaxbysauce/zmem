@@ -50,7 +50,7 @@ ROUND-2A AMENDMENTS:
   bumped, so flipping the state hint must not move it (a faulty bump
   that raises C alongside B breaks this stability pin).
 - PROBE-TIMEOUT leg: a real git repo at the event cwd with the seam
-  unset and ``ZMEM_STATE_PROBE_TIMEOUT_S=0.001`` (the operator/test knob
+  unset and ``ZMEM_STATE_PROBE_TIMEOUT_S`` (the operator/test knob
   the fix documents, seconds, default 2.0) must make the probe genuinely
   time out — exit 0, a delivered seeded row, and ``state=unavailable``
   in ``<ZMEM_DATA>/zmem-decisions.log``.
@@ -354,6 +354,24 @@ def _make_git_repo(base: Path, name: str, *, dirty: bool) -> Path:
     return repo
 
 
+def _widen_repo(repo: Path, files: int = 1200) -> None:
+    """Give the repo a STRUCTURAL work floor: ``files`` tracked files,
+    half of them uncommitted-modified, so ``git status`` must lstat and
+    hash hundreds of paths. A warm tiny repo once completed inside a
+    1 ms probe-deadline enforcement window (a replay leg flipped to
+    state=dirty); hundreds of hash units cannot finish inside a
+    sub-millisecond deadline under any cache warmth."""
+    for i in range(files):
+        (repo / ("wide-%05d.txt" % i)).write_text(
+            "wide base line %d\n" % i, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-m", "widen")
+    for i in range(0, files, 2):
+        (repo / ("wide-%05d.txt" % i)).write_text(
+            "wide DIRTY line %d\n" % i, encoding="utf-8")
+
+
 class PretoolStateHazardRankingTest(unittest.TestCase):
     """State-conditional hazard ordering through the real pretool body."""
 
@@ -628,10 +646,14 @@ class PretoolStateHazardRankingTest(unittest.TestCase):
     def test_probe_timeout_fail_open_state_unavailable(self):
         base = Path(self._tmp)
         repo = _make_git_repo(base, "repos-timeout", dirty=True)
+        # Structural slowness (600+ modified tracked files) against a
+        # 0.5 ms deadline: the timeout cannot be outrun by cache warmth
+        # the way a 1 ms deadline over a two-file repo could be.
+        _widen_repo(repo)
         neutral = base / "neutral-cwd"
         neutral.mkdir(parents=True, exist_ok=True)
         env = self._production_env()
-        env["ZMEM_STATE_PROBE_TIMEOUT_S"] = "0.001"
+        env["ZMEM_STATE_PROBE_TIMEOUT_S"] = "0.0005"
         proc = _drive_body(env, event_cwd=str(repo), proc_cwd=str(neutral))
         self.assertEqual(proc.returncode, 0,
                          "a probe timeout must fail open (exit 0), got "
@@ -643,9 +665,9 @@ class PretoolStateHazardRankingTest(unittest.TestCase):
             f"times out; ctx={ctx[:400]!r}")
         self.assertIn(
             "state=unavailable", _decision_log_text(self._tmp),
-            "ZMEM_STATE_PROBE_TIMEOUT_S=0.001 against a real repo must "
-            "genuinely time the probe out and record state=unavailable "
-            "in <ZMEM_DATA>/zmem-decisions.log")
+            "ZMEM_STATE_PROBE_TIMEOUT_S=0.0005 against a structurally "
+            "wide dirty repo must genuinely time the probe out and "
+            "record state=unavailable in <ZMEM_DATA>/zmem-decisions.log")
 
     # -- ROUND-2b tier/gate controls (round-2a shapes proven vacuous) ---
     def test_trust_gate_low_trust_row_not_rescued_by_bump(self):
