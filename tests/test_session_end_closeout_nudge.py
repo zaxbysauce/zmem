@@ -49,6 +49,7 @@ standalone: python -X utf8 tests/test_session_end_closeout_nudge.py
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -241,6 +242,62 @@ class SessionEndCloseoutNudgeTest(unittest.TestCase):
             (Path(self._tmp) / "ops" / (naive + ".wrote")).exists(),
             "the marker must key on the bare sid, not the ref string with "
             "its :detail suffix")
+
+    def _seeded_row_id(self) -> str:
+        """A real attributed add WITH --json, so the row id is parseable."""
+        env = _clean_env(self._tmp, self._sid)
+        env.pop("ZMEM_SESSION", None)
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "add",
+             "--namespace", NS, "--type", "fact",
+             "--content", "closeout producer probe row",
+             "--signal", "test", "--confidence", "0.9",
+             "--source-ref", "session:%s" % self._sid, "--json"],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        parsed = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(parsed.get("result"), "stored", parsed)
+        return str(parsed["id"])
+
+    def test_producer_supersede_success_writes_wrote_marker(self):
+        # Reviewer round 2 (R2-1): supersede is a named stamping dispatch
+        # (plan W4.1 + the 0.124.0 release note) — a successful supersede
+        # must attribute the session write exactly like invalidate (the
+        # empty session_ref falls back to the ZMEM_SESSION knob).
+        seeded = self._seeded_row_id()
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "supersede",
+             "--id", seeded, "--reason", "closeout supersede producer probe"],
+            capture_output=True, text=True,
+            env=_clean_env(self._tmp, self._sid), timeout=180,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertTrue(
+            _marker(self._tmp, self._sid, ".wrote").exists(),
+            "a successful `store.py supersede` must write the "
+            "<sha256(sid)[:32]>.wrote marker (named stamping dispatch)")
+
+    def test_producer_update_refusal_leaves_no_wrote_marker(self):
+        # The success-only stamping law holds for EVERY dispatch: an
+        # update that is REFUSED (empty --reason is a stable exit-2
+        # refusal in write.py update_memory) must leave no marker behind.
+        seeded = self._seeded_row_id()
+        _marker(self._tmp, self._sid, ".wrote").unlink(missing_ok=True)
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "update",
+             "--id", seeded, "--content", "updated closeout probe row",
+             "--reason", ""],
+            capture_output=True, text=True,
+            env=_clean_env(self._tmp, self._sid), timeout=180,
+        )
+        self.assertEqual(
+            r.returncode, 2,
+            "the refused update (empty --reason) must exit 2, got "
+            f"{r.returncode}: {r.stderr[-400:]!r}")
+        self.assertFalse(
+            _marker(self._tmp, self._sid, ".wrote").exists(),
+            "a REFUSED update must leave no .wrote marker behind")
 
     def test_refused_write_produces_no_wrote_marker(self):
         r = _store_add(self._tmp, self._sid,

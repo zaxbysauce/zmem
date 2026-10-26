@@ -5927,6 +5927,10 @@ def main():
                 # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
+            # Issue #398: supersede is a named stamping dispatch (plan W4.1)
+            # — stamp ONLY after a successful supersede, mirroring invalidate.
+            if ok:
+                _session_write_marker("")
             sys.exit(0 if ok else 1)
         elif args.cmd == "get":
             sys.exit(0 if get_memory(conn, args.id) else 1)
