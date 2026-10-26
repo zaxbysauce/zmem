@@ -1,6 +1,6 @@
 {
   "baseline_for": "scripts/eval_inject_runner.py",
-  "issue": "112+111+113+234",
+  "issue": "112+111+113+234; re-authored under issue #314 (compose no longer re-derives derived ops tokens — queries gain previously-dropped subcommand/ref tokens; precision_at_k 0.8792->0.8743 is the intended new basis, not a regression)",
   "gold": "eval/injection_gold.jsonl",
   "profile": "fake (model-absent)",
   "clock": "2026-06-01T00:00:00Z",
@@ -8,7 +8,7 @@
   "lane": "for-injection",
   "metrics": {
     "hit_at_k": 1.0,
-    "precision_at_k": 0.8792483660130719,
+    "precision_at_k": 0.8743464052287582,
     "false_injection_rate": 0.0,
     "empty_pool_rate": 0.08035714285714286,
     "mrr": 0.9901960784313726,
@@ -20,7 +20,11 @@
       "omitted": 0,
       "below-bar": 0,
       "budget-drop": 0,
-      "below-relevance": 1
+      "below-relevance": 1,
+      "already-delivered": 0,
+      "expired": 0,
+      "hub-unreachable": 0,
+      "snapshot-expired": 0
     }
   },
   "per_moment": {
@@ -29,10 +33,12 @@
       "positive_items": 65,
       "negative_items": 6,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.8658974358974358,
+      "precision_at_k": 0.8582051282051282,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.08450704225352113,
-      "mrr": 1.0
+      "mrr": 1.0,
+      "precision_delta": -0.007692307692307665,
+      "false_injection_delta": 0.0
     },
     "pretool": {
       "items": 22,
@@ -42,7 +48,9 @@
       "precision_at_k": 0.885,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.045454545454545456,
-      "mrr": 0.9166666666666666
+      "mrr": 0.9166666666666666,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     },
     "subagent": {
       "items": 17,
@@ -52,7 +60,9 @@
       "precision_at_k": 0.90625,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.058823529411764705,
-      "mrr": 0.9375
+      "mrr": 0.9375,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     },
     "precompact": {
       "items": 2,
@@ -62,7 +72,9 @@
       "precision_at_k": 1.0,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.5,
-      "mrr": 1.0
+      "mrr": 1.0,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     }
   },
   "note": "Committed HEAD baseline after the issue #234 type-diverse reseed (2026-09-27; supersedes the #113 baseline). SPLIT BASIS, disclosed: the metrics block is the WEIGHTED run of the reseeded 82-row corpus + 112-item gold (per-moment type profiles live, the same numbers the byte-pinned projection carries) and is the --compare-baseline drift basis; the per_moment block is the WEIGHTS-NEUTRAL run of the SAME corpus and gold (storelib.recall.type_preference pinned to 1.0 via scripts/eval_inject_runner.py --moment-weights-neutral) so per-moment precision_delta measures exactly the #126 profiles' contribution — pretool improves 0.885 -> 0.895 (the labeled decision row re-enters the k=5 cut under the 1.1163-vs-0.8372 multipliers), the other three moments are identical under both bases. Negative controls: false_injection_rate 0.0 on both bases. Reproduce either basis with the runner command plus/minus --moment-weights-neutral against a fresh --store."

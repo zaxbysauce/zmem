@@ -152,6 +152,10 @@ _BG_LINE_RE = re.compile(
     # Issue #183: canonical query rewrites append only rewrite=1; omission
     # remains the closed false representation and preserves every old shape.
     r"(?: rewrite=(\S+))?"
+    # Issue #397: the pretool repository-state predicate's outcome
+    # (state=dirty|clean|unavailable) rides only when a probe/seam ran —
+    # same additive rule as every field above; absent on all other lines.
+    r"(?: state=(\S+))?"
     r"\s*$"
 )
 
@@ -265,7 +269,7 @@ def parse_bg_log(path) -> list:
             (ts, status, reason, omitted, ids_raw, all_raw, _tok, ops,
              exc, sid, moment, lane, version, t_ms_raw, arms, _batch,
              _tools, _paths, margin, margin_pruned_raw, _store_timeout,
-             rewrite_raw) = m.groups()
+             rewrite_raw, _state_hint) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:

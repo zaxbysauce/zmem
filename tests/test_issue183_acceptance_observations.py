@@ -441,7 +441,9 @@ class Issue183AcceptanceObservationsTest(unittest.TestCase):
                 newline="\n",
             )
             ops = scratch / "ops"
-            ops.mkdir()
+            # Issue #398: the .wrote session marker stamps <data>/ops on
+            # attributed adds, so the directory may already exist.
+            ops.mkdir(exist_ok=True)
             sid = "delivery-unreferenced-183"
             scripts = str(ROOT / "skills" / "memory" / "scripts")
             saved_path = sys.path[:]

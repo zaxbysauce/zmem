@@ -666,7 +666,9 @@ def _pretool_repo_state(event: dict, query: str) -> str:
         pass  # unknown seam values fall through to the production probe
     lowered = (query or "").lower()
     if not any(verb in lowered for verb in _STATE_PROBE_VERBS):
-        return "unavailable"  # not a state-hazardous command: no probe
+        return ""  # not a state-hazardous command: NO probe ran (the
+        # decision line then carries no state= field at all — "ran and
+        # failed" (unavailable) is a different, recorded outcome)
     cwd = None
     raw_cwd = event.get("cwd")
     if isinstance(raw_cwd, str) and raw_cwd.strip() and os.path.isdir(raw_cwd):
