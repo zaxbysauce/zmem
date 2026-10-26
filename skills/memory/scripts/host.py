@@ -40,6 +40,42 @@ def _env(name: str) -> str | None:
     return val if val else None
 
 
+class StoreConfigError(ValueError):
+    """A store-location config variable names the wrong KIND of path.
+
+    Raised by resolve_store_path / _resolve_data_dir when one of the
+    directory-shaped variables (ZMEM_DATA, CLAUDE_PLUGIN_DATA,
+    ZCODE_PLUGIN_DATA) names an existing REGULAR FILE instead of a
+    directory (issue #291, AC1). Distinct from a bare ValueError so
+    callers can refuse loudly instead of activating a default-location
+    fallback (the correction_queue / storelib.config lesson: a
+    misconfigured leg must fail, never silently redirect sidecars or
+    config to ~/.zmem or cwd). store.py converts this to exit 2 with a
+    message naming ZMEM_STORE before storelib's import-time resolution
+    can turn it into a traceback.
+    """
+
+
+def _env_data_dir_checked(varname: str, value: str) -> Path:
+    """Expand a directory-shaped env value, refusing an existing regular file.
+
+    The single kind-check seam for every data-dir limb (issue #291): a
+    value naming an existing regular file is the documented laptop
+    misconfiguration (ZMEM_DATA=...\\store.sqlite) — silently composing
+    <file>/store.sqlite surfaces downstream as an unrelated maintenance-
+    lock error. A NONEXISTENT path passes through unchanged (the historical
+    create-on-first-use behavior); a directory passes through; a symlink to
+    a file is a file (Path.is_file follows links).
+    """
+    p = Path(value).expanduser()
+    if p.is_file():
+        raise StoreConfigError(
+            f"zmem: {varname} names an existing file ({p}); it is a "
+            "directory variable — point ZMEM_STORE at the store file instead"
+        )
+    return p
+
+
 def resolve_store_path() -> Path:
     """Resolve the store.sqlite path. See module docstring for the priority chain."""
     explicit = _env("ZMEM_STORE")
@@ -48,15 +84,17 @@ def resolve_store_path() -> Path:
 
     zmem_data = _env("ZMEM_DATA")
     if zmem_data:
-        return Path(zmem_data).expanduser() / "store.sqlite"
+        return _env_data_dir_checked("ZMEM_DATA", zmem_data) / "store.sqlite"
 
     claude_data = _env("CLAUDE_PLUGIN_DATA")
     if claude_data:
-        return Path(claude_data).expanduser() / "store.sqlite"
+        return (_env_data_dir_checked("CLAUDE_PLUGIN_DATA", claude_data)
+                / "store.sqlite")
 
     zcode_data = _env("ZCODE_PLUGIN_DATA")
     if zcode_data:
-        return Path(zcode_data).expanduser() / "store.sqlite"
+        return (_env_data_dir_checked("ZCODE_PLUGIN_DATA", zcode_data)
+                / "store.sqlite")
 
     home = Path(os.path.expanduser("~"))
     zmem_default = home / ".zmem" / "store.sqlite"
@@ -118,6 +156,8 @@ def _legacy_plugin_store(home: Path) -> Path | None:
         chosen = matches[0]
 
     if len(matches) > 1:
+        if _SUPPRESS_LEGACY_WARNING:
+            return chosen
         try:
             import sys as _sys
             others = "".join(
@@ -540,19 +580,21 @@ def _resolve_data_dir() -> Path:
     Mirrors resolve_store_path()'s precedence INCLUDING the explicit-store
     step: a ZMEM_STORE-selected store keeps its sidecars beside that store,
     matching correction_queue's data-dir chain (PR #199 review) — only the
-    store-FILE suffix is dropped."""
+    store-FILE suffix is dropped. Issue #291: the directory limbs share the
+    resolve_store_path kind check (an independent reader must not silently
+    re-accept a file-shaped value the store path already refuses)."""
     explicit_store = _env("ZMEM_STORE")
     if explicit_store:
         return Path(explicit_store).expanduser().parent
     explicit = _env("ZMEM_DATA")
     if explicit:
-        return Path(explicit).expanduser()
+        return _env_data_dir_checked("ZMEM_DATA", explicit)
     claude_data = _env("CLAUDE_PLUGIN_DATA")
     if claude_data:
-        return Path(claude_data).expanduser()
+        return _env_data_dir_checked("CLAUDE_PLUGIN_DATA", claude_data)
     zcode_data = _env("ZCODE_PLUGIN_DATA")
     if zcode_data:
-        return Path(zcode_data).expanduser()
+        return _env_data_dir_checked("ZCODE_PLUGIN_DATA", zcode_data)
     return Path(os.path.expanduser("~")) / ".zmem"
 
 
@@ -777,6 +819,11 @@ def resolve_scopes(
 # its lock broken. Timeouts are therefore set far above any realistic run
 # (see store.py's *_LOCK_STALE_SECONDS), and the worst case degrades to
 # today's behavior (two concurrent runs), not to corruption.
+
+# Set briefly by store.py's pre-import preflight so its extra resolver call
+# does not re-print the multi-legacy-store warning the other two calls in the
+# same process already printed (review PRR-031).
+_SUPPRESS_LEGACY_WARNING = False
 
 _NO_LOCK_TOKEN = "unlocked"
 

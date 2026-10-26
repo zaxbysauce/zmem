@@ -619,12 +619,123 @@ pending overlay rather than a recency-shaped serve.
 
 The capability-matrix rows for the Inject and explicit-recall degrade
 cells move from obligation to shipped with this delivery; the T-12
-`doctor --fleet` snapshot-age report (issue #291) remains open.
+`doctor --fleet` family (issue #291) ships with the fleet-operations
+release, including the snapshot-age check.
+
+## Installing the fleet (issue #291)
+
+Surfaces shipped with the fleet-operations release (under
+`scripts/fleet/` and `skills/memory/scripts/`):
+
+- **Hub**: `install-hub.ps1` / `install-hub.sh REPO_ROOT DATA_DIR
+  TOKENS_FILE [PORT]` register the hub bound to 127.0.0.1 only, refuse a
+  broad-ACL (SID-matched) / non-0600 principal map, and configure
+  `tailscale serve --bg --https=443 http://127.0.0.1:<port>`. The Linux
+  unit runs as the invoking (sudo) user with NoNewPrivileges and verifies
+  the service came up before reporting success.
+- **Per-machine principals**: `scripts/fleet/issue-principal.py --map
+  FILE --principal ID --host H --harness X [--namespaces a,b]
+  [--capabilities c1,c2] [--preset off-tailnet]` appends to the hub's map
+  under a strict fail-closed lock and prints the token exactly once. An
+  entry WITHOUT `--namespaces` is UNSCOPED hub-side (every namespace
+  allowed; capabilities never gate add/capture) — the issuer refuses it
+  unless `--allow-unscoped` is passed. `--preset off-tailnet` means
+  capabilities `read,passive` AND requires `--namespaces`.
+- **Broker**: `install-broker.ps1` (token piped via the PowerShell
+  pipeline) / `install-broker.sh REPO_ROOT HUB_URL [NAMESPACES]` (token
+  piped via stdin) write the singular per-broker credential the CLIENT
+  transport reads, refuse conflicting effective config (ZMEM_HERMES_MODE
+  other than unset/`mcp`, a differing `ZMEM_MCP_URL`, any plural map, any
+  `ZMEM_STORE`) in BOTH the root and invoking-user scopes under sudo, and
+  validate with a fresh child asserting the transport resolves mcp BEFORE
+  persisting the configuration.
+- **Health**: `doctor --fleet` reports seven checks (hub reachable, hello
+  compatible, principal, op-queue backlog with oldest age, snapshot age,
+  stray local core.md, full-disk encryption while a complete snapshot
+  pair exists). `ZMEM_FLEET_FDE_PROBE` (`on`/`off`) overrides the
+  encryption probe for operators and tests.
+
+## Tailscale identity facts (recorded per issue #291)
+
+Two Tailscale facts bound the fleet design (from the issue's design
+critique): Serve's `Tailscale-User-*` identity headers are ABSENT for
+tagged devices, and a backend `WhoIs` lookup through Serve identifies the
+Serve PROXY, not the original node. Node identity therefore cannot be
+inferred naively from either — the bearer principal (per-machine, via the
+principal map) remains the ONLY authorization authority, and Tailscale
+identity is defence in depth at best.
 
 ## Peer ingest trust mode (issue #282)
 
 Every machine importing rows it did not author runs
-`ingest-jsonl --trust untrusted-peer --allow-namespace <ns...>
+`ingest-jsonl --trust untrusted-peer --allow-namespace <ns>
 --capture-mode auto` (add `--attribute-host <this box>` to stamp local
-attribution). Trust claims inside the rows are clamped, namespaces are
+attribution; `--allow-namespace` is repeatable, one namespace per flag).
+Trust claims inside the rows are clamped, namespaces are
 gated, and evidence records from peers are refused; see docs/CLOUD.md.
+
+## Migrating from a peer JSONL exchange (issue #291)
+
+The interim topology this replaces: a laptop runs
+`~/.zmem/zmem_exchange.py` hourly (scheduled task `ZMemExchange`),
+exporting timestamped JSONL to a synced `exchanges/outbox/` and ingesting
+`exchanges/inbox/`. The hub topology is authoritative; this runbook ends
+the peer exchange WITHOUT losing a row.
+
+1. **Quiesce the exchange.** Disable the scheduled task / cron entry on
+   every machine that runs one, then let the final export finish so the
+   outbox is a complete tail.
+2. **Final authoritative ingest.** On the hub, ingest each machine's
+   outbox ONCE with the T-03 peer-trust mode (the file goes via `--in`,
+   and `--allow-namespace` is repeatable, one namespace per flag):
+   `store.py ingest-jsonl --in <outbox.jsonl> --trust untrusted-peer
+   --allow-namespace <ns> --capture-mode auto --attribute-host <box>`.
+   Trust claims are clamped and namespaces gated (the #282 contract).
+3. **Re-embed on the hub** in its local context: run `store.py reembed`
+   on the hub so the ingested rows are searchable on the hub's embedding
+   profile (peer-imported embeddings are not assumed compatible).
+4. **Switch each former peer to broker mode.** On each machine (the
+   laptop first):
+   - UNSET `ZMEM_STORE` in every scope — `ZMEM_STORE` together with
+     `ZMEM_REMOTE_URL` is a configuration error (the #289 rule).
+   - Make `ZMEM_DATA` a writable DIRECTORY (a value naming an existing
+     file is now refused with exit 2; the laptop's historical
+     `ZMEM_DATA=...store.sqlite` misconfiguration is exactly this).
+   - Set `ZMEM_REMOTE_URL` to the hub's full `/mcp` endpoint and install
+     the per-broker credential with `scripts/fleet/install-broker.{ps1,sh}`
+     (the singular token file; the hub's principal map never leaves the
+     hub).
+5. **Keep the old store read-only as a backup** — MOVE it OUT of the
+   active data dir (e.g. `store.sqlite.pre-fleet.bak`) so the broker's
+   queue/snapshot sidecars never share a directory with it.
+6. **Verify**: `doctor --fleet` green on every broker machine. A stray
+   local `core.md` in remote mode is flagged (the hub owns Tier 0).
+
+## Hub backup with Litestream (issue #291)
+
+Litestream gives the hub DISASTER RECOVERY — a point-in-time replica it
+can restore after disk loss. It is NOT availability: a running hub that
+is unreachable stays unreachable until the operator restores, and
+replication does NOT restore the filesystem sidecars (op queue, broker
+snapshots, decision logs) — only `store.sqlite`.
+
+Reference replica (operator attachment): Litestream SFTP replica to
+`r640ai` over the tailnet at `/srv/zmem-litestream/store`, snapshot
+interval 24h, retention 30 days.
+
+The restore drill (run once on the hub box and attach the output to the
+PR):
+
+```bash
+litestream restore -o /tmp/zmem-restore-drill/store.sqlite sftp://r640ai/srv/zmem-litestream/store
+python - <<'EOF'
+import sqlite3
+conn = sqlite3.connect("/tmp/zmem-restore-drill/store.sqlite")
+print(conn.execute("PRAGMA integrity_check").fetchone()[0])
+EOF
+python skills/memory/scripts/doctor.py --store /tmp/zmem-restore-drill/store.sqlite
+```
+
+Green (`ok`, `integrity_check` = `ok`) closes the drill. The restored
+store is a SCRATCH copy — the live hub keeps serving from its own disk;
+see `docs/CLOUD.md` for the off-tailnet runner tiers.

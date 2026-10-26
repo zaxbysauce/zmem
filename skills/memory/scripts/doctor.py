@@ -4668,6 +4668,671 @@ def _check_miss_rate(
     return _check("miss-rate", status, summary, report=report)
 
 
+# --- Fleet checks (issue #291, Workstream T PR 12) ---------------------------
+#
+# `doctor --fleet` adds seven broker-machine checks after the existing
+# fleet-remote check. Design constraints (plan REV 4):
+#   * every check is read-only and NON-CREATING (plain Path math, never
+#     fleet.snapshot._snapshot_paths/_broker_dir, which mkdir);
+#   * the hub probe is stdlib urllib (reachability, not protocol
+#     correctness); hello compatibility goes through the REAL transport
+#     (`fleet.transport.McpHttp.hello`) with its ACTUAL failure envelopes;
+#   * the principal check has two lanes: the HUB lane validates the plural
+#     ZMEM_MCP_TOKENS_FILE map directly (never importing server auth —
+#     load_principal_map exits on error, the #369 precedent), the BROKER
+#     lane consumes the authenticated-hello result (the installed
+#     per-broker credential is a singular token file the hub validates);
+#   * no token VALUE is ever reported — only shapes and counts.
+
+_FLEET_PROBE_TIMEOUT_S = 3.0
+_FLEET_FDE_PROBE_ENV = "ZMEM_FLEET_FDE_PROBE"
+_FLEET_HELPER_TIMEOUT_S = 10.0
+
+# Principal-map parity constants (issue #291): doctor mirrors
+# hermes-plugin/server/auth.py's parser limits WITHOUT importing server auth
+# (its loader exits on error). A supp test imports auth's constants and pins
+# these equal, so the two rule sets cannot drift.
+_FLEET_PRINCIPAL_ALLOWED_FIELDS = frozenset(
+    {"principal", "host", "harness", "namespaces", "capabilities", "revoked"})
+_FLEET_PRINCIPAL_REQUIRED_FIELDS = frozenset(
+    {"principal", "host", "harness"})
+_FLEET_MAX_PRINCIPALS = 256
+_FLEET_MAX_NAMESPACES = 128
+_FLEET_MAX_NS_UTF8_BYTES = 256
+_FLEET_MAX_NS_TOTAL_UTF8_BYTES = 8192
+# Grammar parity with auth (review round 1): the hub refuses maps on these
+# rules, so the doctor lane and the issuer must too — a map the hub would
+# exit-2 on must never report "valid".
+import re as _re_fleet  # noqa: E402  (module-level, beside its constant)
+_FLEET_PRINCIPAL_ID_RE = _re_fleet.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_FLEET_MAX_PRINCIPAL_ID_CHARS = 64
+_FLEET_MAX_TAG_VALUE_CHARS = 128
+_FLEET_ALLOWED_CAPABILITIES = frozenset(
+    {"read", "passive", "write", "mutate", "admin"})
+_FLEET_MAX_TOKEN_UTF8_BYTES = 4096
+
+
+def _fleet_remote_url() -> str:
+    """The configured hub URL (issue #287 chain: ZMEM_REMOTE_URL, else the
+    Hermes-side ZMEM_MCP_URL)."""
+    return (os.environ.get("ZMEM_REMOTE_URL", "")
+            or os.environ.get("ZMEM_MCP_URL", "")).strip()
+
+
+def _check_fleet_hub_reachable() -> dict:
+    """Reachability only: ANY HTTP response (including 4xx/5xx) proves the
+    endpoint answered; refused/timeout/bad URL is a fail."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = _fleet_remote_url()
+    if not url:
+        return _check(
+            "fleet-hub-reachable", "skip",
+            "Fleet remote mode not configured (ZMEM_REMOTE_URL unset).")
+    details: dict[str, object] = {"remote_url": url}
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        return _check(
+            "fleet-hub-reachable", "fail",
+            f"Unsupported hub URL scheme {scheme!r} (expected http/https): "
+            f"{url}", **details)
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    # ProxyHandler({}) disables ambient proxies: the hub is tailnet-local,
+    # and a proxy turns "connection refused" into a proxy 502 (a false
+    # reachable-pass); the frozen fleet test depends on that determinism.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        resp = opener.open(urllib.request.Request(url, method="GET"),
+                           timeout=_FLEET_PROBE_TIMEOUT_S)
+        with resp:
+            resp.read(1)
+        return _check("fleet-hub-reachable", "pass",
+                      "Hub answered at the configured URL.", **details)
+    except urllib.error.HTTPError as exc:
+        with exc:
+            exc.read(1)
+        details["http_status"] = exc.code
+        if 300 <= exc.code < 400:
+            return _check(
+                "fleet-hub-reachable", "fail",
+                f"Hub URL redirects (HTTP {exc.code}) - a hub must answer "
+                "directly at the configured URL.", **details)
+        note = "" if exc.code < 500 else " (backend unhealthy — 5xx)"
+        return _check("fleet-hub-reachable", "pass",
+                      f"Hub reachable: HTTP {exc.code}{note}.", **details)
+    except Exception as exc:  # noqa: BLE001 - refusal/timeout/parse, reported
+        return _check("fleet-hub-reachable", "fail",
+                      f"Hub unreachable at {url}: {exc}", **details)
+
+
+def _fleet_hello_once() -> tuple[str, str, dict]:
+    """One authenticated hello through the REAL transport.
+
+    Returns (verdict, summary, details) with verdict pass/fail/skip using
+    the transport's ACTUAL envelopes: the hub's SUCCESS payload carries
+    negotiation fields with NO ``ok`` member (detected by shape), connect
+    failures collapse to ``{'ok': False, 'reason': 'hub-unreachable'}``
+    (skip — fleet-hub-reachable owns that verdict), and EVERY other
+    reachable-but-unsuccessful result — including the 401-collapsed
+    ``empty-pool`` — is a FAIL: the transport cannot distinguish auth
+    failure, so a failed authenticated hello is a compatibility failure
+    (the plan-critic round-3 taxonomy).
+    """
+    try:
+        from fleet import transport as fleet_transport  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 - optional surface on dev boxes
+        return ("skip", f"fleet.transport unavailable: {exc}", {})
+    url = _fleet_remote_url()
+    if not url:
+        return ("skip", "No hub URL configured.", {})
+    deadline_s = _FLEET_PROBE_TIMEOUT_S + 3.0
+    try:
+        http = fleet_transport.McpHttp(
+            url=url, executor=fleet_transport.DeadlineExecutor(),
+            deadline_s=deadline_s)
+        _hello_started = time.monotonic()
+        payload = http.hello()
+        _hello_elapsed = time.monotonic() - _hello_started
+    except Exception as exc:  # noqa: BLE001 - hello itself fails open
+        payload = {"ok": False, "reason": f"hello-call-error: {exc}"}
+        _hello_elapsed = 0.0
+    details: dict[str, object] = {}
+    if isinstance(payload, dict) and isinstance(
+            payload.get("supported_protocol_majors"), list):
+        # Success shape (no ``ok`` member on success by design).
+        hub_window = [m for m in payload["supported_protocol_majors"]
+                      if isinstance(m, int) and not isinstance(m, bool)]
+        client_major = fleet_transport.CLIENT_PROTOCOL_MAJOR
+        details["hub_supported_majors"] = hub_window
+        details["client_major"] = client_major
+        if client_major in hub_window:
+            return ("pass", "Hub hello negotiated a compatible protocol "
+                    f"window (client major {client_major}).", details)
+        return ("fail", f"Hub protocol window {hub_window} excludes client "
+                f"major {client_major}.", details)
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    details["reason"] = reason
+    details["elapsed_s"] = round(_hello_elapsed, 2)
+    if reason == fleet_transport.REASON_HUB_UNREACHABLE:
+        return ("skip", "Hub unreachable (see fleet-hub-reachable).", details)
+    if reason == fleet_transport.REASON_EMPTY_POOL and (
+            _hello_elapsed >= deadline_s * 0.95):
+        # DeadlineExecutor returns None on a deadline hit and hello maps a
+        # non-dict payload to the empty-pool envelope - a slow-but-alive
+        # hub must not be reported as an auth/compat failure (PRR-013).
+        details["timeout"] = True
+        return ("skip",
+                f"Hub did not answer the hello inside the {deadline_s:.0f}s "
+                "probe deadline (timeout, not an auth failure).", details)
+    return ("fail", f"Authenticated hello unsuccessful: {reason}", details)
+
+
+def _check_fleet_hello_compat(hello: tuple[str, str, dict]) -> dict:
+    verdict, summary, details = hello
+    if verdict == "pass":
+        return _check("fleet-hello-compat", "pass", summary, **details)
+    if verdict == "skip":
+        return _check("fleet-hello-compat", "skip", summary, **details)
+    return _check("fleet-hello-compat", "fail", summary, **details)
+
+
+def _check_fleet_principal(hello: tuple[str, str, dict]) -> dict:
+    """The principal lane for --fleet: plural map (hub box) or the installed
+    singular broker credential (validated by the authenticated hello)."""
+    singular = bool(
+        (os.environ.get("ZMEM_MCP_TOKEN_FILE", "") or "").strip()
+        or (os.environ.get("ZMEM_MCP_TOKEN", "") or "").strip())
+    plural = bool((os.environ.get("ZMEM_MCP_TOKENS_FILE", "") or "").strip())
+    if plural:
+        # HUB lane: direct structural validation of the principal map —
+        # auth-parser parity WITHOUT importing server auth (its loader
+        # exits on error; the _check_mcp_token precedent). Token values
+        # are never reported.
+        tok_file = (os.environ.get("ZMEM_MCP_TOKENS_FILE", "") or "").strip()
+        path = Path(tok_file).expanduser()
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) unreadable: "
+                          f"{exc}")
+        except UnicodeDecodeError as exc:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) is not valid "
+                          f"UTF-8: {exc}")
+        if len(raw) > 4 * 1024 * 1024:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) exceeds the "
+                          "4 MiB diagnostic read cap.")
+        problems, count = _fleet_principal_map_problems(raw)
+        if problems:
+            return _check("fleet-principal", "fail",
+                          "; ".join(problems[:3]),
+                          principal_count=count)
+        return _check("fleet-principal", "pass",
+                      f"Principal map valid ({count} principals).",
+                      principal_count=count)
+    if singular:
+        # BROKER lane: the installed per-broker credential is validated by
+        # the authenticated hello itself (the transport resolves the token
+        # from env; the hub accepts or refuses it).
+        verdict, summary, details = hello
+        # A malformed token FILE is a fail independent of the hub.
+        token_file = (os.environ.get("ZMEM_MCP_TOKEN_FILE", "") or "").strip()
+        invalid_cls = None
+        if token_file:
+            try:
+                from fleet import transport as _ft  # noqa: PLC0415
+                invalid_cls = _ft._TokenFileInvalid  # noqa: SLF001
+                _ft._resolve_token(None, dict(os.environ))  # noqa: SLF001
+            except Exception as exc:  # noqa: BLE001
+                if invalid_cls is not None and isinstance(exc, invalid_cls):
+                    return _check(
+                        "fleet-principal", "fail",
+                        f"ZMEM_MCP_TOKEN_FILE ({token_file}) is malformed "
+                        "JSON — no credential was sent.")
+                # transport absent/unavailable: hello's skip carries it
+        if verdict == "pass":
+            return _check("fleet-principal", "pass",
+                          "Broker credential accepted by the hub "
+                          "(authenticated hello succeeded).", **details)
+        if verdict == "skip":
+            return _check("fleet-principal", "skip", summary, **details)
+        return _check("fleet-principal", "fail",
+                      "Broker credential not accepted: " + summary, **details)
+    return _check("fleet-principal", "skip",
+                  "No principal configuration on this machine "
+                  "(neither ZMEM_MCP_TOKENS_FILE nor a broker credential).")
+
+
+def _fleet_principal_map_problems(raw: str) -> tuple[list[str], int]:
+    """Structural validation of a principal map with auth-parser parity.
+
+    Mirrors hermes-plugin/server/auth.py _parse_principal_map's load-bearing
+    rules (allowed/required field split, revoked boolean, duplicate ids,
+    normalized-token collisions, count limits, per-namespace and aggregate
+    namespace UTF-8 byte budgets). A supp test pins this rule set against
+    the server parser's constants. Token VALUES never leave this function.
+    """
+    import hashlib
+    import json as _json
+
+    problems: list[str] = []
+    try:
+        obj = _json.loads(raw)
+    except RecursionError:
+        return (["map is nested too deeply to parse (the hub parser would "
+                 "refuse it)"], 0)
+    except ValueError as exc:
+        return ([f"map is not valid JSON ({exc})"], 0)
+    if not isinstance(obj, dict):
+        return (["map must be a JSON object mapping tokens to principals"], 0)
+    if not obj:
+        return (["map is empty — a map that authenticates nobody is a "
+                 "misconfiguration"], 0)
+    allowed = _FLEET_PRINCIPAL_ALLOWED_FIELDS
+    required = _FLEET_PRINCIPAL_REQUIRED_FIELDS
+    seen_ids: set[str] = set()
+    seen_tokens: set[str] = set()
+    for token, entry in obj.items():
+        if not isinstance(token, str) or not token.strip():
+            problems.append("map keys must be non-empty token strings")
+            continue
+        if len(token.encode("utf-8")) > _FLEET_MAX_TOKEN_UTF8_BYTES:
+            problems.append(
+                f"a token exceeds {_FLEET_MAX_TOKEN_UTF8_BYTES} UTF-8 bytes")
+        norm = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+        if norm in seen_tokens:
+            problems.append("duplicate normalized token")
+        seen_tokens.add(norm)
+        if not isinstance(entry, dict):
+            problems.append("entry must be a JSON object")
+            continue
+        unknown = sorted(set(entry) - allowed)
+        if unknown:
+            problems.append(f"unknown field(s) {unknown}")
+        missing = required - set(entry)
+        if missing:
+            problems.append(f"missing required field(s) {sorted(missing)}")
+        entry_ns_bytes = 0
+        pid = entry.get("principal")
+        if isinstance(pid, str) and pid.strip():
+            pid = pid.strip()
+            if pid in seen_ids:
+                problems.append(f"duplicate principal id {pid!r}")
+            seen_ids.add(pid)
+            if (len(pid) > _FLEET_MAX_PRINCIPAL_ID_CHARS
+                    or not _FLEET_PRINCIPAL_ID_RE.match(pid)):
+                problems.append(
+                    f"'principal' must match [A-Za-z0-9][A-Za-z0-9._-]* and "
+                    f"be at most {_FLEET_MAX_PRINCIPAL_ID_CHARS} characters")
+        elif "principal" in entry:
+            problems.append("'principal' must be a non-empty string")
+        for field in ("host", "harness"):
+            value = entry.get(field)
+            if not isinstance(value, str):
+                if field in entry:
+                    problems.append(
+                        f"'{field}' must be a string matching "
+                        "[A-Za-z0-9][A-Za-z0-9._-]* (at most "
+                        f"{_FLEET_MAX_TAG_VALUE_CHARS} characters)")
+            else:
+                value = value.strip()
+                if (not value
+                        or len(value) > _FLEET_MAX_TAG_VALUE_CHARS
+                        or not _FLEET_PRINCIPAL_ID_RE.match(value)):
+                    problems.append(
+                        f"'{field}' must match "
+                        "[A-Za-z0-9][A-Za-z0-9._-]* and be at most "
+                        f"{_FLEET_MAX_TAG_VALUE_CHARS} characters")
+        revoked = entry.get("revoked")
+        if revoked is not None and not isinstance(revoked, bool):
+            problems.append("'revoked' must be a boolean when present")
+        namespaces = entry.get("namespaces")
+        if namespaces is not None:
+            if (not isinstance(namespaces, list)
+                    or not namespaces
+                    or not all(isinstance(n, str) for n in namespaces)):
+                problems.append(
+                    "'namespaces' must be a NON-EMPTY list of strings")
+            else:
+                if any(not n.strip() for n in namespaces):
+                    problems.append("'namespaces' entries must be non-empty")
+                if len(namespaces) > _FLEET_MAX_NAMESPACES:
+                    problems.append(
+                        f"'namespaces' exceeds the maximum of "
+                        f"{_FLEET_MAX_NAMESPACES} entries")
+                from schema_meta import is_valid_namespace  # noqa: PLC0415
+                for ns in namespaces:
+                    if not is_valid_namespace(ns):
+                        problems.append(
+                            f"namespace {ns[:40]!r} is not a valid scoped "
+                            "namespace (the hub parser would refuse it)")
+                    ns_bytes = len(ns.encode("utf-8"))
+                    if ns_bytes > _FLEET_MAX_NS_UTF8_BYTES:
+                        problems.append(
+                            f"a namespace exceeds {_FLEET_MAX_NS_UTF8_BYTES} "
+                            "UTF-8 bytes")
+                    entry_ns_bytes += ns_bytes
+        if entry_ns_bytes > _FLEET_MAX_NS_TOTAL_UTF8_BYTES:
+            problems.append(
+                f"an entry's namespaces exceed the per-entry aggregate of "
+                f"{_FLEET_MAX_NS_TOTAL_UTF8_BYTES} UTF-8 bytes")
+        capabilities = entry.get("capabilities")
+        if capabilities is not None:
+            if (not isinstance(capabilities, list) or not capabilities
+                    or not all(isinstance(c, str) for c in capabilities)
+                    or any(c not in _FLEET_ALLOWED_CAPABILITIES
+                           for c in capabilities)):
+                problems.append(
+                    "'capabilities' must be a NON-EMPTY list from "
+                    + ", ".join(sorted(_FLEET_ALLOWED_CAPABILITIES)))
+    if len(obj) > _FLEET_MAX_PRINCIPALS:
+        problems.append(
+            f"map exceeds the maximum of {_FLEET_MAX_PRINCIPALS} principals")
+    return (problems, len(obj))
+
+
+def _check_fleet_op_queue(resolved_store: Path,
+                          now_epoch: float | None = None) -> dict:
+    """Backlog semantics: depth counts ONLY status=='pending' entries
+    (receipts flip status in place — history is not backlog)."""
+    import json as _json
+
+    queue_dir = resolved_store.parent / "queue"
+    depth = 0
+    retired = 0
+    malformed_lines = 0
+    malformed_ts = 0
+    oldest: float | None = None
+    now = now_epoch if now_epoch is not None else time.time()
+    unreadable_files = 0
+    try:
+        paths = sorted(queue_dir.glob("ops-*.jsonl"))
+    except OSError:
+        paths = []
+        unreadable_files = 1
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            unreadable_files += 1
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = _json.loads(line)
+            except ValueError:
+                malformed_lines += 1
+                continue
+            if not isinstance(entry, dict):
+                malformed_lines += 1
+                continue
+            if entry.get("status") == "pending":
+                depth += 1
+                ts = entry.get("enqueued_at")
+                if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+                    if ts <= now + 300:  # future timestamps are malformed
+                        oldest = ts if oldest is None else min(oldest, ts)
+                    else:
+                        malformed_ts += 1
+                else:
+                    malformed_ts += 1
+            else:
+                retired += 1
+    details: dict[str, object] = {"depth": depth, "retired": retired}
+    if malformed_lines:
+        details["malformed_lines"] = malformed_lines
+    if unreadable_files:
+        details["unreadable_files"] = unreadable_files
+    if depth == 0 and unreadable_files:
+        return _check("fleet-op-queue", "warn",
+                      f"{unreadable_files} queue file(s) unreadable - the "
+                      "backlog could not be measured.", **details)
+    if depth == 0:
+        return _check("fleet-op-queue", "pass",
+                      "Op queue drained (no pending entries).", **details)
+    if oldest is not None:
+        details["oldest_age_s"] = int(now - oldest)
+    if malformed_ts:
+        details["malformed_timestamps"] = malformed_ts
+    return _check("fleet-op-queue", "warn",
+                  f"{depth} pending op-queue entrie(s); oldest age in "
+                  "details — flush with a hub connection.", **details)
+
+
+def _fleet_snapshot_state(resolved_store: Path) -> tuple[str, dict]:
+    """(state, meta) where state in {absent, incomplete, corrupt, expired,
+    valid}; NON-CREATING (plain path math, no _broker_dir mkdir)."""
+    import json as _json
+
+    snap = resolved_store.parent / "broker" / "snapshot.sqlite"
+    meta_path = resolved_store.parent / "broker" / "snapshot.meta.json"
+    snap_exists = snap.is_file()
+    meta_exists = meta_path.is_file()
+    if not snap_exists and not meta_exists:
+        return ("absent", {})
+    if snap_exists != meta_exists:
+        return ("incomplete", {})
+    meta: dict = {}
+    try:
+        meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ("corrupt", {})
+    if not isinstance(meta, dict):
+        return ("corrupt", {})
+    # The sqlite half must actually BE a snapshot: a truncated or foreign
+    # file with no memory table is corrupt, never fresh (PRR-020).
+    try:
+        _snap_conn = sqlite3.connect(f"file:{snap.resolve()}?mode=ro",
+                                     uri=True, timeout=2.0)
+        try:
+            _snap_row = _snap_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='memory'").fetchone()
+        finally:
+            _snap_conn.close()
+        if _snap_row is None:
+            return ("corrupt", {})
+    except sqlite3.Error:
+        return ("corrupt", {})
+    issued = meta.get("issued_at")
+    expires = meta.get("expires_at")
+    if (not isinstance(issued, (int, float)) or isinstance(issued, bool)
+            or not isinstance(expires, (int, float))
+            or isinstance(expires, bool)):
+        return ("corrupt", {})
+    now = time.time()
+    if expires <= now:
+        return ("expired", meta)
+    return ("valid", meta)
+
+
+def _check_fleet_snapshot_age(resolved_store: Path,
+                              now_epoch: float | None = None) -> dict:
+    state, meta = _fleet_snapshot_state(resolved_store)
+    if state == "absent":
+        return _check("fleet-snapshot-age", "skip",
+                      "No offline snapshot on this machine yet.")
+    if state == "incomplete":
+        return _check("fleet-snapshot-age", "warn",
+                      "Incomplete snapshot pair (exactly one of "
+                      "snapshot.sqlite / snapshot.meta.json present).")
+    if state == "corrupt":
+        return _check("fleet-snapshot-age", "warn",
+                      "snapshot.meta.json is unparseable or carries "
+                      "non-numeric timestamps.")
+    now = now_epoch if now_epoch is not None else time.time()
+    details = {
+        "revision": meta.get("snapshot_revision"),
+        "age_s": int(now - float(meta["issued_at"])),
+        "expires_in_s": int(float(meta["expires_at"]) - now),
+    }
+    if state == "expired":
+        return _check("fleet-snapshot-age", "warn",
+                      f"Offline snapshot expired (revision "
+                      f"{details['revision']}); offline reads are degraded.",
+                      **details)
+    return _check("fleet-snapshot-age", "pass",
+                  f"Offline snapshot fresh (revision {details['revision']}, "
+                  f"{details['age_s']}s old).", **details)
+
+
+def _check_fleet_tier0_local() -> dict:
+    remote_url = _fleet_remote_url()
+    if not remote_url:
+        return _check("fleet-tier0-local", "skip",
+                      "Local mode — the local core.md is authoritative.")
+    try:
+        core = host.resolve_core_md_path()
+        present = core.is_file()
+        core_text = str(core)
+    except host.StoreConfigError as exc:
+        return _check("fleet-tier0-local", "skip",
+                      f"Store path refused; cannot resolve the local "
+                      f"core.md: {exc}")
+    if present:
+        return _check("fleet-tier0-local", "warn",
+                      f"A stray local Tier-0 file exists at {core_text} "
+                      "while remote mode is on — the hub owns Tier 0; "
+                      "local edits there are not served.",
+                      path=_display_path(core))
+    return _check("fleet-tier0-local", "pass",
+                  "No stray local core.md in remote mode.")
+
+
+def _fleet_fde_probe_mount(snapshot_dir: Path) -> str:
+    """Best-effort full-disk-encryption verdict for the mount holding the
+    snapshot: 'on', 'off', 'unknown', or 'invalid-seam'. Every OS helper is
+    time-bounded; never raises."""
+    import subprocess
+
+    seam = (os.environ.get(_FLEET_FDE_PROBE_ENV, "") or "").strip().lower()
+    if seam:
+        if seam in ("on", "off"):
+            return seam
+        return "invalid-seam"
+    try:
+        if os.name == "nt":
+            drive, _ = os.path.splitdrive(str(snapshot_dir.resolve()))
+            if not drive:
+                return "unknown"
+            out = subprocess.run(
+                ["manage-bde", "-status", drive],
+                capture_output=True, text=True, timeout=_FLEET_HELPER_TIMEOUT_S,
+                check=False)
+            text = out.stdout or ""
+            if "Protection On" in text:
+                return "on"
+            if "Protection Off" in text:
+                return "off"
+            return "unknown"
+        out = subprocess.run(
+            ["findmnt", "-no", "SOURCE", str(snapshot_dir)],
+            capture_output=True, text=True, timeout=_FLEET_HELPER_TIMEOUT_S,
+            check=False)
+        source = (out.stdout or "").strip()
+        if not source:
+            return "unknown"
+        if source.startswith("/dev/mapper/") or "crypt" in source.lower():
+            return "on"
+        # A plain source name proves nothing either way (btrfs/LVM/loop can
+        # sit on encrypted or plain volumes) - "off" would be a spurious
+        # hard FAIL making the runbook's green gate unreachable on
+        # ordinary Linux (PRR-020).
+        return "unknown"
+    except Exception:  # noqa: BLE001 - probes never crash doctor
+        return "unknown"
+
+
+def _check_fleet_disk_encryption(resolved_store: Path) -> dict:
+    state, _meta = _fleet_snapshot_state(resolved_store)
+    if state not in ("valid", "expired"):
+        return _check("fleet-disk-encryption", "skip",
+                      "No complete snapshot pair — the encryption "
+                      "requirement applies only while a snapshot exists.")
+    verdict = _fleet_fde_probe_mount(
+        resolved_store.parent / "broker")
+    if verdict == "on":
+        return _check("fleet-disk-encryption", "pass",
+                      "Full-disk encryption is on for the snapshot's "
+                      "mount.")
+    if verdict == "off":
+        return _check("fleet-disk-encryption", "fail",
+                      "Full-disk encryption is OFF while an offline "
+                      "snapshot exists — the snapshot holds plaintext "
+                      "memory rows.")
+    if verdict == "invalid-seam":
+        return _check("fleet-disk-encryption", "warn",
+                      f"{_FLEET_FDE_PROBE_ENV} must be 'on' or 'off' when "
+                      "set; refusing to guess.")
+    return _check("fleet-disk-encryption", "warn",
+                  "Could not determine full-disk encryption state "
+                  "(probe unavailable or undetectable).")
+
+
+def _fleet_checks(resolved_store: Path,
+                  now_epoch: float | None = None,
+                  store_refusal: str | None = None) -> list[dict]:
+    """The seven --fleet checks (issue #291 AC2).
+
+    ``now_epoch`` is the report's pinned clock (ZMEM_TEST_NOW, parsed to
+    epoch) so age/expiry rows agree with the report under a pinned clock;
+    ``store_refusal`` (error mode) degrades the four store-path-derived
+    checks to skip-with-reason instead of false greens against a
+    fabricated path (PRR-014).
+    """
+    checks: list[dict] = []
+    checks.append(_check_fleet_hub_reachable())
+    hello = _fleet_hello_once()
+    checks.append(_check_fleet_hello_compat(hello))
+    checks.append(_check_fleet_principal(hello))
+    if store_refusal is not None:
+        _note = "store path configuration refused: " + store_refusal
+        checks.append(_check("fleet-op-queue", "skip",
+                             "Op-queue backlog unmeasurable - " + _note))
+        checks.append(_check("fleet-snapshot-age", "skip",
+                             "Snapshot age unmeasurable - " + _note))
+        checks.append(_check("fleet-tier0-local", "skip",
+                             "Stray-core.md check unmeasurable - " + _note))
+        checks.append(_check("fleet-disk-encryption", "skip",
+                             "Encryption state unmeasurable - " + _note))
+        return checks
+    checks.append(_check_fleet_op_queue(resolved_store,
+                                        now_epoch=now_epoch))
+    checks.append(_check_fleet_snapshot_age(resolved_store,
+                                            now_epoch=now_epoch))
+    checks.append(_check_fleet_tier0_local())
+    checks.append(_check_fleet_disk_encryption(resolved_store))
+    return checks
+
+
+def _parse_now_epoch(now: str | None) -> float | None:
+    """The report's pinned clock as epoch seconds (None = wall time)."""
+    if not now:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(now.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    try:
+        return dt.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def build_report(
     project: Path,
     repo_root: Path,
@@ -4680,6 +5345,7 @@ def build_report(
     confirm_no_training_export: bool = False,
     now: str | None = None,
     expiring: str | None = None,
+    fleet: bool = False,
 ) -> dict:
     staging_cleanup = None
     if cleanup_training_staging:
@@ -4693,12 +5359,43 @@ def build_report(
             max_age_hours=training_staging_max_age_hours,
             confirm_no_training_export=confirm_no_training_export,
         )
-    resolved_store = (
-        Path(store_override).expanduser()
-        if store_override
-        else host.resolve_store_path()
-    )
+    # Issue #291: a REFUSED store configuration (a directory variable naming
+    # an existing file) must not crash doctor — the report degrades to an
+    # error-mode: a store-resolution FAIL check, the --fleet checks (they
+    # are storelib-free by construction), and one skip row for the
+    # store-backed checks (their lazy storelib imports re-enter the refused
+    # resolver; schema.py resolves at import time). The placeholder keeps
+    # plain Path math working for the fleet checks' queue/snapshot reads.
+    store_refusal: str | None = None
+    if store_override:
+        resolved_store = Path(store_override).expanduser()
+    else:
+        try:
+            resolved_store = host.resolve_store_path()
+        except host.StoreConfigError as exc:
+            store_refusal = str(exc)
+            raw_dir = (os.environ.get("ZMEM_DATA", "")
+                       or os.environ.get("CLAUDE_PLUGIN_DATA", "")
+                       or os.environ.get("ZCODE_PLUGIN_DATA", "")
+                       or ".")
+            resolved_store = Path(raw_dir).expanduser() / "store.sqlite"
     checks: list[dict] = []
+    if store_refusal is not None:
+        checks.append(_check("store-resolution", "fail", store_refusal,
+                             resolved_store=_display_path(resolved_store)))
+        checks.append(_check_local_path(resolved_store))
+        if fleet:
+            checks.extend(_fleet_checks(
+                resolved_store, now_epoch=_parse_now_epoch(now),
+                store_refusal=store_refusal))
+        checks.append(_check(
+            "store-backed-checks", "skip",
+            "Store path configuration refused; every store-backed check is "
+            "skipped: " + store_refusal))
+        checks.append(_check_python())
+        checks.append(_check_inject_switch())
+        return _finish_report(project, repo_root, resolved_store, checks,
+                              now=now, expiring=expiring)
     checks.append(_check_store_resolution(repo_root, resolved_store))
     checks.append(_check_local_path(resolved_store))
     # Issue #185: install-skew, ZCode native memory, and orphan-store
@@ -4745,6 +5442,11 @@ def build_report(
     # Issue #287 (Workstream T PR 8): the per-machine broker surface when
     # fleet remote mode is configured.
     checks.append(_check_fleet_remote(repo_root, resolved_store))
+    # Issue #291 (Workstream T PR 12): the operator fleet checks under
+    # --fleet (seven checks; storelib-free by construction).
+    if fleet:
+        checks.extend(_fleet_checks(resolved_store,
+                                    now_epoch=_parse_now_epoch(now)))
     checks.append(_check_tier0_size(project))
     checks.append(_check_embeddings())
     # Issue #63, 8.4: store-side embedding health (profile/dim/coverage).
@@ -4777,7 +5479,20 @@ def build_report(
                 resolved_store, miss_rate_opts, store_explicit=bool(store_override)
             )
         )
+    return _finish_report(
+        project, repo_root, resolved_store, checks,
+        namespace_check=namespace_check, staging_cleanup=staging_cleanup,
+        now=now, expiring=expiring)
 
+
+def _finish_report(
+        project: Path, repo_root: Path, resolved_store: Path,
+        checks: list[dict], *, namespace_check: dict | None = None,
+        staging_cleanup: dict | None = None, now: str | None = None,
+        expiring: str | None = None) -> dict:
+    """The shared build_report tail: counts, recommendations, the report
+    dict, and the optional --expiring block (issue #291 split it out so the
+    store-refusal error-mode path emits the same report shape)."""
     # "info" is a supported non-ok-flipping status (hybrid-default's
     # embeddings-unavailable branch: lexical fallback works — PRR-001R fix;
     # previously the missing key raised KeyError in the aggregation below).
@@ -4788,7 +5503,7 @@ def build_report(
     recommendations = _recommendations(checks)
     namespace = (
         namespace_check["details"].get("namespace")
-        if namespace_check["status"] == "pass"
+        if namespace_check is not None and namespace_check["status"] == "pass"
         else None
     )
     report = {
@@ -5251,6 +5966,16 @@ def main(argv: list[str] | None = None) -> int:
         help="include a short content preview per top missed memory id "
         "(default: ids and namespaces only)",
     )
+    ap.add_argument(
+        "--fleet",
+        action="store_true",
+        help="issue #291: add the seven fleet checks (hub reachability, "
+        "hello compatibility, principal validity, op-queue depth/oldest "
+        "age, snapshot age, stray local core.md in remote mode, and "
+        "full-disk encryption while a snapshot exists). The "
+        "ZMEM_FLEET_FDE_PROBE env (values on/off) overrides the "
+        "encryption probe for operators and tests.",
+    )
     args = ap.parse_args(argv)
 
     if args.cleanup_training_staging:
@@ -5301,6 +6026,7 @@ def main(argv: list[str] | None = None) -> int:
         confirm_no_training_export=args.confirm_no_training_export,
         now=_now_override,
         expiring=expiring_horizon,
+        fleet=args.fleet,
     )
     human = _render_human(report)
     payload = json.dumps(report, indent=2, sort_keys=True)

@@ -22,8 +22,12 @@ to branch on host. Override the shared store location with the `ZMEM_DATA` env
 var (or the CC plugin's `storeDirectory` userConfig setting) if `~/.zmem`
 isn't where you want it.
 
-**Phase-1 limitation:** keep one canonical physical store path on one machine.
-Do not let different hosts silently fan out to different physical stores.
+**Fleet topology:** the single-machine default is one canonical store per
+machine, but a multi-machine fleet runs ONE authoritative hub with a broker
+on every other machine — installers, per-machine principals, `doctor
+--fleet`, backup, and the migration runbook live in
+[docs/FLEET.md](docs/FLEET.md) (issue #291; the fleet install scripts are
+under `scripts/fleet/`).
 
 ## What it does
 
@@ -1600,6 +1604,8 @@ committed snapshot up to a full sync-repo read/write loop: see
 
 - Keep **one canonical physical store path** per machine. If two hosts resolve
   to different physical stores, that is a cutover failure, not a supported mode.
+  (Fleet deployments — one authoritative hub plus broker machines — are the
+  documented exception; see [docs/FLEET.md](docs/FLEET.md).)
 - Backups and restores are first-class maintenance commands:
   `<interpreter> <store.py> backup` and `<interpreter> <store.py> restore --from <snapshot> --force`.
   Run restores when no session is actively writing.
