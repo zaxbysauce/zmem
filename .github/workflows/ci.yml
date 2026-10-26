@@ -234,16 +234,22 @@ jobs:
 
       # Issue #291 (Workstream T PR 12): the fleet-operator checks are
       # module-level pytest functions with a __main__ runner (added after
-      # review found CI executed zero assertions from them). The guard pins
-      # the transport-exercising tests to a PASS verdict — the #159/#291
-      # rule "the mcp dependency must be exercised on every matrix leg".
-      # A blanket any-SKIP-scan would false-fire on the sanctioned
-      # environment skip (the installer-statics bash probe skips on Windows
-      # runners where `bash` resolves to the non-functional WSL stub).
+      # review found CI executed zero assertions from them). Three detectors,
+      # each proving one thing: (1) `import mcp` gates the dependency is
+      # installed on the leg; (2) the SKIP scan proves an mcp-missing skip
+      # cannot hide behind exit 0 — with ONE test-scoped exemption,
+      # test_installer_statics, whose bash probe legitimately skips on
+      # Windows runners (`bash` resolves to the non-functional WSL stub);
+      # (3) the PASS pins prove the transport-exercising tests ran green
+      # rather than silently doing nothing (issues #159/#291).
       - name: Fleet operator checks (skip-guarded)
         shell: bash
         run: |
           set -e
+          python -c "import mcp" || {
+            echo "::error::t12: the mcp dependency is not importable on this leg (issues #159/#291)"
+            exit 1
+          }
           out="$(python tests/test_t12_fleet_ops.py 2>&1)" || {
             printf '%s\n' "$out"
             exit 1
@@ -254,12 +260,18 @@ jobs:
             exit 1
           }
           printf '%s\n' "$out2"
+          nonsanctioned="$(printf '%s\n%s\n' "$out" "$out2" | grep -E '^SKIP:' | grep -v '^SKIP: test_installer_statics' || true)"
+          if [ -n "$nonsanctioned" ]; then
+            printf '%s\n' "$nonsanctioned"
+            echo "::error::t12 fleet operator checks skipped - the mcp dependency must be exercised on every matrix leg (issues #159/#291)"
+            exit 1
+          fi
           for t in test_doctor_fleet_checks_present \
                    test_hello_real_transport_401_is_a_failure \
                    test_broker_credential_file_resolves_through_transport \
                    test_hermes_store_config_refusal_propagates; do
             if ! printf '%s\n%s\n' "$out" "$out2" | grep -q "^PASS $t\$"; then
-              echo "::error::t12 fleet operator checks: '$t' did not PASS - the mcp dependency must be exercised on every matrix leg (issues #159/#291)"
+              echo "::error::t12 fleet operator checks: '$t' did not PASS (issues #159/#291)"
               exit 1
             fi
           done
