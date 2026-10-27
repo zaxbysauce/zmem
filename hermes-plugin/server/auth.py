@@ -675,17 +675,19 @@ def _parse_principal_map(raw: str, source: str) -> dict:
 # the synthesized shapes defer to the DACL leg.
 _WINDOWS_SYNTHESIZED_MODES = frozenset({0o666, 0o444})
 
-# Owner-relative Windows policy: an allow-ACE is exempt only when its SID is
-# the file OWNER, SYSTEM (S-1-5-18), or Administrators (S-1-5-32-544) — what
-# a locked-down install grants. Any other allow-ACE principal is exposure.
-# NARROWED (implementation probe, issue #406): real Windows user-profile
-# directories inherit allow-ACEs for machine-local SIDs (S-1-5-21-*) that do
-# not resolve to any broad principal — per-app capability SIDs and sandbox
-# groups on the SAME machine — so an owner-relative policy false-refuses
-# every legitimate developer/CI map. The enforceable boundary that still
-# matches the installers' refusal contract (install-hub.ps1) is the
-# well-known BROAD principals; the verdict text says exactly that and never
-# claims owner-only.
+# Windows verdict policy (issue #406): an allow-ACE is exposure when its
+# SID is one of the well-known BROAD principals — Everyone (S-1-1-0),
+# BUILTIN\Users (S-1-5-32-545), Authenticated Users (S-1-5-11) — exactly
+# install-hub.ps1's creation-time refusal list. An owner-relative policy
+# (refuse every non-owner ACE) was considered and REJECTED: real Windows
+# user-profile directories inherit allow-ACEs for machine-local SIDs
+# (S-1-5-21-*) that do not resolve to any broad principal — per-app
+# capability SIDs and sandbox groups on the SAME machine — so an
+# owner-relative policy false-refuses every legitimate developer/CI map.
+# The verdict text names the broad-SID list and never claims owner-only.
+# KNOWN gap vs install-hub.sh (POSIX), which additionally refuses a
+# foreign-OWNED map: the runtime ownership check was deliberately not
+# built (same narrowing decision); see the PR body's Considered table.
 _NT_BROAD_SIDS = frozenset({"S-1-1-0", "S-1-5-32-545", "S-1-5-11"})
 
 _ACCESS_ALLOWED_ACE_TYPE = 0x0
@@ -694,12 +696,17 @@ _ACCESS_ALLOWED_ACE_TYPE = 0x0
 class MapPermissionRefused(SystemExit):
     """A principal map whose file permissions expose its bearer entries.
 
-    A SystemExit subclass (exit 2, the map config-failure class) raised
-    BEFORE PrincipalMap.force_reload's generic ``except SystemExit``
-    keep-previous-map handler: a permission drift does not change file
-    content, so keeping the previous map would keep serving exactly the
-    credentials the file now exposes locally. The hub fails closed instead;
-    the README documents the supervisor restart loop and the remedy.
+    A SystemExit subclass (exit 2, the map config-failure class) used on
+    the paths where an unwind genuinely terminates the process: STARTUP
+    (wrapped into the ``_fail_map`` exit) and the POSIX SIGHUP handler
+    (``force_reload`` — a raise out of a raw signal handler exits the
+    process). The PER-REQUEST path (``maybe_reload``, called from
+    ``verify_token``) deliberately does NOT raise: uvicorn's ASGI wrapper
+    catches ``BaseException`` and would turn the refusal into an HTTP 500
+    while the hub keeps serving the exposed map, so that path terminates
+    via ``os._exit(2)`` instead, which nothing can catch. Either way the
+    hub fails closed; the README documents the supervisor restart loop
+    and the remedy.
     """
 
     def __init__(self, message: str) -> None:
@@ -822,6 +829,16 @@ def _nt_security_ace_tuples(path, fd):
             ace_addr = ace_ptr.value
             header = (ctypes.c_ubyte * 2).from_address(ace_addr)
             ace_type = header[0]
+            if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+                # Only ALLOW ACEs grant access (the policy below). Other
+                # ACE layouts (object/callback/audit) put the SID elsewhere
+                # than +8 — converting that garbage is at best noise; skip
+                # the parse entirely. KNOWN limitation, disclosed: a
+                # conditional/callback ALLOW ACE for Everyone (type 0x9)
+                # is therefore not refused even though install-hub.ps1's
+                # Get-Acl scan would refuse it (setting one needs
+                # WRITE_DAC; see the PR body's Considered table).
+                continue
             # ACCESS_ALLOWED_ACE: 4-byte header + 4-byte mask, SID at +8.
             ace_tuples.append((_sid_str(ace_addr + 8), ace_type))
         return owner_sid, ace_tuples
@@ -848,7 +865,7 @@ def _map_permission_problem(path, st, *, fd=None) -> Optional[str]:
         return None  # an authoritative finer-grained stat already decided
     try:
         owner_sid, ace_tuples = _nt_security_ace_tuples(path, fd)
-    except (OSError, ImportError, AttributeError) as exc:
+    except Exception as exc:  # noqa: BLE001 - fail-closed on ANY inspection failure
         return (f"could not inspect permissions ({type(exc).__name__}: "
                 f"{exc}); refusing rather than serve an uninspectable map")
     if ace_tuples is None:
@@ -923,6 +940,13 @@ class PrincipalMap:
         except OSError:
             _pre_st = None
         if _pre_st is not None:
+            if not _stat.S_ISREG(_pre_st.st_mode):
+                sys.stderr.write(
+                    "zmem-mcp: zmem_mcp_principal_map_permission_refused "
+                    f"{self._path} not a regular file" + chr(10))
+                raise MapPermissionRefused(
+                    f"ZMEM_MCP_TOKENS_FILE ({self._path}) is not a regular "
+                    "file — refusing rather than block the hub on it")
             _problem = _map_permission_problem(self._path, _pre_st)
             if _problem is not None:
                 sys.stderr.write(
@@ -987,16 +1011,22 @@ class PrincipalMap:
         mtime = st.st_mtime_ns
         # Issue #406: permission drift often does NOT bump mtime (chmod
         # changes ctime only), so the once-per-second stat also re-checks
-        # the permission shape; a refusal escapes verify_token and ends the
-        # process (fail-closed; README documents the supervisor behavior).
+        # the permission shape. This runs INSIDE the ASGI request path:
+        # raising here would be swallowed by uvicorn's ``except
+        # BaseException`` (HTTP 500, hub keeps serving the exposed map —
+        # probe-confirmed), so the refusal terminates the process
+        # directly. os._exit cannot be caught by any layer; the stable
+        # diagnostic line is flushed first. Fail-closed on every platform
+        # (no SIGHUP required); the supervisor's restart then hits the
+        # startup refusal and keeps the hub down until the map is fixed.
         _problem = _map_permission_problem(self._path, st)
         if _problem is not None:
             sys.stderr.write(
                 "zmem-mcp: zmem_mcp_principal_map_permission_refused "
                 f"{self._path} {_problem}" + chr(10))
-            raise MapPermissionRefused(
-                f"ZMEM_MCP_TOKENS_FILE ({self._path}) is over-permissive: "
-                f"{_problem}")
+            sys.stderr.flush()
+            sys.stdout.flush()
+            os._exit(2)
         if self._mtime is not None and mtime == self._mtime:
             return
         self.force_reload()
@@ -1044,6 +1074,12 @@ def load_principal_map(path: Optional[str] = None) -> PrincipalMap:
         st = os.stat(p)
     except OSError as exc:
         _fail_map(f"ZMEM_MCP_TOKENS_FILE ({tok_file}) unreadable: {exc}")
+    if not _stat.S_ISREG(st.st_mode):
+        # A FIFO/device at the path would BLOCK the open below (startup
+        # hang); refuse instead. os.stat follows symlinks, so a link to a
+        # regular map still passes.
+        _fail_map(f"ZMEM_MCP_TOKENS_FILE ({tok_file}) is not a regular "
+                  "file — refusing rather than block the hub on it")
     # Issue #406: the map carries bearer entries for up to 256 machines;
     # a group/world-readable file must refuse startup, never serve.
     problem = _map_permission_problem(p, st)

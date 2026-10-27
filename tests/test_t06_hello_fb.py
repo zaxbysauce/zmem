@@ -33,10 +33,13 @@ def _map_owner_only(path) -> None:
     inherited ACL (non-system drives inherit Users/Authenticated-Users
     allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
     if os.name == "nt":
-        subprocess.run(
+        r = subprocess.run(
             ["icacls", os.fspath(path), "/inheritance:r",
              "/grant", os.environ.get("USERNAME", "") + ":(F)"],
             capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
     else:
         os.chmod(os.fspath(path), 0o600)
 

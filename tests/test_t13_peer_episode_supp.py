@@ -125,9 +125,13 @@ class EpisodeResolvabilityTest(unittest.TestCase):
         rp = self._run("purge", "--id", rid)
         self.assertEqual(rp.returncode, 0, rp.stderr)
         # A later file re-stages a decoy with the same id (claiming the
-        # allowed ns) plus the episode pointer: the authored union
-        # subtracts the purged id, so the pointer must clear — mirroring
-        # the memory-pointer rule exactly.
+        # allowed ns) plus the episode pointer. OBSERVABLE CONTRACT: the
+        # pointer must land cleared. Mechanism note (honest, feedback
+        # round): the #395 purged subtraction in _peer_resolvable is
+        # backstopped here by the apply-time guard (sync.py's
+        # 'summary_id in purged_ids -> ""'), so this test pins the
+        # contract even though either guard alone would clear it; the
+        # subtraction's load-bearing consumer is the memory-pointer rule.
         decoy = _row(rid, NS, "decoy restage")
         decoy["type"] = "state"
         r = self._ingest_peer([decoy, _episode(eid, rid)])

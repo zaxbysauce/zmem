@@ -266,6 +266,18 @@ jobs:
             echo "::error::t12 fleet operator checks skipped - the mcp dependency must be exercised on every matrix leg (issues #159/#291)"
             exit 1
           fi
+          out3="$(python tests/test_t12_map_perms.py 2>&1)" || {
+            printf '%s\n' "$out3"
+            echo "::error::t12 map-permission driver (doctor leg) failed - the fleet-principal lane must fail an over-permissive map on every matrix leg (issue #406)"
+            exit 1
+          }
+          printf '%s\n' "$out3"
+          out4="$(python tests/test_t12_map_perms.py --hub-refusal 2>&1)" || {
+            printf '%s\n' "$out4"
+            echo "::error::t12 map-permission driver (hub refusal leg) failed - the hub must refuse an over-permissive map at load and reload on every matrix leg (issue #406)"
+            exit 1
+          }
+          printf '%s\n' "$out4"
           for t in test_doctor_fleet_checks_present \
                    test_hello_real_transport_401_is_a_failure \
                    test_broker_credential_file_resolves_through_transport \

@@ -4942,7 +4942,7 @@ def _nt_security_ace_tuples(path, fd):
         if p_sd.value:  # defensive: free a descriptor the API may have
             # allocated before failing (reviewer nit — leak window closed)
             ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(p_sd.value))
-        raise OSError(f"GetSecurityInfo failed (winerror {rc})")
+        raise OSError(f"Win32 security query failed (winerror {rc})")
 
     def _sid_str(sid_addr):
         """SID string for a raw address, or raises."""
@@ -4988,6 +4988,13 @@ def _nt_security_ace_tuples(path, fd):
             ace_addr = ace_ptr.value
             header = (ctypes.c_ubyte * 2).from_address(ace_addr)
             ace_type = header[0]
+            if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+                # Parity with auth.py: only ALLOW ACEs grant access; other
+                # ACE layouts put the SID elsewhere than +8 — skip the
+                # parse. KNOWN limitation: a conditional/callback ALLOW ACE
+                # for Everyone (type 0x9) is not refused (setting one needs
+                # WRITE_DAC; PR body Considered table).
+                continue
             # ACCESS_ALLOWED_ACE: 4-byte header + 4-byte mask, SID at +8.
             ace_tuples.append((_sid_str(ace_addr + 8), ace_type))
         return owner_sid, ace_tuples
@@ -5014,7 +5021,7 @@ def _map_permission_problem(path, st, *, fd=None):
         return None  # an authoritative finer-grained stat already decided
     try:
         owner_sid, ace_tuples = _nt_security_ace_tuples(path, fd)
-    except (OSError, ImportError, AttributeError) as exc:
+    except Exception as exc:  # noqa: BLE001 - fail-closed on ANY inspection failure
         return (f"could not inspect permissions ({type(exc).__name__}: "
                 f"{exc}); failing rather than pass an uninspectable map")
     if ace_tuples is None:
@@ -5037,41 +5044,49 @@ def _check_fleet_principal(hello: tuple[str, str, dict]) -> dict:
         # are never reported.
         tok_file = (os.environ.get("ZMEM_MCP_TOKENS_FILE", "") or "").strip()
         path = Path(tok_file).expanduser()
+        # Issue #406 (feedback round): the permission verdict runs BEFORE
+        # any bearer content is read — an exposure verdict must never be
+        # masked by a content failure, and the diagnostic must not pull
+        # bearer material out of a file it is declaring exposed. The
+        # verdict is NAME-based (os.stat + path ACL query — the frozen AC1
+        # driver's os.stat contract); the hub's load/reload path is the
+        # handle-based enforcement.
+        try:
+            _st = os.stat(path)
+        except OSError as exc:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) os.stat failed "
+                          f"for the permission verdict: {exc}",
+                          principal_count=0)
+        if not _stat.S_ISREG(_st.st_mode):
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({str(path)}) is not a "
+                          "regular file — refusing rather than read it",
+                          principal_count=0)
+        _perm_problem = _map_permission_problem(path, _st)
+        if _perm_problem is not None:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({str(path)}) permission is "
+                          f"over-permissive: {_perm_problem}",
+                          principal_count=0)
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError as exc:
             return _check("fleet-principal", "fail",
-                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) unreadable: "
+                          f"ZMEM_MCP_TOKENS_FILE ({str(path)}) unreadable: "
                           f"{exc}")
         except UnicodeDecodeError as exc:
             return _check("fleet-principal", "fail",
-                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) is not valid "
+                          f"ZMEM_MCP_TOKENS_FILE ({str(path)}) is not valid "
                           f"UTF-8: {exc}")
         if len(raw) > 4 * 1024 * 1024:
             return _check("fleet-principal", "fail",
-                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) exceeds the "
+                          f"ZMEM_MCP_TOKENS_FILE ({str(path)}) exceeds the "
                           "4 MiB diagnostic read cap.")
         problems, count = _fleet_principal_map_problems(raw)
         if problems:
             return _check("fleet-principal", "fail",
                           "; ".join(problems[:3]),
-                          principal_count=count)
-        # Issue #406: content-valid is not enough — the map carries bearer
-        # entries, so its FILE permission shape gets the same verdict the
-        # hub enforces at load/reload and the installers enforce at
-        # creation (mode 0600 / no broad allow ACE).
-        try:
-            _st = os.stat(path)
-        except OSError as exc:
-            return _check("fleet-principal", "fail",
-                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) could not be "
-                          f"stat-ted for the permission verdict: {exc}",
-                          principal_count=count)
-        _perm_problem = _map_permission_problem(path, _st)
-        if _perm_problem is not None:
-            return _check("fleet-principal", "fail",
-                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) permission is "
-                          f"over-permissive: {_perm_problem}",
                           principal_count=count)
         return _check("fleet-principal", "pass",
                       f"Principal map valid ({count} principals).",

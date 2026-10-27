@@ -228,8 +228,11 @@ def _strip_attribution(tags: Any) -> str:
     from storelib.entity import split_tag_tokens
     if not isinstance(tags, str) or not tags:
         return tags if isinstance(tags, str) else ""
+    # Typed entity forms mint host/agent entities exactly like the bare
+    # prefixes (issue #395 feedback round) — strip both families.
     kept = [t for t in split_tag_tokens(tags)
-            if not t.lower().startswith(("host:", "agent:"))]
+            if not t.lower().startswith(("host:", "agent:",
+                                         "entity:host:", "entity:agent:"))]
     return ",".join(kept)
 
 

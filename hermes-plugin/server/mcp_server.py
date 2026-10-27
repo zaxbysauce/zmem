@@ -1693,7 +1693,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         )
         return resolved if resolved is not None else deny_all_principal()
 
-    _ATTRIBUTION_TAG_PREFIXES = ("host:", "agent:")
+    # Typed entity forms mint host/agent entities through the extractor
+    # exactly like the bare prefixes (issue #395 feedback round: probe
+    # showed 'entity:host:evil' survives a bare-prefix strip and still
+    # extracts ('host', 'evil')), so the strip refuses both families.
+    # Host/agent identity is SERVER-derived (issue #281) — a client never
+    # gets to mint either kind, typed or not.
+    _ATTRIBUTION_TAG_PREFIXES = ("host:", "agent:",
+                                 "entity:host:", "entity:agent:")
 
     # -- issue #285: protocol gate + hello handshake ------------------------
 

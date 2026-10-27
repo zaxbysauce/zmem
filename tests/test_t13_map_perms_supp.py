@@ -28,10 +28,13 @@ def _map_owner_only(path) -> None:
     inherited ACL (non-system drives inherit Users/Authenticated-Users
     allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
     if os.name == "nt":
-        subprocess.run(
+        r = subprocess.run(
             ["icacls", os.fspath(path), "/inheritance:r",
              "/grant", os.environ.get("USERNAME", "") + ":(F)"],
             capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
     else:
         os.chmod(os.fspath(path), 0o600)
 
@@ -238,19 +241,52 @@ class RefusalBehaviorTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 pm.force_reload()
 
-    def test_maybe_reload_catches_mtime_preserving_drift(self):
-        """chmod changes ctime, not mtime — the once-per-second stat still
-        re-checks the permission shape (issue #406 claim 2)."""
+    def test_maybe_reload_refusal_terminates_via_os_exit(self):
+        """PRR-001 (swarm-pr-review round): the per-request refusal must
+        TERMINATE THE PROCESS, not raise — uvicorn's ASGI wrapper catches
+        BaseException, so a plain raise degrades to HTTP 500 while the
+        exposed map keeps serving. maybe_reload calls os._exit(2); this
+        test discriminates that mechanism (a revert to `raise` fails here
+        because SystemExit is not the sentinel). chmod changes ctime, not
+        mtime — the once-per-second stat still re-checks the shape, and
+        the rate-limit gate is cleared first."""
+        import time
         auth = self._auth()
         p = _write_map(self._tmp)
         pm = auth.load_principal_map(str(p))
-        # The 1s reload rate-limit gate precedes the stat; move past it.
-        import time
-        time.sleep(1.1)
-        with _stat_mode_for(str(p), 0o100644):  # mtime preserved by the patch
-            with self.assertRaises(SystemExit) as ctx:
+        time.sleep(1.1)  # move past the 1s maybe_reload rate-limit gate
+        real_stat = os.stat
+        target = str(p)
+
+        class _ProcessExited(AssertionError):
+            pass
+
+        def _fake_exit(code):
+            raise _ProcessExited(f"os._exit({code})")
+
+        def _patched(arg, *a, **kw):
+            try:
+                hit = os.fspath(arg) == target
+            except TypeError:
+                hit = False
+            if not hit:
+                return real_stat(arg, *a, **kw)
+            real = real_stat(arg, *a, **kw)
+            fields = list(tuple(real)[:10])
+            fields[0] = 0o100644
+            return os.stat_result(
+                tuple(fields), {"st_mtime_ns": real.st_mtime_ns})
+
+        real_exit = os._exit
+        os.stat = _patched
+        os._exit = _fake_exit
+        try:
+            with self.assertRaises(_ProcessExited) as ctx:
                 pm.maybe_reload()
-        self.assertIsInstance(ctx.exception, auth.MapPermissionRefused)
+        finally:
+            os.stat = real_stat
+            os._exit = real_exit
+        self.assertIn("os._exit(2)", str(ctx.exception))
 
     def test_permission_refusal_class_not_softened(self):
         auth = self._auth()
@@ -280,12 +316,23 @@ class RealDaclTest(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp(prefix="zmem-t13-dacl-")
-        os.environ.pop("ZMEM_MCP_TOKEN", None)
-        os.environ.pop("ZMEM_MCP_TOKEN_FILE", None)
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(self._tmp, True))
+        self._saved_env = {k: os.environ.get(k) for k in (
+            "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE", "ZMEM_MCP_TOKENS_FILE")}
+        self.addCleanup(self._restore_env)
+        for k in self._saved_env:
+            os.environ.pop(k, None)
+
+    def _restore_env(self):
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def tearDown(self):
-        import shutil
-        shutil.rmtree(self._tmp, ignore_errors=True)
+        pass
 
     def test_owner_only_temp_file_loads(self):
         auth = self._auth()
@@ -311,6 +358,27 @@ class RealDaclTest(unittest.TestCase):
             subprocess.run(["icacls", str(p), "/remove", "Everyone"],
                            capture_output=True, timeout=30)
 
+    def test_doctor_lane_fails_everyone_ace(self):
+        """PRR-003 companion: the DOCTOR copy of the verdict (its own
+        ctypes walker, its own lane) must fail a map carrying a broad
+        Everyone allow ACE — never executed anywhere before this."""
+        doctor = _load("zmem_t13_perms_doctor", DOCTOR_PY)
+        p = _write_map(self._tmp)
+        r = subprocess.run(
+            ["icacls", str(p), "/grant", "Everyone:(R)"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.environ["ZMEM_MCP_TOKENS_FILE"] = str(p)
+        try:
+            result = doctor._check_fleet_principal(("pass", "hello ok", {}))
+        finally:
+            os.environ.pop("ZMEM_MCP_TOKENS_FILE", None)
+            subprocess.run(["icacls", str(p), "/remove", "Everyone"],
+                           capture_output=True, timeout=30)
+        self.assertEqual(result.get("status"), "fail", result)
+        self.assertIn("over-permissive", str(result.get("summary", "")).lower(),
+                      result)
+
     def test_inspection_error_refuses_fail_closed(self):
         auth = self._auth()
         p = _write_map(self._tmp)
@@ -331,18 +399,90 @@ class RealDaclTest(unittest.TestCase):
             auth._nt_security_ace_tuples = real
 
 
+class DoctorVerdictTest(unittest.TestCase):
+    """PRR-003: doctor's OWN copy of the #406 verdict must fail an
+    over-permissive map — asserted in pytest form (the frozen driver's
+    pytest classes early-return when the verdict is absent, and CI never
+    ran its argv-gated legs, so the doctor half had zero mutation-killing
+    coverage)."""
+
+    def _doctor(self):
+        return _load("zmem_t13_perms_doctor2", DOCTOR_PY)
+
+    def _run_lane(self, tmp, stat_mode=None):
+        doctor = self._doctor()
+        p = _write_map(tmp)
+        saved = {k: os.environ.get(k) for k in (
+            "ZMEM_MCP_TOKENS_FILE", "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE")}
+        os.environ["ZMEM_MCP_TOKENS_FILE"] = str(p)
+        os.environ.pop("ZMEM_MCP_TOKEN", None)
+        os.environ.pop("ZMEM_MCP_TOKEN_FILE", None)
+        try:
+            if stat_mode is None:
+                return doctor._check_fleet_principal(("pass", "hello ok", {}))
+            with _stat_mode_for(str(p), stat_mode):
+                return doctor._check_fleet_principal(
+                    ("pass", "hello ok", {}))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_overpermissive_map_fails(self):
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="zmem-t13-docverdict-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, True))
+        result = self._run_lane(tmp, stat_mode=0o100644)
+        self.assertEqual(result.get("status"), "fail", result)
+        self.assertIn("over-permissive",
+                      str(result.get("summary", "")).lower(), result)
+
+    def test_owner_only_map_passes(self):
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="zmem-t13-docverdict-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, True))
+        result = self._run_lane(tmp)
+        self.assertEqual(result.get("status"), "pass", result)
+
+    @unittest.skipUnless(os.name == "nt", "NULL-DACL leg is nt-only")
+    def test_null_dacl_refused(self):
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="zmem-t13-docverdict-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, True))
+        doctor = self._doctor()
+        real = doctor._nt_security_ace_tuples
+
+        def _null(path, fd):
+            return "S-1-5-21-9-9-9-9", None
+
+        doctor._nt_security_ace_tuples = _null
+        try:
+            p = _write_map(tmp)
+            os.environ["ZMEM_MCP_TOKENS_FILE"] = str(p)
+            result = doctor._check_fleet_principal(
+                ("pass", "hello ok", {}))
+        finally:
+            os.environ.pop("ZMEM_MCP_TOKENS_FILE", None)
+            doctor._nt_security_ace_tuples = real
+        self.assertEqual(result.get("status"), "fail", result)
+        self.assertIn("null", str(result.get("summary", "")).lower(), result)
+
+
 class PerRequestRefusalTest(unittest.TestCase):
     """The refusal escapes verify_token as process termination (round-2
     plan-critic finding R2-F5) — proven in a subprocess so the SystemExit
     cannot be absorbed by the test runner."""
 
     CHILD = r'''
-import contextlib, importlib.util, json, os, sys, tempfile
+import contextlib, importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location("authchild", sys.argv[1])
 auth = importlib.util.module_from_spec(spec)
 sys.modules["authchild"] = auth
 spec.loader.exec_module(auth)
-tmp = tempfile.mkdtemp(prefix="t13-verify-")
+tmp = sys.argv[2]  # parent-owned dir; the parent removes it (the child
+# ends in os._exit, which cannot clean up)
 p = os.path.join(tmp, "tokens.json")
 with open(p, "w", encoding="utf-8") as f:
     json.dump({"supp-secret-token-1": {
@@ -351,10 +491,13 @@ with open(p, "w", encoding="utf-8") as f:
 def _pin_owner_only(path):
     import subprocess
     if os.name == "nt":
-        subprocess.run(
+        r = subprocess.run(
             ["icacls", path, "/inheritance:r",
              "/grant", os.environ.get("USERNAME", "") + ":(F)"],
             capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
     else:
         os.chmod(path, 0o600)
 
@@ -384,11 +527,17 @@ print("UNREACHABLE: verify_token returned after permission drift")
 '''
 
     def test_verify_token_drift_terminates_nonzero(self):
+        """Covers verify_token -> maybe_reload under mtime-preserving
+        permission drift (the once-per-second stat re-check) and asserts
+        the ASGI-level contract from the PRR-001 fix: the child process
+        TERMINATES nonzero with the stable refusal line — with os._exit(2)
+        no ASGI layer can swallow the refusal into a 500."""
         import time
-        child = Path(self._tmp_child())
+        child, child_dir = self._tmp_child()
         child.write_text(self.CHILD, encoding="utf-8")
         r = subprocess.run(
-            [sys.executable, "-X", "utf8", str(child), str(AUTH_PY)],
+            [sys.executable, "-X", "utf8", str(child), str(AUTH_PY),
+             child_dir],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=120, cwd=str(REPO_ROOT))
         self.assertNotEqual(r.returncode, 0,
@@ -400,7 +549,7 @@ print("UNREACHABLE: verify_token returned after permission drift")
     def _tmp_child(self):
         d = tempfile.mkdtemp(prefix="zmem-t13-verify-")
         self.addCleanup(lambda: __import__("shutil").rmtree(d, True))
-        return str(Path(d) / "child.py")
+        return Path(d) / "child.py", d
 
 
 @unittest.skipUnless(hasattr(__import__("signal"), "SIGHUP"),
@@ -410,12 +559,12 @@ class SighupRefusalTest(unittest.TestCase):
     with the refusal text (plan R3 lifecycle leg)."""
 
     CHILD_TEMPLATE = r'''
-import importlib.util, json, os, signal, sys, tempfile, time
+import importlib.util, json, os, signal, sys, time
 spec = importlib.util.spec_from_file_location("authchild", sys.argv[1])
 auth = importlib.util.module_from_spec(spec)
 sys.modules["authchild"] = auth
 spec.loader.exec_module(auth)
-tmp = tempfile.mkdtemp(prefix="t13-sighup-")
+tmp = sys.argv[2]
 p = os.path.join(tmp, "tokens.json")
 with open(p, "w", encoding="utf-8") as f:
     json.dump({"supp-secret-token-1": {
@@ -424,10 +573,13 @@ with open(p, "w", encoding="utf-8") as f:
 def _pin_owner_only(path):
     import subprocess
     if os.name == "nt":
-        subprocess.run(
+        r = subprocess.run(
             ["icacls", path, "/inheritance:r",
              "/grant", os.environ.get("USERNAME", "") + ":(F)"],
             capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
     else:
         os.chmod(path, 0o600)
 
@@ -456,10 +608,12 @@ print("UNREACHABLE: survived SIGHUP reload of a drifted map")
 '''
 
     def test_sighup_drift_terminates_nonzero(self):
-        child = Path(tempfile.mkdtemp(prefix="zmem-t13-sighup-")) / "child.py"
+        d = tempfile.mkdtemp(prefix="zmem-t13-sighup-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, True))
+        child = Path(d) / "child.py"
         child.write_text(self.CHILD_TEMPLATE, encoding="utf-8")
         r = subprocess.run(
-            [sys.executable, "-X", "utf8", str(child), str(AUTH_PY)],
+            [sys.executable, "-X", "utf8", str(child), str(AUTH_PY), d],
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=120, cwd=str(REPO_ROOT))
         self.assertNotEqual(r.returncode, 0)

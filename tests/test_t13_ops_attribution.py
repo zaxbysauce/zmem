@@ -23,10 +23,13 @@ def _map_owner_only(path) -> None:
     inherited ACL (non-system drives inherit Users/Authenticated-Users
     allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
     if os.name == "nt":
-        subprocess.run(
+        r = subprocess.run(
             ["icacls", os.fspath(path), "/inheritance:r",
              "/grant", os.environ.get("USERNAME", "") + ":(F)"],
             capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
     else:
         os.chmod(os.fspath(path), 0o600)
 
@@ -58,13 +61,23 @@ class OpsAttributionGrammarTest(unittest.TestCase):
 
     def test_case_varied_and_noncomma_forms_stripped(self):
         out = self._strip("Host:evil,x;host:evil2, agent:legit-ish,plain")
-        lowered = out.lower()
-        self.assertNotIn("host:", lowered.replace("host:", "", 0))
         for token in out.split(","):
             self.assertFalse(
-                token.lower().startswith(("host:", "agent:")),
+                token.lower().startswith(("host:", "agent:",
+                                          "entity:host:", "entity:agent:")),
                 f"forged token survived: {token!r} in {out!r}")
         self.assertIn("plain", out)
+
+    def test_typed_entity_forms_stripped(self):
+        """PRR-002: the typed entity forms mint host/agent entities
+        exactly like the bare prefixes — the strip refuses both."""
+        out = self._strip("entity:host:evil,entity:agent:bot,keep-me")
+        for token in out.split(","):
+            self.assertFalse(
+                token.lower().startswith(("host:", "agent:",
+                                          "entity:host:", "entity:agent:")),
+                f"forged token survived: {token!r} in {out!r}")
+        self.assertIn("keep-me", out)
 
     def test_denied_shape_and_empty(self):
         self.assertEqual(self._strip(""), "")
@@ -180,6 +193,41 @@ class McpSeparatorNormalizationPinTest(unittest.TestCase):
             else:
                 os.environ[k] = v
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_typed_forged_form_stripped_at_add(self):
+        """PRR-002 at the MCP surface: a client-supplied
+        'entity:host:evil' tag must not survive the add strip (it would
+        mint the forged host entity through the extractor)."""
+        import asyncio
+        import sqlite3
+        server = self.mcp_server.build_server(host="127.0.0.1", port=0,
+                                              use_tls=False)
+        verifier = self.mcp_server.resolve_token_auth()[0]
+        access_token = asyncio.run(verifier.verify_token("norm-secret-token"))
+        self.assertIsNotNone(access_token)
+        from mcp.server.auth.middleware.auth_context import auth_context_var
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+        async def call():
+            return await server._tool_manager.call_tool(
+                "add", {"type": "fact", "content": "typed forge probe",
+                        "namespace": "project:norm",
+                        "tags": "entity:host:evil,entity:agent:bot,ok-tag"},
+                context=None)
+        ctx = auth_context_var.set(AuthenticatedUser(access_token))
+        try:
+            out = asyncio.run(call())
+        finally:
+            auth_context_var.reset(ctx)
+        payload = out[0] if isinstance(out, tuple) else out
+        row_id = payload.get("id")
+        conn = sqlite3.connect(os.path.join(self._tmp, "store.sqlite"))
+        tags = conn.execute(
+            "SELECT tags FROM memory WHERE id=?", (row_id,)).fetchone()[0]
+        conn.close()
+        toks = set(tags.split(","))
+        self.assertEqual(toks, {"ok-tag",
+                                "host:norm-host", "agent:claude"})
 
     def test_benign_multiseparator_tags_normalize_to_commas(self):
         import asyncio

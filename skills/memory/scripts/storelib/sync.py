@@ -2024,11 +2024,10 @@ def _strict_ingest_staged(
         # is not in `memory` (so it slips past pre_existing) but never lands
         # at apply time (purged_denied), which would leave a kept pointer to
         # a row that was never created. PR #393 review V10-note: the
-        # EPISODE-summary rule below is NOT this rule — it still consults
-        # the full staged CLAIMED-namespace map, so an episode pointer can
-        # resolve a decoy-collided foreign id that a memory pointer here
-        # would refuse; that pre-existing gap is filed separately and the
-        # old "the rules resolve the same way" claim was false.
+        # EPISODE-summary rule below WAS not this rule (it consulted the full
+        # staged CLAIMED-namespace map) — that pre-existing gap was closed
+        # by issue #395 (the episode fallback now resolves via
+        # _peer_resolvable like this rule).
         # PR #393 review V1: the authored union must never let a peer author
         # a lineage CYCLE. A self-pointer (update_of == own id) or an A<->B
         # pair inside the authored set would survive the clamp below and
