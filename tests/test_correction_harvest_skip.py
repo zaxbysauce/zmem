@@ -384,5 +384,156 @@ class FencedObjectShapeTest(unittest.TestCase):
         self.assertFalse(corrections.is_harvest_paste(
             "short genuine correction text without any fence"))
 
+
+class CRLFAndHardeningTest(unittest.TestCase):
+    """PR #407 review round (PRR-002): a CRLF-fenced harvest paste — any
+    Windows-originated editor output — used to bypass the gate because the
+    fence regex pinned a bare LF; line endings are normalized now. Also
+    pins the RecursionError fail-closed leg (deeply nested `[` bait must
+    classify as not-harvest, never raise)."""
+
+    HARVEST_OBJ = {"namespace": "p:x", "type": "lesson",
+                   "content": "c" * 400, "signal": "test"}
+
+    def test_crlf_fenced_harvest_still_gated(self):
+        import corrections
+        lf = ("see below\n```json\n"
+              + json.dumps(self.HARVEST_OBJ) + "\n```")
+        self.assertTrue(corrections.is_harvest_paste(lf))
+        self.assertTrue(corrections.is_harvest_paste(lf.replace("\n", "\r\n")),
+                        "a CRLF-fenced harvest paste must be gated exactly "
+                        "like its LF twin")
+
+    def test_crlf_genuine_control_ungated(self):
+        import corrections
+        genuine = ("the store.py add command needs an explicit --id flag "
+                   "or it errors — ran into this twice today, the flag is "
+                   "required not positional " + "x" * 420)
+        self.assertFalse(corrections.is_harvest_paste(genuine))
+        self.assertFalse(corrections.is_harvest_paste(
+            genuine.replace("\n", "\r\n")))
+
+    def test_deeply_nested_bait_fails_closed(self):
+        import corrections
+        bait = "note\n```json\n" + "[" * 3000 + "\n```\n" + "pad" * 200
+        self.assertFalse(corrections.is_harvest_paste(bait))
+
+
+class QueueLaneParityTest(unittest.TestCase):
+    """PR #407 review F6-1: every transcript-driven correction-queue writer
+    must apply the harvest gate. Structural pin: each `append_queue(` call
+    site either carries an is_harvest_paste reference within its enclosing
+    30 lines (call-form window — prose mentions cannot satisfy it) or is a
+    documented OPERATOR-AUTHORITATIVE site (queue-add: the human typed the
+    message as argv; nothing transcript-driven reaches it)."""
+
+    # Content-based exemption: queue-add is the explicit operator argv
+    # subcommand (not a transcript lane); its append sits beside the
+    # QUEUE_ADD_SOURCE marker.
+    OPERATOR_MARKER = "QUEUE_ADD_SOURCE"
+
+    def test_every_append_queue_site_is_gated(self):
+        repo = Path(__file__).resolve().parents[1]
+        for rel in ("skills/memory/scripts/storelib/retain.py",
+                    "skills/memory/scripts/storelib/mine.py"):
+            src = (repo / rel).read_text(encoding="utf-8")
+            lines = src.splitlines()
+            sites = [i for i, ln in enumerate(lines)
+                     if "append_queue(" in ln and "import" not in ln
+                     and not ln.lstrip().startswith("#")]
+            self.assertTrue(sites, f"{rel}: no append_queue sites found")
+            non_exempt = [
+                i for i in sites
+                if self.OPERATOR_MARKER not in
+                "\n".join(lines[max(0, i - 10):i + 10])
+            ]
+            if not non_exempt:
+                continue
+            # Call-form gate references only (imports, prose, AND
+            # commented-out lines cannot satisfy — a commented gate is a
+            # disabled gate).
+            gates = [i for i, ln in enumerate(lines)
+                     if "is_harvest_paste(" in ln and "import" not in ln
+                     and not ln.lstrip().startswith("#")]
+            self.assertGreaterEqual(
+                len(gates), len(non_exempt),
+                f"{rel}: {len(non_exempt)} transcript-driven append sites "
+                f"but only {len(gates)} harvest-gate call sites")
+            self.assertLess(
+                gates[0], non_exempt[0],
+                f"{rel}: the first harvest gate must precede the first "
+                f"append site (messages are gated at intake, before any "
+                f"queue write)")
+            # Adjacent pairing: every non-exempt site has a gate within 30
+            # lines above it, OR the file gates at a single intake point
+            # that precedes all sites (retain gates the extracted text
+            # itself, long before the append).
+            for i in non_exempt:
+                adjacent = any(0 <= i - g <= 30 for g in gates)
+                intake = gates[0] < i
+                self.assertTrue(
+                    adjacent or (len(gates) == 1 and intake),
+                    f"{rel}:{i + 1}: no harvest gate adjacent and no "
+                    f"single intake gate preceding it")
+
+    def test_mine_queue_mined_skips_harvest_and_counts_it(self):
+        """Behavioral leg (critic re-gate): _queue_mined must skip a harvest
+        paste, queue the genuine candidate, and COUNT the skip distinctly in
+        the summary — never folded into 'already present'."""
+        import importlib.util
+        tmp = tempfile.mkdtemp(prefix="zmem-harvest-qm-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        sys.path.insert(0, str(SCRIPTS))
+        saved = {k: os.environ.get(k) for k in
+                 ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODEL_AUTODOWNLOAD")}
+        os.environ.update({
+            "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+            "ZMEM_DATA": tmp,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        })
+        try:
+            for m in [k for k in list(sys.modules)
+                      if k == "storelib" or k.startswith("storelib.")]:
+                del sys.modules[m]
+            spec = importlib.util.spec_from_file_location(
+                "mine_harvest_probe", SCRIPTS / "storelib" / "mine.py")
+            mine = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mine)
+            harvest = ("session harvest below\n```json\n["
+                       + json.dumps({"namespace": "project:x",
+                                     "type": "lesson",
+                                     "content": "c" * 420,
+                                     "signal": "test"})
+                       + "]\n```")
+            report = {"corrections": [
+                {"message": harvest, "type": "correction",
+                 "confidence": 0.8},
+                {"message": "the deploy script needs PYTHONUTF8=1 or it "
+                            "crashes on unicode arrows",
+                 "type": "correction", "confidence": 0.8},
+            ]}
+            import io as _io
+            import contextlib as _contextlib
+            buf = _io.StringIO()
+            with _contextlib.redirect_stdout(buf):
+                rc = mine._queue_mined(report, host="claude")
+            self.assertEqual(rc, 0)
+            summary = buf.getvalue()
+            self.assertIn("1 harvest-paste skipped", summary,
+                          "the gate skip must be counted distinctly, never "
+                          "folded into 'already present'")
+            self.assertIn("0 already present", summary)
+            qfiles = list((Path(tmp) / "queue").glob("*.json"))
+            self.assertEqual(len(qfiles), 1, "exactly one namespace queue")
+            items = json.loads(qfiles[0].read_text(encoding="utf-8"))
+            self.assertEqual(len(items), 1,
+                             "only the genuine candidate queues")
+            self.assertNotIn("```", items[0].get("message", ""))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1139,12 +1139,9 @@ def _hostless_project_warning(warns: list, namespace: str) -> None:
             f"from scope-resolved recall; the canonical form is "
             f"{canonical!r} (issue #246)"),
     })
-    print(
-        f"[zmem] namespace near-miss: {namespace!r} has no host segment and "
-        f"is unreachable from scope-resolved recall; the canonical form is "
-        f"{canonical!r} (the row still stores; see issue #246)",
-        file=sys.stderr,
-    )
+    # The stderr line is printed ONCE by the structured-warning emission
+    # (_emit_capture_policy_warnings); a direct print here doubled it
+    # (PR #407 review, write-path guards findings).
 
 
 def _conditional_contradiction_scan(conn, namespace: str, content: str,

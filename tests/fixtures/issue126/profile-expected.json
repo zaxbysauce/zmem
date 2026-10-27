@@ -97,7 +97,7 @@
   },
   "metrics": {
     "hit_at_k": 1.0,
-    "precision_at_k": 0.8743464052287582,
+    "precision_at_k": 0.8792483660130719,
     "false_injection_rate": 0.0,
     "empty_pool_rate": 0.08035714285714286,
     "mrr": 0.9901960784313726,
@@ -122,7 +122,7 @@
       "positive_items": 65,
       "negative_items": 6,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.8582051282051282,
+      "precision_at_k": 0.8658974358974358,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.08450704225352113,
       "mrr": 1.0,

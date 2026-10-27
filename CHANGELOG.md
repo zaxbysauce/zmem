@@ -33,7 +33,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   canonicalized to `python`. The `compose(prompt, "plainword")` identity
   pin is updated to the new contract (a bare allowlisted word rides the
   tail); derived vocabulary never contains such words, so gold-item
-  queries are unaffected.
+  queries are unaffected (the eval harness derives raw gold ops strings
+  before composing, so the committed baseline numbers are unchanged —
+  review blocker 2). The Hermes provider's local derivation copy is
+  synced to the same normalization (PRR-004).
 - **Host-less `project:<owner>/<repo>` keys no longer strand silently**
   (issue #246): `add` still stores them (rejection would break legitimate
   hierarchical namespaces like the suite's `project:t03/harvest`
@@ -47,19 +50,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   row conditionally opposes an existing same-namespace row (negation
   polarity + condition marker + shared significant tokens; notice-only —
   no edge, no trust delta, no row rewrite); `--type lesson` rows with no
-  trigger-condition marker get a non-blocking `phrasing_advisory`; and the
-  session-end hook surfaces exactly one bounded closeout reminder when the
-  session wrote rows (`<sha256(sid)[:32]>.wrote`, stamped by add/update/
-  supersede/invalidate on success only — refused writes leave no marker; a
-deduped add (an attributed store write) still stamps) and no closeout was recorded
-  (`store.py closeout-ack --session-id <id>` stamps `.closeout`,
-  store-independent). The reminder never opens the store; the age sweep
-  reaps aged `.wrote`/`.closeout` markers.
+  trigger-condition marker get a non-blocking `phrasing_advisory`; and
+  the session hooks surface exactly one bounded closeout reminder when
+  the session wrote rows (`<sha256(sid)[:32]>.wrote`, stamped by
+  add/update/supersede/invalidate — and entity-card when a card was
+  actually written — on success only; refused writes and no-card builds
+  leave no marker; a deduped add still stamps) and no closeout was
+  recorded (`store.py closeout-ack --session-id <id>` stamps `.closeout`,
+  store-independent; the closeout workflow runs it as Step 7). SessionEnd
+  output has no live model turn on most hosts, so the reminder is
+  re-surfaced ONCE at the next SessionStart in model-visible context
+  (`.nudged` exactly-once marker; the age sweep reaps
+  `.wrote`/`.closeout`/`.nudged`).
 - **Harvest-paste gate** (issue #247): `corrections.is_harvest_paste` —
   fenced-JSON blocks dominated by harvest-key objects
   (namespace/type/content/signal) are no longer captured as correction
-  candidates by the live-capture hook or the Hermes lane, killing the
-  multi-KB queue items and the per-session nag they produced.
+  candidates by the live-capture hook or the Hermes lane — and by the
+  auto-retain and history-mine queue lanes (review PRR-003). Line
+  endings are normalized, so CRLF-fenced pastes are gated too, and
+  deeply nested JSON fails closed instead of raising (review PRR-002).
 - **`.tasktext` lifecycle completion** (issue #336): session end removes
   the session's `.tasktext` stash (keyed on the RAW session id, so keyed
   sessions clear correctly); an all-expired consume unlinks the file; the

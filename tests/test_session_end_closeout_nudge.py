@@ -373,5 +373,65 @@ class SessionEndCloseoutNudgeTest(unittest.TestCase):
                 f"sweep must preserve the fresh marker {path.name}")
 
 
+class SessionStartDeliveryTest(unittest.TestCase):
+    """PR #407 review blocker 3(a): SessionEnd output has no live model
+    turn on most hosts (the launcher comment records Claude Code ignoring
+    bare additionalContext there), so the closeout reminder is re-surfaced
+    ONCE at the next SessionStart through the payload python — the module
+    the launcher translates into model-visible context. Exactly-once via
+    the ``.nudged`` marker; silenced by a recorded closeout."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="zmem-nudge-start-")
+        self._sid = "start-delivery-" + hashlib.sha256(
+            self._tmp.encode("utf8")).hexdigest()[:12]
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "zmem_start_payload_probe",
+            REPO_ROOT / "hooks" / "lib" / "zmem-session-start-payload.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self._payload = mod
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_wrote_without_closeout_delivers_once(self):
+        self._write_marker(".wrote")
+        text = self._payload._closeout_reminder(self._tmp, self._sid)
+        self.assertIn("closeout", text.lower())
+        self.assertIn("closeout-ack", text)
+        self.assertTrue(
+            _marker(self._tmp, self._sid, ".nudged").exists(),
+            "the delivery must stamp the .nudged exactly-once marker")
+        self.assertEqual(
+            self._payload._closeout_reminder(self._tmp, self._sid), "",
+            "the reminder must surface exactly once per session id")
+
+    def test_recorded_closeout_silences_delivery(self):
+        self._write_marker(".wrote")
+        self._write_marker(".closeout")
+        self.assertEqual(self._payload._closeout_reminder(self._tmp, self._sid),
+                         "")
+        self.assertFalse(_marker(self._tmp, self._sid, ".nudged").exists())
+
+    def test_no_writes_no_delivery(self):
+        self.assertEqual(self._payload._closeout_reminder(self._tmp, self._sid),
+                         "")
+        self.assertFalse(_marker(self._tmp, self._sid, ".nudged").exists())
+
+    def test_wiring_callsites_present(self):
+        source = (REPO_ROOT / "hooks" / "lib"
+                  / "zmem-session-start-payload.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(source.count("nudge, closeout_reminder"), 2,
+                                "the reminder must ride BOTH emitted "
+                                "envelopes (first fast-path + final context)")
+
+    def _write_marker(self, suffix: str) -> None:
+        path = _marker(self._tmp, self._sid, suffix)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("1\n", encoding="utf-8")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

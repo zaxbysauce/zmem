@@ -2163,6 +2163,7 @@ _PROVIDER_RUNNER_HEADS = frozenset({
     "cargo", "go", "mvn", "gradle", "make", "cmake",
     "docker", "kubectl", "helm", "terraform",
     "python", "python3", "pytest", "py.test", "tox", "nox",
+    "py",  # Windows launcher; canonicalized to "python" at normalization
     "node", "npx", "tsc", "eslint", "biome", "prettier", "ruff", "mypy",
     "robocopy", "rsync", "curl",
 })
@@ -2218,7 +2219,19 @@ def _derive_provider_ops_tokens(*events: str) -> list:
         if not words:
             continue
         head = words[0].strip().strip("\"'`").lower()
+        # Windows-shaped heads (#314 AC2; synced from ops_tokens
+        # derive_ops_tokens per the keep-in-sync note above): normalize BOTH
+        # path separators and a trailing .exe/.bat/.cmd extension before the
+        # membership test, then canonicalize the Windows Python launcher
+        # `py` (and its extension forms) to `python` (PRR-004).
+        head = head.rsplit("\\", 1)[-1]
         head = head.rsplit("/", 1)[-1] or head  # /usr/bin/git -> git
+        for _ext in (".exe", ".bat", ".cmd"):
+            if head.endswith(_ext):
+                head = head[: -len(_ext)]
+                break
+        if head == "py":
+            head = "python"
         if head in _PROVIDER_RUNNER_HEADS:
             _push(head)
             for i, w in enumerate(words[1:5]):

@@ -391,7 +391,9 @@ class LedgerModuleTest(unittest.TestCase):
         self.assertEqual(compact.read_bytes(), b"compact-survives")
         # Issue #336 contract flip: end_delivery_state (the terminal
         # clear) removes the raw-id-keyed .tasktext stash; the mid-session
-        # clear keeps the survival law pinned elsewhere in this file.
+        # clear keeps the survival law pinned in tests/test_subagent_tasktext.py
+        # (test_clear_delivery_state_keeps_tasktext_stash) and
+        # tests/test_session_end_cleanup.py's ledger-clear leg.
         self.assertFalse(tasktext.exists())
         self.assertFalse((Path(self.tmp) / "store.sqlite").exists())
 

@@ -283,11 +283,15 @@ def is_harvest_paste(text: str) -> bool:
     the harvest keys, dominating the message. Those blocks belong to
     /ingest-harvest, not the correction queue; capturing them produced a
     multi-KB `message` per item and a per-session nag until manual
-    queue-clear. Bounded and fail-closed (only a strict shape matches)."""
+    queue-clear. Bounded and fail-closed (only a strict shape matches).
+    Line endings are normalised first (PR #407 review: a CRLF-fenced paste
+    — any Windows-originated editor output — previously bypassed the gate
+    because the fence regex pinned a bare LF)."""
     if not text or len(text) <= 400:
         return False
     import json as _json
     import re as _re
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     fences = _re.findall("```[a-zA-Z]*" + chr(10) + r"(.*?)" + "```",
                       text, _re.DOTALL)
     if not fences:
@@ -304,6 +308,11 @@ def is_harvest_paste(text: str) -> bool:
         return False
     try:
         parsed = _json.loads(cand)
+    except RecursionError:
+        # Deeply nested `[` bait: not a shape the harvest writer emits, so
+        # fail closed to NOT-harvest (the shell hook's own fallback also
+        # catches this; the direct cli.py lane needs the guard here).
+        return False
     except ValueError:
         # tolerant fallback: substring key match over the block head
         head = probe[:2000]

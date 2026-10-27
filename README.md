@@ -63,7 +63,10 @@ closed moments are `session_start`, `user_prompt`, `pretool`, `subagent`, and
 
 The passive `--for-injection --json` lane of `recall` and `recent` accepts
 `--session-id`, `--moment`, `--lane`, and repeatable `--ops-token` attribution
-flags. An empty query selects recent memories; `pretool` is the only moment
+flags. On the `pretool` passive lane, `recall` also accepts
+`--state-hint dirty|clean` (issue #397: refused with exit 2 unless the
+passive shape and `--moment pretool` are present). An empty query selects
+recent memories; `pretool` is the only moment
 that composes the store-side operation ring. Use
 `<interpreter> <store.py> delivery-clear --session-id=<id>` for terminal session
 cleanup of both the ledger and pending sidecars. Use

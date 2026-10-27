@@ -1148,6 +1148,23 @@ class StoreTimeoutParseParityTest(unittest.TestCase):
         ])
         self.assertEqual(len(rows), 1)
 
+    def test_state_hint_tail_parses(self):
+        # PR #407 review: the writer emits state=dirty|clean|unavailable on
+        # the pretool lane; pin that the EXACT emitted shape survives the
+        # reader (an unparsed line would silently vanish from the join).
+        rows = self._parse([
+            "[1789320004] zmem-hook status=injected reason=injected "
+            "ids=[c] all=[c] tokens=10/100 sid=s5 moment=pretool "
+            "lane=zcode ver=0.124.0 t_ms=42 arms=fts:1/15 "
+            "state=dirty",
+            "[1789320005] zmem-hook status=injected reason=injected "
+            "ids=[d] all=[d] tokens=10/100 sid=s6 moment=pretool "
+            "lane=zcode ver=0.124.0 t_ms=43 arms=fts:1/15 "
+            "state=unavailable",
+        ])
+        self.assertEqual(len(rows), 2,
+                         "state=-tailed lines must parse (reader parity)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

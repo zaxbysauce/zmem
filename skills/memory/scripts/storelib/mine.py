@@ -851,10 +851,23 @@ def _queue_mined(report, host: str, as_json: bool = False) -> int:
         existing_keys = set()
     added = 0
     failed = 0
+    harvest_skipped = 0
     for it in items:
         key = it.get("dedup_key")
         if key in existing_keys:
             continue
+        # Issue #247 parity (PR #407 review PRR-003): a mined candidate whose
+        # message is a pasted harvest block belongs to /ingest-harvest, not
+        # the correction queue — the same gate the manual hook lane applies.
+        msg = it.get("message")
+        if isinstance(msg, str) and msg:
+            try:
+                from corrections import is_harvest_paste as _is_harvest_paste
+                if _is_harvest_paste(msg):
+                    harvest_skipped += 1
+                    continue
+            except Exception:
+                pass
         try:
             if _cq.append_queue(namespace, it):
                 added += 1
@@ -863,9 +876,11 @@ def _queue_mined(report, host: str, as_json: bool = False) -> int:
                 failed += 1
         except Exception:
             failed += 1
-    already = len(items) - added - failed
+    already = len(items) - added - failed - harvest_skipped
     summary = ("[zmem] mine-history: queued %d candidate(s) to %s (source=history-mine); "
                "%d already present" % (added, namespace, already))
+    if harvest_skipped:
+        summary += "; %d harvest-paste skipped" % harvest_skipped
     if failed:
         summary += "; %d write(s) FAILED" % failed
     if as_json:
@@ -1039,9 +1054,22 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
     except Exception:
         existing = set()
     added = failed = 0
+    harvest_skipped = 0
     for c in candidates:
         if c["dedup_key"] in existing:
             continue
+        # Issue #247 parity (PR #407 review F6-1): the hermes/codex adapters
+        # lane is a third transcript-driven queue writer — the same harvest
+        # gate the manual hook lane and the _queue_mined lane apply.
+        msg = c.get("message")
+        if isinstance(msg, str) and msg:
+            try:
+                from corrections import is_harvest_paste as _is_harvest_paste
+                if _is_harvest_paste(msg):
+                    harvest_skipped += 1
+                    continue
+            except Exception:
+                pass
         try:
             item = _cq.make_item(
                 message=c["message"], type_=c["type"],
@@ -1066,7 +1094,10 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
             failed += 1
     summary = ("[zmem] mine-history: queued %d candidate(s) to %s "
                "(source=%s); %d already present"
-               % (added, namespace, source, len(candidates) - added - failed))
+               % (added, namespace, source,
+                  len(candidates) - added - failed - harvest_skipped))
+    if harvest_skipped:
+        summary += "; %d harvest-paste skipped" % harvest_skipped
     if failed:
         summary += "; %d write(s) FAILED" % failed
     print(summary, file=sys.stderr if as_json else sys.stdout)

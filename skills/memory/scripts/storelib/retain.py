@@ -31,6 +31,7 @@ try:
         aggregate_errors as _aggregate_errors,
         classify_error_type as _classify_error_type,
         detect_patterns as _detect_patterns,
+        is_harvest_paste as _is_harvest_paste,
         should_include_message as _should_include_message,
     )
     from correction_queue import append_queue as _append_queue
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover - direct-module loads in tests
         aggregate_errors as _aggregate_errors,
         classify_error_type as _classify_error_type,
         detect_patterns as _detect_patterns,
+        is_harvest_paste as _is_harvest_paste,
         should_include_message as _should_include_message,
     )
     from correction_queue import append_queue as _append_queue  # type: ignore
@@ -241,6 +243,12 @@ def extract_candidates(evidence_rows: Iterable[dict[str, Any]]) -> list[QueueIte
 
         text = _normalize_text(_strip_zmem_fence(text_raw))
         if not text or not _should_include_message(text):
+            continue
+        # Issue #247 parity (PR #407 review PRR-003): the auto-retain lane
+        # queues correction candidates exactly like the manual hook lane, so
+        # a pasted harvest block must be gated here too — otherwise the same
+        # multi-KB paste re-enters the queue through this lane.
+        if _is_harvest_paste(text):
             continue
 
         cls: str | None = None

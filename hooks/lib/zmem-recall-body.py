@@ -683,6 +683,12 @@ def _pretool_repo_state(event: dict, query: str) -> str:
                     timeout_s = val
             except ValueError:
                 pass  # malformed knob -> default (fail-open, not fail-closed)
+        # Clamp to the store-timeout knob's 8 s ceiling: a huge finite value
+        # (e.g. 1e308) overflows the Windows ms conversion inside
+        # subprocess.run and the OverflowError escaped this probe's except
+        # into the hook's catch-all, dropping the whole recall (PR #407
+        # review, non-blocking probe findings).
+        timeout_s = min(timeout_s, 8.0)
         proc = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=no"],
             capture_output=True, text=True, timeout=timeout_s, cwd=cwd,

@@ -1736,12 +1736,22 @@ def consume_task_text(data_dir: str, session_id: str,
         # Issue #336 AC2: every entry expired. The in-memory prune above is
         # the only expiry mechanism, so an all-expired stash would otherwise
         # keep its stale payload on disk until the age sweep; unlink it now
-        # (fail-open — the next park rewrites the file regardless).
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except OSError:
-            pass
+        # (fail-open — the next park rewrites the file regardless). The
+        # bounded retry mirrors the consumed-head branch below: on Windows a
+        # concurrent reader holding the file open fails the delete with a
+        # sharing violation, and a surviving file here means the NEXT
+        # consume re-reads the same expired stash once before the sweep.
+        for _attempt in range(2):
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                if _attempt:
+                    break
+                time.sleep(0.01)
         return ""
     idx = 0
     if agent_id:

@@ -6408,7 +6408,11 @@ def main():
                       f"id={card_result['id']} "
                       f"entity_id={card_result['entity_id']} "
                       f"source_ref={card_result['source_ref']}")
-            _session_write_marker("")
+            # Issue #398: stamp ONLY when a card row was actually written —
+            # result=no_card means nothing was stored, so the session-end
+            # closeout reminder must not arm (PRR-008).
+            if card_result.get("result") != "no_card":
+                _session_write_marker("")
             sys.exit(0)
         elif args.cmd == "links":
             sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,
