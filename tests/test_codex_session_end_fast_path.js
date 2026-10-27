@@ -442,13 +442,19 @@ function testDivergentStoreAndDataRoots() {
             encoding: "utf8",
             timeout: 15000,
         });
-        const storeGone = [".ledger", ".pending"].every((suffix) =>
+        // Issue #336 contract flip: the terminal clear (session_end) also
+        // removes the session's .tasktext stash beside the store; only the
+        // mid-session ledger-clear legs keep the survival pins (twin flips
+        // in test_session_end_cleanup.py and test_delivery_ledger.py). The
+        // unrelated default data dir is never touched by the store-scoped
+        // clear.
+        const storeGone = [".ledger", ".pending", ".tasktext"].every((suffix) =>
             !fs.existsSync(sidecarPath(storeDir, sessionId, suffix)));
-        const storePreserved = [".compact", ".tasktext"].every((suffix) =>
+        const storePreserved = [".compact"].every((suffix) =>
             fs.existsSync(sidecarPath(storeDir, sessionId, suffix)));
         const defaultPreserved = [".ledger", ".pending", ".compact", ".tasktext"].every((suffix) =>
             fs.existsSync(sidecarPath(defaultDataDir, sessionId, suffix)));
-        check("divergent ZMEM_STORE root clears only ledger and pending beside store", () =>
+        check("divergent ZMEM_STORE root clears ledger, pending, and tasktext beside store", () =>
             result.status === 0 && result.stdout === "{}\n" && result.stderr === ""
             && storeGone && storePreserved && defaultPreserved);
     } finally {
