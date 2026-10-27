@@ -24,9 +24,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   read — no check/use window): an allow ACE for Everyone / BUILTIN\Users /
   Authenticated Users (the installers' refusal list), a NULL/absent DACL,
   or an inspection FAILURE all refuse (fail-closed — an uninspectable map
-  is never served); machine-local SIDs are deliberately out of scope
-  (user-profile directories inherit same-machine capability SIDs that do
-  not expose the file to other accounts). POSIX verdicts are mode-bit
+  is never served); machine-local principals (including local groups
+  and same-machine capability SIDs, which user-profile directories
+  routinely inherit) are deliberately out of scope — the refusal list
+  is exactly the installers'. POSIX verdicts are mode-bit
   based (any group/other access bit fails). Operators: fix drifted maps
   with `chmod 600` (or restrict the DACL to the hub service account); a
   systemd-supervised hub will restart-loop until the permission is fixed
