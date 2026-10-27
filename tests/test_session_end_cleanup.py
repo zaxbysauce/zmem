@@ -256,7 +256,10 @@ class SessionEndCleanupTest(unittest.TestCase):
             self.assertFalse(paths["ledger"].exists())
             self.assertFalse(paths["pending"].exists())
             self.assertTrue(paths["compact"].exists())
-            self.assertTrue(paths["tasktext"].exists())
+            # Issue #336 contract flip: the terminal clear (session_end)
+            # removes the session's .tasktext stash; only the mid-session
+            # ledger-clear leg keeps the survival pin.
+            self.assertFalse(paths["tasktext"].exists())
             self.assertFalse((data_dir / "store.sqlite").exists())
 
     def test_codex_session_end_entry_is_main_thread_command_with_two_second_timeout(self):

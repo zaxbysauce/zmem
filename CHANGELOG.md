@@ -5,6 +5,81 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.124.0] - 2026-10-26
+
+### Fixed
+- **Pretool recall is no longer blind to repository state** (issue #397): a
+  bounded, fail-open `git status --porcelain --untracked-files=no` probe
+  (armed only for restore/destructive verbs, run at the event cwd with
+  `ZMEM_STATE_PROBE_TIMEOUT_S`, default 2s) feeds a `--state-hint` to the
+  pretool passive recall; a stored conditional-hazard row (uncommitted-tree
+  lexicon + condition marker + negation polarity) receives a +0.15 rank
+  bump ONLY under `dirty`, so the row that says "never when uncommitted"
+  outranks the unconditional row exactly at the destructive git call
+  (motivated by the opencode-swarm PR #3419 probe-wipe incident). The hint
+  rides the recall query branch only (recent stays state-blind); clean /
+  unavailable / absent hints are byte-identical to today; the decision log
+  records `state=dirty|clean|unavailable` on the pretool lane; the global
+  relevance floor and trust gates still withhold gated rows (a bump never
+  rescues them). Test seam: `ZMEM_TEST_REPO_STATE`.
+- **`compose_inject_query` no longer re-derives already-derived ops tokens**
+  (issue #314): the lossy single-event re-derivation (which silently
+  dropped ring-derived tails whenever the newest event was non-runner
+  headed, and truncated runner-headed joins to the `words[1:5]` window) is
+  replaced by a SAFETY-only sanitizer (allowlist + secret-shape +
+  leading-dash guards + dedup + caps). Windows-shaped interpreter heads
+  (`python.exe`, `py`, backslash paths, `.exe`/`.bat`/`.cmd` extensions)
+  now resolve to the same runner tokens as their POSIX aliases, with `py`
+  canonicalized to `python`. The `compose(prompt, "plainword")` identity
+  pin is updated to the new contract (a bare allowlisted word rides the
+  tail); derived vocabulary never contains such words, so gold-item
+  queries are unaffected (the eval harness derives raw gold ops strings
+  before composing, so the committed baseline numbers are unchanged —
+  review blocker 2). The Hermes provider's local derivation copy is
+  synced to the same normalization (PRR-004).
+- **Host-less `project:<owner>/<repo>` keys no longer strand silently**
+  (issue #246): `add` still stores them (rejection would break legitimate
+  hierarchical namespaces like the suite's `project:t03/harvest`
+  fixtures), but emits a structured `namespace_project_near_miss` warning
+  naming the canonical `project:github.com/<owner>/<repo>` form. The
+  empty-key half of #246 was already fixed by the #166 grammar.
+
+### Added
+- **Write-time capture guards** (issue #398): `add` emits a
+  `contradiction_link` notice (stderr + structured warnings) when the new
+  row conditionally opposes an existing same-namespace row (negation
+  polarity + condition marker + shared significant tokens; notice-only —
+  no edge, no trust delta, no row rewrite); `--type lesson` rows with no
+  trigger-condition marker get a non-blocking `phrasing_advisory`; and
+  the session hooks surface exactly one bounded closeout reminder when
+  the session wrote rows (`<sha256(sid)[:32]>.wrote`, stamped by
+  add/update/supersede/invalidate — and entity-card when a card was
+  actually written — on success only; refused writes and no-card builds
+  leave no marker; a deduped add still stamps) and no closeout was
+  recorded (`store.py closeout-ack --session-id <id>` stamps `.closeout`,
+  store-independent; the closeout workflow runs it as Step 7). SessionEnd
+  output has no live model turn on most hosts, so the reminder is
+  re-surfaced ONCE at the next SessionStart in model-visible context
+  (`.nudged` exactly-once marker; the age sweep reaps
+  `.wrote`/`.closeout`/`.nudged`).
+- **Harvest-paste gate** (issue #247): `corrections.is_harvest_paste` —
+  fenced-JSON blocks dominated by harvest-key objects
+  (namespace/type/content/signal) are no longer captured as correction
+  candidates by the live-capture hook or the Hermes lane — and by the
+  auto-retain and history-mine queue lanes (review PRR-003). Line
+  endings are normalized, so CRLF-fenced pastes are gated too, and
+  deeply nested JSON fails closed instead of raising (review PRR-002).
+- **`.tasktext` lifecycle completion** (issue #336): session end removes
+  the session's `.tasktext` stash (keyed on the RAW session id, so keyed
+  sessions clear correctly); an all-expired consume unlinks the file; the
+  backup sweep reaps `.tasktext.tmp.` orphans; the session-end header and
+  the stale purge comment are true again. The mid-session `ledger-clear`
+  survival pin is unchanged by design; the two terminal-path pins flip
+  with this contract change.
+
+**Schema unchanged (19/19)** — no migration; every installed zmem client
+on a shared store keeps working.
+
 ## [0.123.0] - 2026-10-24
 
 ### feat(memory): fleet operations — tailscale-serve hub install, per-machine principals, Litestream, doctor --fleet, peer-exchange migration (issue #291, Workstream T PR 12)

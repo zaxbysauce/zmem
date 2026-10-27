@@ -538,10 +538,14 @@ def cmd_sweep(marker_dir: str | None = None,
                 # transient by lifecycle (released after each write), and a
                 # killed writer's orphan is phantom-broken by liveness before
                 # this age backstop ever matters.
-                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals", ".reserve", ".feedback.lock"))
+                if (not rname.endswith((".log", ".delivered", ".pending", ".ledger", ".compact", ".tasktext", ".delivery-ended", ".capture-failure.json", ".signals", ".reserve", ".feedback.lock", ".wrote", ".closeout", ".nudged"))
                         and ".ledger.seg." not in rname
                         and ".ledger.tmp." not in rname
-                        and ".reserve.tmp." not in rname):
+                        and ".reserve.tmp." not in rname
+                        # issue #336 AC3: killed-write orphans of the
+                        # tasktext stash; the age sweep reaps them like the
+                        # ledger tmp shapes (purge also scrubs them).
+                        and ".tasktext.tmp." not in rname):
                     continue
                 rp = ops_dir / rname
                 try:

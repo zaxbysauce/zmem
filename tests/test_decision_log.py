@@ -713,7 +713,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=injected", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153 additive tails
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153 additive tails
 
     def test_pretool_mode_moment(self):
         _run_body(self._tmp, "pretool",
@@ -721,7 +721,7 @@ class MomentFieldBodyTest(_SeededStore):
                    "tool_input": {"command": "git stash pop"}},
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
-        self.assertRegex(line, r" sid=\S+ moment=pretool(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153
+        self.assertRegex(line, r" sid=\S+ moment=pretool(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_body_line_carries_mode_moment(self):
         _run_body(self._tmp, "user_prompt",
@@ -729,7 +729,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns, ZMEM_INJECT="0")
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=silent reason=disabled", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153
 
 
 class MomentFieldSessionStartTest(unittest.TestCase):
@@ -784,7 +784,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode == 0, True, r.stderr[-800:])
         lines = _decision_lines(self._tmp)
         self.assertTrue(lines, "session-start decision line missing")
-        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start lane=zcode ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?$")  # issue #136/#153
+        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start lane=zcode ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_line_carries_session_start_moment(self):
         # The kill-switch block resolves the sid from the env chain (the
@@ -1147,6 +1147,23 @@ class StoreTimeoutParseParityTest(unittest.TestCase):
             "all=[b] tokens=10/100 sid=s4 moment=pretool",
         ])
         self.assertEqual(len(rows), 1)
+
+    def test_state_hint_tail_parses(self):
+        # PR #407 review: the writer emits state=dirty|clean|unavailable on
+        # the pretool lane; pin that the EXACT emitted shape survives the
+        # reader (an unparsed line would silently vanish from the join).
+        rows = self._parse([
+            "[1789320004] zmem-hook status=injected reason=injected "
+            "ids=[c] all=[c] tokens=10/100 sid=s5 moment=pretool "
+            "lane=zcode ver=0.124.0 t_ms=42 arms=fts:1/15 "
+            "state=dirty",
+            "[1789320005] zmem-hook status=injected reason=injected "
+            "ids=[d] all=[d] tokens=10/100 sid=s6 moment=pretool "
+            "lane=zcode ver=0.124.0 t_ms=43 arms=fts:1/15 "
+            "state=unavailable",
+        ])
+        self.assertEqual(len(rows), 2,
+                         "state=-tailed lines must parse (reader parity)")
 
 
 if __name__ == "__main__":

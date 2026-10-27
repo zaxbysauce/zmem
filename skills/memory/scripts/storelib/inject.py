@@ -972,6 +972,7 @@ def select_and_budget_for_injection(
     principal: str | None = None,
     harness: str | None = None,
     no_telemetry: bool = False,
+    state_hint: str | None = None,
 ) -> dict:
     """Select, render, account, and record one passive injection event.
 
@@ -1293,6 +1294,12 @@ def select_and_budget_for_injection(
             # the passive cross-encoder lane (CE + PASSIVE=1 + no-bump).
             kwargs["cross_rerank"] = _ce_cli_allowed(
                 no_bump=True, no_hybrid=False, for_injection=True)
+            # Issue #397: the repository-state hint rides ONLY the query
+            # branch — never the shared kwargs dict, whose query-less leg
+            # feeds recent_memory (an unexpected kwarg there is swallowed
+            # by the selector's fail-open except as a silent empty pool).
+            if state_hint:
+                kwargs["_state_hazard_hint"] = state_hint
             recall_module.recall_memory(conn, **kwargs)
         else:
             recall_module.recent_memory(conn, **kwargs)

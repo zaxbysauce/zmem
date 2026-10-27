@@ -276,6 +276,46 @@ def _native_nudge(host, settings_dir, marker):
         return ""
 
 
+def _closeout_reminder(data_dir, session_id):
+    """Issue #398 delivery leg (PR #407 review blocker 3): the session-end
+    reminder is emitted in a shape hosts ignore at SessionEnd (no live model
+    turn), so the reminder is re-surfaced HERE — at SessionStart, which the
+    launcher translates into model-visible context. Exactly-once per session
+    via the ``<sha256(sid)[:32]>.nudged`` ops marker; silenced by a recorded
+    closeout (``.closeout``, written by ``store.py closeout-ack``). Fail-open
+    in every path."""
+    if not data_dir or not session_id:
+        return ""
+    try:
+        import hashlib as _hashlib
+        stem = _hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        ops = os.path.join(data_dir, "ops")
+        wrote = os.path.join(ops, stem + ".wrote")
+        closeout = os.path.join(ops, stem + ".closeout")
+        nudged = os.path.join(ops, stem + ".nudged")
+        if not os.path.isfile(wrote) or os.path.isfile(closeout) \
+                or os.path.isfile(nudged):
+            return ""
+        try:
+            os.makedirs(ops, exist_ok=True)
+            fd = os.open(nudged, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, b"nudged\n")
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            return ""
+        except OSError:
+            pass
+        return ("# ZMem closeout reminder: the previous session with this id "
+                "wrote memory rows but no closeout was recorded. Run the "
+                "closeout workflow for session " + session_id + " (or "
+                "`store.py closeout-ack --session-id " + session_id + "` if "
+                "nothing needs capturing).")
+    except Exception:
+        return ""
+
+
 def _lane(host):
     return {"claude": "claude", "codex": "codex", "zcode": "zcode",
             "hermes": "hermes-provider", "hermes-provider": "hermes-provider",
@@ -539,7 +579,10 @@ def main():
                   % (shlex.quote(sys.executable),
                      shlex.quote(store_py))) if store_py and os.path.isfile(store_py) else ""
     nudge = _native_nudge(host, settings_dir, marker)
-    first_ctx = _soft_trim("\n\n".join(x for x in (tier0, store_note, nudge) if x), budget)
+    closeout_reminder = _closeout_reminder(data_dir, session_id)
+    first_ctx = _soft_trim("\n\n".join(x for x in
+                            (tier0, store_note, nudge, closeout_reminder)
+                            if x), budget)
     first_payload = {}
     if first_ctx:
         first_payload["additionalContext"] = first_ctx
@@ -556,7 +599,8 @@ def main():
                                 attribution_version=attribution_version)
     promotion = _promotion_note(store_py)
     final_ctx = _soft_trim("\n\n".join(x for x in
-                            (correction, tier0, tier2, promotion, store_note, nudge)
+                            (correction, tier0, tier2, promotion, store_note,
+                             nudge, closeout_reminder)
                             if x), budget)
     payload = {}
     if final_ctx:

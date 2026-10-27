@@ -248,6 +248,10 @@ def _hermes_capture_correction(namespace: str, session_id: str,
         import correction_queue as cq  # type: ignore
         if not corrections.should_include_message(text):
             return False
+        # Issue #247: pasted harvest blocks are not corrections on this
+        # lane either (same modules, same shape rule).
+        if corrections.is_harvest_paste(text):
+            return False
         item_type, patterns, confidence, sentiment, decay_days = \
             corrections.detect_patterns(text)
         if not item_type:
@@ -2011,6 +2015,51 @@ def _append_hermes_query_ring(payload: dict[str, object]) -> None:
     except Exception:
         pass
 
+def _session_write_marker(session_ref: str) -> None:
+    """Best-effort `<sha256(sid)[:32]>.wrote` stamp for issue #398.
+
+    `session_ref` is the write's `--source-ref` when it is shaped
+    `session:<sid>` or `session:<sid>:<detail>`, else the ambient
+    ZMEM_SESSION. Fail-open by design: a marker failure can never fail the
+    write itself. The stamp lives beside the delivery ledger's ops
+    sidecars and uses the same raw-id hashing convention."""
+    sid = ""
+    if session_ref and session_ref.startswith("session:"):
+        sid = session_ref[len("session:"):].split(":", 1)[0]
+    if not sid:
+        sid = os.environ.get("ZMEM_SESSION", "")
+    if not sid:
+        return
+    try:
+        import hashlib
+        data_dir = _injection_data_dir(None)
+        ops = os.path.join(data_dir, "ops")
+        os.makedirs(ops, exist_ok=True)
+        name = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:32] + ".wrote"
+        path = os.path.join(ops, name)
+        with open(path, "a", encoding="utf-8"):
+            pass  # touch: presence is the signal; content stays empty
+    except OSError:
+        pass
+
+
+def _cmd_closeout_ack(args) -> None:
+    """Store-independent closeout marker (issue #398): touches
+    `<sha256(sid)[:32]>.closeout` under the ops dir and never opens
+    SQLite — the session-end nudge consults the pair."""
+    import hashlib
+    data_dir = _injection_data_dir(None)
+    ops = os.path.join(data_dir, "ops")
+    os.makedirs(ops, exist_ok=True)
+    name = hashlib.sha256(args.session_id.encode("utf-8")
+                          ).hexdigest()[:32] + ".closeout"
+    with open(os.path.join(ops, name), "a", encoding="utf-8"):
+        pass
+    print(json.dumps({"ok": True, "session_id": args.session_id,
+                      "closeout_recorded": True},
+                     separators=(",", ":")) + "\n", end="")
+
+
 def main():
     # Production-stream encoding hardening (issue #62 editorial round, Claude
     # Code F-005): every ``print`` in store.py, including consolidate's
@@ -2238,6 +2287,11 @@ def main():
                           choices=INJECTION_LANES, default=None,
                           help="Injection lane")
     p_recall.add_argument(
+        "--state-hint", dest="state_hint", type=str,
+        choices=("dirty", "clean"), default=None,
+        help="Pretool repository-state predicate (issue #397; passive "
+             "recall under --moment pretool only — refuses elsewhere)")
+    p_recall.add_argument(
         "--delegation-prompt", dest="delegation_prompt", type=str, default="",
         help="PreToolUse(Agent/Task) delegating prompt (issue #253): park it "
              "store-side for the child's SubagentStart recall query. Only "
@@ -2370,6 +2424,11 @@ def main():
     p_prefetch.add_argument("--lane", dest="lane", type=str,
                             choices=INJECTION_LANES, default=None,
                             help="Injection lane")
+    p_prefetch.add_argument(
+        "--state-hint", dest="state_hint", type=str,
+        choices=("dirty", "clean"), default=None,
+        help="Pretool repository-state predicate (issue #397; passive "
+             "prefetch under --moment pretool only — refuses elsewhere)")
     p_prefetch.add_argument("--ops-token", dest="ops_tokens", type=str,
                             action="append", default=[],
                             help="Operation token from the pretool ring "
@@ -2452,6 +2511,12 @@ def main():
                                   help="caller harness id (issue #284)")
     p_delivery_clear.add_argument("--session-id", required=True,
                                   help="Session id whose delivery state will be cleared")
+
+    p_closeout_ack = _add_parser(
+        "closeout-ack", help="record that this session ran the closeout "
+        "skill (issue #398; store-independent marker only)")
+    p_closeout_ack.add_argument("--session-id", required=True,
+                                help="Session id whose closeout is recorded")
 
     p_search = _add_parser("search", help="keyword search (no confidence floor)")
     p_search.add_argument("--text", required=True)
@@ -4225,6 +4290,14 @@ def main():
 
     # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
     # so session lifecycle cleanup remains idempotent and SQLite-independent.
+    if args.cmd == "closeout-ack":
+        try:
+            _cmd_closeout_ack(args)
+        except OSError as exc:
+            print(f"[zmem] closeout-ack failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
     if args.cmd in ("ledger-clear", "delivery-clear"):
         from storelib import delivery_ledger
         try:
@@ -5405,6 +5478,10 @@ def main():
                 finally:
                     if _human_out is not None:
                         sys.stdout = _human_out
+                # Issue #398: stamp ONLY after a successful write (a
+                # CapturePolicyRefusal above exits 2 without reaching here,
+                # so refused writes leave no marker).
+                _session_write_marker(args.source_ref)
                 if args.json:
                     # Structured write result (issue #65, 10.8): consumed by
                     # the MCP/Hermes add surfaces so remote write warnings
@@ -5511,6 +5588,8 @@ def main():
                 # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
+            if ok:
+                _session_write_marker("")
             sys.exit(0 if ok else 1)
         elif args.cmd == "update":
             try:
@@ -5549,6 +5628,8 @@ def main():
                 finally:
                     if _human_out is not None:
                         sys.stdout = _human_out
+                # Issue #398: stamp ONLY after a successful update.
+                _session_write_marker(args.source_ref)
                 if args.json:
                     print(json.dumps({
                         "id": str(res),
@@ -5578,12 +5659,24 @@ def main():
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(2)
         elif args.cmd == "recall":
+            if getattr(args, "state_hint", None) and not (
+                    args.for_injection and args.json and args.session_id):
+                # W1.2: the hint is a passive-only ranking lever; any other
+                # combination exits 2 instead of silently ignoring it.
+                print("[zmem] --state-hint requires --for-injection --json "
+                      "with --session-id", file=sys.stderr)
+                sys.exit(2)
             if args.for_injection and args.json and args.session_id:
+                if getattr(args, "state_hint", None) and args.moment != "pretool":
+                    print("[zmem] --state-hint requires --moment pretool",
+                          file=sys.stderr)
+                    sys.exit(2)
                 _park_delegation_prompt(args)
                 try:
                     payload = select_and_budget_for_injection(
                         conn,
                         query=args.query,
+                        state_hint=getattr(args, "state_hint", None),
                         namespace=args.namespace,
                         moment=args.moment,
                         session_id=args.session_id,
@@ -5753,6 +5846,10 @@ def main():
             # global_limit/budget (the contract's exact dispatch values);
             # data_dir=None so the selector resolves the sidecar dir through
             # the canonical store precedence.
+            if getattr(args, "state_hint", None) and args.moment != "pretool":
+                print("[zmem] --state-hint requires --moment pretool",
+                      file=sys.stderr)
+                sys.exit(2)
             prefetch_query = args.query
             if (args.moment == "user_prompt"
                     and os.environ.get("ZMEM_QUERY_CONTEXT", "1").strip() != "0"):
@@ -5777,6 +5874,7 @@ def main():
                 payload = select_and_budget_for_injection(
                     conn,
                     query=prefetch_query,
+                    state_hint=getattr(args, "state_hint", None),
                     namespace=args.namespace,
                     moment=args.moment,
                     session_id=args.session_id,
@@ -5829,6 +5927,10 @@ def main():
                 # refused — both stable exit-2 refusals, not tracebacks.
                 print(str(exc), file=sys.stderr)
                 sys.exit(2)
+            # Issue #398: supersede is a named stamping dispatch (plan W4.1)
+            # — stamp ONLY after a successful supersede, mirroring invalidate.
+            if ok:
+                _session_write_marker("")
             sys.exit(0 if ok else 1)
         elif args.cmd == "get":
             sys.exit(0 if get_memory(conn, args.id) else 1)
@@ -6306,6 +6408,11 @@ def main():
                       f"id={card_result['id']} "
                       f"entity_id={card_result['entity_id']} "
                       f"source_ref={card_result['source_ref']}")
+            # Issue #398: stamp ONLY when a card row was actually written —
+            # result=no_card means nothing was stored, so the session-end
+            # closeout reminder must not arm (PRR-008).
+            if card_result.get("result") != "no_card":
+                _session_write_marker("")
             sys.exit(0)
         elif args.cmd == "links":
             sys.exit(cmd_links(conn, ids=args.ids, as_json=args.json,

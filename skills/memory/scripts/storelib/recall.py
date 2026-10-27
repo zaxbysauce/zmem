@@ -1200,6 +1200,48 @@ def _normalize_as_of(as_of: str | None) -> str | None:
         dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
+# Issue #397: closed state-hazard lexicon + bump helpers (see the bump site in _recall_one_tier).
+_STATE_HAZARD_LEXICON_RE = re.compile(
+    r"\b(?:uncommitted|dirty[ ]tree|dirty[ ]working[ ]tree)\b",
+    re.IGNORECASE,
+)
+_STATE_HAZARD_MARKER_RE = re.compile(
+    r"\b(?:when|whenever|if|while|before|after|until)\b",
+    re.IGNORECASE,
+)
+_STATE_HAZARD_BUMP = 0.15
+
+
+def _state_row_polarity_negated(content: str) -> bool:
+    """Negation polarity for the hazard bump: the row must carry an
+    explicit negator (never/don't/do not/avoid) — the incident shape pairs
+    a negated conditional against an affirmative unconditional row."""
+    return re.search(
+        r"\b(?:never|don't|do[ ]not|dont|avoid)\b", content or "",
+        re.IGNORECASE) is not None
+
+
+def _apply_state_hazard_bump(
+        scored: list[tuple[float, dict]]) -> list[tuple[float, dict]]:
+    """+0.15 on both the sort score and `_score` for qualifying rows."""
+    from storelib.consolidate import _polarity_signature
+    out: list[tuple[float, dict]] = []
+    for score, item in scored:
+        content = item.get("content") or ""
+        if (item.get("confidence", 0) is not None
+                and _STATE_HAZARD_LEXICON_RE.search(content)
+                and _STATE_HAZARD_MARKER_RE.search(content)
+                and _state_row_polarity_negated(content)
+                and _polarity_signature(content)):
+            item = dict(item)
+            item["_score"] = float(item.get("_score", score) or 0.0
+                                  ) + _STATE_HAZARD_BUMP
+            out.append((score + _STATE_HAZARD_BUMP, item))
+        else:
+            out.append((score, item))
+    return out
+
+
 def _recall_one_tier(
     conn: sqlite3.Connection,
     *,
@@ -1220,6 +1262,7 @@ def _recall_one_tier(
     expiry_lane: bool = False,
     expiry_acc: dict | None = None,
     prompt_timestamp: str | None = None,
+    state_hazard_bump: bool = False,
 ) -> list[tuple[float, dict]]:
     """FTS5 + composite scoring for ONE namespace set (a single recall tier).
 
@@ -1705,6 +1748,17 @@ def _recall_one_tier(
                 "rel": rel,
                 "trust": trust,
             }
+
+    # Issue #397: conditional-hazard rank bump — AFTER composite scoring,
+    # BEFORE sort/MMR/limit, on both the sort score and `_score`. The caller
+    # passes state_hazard_bump only when the hint is exactly "dirty";
+    # clean/unavailable/absent hints never reach here (byte-identical
+    # behavior). The full predicate (lexicon + condition marker + negation
+    # polarity) lives in _apply_state_hazard_bump; the confidence filter has
+    # already run and the post-pipeline relevance/trust gates do not read
+    # `_score`, so the no-admission invariant is preserved.
+    if state_hazard_bump and scored:
+        scored = _apply_state_hazard_bump(scored)
 
     # Sort by composite score descending within this tier, take top `limit`.
     if stable_ties:
@@ -3149,6 +3203,7 @@ def _recall_memory_impl(
     _user_global_floor: float | None = None,
     _authorized_namespaces: frozenset | None = None,
     exact: bool = False,
+    _state_hazard_hint: str | None = None,
 ) -> list[dict]:
     """FTS5 keyword recall with composite ranking + optional hybrid RRF fusion.
 
@@ -3383,6 +3438,7 @@ def _recall_memory_impl(
                 moment=effective_moment, lane=lane,
                 prompt_timestamp=prompt_timestamp,
                 expiry_lane=expiry_active, expiry_acc=expiry_acc,
+                state_hazard_bump=(_state_hazard_hint == "dirty"),
             )
 
     global_scored: list[tuple[float, dict]] = []
@@ -3400,6 +3456,7 @@ def _recall_memory_impl(
                 moment=effective_moment, lane=lane,
                 expiry_lane=expiry_active, expiry_acc=expiry_acc,
                 prompt_timestamp=prompt_timestamp,
+                state_hazard_bump=(_state_hazard_hint == "dirty"),
             )
 
     # Issue #235: the user:global tier floor.  The selector threads the
@@ -5365,6 +5422,7 @@ def _collect_injection_candidates(
     lane: str | None = None,
     _user_global_floor: float | None = None,
     _authorized_namespaces: frozenset | None = None,
+    _state_hazard_hint: str | None = None,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -5417,6 +5475,10 @@ def _collect_injection_candidates(
             cross_rerank=cross_rerank,
             weights=weights,
             no_unfold=no_unfold,
+            # Issue #397: the hint rides THIS call only — deliberately NOT
+            # the shared `common` dict, whose query-less leg feeds
+            # _recent_memory_impl (state-blind by design).
+            _state_hazard_hint=_state_hazard_hint,
             **common,
         )
     return dict(details)
@@ -5457,6 +5519,7 @@ def recall_memory(
     lane: str | None = None,
     _user_global_floor: float | None = None,
     _authorized_namespaces: frozenset | None = None,
+    _state_hazard_hint: str | None = None,
     exact: bool = False,
 ) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
@@ -5555,6 +5618,7 @@ def recall_memory(
         lane=lane,
         _user_global_floor=_user_global_floor,
         _authorized_namespaces=_authorized_namespaces,
+        _state_hazard_hint=_state_hazard_hint,
     )
     if _capture is not None:
         _capture.clear()

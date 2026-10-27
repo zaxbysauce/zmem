@@ -407,5 +407,84 @@ class RegistrationNeedleTest(unittest.TestCase):
         self.assertNotIn("_transcript_tail", text)
 
 
+class TaskTextRetentionTest(unittest.TestCase):
+    """Task-text stash retention: session-end removal, expiry unlink, and
+    sweep reaping of torn .tasktext.tmp.* files.
+
+    All state lives under a throwaway temp data dir; the sweep case drives
+    the public `store.py sweep` subprocess with the module's _clean_env
+    (ambient zmem env stripped, store pinned inside the temp dir).
+    """
+
+    def setUp(self):
+        import storelib.delivery_ledger as dl
+        self.dl = dl
+        self._tmp = tempfile.mkdtemp(prefix="zmem-retention-")
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_session_end_removes_tasktext(self):
+        sid = "retention-end-1"
+        self.dl.park_task_text(self._tmp, sid, "delegated task text")
+        path = Path(self.dl.tasktext_path(self._tmp, sid))
+        self.assertTrue(path.exists())
+        self.dl.end_delivery_state(self._tmp, sid)
+        self.assertFalse(
+            path.exists(),
+            "session end must remove the parked tasktext sidecar")
+
+    def test_session_end_keyed_clear_removes_raw_id_tasktext(self):
+        # Signature check (amendment): end_delivery_state DOES accept
+        # principal=/harness= kwargs (the issue #284 composite ledger
+        # key), so this leg drives the keyed variant directly. The tasktext
+        # stash is parked and addressed under the RAW session id
+        # (tasktext_path hashes session_id alone), so the session-end
+        # removal must key on the raw id too — a fix that unlinks
+        # tasktext_path(data_dir, <composite key>) would silently strand
+        # every keyed session's parked stash.
+        sid = "retention-keyed-1"
+        self.dl.park_task_text(self._tmp, sid, "delegated task text")
+        path = Path(self.dl.tasktext_path(self._tmp, sid))
+        self.assertTrue(path.exists())
+        self.dl.end_delivery_state(self._tmp, sid,
+                                   principal="p", harness="h")
+        self.assertFalse(
+            path.exists(),
+            "a KEYED (principal/harness) session-end clear must still "
+            "remove the tasktext sidecar parked under the RAW session id "
+            "— removal keys on the raw id, not the composite ledger key")
+
+    def test_all_expired_consume_unlinks(self):
+        sid = "retention-expired-1"
+        old = time.time() - 40 * 3600  # far past the delivery window
+        self.dl.park_task_text(self._tmp, sid, "stale delegated text",
+                               now=old)
+        path = Path(self.dl.tasktext_path(self._tmp, sid))
+        self.assertTrue(path.exists())
+        self.assertEqual(self.dl.consume_task_text(self._tmp, sid), "")
+        self.assertFalse(
+            path.exists(),
+            "a consume that finds only expired entries must still unlink "
+            "the stash file")
+
+    def test_sweep_reaps_tasktext_tmp(self):
+        ops = Path(self._tmp) / "ops"
+        ops.mkdir(parents=True, exist_ok=True)
+        torn = ops / "deadbeef.tasktext.tmp.aabbccdd"
+        torn.write_text("{}", encoding="utf-8")
+        old = time.time() - 40 * 86400
+        os.utime(torn, (old, old))
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "sweep",
+             "--marker-dir", self._tmp, "--max-age-days", "30"],
+            capture_output=True, text=True, timeout=120,
+            env=_clean_env(self._tmp))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(
+            torn.exists(),
+            "sweep must reap a stale .tasktext.tmp.* orphan")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -381,6 +381,22 @@ State plainly:
 That last line matters most: it is the evidence the bar was actually applied,
 not skipped.
 
+## Step 7 — Acknowledge the closeout
+
+The write-attribution flow stamps a `<sha256(session-id)[:32]>.wrote` marker
+under `<data>/ops/` for every session that stored a row, and the session
+hooks surface exactly one bounded closeout reminder while that marker exists
+without a recorded closeout (issue #398). Running this workflow IS the
+closeout — record it so the reminder silences:
+
+```bash
+"$P" "$S" closeout-ack --session-id "<session-id>"
+```
+
+`closeout-ack` is store-independent (it writes only the `.closeout` marker,
+never `store.sqlite`). Skip it only when the session genuinely wrote nothing;
+in that case no `.wrote` marker exists and no reminder is armed.
+
 ## Never
 
 - Never put secrets, credentials, tokens, or PII in the store — it is local

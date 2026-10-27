@@ -108,6 +108,33 @@ class GoldItem:
     expect: str = "inject"
 
 
+def _compose_gold_query(item: "GoldItem") -> str:
+    """Compose the item's eval query through the hook's real compose (issue
+    #88 / #85 direction 4), deriving the RAW gold ops first so compose
+    receives already-derived tokens — its post-#314 contract (PR #407
+    review blocker 2: feeding raw strings made the HARNESS change 12 gold
+    queries and the re-authored baseline masked it). Gold ops may be a
+    single raw string or a list of raw command strings; derive_ops_tokens
+    is variadic over events. Without ops the composition is the byte-exact
+    identity."""
+    from storelib.ops_tokens import compose_inject_query, derive_ops_tokens
+    ops = item.ops
+    if not ops:
+        return item.query
+    if isinstance(ops, str):
+        events = [ops]
+    elif isinstance(ops, (list, tuple)):
+        events = [str(e) for e in ops if e]
+    else:
+        return item.query
+    if not events:
+        return item.query
+    # compose takes the space-joined derived-token string (its internal
+    # sanitizer re-splits); the hook passes the ring's joined form too.
+    return compose_inject_query(
+        item.query, " ".join(derive_ops_tokens(*events)))
+
+
 def load_gold(path: str) -> list[GoldItem]:
     """Parse + validate a gold JSONL file. Fail-closed: the first invalid item
     raises GoldError naming that item (and the line number)."""
@@ -670,7 +697,7 @@ def evaluate_injection_items(
     import contextlib
     import io
     import json as _json
-    from storelib.ops_tokens import compose_inject_query
+    from storelib.ops_tokens import compose_inject_query, derive_ops_tokens
     from storelib.recall import (
         _format_fenced_recall,
         _normalize_as_of,
@@ -722,9 +749,12 @@ def evaluate_injection_items(
             # Hook parity: every query lane caps the query at 500 chars
             # (UserPromptSubmit prose, derived ops tokens, subagent task
             # text all go through the cap), so the eval must too.
-            base_query = (
-                compose_inject_query(item.query, item.ops) if item.ops else item.query
-            )
+            # Gold ops are RAW command text (string or list): derive first,
+            # exactly like the hook lanes, so compose receives
+            # already-derived tokens (its post-#314 contract). Feeding raw
+            # strings here made the harness itself change 12 gold queries
+            # when the compose contract flipped (PR #407 review blocker 2).
+            base_query = _compose_gold_query(item)
             executed_query = base_query[:500]
         rows, envelope = _run_lane(item, executed_query or "", k)
         rendered_ids = [r["id"] for r in rows]
@@ -882,7 +912,7 @@ def evaluate_items(
     """
     import io
     import contextlib
-    from storelib.ops_tokens import compose_inject_query
+    from storelib.ops_tokens import compose_inject_query, derive_ops_tokens
     from storelib.recall import _normalize_as_of, recall_memory
 
     for item in items:
@@ -900,9 +930,11 @@ def evaluate_items(
         # Issue #88 / #85 direction 4: decision-point items carry their
         # prior-turn operation context; compose through the SAME function the
         # UserPromptSubmit hook uses so the eval measures the real query.
+        # Gold ops are RAW command text — derive first (post-#314 compose
+        # expects already-derived tokens; see _compose_gold_query).
         # Without ops the composition is the byte-exact identity (pinned by
         # tests), so every legacy item's query — and score — is unchanged.
-        query = compose_inject_query(item.query, item.ops) if item.ops else item.query
+        query = _compose_gold_query(item)
         # recall_memory prints its CLI surface (fences or JSON) regardless of
         # as_json — the runner's stdout is reserved for the JSON report, so
         # the per-query prints are captured and discarded. no_bump supplies

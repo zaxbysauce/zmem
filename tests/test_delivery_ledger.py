@@ -389,7 +389,12 @@ class LedgerModuleTest(unittest.TestCase):
         self.assertFalse(Path(self.dl.ledger_path(self.tmp, sid)).exists())
         self.assertFalse(Path(self.dl.pending_path(self.tmp, sid)).exists())
         self.assertEqual(compact.read_bytes(), b"compact-survives")
-        self.assertEqual(tasktext.read_bytes(), b"tasktext-survives")
+        # Issue #336 contract flip: end_delivery_state (the terminal
+        # clear) removes the raw-id-keyed .tasktext stash; the mid-session
+        # clear keeps the survival law pinned in tests/test_subagent_tasktext.py
+        # (test_clear_delivery_state_keeps_tasktext_stash) and
+        # tests/test_session_end_cleanup.py's ledger-clear leg.
+        self.assertFalse(tasktext.exists())
         self.assertFalse((Path(self.tmp) / "store.sqlite").exists())
 
     def test_park_multi_row_single_fence_stored_once(self):

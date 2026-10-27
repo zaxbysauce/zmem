@@ -714,6 +714,72 @@ capture-mode/interval controls. Complete
 are removed before transcript-derived content reaches deduplication, queue
 synthesis, or closeout review.
 
+#### Pre-tool repository-state predicate — issue #397
+
+Since 0.124.0 the pretool lane carries a bounded, fail-open
+repository-state predicate. When the DERIVED pretool query contains any
+restore/destructive verb as a substring (checkout, restore, reset, stash,
+clean, rebase, merge, push, cherry-pick, revert, filter-branch — a
+substring match, so benign text like "cleanup" also arms it; the cost is
+one extra `git status`), the hook body runs
+`git status --porcelain --untracked-files=no` once — TRACKED-change dirt
+only, exactly the wiped-by-`git checkout --` hazard — in the EVENT cwd
+when it names an existing directory (process cwd otherwise), with the
+timeout read from `ZMEM_STATE_PROBE_TIMEOUT_S`
+(float seconds, default 2.0, clamped at 8.0; malformed values fall back
+to the default). When the verb gate does not arm, the probe does not run
+and the decision line carries NO `state=` field at all — absence means
+"no probe ran", distinct from `state=unavailable` ("ran and failed").
+The outcome travels as `--state-hint dirty|clean` on the pretool recall
+argv (omitted entirely when the probe fails — never an unknown value) and
+is recorded on the decision line as `state=dirty|clean|unavailable`.
+Store-side, a candidate row receives a +0.15 rank bump — on both the sort
+score and `_score` — ONLY when the hint is exactly `dirty` AND the row's
+content matches the closed hazard lexicon (`uncommitted`, `dirty tree`,
+`dirty working tree`) AND carries a condition marker AND negation
+polarity. Clean, unavailable, and absent hints are byte-identical to
+today; the global relevance floor and trust gates still withhold gated
+rows (a bump never rescues them). The hint rides the recall query branch
+only — the queryless `recent` lane stays state-blind. Test seam:
+`ZMEM_TEST_REPO_STATE=dirty|clean|unavailable` overrides the probe
+entirely.
+
+#### Write-path capture guards and the session closeout — issues #398 / #246 / #247
+
+- **Conditional-contradiction notice (#398)**: an `add` whose content
+  opposes a recent same-namespace row (negation-polarity disagreement +
+  condition marker + >= 2 shared significant tokens, 200-row window)
+  stores normally with a STRUCTURED notice naming both rows — notice
+  only, never an edge or trust mutation.
+- **Lesson phrasing advisory (#398)**: a `--type lesson` row with no
+  trigger-condition marker (when/whenever/if/while/before/after/until)
+  stores with an advisory suggesting the conditional phrasing.
+- **Hostless namespace near-miss (#246)**: a `project:<owner>/<repo>`
+  key with a dotless first component stores, with a
+  `namespace_project_near_miss` warning naming the canonical
+  `project:github.com/<owner>/<repo>` form (assumption A7:
+  warn-and-store — rejecting would break legitimate hierarchical
+  namespaces).
+- **Session closeout (#398)**: every successful attributed store write
+  (`add`/`update`/`supersede`/`invalidate`/`entity-card` when a card was
+  written) stamps `<sha256(session-id)[:32]>.wrote` under `<data>/ops/`;
+  refused writes stamp nothing. The session hooks surface exactly one
+  bounded closeout reminder while `.wrote` exists without `.closeout` —
+  at session end, and (because SessionEnd output has no live model turn
+  on most hosts) re-surfaced once at the NEXT SessionStart in
+  model-visible context. A recorded closeout silences it:
+  `store.py closeout-ack --session-id <id>` (store-independent; the
+  closeout workflow's Step 7 runs it). The ops age sweep reaps
+  `.wrote`/`.closeout`/`.nudged` markers after
+  `ZMEM_SENTINEL_SWEEP_DAYS`.
+- **Harvest-paste gate (#247)**: a user message over 400 chars whose
+  dominant fenced block parses as JSON (array or single object) carrying
+  >= 3 of the harvest keys (`namespace`, `type`, `content`, `signal`) is
+  NOT captured as a correction candidate — it belongs to
+  `/ingest-harvest`. The gate runs on the manual correction hook lane and
+  the auto-retain and history-mine lanes; line endings are normalized
+  (CRLF pastes are gated too).
+
 #### Pre-tool inject — issue #90 / #85 direction C
 
 On hosts whose pre-tool contract was probed and confirmed (ZCode: documented;
@@ -789,9 +855,12 @@ redact before capping the parked bytes at 800, never a storelib import in
 the adapter), the CLI parks it via `park_task_text`
 (secret-redacted through the canonical `redact_text`, advisory and
 fail-open; 16-entry cap, and a stale entry stops being CONSUMED after the
-6h window — but that prune is in-memory only, so the file survives
-session-end clears and the real bound on untrusted host prose on disk is
-the ops age sweep, `ZMEM_SENTINEL_SWEEP_DAYS`, default 7 days; `purge`
+6h window — that prune is in-memory only; issue #336 (0.124.0) added the
+disk bounds: the TERMINAL session-end clear now unlinks the stash beside
+the data dir it serves (the mid-session `ledger-clear` keeps it), an
+all-expired consume unlinks immediately, and the real bound on untrusted
+host prose on disk remains the ops age sweep,
+`ZMEM_SENTINEL_SWEEP_DAYS`, default 7 days; `purge`
 scrubs the stash by needle and reaps orphaned `*.tasktext.tmp.*`;
 0600-at-open + atomic replace, with owner-only access on Windows resting
 on the operator-profile ACL rather than chmod), and the selector consumes it
@@ -1223,6 +1292,7 @@ The exact session-aware CLI forms are:
   [--ops-token <token>]... [--authorized-namespace <ns>]...
 <interpreter> <store.py> ledger-clear --session-id=<id> [--principal <id>] [--harness <id>]
 <interpreter> <store.py> delivery-clear --session-id=<id> [--principal <id>] [--harness <id>]
+<interpreter> <store.py> closeout-ack --session-id=<id>
 ```
 
 The passive `recall` and `recent` commands accept the additive attribution
@@ -1231,7 +1301,11 @@ called with `--for-injection --json`, plus the payload flag
 `--delegation-prompt` (issue #253) and repeatable `--authorized-namespace`
 (issue #283: the caller's namespace allow-list — the selector's
 `user:global` and cross-project lanes are filtered to it; omitted means
-unscoped). `--delegation-prompt` is honored ONLY on
+unscoped). On the pretool passive lane, recall additionally accepts
+`--state-hint dirty|clean` (issue #397): it REQUIRES the passive shape
+(`--for-injection --json --session-id`) and `--moment pretool` on recall —
+either missing is a stable exit-2 refusal — and is refused on any moment
+other than pretool; the hook is the intended caller. `--delegation-prompt` is honored ONLY on
 `--moment pretool` with a session id, is secret-redacted before it touches the
 sidecar, and exists to park the delegating Agent/Task prompt for the subagent
 moment; every other moment ignores it. An empty query dispatches to recent
