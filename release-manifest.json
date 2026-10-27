@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "de7daeeb1520bfbf25852ec41ce02f0c80219512376b4105c7cbd08b28884e29",
+  "digest": "254950bab0d3f5c9deaaec66b2498af2e5fb64ce84d0f40458ab3d20c24083d1",
   "files": {
     ".agents/plugins/marketplace.json": "9fdfed3c038b7c8603ca8420a91fb9e26c398428794c49d74eb08dc06cefbe7d",
     ".claude-plugin/marketplace.json": "f888ef4d1f438e61196c0afa3504843ccd30859abedeb8f0c64215a5df221aba",
@@ -13,7 +13,7 @@
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fdec448c8b40d7a0a5c32b98e80e9a1aedcd1df15d806c3c93b059183814b1eb",
     "hermes-plugin/hooks/zmem-hermes-verify.py": "636dc228dd013600f50b8f898622dbb7c6040a4b0229e412b6e6b59126775368",
     "hermes-plugin/plugin.yaml": "fc21ed0d9ef4adaead61791a3fc86cb71df98430c961e9415a033840716008a0",
-    "hermes-plugin/server/auth.py": "a05371855dc0fafbe07ce76a7ff32b6d14ad08d234a2fe20b32db4e375d24295",
+    "hermes-plugin/server/auth.py": "f3cbecbf8108db8ead03fcf80ea1391b46382d81647f3fc7dbf0a7a7fd6f2444",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "e64c72db385922b7dc198651c4569abd0eba85040db10aa3ca2da9d7003906c8",
     "hermes-plugin/server/mcp_server.py": "79b86e2a146a105491f9f1b0728bb63016391141de0fd37bf91c00b704bf5037",
@@ -73,7 +73,7 @@
     "skills/memory/scripts/correction_queue.py": "b9306cab8e1a4a035581093d91ad2acf34926fdac02b853c8c4384d7ef4bbf9f",
     "skills/memory/scripts/corrections.py": "cf6ac131d092bb319cf9cfcf762b8384105588c8adb968349c804efb50bbaf7a",
     "skills/memory/scripts/cross_encoder_profiles.py": "5fbf8dec9f660b76234e4254a8964e4b5756bfec4f88df6483d71b6b8250b42d",
-    "skills/memory/scripts/doctor.py": "b8a719a1b85f46ccb65de6c56eab21a524b61a8702e51c94a9d30f5b7b13d3db",
+    "skills/memory/scripts/doctor.py": "a452300e45f9e06f8767bc27f25bb31c95b82159207710be42480b5c6a5ca033",
     "skills/memory/scripts/drift.py": "c6ba2148f71671275b4096c747942411fa2ac48558ed8420cbe8abfbdffe356e",
     "skills/memory/scripts/embed_profiles.py": "0666878e7c4924bf8798fed0641bbdaf36b33edad1c7f7d16ecf5e984e06899c",
     "skills/memory/scripts/embeddings.py": "5e6016f10a0b1903885a9a9d8419398922ce988911c915a35eac28124034ce80",
