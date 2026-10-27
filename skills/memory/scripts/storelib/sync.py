@@ -2100,13 +2100,17 @@ def _strict_ingest_staged(
                                    caller_source_ref=source_ref,
                                    resolvable_ids=_peer_resolvable)
             elif table == "episode":
-                # F22: an episode summary pointer is a lineage claim too.
+                # F22 + #395 item 2: an episode summary pointer is a lineage
+                # claim too, and it resolves under the SAME rule the memory
+                # pointers use above — `_peer_resolvable` (store rows in
+                # allowed namespaces UNION authored staged ids minus purged).
+                # The pre-#395 fallback consulted the raw staged CLAIMED
+                # namespace map, so a decoy row colliding with a foreign-
+                # namespace store id (landing `skipped`, never authored)
+                # kept the pointer aimed at the foreign row.
                 sid = obj.get("summary_memory_id") or ""
                 if sid and sid not in _peer_resolvable:
-                    staged_ns = staged_mem_ns.get(sid)
-                    if staged_ns is None or not trust_policy.namespace_allowed(
-                            staged_ns):
-                        obj["summary_memory_id"] = ""
+                    obj["summary_memory_id"] = ""
                 obj["namespace"] = obj.get("namespace", "").strip()
     # v15 (#173 PR-review F13/F29): observability for the expiry apply pass —
     # purged parents soft-drop and identical reimports are no-ops, neither is

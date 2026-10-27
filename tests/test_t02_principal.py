@@ -50,6 +50,21 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+import subprocess
+
+
+def _map_owner_only(path) -> None:
+    """#406 contract: a test map must not depend on the directory's
+    inherited ACL (non-system drives inherit Users/Authenticated-Users
+    allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
+    if os.name == "nt":
+        subprocess.run(
+            ["icacls", os.fspath(path), "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+    else:
+        os.chmod(os.fspath(path), 0o600)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_DIR = REPO_ROOT / "hermes-plugin" / "server"
@@ -230,6 +245,7 @@ class RequestScopedPrincipalTest(unittest.TestCase):
         mapping[_TOKEN_U].pop("namespaces")
         with open(self._map_path, "w", encoding="utf-8") as f:
             json.dump(mapping, f)
+        _map_owner_only(self._map_path)
         return self._map_path
 
     def _build_with_map(self, map_path):
@@ -353,6 +369,7 @@ class RequestScopedPrincipalTest(unittest.TestCase):
 
         with open(self._map_path, "w", encoding="utf-8") as f:
             f.write("{not valid json")
+        _map_owner_only(self._map_path)  # corrupt leg, not perm leg
         st = os.stat(self._map_path)
         os.utime(self._map_path, (st.st_atime, st.st_mtime + 5))
         # Past the 1-second reload window the next verification hits the

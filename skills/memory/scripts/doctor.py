@@ -23,6 +23,7 @@ import os
 import shutil
 import re
 import sqlite3
+import stat as _stat
 import subprocess
 import sys
 import time
@@ -4843,6 +4844,182 @@ def _check_fleet_hello_compat(hello: tuple[str, str, dict]) -> dict:
     return _check("fleet-hello-compat", "fail", summary, **details)
 
 
+# -- principal-map file-permission verdict (issue #406) --------------------
+#
+# Deliberate byte-parity with hermes-plugin/server/auth.py's copy (the
+# repo's parser-mirror precedent: doctor never imports server auth); a supp
+# test pins the parity. The verdict answers one question: does the map
+# file's permission shape expose its bearer entries beyond the owner-only
+# contract the installers enforce at creation (install-hub.sh mode 0600;
+# install-hub.ps1 no broad allow ACE)?
+
+# os.stat on NTFS synthesizes st_mode from only the readonly attribute, so
+# S_IMODE is always one of these two shapes there regardless of the real
+# DACL. A finer-grained mode on nt is therefore an authoritative stat (a
+# POSIX-ish mount or a deliberate injection) and the mode leg applies to it;
+# the synthesized shapes defer to the DACL leg.
+_WINDOWS_SYNTHESIZED_MODES = frozenset({0o666, 0o444})
+
+# The enforceable Windows boundary matching install-hub.ps1's refusal list.
+# NOT owner-relative on purpose: real Windows user-profile directories
+# inherit allow-ACEs for machine-local SIDs (S-1-5-21-*, including
+# unresolvable per-app capability SIDs and sandbox groups) that do not make
+# the file readable by other accounts' broad groups — an owner-relative
+# policy false-refuses every legitimate developer/CI map (verified by probe
+# during implementation). Broad well-known principals are the real exposure.
+_NT_BROAD_SIDS = frozenset({"S-1-1-0", "S-1-5-32-545", "S-1-5-11"})
+
+_ACCESS_ALLOWED_ACE_TYPE = 0x0
+
+
+def _map_mode_problem(st):
+    """POSIX mode-bits verdict over a stat result (pure; parity-tested)."""
+    imode = _stat.S_IMODE(st.st_mode)
+    if not (imode & 0o077):
+        return None
+    if os.name == "nt" and imode in _WINDOWS_SYNTHESIZED_MODES:
+        # Synthesized nt shape: the real answer is the DACL leg.
+        return None
+    return (f"mode 0{imode:o} grants group/world access "
+            f"(installers enforce 0600/owner-only; chmod 0600 the file)")
+
+
+def _nt_allow_ace_problem(owner_sid, ace_tuples):
+    """Broad-allow-ACE policy over parsed (sid, ace_type) pairs.
+
+    Pure function (parity-tested): an ACCESS_ALLOWED ace naming a
+    well-known BROAD principal (Everyone / BUILTIN\\Users / Authenticated
+    Users — install-hub.ps1's refusal list) is exposure. Denied/audit ACEs
+    never grant access; machine-local SIDs are deliberately out of scope
+    (see the narrowing note above — they do not make the file readable by
+    OTHER local accounts' broad groups).
+    """
+    for sid, ace_type in ace_tuples:
+        if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+            continue
+        if sid in _NT_BROAD_SIDS:
+            return (f"broad allow ACE grants {sid} (Everyone/Users/"
+                    f"Authenticated Users) access — restrict the file to "
+                    f"the hub service account")
+    return None
+
+
+def _nt_security_ace_tuples(path, fd):
+    """(owner_sid, [(sid, ace_type), ...]) for the file's DACL, or raises.
+
+    Uses the HANDLE of an already-open descriptor when given (the same
+    object a caller is about to read — no check/use window), converting the
+    CRT descriptor with msvcrt.get_osfhandle; falls back to a path query.
+    Kept in parity with hermes-plugin/server/auth.py's copy.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    advapi32 = ctypes.windll.advapi32
+    OWNER_INFO = 0x00000001
+    DACL_INFO = 0x00000004
+    p_sd = ctypes.c_void_p()
+    owner = ctypes.c_void_p()
+    dacl_present = ctypes.wintypes.BOOL()
+    p_dacl = ctypes.c_void_p()
+    defaulted = ctypes.wintypes.BOOL()
+
+    if fd is not None:
+        import msvcrt
+        handle = msvcrt.get_osfhandle(fd)
+        rc = advapi32.GetSecurityInfo(
+            ctypes.wintypes.HANDLE(handle), 1,  # SE_FILE_OBJECT
+            OWNER_INFO | DACL_INFO,
+            ctypes.byref(owner), None, ctypes.byref(p_dacl), None,
+            ctypes.byref(p_sd))
+    else:
+        rc = advapi32.GetNamedSecurityInfoW(
+            ctypes.c_wchar_p(os.fspath(path)), 1,  # SE_FILE_OBJECT
+            OWNER_INFO | DACL_INFO,
+            ctypes.byref(owner), None, ctypes.byref(p_dacl), None,
+            ctypes.byref(p_sd))
+    if rc != 0 or not p_sd.value:
+        raise OSError(f"GetSecurityInfo failed (winerror {rc})")
+
+    def _sid_str(sid_addr):
+        """SID string for a raw address, or raises."""
+        buf = ctypes.c_wchar_p()
+        try:
+            if advapi32.ConvertSidToStringSidW(
+                    ctypes.c_void_p(sid_addr), ctypes.byref(buf)) == 0:
+                raise OSError("ConvertSidToStringSidW failed")
+            value = buf.value
+            if value is None:
+                raise OSError("ConvertSidToStringSidW returned null")
+            return value
+        finally:
+            addr = ctypes.cast(buf, ctypes.c_void_p).value
+            if addr:
+                ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(addr))
+
+    try:
+        owner_sid = _sid_str(owner.value) if owner.value else None
+        ace_tuples = []
+        if not advapi32.GetSecurityDescriptorDacl(
+                p_sd, ctypes.byref(dacl_present), ctypes.byref(p_dacl),
+                ctypes.byref(defaulted)):
+            raise OSError("GetSecurityDescriptorDacl failed")
+        if not dacl_present.value or not p_dacl.value:
+            # NULL DACL = everyone-full; absent DACL = inherited (object's
+            # protection is not owner-pinned). Either way: not owner-only.
+            return owner_sid, None  # None marks NULL/absent DACL
+        class _ACL_SIZE(ctypes.Structure):
+            # ACL_SIZE_INFORMATION: three DWORDs; only AceCount is read.
+            _fields_ = [("AceCount", ctypes.wintypes.DWORD),
+                        ("AclBytesInUse", ctypes.wintypes.DWORD),
+                        ("AclBytesFree", ctypes.wintypes.DWORD)]
+        size_info = _ACL_SIZE()
+        if not advapi32.GetAclInformation(
+                p_dacl, ctypes.byref(size_info),
+                ctypes.sizeof(_ACL_SIZE), 2):  # AclSizeInformation
+            raise OSError("GetAclInformation failed")
+        ace_ptr = ctypes.c_void_p()
+        for i in range(size_info.AceCount):
+            if advapi32.GetAce(p_dacl, i, ctypes.byref(ace_ptr)) == 0:
+                raise OSError("GetAce failed")
+            ace_addr = ace_ptr.value
+            header = (ctypes.c_ubyte * 2).from_address(ace_addr)
+            ace_type = header[0]
+            # ACCESS_ALLOWED_ACE: 4-byte header + 4-byte mask, SID at +8.
+            ace_tuples.append((_sid_str(ace_addr + 8), ace_type))
+        return owner_sid, ace_tuples
+    finally:
+        if p_sd.value:
+            ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(p_sd.value))
+
+
+def _map_permission_problem(path, st, *, fd=None):
+    """Over-permissive principal-map verdict, or None when owner-only.
+
+    POSIX mode leg first; on nt, synthesized stat shapes defer to the DACL
+    leg (handle-based when fd is given). DACL inspection failures FAIL the
+    check (fail-closed): skipping the only authoritative Windows check
+    would pass an uninspectable map whose exposure is unknown.
+    """
+    problem = _map_mode_problem(st)
+    if problem is not None:
+        return problem
+    if os.name != "nt":
+        return None
+    imode = _stat.S_IMODE(st.st_mode)
+    if imode not in _WINDOWS_SYNTHESIZED_MODES:
+        return None  # an authoritative finer-grained stat already decided
+    try:
+        owner_sid, ace_tuples = _nt_security_ace_tuples(path, fd)
+    except (OSError, ImportError, AttributeError) as exc:
+        return (f"could not inspect permissions ({type(exc).__name__}: "
+                f"{exc}); failing rather than pass an uninspectable map")
+    if ace_tuples is None:
+        return ("DACL is NULL/absent — grants everyone; restrict the file "
+                "to the hub service account")
+    return _nt_allow_ace_problem(owner_sid, ace_tuples)
+
+
 def _check_fleet_principal(hello: tuple[str, str, dict]) -> dict:
     """The principal lane for --fleet: plural map (hub box) or the installed
     singular broker credential (validated by the authenticated hello)."""
@@ -4875,6 +5052,23 @@ def _check_fleet_principal(hello: tuple[str, str, dict]) -> dict:
         if problems:
             return _check("fleet-principal", "fail",
                           "; ".join(problems[:3]),
+                          principal_count=count)
+        # Issue #406: content-valid is not enough — the map carries bearer
+        # entries, so its FILE permission shape gets the same verdict the
+        # hub enforces at load/reload and the installers enforce at
+        # creation (mode 0600 / no broad allow ACE).
+        try:
+            _st = os.stat(path)
+        except OSError as exc:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) could not be "
+                          f"stat-ted for the permission verdict: {exc}",
+                          principal_count=count)
+        _perm_problem = _map_permission_problem(path, _st)
+        if _perm_problem is not None:
+            return _check("fleet-principal", "fail",
+                          f"ZMEM_MCP_TOKENS_FILE ({tok_file}) permission is "
+                          f"over-permissive: {_perm_problem}",
                           principal_count=count)
         return _check("fleet-principal", "pass",
                       f"Principal map valid ({count} principals).",

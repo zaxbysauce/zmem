@@ -53,6 +53,7 @@ import json as _json
 import importlib.util
 import os
 import re
+import stat as _stat
 import sys
 import time
 from dataclasses import dataclass
@@ -651,6 +652,226 @@ def _parse_principal_map(raw: str, source: str) -> dict:
     return entries
 
 
+# -- principal-map file-permission contract (issue #406) -------------------
+#
+# The installers pin an owner-only shape at CREATION (install-hub.sh refuses
+# any mode != 600; install-hub.ps1 refuses broad allow ACEs for Everyone /
+# Users / Authenticated Users). These helpers extend that contract to LOAD
+# time, RELOAD time, and doctor time: a map that drifted to group/world
+# access after a correct install (umask-created replacement via mv/cp,
+# chmod, ACL inheritance reset on a volume move) must refuse to serve its
+# bearer entries instead of keeping answering on bearer possession — a
+# locally readable map equals full principal impersonation for every local
+# account on a multi-user hub.
+#
+# Kept in deliberate byte-parity with skills/memory/scripts/doctor.py's copy
+# (the repo's parser-mirror precedent: doctor never imports server auth, and
+# server auth never imports storelib); tests pin the parity.
+
+# os.stat on NTFS synthesizes st_mode from only the readonly attribute, so
+# S_IMODE is always one of these two shapes there regardless of the real
+# DACL. A finer-grained mode on nt is therefore an authoritative stat (a
+# POSIX-ish mount or a deliberate injection) and the mode leg applies to it;
+# the synthesized shapes defer to the DACL leg.
+_WINDOWS_SYNTHESIZED_MODES = frozenset({0o666, 0o444})
+
+# Owner-relative Windows policy: an allow-ACE is exempt only when its SID is
+# the file OWNER, SYSTEM (S-1-5-18), or Administrators (S-1-5-32-544) — what
+# a locked-down install grants. Any other allow-ACE principal is exposure.
+# NARROWED (implementation probe, issue #406): real Windows user-profile
+# directories inherit allow-ACEs for machine-local SIDs (S-1-5-21-*) that do
+# not resolve to any broad principal — per-app capability SIDs and sandbox
+# groups on the SAME machine — so an owner-relative policy false-refuses
+# every legitimate developer/CI map. The enforceable boundary that still
+# matches the installers' refusal contract (install-hub.ps1) is the
+# well-known BROAD principals; the verdict text says exactly that and never
+# claims owner-only.
+_NT_BROAD_SIDS = frozenset({"S-1-1-0", "S-1-5-32-545", "S-1-5-11"})
+
+_ACCESS_ALLOWED_ACE_TYPE = 0x0
+
+
+class MapPermissionRefused(SystemExit):
+    """A principal map whose file permissions expose its bearer entries.
+
+    A SystemExit subclass (exit 2, the map config-failure class) raised
+    BEFORE PrincipalMap.force_reload's generic ``except SystemExit``
+    keep-previous-map handler: a permission drift does not change file
+    content, so keeping the previous map would keep serving exactly the
+    credentials the file now exposes locally. The hub fails closed instead;
+    the README documents the supervisor restart loop and the remedy.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(2)
+        self.message = message
+
+
+def _map_mode_problem(st) -> Optional[str]:
+    """POSIX mode-bits verdict over a stat result (pure; parity-tested)."""
+    imode = _stat.S_IMODE(st.st_mode)
+    if not (imode & 0o077):
+        return None
+    if os.name == "nt" and imode in _WINDOWS_SYNTHESIZED_MODES:
+        # Synthesized nt shape: the real answer is the DACL leg.
+        return None
+    return (f"mode 0{imode:o} grants group/world access "
+            f"(installers enforce 0600/owner-only; chmod 0600 the file)")
+
+
+def _nt_allow_ace_problem(owner_sid, ace_tuples):
+    """Broad-allow-ACE policy over parsed (sid, ace_type) pairs.
+
+    Pure function (parity-tested): an ACCESS_ALLOWED ace naming a
+    well-known BROAD principal (Everyone / BUILTIN\\Users / Authenticated
+    Users — install-hub.ps1's refusal list) is exposure. Denied/audit ACEs
+    never grant access; machine-local SIDs are deliberately out of scope
+    (see the narrowing note above — they do not make the file readable by
+    OTHER local accounts' broad groups).
+    """
+    for sid, ace_type in ace_tuples:
+        if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
+            continue
+        if sid in _NT_BROAD_SIDS:
+            return (f"broad allow ACE grants {sid} (Everyone/Users/"
+                    f"Authenticated Users) access — restrict the file to "
+                    f"the hub service account")
+    return None
+
+
+def _nt_security_ace_tuples(path, fd):
+    """(owner_sid, [(sid, ace_type), ...]) for the file's DACL, or raises.
+
+    Uses the HANDLE of an already-open descriptor when given (the same
+    object the caller will read — no check/use window), converting the CRT
+    descriptor with msvcrt.get_osfhandle; falls back to a path query.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    advapi32 = ctypes.windll.advapi32
+    OWNER_INFO = 0x00000001
+    DACL_INFO = 0x00000004
+    p_sd = ctypes.c_void_p()
+    owner = ctypes.c_void_p()
+    dacl_present = ctypes.wintypes.BOOL()
+    p_dacl = ctypes.c_void_p()
+    defaulted = ctypes.wintypes.BOOL()
+
+    if fd is not None:
+        import msvcrt
+        handle = msvcrt.get_osfhandle(fd)
+        rc = advapi32.GetSecurityInfo(
+            ctypes.wintypes.HANDLE(handle), 1,  # SE_FILE_OBJECT
+            OWNER_INFO | DACL_INFO,
+            ctypes.byref(owner), None, ctypes.byref(p_dacl), None,
+            ctypes.byref(p_sd))
+    else:
+        rc = advapi32.GetNamedSecurityInfoW(
+            ctypes.c_wchar_p(os.fspath(path)), 1,  # SE_FILE_OBJECT
+            OWNER_INFO | DACL_INFO,
+            ctypes.byref(owner), None, ctypes.byref(p_dacl), None,
+            ctypes.byref(p_sd))
+    if rc != 0 or not p_sd.value:
+        raise OSError(f"GetSecurityInfo failed (winerror {rc})")
+
+    def _sid_str(sid_addr):
+        """SID string for a raw address, or raises."""
+        buf = ctypes.c_wchar_p()
+        try:
+            if advapi32.ConvertSidToStringSidW(
+                    ctypes.c_void_p(sid_addr), ctypes.byref(buf)) == 0:
+                raise OSError("ConvertSidToStringSidW failed")
+            value = buf.value
+            if value is None:
+                raise OSError("ConvertSidToStringSidW returned null")
+            return value
+        finally:
+            addr = ctypes.cast(buf, ctypes.c_void_p).value
+            if addr:
+                ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(addr))
+
+    try:
+        owner_sid = _sid_str(owner.value) if owner.value else None
+        ace_tuples = []
+        if not advapi32.GetSecurityDescriptorDacl(
+                p_sd, ctypes.byref(dacl_present), ctypes.byref(p_dacl),
+                ctypes.byref(defaulted)):
+            raise OSError("GetSecurityDescriptorDacl failed")
+        if not dacl_present.value or not p_dacl.value:
+            # NULL DACL = everyone-full; absent DACL = inherited (object's
+            # protection is not owner-pinned). Either way: not owner-only.
+            return owner_sid, None  # None marks NULL/absent DACL
+        class _ACL_SIZE(ctypes.Structure):
+            # ACL_SIZE_INFORMATION: three DWORDs; only AceCount is read.
+            _fields_ = [("AceCount", ctypes.wintypes.DWORD),
+                        ("AclBytesInUse", ctypes.wintypes.DWORD),
+                        ("AclBytesFree", ctypes.wintypes.DWORD)]
+        size_info = _ACL_SIZE()
+        if not advapi32.GetAclInformation(
+                p_dacl, ctypes.byref(size_info),
+                ctypes.sizeof(_ACL_SIZE), 2):  # AclSizeInformation
+            raise OSError("GetAclInformation failed")
+        ace_ptr = ctypes.c_void_p()
+        for i in range(size_info.AceCount):
+            if advapi32.GetAce(p_dacl, i, ctypes.byref(ace_ptr)) == 0:
+                raise OSError("GetAce failed")
+            ace_addr = ace_ptr.value
+            header = (ctypes.c_ubyte * 2).from_address(ace_addr)
+            ace_type = header[0]
+            # ACCESS_ALLOWED_ACE: 4-byte header + 4-byte mask, SID at +8.
+            ace_tuples.append((_sid_str(ace_addr + 8), ace_type))
+        return owner_sid, ace_tuples
+    finally:
+        if p_sd.value:
+            ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(p_sd.value))
+
+
+def _map_permission_problem(path, st, *, fd=None) -> Optional[str]:
+    """Over-permissive principal-map verdict, or None when owner-only.
+
+    POSIX mode leg first; on nt, synthesized stat shapes defer to the DACL
+    leg (handle-based when fd is given). DACL inspection failures are
+    REFUSED (fail-closed): skipping the only authoritative Windows check
+    would serve the tokens precisely when their exposure is unknown.
+    """
+    problem = _map_mode_problem(st)
+    if problem is not None:
+        return problem
+    if os.name != "nt":
+        return None
+    imode = _stat.S_IMODE(st.st_mode)
+    if imode not in _WINDOWS_SYNTHESIZED_MODES:
+        return None  # an authoritative finer-grained stat already decided
+    try:
+        owner_sid, ace_tuples = _nt_security_ace_tuples(path, fd)
+    except (OSError, ImportError, AttributeError) as exc:
+        return (f"could not inspect permissions ({type(exc).__name__}: "
+                f"{exc}); refusing rather than serve an uninspectable map")
+    if ace_tuples is None:
+        return ("DACL is NULL/absent — grants everyone; restrict the file "
+                "to the hub service account")
+    return _nt_allow_ace_problem(owner_sid, ace_tuples)
+
+
+def _open_map_checked(path):
+    """Open the map and verify the OPEN object's permissions, atomically.
+
+    open -> fstat -> permission verdict on the same handle that the caller
+    reads from: the path-based stat verdict alone leaves a replace-after-
+    check window. Returns (text, mtime_ns). Raises OSError/MapPermission-
+    Refused via the caller on failure shapes.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        st = os.fstat(fh.fileno())
+        problem = _map_permission_problem(path, st, fd=fh.fileno())
+        if problem is not None:
+            raise MapPermissionRefused(
+                f"ZMEM_MCP_TOKENS_FILE ({path}) is over-permissive: "
+                f"{problem}")
+        return fh.read(), st.st_mtime_ns
+
+
 class PrincipalMap:
     """The loaded token map with mtime-rate-limited reload (issue #281).
 
@@ -687,12 +908,34 @@ class PrincipalMap:
         logs a fixed-class warning: an operator's corrupt rewrite must not
         brick auth for every live machine, but it DOES defer any pending
         revocation until a valid rewrite lands (disclosed in README).
+        A PERMISSION refusal is different and fails closed (issue #406):
+        a chmod does not change content, so keeping the previous map would
+        keep serving exactly the credentials the file now exposes locally.
         """
+        # Path-based pre-check (issue #406): the drift is detectable before
+        # any read; the authoritative same-handle check runs inside
+        # _open_map_checked below.
         try:
-            mtime = os.stat(self._path).st_mtime_ns
-            with open(self._path, "r", encoding="utf-8") as fh:
-                raw = fh.read()
+            _pre_st = os.stat(self._path)
+        except OSError:
+            _pre_st = None
+        if _pre_st is not None:
+            _problem = _map_permission_problem(self._path, _pre_st)
+            if _problem is not None:
+                sys.stderr.write(
+                    "zmem-mcp: zmem_mcp_principal_map_permission_refused "
+                    f"{self._path} {_problem}" + chr(10))
+                raise MapPermissionRefused(
+                    f"ZMEM_MCP_TOKENS_FILE ({self._path}) is "
+                    f"over-permissive: {_problem}")
+        try:
+            raw, mtime = _open_map_checked(self._path)
             entries = _parse_principal_map(raw, self._path)
+        except MapPermissionRefused as exc:
+            sys.stderr.write(
+                "zmem-mcp: zmem_mcp_principal_map_permission_refused "
+                f"{self._path} {getattr(exc, 'message', exc)}" + chr(10))
+            raise
         except SystemExit:
             # A RELOAD-time config failure (the exit-2 class _fail_config
             # raises, e.g. a corrupt rewrite) must NOT take the server
@@ -739,6 +982,18 @@ class PrincipalMap:
         # coarse-granularity filesystem can land two edits in one tick.
         # st_mtime_ns keeps sub-second granularity where the FS provides it.
         mtime = st.st_mtime_ns
+        # Issue #406: permission drift often does NOT bump mtime (chmod
+        # changes ctime only), so the once-per-second stat also re-checks
+        # the permission shape; a refusal escapes verify_token and ends the
+        # process (fail-closed; README documents the supervisor behavior).
+        _problem = _map_permission_problem(self._path, st)
+        if _problem is not None:
+            sys.stderr.write(
+                "zmem-mcp: zmem_mcp_principal_map_permission_refused "
+                f"{self._path} {_problem}" + chr(10))
+            raise MapPermissionRefused(
+                f"ZMEM_MCP_TOKENS_FILE ({self._path}) is over-permissive: "
+                f"{_problem}")
         if self._mtime is not None and mtime == self._mtime:
             return
         self.force_reload()
@@ -783,7 +1038,20 @@ def load_principal_map(path: Optional[str] = None) -> PrincipalMap:
         )
     p = Path(tok_file).expanduser()
     try:
-        raw = p.read_text(encoding="utf-8")
+        st = os.stat(p)
+    except OSError as exc:
+        _fail_map(f"ZMEM_MCP_TOKENS_FILE ({tok_file}) unreadable: {exc}")
+    # Issue #406: the map carries bearer entries for up to 256 machines;
+    # a group/world-readable file must refuse startup, never serve.
+    problem = _map_permission_problem(p, st)
+    if problem is not None:
+        _fail_map(f"ZMEM_MCP_TOKENS_FILE ({tok_file}) is over-permissive: "
+                  f"{problem}")
+    try:
+        raw, _mtime = _open_map_checked(p)
+    except MapPermissionRefused as exc:
+        # exc.message already names the file and shape; no double prefix.
+        _fail_map(getattr(exc, "message", str(exc)))
     except OSError as exc:
         _fail_map(f"ZMEM_MCP_TOKENS_FILE ({tok_file}) unreadable: {exc}")
     entries = _parse_principal_map(raw, f"ZMEM_MCP_TOKENS_FILE ({tok_file})")

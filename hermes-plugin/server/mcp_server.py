@@ -447,6 +447,33 @@ def _resolve_store_py() -> Path:
     return _resolve_zmem_home() / _STORE_PY_REL
 
 
+_split_tag_tokens = None
+
+
+def _load_split_tag_tokens():
+    """Resolve the store checkout's consumer tag tokenizer (issue #381).
+
+    The attribution strip must decide tokenhood under the SAME grammar every
+    storelib consumer uses to read tags back (storelib.entity's
+    split_tag_tokens: comma, semicolon, and whitespace separators) — the
+    pre-#395 comma-only, case-sensitive strip here let `Host:evil` and
+    `x;host:evil` survive and mint forged host entities. Uses the same
+    temporary sys.path seam as the log_rotate/recall imports, cached after
+    first success. Raises loudly on failure — never falls back to a
+    hand-rolled comma-only strip.
+    """
+    global _split_tag_tokens
+    if _split_tag_tokens is None:
+        saved_path = sys.path[:]
+        sys.path.insert(0, str(_resolve_store_py().parent))
+        try:
+            from storelib.entity import split_tag_tokens  # noqa: PLC0415
+            _split_tag_tokens = split_tag_tokens
+        finally:
+            sys.path[:] = saved_path
+    return _split_tag_tokens
+
+
 def _load_store_constants() -> None:
     """Import ALLOWED_SIGNALS / ALLOWED_TYPES / ALLOWED_TAINTS / MAX_CONTENT_CHARS
     from schema_meta (the single source of truth shared with store.py). schema_meta
@@ -1775,14 +1802,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
 
     def _apply_add_attribution(raw_tags, principal: Principal):
         """add(): strip client host:/agent: tags, append the principal's
-        stamp (map mode only; legacy passes through untouched)."""
+        stamp (map mode only; legacy passes through untouched). The strip
+        tokenizes under the consumer grammar (issue #395: case-varied and
+        non-comma forged forms must not survive)."""
         stamps = _attribution_tags(principal)
         if not stamps:
             return raw_tags
         cleaned = [
-            t.strip() for t in (raw_tags or "").split(",")
-            if t.strip()
-            and not t.strip().startswith(_ATTRIBUTION_TAG_PREFIXES)
+            t for t in _load_split_tag_tokens()(raw_tags or "")
+            if not t.lower().startswith(_ATTRIBUTION_TAG_PREFIXES)
         ]
         return ",".join(cleaned + stamps)
 
@@ -1792,17 +1820,17 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         tags=None (inheritance) merges with the target row's tags — benign
         inherited tags survive, stale host:/agent: tags are replaced by the
         stamp. Client-supplied tags keep the documented override semantics
-        for benign tags (replace) with the stamp appended after the strip.
-        Legacy mode passes client_tags through untouched.
+        for benign tags (replace) with the stamp appended after the strip
+        (consumer grammar, issue #395). Legacy mode passes client_tags
+        through untouched.
         """
         stamps = _attribution_tags(principal)
         if not stamps:
             return client_tags
         base = client_tags if client_tags is not None else (inherited_tags or "")
         cleaned = [
-            t.strip() for t in base.split(",")
-            if t.strip()
-            and not t.strip().startswith(_ATTRIBUTION_TAG_PREFIXES)
+            t for t in _load_split_tag_tokens()(base)
+            if not t.lower().startswith(_ATTRIBUTION_TAG_PREFIXES)
         ]
         return ",".join(cleaned + stamps)
 

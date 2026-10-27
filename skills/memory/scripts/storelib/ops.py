@@ -219,12 +219,17 @@ def _target_namespace(conn: sqlite3.Connection, target: str) -> Optional[str]:
 
 def _strip_attribution(tags: Any) -> str:
     """Drop caller-forged attribution tags (the hub strips host:/agent:
-    client tags on every write path and stamps its own — #281)."""
+    client tags on every write path and stamps its own — #281).
+
+    Tokenizes under the consumer grammar (issue #395: the pre-fix
+    comma-only split let case-varied and semicolon-delimited forged forms
+    survive the strip, exactly the #381 defect class the sync lane fixed).
+    """
+    from storelib.entity import split_tag_tokens
     if not isinstance(tags, str) or not tags:
         return tags if isinstance(tags, str) else ""
-    kept = [t.strip() for t in tags.split(",")
-            if t.strip() and not t.strip().lower().startswith(("host:",
-                                                               "agent:"))]
+    kept = [t for t in split_tag_tokens(tags)
+            if not t.lower().startswith(("host:", "agent:"))]
     return ",".join(kept)
 
 

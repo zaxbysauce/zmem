@@ -34,6 +34,20 @@ import unittest
 import uuid
 from pathlib import Path
 
+
+def _map_owner_only(path) -> None:
+    """#406 contract: a test map must not depend on the directory's
+    inherited ACL (non-system drives inherit Users/Authenticated-Users
+    allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
+    if os.name == "nt":
+        subprocess.run(
+            ["icacls", os.fspath(path), "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+    else:
+        os.chmod(os.fspath(path), 0o600)
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_DIR = REPO_ROOT / "hermes-plugin" / "server"
 AUTH_MODULE = "zmem_auth_t02_feedback"
@@ -102,6 +116,9 @@ class _MapCase(unittest.TestCase):
     def write(self, mapping, *, bump=0):
         with open(self.map_path, "w", encoding="utf-8") as f:
             json.dump(mapping, f)
+        # #406: the hub refuses a group/world-readable map at load;
+        # pin the installer contract (0o600 keeps the write bit on NTFS).
+        os.chmod(self.map_path, 0o600)
         if bump:
             st = os.stat(self.map_path)
             os.utime(self.map_path, (st.st_atime, st.st_mtime + bump))
@@ -148,6 +165,7 @@ class MapLoaderFailLoudTest(_MapCase):
         deep = "[" * 5000 + "]" * 5000
         with open(self.map_path, "w", encoding="utf-8") as f:
             f.write(deep)
+        os.chmod(self.map_path, 0o600)  # corrupt leg: keep owner-only
         err = self._stderr_exit()
         self.assertNotIn("Traceback", err)
         self.assertTrue(err.strip())
