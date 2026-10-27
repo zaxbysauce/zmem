@@ -320,7 +320,7 @@ def test_principal_map_capability_branch():
         token: {"principal": "fbhost", "host": "fbhost",
                 "harness": "fbharness", "namespaces": ["user:global"]},
     }), encoding="utf-8")
-    os.chmod(tokens_path, 0o600)  # #406 map permission contract
+    _map_owner_only(tokens_path)
     os.environ.update({
         "ZMEM_HOME": str(REPO_ROOT),
         "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),

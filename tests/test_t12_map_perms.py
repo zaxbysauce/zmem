@@ -189,6 +189,21 @@ def _load_auth():
 def _write_map(tmp):
     map_path = Path(tmp) / "tokens.json"
     map_path.write_text(json.dumps(MAP_TEMPLATE), encoding="utf-8")
+    # CHECK_WRONG amend (2nd): the fix's REAL fstat/DACL verdict consults
+    # the open descriptor, which the os.stat monkeypatch cannot drive — on
+    # POSIX an umask-022 map (0o644) refused at leg 2b's initial load, and
+    # on Windows a map written under a broad-ACL directory (non-system
+    # drives inherit Users/Authenticated-Users allow ACEs) refused at
+    # startup. Pin the installer contract for REAL so the monkeypatched
+    # stat remains the only verdict input the driver varies.
+    import subprocess
+    if os.name == "nt":
+        subprocess.run(
+            ["icacls", str(map_path), "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+    else:
+        os.chmod(map_path, 0o600)
     return map_path
 
 

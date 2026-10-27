@@ -127,11 +127,20 @@ class McpAttributionGrammarTest(unittest.TestCase):
                 "harness": "claude",
                 "namespaces": ["project:probe"],
             }}, f)
-        # The fix (#406) refuses a group/world-readable map at load; a plain
-        # open() under umask 022 creates 0o644 on POSIX. Pin the installer
-        # contract so this check tests the attribution strip, not map perms
-        # (0o600 keeps the write bit on NTFS, so Windows is unaffected).
-        os.chmod(self._map_path, 0o600)
+        # The fix (#406) refuses a group/world-readable map at load; the
+        # fstat/DACL verdict on the OPEN descriptor is REAL, so the file
+        # itself must satisfy the installer contract everywhere: POSIX
+        # umask 022 creates 0o644, and Windows non-system directories
+        # inherit Users/Authenticated-Users allow ACEs (0o600 chmod is a
+        # DACL no-op on NTFS). Pin owner-only for real.
+        import subprocess
+        if os.name == "nt":
+            subprocess.run(
+                ["icacls", self._map_path, "/inheritance:r",
+                 "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+                capture_output=True, timeout=30)
+        else:
+            os.chmod(self._map_path, 0o600)
         # Env pinned exactly like tests/test_t02_principal.py setUp: the
         # store can only ever land in the scratch dir.
         self._env = {

@@ -664,7 +664,7 @@ def _parse_principal_map(raw: str, source: str) -> dict:
 # locally readable map equals full principal impersonation for every local
 # account on a multi-user hub.
 #
-# Kept in deliberate byte-parity with skills/memory/scripts/doctor.py's copy
+# Kept in logic parity with skills/memory/scripts/doctor.py's copy (mode/ACE verdict strings byte-identical; the inspection-failure verb differs: serve vs pass)
 # (the repo's parser-mirror precedent: doctor never imports server auth, and
 # server auth never imports storelib); tests pin the parity.
 
@@ -773,6 +773,9 @@ def _nt_security_ace_tuples(path, fd):
             ctypes.byref(owner), None, ctypes.byref(p_dacl), None,
             ctypes.byref(p_sd))
     if rc != 0 or not p_sd.value:
+        if p_sd.value:  # defensive: free a descriptor the API may have
+            # allocated before failing (reviewer nit — leak window closed)
+            ctypes.windll.kernel32.LocalFree(ctypes.c_void_p(p_sd.value))
         raise OSError(f"GetSecurityInfo failed (winerror {rc})")
 
     def _sid_str(sid_addr):

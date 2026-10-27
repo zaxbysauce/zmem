@@ -265,7 +265,7 @@ class RefusalBehaviorTest(unittest.TestCase):
         p = _write_map(self._tmp)
         pm = auth.load_principal_map(str(p))
         p.write_text("{not valid json", encoding="utf-8")
-        os.chmod(p, 0o600)
+        _map_owner_only(p)
         changed = pm.force_reload()
         self.assertFalse(changed)
         self.assertIsNotNone(pm.lookup_token("supp-secret-token-1"))
@@ -348,7 +348,18 @@ with open(p, "w", encoding="utf-8") as f:
     json.dump({"supp-secret-token-1": {
         "principal": "m", "host": "h", "harness": "claude",
         "namespaces": ["project:supp"]}}, f)
-os.chmod(p, 0o600)
+def _pin_owner_only(path):
+    import subprocess
+    if os.name == "nt":
+        subprocess.run(
+            ["icacls", path, "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+    else:
+        os.chmod(path, 0o600)
+
+
+_pin_owner_only(p)
 pm = auth.load_principal_map(p)
 verifier = auth.MapTokenVerifier(pm)
 real_stat = os.stat
@@ -410,7 +421,18 @@ with open(p, "w", encoding="utf-8") as f:
     json.dump({"supp-secret-token-1": {
         "principal": "m", "host": "h", "harness": "claude",
         "namespaces": ["project:supp"]}}, f)
-os.chmod(p, 0o600)
+def _pin_owner_only(path):
+    import subprocess
+    if os.name == "nt":
+        subprocess.run(
+            ["icacls", path, "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+    else:
+        os.chmod(path, 0o600)
+
+
+_pin_owner_only(p)
 pm = auth.load_principal_map(p)
 signal.signal(signal.SIGHUP, lambda s, f: pm.force_reload())
 real_stat = os.stat

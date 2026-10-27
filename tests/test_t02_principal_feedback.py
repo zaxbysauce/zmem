@@ -32,6 +32,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+import subprocess
 from pathlib import Path
 
 
@@ -118,7 +119,7 @@ class _MapCase(unittest.TestCase):
             json.dump(mapping, f)
         # #406: the hub refuses a group/world-readable map at load;
         # pin the installer contract (0o600 keeps the write bit on NTFS).
-        os.chmod(self.map_path, 0o600)
+        _map_owner_only(self.map_path)
         if bump:
             st = os.stat(self.map_path)
             os.utime(self.map_path, (st.st_atime, st.st_mtime + bump))
@@ -165,7 +166,7 @@ class MapLoaderFailLoudTest(_MapCase):
         deep = "[" * 5000 + "]" * 5000
         with open(self.map_path, "w", encoding="utf-8") as f:
             f.write(deep)
-        os.chmod(self.map_path, 0o600)  # corrupt leg: keep owner-only
+        _map_owner_only(self.map_path)  # corrupt leg, not perm leg
         err = self._stderr_exit()
         self.assertNotIn("Traceback", err)
         self.assertTrue(err.strip())
