@@ -32,7 +32,25 @@ import sys
 import tempfile
 import unittest
 import uuid
+import subprocess
 from pathlib import Path
+
+
+def _map_owner_only(path) -> None:
+    """#406 contract: a test map must not depend on the directory's
+    inherited ACL (non-system drives inherit Users/Authenticated-Users
+    allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
+    if os.name == "nt":
+        r = subprocess.run(
+            ["icacls", os.fspath(path), "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+    else:
+        os.chmod(os.fspath(path), 0o600)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_DIR = REPO_ROOT / "hermes-plugin" / "server"
@@ -102,6 +120,9 @@ class _MapCase(unittest.TestCase):
     def write(self, mapping, *, bump=0):
         with open(self.map_path, "w", encoding="utf-8") as f:
             json.dump(mapping, f)
+        # #406: the hub refuses a group/world-readable map at load;
+        # pin the installer contract (0o600 keeps the write bit on NTFS).
+        _map_owner_only(self.map_path)
         if bump:
             st = os.stat(self.map_path)
             os.utime(self.map_path, (st.st_atime, st.st_mtime + bump))
@@ -148,6 +169,7 @@ class MapLoaderFailLoudTest(_MapCase):
         deep = "[" * 5000 + "]" * 5000
         with open(self.map_path, "w", encoding="utf-8") as f:
             f.write(deep)
+        _map_owner_only(self.map_path)  # corrupt leg, not perm leg
         err = self._stderr_exit()
         self.assertNotIn("Traceback", err)
         self.assertTrue(err.strip())

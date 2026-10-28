@@ -31,6 +31,23 @@ import tempfile
 import time
 from pathlib import Path
 
+
+def _map_owner_only(path) -> None:
+    """#406 contract: a test map must not depend on the directory's
+    inherited ACL (non-system drives inherit Users/Authenticated-Users
+    allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
+    if os.name == "nt":
+        r = subprocess.run(
+            ["icacls", os.fspath(path), "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+    else:
+        os.chmod(os.fspath(path), 0o600)
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 DOCTOR_PY = SCRIPTS_DIR / "doctor.py"
@@ -78,6 +95,8 @@ _FDE_UNSET = object()
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+    if path.name == "tokens.json":
+        _map_owner_only(path)  # only the map carries the load contract
 
 
 def _base_env(home: Path) -> dict:

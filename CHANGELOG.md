@@ -5,6 +5,65 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.125.0] - 2026-10-27
+
+### Fixed
+- **Fleet principal maps are refused when their file permissions expose the
+  bearer entries** (issue #406, Priority): the owner-only contract the hub
+  installers enforce at creation (`install-hub.sh` mode 0600;
+  `install-hub.ps1` no broad allow ACE) is now also enforced at hub STARTUP
+  (`load_principal_map` exits 2 naming the file and mode), on SIGHUP
+  (`force_reload` raises `MapPermissionRefused` — a raise out of a raw
+  signal handler terminates the process), on the PER-REQUEST mtime check
+  (`maybe_reload` re-checks the permission shape on its once-per-second
+  stat — `chmod` changes ctime only — and terminates the process with
+  `os._exit(2)`, which the ASGI layer cannot swallow into an HTTP 500),
+  and at
+  `doctor --fleet` time (the fleet-principal lane fails an over-permissive
+  map naming the offending shape — a name-based diagnostic; the hub's
+  load/reload path is the enforcement). On Windows the hub's verdict reads
+  the DACL (handle-based via `msvcrt.get_osfhandle` on the same descriptor
+  that is read — no check/use window): an allow ACE for Everyone / BUILTIN\Users /
+  Authenticated Users (the installers' refusal list), a NULL/absent DACL,
+  or an inspection FAILURE all refuse (fail-closed — an uninspectable map
+  is never served); machine-local principals (including local groups
+  and same-machine capability SIDs, which user-profile directories
+  routinely inherit) are deliberately out of scope — the refusal list
+  is exactly the installers'. POSIX verdicts are mode-bit
+  based (any group/other access bit fails). Operators: run
+  `doctor --fleet` BEFORE upgrading a fleet to catch drifted maps; fix
+  them with `chmod 600` (POSIX) or
+  `icacls <map> /inheritance:r /grant "<hub-account>":F` (Windows); a
+  systemd-supervised hub restart-loops until the permission is fixed,
+  and the Windows Scheduled Task stops after its retry budget
+  (install-hub.ps1 RestartCount 3) — both intentional fail-closed
+  behavior. Map-writing tests pin 0600.
+- **The MCP write path strips client attribution tags under the consumer
+  grammar** (issue #395 item 1): `mcp_server`'s add/update strips (and the
+  hub flush strip in `storelib/ops.py`) now tokenize with
+  `storelib.entity.split_tag_tokens` (the #381 fix the sync lane already
+  uses) instead of a hand-rolled comma-only, case-sensitive split —
+  `Host:evil` (case-varied), `x;host:evil` (semicolon-delimited), and the
+  typed `entity:host:`/`entity:agent:` forms (which mint the same forged
+  entities through the extractor) no longer survive. Disclosed
+  normalization: tokenized tag strings re-join with commas (`a;b` ->
+  `a,b`) on the map-mode add/update path AND on the hub-flush ops strip;
+  the legacy single-token MCP mode is byte-identical.
+- **A strict-lane peer file can no longer keep an episode summary pointer
+  alive through a staged claim** (issue #395 item 2): the episode
+  `summary_memory_id` fallback consulted the raw CLAIMED-namespace map, so
+  a decoy row colliding with a foreign-namespace store id (landing
+  `skipped`, never authored) kept the pointer aimed at the foreign row. The
+  fallback is deleted; episode pointers resolve under the SAME set the
+  memory-pointer rule uses (allowed store rows UNION authored staged ids
+  minus purged ids), so authored summaries and allowed store rows keep
+  their pointers and decoys clear.
+- Correction recorded on issue #395 item 3: default-mode harvest row
+  isolation ALREADY works at base and at the issue's own anchor commit
+  (the per-row guard landed in PR #393's own review round); the claim was
+  disproved by execution and the behavior is now pinned by a PRESERVING
+  test instead of a fix.
+
 ## [0.124.0] - 2026-10-26
 
 ### Fixed

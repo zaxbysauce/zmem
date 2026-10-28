@@ -25,6 +25,24 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+import subprocess
+
+
+def _map_owner_only(path) -> None:
+    """#406 contract: a test map must not depend on the directory's
+    inherited ACL (non-system drives inherit Users/Authenticated-Users
+    allow ACEs, which the hub correctly refuses). POSIX uses chmod."""
+    if os.name == "nt":
+        r = subprocess.run(
+            ["icacls", os.fspath(path), "/inheritance:r",
+             "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+            capture_output=True, timeout=30)
+        assert r.returncode == 0, (
+            f"icacls owner-only pin failed rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+    else:
+        os.chmod(os.fspath(path), 0o600)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_DIR = REPO_ROOT / "hermes-plugin" / "server"
@@ -305,6 +323,7 @@ def test_principal_map_capability_branch():
         token: {"principal": "fbhost", "host": "fbhost",
                 "harness": "fbharness", "namespaces": ["user:global"]},
     }), encoding="utf-8")
+    _map_owner_only(tokens_path)
     os.environ.update({
         "ZMEM_HOME": str(REPO_ROOT),
         "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),

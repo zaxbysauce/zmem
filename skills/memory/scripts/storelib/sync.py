@@ -2024,11 +2024,10 @@ def _strict_ingest_staged(
         # is not in `memory` (so it slips past pre_existing) but never lands
         # at apply time (purged_denied), which would leave a kept pointer to
         # a row that was never created. PR #393 review V10-note: the
-        # EPISODE-summary rule below is NOT this rule — it still consults
-        # the full staged CLAIMED-namespace map, so an episode pointer can
-        # resolve a decoy-collided foreign id that a memory pointer here
-        # would refuse; that pre-existing gap is filed separately and the
-        # old "the rules resolve the same way" claim was false.
+        # EPISODE-summary rule below WAS not this rule (it consulted the full
+        # staged CLAIMED-namespace map) — that pre-existing gap was closed
+        # by issue #395 (the episode fallback now resolves via
+        # _peer_resolvable like this rule).
         # PR #393 review V1: the authored union must never let a peer author
         # a lineage CYCLE. A self-pointer (update_of == own id) or an A<->B
         # pair inside the authored set would survive the clamp below and
@@ -2100,13 +2099,17 @@ def _strict_ingest_staged(
                                    caller_source_ref=source_ref,
                                    resolvable_ids=_peer_resolvable)
             elif table == "episode":
-                # F22: an episode summary pointer is a lineage claim too.
+                # F22 + #395 item 2: an episode summary pointer is a lineage
+                # claim too, and it resolves under the SAME rule the memory
+                # pointers use above — `_peer_resolvable` (store rows in
+                # allowed namespaces UNION authored staged ids minus purged).
+                # The pre-#395 fallback consulted the raw staged CLAIMED
+                # namespace map, so a decoy row colliding with a foreign-
+                # namespace store id (landing `skipped`, never authored)
+                # kept the pointer aimed at the foreign row.
                 sid = obj.get("summary_memory_id") or ""
                 if sid and sid not in _peer_resolvable:
-                    staged_ns = staged_mem_ns.get(sid)
-                    if staged_ns is None or not trust_policy.namespace_allowed(
-                            staged_ns):
-                        obj["summary_memory_id"] = ""
+                    obj["summary_memory_id"] = ""
                 obj["namespace"] = obj.get("namespace", "").strip()
     # v15 (#173 PR-review F13/F29): observability for the expiry apply pass —
     # purged parents soft-drop and identical reimports are no-ops, neither is
