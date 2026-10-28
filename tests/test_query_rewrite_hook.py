@@ -1,6 +1,7 @@
 """D2-H hook query-rewrite and decision-parser contracts."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import importlib.util

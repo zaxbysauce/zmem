@@ -5,8 +5,9 @@ executable immediately before the script path. At MAIN the SessionStart note
 and all four ``zmem-reflect.sh`` nudges render the bare script path, and the
 two capture hooks (convention-capture, capture-failure) do the same, so an
 agent that copies a suggested command on Windows can hit the Store
-``python`` stub. ``store.py`` has no shebang, so a bare token depends
-entirely on the caller's shell resolution.
+``python`` stub. ``store.py`` carries a shebang (issue #294), but a bare token still
+depends on the caller's shell resolution — the interpreter-prefixed form
+remains the supported surface.
 
 The token rule is deliberately interpreter-agnostic (the issue's AC harness):
 split the rendered command with ``shlex.split(cmd, posix=False)`` (non-POSIX
@@ -18,6 +19,7 @@ check independent of which interpreter the hook resolved.
 
 Run: python tests/test_r03_interpreter_in_commands.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

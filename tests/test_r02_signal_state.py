@@ -19,6 +19,7 @@ Skips when no bash is available (same policy as test_reflect_hook.py).
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import json

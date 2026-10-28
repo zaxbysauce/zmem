@@ -17,6 +17,7 @@ The eval re-derivation contract is pinned too: eval_gold._gate_passes with
 trust_floor models the real gate, and the 3-key gate-stats shape is
 unchanged (floor-dropped rows count in the existing trust_failed bucket).
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import json
 import os
 import pathlib

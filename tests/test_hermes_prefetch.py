@@ -13,6 +13,7 @@ store: the scratch environment is pinned at module import (the
 tests/test_hermes_transport.py pattern) and the reset test's ledger-clear is
 recorded through a patched module-level ``_run_store``.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import copy

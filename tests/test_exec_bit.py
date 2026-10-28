@@ -23,6 +23,7 @@ Run: python tests/test_exec_bit.py   (no pytest required — repo convention)
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import subprocess
 import unittest
@@ -90,6 +91,65 @@ class ExecBitGuardTest(unittest.TestCase):
                 f"`store.py ...` command. Found non-executable: {detail}. "
                 "Fix with `git update-index --chmod=+x <path>` and commit."
             )
+
+
+class ShebangLineGuardTest(unittest.TestCase):
+    """Issue #294: an executable without a shebang is a POSIX trap.
+
+    store.py is committed 100755 (pinned above). Without a `#!` line, POSIX
+    execve returns ENOEXEC and the shell silently reinterprets the file as a
+    shell SCRIPT — the module docstring becomes shell syntax. These pins
+    make the shebang, the LF bytes, and (on POSIX) actual direct execution
+    part of the guardrail.
+    """
+
+    ALLOWED_SHEBANGS = (b"#!/usr/bin/env python",
+                        b"#!/usr/bin/env python3")
+
+    def test_required_scripts_have_lf_shebang(self):
+        bad = []
+        for rel in REQUIRED_EXEC_SCRIPTS:
+            data = (REPO_ROOT / rel).read_bytes()
+            first = data.split(b"\n", 1)[0]
+            if first not in self.ALLOWED_SHEBANGS:
+                bad.append((rel, first[:40]))
+            if b"\r\n" in data:
+                bad.append((rel, b"<contains CRLF>"))
+        if bad:
+            detail = "; ".join(f"{p} -> {m!r}" for p, m in bad)
+            self.fail(
+                "Direct-exec memory scripts must carry a shebang on line 1 "
+                "(env form, sibling-consistent) and stay LF-only so a POSIX "
+                f"direct exec never falls back to shell interpretation: {detail}"
+            )
+
+    def test_store_py_direct_exec_posix(self):
+        """The issue's definition of done: `./store.py --help` runs on POSIX.
+
+        Windows ignores shebangs (CreateProcess extension dispatch), so this
+        leg only executes there via skipUnless — CI's ubuntu lane covers it.
+        Isolated home/store env so the probe never touches a real store.
+        """
+        import os
+        import sys
+        import tempfile
+
+        if os.name != "posix":
+            self.skipTest("POSIX-only: shebang dispatch does not exist on Windows")
+        script = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+        env = dict(os.environ)
+        env["HOME"] = tempfile.mkdtemp(prefix="zmem-execbit-")
+        env["ZMEM_STORE"] = env["HOME"] + "/store.sqlite"
+        env["ZMEM_DATA"] = env["HOME"]
+        env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        result = subprocess.run(
+            ["./" + str(script.name)], cwd=str(script.parent),
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"direct exec failed: {result.stderr[:300]}",
+        )
 
 
 if __name__ == "__main__":

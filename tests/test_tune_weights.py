@@ -18,6 +18,7 @@ Run: python tests/test_tune_weights.py   (no pytest — repo convention)
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

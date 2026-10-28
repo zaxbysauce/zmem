@@ -12,6 +12,7 @@ against assertions capped at 10 s) so slow CI runners stay deterministic;
 the operations themselves block on Events released by the cancel hooks, not
 on sleeps, so the tests cannot pass by timing luck.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import os

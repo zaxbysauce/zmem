@@ -11,6 +11,7 @@ Three contracts:
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import inspect
 import json

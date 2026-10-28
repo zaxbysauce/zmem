@@ -30,6 +30,7 @@ Run: python tests/test_graph_seed_arm.py   (no pytest — repo convention)
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 # ---------------------------------------------------------------------------
 # Env pin — BEFORE any storelib import (house contract: storelib freezes

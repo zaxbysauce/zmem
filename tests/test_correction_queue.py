@@ -11,6 +11,7 @@ Run: python tests/test_correction_queue.py
 Plain unittest, no third-party harness — matches the repo convention."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import json

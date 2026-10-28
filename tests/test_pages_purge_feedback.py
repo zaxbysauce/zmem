@@ -4,6 +4,7 @@ These tests use the existing Q01 subprocess harness so purge runs through the
 real CLI and its maintenance-lock ladder.  Every page path is disposable.
 """
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import json

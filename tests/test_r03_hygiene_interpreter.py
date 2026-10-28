@@ -11,6 +11,7 @@ command prefix (schema/backup hints via storelib.opcmds).
 
 Run: python tests/test_r03_hygiene_interpreter.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import os
 import re
@@ -116,8 +117,9 @@ class OperatorCommandPrefixPin(unittest.TestCase):
             stripped.append(tok)
         self.assertTrue(os.path.isfile(stripped[0]), stripped[0])
         self.assertTrue(os.path.isfile(stripped[1]), stripped[1])
-        # The resolved store path must be the real CLI shim (no shebang, so
-        # it must never be suggested as a bare token).
+        # The resolved store path must be the real CLI shim (its shebang
+        # exists for POSIX direct exec, but it must still never be
+        # suggested as a bare token — issue #259/#294).
         self.assertTrue(stripped[1].replace("\\", "/").endswith(
             "skills/memory/scripts/store.py"), stripped[1])
 

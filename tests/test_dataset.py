@@ -6,6 +6,7 @@ behavior calls the library in-process with the store env pinned at MODULE
 IMPORT (storelib freezes STORE_PATH at first import — see the repo-test
 hazard notes). No test in this file ever touches the operator's ~/.zmem.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import os
 import sys

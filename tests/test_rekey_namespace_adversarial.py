@@ -1,6 +1,7 @@
 """Additive guardrails for issue #168's public migration surfaces."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import os
 import sqlite3

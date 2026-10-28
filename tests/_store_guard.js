@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+/**
+ * JS test-harness store isolation guard (issue #244) — the node twin of
+ * tests/_store_guard.py. Fires (exit 1) when any store path the resolution
+ * chain can produce, explicitly env-named or not, lands inside the real
+ * home's .zmem root while that root exists. Ephemeral CI homes have no
+ * ~/.zmem and the guard stays silent; opt out with ZMEM_ALLOW_REAL_STORE=1.
+ *
+ * Required by the JS test files that spawn store.py (mirrors the python
+ * wiring); the C9 acceptance check drives it directly.
+ */
+"use strict";
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+function candidatePaths() {
+  const seen = new Set();
+  const out = [];
+  const push = (p) => {
+    if (p && !seen.has(p.toLowerCase())) {
+      seen.add(p.toLowerCase());
+      out.push(p);
+    }
+  };
+  for (const v of ["ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA",
+                   "ZCODE_PLUGIN_DATA"]) {
+    const raw = (process.env[v] || "").trim();
+    if (!raw) continue;
+    const p = path.resolve(raw.replace(/^~(?=$|[\\/])/, os.homedir()));
+    push(p.endsWith(".sqlite") ? p : path.join(p, "store.sqlite"));
+  }
+  push(path.join(os.homedir(), ".zcode", "memory", "store.sqlite"));
+  push(path.join(os.homedir(), ".zmem", "store.sqlite"));
+  return out;
+}
+
+function resolvedStorePath() {
+  /** The store path this environment WOULD use, by the same precedence
+   * host.resolve_store_path applies (explicit vars in order, else the home
+   * default). The guard judges THIS path — a scratch ZMEM_STORE/ZMEM_DATA
+   * keeps the run green even though the default candidate still exists. */
+  for (const v of ["ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA",
+                   "ZCODE_PLUGIN_DATA"]) {
+    const raw = (process.env[v] || "").trim();
+    if (!raw) continue;
+    const p = path.resolve(raw.replace(/^~(?=$|[\\/])/, os.homedir()));
+    return p.endsWith(".sqlite") ? p : path.join(p, "store.sqlite");
+  }
+  return path.join(os.homedir(), ".zmem", "store.sqlite");
+}
+
+function check(failFast) {
+  if ((process.env.ZMEM_ALLOW_REAL_STORE || "").trim() === "1") {
+    return { ok: true, why: "opt-out ZMEM_ALLOW_REAL_STORE=1 set" };
+  }
+  const root = path.join(os.homedir(), ".zmem");
+  let rootExists = false;
+  try {
+    rootExists = fs.statSync(root).isDirectory();
+  } catch (_e) {
+    rootExists = false;
+  }
+  if (!rootExists) {
+    return { ok: true, why: `no real store root at ${root}` };
+  }
+  const resolved = resolvedStorePath();
+  const rel = path.relative(root, resolved);
+  if (rel === "" || (!rel.split(path.sep).includes("..") &&
+                     !path.isAbsolute(rel))) {
+    const msg =
+      "tests/_store_guard.js: refusing to run against the REAL default " +
+      `store area (${resolved} is inside ${root}). Set ZMEM_STORE (a ` +
+      "sqlite FILE path) or ZMEM_DATA (a directory) to a scratch path, or " +
+      "set ZMEM_ALLOW_REAL_STORE=1 to run deliberately against the live " +
+      "store.";
+    if (failFast) {
+      console.error(msg);
+      process.exit(1);
+    }
+    return { ok: false, why: msg };
+  }
+  return { ok: true, why: `resolved ${resolved} is outside the real root` };
+}
+
+if (require.main === module) {
+  const r = check(true);
+  console.log(`store-guard: ok=${r.ok} ${r.why}`);
+  process.exit(0);
+} else {
+  module.exports = { check, candidatePaths, resolvedStorePath };
+  check(true);
+}

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Focused issue #189 coverage for the Codex SessionEnd fast path.
+require("./_store_guard.js"); // issue #244 isolation guard
 
 "use strict";
 

@@ -26,6 +26,7 @@ __main__ block prints PASS/FAIL per check and exits 1 on failure).
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import asyncio
 import contextlib

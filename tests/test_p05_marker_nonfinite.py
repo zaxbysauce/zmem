@@ -9,6 +9,7 @@ a fresh marker keeps suppressing only for the marker TTL).
 
 Run standalone: python tests/test_p05_marker_nonfinite.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import json
 import os
 import sys

@@ -110,6 +110,66 @@ def _warn_reserved_source_ref(source_ref: str | None) -> None:
     warn_reserved_source_ref(source_ref)
 
 
+_FIXTURE_SOURCE_REFS = {"user:long-row"}
+_FIXTURE_NAMESPACES = {"test", "ns1", "ns2", "user:t"}
+
+
+def _refuse_fixture_shaped_default_store_write(args: argparse.Namespace) -> None:
+    """Issue #244 write-time guard: refuse a fixture-shaped ``add`` when the
+    store this CLI would write is the operator's real home store area (any
+    resolution candidate inside ``~/.zmem``), REGARDLESS of whether the store
+    exists yet — the first polluting write is covered too.
+
+    The shape gate is deliberately narrow (the leaked-seed shapes: a
+    ``-seed``-suffixed ``--source-ref``, the historical ``user:long-row``
+    probe ref, the known fixture namespaces), so ordinary operator writes are
+    untouched. Opt out with ZMEM_ALLOW_FIXTURE_WRITES=1 for deliberate
+    seeding against the live store. Refusal exits 2 and prints only to
+    stderr (the --json stdout contract is preserved).
+    """
+    if os.environ.get("ZMEM_ALLOW_FIXTURE_WRITES", "").strip() == "1":
+        return
+    source_ref = (getattr(args, "source_ref", "") or "").strip()
+    namespace = (getattr(args, "namespace", "") or "").strip()
+    shaped = (
+        source_ref.endswith("-seed")
+        or source_ref in _FIXTURE_SOURCE_REFS
+        or namespace in _FIXTURE_NAMESPACES
+    )
+    if not shaped:
+        return
+    home = Path(os.path.expanduser("~"))
+    zmem_root = home / ".zmem"
+    # The RESOLVED path this CLI would write, by host.resolve_store_path's
+    # precedence — a scratch ZMEM_STORE/ZMEM_DATA keeps the write allowed
+    # even though the default candidate still exists inside the real root.
+    resolved: Path | None = None
+    for var in ("ZMEM_STORE", "ZMEM_DATA",
+                "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        resolved = p if p.suffix == ".sqlite" else p / "store.sqlite"
+        break
+    if resolved is None:
+        resolved = zmem_root / "store.sqlite"
+    try:
+        resolved.relative_to(zmem_root)
+    except ValueError:
+        return
+    print(
+        "[zmem] refusing fixture-shaped write against the real default "
+        f"store area ({resolved} is inside {zmem_root}): namespace="
+        f"{namespace!r} source_ref={source_ref!r} matches a test/seed "
+        "fixture pattern (issue #244). Point ZMEM_STORE (a sqlite file) "
+        "or ZMEM_DATA (a directory) at a scratch path, or set "
+        "ZMEM_ALLOW_FIXTURE_WRITES=1 to seed the live store deliberately.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def _recall_scopes(args: argparse.Namespace) -> dict[str, str]:
     """Resolve the implicit #167 scope map used by ordinary read commands.
 
@@ -5556,6 +5616,7 @@ def main():
                 else:
                     _human_out = None
                 try:
+                    _refuse_fixture_shaped_default_store_write(args)
                     _warn_reserved_source_ref(args.source_ref)
                     res = add_memory(
                         conn,

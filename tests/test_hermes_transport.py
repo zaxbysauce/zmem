@@ -7,6 +7,7 @@ any provider import; no test deletes tracked files and no test asserts on
 wall-clock time — the fake executor's virtual clock supplies all deadline
 evidence.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import io

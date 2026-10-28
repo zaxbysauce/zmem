@@ -8,6 +8,7 @@ normalization on the MCP add path in map mode (plan finding F9).
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

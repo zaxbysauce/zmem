@@ -146,6 +146,27 @@ def _sanitize_error_text(text, limit: int = 200) -> str:
         return ""
     return _collapse_line_breaks(text)[:limit].strip()
 
+def _redact_failure_text(text, limit: int = 200) -> str:
+    """Failure-record text renderer (issue #277): redact FIRST, then sanitize.
+
+    A failed tool call's output can echo credentials (Bearer tokens, api_key=
+    forms, credentialed URLs) that a failure record would otherwise persist
+    verbatim and render into reflect-hook prompts — so redaction runs BEFORE
+    the 200-char truncation (a secret straddling the window is still caught)
+    and before the line-break collapse. The redaction primitive failing
+    (absent module, unexpected shape) degrades to exactly _sanitize_error_text
+    behavior: failure capture must never die, and plain diagnostic text stays
+    byte-identical to the pre-#277 renderer (redact_text only rewrites
+    secret-shaped substrings).
+    """
+    if not text:
+        return ""
+    try:
+        redacted, _redactions = redact_text(str(text))
+    except Exception:
+        redacted = str(text)
+    return _collapse_line_breaks(redacted)[:limit].strip()
+
 def _sanitize_pack_content(text) -> str:
     """Make a stored memory field safe to render as one export-pack bullet.
 
@@ -334,12 +355,12 @@ def _failures_from_transcript(path: str, text: str | None = None):
                 if _is_rejection_text(effective):
                     rejections.append({
                         "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
-                        "reason": _sanitize_error_text(_rejection_reason(effective)),
+                        "reason": _redact_failure_text(_rejection_reason(effective)),
                     })
                 else:
                     details.append({
                         "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
-                        "error": _sanitize_error_text(effective),
+                        "error": _redact_failure_text(effective),
                     })
         # Pure sibling-string form: the top-level toolUseResult is itself a
         # rejection but no tool_result block classified this record (e.g. the
@@ -360,7 +381,7 @@ def _failures_from_transcript(path: str, text: str | None = None):
                 anon += 1
             rejections.append({
                 "tool": _sanitize_tool_name(tool_names.get(tid, "?")),
-                "reason": _sanitize_error_text(_rejection_reason(tur)),
+                "reason": _redact_failure_text(_rejection_reason(tur)),
             })
     return details[::-1], rejections
 
@@ -470,7 +491,7 @@ def _failures_from_db(db_path: str, session_id: str, *,
         for r in rows:
             details.append({
                 "tool": _sanitize_tool_name(r["tool_name"] or "?"),
-                "error": _sanitize_error_text(r["error_message"] or ""),
+                "error": _redact_failure_text(r["error_message"] or ""),
                 "error_type": r["error_type"] or "",
                 "retry_count": r["retry_count"] or 0,
                 "destructive": bool(r["destructive"]),

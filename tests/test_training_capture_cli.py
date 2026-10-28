@@ -1,6 +1,7 @@
 """Focused CLI tests for governed delivery identity creation and replay."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import io

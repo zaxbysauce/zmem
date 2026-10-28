@@ -1,6 +1,7 @@
 """Wave D1 tests for the pure ambiguity/rewrite and evidence-read helpers."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import atexit
 import contextlib

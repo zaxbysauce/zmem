@@ -25,6 +25,7 @@ Run: python tests/test_score_composition.py   (no pytest — repo convention)
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 # ---------------------------------------------------------------------------
 # Env pin — BEFORE any storelib import. storelib freezes STORE_PATH on first

@@ -30,6 +30,7 @@ the dimensions most relevant to what they prove — e.g. a "writes nothing" test
 asserts the meta rows are unchanged AND the would-skip message printed; a force
 test asserts the merge ran (live-count dropped) and the message says "merged".
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import importlib.util

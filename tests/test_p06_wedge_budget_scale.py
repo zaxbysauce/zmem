@@ -10,6 +10,7 @@ scans at most _MAX_SEGMENTS_PER_COMPACT oldest-first).
 
 Run standalone: python tests/test_p06_wedge_budget_scale.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import os
 import sys
 import tempfile

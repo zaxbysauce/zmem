@@ -21,6 +21,7 @@ if unavailable. If the hook under test stops emitting when it should not, the
 test FAILS rather than silently passing."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

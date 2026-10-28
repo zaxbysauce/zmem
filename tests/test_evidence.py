@@ -1,6 +1,7 @@
 """Wave A evidence schema, writer, retention, and strict transport tests."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import atexit

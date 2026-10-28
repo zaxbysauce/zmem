@@ -11,6 +11,7 @@ is asserted while ``FakeExecutor.advance(0.0)`` drives the scheduled work.
 Store-touching paths run the real ``store.py`` subprocess against the
 scratch store pinned below — never the operator's ``~/.zmem``.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import importlib.util

@@ -6,6 +6,7 @@ here.  Covers the PRR-001/002 real-wire envelope regression (int
 PRR-012 source-ref-exists truth paths, PRR-013 nudge literal pin,
 PRR-015/PRR-M04 ops-append contract branches, PRR-022 dash-token guard,
 and the TC-03 first-arm-wins rule."""
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import importlib.util

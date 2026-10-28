@@ -1,6 +1,7 @@
 """Fixed-byte and safety tests for the #155 replay evaluator."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import copy
 import ast

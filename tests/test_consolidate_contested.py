@@ -8,6 +8,7 @@ never auto-merged (not even with --force), are always reported, and
 --merge-contested is the explicit override. Both clustering paths (lexical
 fallback and cosine via embedded stub vectors) are covered.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import io

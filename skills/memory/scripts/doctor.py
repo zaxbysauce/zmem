@@ -1371,8 +1371,85 @@ def _check_mcp_token() -> dict:
             default) -- details carry unscoped_token: true
       pass  scoped token -- details carry unscoped_token: false and the
             namespace count (plus reads_require_namespace guidance)
+
+    Issue #369: when the plural ZMEM_MCP_TOKENS_FILE (principal-map mode) is
+    set it WINS (matching the server's resolve_token_auth precedence) and the
+    check reports the map's scope shape instead: principal/scoped/unscoped/
+    revoked counts, mode="principal-map", never a token value.
     """
     env_tok = os.environ.get("ZMEM_MCP_TOKEN", "").strip()
+    # Issue #369: the principal-map auth mode (ZMEM_MCP_TOKENS_FILE, plural)
+    # WINS over the legacy vars server-side (resolve_token_auth precedence),
+    # so it is checked FIRST and returns — falling through to the legacy
+    # report would describe a mode the box is not running. Doctor parses the
+    # JSON directly (never imports server auth — its loaders exit 2, the
+    # same reason as the legacy branches) and reports the scope SHAPE only:
+    # counts, never token values, never principal hosts.
+    tokens_file = os.environ.get("ZMEM_MCP_TOKENS_FILE", "").strip()
+    if tokens_file:
+        try:
+            map_path = Path(tokens_file).expanduser()
+            raw = map_path.read_text(encoding="utf-8")
+            problems, principal_count = _fleet_principal_map_problems(raw)
+            if problems:
+                return _check(
+                    "mcp-token",
+                    "fail",
+                    "ZMEM_MCP_TOKENS_FILE is configured but the principal "
+                    "map is invalid (the hub would exit 2): "
+                    + "; ".join(problems[:3]),
+                    mode="principal-map",
+                    source="ZMEM_MCP_TOKENS_FILE",
+                )
+            import json as _json
+            obj = _json.loads(raw)
+            scoped = 0
+            unscoped = 0
+            revoked = 0
+            for entry in obj.values():
+                if not isinstance(entry, dict):
+                    continue
+                namespaces = entry.get("namespaces")
+                if namespaces:
+                    scoped += 1
+                else:
+                    unscoped += 1
+                if entry.get("revoked") is True:
+                    revoked += 1
+            verdict = "pass" if scoped else "warn"
+            msg = (
+                f"Principal-map auth mode: {principal_count} principal(s) "
+                f"({scoped} scoped, {unscoped} unscoped"
+                + (f", {revoked} revoked" if revoked else "")
+                + "). "
+                + ("Unscoped principals have full store access."
+                   if unscoped else "Every principal is namespace-scoped.")
+            )
+            return _check(
+                "mcp-token",
+                verdict,
+                msg,
+                mode="principal-map",
+                source="ZMEM_MCP_TOKENS_FILE",
+                principal_count=principal_count,
+                scoped_count=scoped,
+                unscoped_count=unscoped,
+                revoked_count=revoked,
+            )
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError,
+                TypeError) as exc:
+            # Whole-branch containment (plan-critic round 1): structural
+            # validation itself encodes UTF-8 and can raise on escaped-
+            # surrogate token keys — any failure is a structured verdict,
+            # never an escaping exception.
+            return _check(
+                "mcp-token",
+                "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) is configured but "
+                f"cannot be validated (the hub would exit 2): {exc}",
+                mode="principal-map",
+                source="ZMEM_MCP_TOKENS_FILE",
+            )
     if env_tok:
         return _check(
             "mcp-token",
@@ -2233,25 +2310,36 @@ def _check_second_stores(
             **details,
         )
 
-    canonical_ids: set[str] | None = None
+    # Issue #245: classify against ALL canonical rows, not just live ones.
+    # A second-store row that canonical holds as a TOMBSTONE is not stranded
+    # — promote-store refuses to resurrect it by design — so it must never
+    # drive the cutover-blocking FAIL. Only ids absent from canonical
+    # entirely are real stranding.
+    canonical_live_ids: set[str] | None = None
+    canonical_all_ids: set[str] | None = None
     if canonical.exists():
         try:
             conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
             try:
-                canonical_ids = {
+                canonical_live_ids = {
                     r[0]
                     for r in conn.execute(
                         "SELECT id FROM memory WHERE superseded_at IS NULL"
                     )
                 }
+                canonical_all_ids = {
+                    r[0] for r in conn.execute("SELECT id FROM memory")
+                }
             finally:
                 conn.close()
         except sqlite3.Error:
-            canonical_ids = None
+            canonical_live_ids = None
+            canonical_all_ids = None
 
     results: list[dict] = []
     worst = "skip"
     unique_total = 0
+    tombstoned_total = 0
     for p in extra:
         entry: dict = {"path": _display_path(p)}
         live = 0
@@ -2274,18 +2362,48 @@ def _check_second_stores(
                 worst = "warn"
             continue
         entry["live_rows"] = live
-        if canonical_ids is None:
+        if canonical_all_ids is None:
             entry["missing_in_canonical"] = "unknown (canonical store unreadable)"
             entry["status"] = "warn" if live else "skip"
         else:
-            missing = len(ids - canonical_ids)
-            entry["missing_in_canonical"] = missing
+            missing_ids = ids - canonical_all_ids
+            tombstoned_ids = (ids & canonical_all_ids) - (canonical_live_ids
+                                                          or set())
+            missing = len(missing_ids)
+            tombstoned = len(tombstoned_ids)
             unique_total += missing
-            entry["status"] = "fail" if missing else ("warn" if live else "skip")
+            tombstoned_total += tombstoned
+            entry["missing_in_canonical"] = missing
+            entry["tombstoned_in_canonical"] = tombstoned
+            # Issue #245: tombstoned-in-canonical rows are informational
+            # (retire the store when convenient) — only genuinely absent
+            # ids strand on cutover.
+            entry["status"] = ("fail" if missing
+                               else ("warn" if live or tombstoned else "skip"))
         results.append(entry)
 
     statuses = {e["status"] for e in results}
     worst = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "skip"
+
+    # Issue #245 comment: the human summary carries a PER-PATH breakdown so
+    # a multi-store report cannot be misattributed to the first store.
+    def _breakdown() -> str:
+        parts = []
+        for e in results:
+            name = Path(str(e.get("path", "?"))).name
+            miss = e.get("missing_in_canonical")
+            tomb = e.get("tombstoned_in_canonical")
+            if isinstance(miss, int):
+                parts.append(
+                    f"{name}: {miss} absent, "
+                    f"{tomb if isinstance(tomb, int) else 0} "
+                    f"tombstoned-in-canonical, {e.get('live_rows', 0)} live"
+                )
+            elif "error" in e:
+                parts.append(f"{name}: unreadable")
+            else:
+                parts.append(f"{name}: canonical unreadable")
+        return "; ".join(parts)
 
     details["second_stores"] = results
     if worst == "fail":
@@ -2296,15 +2414,22 @@ def _check_second_stores(
             f"({_display_path(canonical)}) — cutover would strand them. Run "
             "`promote-store --from <path>` to merge them in, then retire the "
             "second store; also disable the old host's native memory (see "
-            "the claude-native-memory / codex-native-memory checks).",
+            "the claude-native-memory / codex-native-memory checks). "
+            f"Per store — {_breakdown()}.",
             **details,
         )
     if worst == "warn":
+        tomb_note = (
+            f" {tombstoned_total} row(s) are tombstoned in canonical "
+            "(already superseded there; nothing to promote)."
+            if tombstoned_total else ""
+        )
         return _check(
             "second-stores",
             "warn",
-            "A leftover second store exists but every live row is already in "
-            "the canonical store; retire it when convenient.",
+            "A leftover second store exists but every live row is already "
+            "in the canonical store (live or tombstoned); retire it when "
+            f"convenient.{tomb_note} Per store — {_breakdown()}.",
             **details,
         )
     return _check(

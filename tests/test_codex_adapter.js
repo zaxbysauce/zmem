@@ -8,6 +8,7 @@
 //   - Codex canonical env, event mapping, envelopes, and native Tier0
 //   - stable PostToolUse failure capture, fail-open success path, loop guards
 //   - noise preservation and sentinel-safe translation on the Codex lane
+require("./_store_guard.js"); // issue #244 isolation guard
 
 "use strict";
 
