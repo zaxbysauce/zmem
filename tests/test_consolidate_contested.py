@@ -8,6 +8,14 @@ never auto-merged (not even with --force), are always reported, and
 --merge-contested is the explicit override. Both clustering paths (lexical
 fallback and cosine via embedded stub vectors) are covered.
 """
+# The CI vec-gated/hermes steps run this module via `python -m unittest
+# tests/<file>.py`, which puts the REPO ROOT on sys.path (not tests/)
+# — resolve the guard by file location so both execution shapes
+# import it (issue #244).
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
