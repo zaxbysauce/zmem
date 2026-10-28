@@ -143,7 +143,7 @@ class ShebangLineGuardTest(unittest.TestCase):
         env["ZMEM_DATA"] = env["HOME"]
         env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         result = subprocess.run(
-            ["./" + str(script.name)], cwd=str(script.parent),
+            ["./" + str(script.name), "--help"], cwd=str(script.parent),
             capture_output=True, text=True, env=env, timeout=120,
         )
         self.assertEqual(
