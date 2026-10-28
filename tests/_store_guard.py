@@ -5,8 +5,9 @@ default store. This guard fires (exit 1) when the store path the resolution
 chain WOULD use — explicitly env-named or not — lands inside the real
 home's ``.zmem`` area while the default STORE FILE exists. Ephemeral
 environments (CI runners, fresh containers) may have ``~/.zmem`` created as
-a side effect but no live store file, so the guard stays silent there on
-purpose; the FIRST-WRITE case for test pollution is owned by the write-time
+a side effect — including the store file — so the guard is silent when CI or
+GITHUB_ACTIONS carries a TRUTHY value (runners self-identify; a developer's
+``CI=false`` does not count); the FIRST-WRITE case for test pollution is owned by the write-time
 refusal in storelib/cli.py, which carries no existence gate.
 
 Opt out explicitly with ZMEM_ALLOW_REAL_STORE=1 (deliberate operator runs
@@ -83,9 +84,14 @@ def check(fail_fast=True):
     # the artifact). The guard protects DEVELOPER homes; CI-side fixture
     # leakage is the write-time refusal's job (no existence gate, active
     # everywhere).
-    if os.environ.get("CI", "").strip() or \
-            os.environ.get("GITHUB_ACTIONS", "").strip():
-        return True, "ephemeral CI runner (CI/GITHUB_ACTIONS set)"
+    # Truthy VALUES only ("true"/"1"/"yes", case-insensitive): CI=false — a
+    # real developer convention for forcing interactive behavior — must NOT
+    # silence the guard on a live home (final-critic round 4). Runners
+    # self-identify with CI=true/GITHUB_ACTIONS=true.
+    _ci = os.environ.get("CI", "").strip().lower()
+    _gha = os.environ.get("GITHUB_ACTIONS", "").strip().lower()
+    if _ci in ("true", "1", "yes") or _gha in ("true", "1", "yes"):
+        return True, "ephemeral CI runner (CI/GITHUB_ACTIONS truthy)"
     home = Path(os.path.expanduser("~"))
     zmem_root = home / ".zmem"
     # Gate on the default STORE FILE, not the root dir: CI lanes can have

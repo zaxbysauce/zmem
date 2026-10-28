@@ -4,8 +4,9 @@
  * tests/_store_guard.py. Fires (exit 1) when the store path the resolution
  * chain WOULD use — explicitly env-named or not — lands inside the real
  * home's .zmem area while the default STORE FILE exists. Ephemeral CI homes
- * may have ~/.zmem as a side effect but no store file; the guard stays
- * silent there. Opt out with ZMEM_ALLOW_REAL_STORE=1.
+ * may have ~/.zmem — including the store file — as a side effect, so the
+ * guard is silent when CI or GITHUB_ACTIONS carries a TRUTHY value (a
+ * developer's CI=false does not count). Opt out with ZMEM_ALLOW_REAL_STORE=1.
  *
  * Required by the JS test files that spawn store.py (mirrors the python
  * wiring); the C9 acceptance check drives it directly.
@@ -60,9 +61,13 @@ function check(failFast) {
   // may create ~/.zmem/store.sqlite as a side effect (PR #410 CI round 4).
   // The guard protects DEVELOPER homes; CI-side fixture leakage is the
   // write-time refusal's job (always active).
-  if ((process.env.CI || "").trim() ||
-      (process.env.GITHUB_ACTIONS || "").trim()) {
-    return { ok: true, why: "ephemeral CI runner (CI/GITHUB_ACTIONS set)" };
+  // Truthy VALUES only: CI=false (a developer convention) must not silence
+  // the guard on a live home (final-critic round 4).
+  const ci = (process.env.CI || "").trim().toLowerCase();
+  const gha = (process.env.GITHUB_ACTIONS || "").trim().toLowerCase();
+  if (["true", "1", "yes"].includes(ci) ||
+      ["true", "1", "yes"].includes(gha)) {
+    return { ok: true, why: "ephemeral CI runner (CI/GITHUB_ACTIONS truthy)" };
   }
   const root = path.join(os.homedir(), ".zmem");
   // Gate on the default STORE FILE, not the root dir: CI lanes can have

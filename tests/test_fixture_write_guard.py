@@ -84,5 +84,40 @@ class FixtureWriteGuardTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
 
 
+class GuardCiCarveOutPinTest(unittest.TestCase):
+    """Final-critic round 4: the session guards are silent ONLY on truthy CI.
+
+    CI=false (a developer convention) must keep the guard armed on a live
+    home; CI=true silences it (the ephemeral-runner fix from CI round 4).
+    Drives the guard modules as subprocesses under a fake home that carries
+    the store file — never the real store.
+    """
+
+    def _run_guard(self, env_extra):
+        fakehome = tempfile.mkdtemp(prefix="zmem-fwg-ci-")
+        os.makedirs(os.path.join(fakehome, ".zmem"), exist_ok=True)
+        Path(fakehome, ".zmem", "store.sqlite").write_bytes(b"")
+        env = dict(os.environ)
+        env["HOME"] = fakehome
+        env["USERPROFILE"] = fakehome
+        for k in ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_ALLOW_REAL_STORE",
+                  "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+                  "CI", "GITHUB_ACTIONS"):
+            env.pop(k, None)
+        env.update(env_extra)
+        r = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tests" / "_store_guard.py"),
+             "--probe"],
+            capture_output=True, text=True, env=env, timeout=120,
+            cwd=str(REPO_ROOT))
+        return r.returncode
+
+    def test_ci_true_silences_guard_with_store_present(self):
+        self.assertEqual(self._run_guard({"CI": "true"}), 0)
+
+    def test_ci_false_keeps_guard_armed(self):
+        self.assertEqual(self._run_guard({"CI": "false"}), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
