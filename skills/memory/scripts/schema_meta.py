@@ -455,7 +455,8 @@ INJECT_FLOOR_USER_GLOBAL_ENV = "ZMEM_INJECT_FLOOR_USER_GLOBAL"
 # Workstream G).  These are wire values, not presentation labels: every
 # producer, parser, and report must use the same order and spelling.  ``expired``
 # names an eligible pool drained by the live-expiry gate (issue #174).
-INJECT_LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+INJECT_LANES = ("claude", "codex", "zcode", "deepseek",
+                "hermes-provider", "hermes-compat")
 INJECT_MOMENTS = ("session_start", "user_prompt", "pretool", "subagent",
                   "precompact")
 INJECT_SILENT_REASONS = (

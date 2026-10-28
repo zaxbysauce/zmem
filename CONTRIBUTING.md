@@ -9,8 +9,8 @@ fails a PR that claims a version already published as a tag (version collision) 
 newest published tag (version ordering). The practical consequences, all enforced:
 
 - Any edit under `hooks/`, `skills/memory/scripts/`, `skills/**/SKILL.md`, `hermes-plugin/`,
-  `scripts/`, or any of the seven host manifests requires a release-version bump in the same PR
-  (all seven manifests + a dated newest-first `## [X.Y.Z]` CHANGELOG section + a re-emitted
+  `scripts/`, or any of the eight host manifests requires a release-version bump in the same PR
+  (all eight manifests + a dated newest-first `## [X.Y.Z]` CHANGELOG section + a re-emitted
   `release-manifest.json` after `git add`). There is no equal-version re-emit escape: re-emitting
   the manifest at an already-tagged version is refused as a collision.
 - Docs/tests/CI-only PRs need no bump — an unchanged version with an unchanged manifest passes.

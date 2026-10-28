@@ -659,7 +659,7 @@ _STORE_CONSTANTS = {
     # Issue #153: closed decision-log vocabularies.  Keep this fallback
     # byte-identical with schema_meta/inject.py so an in-tree provider with a
     # temporarily unreachable skills checkout still emits compatible logs.
-    "INJECT_LANES": ("claude", "codex", "zcode", "hermes-provider", "hermes-compat"),
+    "INJECT_LANES": ("claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat"),
     "INJECT_MOMENTS": ("session_start", "user_prompt", "pretool", "subagent", "precompact"),
     # The T-11 remote-mode pair (hub-unreachable, snapshot-expired;
     # issue #290) joins the closed set since 0.122.0.

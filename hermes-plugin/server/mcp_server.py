@@ -89,7 +89,7 @@ _NAMESPACE_VALIDATOR = None
 # Issue #153: closed runtime lanes.  The fallback is intentionally kept
 # byte-identical with schema_meta and the local Hermes provider.
 _INJECT_LANES = (
-    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+    "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat",
 )
 # Issue #87 / #85 direction 1: closed reason set for silent injects — loaded
 # from schema_meta (same source as the hook body and the Hermes twin).
@@ -3151,7 +3151,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error(
                 "prefetch requires namespace, session_id, and moment")
         if lane is not None and lane not in (
-                "claude", "codex", "zcode", "hermes-provider", "hermes-compat"):
+                "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat"):
             return _error(f"invalid lane: {lane!r}")
         # Issue #110 (P0-5) parity: the global passive kill switch silences
         # this lane before any store subprocess (twin of session_start).
@@ -3716,7 +3716,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         if lane is not None and lane not in _INJECT_LANES:
             return _invalid_argument("lane", lane)
         if lane is not None and lane not in (
-                "claude", "codex", "zcode", "hermes-provider", "hermes-compat"):
+                "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat"):
             return _error(f"invalid lane: {lane!r}")
         resolved_ns = (namespace or "").strip() or "user:global"
         if resolved_ns == "*":

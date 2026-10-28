@@ -427,7 +427,7 @@ class StorelibClassifierContractTests(unittest.TestCase):
             "hub-unreachable", "snapshot-expired",
         )
         expected_lanes = (
-            "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+            "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat",
         )
         expected_moments = (
             "session_start", "user_prompt", "pretool", "subagent", "precompact",

@@ -620,6 +620,79 @@ def _cmd_apply_ops(conn, args) -> int:
     return 0
 
 
+
+def _cmd_ops_enqueue(args) -> int:
+    """Enqueue one typed operation on the durable op queue (issue #374).
+
+    Remote mode: remote_gate routes this as an ALLOW-LOCAL sidecar write
+    and the caller receives the pending receipt. --dedup-key (64-hex)
+    maps verbatim to opqueue.enqueue's dedup_key replay suppression.
+    """
+    import json as _json
+    from fleet import opqueue as _opqueue
+    try:
+        op_args = _json.loads(args.args_json)
+        if not isinstance(op_args, dict):
+            raise ValueError("--args must be a JSON object")
+    except ValueError as exc:
+        print("[zmem] ops-enqueue: %s" % exc, file=sys.stderr)
+        return 2
+    if args.dedup_key is not None:
+        dk = args.dedup_key.strip().lower()
+        if len(dk) != 64 or any(c not in "0123456789abcdef" for c in dk):
+            print("[zmem] ops-enqueue: --dedup-key must be 64 hex chars",
+                  file=sys.stderr)
+            return 2
+    else:
+        dk = None
+    entry = _opqueue.enqueue(args.principal or "local", args.op, op_args,
+                             env=dict(os.environ), dedup_key=dk)
+    out = {"ok": True, "op_id": entry.get("op_id"), "op": args.op,
+           "status": entry.get("status", "pending"), "queue": "ops"}
+    sys.stdout.write(_json.dumps(out) + chr(10))
+    return 0
+
+
+def _cmd_ops_flush(conn, args) -> int:
+    """Apply pending queued operations to the LOCAL store and mark their
+    queue receipts (issue #374). No entry is left permanently pending."""
+    import json as _json
+    from fleet import opqueue as _opqueue
+    if not getattr(args, "local", False):
+        print("[zmem] ops-flush: --local is required (remote flush rides "
+              "the routed-read legs)", file=sys.stderr)
+        return 2
+    env = dict(os.environ)
+    pending = _opqueue.pending("local", env)
+    if not pending:
+        sys.stdout.write(_json.dumps({"ok": True, "receipts": [],
+                                      "count": 0}) + chr(10))
+        return 0
+    batch = [{"op_id": e.get("op_id"), "op": e.get("op"),
+              "args": e.get("args", {})} for e in pending]
+    payload = chr(10).join(_json.dumps(op) for op in batch)
+    import subprocess as _sp
+    store_py = Path(__file__).resolve().parents[1] / "store.py"
+    r = _sp.run([sys.executable, "-X", "utf8", str(store_py),
+                 "apply-ops", "--in", "-", "--json"],
+                input=payload, capture_output=True, text=True,
+                cwd=str(store_py.parent), timeout=120)
+    if r.returncode != 0:
+        print("[zmem] ops-flush: apply-ops failed: %s"
+              % (r.stderr or "").strip()[:200], file=sys.stderr)
+        return 1
+    try:
+        result = _json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        print("[zmem] ops-flush: unparseable apply-ops output",
+              file=sys.stderr)
+        return 1
+    receipts = result.get("receipts", [])
+    _opqueue.mark_receipts("local", receipts, env)
+    sys.stdout.write(_json.dumps({"ok": True, "count": len(receipts),
+                                  "receipts": receipts}) + chr(10))
+    return 0
+
 def cmd_hermes_reflect(*, payload: object) -> int:
     """Capture one Hermes payload and return one prepare result as JSON.
 
@@ -3425,6 +3498,28 @@ def main():
 
     # queue-add (issue #260): the write-side sibling of queue-list/queue-clear.
     # Cheap closeout note — never touches the store (no connect/embedding/dedup).
+    p_ops_enq = _add_parser(
+        "ops-enqueue",
+        help="enqueue one typed operation on the durable op queue "
+             "(issue #374; distinct from the correction-note queue-add)")
+    p_ops_enq.add_argument("--op", dest="op", required=True,
+                           choices=["add", "update", "supersede",
+                                    "invalidate", "capture"])
+    p_ops_enq.add_argument("--args", dest="args_json", required=True,
+                           help="JSON object of operation arguments")
+    p_ops_enq.add_argument("--principal", dest="principal", type=str,
+                           default=None)
+    p_ops_enq.add_argument("--dedup-key", dest="dedup_key", type=str,
+                           default=None,
+                           help="64-hex replay suppression key")
+    p_ops_enq.add_argument("--json", action="store_true")
+    p_ops_flush = _add_parser(
+        "ops-flush",
+        help="apply pending queued operations and mark their receipts")
+    p_ops_flush.add_argument("--local", action="store_true",
+                             help="apply against the LOCAL store "
+                                  "(refused in remote mode)")
+    p_ops_flush.add_argument("--json", action="store_true")
     p_queue_add = _add_parser(
         "queue-add",
         help="append a cheap closeout note to a namespace's correction "
@@ -3583,7 +3678,7 @@ def main():
                              "(source=history-mine; resolves the store namespace "
                              "from the current project's git origin, so it may "
                              "spawn one short `git` subprocess)")
-    p_mine.add_argument("--source", choices=["claude", "codex", "hermes"],
+    p_mine.add_argument("--source", choices=["claude", "codex", "hermes", "deepseek"],
                         default="claude",
                         help="input surface (issue #71 I): claude = Claude Code "
                              "transcripts (default, full report); codex = a "
@@ -4256,6 +4351,13 @@ def main():
     # BEFORE connect()/migrate() — a bad/locked/missing store can never block
     # closeout queue review or a cheap closeout note (same policy as
     # `failures`/`corrections`/`sweep`).
+    if args.cmd == "ops-enqueue":
+        # Store-free sidecar dispatch (the T-10 law: a queue-only command
+        # must never connect/create a store — remote mode keeps
+        # data-remote free of store.sqlite).
+        sys.exit(_cmd_ops_enqueue(args))
+    if args.cmd == "ops-flush":
+        sys.exit(_cmd_ops_flush(conn=None, args=args))
     if args.cmd == "queue-list":
         sys.exit(cmd_queue_list(namespace=args.namespace, as_json=args.json))
     if args.cmd == "queue-clear":

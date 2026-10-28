@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fleet-capability-matrix.schema.json",
+  "title": "zmem fleet capability matrix",
+  "description": "Schema for docs/fleet-capability-matrix.json (issue #363). The matrix is the single source of truth for the fleet write-path contract; this schema is the machine guardrail a broker-side consumer validates against. Committed beside the matrix; the matrix's own \"$schema\" key points here.",
+  "type": "object",
+  "required": ["matrix_version", "generator", "rows"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Pointer at this schema file (relative name)."
+    },
+    "schema": {
+      "type": ["integer", "string"],
+      "description": "Schema version field carried by the matrix document."
+    },
+    "matrix_version": {
+      "type": "integer",
+      "enum": [1],
+      "description": "The matrix contract version (issue #280 pinned 1)."
+    },
+    "generator": {
+      "type": "string",
+      "description": "The deterministic generator that produced the artifact."
+    },
+    "generator_note": {
+      "type": "string"
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["harness", "moment", "hook_event", "status", "launcher", "inputs", "hub_ops", "degraded"],
+        "additionalProperties": false,
+        "properties": {
+          "harness": {
+            "type": "string"
+          },
+          "min_version": {
+            "type": "string"
+          },
+          "moment": {
+            "type": "string"
+          },
+          "hook_event": {
+            "type": ["string", "null"],
+            "description": "The host event the moment rides; null for the explicit-tool lane."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["registered", "capability_gap"]
+          },
+          "launcher": {
+            "type": ["string", "null"],
+            "description": "What actually delivers the moment; null on capability_gap rows."
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "locality"],
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "locality": {
+                  "type": "string",
+                  "enum": ["client_local", "hub_authoritative"]
+                }
+              }
+            }
+          },
+          "hub_ops": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["select", "ingest", "flush"]
+            }
+          },
+          "degraded": {
+            "type": "string",
+            "description": "The degrade-never-block commitment (non-empty string pinned by tests/test_t01_fleet_matrix.py)."
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

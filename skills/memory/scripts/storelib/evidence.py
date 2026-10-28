@@ -45,7 +45,7 @@ EVIDENCE_ASSOCIATION_PAGE_MAX = 256
 EVIDENCE_LOOKUP_CHUNK_SIZE = 400
 EVIDENCE_ASSOCIATION_LOOKUP_CHUNK_SIZE = 900
 EVIDENCE_LANES = (
-    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+    "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat",
 )
 EVIDENCE_MOMENTS = (
     "session_start", "user_prompt", "pretool", "subagent", "precompact",

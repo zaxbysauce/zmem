@@ -485,3 +485,51 @@ def make_item(
     if redactions:
         item["secret_warning"] = True
     return item
+
+
+def queue_lock(namespace: str, queue_dir: Optional[Path] = None):
+    """O_EXCL advisory lock for the capture admission path (issue #374):
+    serializes concurrent capture writes to one namespace's queue. Other
+    queue writers (CLI queue-add, the ops paths) do NOT take this lock.
+    Context manager; stale locks are reclaimed after 30s. Never raises."""
+    import contextlib
+    import time as _time
+    path = queue_path_for(namespace, queue_dir)
+    lock = path.with_suffix(path.suffix + ".lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    @contextlib.contextmanager
+    def _cm():
+        import os as _os
+        fd = None
+        deadline = _time.time() + 30
+        acquired = False
+        while not acquired and _time.time() < deadline:
+            try:
+                fd = _os.open(str(lock), _os.O_CREAT | _os.O_EXCL |
+                              _os.O_WRONLY)
+                acquired = True
+            except (FileExistsError, OSError):
+                try:
+                    if _time.time() - lock.stat().st_mtime > 30:
+                        lock.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                _time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    _os.close(fd)
+                except OSError:
+                    pass
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return _cm()

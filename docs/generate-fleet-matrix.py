@@ -32,8 +32,10 @@ MIN_VERSION = {
     "zcode": "3.15.3",
     "hermes": "0.21.1",
     "opencode": "1.18.30",
+    "deepseek": "0.2.1-rc.2",
 }
-SUPPORTED_HARNESSES = ("claude", "codex", "zcode", "hermes", "opencode")
+SUPPORTED_HARNESSES = ("claude", "codex", "zcode", "hermes", "opencode",
+                      "deepseek")
 
 # Degraded-class texts.  These strings are the AC1 mapping verbatim as
 # docs/FLEET.md renders it (ASCII quotes, `reason:` key prefix) so the doc
@@ -139,7 +141,29 @@ def _hermes_callbacks():
     return sorted(set(names))
 
 
+# Native dsh/Cordis plugin wiring (issue #374): the deepseek adapter
+# registers these events in deepseek-plugin/index.mjs — no hooks.deepseek.json
+# exists or may be fabricated; the verb->event map below mirrors the plugin's
+# actual ctx.on registrations.
+_NATIVE_WIRING = {
+    "deepseek": {
+        "session-start": "agent/created",
+        "recall": "agent/pre-step",
+        "pretool-recall": "tools/pre-execute",
+        "capture-failure": "tools/result",
+        "reflect": "agent/turn-stopping",
+        # precompact is deliberately ABSENT (PR #409 review): the adapter
+        # listens for compaction events but its handler acts only on
+        # compaction/end (state reset) — no pre-compaction recall is
+        # delivered, so the matrix records a capability_gap row instead of
+        # an overclaimed registered row for compaction/start.
+    },
+}
+_NATIVE_NOTE = ("Native dsh/Cordis plugin event "
+                "(deepseek-plugin/index.mjs); no shell-hook manifest (#374).")
+
 WIRING = _manifest_wiring()
+WIRING.update(_NATIVE_WIRING)
 HERMES_CALLBACKS = _hermes_callbacks()
 UNION_EVENTS = sorted({ev for verbs in WIRING.values() for ev in verbs.values()})
 
@@ -271,6 +295,20 @@ for _cb, _moment in CALLBACK_MOMENTS.items():
     )
 
 
+AUTHORIZATION_INPUT = {"name": "principal authorization",
+                        "locality": "hub_authoritative"}
+
+
+def _with_authorization_input(inputs, hub_ops):
+    """Issue #363 AC1: every ingest row carries the authorization input."""
+    if "ingest" not in hub_ops:
+        return inputs
+    for item in inputs:
+        if "authorization" in str(item.get("name", "")):
+            return inputs
+    return list(inputs) + [dict(AUTHORIZATION_INPUT)]
+
+
 def _row(harness, moment, hook_event, status, launcher, notes=None):
     spec = MOMENT_SPEC[moment]
     row = {
@@ -280,11 +318,14 @@ def _row(harness, moment, hook_event, status, launcher, notes=None):
         "hook_event": hook_event,
         "status": status,
         "launcher": launcher,
-        "inputs": spec["inputs"],
+        "inputs": _with_authorization_input(spec["inputs"],
+                                            spec["hub_ops"]),
         "hub_ops": spec["hub_ops"],
         "degraded": spec["degraded"],
     }
     note = notes if notes is not None else spec.get("notes")
+    if harness in _NATIVE_WIRING:
+        note = _NATIVE_NOTE
     if harness == "opencode" and status == "capability_gap":
         note = OPENCUE_GAP if note is None else note
     if note:
@@ -355,6 +396,7 @@ def build_rows():
 
 def render(rows):
     return json.dumps({
+        "$schema": "./fleet-capability-matrix.schema.json",
         "matrix_version": 1,
         "generator": "docs/generate-fleet-matrix.py",
         "generator_note": (

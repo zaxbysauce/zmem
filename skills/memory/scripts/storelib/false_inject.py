@@ -54,7 +54,7 @@ LEGACY_MOMENT = "legacy"
 # doctor consumers.  Runtime ``subagent`` and compatibility moments remain
 # aggregate-visible but are deliberately outside the exact 5x4 named matrix.
 _ATTR_LANES = (
-    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+    "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat",
 )
 _REPORT_LANES = tuple(sorted(_ATTR_LANES))
 _REPORT_MOMENTS = tuple(sorted(

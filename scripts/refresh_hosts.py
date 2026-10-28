@@ -52,6 +52,7 @@ CANONICAL_MANIFESTS = frozenset(
         ".zcode-plugin/plugin.json",
         "hermes-plugin/plugin.yaml",
         "marketplace.json",
+        "deepseek-plugin/plugin.json",
     }
 )
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -521,7 +522,7 @@ def _validate_checkout(checkout: Path) -> tuple[str, str, dict[str, str], list[t
         if extra:
             details.append("unexpected " + ", ".join(extra))
         raise RefreshError(
-            "checkout host-facing manifest set must be the canonical seven paths ("
+            "checkout host-facing manifest set must be the canonical eight paths ("
             + "; ".join(details)
             + ")"
         )

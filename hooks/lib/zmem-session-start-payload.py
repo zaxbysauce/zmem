@@ -317,7 +317,7 @@ def _closeout_reminder(data_dir, session_id):
 
 
 def _lane(host):
-    return {"claude": "claude", "codex": "codex", "zcode": "zcode",
+    return {"claude": "claude", "codex": "codex", "zcode": "zcode", "deepseek": "deepseek",
             "hermes": "hermes-provider", "hermes-provider": "hermes-provider",
             "hermes-compat": "hermes-compat"}.get((host or "zcode").lower(), "")
 

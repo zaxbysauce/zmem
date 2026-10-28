@@ -5,6 +5,71 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.127.0] - 2026-10-28
+
+### Added
+
+- **DeepSeek Harness (dsh) native adapter — Workstream T PR 13 (#374):**
+  new `deepseek-plugin/` Cordis package (`@zaxbyhub/zmem-deepseek`) with
+  first-accepted-pre-step fenced delivery through the T-05
+  `prefetch --reserve`/`prefetch-ack` CLI seam, reservation acknowledgement
+  only after observed session admission, `startsRequestSeries` spread-
+  preservation, explicit `zmem_add`/`zmem_update`/`zmem_supersede`/
+  `zmem_invalidate`/`zmem_recall`/`zmem_search`/`zmem_get`/`zmem_list`/
+  **Disclosed boundaries:** the dsh product loader is not part of the
+  published `@deepseek-ai` packages — installation is validated at the
+  profile-row (`cordis.yml`)/package-contract level only; native canary
+  evidence is win32/headless-only (first-class support claims are gated
+  by the committed canary + support reports at
+  `docs/host-gate-evidence/deepseek/`); compaction reaction is pinned
+  with synthetic markers (the real compactor package is absent from
+  0.2.1-rc.2); the canary evidence exercises cordis exactly 4.0.5 — the
+  declared peer range `^4.0.5` admits other cordis 4.x releases that have
+  not been exercised.
+  `zmem_recent` tools routed through the same backend (typed
+  `ops-enqueue`/`ops-flush --local` receipts; pending remote / committed
+  local), identity/lifecycle isolation across concurrent agents, fork and
+  synthetic compaction markers, T-11 offline snapshot labelled delivery,
+  bounded guidance/policy/kill-switch behavior, and the profile-row
+  install/upgrade/activation/uninstall contract with restart honesty.
+- **DeepSeek capture, retention, provenance and fleet parity — Workstream T
+  PR 14 (#375):** original-user-message correction capture and immutable
+  final tool-failure capture through the shared python entry
+  (`hooks/lib/zmem-capture-entry.py`) with always-on redaction (including
+  the long AKIA/SK-run fallback), content+session dedup under the new
+  O_EXCL correction-queue lock, default-off auto-retain honored, bounded
+  once-per-session reflection nudge with no self-continuation,
+  `mine-history --source deepseek` versioned session-export parsing with
+  refusal contracts (Claude-JSONL shapes, unsafe paths, malformed records,
+  unsupported generations), `retain-adapt --host deepseek`, the
+  `deepseek-plugin` doctor `--fleet` check (version, activation, backend,
+  principal, snapshot, queue depth), and the committed native canary +
+  support reports at `docs/host-gate-evidence/deepseek/`.
+- **Fleet write-path contract residuals (#363):** the generated fleet
+  capability matrix carries a principal-authorization input on every
+  `ingest` row plus a `$schema` pointer to the committed JSON Schema, and
+  `apply-ops` short-circuits byte-identical queued replays
+  namespace-scoped with trust/retrieval counters unchanged.
+- **Principal-map permission enforcement (#406):** doctor `--fleet` fails
+  the fleet-principal check on over-permissive maps (POSIX mode tiers or
+  broad Windows ACEs via the shared the self-contained verdict copies in `hermes-plugin/server/auth.py` and `doctor.py` (#408's architecture, now shared)), and the hub
+  refuses to LOAD an over-permissive map at startup or mtime-reload
+  (keeping the previous generation and logging
+  `zmem_mcp_principal_map_permission_refused`).
+
+### Changed
+
+- The `deepseek` lane joins `INJECT_LANES` and every lane/host vocabulary
+  (selector, evidence, decision-report, canary-input, fallback `_lane`
+  maps, retain hosts, mine sources); `refresh_hosts` canonical manifest set
+  is now EIGHT (adds `deepseek-plugin/plugin.json`); the five-lanes
+  decision fixture is six lanes / 24 rows.
+- Remote-mode CLI: `prefetch` gains a dedicated remote routing band
+  (forwarded/refused flag table, authenticated hub identity, `--exclude`
+  refused with a named diagnostic) with offline full-envelope serving on
+  the no-ok-key `hub-unreachable` refusal shape and a bounded
+  reconnect flush; `ops-enqueue`/`ops-flush --local` dispatch store-free.
+
 ## [0.125.0] - 2026-10-27
 
 ### Fixed

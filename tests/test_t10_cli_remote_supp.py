@@ -501,8 +501,8 @@ def test_config_error_names_store_data_and_remote_url():
 
 def test_refuse_band_beyond_frozen_six_refuses_and_never_creates_store():
     """backup / evidence write / operation-feedback / apply-ops /
-    prefetch / hermes-convention: exit 2 with the exact refusal phrase,
-    no store.sqlite."""
+    hermes-convention: exit 2 with the exact refusal phrase, no
+    store.sqlite. prefetch left the band in #374 (offline serve)."""
     tmp = _pinned_scratch("p3")
     try:
         env = _remote_subproc_env(tmp, _dead_port_url())
@@ -523,9 +523,6 @@ def test_refuse_band_beyond_frozen_six_refuses_and_never_creates_store():
              ["--session-id", "s", "--event-id", "evt-1",
               "--outcome", "success"]),
             ("apply-ops", ["--in", batch]),
-            ("prefetch",
-             ["--query", "q", "--namespace", "user:global",
-              "--session-id", "s", "--moment", "user_prompt"]),
             ("hermes-convention", []),
         ]
         for command, extra in cases:
@@ -542,6 +539,23 @@ def test_refuse_band_beyond_frozen_six_refuses_and_never_creates_store():
                 f"'{command}' touched the local store ({tmp}/store.sqlite "
                 f"exists) — a remote-mode refusal must happen before any "
                 f"store access")
+        # prefetch left the refuse band in #374: remote prefetch now
+        # routes to the hub and, when the hub is unreachable, serves the
+        # T-11 offline snapshot envelope (rc 0, reason hub-unreachable)
+        # WITHOUT ever creating a local store.
+        proc = _run_store_env(
+            env, "prefetch", "--query", "q", "--namespace", "user:global",
+            "--session-id", "s", "--moment", "user_prompt", input_text="")
+        assert proc.returncode == 0, (
+            f"prefetch against an unreachable hub must serve the offline "
+            f"envelope (issue #374); rc={proc.returncode} "
+            f"stdout={_tail(proc.stdout)!r} stderr={_tail(proc.stderr)!r}")
+        assert "hub-unreachable" in (proc.stdout or ""), (
+            f"the offline envelope must carry reason hub-unreachable; "
+            f"stdout={_tail(proc.stdout)!r}")
+        assert not _store_exists(tmp), (
+            "the offline prefetch serve must never create a local store")
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

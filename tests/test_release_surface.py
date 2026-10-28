@@ -34,6 +34,7 @@ REPORT_KEYS = ("total_applied", "total_violated", "nonzero_applied",
                "nonzero_violated", "matched_applied", "matched_violated",
                "unmatched_operations")
 MANIFESTS = (
+    "deepseek-plugin/plugin.json",
     "marketplace.json",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",

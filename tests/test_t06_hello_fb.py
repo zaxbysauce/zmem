@@ -383,6 +383,15 @@ def _main() -> int:
         except AssertionError as exc:
             failures.append((check.__name__, str(exc)))
             print(f"FAIL {check.__name__}: {exc}")
+        except SystemExit as exc:
+            # A refusal path (e.g. an issue-#406 map-permission exit) must
+            # surface as a named FAIL, not exit the driver silently after
+            # earlier PASS lines.
+            failures.append((check.__name__, f"SystemExit {exc.code}"))
+            print(f"FAIL {check.__name__}: exited ({exc.code})")
+        except Exception as exc:  # noqa: BLE001 - driver reports, never dies
+            failures.append((check.__name__, repr(exc)))
+            print(f"FAIL {check.__name__}: {exc!r}")
     if failures:
         print(f"{len(failures)} check(s) failed")
         return 1

@@ -1003,6 +1003,131 @@ def _mine_hermes_candidates(sessions_dir: str) -> list[dict]:
     return candidates
 
 
+DSH_EXPORT_FORMAT = "dsh-session-export"
+DSH_EXPORT_SUPPORTED_VERSIONS = (1,)
+_DSH_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+class _DshExportError(ValueError):
+    """A refused dsh session export (issue #375 AC4): the message names the
+    disqualifying property (claude-shape / unsafe path / malformed line /
+    unsupported generation)."""
+
+
+def _dsh_record_text(data):
+    """Best-effort text of one export record's message content."""
+    if not isinstance(data, dict):
+        return ""
+    msg = data.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+    return " ".join(parts)
+
+
+def _mine_deepseek_candidates(root):
+    """Candidates from versioned dsh session exports (issue #375 AC4).
+
+    Format: first line {"format":"dsh-session-export","version":1} then
+    event records {"seq", "type", "data"}. Claude-JSONL shapes, unsafe
+    source refs, malformed lines and unsupported generations are REFUSED
+    (ValueError naming the disqualifier). Corrections come from original
+    user messages (source.kind == "user"); failures from tool/result
+    records carrying an error."""
+    import corrections as _corrections
+    root_path = Path(root)
+    files = sorted(root_path.glob("*.jsonl")) if root_path.is_dir() else []
+    if not files and not root_path.is_dir():
+        raise FileNotFoundError(str(root_path))
+    candidates = []
+    for path in files:
+        raw = path.read_text(encoding="utf-8")[:_DSH_MAX_FILE_BYTES]
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        try:
+            header = json.loads(lines[0])
+        except ValueError:
+            raise _DshExportError(
+                "not a dsh session export: missing version header "
+                "(claude-shaped transcripts are not dsh exports)")
+        if not isinstance(header, dict) or                 header.get("format") != DSH_EXPORT_FORMAT:
+            raise _DshExportError(
+                "not a dsh session export: foreign transcript shape "
+                "(claude jsonl is refused; deepseek exports carry the "
+                "dsh-session-export header)")
+        version = header.get("version")
+        if version not in DSH_EXPORT_SUPPORTED_VERSIONS:
+            raise _DshExportError(
+                f"unsupported dsh session export generation: {version!r} "
+                f"(supported: {DSH_EXPORT_SUPPORTED_VERSIONS})")
+        source_name = "dsh-session:%s" % path.stem
+        for ln in lines[1:]:
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                raise _DshExportError(
+                    "malformed json line in dsh session export")
+            if not isinstance(rec, dict) or not isinstance(
+                    rec.get("type"), str):
+                raise _DshExportError(
+                    "malformed record in dsh session export")
+            data = rec.get("data") if isinstance(rec.get("data"), dict) \
+                else {}
+            ref = str(data.get("source_ref") or "")
+            if ref.startswith("..") or ref.startswith("/") or "://" in ref:
+                raise _DshExportError(
+                    "unsafe path reference in dsh session export record")
+            rtype = rec["type"]
+            if rtype == "user/message":
+                src = data.get("source") if isinstance(
+                    data.get("source"), dict) else {}
+                if src.get("kind") != "user":
+                    continue  # plugin/model/tool-sourced text is not a
+                    # user correction
+                text = _dsh_record_text(data)
+                if not text or len(text) < 5:
+                    continue
+                if not _corrections.should_include_message(text):
+                    continue
+                if _corrections.is_harvest_paste(text):
+                    continue
+                candidates.append({
+                    "type": "correction", "source": source_name,
+                    "message": text[:2000],
+                    "dedup_key": "cor|%s|%s" % (
+                        path.stem, " ".join(text.split())[:120]),
+                })
+            elif rtype == "tool/result":
+                err = data.get("error")
+                if not isinstance(err, dict):
+                    continue
+                text = str(err.get("message") or "") or _dsh_record_text(data)
+                if not text:
+                    continue
+                # classify_error_type returns a TUPLE — (None, None) for
+                # unclassified/excluded text is truthy. Test the first
+                # element (the type), or unfiltered tool errors become
+                # hub memory rows.
+                _etype = _corrections.classify_error_type(text)
+                if not (_etype and _etype[0]):
+                    continue
+                candidates.append({
+                    "type": "error_pattern", "source": source_name,
+                    "message": text[:2000],
+                    "dedup_key": "err|%s|%s" % (
+                        path.stem, " ".join(text.split())[:120]),
+                })
+    return candidates
+
+
 def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
                               queue: bool, as_json: bool, limit=None) -> int:
     """Dispatch for `mine-history --source codex|hermes` (issue #71 I).
@@ -1011,7 +1136,10 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
     REVIEWED before any store write, --queue appends to the #47 sidecar with
     dedup_key idempotency, never auto-writes the store."""
     try:
-        if source == "codex":
+        if source == "deepseek":
+            root = transcript_dir or str(Path.home() / ".dsh" / "exports")
+            candidates = _mine_deepseek_candidates(root)
+        elif source == "codex":
             root = transcript_dir or os.environ.get("ZMEM_CODEX_MEMORY") \
                 or str(Path.home() / ".codex" / "MEMORY.md")
             candidates = _mine_codex_candidates(root)
@@ -1081,7 +1209,8 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
                 sentiment="correction",
                 decay_days=c.get("decay_days", 90), session="",
                 namespace=namespace,
-                host="codex" if source == "codex" else "hermes",
+                host=("codex" if source == "codex"
+                     else "deepseek" if source == "deepseek" else "hermes"),
             )
             item["dedup_key"] = c["dedup_key"]
             item["source"] = "history-mine"

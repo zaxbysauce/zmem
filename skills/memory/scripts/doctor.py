@@ -4720,6 +4720,59 @@ def _fleet_remote_url() -> str:
             or os.environ.get("ZMEM_MCP_URL", "")).strip()
 
 
+def _check_fleet_deepseek() -> dict:
+    """DeepSeek adapter diagnostics (issue #375 AC5): installed runtime/
+    bundle version, selected profile, activation state, backend/principal
+    resolution, snapshot state and pending queue depth. Read-only; no
+    credential values are ever reported."""
+    import json as _json
+    root = Path(__file__).resolve().parents[3]
+    manifest = root / "deepseek-plugin" / "plugin.json"
+    if not manifest.is_file():
+        return _check("deepseek-plugin", "warn",
+                      "deepseek-plugin/ is not present (native adapter "
+                      "not installed on this machine)")
+    try:
+        meta = _json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _check("deepseek-plugin", "fail",
+                      f"deepseek-plugin/plugin.json unreadable: {exc}")
+    runtime = meta.get("runtime") if isinstance(meta.get("runtime"),
+                                                dict) else {}
+    remote = bool((os.environ.get("ZMEM_REMOTE_URL", "") or "").strip())
+    principal = "hub-authenticated" if remote else "local"
+    profile = (os.environ.get("ZMEM_DEEPSEEK_PROFILE", "") or "").strip()
+    try:
+        import host as _host
+        snap_state, _meta = _fleet_snapshot_state(
+            _host.resolve_store_path())
+    except Exception:
+        snap_state = "unknown"
+    queue_depth = 0
+    try:
+        import host as _host
+        store_dir = _host.resolve_store_path().parent
+        for q in sorted((store_dir / "queue").glob("ops-*.jsonl")):
+            for line in q.read_text(encoding="utf-8",
+                                    errors="replace").splitlines():
+                try:
+                    if _json.loads(line).get("status") == "pending":
+                        queue_depth += 1
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    summary = (f"plugin version {meta.get('version', '?')} runtime "
+               f"{runtime.get('tested', '?')} backend "
+               f"{'remote' if remote else 'local'} principal {principal} "
+               f"snapshot {snap_state} pending-queue {queue_depth} "
+               "activation restart-required (no HMR; restart the host to "
+               "load the cordis.yml profile row)"
+               + (f" profile {profile}" if profile else
+                  " profile <unset (cordis.yml row)>"))
+    return _check("deepseek-plugin", "pass", summary)
+
+
 def _check_fleet_hub_reachable() -> dict:
     """Reachability only: ANY HTTP response (including 4xx/5xx) proves the
     endpoint answered; refused/timeout/bad URL is a fail."""
@@ -5504,6 +5557,7 @@ def _fleet_checks(resolved_store: Path,
     fabricated path (PRR-014).
     """
     checks: list[dict] = []
+    checks.append(_check_fleet_deepseek())
     checks.append(_check_fleet_hub_reachable())
     hello = _fleet_hello_once()
     checks.append(_check_fleet_hello_compat(hello))

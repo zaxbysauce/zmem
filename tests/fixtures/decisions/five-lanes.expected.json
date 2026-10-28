@@ -22,7 +22,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [],
@@ -42,7 +42,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -66,7 +66,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [],
@@ -86,7 +86,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -110,7 +110,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -134,7 +134,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -158,7 +158,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -182,7 +182,79 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "deepseek",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "precompact",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-deepseek",
+      "status": "injected",
+      "t_ms": 40,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.127.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "lane": "deepseek",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "pretool",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-deepseek",
+      "status": "injected",
+      "t_ms": 30,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.127.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000001"
+      ],
+      "lane": "deepseek",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "session_start",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-deepseek",
+      "status": "injected",
+      "t_ms": 10,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -192,6 +264,30 @@
       "exc": null,
       "ids": [
         "00000000-0000-4000-8000-000000000002"
+      ],
+      "lane": "deepseek",
+      "margin": null,
+      "margin_pruned": null,
+      "moment": "user_prompt",
+      "omitted": 0,
+      "ops": null,
+      "reason": "injected",
+      "sid": "fixture-deepseek",
+      "status": "injected",
+      "t_ms": 20,
+      "tok_budget": null,
+      "tok_used": null,
+      "ts": 1780272000,
+      "ver": "0.127.0"
+    },
+    {
+      "all": [
+        "00000000-0000-4000-8000-000000000003"
+      ],
+      "arms": null,
+      "exc": null,
+      "ids": [
+        "00000000-0000-4000-8000-000000000003"
       ],
       "lane": "hermes-compat",
       "margin": null,
@@ -206,16 +302,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000001"
+        "00000000-0000-4000-8000-000000000002"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000001"
+        "00000000-0000-4000-8000-000000000002"
       ],
       "lane": "hermes-compat",
       "margin": null,
@@ -230,16 +326,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000002"
+        "00000000-0000-4000-8000-000000000003"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000002"
+        "00000000-0000-4000-8000-000000000003"
       ],
       "lane": "hermes-compat",
       "margin": null,
@@ -254,16 +350,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000003"
+        "00000000-0000-4000-8000-000000000001"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000003"
+        "00000000-0000-4000-8000-000000000001"
       ],
       "lane": "hermes-compat",
       "margin": null,
@@ -278,16 +374,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000001"
+        "00000000-0000-4000-8000-000000000002"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000001"
+        "00000000-0000-4000-8000-000000000002"
       ],
       "lane": "hermes-provider",
       "margin": null,
@@ -302,16 +398,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000003"
+        "00000000-0000-4000-8000-000000000001"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000003"
+        "00000000-0000-4000-8000-000000000001"
       ],
       "lane": "hermes-provider",
       "margin": null,
@@ -326,16 +422,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000001"
+        "00000000-0000-4000-8000-000000000002"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000001"
+        "00000000-0000-4000-8000-000000000002"
       ],
       "lane": "hermes-provider",
       "margin": null,
@@ -350,16 +446,16 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
-        "00000000-0000-4000-8000-000000000002"
+        "00000000-0000-4000-8000-000000000003"
       ],
       "arms": null,
       "exc": null,
       "ids": [
-        "00000000-0000-4000-8000-000000000002"
+        "00000000-0000-4000-8000-000000000003"
       ],
       "lane": "hermes-provider",
       "margin": null,
@@ -374,7 +470,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -398,7 +494,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -422,7 +518,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -446,7 +542,7 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     },
     {
       "all": [
@@ -470,13 +566,13 @@
       "tok_budget": null,
       "tok_used": null,
       "ts": 1780272000,
-      "ver": "0.125.0"
+      "ver": "0.127.0"
     }
   ],
   "fixture": {
     "generated_at": "2026-06-01T00:00:00Z",
     "namespace": "project:fixture",
-    "version": "0.125.0"
+    "version": "0.127.0"
   },
   "matrix": [
     {
@@ -490,9 +586,9 @@
       "t_ms": 40,
       "t_ms_avg": 40,
       "t_ms_max": 40,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -506,9 +602,9 @@
       "t_ms": 30,
       "t_ms_avg": 30,
       "t_ms_max": 30,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -522,9 +618,9 @@
       "t_ms": 10,
       "t_ms_avg": 10,
       "t_ms_max": 10,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -538,9 +634,9 @@
       "t_ms": 20,
       "t_ms_avg": 20,
       "t_ms_max": 20,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -554,9 +650,9 @@
       "t_ms": 40,
       "t_ms_avg": 40,
       "t_ms_max": 40,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -570,9 +666,9 @@
       "t_ms": 30,
       "t_ms_avg": 30,
       "t_ms_max": 30,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -586,9 +682,9 @@
       "t_ms": 10,
       "t_ms_avg": 10,
       "t_ms_max": 10,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -602,9 +698,73 @@
       "t_ms": 20,
       "t_ms_avg": 20,
       "t_ms_max": 20,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "deepseek",
+      "moment": "precompact",
+      "silent": 0,
+      "t_ms": 40,
+      "t_ms_avg": 40,
+      "t_ms_max": 40,
+      "ver": "0.127.0",
+      "versions": [
+        "0.127.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "deepseek",
+      "moment": "pretool",
+      "silent": 0,
+      "t_ms": 30,
+      "t_ms_avg": 30,
+      "t_ms_max": 30,
+      "ver": "0.127.0",
+      "versions": [
+        "0.127.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "deepseek",
+      "moment": "session_start",
+      "silent": 0,
+      "t_ms": 10,
+      "t_ms_avg": 10,
+      "t_ms_max": 10,
+      "ver": "0.127.0",
+      "versions": [
+        "0.127.0"
+      ]
+    },
+    {
+      "already_delivered": 0,
+      "count": 1,
+      "empty_pool": 0,
+      "injected": 1,
+      "lane": "deepseek",
+      "moment": "user_prompt",
+      "silent": 0,
+      "t_ms": 20,
+      "t_ms_avg": 20,
+      "t_ms_max": 20,
+      "ver": "0.127.0",
+      "versions": [
+        "0.127.0"
       ]
     },
     {
@@ -618,9 +778,9 @@
       "t_ms": 40,
       "t_ms_avg": 40,
       "t_ms_max": 40,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -634,9 +794,9 @@
       "t_ms": 30,
       "t_ms_avg": 30,
       "t_ms_max": 30,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -650,9 +810,9 @@
       "t_ms": 10,
       "t_ms_avg": 10,
       "t_ms_max": 10,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -666,9 +826,9 @@
       "t_ms": 20,
       "t_ms_avg": 20,
       "t_ms_max": 20,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -682,9 +842,9 @@
       "t_ms": 40,
       "t_ms_avg": 40,
       "t_ms_max": 40,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -698,9 +858,9 @@
       "t_ms": 30,
       "t_ms_avg": 30,
       "t_ms_max": 30,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -714,9 +874,9 @@
       "t_ms": 10,
       "t_ms_avg": 10,
       "t_ms_max": 10,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -730,9 +890,9 @@
       "t_ms": 20,
       "t_ms_avg": 20,
       "t_ms_max": 20,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -746,9 +906,9 @@
       "t_ms": 40,
       "t_ms_avg": 40,
       "t_ms_max": 40,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -762,9 +922,9 @@
       "t_ms": 30,
       "t_ms_avg": 30,
       "t_ms_max": 30,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -778,9 +938,9 @@
       "t_ms": 10,
       "t_ms_avg": 10,
       "t_ms_max": 10,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     },
     {
@@ -794,9 +954,9 @@
       "t_ms": 20,
       "t_ms_avg": 20,
       "t_ms_max": 20,
-      "ver": "0.125.0",
+      "ver": "0.127.0",
       "versions": [
-        "0.125.0"
+        "0.127.0"
       ]
     }
   ]

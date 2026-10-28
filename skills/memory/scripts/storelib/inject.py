@@ -39,7 +39,8 @@ INJECTION_MOMENTS = (
     "session_start", "user_prompt", "pretool", "subagent", "precompact",
 )
 INJECTION_LANES = (
-    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+    "claude", "codex", "zcode", "deepseek",
+    "hermes-provider", "hermes-compat",
 )
 
 INJECTION_ENVELOPE_REQUIRED = frozenset({
@@ -99,7 +100,8 @@ try:  # pragma: no cover - trivial import guard
     # schema_meta may be unavailable or from an older release.
     INJECT_LANES = tuple(getattr(
         _schema_meta, "INJECT_LANES",
-        ("claude", "codex", "zcode", "hermes-provider", "hermes-compat"),
+        ("claude", "codex", "zcode", "deepseek",
+         "hermes-provider", "hermes-compat"),
     ))
     INJECT_MOMENTS = tuple(getattr(
         _schema_meta, "INJECT_MOMENTS",
@@ -114,8 +116,8 @@ try:  # pragma: no cover - trivial import guard
 except Exception:  # noqa: BLE001 - partially-deployed tree: use the literals
     _schema_meta = None
     _PROTECTED_TYPES = ("decision", "constraint")
-    INJECT_LANES = ("claude", "codex", "zcode", "hermes-provider",
-                    "hermes-compat")
+    INJECT_LANES = ("claude", "codex", "zcode", "deepseek",
+                    "hermes-provider", "hermes-compat")
     INJECT_MOMENTS = ("session_start", "user_prompt", "pretool", "subagent",
                       "precompact")
     INJECT_SILENT_REASONS = (

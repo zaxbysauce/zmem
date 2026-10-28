@@ -231,10 +231,36 @@ def _redact_args(args: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _dedup_live(queue_path, dedup_key):
+    """True when a live queue entry already carries this dedup key
+    (issue #374 capture replay suppression)."""
+    if not dedup_key:
+        return False
+    try:
+        with open(queue_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or dedup_key not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("dedup_key") == dedup_key:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def enqueue(principal: str, op: str, args: Mapping[str, Any],
             depends_on: Optional[str] = None, client_seq: Optional[int] = None,
-            env=None) -> dict[str, Any]:
-    """Append one redacted op entry; returns the entry as queued."""
+            env=None, dedup_key: Optional[str] = None) -> dict[str, Any]:
+    """Append one redacted op entry; returns the entry as queued.
+
+    ``dedup_key`` (issue #374 capture replay suppression): when a live
+    entry already carries the same key the enqueue is a no-op that returns
+    the existing entry."""
     path = queue_path(principal, env)
     path.parent.mkdir(parents=True, exist_ok=True)
     # A hardened directory must keep the owner +x bit: 0o600 on a POSIX
@@ -243,6 +269,10 @@ def enqueue(principal: str, op: str, args: Mapping[str, Any],
     _harden(path.parent, 0o700)
 
     with _queue_lock(path):
+        if dedup_key and _dedup_live(path, dedup_key):
+            for e in _read_entries(path):
+                if isinstance(e, dict) and e.get("dedup_key") == dedup_key:
+                    return e
         entries = _read_entries(path)
         seqs = [int(e.get("client_seq", 0)) for e in entries
                 if isinstance(e.get("client_seq"), int)]
@@ -264,6 +294,8 @@ def enqueue(principal: str, op: str, args: Mapping[str, Any],
             "status": "pending",
             "enqueued_at": time.time(),
         }
+        if dedup_key:
+            entry["dedup_key"] = dedup_key
         size_before = path.stat().st_size if path.exists() else 0
         # PROJECTED bound: refuse when THIS entry would carry the file past
         # its cap (a check-before-append can be overshot by the entry's own

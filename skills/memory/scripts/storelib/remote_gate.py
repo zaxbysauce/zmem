@@ -54,7 +54,7 @@ _ALLOW_LOCAL = frozenset({
     "failures", "signals", "corrections", "queue-list", "queue-clear",
     "queue-add", "source-exists", "source-ref-exists", "ops-append",
     "retain", "retain-adapt", "ledger-clear", "delivery-clear",
-    "hermes-reflect", "hermes-context",
+    "hermes-reflect", "hermes-context", "ops-enqueue",
 })
 _HERMES_CONTEXT_ALLOWED_ACTIONS = frozenset({"commit-cursor"})
 
@@ -328,6 +328,110 @@ def _expected_read_keys(cmd: str, envelope: dict[str, Any]) -> bool:
     return required.issubset(envelope)
 
 
+def _route_prefetch(args: Any) -> None:
+    """Remote prefetch (issue #374): forwarded = query, namespace,
+    session-id, moment, lane, reserve, ops-token; REFUSED = --exclude (the
+    hub prefetch tool accepts no exclusion parameter) and client-asserted
+    --principal/--harness (remote identity is the AUTHENTICATED token); the
+    refusal names the flag. Offline (hub unreachable) serves the FULL
+    injection envelope from the T-11 snapshot with no live reservation."""
+    opqueue, transport = _import_fleet()
+    for flag, value in (("--exclude", getattr(args, "exclude_ids", None)),
+                        ("--principal", getattr(args, "principal", None)),
+                        ("--harness", getattr(args, "harness", None)),
+                        # input-only or local-only prefetch flags: named
+                        # refusal (never a silent drop) per the honesty
+                        # contract — the hub passive tool has no
+                        # state-hint / for-injection / authorized-
+                        # namespace parameters.
+                        ("--state-hint", getattr(args, "state_hint", None)),
+                        ("--for-injection",
+                         bool(getattr(args, "for_injection", False))),
+                        ("--authorized-namespace",
+                         getattr(args, "authorized_namespace", None) or None)):
+        if value:
+            _refuse(
+                f"{flag} is not supported in remote mode (ZMEM_REMOTE_URL "
+                f"is set); remote prefetch identity is the authenticated "
+                f"hub principal and the hub tool accepts no exclusions")
+    http = _hub(transport)
+    env = dict(os.environ)
+    started = time.monotonic()
+    deadline_s = transport.resolve_deadline_s(env)
+    remaining_ms = int(max(0.0, deadline_s - (time.monotonic() - started))
+                       * 1000)
+    # Same bounded reconnect flush as _route_read (T-09/#374 C12): a
+    # prefetch after a reconnect commits queued ops under the shared
+    # remaining-deadline budget.
+    if remaining_ms > 1:
+        try:
+            opqueue.flush("local", http, env=env,
+                          deadline_ms=max(1, min(2000, remaining_ms // 4)))
+        except Exception:  # noqa: BLE001 - flush is best-effort, never fatal
+            pass
+    try:
+        result = http.prefetch(
+            args.query, namespace=args.namespace,
+            session_id=args.session_id, moment=args.moment,
+            ops_tokens=list(getattr(args, "ops_tokens", []) or []),
+            lane=args.lane, reserve=bool(args.reserve),
+            deadline_ms=max(1, remaining_ms))
+    except Exception as exc:  # noqa: BLE001 - offline leg
+        envelope, state = _offline_prefetch(args)
+        if envelope is not None:
+            _emit_json(envelope)
+            return
+        _refuse(f"hub-unreachable: {exc.__class__.__name__}")
+        return
+    # A dead/unreachable hub answers {ok: False, reason: hub-unreachable}
+    # WITHOUT raising — the offline arm must engage on that shape too.
+    if isinstance(result, dict) and result.get("ok") is not True and result.get("reason") == "hub-unreachable":
+        envelope, state = _offline_prefetch(args)
+        if envelope is not None:
+            _emit_json(envelope)
+            return
+    _emit_json(result)
+
+
+def _offline_prefetch(args: Any):
+    """Full injection envelope from the T-11 snapshot (no reservation)."""
+    try:
+        scripts = str(_scripts_dir())
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        from fleet import snapshot as fleet_snapshot
+    except Exception:  # noqa: BLE001
+        return None, None
+    try:
+        envelope, state = fleet_snapshot._serve_offline_read(
+            dict(os.environ), query=args.query, namespace=args.namespace,
+            moment=args.moment or "user_prompt",
+            session_id=args.session_id or "", lane=args.lane or "deepseek")
+        envelope = dict(envelope)
+        envelope.pop("reservation", None)
+        return envelope, state
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _route_ack(args: Any) -> None:
+    """Remote prefetch-ack (issue #374): McpHttp.prefetch_ack."""
+    opqueue, transport = _import_fleet()
+    http = _hub(transport)
+    try:
+        http.prefetch_ack(args.reservation, deadline_ms=2000)
+        _emit_json({"ok": True, "reservation": args.reservation})
+    except Exception as exc:  # noqa: BLE001
+        _emit_json({"ok": False,
+                    "error": "prefetch-ack failed: %s"
+                             % exc.__class__.__name__})
+
+
+def _emit_json(obj: Any) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.exit(0)
+
+
 def _route_read(cmd: str, args: Any) -> None:
     opqueue, transport = _import_fleet()
     # Pre-import the heavy MCP client stack in the MAIN thread, BEFORE the
@@ -443,6 +547,16 @@ def handle_remote(args: Any) -> None:
         _refuse_write_flags(cmd, args)
         _enqueue_write(cmd, args)
         return
+    if cmd == "prefetch":
+        _route_prefetch(args)
+        return
+    if cmd == "prefetch-ack":
+        _route_ack(args)
+        return
+    if cmd == "ops-flush" and getattr(args, "local", False):
+        _refuse("ops-flush --local is refused in remote mode "
+                "(ZMEM_REMOTE_URL is set); remote flush rides the hub "
+                "apply_ops path")
     if cmd in _ROUTE_READ:
         _refuse_read_flags(cmd, args)
         _route_read(cmd, args)

@@ -461,7 +461,7 @@ def _decision_moment(mode: str) -> str:
 
 
 def _lane() -> str:
-    return {"claude": "claude", "codex": "codex", "zcode": "zcode",
+    return {"claude": "claude", "codex": "codex", "zcode": "zcode", "deepseek": "deepseek",
             "hermes": "hermes-provider", "hermes-provider": "hermes-provider",
             "hermes-compat": "hermes-compat"}.get(
                 os.environ.get("ZMEM_HOST", "zcode").strip().lower(), "")

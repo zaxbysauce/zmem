@@ -204,6 +204,25 @@ it, so a matrix-only edit fails CI), never a silent edit.
 | OpenCode | 1.18.30 | Fleet-hub install fact at issue #280 filing (2026-10-05); no adapter ships yet (issue #66) — every OpenCode row is `capability_gap` until it lands. |
 | Hermes | 0.21.1 | In-repo source pin `cdf4c76` (`scripts/host_canary.py` default; `tests/fixtures/canary/hermes/cdf4c76.json`; asserted by `tests/test_host_canary.py`). Present at the issue's pinned base 80b39602 and unchanged at d116a67. |
 | ZCode | 3.15.3 | **Disclosed deviation:** AC4 asks for "the versions their adapters in this repo target", but the repo contains no numeric ZCode host pin anywhere (checked the plugin manifests, the canary, README, and docs/CLAIMS-AUDIT at both 80b39602 and d116a67). The floor recorded here is `ZCode.exe` ProductVersion 3.15.3.8237, probed on the dev box on 2026-10-15 — the host generation the `hooks.zcode.json` process-hook adapter actually runs on — and is a probe, not an adapter-targeted pin. |
+| DeepSeek (dsh) | 0.2.1-rc.2 | Native Cordis adapter (`deepseek-plugin/`, issues #374/#375). The peerDependencies in `deepseek-plugin/package.json` pin the exact published `@deepseek-ai/*` set the adapter was probed against; **preview-scoped** — first-class support claims require the passing native canary at `docs/host-gate-evidence/deepseek/` (currently `win32`/`headless` only). |
+
+## DeepSeek adapter (T-13/T-14, preview)
+
+`deepseek-plugin/` is the native DeepSeek Harness adapter: passive recall
+enters the **first accepted `agent/pre-step`** through the T-05
+`prefetch --reserve` CLI seam with the reservation acknowledged only after
+observed session admission; the explicit `zmem_*` tools ride the same
+backend (typed `ops-enqueue`/`ops-flush --local` receipts — pending in
+remote mode, committed locally); capture delegates to the shared python
+surface (`hooks/lib/zmem-capture-entry.py`) with always-on redaction and
+content+session dedup, and reflection runs the shared reflect hook
+(`hooks/zmem-reflect.sh`) inside a once-per-session bound whose nudge is
+surfaced as state for the host (never a self-triggered continuation);
+ `mine-history --source deepseek` parses the versioned session
+export with refusal contracts; `doctor --fleet` reports the
+`deepseek-plugin` lane. The harness's own plugin loader is not part of
+the published packages: installation is validated at the profile-row
+(`cordis.yml`) level, and activation honestly requires a host restart.
 
 ## Trust model
 

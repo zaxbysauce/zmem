@@ -75,7 +75,8 @@ ALGORITHM = "sha256-crlf-norm"
 # modified or dropped must be drift-detectable, not invisible. Keep in sync
 # with release_gate's runtime-surface description (this tuple is the single
 # source of truth both hash through).
-_SURFACE_DIRS = ("hooks/", "skills/memory/scripts/", "hermes-plugin/", "scripts/")
+_SURFACE_DIRS = ("hooks/", "skills/memory/scripts/",
+                 "hermes-plugin/", "scripts/", "deepseek-plugin/")
 # skills/**/SKILL.md — any depth under skills/, but only there (an unrelated
 # docs/SKILL.md is not runtime surface).
 _SKILL_MD_SELF = "skills/SKILL.md"

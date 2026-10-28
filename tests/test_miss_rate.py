@@ -266,7 +266,7 @@ class MissRateMomentTest(unittest.TestCase):
         self.assertEqual(len(parsed), 1)
         self.assertIsNone(parsed[0]["lane"])
         matrix = miss_rate.build_decision_matrix(parsed)
-        self.assertEqual(len(matrix), 20)
+        self.assertEqual(len(matrix), 24)
         self.assertTrue(all(row["count"] == 0 for row in matrix))
         aggregate = miss_rate._attribution_aggregate(parsed)
         self.assertEqual(aggregate["lane_less"], 1)
@@ -287,7 +287,7 @@ class MissRateMomentTest(unittest.TestCase):
         matrix = miss_rate.build_decision_matrix(parsed)
         pairs = [(row["lane"], row["moment"]) for row in matrix]
         self.assertEqual(pairs, sorted(pairs))
-        self.assertEqual(len(matrix), 20)
+        self.assertEqual(len(matrix), 24)
         nonzero = [row for row in matrix if row["count"]]
         self.assertEqual(len(nonzero), 1)
         self.assertEqual(nonzero[0]["count"], 1)
@@ -306,7 +306,7 @@ class DecisionReportBucketsTest(unittest.TestCase):
         log_path = fixture_dir / "five-lanes.log"
         expected_path = fixture_dir / "five-lanes.expected.json"
         raw = log_path.read_bytes()
-        self.assertEqual(raw.count(b"\n"), 20)
+        self.assertEqual(raw.count(b"\n"), 24)
         self.assertTrue(raw.endswith(b"\n"))
         self.assertNotIn(b"\r", raw)
         self.assertTrue(all(line.startswith(b"[1780272000]")
@@ -325,11 +325,11 @@ class DecisionReportBucketsTest(unittest.TestCase):
             "00000000-0000-4000-8000-000000000003",
         }
         fixture_rows = miss_rate.parse_bg_log(log_path)
-        self.assertEqual(len(fixture_rows), 20)
+        self.assertEqual(len(fixture_rows), 24)
         self.assertEqual(
             {(row["lane"], row["moment"]) for row in fixture_rows},
             {(lane, moment) for lane in
-             ("claude", "codex", "hermes-compat", "hermes-provider", "zcode")
+             ("claude", "codex", "deepseek", "hermes-compat", "hermes-provider", "zcode")
              for moment in ("precompact", "pretool", "session_start", "user_prompt")},
         )
         self.assertEqual(sum(row["reason"] == "already-delivered"
@@ -337,7 +337,7 @@ class DecisionReportBucketsTest(unittest.TestCase):
         self.assertEqual(sum(row["reason"] == "empty-pool"
                              for row in fixture_rows), 2)
         self.assertEqual(sum(row["status"] == "injected"
-                             for row in fixture_rows), 17)
+                             for row in fixture_rows), 21)
         delivered = next(row for row in fixture_rows
                          if row["reason"] == "already-delivered")
         self.assertEqual(delivered["status"], "silent")
@@ -367,11 +367,11 @@ class DecisionReportBucketsTest(unittest.TestCase):
             ]) + "\n", encoding="utf-8")
             parsed = miss_rate.parse_bg_log(path)
         matrix = miss_rate.build_decision_matrix(parsed)
-        self.assertEqual(len(matrix), 20)
+        self.assertEqual(len(matrix), 24)
         self.assertEqual(
             {(row["lane"], row["moment"]) for row in matrix},
             {(lane, moment) for lane in
-             ("claude", "codex", "hermes-compat", "hermes-provider", "zcode")
+             ("claude", "codex", "deepseek", "hermes-compat", "hermes-provider", "zcode")
              for moment in ("precompact", "pretool", "session_start", "user_prompt")},
         )
         by_pair = {(row["lane"], row["moment"]): row for row in matrix}

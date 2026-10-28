@@ -613,10 +613,10 @@ class DecisionLogAttributionTest(unittest.TestCase):
 
         payload = json.loads(expected_path.read_text(encoding="utf-8"))
         rows = payload["matrix"]
-        self.assertEqual(len(rows), 20)
+        self.assertEqual(len(rows), 24)
         pairs = [(row["lane"], row["moment"]) for row in rows]
         self.assertEqual(pairs, sorted(pairs))
-        self.assertEqual(len(set(pairs)), 20)
+        self.assertEqual(len(set(pairs)), 24)
 
     def test_already_delivered_reason(self):
         from storelib.inject import classify_silent_reason

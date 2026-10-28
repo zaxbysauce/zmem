@@ -35,6 +35,7 @@ VERSION = "0.36.0"
 MARKETPLACE_PREIMAGE_VERSION = "0.14.0"
 COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 CANONICAL_MANIFESTS = {
+    "deepseek-plugin/plugin.json",
     ".agents/plugins/marketplace.json",
     ".claude-plugin/marketplace.json",
     ".claude-plugin/plugin.json",
