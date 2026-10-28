@@ -56,6 +56,14 @@ function check(failFast) {
   if ((process.env.ZMEM_ALLOW_REAL_STORE || "").trim() === "1") {
     return { ok: true, why: "opt-out ZMEM_ALLOW_REAL_STORE=1 set" };
   }
+  // CI runners are ephemeral: the home dies with the job, and suites there
+  // may create ~/.zmem/store.sqlite as a side effect (PR #410 CI round 4).
+  // The guard protects DEVELOPER homes; CI-side fixture leakage is the
+  // write-time refusal's job (always active).
+  if ((process.env.CI || "").trim() ||
+      (process.env.GITHUB_ACTIONS || "").trim()) {
+    return { ok: true, why: "ephemeral CI runner (CI/GITHUB_ACTIONS set)" };
+  }
   const root = path.join(os.homedir(), ".zmem");
   // Gate on the default STORE FILE, not the root dir: CI lanes can have
   // ~/.zmem created as a side effect while a live operator store always has

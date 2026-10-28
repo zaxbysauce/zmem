@@ -77,6 +77,15 @@ def check(fail_fast=True):
     """Return (ok, message). When fail_fast and not ok, exit 1 with the message."""
     if os.environ.get(_OPT_OUT, "").strip() == "1":
         return True, f"opt-out {_OPT_OUT}=1 set"
+    # CI runners are ephemeral: the home dies with the job, and suites there
+    # may create ~/.zmem/store.sqlite as a side effect (PR #410 CI round 4:
+    # a python suite created it, then the node lane's guard false-fired on
+    # the artifact). The guard protects DEVELOPER homes; CI-side fixture
+    # leakage is the write-time refusal's job (no existence gate, active
+    # everywhere).
+    if os.environ.get("CI", "").strip() or \
+            os.environ.get("GITHUB_ACTIONS", "").strip():
+        return True, "ephemeral CI runner (CI/GITHUB_ACTIONS set)"
     home = Path(os.path.expanduser("~"))
     zmem_root = home / ".zmem"
     # Gate on the default STORE FILE, not the root dir: CI lanes can have
