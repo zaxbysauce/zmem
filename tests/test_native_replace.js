@@ -10,10 +10,10 @@
 //   - native-memory nudge fires once (claude host), then is suppressed by the
 //     marker file
 //   - nudge suppressed when settings.json has autoMemoryEnabled:false
-require("./_store_guard.js"); // issue #244 isolation guard
 //   - nudge never fires on the zcode host
 //
 // Run: node tests/test_native_replace.js   (exit 0 = all pass)
+require("./_store_guard.js"); // issue #244 isolation guard
 
 "use strict";
 

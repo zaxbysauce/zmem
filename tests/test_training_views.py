@@ -7,6 +7,14 @@ than duplicating the row-building implementation.
 """
 
 from __future__ import annotations
+# The acceptance fixture spawns this module via `python -m unittest
+# tests/test_training_views.py`, which puts the REPO ROOT on sys.path (not
+# tests/) — resolve the guard by file location so both execution shapes
+# import it (issue #244).
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib

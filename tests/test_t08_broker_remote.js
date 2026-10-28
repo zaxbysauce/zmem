@@ -10,10 +10,10 @@
 //   LEG 1 (local)  — ZMEM_STORE=<local.sqlite> (seeded), no remote env: the
 //                    current local path must deliver the seeded content.
 //   LEG 2 (remote) — ZMEM_STORE=<empty.sqlite> (a THIRD store with NO seed —
-require("./_store_guard.js"); // issue #244 isolation guard
 //                    proves content came from the hub) plus
 //                    ZMEM_REMOTE_URL=<in-process hub> (+ ZMEM_MCP_TOKEN).
 //
+require("./_store_guard.js"); // issue #244 isolation guard
 // The hub is the real hermes-plugin/server/mcp_server.py, served on an
 // ephemeral loopback port by tests/support/t08_hub.py against its own
 // identically seeded store.

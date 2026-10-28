@@ -10,10 +10,10 @@
 //   - stdin bytes replayed to the child verbatim
 //   - no ~5s session-start stall
 //
-require("./_store_guard.js"); // issue #244 isolation guard
 // Run: node tests/test_launcher.js   (exit 0 = all pass)
 
 "use strict";
+require("./_store_guard.js"); // issue #244 isolation guard
 
 const { spawnSync, execFileSync } = require("child_process");
 const crypto = require("crypto");
