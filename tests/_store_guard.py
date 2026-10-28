@@ -1,13 +1,13 @@
 """Test-harness store isolation guard (issue #244).
 
 A test run must never resolve — let alone write — the operator's REAL
-default store. This guard fires (exit 1) when any store path the resolution
-chain can produce, explicitly env-named or not, lands inside the real
-home's ``.zmem`` root while that root exists. Ephemeral environments (CI
-runners, fresh containers) have no ``~/.zmem`` and nothing to protect, so
-the guard stays silent there on purpose; the FIRST-WRITE case for test
-pollution is owned by the write-time refusal in storelib/cli.py, which
-carries no existence gate.
+default store. This guard fires (exit 1) when the store path the resolution
+chain WOULD use — explicitly env-named or not — lands inside the real
+home's ``.zmem`` area while the default STORE FILE exists. Ephemeral
+environments (CI runners, fresh containers) may have ``~/.zmem`` created as
+a side effect but no live store file, so the guard stays silent there on
+purpose; the FIRST-WRITE case for test pollution is owned by the write-time
+refusal in storelib/cli.py, which carries no existence gate.
 
 Opt out explicitly with ZMEM_ALLOW_REAL_STORE=1 (deliberate operator runs
 against the live store, e.g. canary maintenance).

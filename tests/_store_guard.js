@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
  * JS test-harness store isolation guard (issue #244) — the node twin of
- * tests/_store_guard.py. Fires (exit 1) when any store path the resolution
- * chain can produce, explicitly env-named or not, lands inside the real
- * home's .zmem root while that root exists. Ephemeral CI homes have no
- * ~/.zmem and the guard stays silent; opt out with ZMEM_ALLOW_REAL_STORE=1.
+ * tests/_store_guard.py. Fires (exit 1) when the store path the resolution
+ * chain WOULD use — explicitly env-named or not — lands inside the real
+ * home's .zmem area while the default STORE FILE exists. Ephemeral CI homes
+ * may have ~/.zmem as a side effect but no store file; the guard stays
+ * silent there. Opt out with ZMEM_ALLOW_REAL_STORE=1.
  *
  * Required by the JS test files that spawn store.py (mirrors the python
  * wiring); the C9 acceptance check drives it directly.
