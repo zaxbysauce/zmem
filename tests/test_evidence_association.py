@@ -6,6 +6,14 @@ files as raw UTF-8 bytes, including the association rows and their ordering.
 """
 
 from __future__ import annotations
+# The CI MCP step runs this module via `python -m unittest
+# tests/<file>.py`, which puts the REPO ROOT on sys.path (not
+# tests/) — resolve the guard by file location so both execution
+# shapes import it (issue #244).
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import asyncio

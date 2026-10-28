@@ -79,8 +79,11 @@ def check(fail_fast=True):
         return True, f"opt-out {_OPT_OUT}=1 set"
     home = Path(os.path.expanduser("~"))
     zmem_root = home / ".zmem"
-    if not zmem_root.is_dir():
-        return True, f"no real store root at {zmem_root} (ephemeral environment)"
+    # Gate on the default STORE FILE, not the root dir: CI lanes can have
+    # ~/.zmem created as a side effect (sentinels, parent-dir mkdirs) while
+    # an operator's live store always has the file (PR #410 CI round).
+    if not (zmem_root / "store.sqlite").is_file():
+        return True, f"no real default store at {zmem_root} (ephemeral environment)"
     resolved = _resolved_store_path()
     try:
         rel = resolved.relative_to(zmem_root)

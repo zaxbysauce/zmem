@@ -56,14 +56,17 @@ function check(failFast) {
     return { ok: true, why: "opt-out ZMEM_ALLOW_REAL_STORE=1 set" };
   }
   const root = path.join(os.homedir(), ".zmem");
-  let rootExists = false;
+  // Gate on the default STORE FILE, not the root dir: CI lanes can have
+  // ~/.zmem created as a side effect while a live operator store always has
+  // the file (PR #410 CI round).
+  let storeExists = false;
   try {
-    rootExists = fs.statSync(root).isDirectory();
+    storeExists = fs.statSync(path.join(root, "store.sqlite")).isFile();
   } catch (_e) {
-    rootExists = false;
+    storeExists = false;
   }
-  if (!rootExists) {
-    return { ok: true, why: `no real store root at ${root}` };
+  if (!storeExists) {
+    return { ok: true, why: `no real default store at ${root}` };
   }
   const resolved = resolvedStorePath();
   const rel = path.relative(root, resolved);
