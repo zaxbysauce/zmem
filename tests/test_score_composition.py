@@ -236,7 +236,7 @@ class ComputeScoreRelevanceLaneTest(unittest.TestCase):
         messages for the four invalid inputs (hyphenated moments leak the
         schema separator; bogus lane; underscore-spelled moments)."""
         moments = ("session_start", "user_prompt", "pretool", "subagent", "precompact")
-        lanes = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+        lanes = ("claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat")
         for m in moments:
             for lane in lanes:
                 self.assertIsInstance(

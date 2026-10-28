@@ -176,7 +176,7 @@ envelope; no consumer-side renderer, no second budget run:
 ```
 <interpreter> <store.py> prefetch --query "<text>" --namespace <ns> \
   --session-id <id> --moment <session_start|user_prompt|pretool|subagent|precompact> \
-  [--lane <claude|codex|zcode|hermes-provider|hermes-compat>] \
+  [--lane <claude|codex|zcode|deepseek|hermes-provider|hermes-compat>] \
   [--ops-token <token>]... [--exclude <memory-id>]... \
   [--authorized-namespace <ns>]... [--reserve] \
   [--principal <id>] [--harness <id>]
@@ -1094,8 +1094,8 @@ MCP server:
 
 Passive decision lines carry an additive attribution suffix after `moment=`:
 `lane=<lane> ver=<manifest-semver> t_ms=<nonnegative-rounded-ms>`. The exact
-closed lane vocabulary is `claude`, `codex`, `zcode`, `hermes-provider`, and
-`hermes-compat`. Runtime moments are `session_start`, `user_prompt`,
+closed lane vocabulary is `claude`, `codex`, `zcode`, `deepseek`,
+`hermes-provider`, and `hermes-compat`. Runtime moments are `session_start`, `user_prompt`,
 `pretool`, `subagent`, and `precompact`. The exact silent-reason vocabulary is
 `empty-pool`, `omitted`, `below-bar`, `budget-drop`, `below-relevance`,
 `already-delivered`, and `expired`; `expired` names a pool that was eligible

@@ -77,6 +77,14 @@
         "decision": 1.0,
         "constraint": 1.0
       },
+      "deepseek": {
+        "fact": 1.0,
+        "lesson": 1.0,
+        "convention": 1.0,
+        "preference": 1.0,
+        "decision": 1.0,
+        "constraint": 1.0
+      },
       "hermes-provider": {
         "fact": 1.0,
         "lesson": 1.0,

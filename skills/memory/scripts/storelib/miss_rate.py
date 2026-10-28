@@ -76,7 +76,7 @@ _SID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 # not be importable.  ``moment`` deliberately remains open below for older
 # compatibility values (for example ``session_start_compact``).
 _ATTR_LANES = (
-    "claude", "codex", "zcode", "hermes-provider", "hermes-compat",
+    "claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat",
 )
 _ATTR_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _ATTR_TOKEN_RE = re.compile(r"(?:^|\s)(?:lane|ver|t_ms)=")

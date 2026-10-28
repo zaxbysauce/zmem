@@ -199,7 +199,7 @@ HOST="${ZMEM_HOST:-zcode}"
 # remain safe, while native host behavior continues to use the original HOST.
 ATTR_LANE=""
 case "$HOST" in
-  claude|codex|zcode) ATTR_LANE="$HOST" ;;
+  claude|codex|zcode|deepseek) ATTR_LANE="$HOST" ;;
 esac
 # Session id for the bg-log decision line (issue #94): the env chain the
 # other capture hooks use (launcher exports ZMEM_SESSION; the legacy vars

@@ -269,7 +269,7 @@ if os.environ.get("ZMEM_AUTO_RETAIN", "") != "0":
         _retain_driver = os.path.join(_retain_root, "hooks", "lib",
                                       "zmem-retain-process.py")
         _retain_host = os.environ.get("ZMEM_HOST", "zcode").strip().lower()
-        if (_retain_host in ("claude", "codex", "zcode")
+        if (_retain_host in ("claude", "codex", "zcode", "deepseek")
                 and os.path.isfile(_retain_driver)):
             _retain_argv = [sys.executable, _retain_driver,
                             "--host", _retain_host,

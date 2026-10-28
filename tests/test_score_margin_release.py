@@ -69,8 +69,9 @@ class ScoreMarginReleaseAcceptanceTest(unittest.TestCase):
         manifests = tuple(manifests)
         self.assertEqual(
             len(manifests),
-            7,
-            "exactly seven host-facing manifests must participate in the release",
+            8,
+            "exactly eight host-facing manifests must participate in the "
+            "release",
         )
 
         for relative in manifests:

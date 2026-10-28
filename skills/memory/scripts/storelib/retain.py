@@ -54,7 +54,8 @@ except ImportError:  # pragma: no cover - direct-module loads in tests
 QueueItem = dict[str, Any]
 
 # The closed host vocabulary (CLI --host choices and row lane stamps).
-RETAIN_HOSTS = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+RETAIN_HOSTS = ("claude", "codex", "zcode", "deepseek",
+                "hermes-provider", "hermes-compat")
 
 # Canonical UTC timestamp shape every evidence row must carry.  Real host
 # transcripts carry millisecond precision (Claude Code writes
@@ -434,6 +435,36 @@ def normalize_host_payload(payload: Iterable[dict[str, Any]], *, host: str,
             payload, session=session, namespace=namespace, host=host)
     for rec in payload or []:
         if not isinstance(rec, dict):
+            continue
+        if host == "deepseek":
+            # dsh session record (issue #375): flat {"seq","type","data"};
+            # user/message with a user-kind source -> user text,
+            # tool/result with an error -> failure row.
+            data = rec.get("data") if isinstance(rec.get("data"), dict) \
+                else {}
+            if rec.get("type") == "user/message":
+                src = data.get("source") if isinstance(
+                    data.get("source"), dict) else {}
+                if src.get("kind") != "user":
+                    continue
+                evidence_id, timestamp, text = (
+                    str(rec.get("seq")), "",
+                    _flatten_content(data.get("message", {})))
+                ok = bool(text) and len(text) >= 5
+            elif rec.get("type") == "tool/result" and isinstance(
+                    data.get("error"), dict):
+                evidence_id, timestamp, text = (
+                    "err-%s" % rec.get("seq"), "",
+                    str(data["error"].get("message") or ""))
+                ok = bool(text)
+            else:
+                continue
+            if not ok:
+                continue
+            rows.append({
+                "uuid": evidence_id, "timestamp": timestamp,
+                "role": "user", "content": text,
+            })
             continue
         if host == "claude":
             # Match the shape this repo's own proven Claude transcript reader

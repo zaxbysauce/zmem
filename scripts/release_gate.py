@@ -110,7 +110,7 @@ SECTION_RE = re.compile(
     r"^## \[(?!Unreleased\b)([0-9]+\.[0-9]+\.[0-9]+)\][^\n]*$", re.MULTILINE
 )
 
-# Fallback floor for the manifest count: the repo ships seven today; the
+# Fallback floor for the manifest count: the repo ships eight today; the
 # point of the floor is to catch an accidentally DELETED surface, while a
 # newly added surface is picked up automatically by the enumeration.
 MIN_MANIFESTS = 5
@@ -768,10 +768,35 @@ def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
     for rel in manifests:
         cur = _version_at(repo_root, "HEAD", rel)
         base = _version_at(repo_root, base_ref, rel)
-        if cur is None or base is None:
+        if cur is None:
             print(f"::error::--check-manifest-freshness could not read "
                   f"version of {rel} at HEAD or {base_ref} — failing closed")
             return 1
+        if base is None:
+            # A manifest NEWLY ADDED by this PR (the canonical-eight
+            # deepseek-plugin/plugin.json case) has no base version to
+            # compare — a legitimate bump, not a parse failure. Tell the
+            # cases apart by probing base_ref:
+            #  - the probe cannot run, or base_ref itself does not
+            #    resolve → indeterminate → fail closed (the behavior
+            #    before new manifests existed);
+            #  - the path EXISTS at base but does not parse → fail closed
+            #    (ManifestParsingRobustnessTest contract);
+            #  - the ref resolves and the path is absent → new manifest,
+            #    counted as bumped.
+            probe = _git(repo_root, "cat-file", "-e", f"{base_ref}:{rel}")
+            ref_ok = _git(repo_root, "cat-file", "-e", f"{base_ref}")
+            if (probe is None or ref_ok is None
+                    or ref_ok.returncode != 0 or probe.returncode == 0):
+                print(f"::error::--check-manifest-freshness could not read "
+                      f"version of {rel} at HEAD or {base_ref} — failing "
+                      f"closed")
+                return 1
+            print(f"::notice::new manifest {rel} at HEAD (absent at "
+                  f"{base_ref}) — counted as bumped")
+            head_versions[rel] = cur
+            bumped = True
+            continue
         head_versions[rel] = cur
         if cur != base:
             bumped = True
@@ -831,7 +856,7 @@ def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
                 collision = next(t for t in tags
                                  if _version_tuple(t) == claimed_tuple)
                 if bumped:
-                    remedy = ("retarget the seven manifests to the next "
+                    remedy = ("retarget the eight manifests to the next "
                               "unused version")
                 else:
                     remedy = ("this PR re-emitted release-manifest.json at "

@@ -159,6 +159,121 @@ class EqualVersionStaleManifestTest(_FixtureRepoTest):
             f"must fail the gate:\n{r.stdout}\n{r.stderr}")
 
 
+class NewManifestAtHeadTest(_FixtureRepoTest):
+    """A manifest ADDED by the PR (absent at base) is a bump, not an error.
+
+    The canonical-eight deepseek-plugin/plugin.json case (PR #409): the
+    freshness version loop cannot read a base version for a path that does
+    not exist at base_ref, and the pre-#409 blanket "could not read version
+    ... failing closed" turned every manifest-ADDING release into a CI
+    failure. The contract now distinguishes three cases:
+
+      1. path ABSENT at base, base ref resolves -> notice + counted as
+         bumped (the gate proceeds);
+      2. path EXISTS at base but does not parse -> still fails closed;
+      3. base ref itself unresolvable -> still fails closed (an
+         indeterminate base must never vacuously count every manifest as
+         new).
+    """
+
+    def _seed_and_bump_with_new_manifest(self, repo: Path) -> None:
+        # Commit A: one manifest 0.5.0 + a runtime surface file, with the
+        # emitted release-manifest.json folded into the commit.
+        (repo / ".claude-plugin").mkdir(parents=True)
+        (repo / "hooks").mkdir(parents=True)
+        (repo / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "zmem", "version": "0.5.0"}),
+            encoding="utf-8")
+        (repo / "hooks" / "a.txt").write_text("surface r1\n", encoding="utf-8")
+        self._git(repo, "init", "-q")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "A: seed 0.5.0")
+        # The emit hashes the INDEX — stage first, then emit, then fold
+        # the emitted manifest in (the documented release ritual).
+        self._git(repo, "add", "-A")
+        self._emit(repo)
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "--amend", "-qm",
+                  "A: seed 0.5.0 + emitted manifest")
+        # Commit B: bump to 0.6.0 AND add a NEW manifest at the
+        # deepseek-plugin/plugin.json canonical surface, re-emit so the
+        # committed manifest describes the head tree.
+        (repo / "deepseek-plugin").mkdir(parents=True)
+        (repo / "deepseek-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "zmem-deepseek", "version": "0.6.0"}),
+            encoding="utf-8")
+        (repo / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "zmem", "version": "0.6.0"}),
+            encoding="utf-8")
+        (repo / "hooks" / "a.txt").write_text("surface r2\n", encoding="utf-8")
+        self._git(repo, "add", "-A")
+        self._emit(repo)
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "B: bump 0.6.0 + new manifest")
+
+    def test_new_manifest_absent_at_base_counts_as_bumped(self):
+        repo = self.tmp / "new-manifest"
+        self._seed_and_bump_with_new_manifest(repo)
+        r = self._freshness(repo, "HEAD~1")
+        combined = r.stdout + r.stderr
+        self.assertEqual(
+            r.returncode, 0,
+            "a release-prep change that ADDS a canonical manifest must "
+            f"pass the freshness gate:\n{combined}")
+        self.assertIn(
+            "counted as bumped", combined,
+            "the new manifest must be disclosed as a counted bump")
+        self.assertIn("release manifest fresh", combined)
+        self.assertNotIn(
+            "failing closed", combined,
+            "absent-at-base is an addition, not a version-read failure")
+
+    def test_manifest_unparseable_at_base_fails_closed(self):
+        repo = self.tmp / "base-unparseable"
+        (repo / ".claude-plugin").mkdir(parents=True)
+        (repo / "hooks").mkdir(parents=True)
+        # Commit A: a manifest that EXISTS at base but does not parse.
+        (repo / ".claude-plugin" / "plugin.json").write_text(
+            "null\n", encoding="utf-8")
+        (repo / "hooks" / "a.txt").write_text("surface r1\n", encoding="utf-8")
+        self._git(repo, "init", "-q")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "A: null manifest at base")
+        # Commit B: the manifest is fixed and parseable at HEAD.
+        (repo / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "zmem", "version": "0.6.0"}),
+            encoding="utf-8")
+        (repo / "hooks" / "a.txt").write_text("surface r2\n", encoding="utf-8")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "B: fix manifest")
+        r = self._freshness(repo, "HEAD~1")
+        combined = r.stdout + r.stderr
+        self.assertNotEqual(
+            r.returncode, 0,
+            "a manifest that EXISTS at base but does not parse must keep "
+            "failing closed")
+        self.assertIn("::error::", combined)
+        self.assertIn("failing closed", combined)
+        self.assertNotIn(
+            "counted as bumped", combined,
+            "an unparseable-at-base manifest must not be mistaken for a "
+            "newly added one")
+
+    def test_unresolvable_base_ref_fails_closed_not_vacuous_pass(self):
+        repo = self.tmp / "bad-base-ref"
+        self._seed_and_bump_with_new_manifest(repo)
+        r = self._freshness(repo, "no-such-ref")
+        combined = r.stdout + r.stderr
+        self.assertNotEqual(
+            r.returncode, 0,
+            "an unresolvable base ref is indeterminate, not a repo where "
+            "every manifest is new — it must fail closed, not vacuously "
+            "pass")
+        self.assertIn("::error::", combined)
+        self.assertIn("failing closed", combined)
+        self.assertNotIn("counted as bumped", combined)
+
+
 class RealRepoEqualVersionVerifyTest(unittest.TestCase):
     """`--base HEAD` on the real repo must RUN the verify, not skip it.
 

@@ -7,6 +7,7 @@
     ".claude-plugin/plugin.json": "870b790f5b2fcbcd46b674ddf1df4cc6a8e6d605345190061824b6287b345d12",
     ".codex-plugin/plugin.json": "870b790f5b2fcbcd46b674ddf1df4cc6a8e6d605345190061824b6287b345d12",
     ".zcode-plugin/plugin.json": "870b790f5b2fcbcd46b674ddf1df4cc6a8e6d605345190061824b6287b345d12",
+    "deepseek-plugin/plugin.json": "a3b76293098fc4eddaf6de8abc192952c8d0f9d381feb8db6d421c882f81e08b",
     "hermes-plugin/plugin.yaml": "86284748c3f8c4a7f719093ad43b7f03eb1bf66cffd8e26c85a07ed24f69a290",
     "hooks/zmem-recall.sh": "c51ebbeb18a4f502fa72a4e09dcc4de8d9d9c92b6c6031aaaac241e8e646fa13",
     "marketplace.json": "0ac6042fb5be1ea5a0df1a268ca8c18f36a5085f872885fc2f59c6c8e0fb4c82",
@@ -15,5 +16,5 @@
     "skills/memory/SKILL.md": "264d32dbe1c386318634541ebf4c3219e89c51ca2db8f80d828a906f1d276188",
     "skills/memory/scripts/store.py": "b566176418df5006082ab893a25d8578333d49042e695daa1e39f4783370fad6"
   },
-  "digest": "5182398e1f733df5d95fab81d5b0dfc8ec82a379f7b6ce210944e2a9d870d30a"
+  "digest": "1d1f165454eaee712fb45272b708c850b54804c0df28d5f30325cea702263130"
 }

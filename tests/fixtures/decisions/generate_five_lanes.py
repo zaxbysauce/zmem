@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LOG = Path(__file__).with_name("five-lanes.log")
 DEFAULT_EXPECTED = Path(__file__).with_name("five-lanes.expected.json")
-LANES = ("claude", "codex", "zcode", "hermes-provider", "hermes-compat")
+LANES = ("claude", "codex", "zcode", "deepseek", "hermes-provider", "hermes-compat")
 # The fixture follows the runtime moment order from the issue.  Report rows
 # are sorted independently by the production matrix builder.
 MOMENTS = ("session_start", "user_prompt", "pretool", "precompact")
@@ -116,14 +116,14 @@ def generate(log_path: Path, expected_path: Path) -> str:
         candidate = Path(scratch) / "decisions.log"
         candidate.write_bytes(raw_log)
         parsed = miss_rate.parse_bg_log(candidate)
-    if len(parsed) != 20:
-        raise SystemExit(f"fixture parser returned {len(parsed)} lines, expected 20")
+    if len(parsed) != 24:
+        raise SystemExit(f"fixture parser returned {len(parsed)} lines, expected 24")
     if any(row.get("ver") != version or not isinstance(row.get("t_ms"), int)
            or row["t_ms"] < 0 for row in parsed):
         raise SystemExit("fixture parser did not retain valid attribution")
     matrix = miss_rate.build_decision_matrix(parsed)
-    if len(matrix) != 20:
-        raise SystemExit("fixture report projection did not produce 20 rows")
+    if len(matrix) != 24:
+        raise SystemExit("fixture report projection did not produce 24 rows")
 
     # Preserve the parser's complete fields but make the expected decision
     # list deterministic in the same lexicographic order as the report rows.

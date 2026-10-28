@@ -45,6 +45,27 @@ _MUTATING_KINDS = ("update", "supersede", "invalidate")
 _MAX_OPS_PER_BATCH = 256
 
 
+def _identical_content_row(conn, namespace: str, content: str):
+    """Live row id with byte-identical content in this namespace, else None.
+
+    Issue #363: the at-most-once replay key for queued adds. Scoped to the
+    effective namespace and LIVE rows only (write.py dedup scoping parity);
+    superseded rows never satisfy a replay.
+    """
+    if not content:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM memory WHERE namespace = ? AND content = ? "
+            "AND superseded_at IS NULL LIMIT 1",
+            (namespace, content)).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    return row[0]
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -317,11 +338,41 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
             # kinds — a by-id op must not escape its row's scope). Checked
             # here so omitted-namespace defaults cannot bypass the guard.
             if kind in ("add", "capture"):
+                # The namespace gate precedes the replay guard: a
+                # not-allowed namespace must get `namespace_not_allowed`
+                # even when the content is a byte-identical replay — a
+                # guard-first order would hand unauthorized principals a
+                # success receipt (and the live row's canonical id, a
+                # cross-namespace existence oracle).
                 if not _namespace_allowed(effective,
                                           _effective_namespace(args)):
                     receipts.append(_receipt(
                         op_id, kind, "rejected",
                         error="namespace_not_allowed"))
+                    continue
+                # Issue #363 AC2 replay guard: after the namespace gate and
+                # scrubbing, a byte-identical live row in the same namespace
+                # is a REPLAY, not a new observation — return the fold
+                # receipt without re-running the write path (no
+                # adjust_trust, no retrieval_count bump). Identical content
+                # already passed the write-policy gates on first apply.
+                # The fold still participates in the exactly-once
+                # bookkeeping (issue #288): record the applied_ops verdict
+                # and resolve the op's id for same-batch dependents.
+                _replay = _identical_content_row(
+                    conn, _effective_namespace(args),
+                    _scrub(str(args.get("content", ""))))
+                if _replay is not None:
+                    receipts.append(_receipt(
+                        op_id, kind, "committed",
+                        canonical_id=_replay, deduped=True))
+                    conn.execute(
+                        "INSERT INTO applied_ops (op_id, principal, status,"
+                        " canonical_id, applied_at) VALUES (?, ?, 'committed',"
+                        " ?, ?)",
+                        (op_id, principal or "", _replay, _now()))
+                    canonical[op_id] = _replay
+                    committed_ids.add(op_id)
                     continue
             else:
                 target_probe = _resolve_target(args, canonical)

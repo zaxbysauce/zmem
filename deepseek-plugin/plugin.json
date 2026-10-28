@@ -1,0 +1,39 @@
+{
+  "name": "@zaxbyhub/zmem-deepseek",
+  "description": "ZMem native DeepSeek Harness (dsh/Cordis) adapter: broker-backed passive recall on the first accepted pre-step, explicit zmem_* memory tools through the same backend, capture with always-on redaction, and offline snapshot delivery (issues #374/#375).",
+  "version": "0.127.0",
+  "runtime": {
+    "kind": "dsh-cordis",
+    "packages": "@deepseek-ai/*",
+    "tested": "0.2.1-rc.2",
+    "cordis": "^4.0.5",
+    "loader": "cordis.yml profile row (the dsh product loader; not part of the published packages)"
+  },
+  "entry": "index.mjs",
+  "tools": [
+    "zmem_add",
+    "zmem_update",
+    "zmem_supersede",
+    "zmem_invalidate",
+    "zmem_recall",
+    "zmem_search",
+    "zmem_get",
+    "zmem_list",
+    "zmem_recent"
+  ],
+  "events": {
+    "agent/created": "session_start moment",
+    "agent/pre-step": "user_prompt moment (first accepted pre-step delivery; reservation acknowledged only after observed admission)",
+    "tools/pre-execute": "pretool context collection (next-request guidance; declared capability gap for the in-flight tool)",
+    "tools/result": "final tool-outcome capture (failures and denials only)",
+    "agent/turn-stopping": "bounded reflection: the shared reflect hook runs inside the bound (its own eligibility/idempotency govern) and the plugin surfaces the nudge as state for the host — never a self-triggered continuation",
+    "session/event": "admission observation (ack) and compaction marker serialization (string-matched)",
+    "agent/disposed": "persisted-session state is never terminal-cleared; acks are synchronous and bounded at the admission moment (12s) — no async tails to drain"
+  },
+  "killSwitches": [
+    "ZMEM_CAPTURE=0",
+    "ZMEM_INJECT=0"
+  ],
+  "sourceKind": "zmem",
+  "contextForm": "recall"
+}

@@ -31,7 +31,8 @@ PLUGIN_SRC = REPO_ROOT / "hermes-plugin" / "__init__.py"
 ALLOWED_LOCALITY = {"client_local", "hub_authoritative"}
 ALLOWED_STATUS = {"registered", "capability_gap"}
 ALLOWED_HUB_OPS = {"select", "ingest", "flush"}
-SUPPORTED_HARNESSES = ("claude", "codex", "zcode", "hermes", "opencode")
+SUPPORTED_HARNESSES = ("claude", "codex", "zcode", "hermes", "opencode",
+                        "deepseek")
 # Floors pinned by issue #280 AC4 (fleet-hub install facts at filing, 2026-10-05).
 # hermes 0.21.1 is the in-repo cdf4c76 source pin; zcode 3.15.3 is the probed
 # dev-box host (ZCode.exe ProductVersion 3.15.3.8237) — provenance in
@@ -43,6 +44,7 @@ PINNED_MIN_VERSIONS = {
     "opencode": "1.18.30",
     "hermes": "0.21.1",
     "zcode": "3.15.3",
+    "deepseek": "0.2.1-rc.2",
 }
 # Issue #280 AC3 names these inputs and their classes.  A matrix that
 # renames or drops one is renegotiating the contract, not filling it in.
@@ -68,6 +70,8 @@ EXTRA_INPUTS = {
     "memory payload": "client_local",
 }
 INPUT_VOCABULARY = dict(PINNED_LOCALITY, **EXTRA_INPUTS)
+INPUT_VOCABULARY["principal authorization"] = "hub_authoritative"
+
 # The explicit-tool lane is a contract fact rather than something derivable
 # from a manifest; every other moment in the grid is derived below.
 EXPLICIT_MOMENTS = ("explicit-recall", "explicit-write")
@@ -200,6 +204,17 @@ def _hermes_callbacks():
 def _expected_moments():
     """Every moment the grid must cover, derived from the live surfaces."""
     wiring = _manifest_wiring()
+    # Native dsh/Cordis wiring parity (issue #374): the deepseek adapter
+    # registers these events in deepseek-plugin/index.mjs — no shell-hook
+    # manifest exists. Keep in sync with _NATIVE_WIRING in the generator.
+    wiring.setdefault("deepseek", {
+        "session-start": "agent/created",
+        "recall": "agent/pre-step",
+        "pretool-recall": "tools/pre-execute",
+        "capture-failure": "tools/result",
+        "reflect": "agent/turn-stopping",
+        "precompact": "compaction/start",
+    })
     moments = set()
     for verbs in wiring.values():
         moments.update(verbs)
@@ -293,6 +308,17 @@ def test_matrix_pins_supported_versions():
     and every opencode row stays capability_gap until #66 lands. RED at
     base, GREEN after the fix."""
     wiring = _manifest_wiring()
+    # Native dsh/Cordis wiring parity (issue #374): the deepseek adapter
+    # registers these events in deepseek-plugin/index.mjs — no shell-hook
+    # manifest exists. Keep in sync with _NATIVE_WIRING in the generator.
+    wiring.setdefault("deepseek", {
+        "session-start": "agent/created",
+        "recall": "agent/pre-step",
+        "pretool-recall": "tools/pre-execute",
+        "capture-failure": "tools/result",
+        "reflect": "agent/turn-stopping",
+        "precompact": "compaction/start",
+    })
     rows = _rows(_load_matrix())
 
     # -- floors ---------------------------------------------------------
@@ -480,6 +506,50 @@ def test_fleet_fixtures_match_the_matrix():
         assert isinstance(step.get("argv"), list) and step["argv"], (
             f"seed.jsonl line {i} has no argv"
         )
+
+
+def test_ingest_rows_carry_authorization():
+    """#363 AC1: every ingest row declares the authorization input it needs.
+
+    A row whose hub_ops includes ``ingest`` is a WRITE path — the hub, not
+    the client, owns the decision — so the matrix must name the principal
+    authorization that input consults: an input whose name contains
+    "authorization" classified ``hub_authoritative`` (the frozen shape is
+    ``{"name": "principal authorization", "locality":
+    "hub_authoritative"}``).  RED at base (no ingest row carries it), GREEN
+    once the #363 matrix update lands; a later harness that grows an ingest
+    row without the input fails here, so the write-path authorization
+    contract cannot silently reopen."""
+    rows = _rows(_load_matrix())
+    offenders = []
+    ingest_rows = 0
+    for i, row in enumerate(rows):
+        if "ingest" not in (row.get("hub_ops") or []):
+            continue
+        ingest_rows += 1
+        where = f"row {i} ({row.get('harness')}/{row.get('moment')})"
+        auth_inputs = [
+            inp for inp in row.get("inputs") or []
+            if "authorization" in str(inp.get("name", "")).lower()
+        ]
+        if not auth_inputs:
+            offenders.append(f"{where}: no authorization input")
+            continue
+        for inp in auth_inputs:
+            if inp.get("locality") != "hub_authoritative":
+                offenders.append(
+                    f"{where}: authorization input {inp.get('name')!r} is "
+                    f"{inp.get('locality')!r}, not hub_authoritative"
+                )
+    assert ingest_rows > 0, (
+        "the matrix declares no ingest rows at all — the grid must contain "
+        "the capture/reflect/explicit-write moments (issue #280)"
+    )
+    assert not offenders, (
+        f"every hub_ops ingest row ({ingest_rows} of {len(rows)}) must carry "
+        f"an input whose name contains 'authorization' with locality "
+        f"'hub_authoritative' (issue #363 AC1); offenders: {offenders}"
+    )
 
 
 _CHECKS = tuple(

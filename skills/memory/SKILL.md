@@ -516,7 +516,8 @@ ends with `sid=<sanitized session id>` (`[^A-Za-z0-9._-]` → `_`, cap 128;
 The additive decision suffix is ordered `lane=`, `ver=`, `t_ms=` after the
 historical `moment=` field and before later additive tails (`arms=`,
 `batch=`, `tools=`, `paths=`, and margin fields). Closed lanes are `claude`,
-`codex`, `zcode`, `hermes-provider`, and `hermes-compat`; runtime moments are
+`codex`, `zcode`, `deepseek`, `hermes-provider`, and `hermes-compat`;
+runtime moments are
 `session_start`, `user_prompt`, `pretool`, `subagent`, and `precompact`.
 Silent reasons are exactly `empty-pool`, `omitted`, `below-bar`, `budget-drop`,
 `below-relevance`, `already-delivered`, and `expired` (`expired` names a pool
@@ -1274,7 +1275,8 @@ SessionStart, and Hermes provider are subprocess-only adapters: they consume
 only the envelope's string `rendered` field and never read SQLite, the
 operation ring, a delivery ledger, or memory rows themselves. The selector's
 closed moments are `session_start`, `user_prompt`, `pretool`, `subagent`, and
-`precompact`; its lanes are `claude`, `codex`, `zcode`, `hermes-provider`, and
+`precompact`; its lanes are `claude`, `codex`, `zcode`, `deepseek`, `hermes-provider`,
+and
 `hermes-compat`. A compact restart is logged locally as
 `session_start_compact`, but the selector and ledger always use
 `session_start`.

@@ -100,7 +100,7 @@ def _lane(env: Mapping[str, str]) -> str:
     mirrored so a remote envelope carries the SAME lane (and fence flavor)
     as the local path would."""
     return {
-        "claude": "claude", "codex": "codex", "zcode": "zcode",
+        "claude": "claude", "codex": "codex", "zcode": "zcode", "deepseek": "deepseek",
         "hermes": "hermes-provider", "hermes-provider": "hermes-provider",
         "hermes-compat": "hermes-compat",
     }.get((env.get("ZMEM_HOST", "zcode") or "zcode").strip().lower(), "")

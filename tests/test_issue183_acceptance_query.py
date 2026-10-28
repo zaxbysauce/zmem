@@ -334,6 +334,7 @@ class Issue183QueryAcceptance(unittest.TestCase):
 
     def test_ac7_release_parity_is_exact_current_version(self):
         manifests = [
+    "deepseek-plugin/plugin.json",
             "marketplace.json", ".claude-plugin/plugin.json", ".claude-plugin/marketplace.json",
             ".codex-plugin/plugin.json", ".zcode-plugin/plugin.json",
             ".agents/plugins/marketplace.json", "hermes-plugin/plugin.yaml",

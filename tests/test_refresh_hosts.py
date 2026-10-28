@@ -126,6 +126,8 @@ def _make_checkout(root: Path) -> Path:
     # at the next minor.  Do not add convenience package/plugin manifests:
     # release parity must bind to this exact set.
     manifests = {
+        "deepseek-plugin/plugin.json": {"name": "@zaxbyhub/zmem-deepseek",
+                                        "version": VERSION},
         ".claude-plugin/plugin.json": {"name": "zmem", "version": VERSION},
         ".claude-plugin/marketplace.json": {
             "plugins": [{"name": "zmem", "version": VERSION}]

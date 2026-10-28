@@ -211,6 +211,10 @@ def _host_manifests() -> dict[str, bytes]:
         "marketplace.json": _json_bytes(
             _marketplace("zmem-zcode", "fixture ZCode marketplace")
         ),
+        # canonical eighth (issue #374): the deepseek adapter manifest
+        "deepseek-plugin/plugin.json": _json_bytes(
+            {"name": "@zaxbyhub/zmem-deepseek", "version": VERSION}
+        ),
     }
 
 

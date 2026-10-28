@@ -1,4 +1,5 @@
 {
+  "$schema": "./fleet-capability-matrix.schema.json",
   "matrix_version": 1,
   "generator": "docs/generate-fleet-matrix.py",
   "generator_note": "PRODUCED by the generator named above; run it with --check to verify. Wiring is derived from hooks/hooks.*.json and the hermes register_hook calls on every run.",
@@ -25,6 +26,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -60,6 +65,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -93,6 +102,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -299,6 +312,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -439,6 +456,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -468,6 +489,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -538,6 +563,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -612,6 +641,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -641,6 +674,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -676,6 +713,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -709,6 +750,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -915,6 +960,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1056,6 +1105,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1090,6 +1143,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1120,6 +1177,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1190,6 +1251,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1264,6 +1329,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1293,6 +1362,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1328,6 +1401,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1361,6 +1438,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1566,6 +1647,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1706,6 +1791,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1735,6 +1824,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1805,6 +1898,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1879,6 +1976,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1908,6 +2009,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -1943,6 +2048,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -1976,6 +2085,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2180,6 +2293,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2321,6 +2438,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -2350,6 +2471,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2420,6 +2545,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2494,6 +2623,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -2523,6 +2656,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2559,6 +2696,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -2593,6 +2734,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2803,6 +2948,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -2948,6 +3097,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -2978,6 +3131,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -3048,6 +3205,10 @@
         },
         {
           "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
           "locality": "hub_authoritative"
         }
       ],
@@ -3123,6 +3284,10 @@
         {
           "name": "ledger",
           "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
         }
       ],
       "hub_ops": [
@@ -3130,6 +3295,883 @@
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
       "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "capture-correction",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "capture-failure",
+      "hook_event": "tools/result",
+      "status": "registered",
+      "launcher": "capture-failure",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "convention-capture",
+      "hook_event": "PostToolUse",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "postcompact",
+      "hook_event": "PostCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "posttoolbatch-recall",
+      "hook_event": "PostToolBatch",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "precompact",
+      "hook_event": "PreCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "pretool-recall",
+      "hook_event": "tools/pre-execute",
+      "status": "registered",
+      "launcher": "pretool-recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "recall",
+      "hook_event": "agent/pre-step",
+      "status": "registered",
+      "launcher": "recall",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "reflect",
+      "hook_event": "agent/turn-stopping",
+      "status": "registered",
+      "launcher": "reflect",
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "session-end",
+      "hook_event": "SessionEnd",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "flush"
+      ],
+      "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "session-start",
+      "hook_event": "agent/created",
+      "status": "registered",
+      "launcher": "session-start",
+      "inputs": [
+        {
+          "name": "Tier 0 files",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "subagent-recall",
+      "hook_event": "SubagentStart",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "agent transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "subagent-reflect",
+      "hook_event": "SubagentStop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "agent transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "capture-failure",
+      "hook_event": "PostToolUseFailure",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "pretool-recall",
+      "hook_event": "PreToolUse",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "session-start",
+      "hook_event": "SessionStart",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "Tier 0 files",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "reflect",
+      "hook_event": "Stop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "post-tool-call",
+      "hook_event": "post_tool_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "tool_input",
+          "locality": "client_local"
+        },
+        {
+          "name": "tool_output",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "pre-llm-call",
+      "hook_event": "pre_llm_call",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "pre-verify",
+      "hook_event": "pre_verify",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "explicit-recall",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py recall",
+      "inputs": [
+        {
+          "name": "query",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\".",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "explicit-write",
+      "hook_event": null,
+      "status": "registered",
+      "launcher": "store.py add",
+      "inputs": [
+        {
+          "name": "memory payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "principal authorization",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "ingest"
+      ],
+      "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
     }
   ]
 }

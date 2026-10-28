@@ -143,8 +143,8 @@ def main() -> int:
                       default=None,
                       help="runtime injection moment")
     call.add_argument("--lane", dest="lane",
-                      choices=("claude", "codex", "zcode", "hermes-provider",
-                               "hermes-compat"),
+                      choices=("claude", "codex", "zcode", "deepseek",
+                               "hermes-provider", "hermes-compat"),
                       default=None,
                       help="runtime host lane")
     call.add_argument("--ops-token", dest="ops_tokens", action="append",
