@@ -101,7 +101,7 @@ With `ZMEM_REMOTE_URL` unset, every command is local and unchanged.
 Store commands run `<interpreter> <store.py path> <subcommand>` — use the
 interpreter the injected command names, or an explicitly resolved one
 (`py -3` on Windows). Never bare `python3` on Windows — that is a Windows
-Store stub — and never a bare `store.py` path (the script has no shebang).
+Store stub — and never a bare `store.py` path (pin the interpreter explicitly; a bare .py path depends on platform dispatch).
 `doctor` is the one separate diagnostic script shown below.
 
 ### doctor — read-only install diagnostics
@@ -123,7 +123,8 @@ store or host config. Checks:
   range [0,1]); inspect deeper with `store.py links --id <uuid>`
 - v13 episode storage present with counts (`episode-tables` check), and the
   MCP token scope advisory (`mcp-token` check: warns `unscoped_token: true`
-  on full-access operator tokens, never reports the token value)
+  on full-access operator tokens; in principal-map mode (`ZMEM_MCP_TOKENS_FILE`)
+  reports scoped/unscoped/revoked counts instead — never a token value)
 - Claude/Codex native-memory conflicts via read-only config inspection
 - ZCode native memory (`zcode-native-memory` check, issue #185):
   `~/.zcode/v2/setting.json` `memoryEnabled: true` fails cutover, explicit
@@ -2369,8 +2370,9 @@ endpoints are checked on every apply.
 One-shot merge of a leftover second store (e.g. `~/.zcode/memory/store.sqlite`)
 into the canonical one. Read-only on the source; source ids are PRESERVED so
 re-runs are no-ops; a NEWER source schema is refused. doctor's
-`second-stores` check fails when any live row exists outside the canonical
-store and recommends this command.
+`second-stores` check fails when canonical is missing live rows that exist
+outside it (rows already tombstoned in canonical are only a WARN — nothing
+to promote) and recommends this command.
 
 ### backup — verified snapshot with retention
 ```

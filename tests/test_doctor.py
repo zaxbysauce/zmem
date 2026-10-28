@@ -1322,6 +1322,21 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
 
     # -- issue #369: principal-map auth mode knows the token-scope check ---
 
+    def _map_owner_only(self, path) -> None:
+        """The hub refuses group/world-readable maps (issue #406); a test
+        map must not depend on the directory's inherited ACL. Windows uses
+        icacls (0o600 keeps the write bit on NTFS); POSIX uses chmod."""
+        import subprocess as _sp
+
+        if os.name == "nt":
+            r = _sp.run(
+                ["icacls", str(path), "/inheritance:r",
+                 "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+                capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        else:
+            os.chmod(str(path), 0o600)
+
     def test_mcp_token_map_mode_reports_scope_shape(self):
         map_path = self.tmp / "principals.json"
         _write_text(map_path, json.dumps({
@@ -1336,6 +1351,7 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
                 "principal": "ops", "host": "dgx-ops",
                 "harness": "hermes", "revoked": True},
         }))
+        self._map_owner_only(map_path)
         env = self._env()
         env.pop("ZMEM_MCP_TOKEN", None)
         env.pop("ZMEM_MCP_TOKEN_FILE", None)
@@ -1358,6 +1374,7 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
             "doctor-map-secret": {"principal": "alpha", "host": "h",
                                   "harness": "c", "namespaces": ["project:x"],
                                   "revoke": True}}))
+        self._map_owner_only(map_path)
         env = self._env()
         env.pop("ZMEM_MCP_TOKEN", None)
         env.pop("ZMEM_MCP_TOKEN_FILE", None)
@@ -1365,6 +1382,69 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
         report = json.loads(self._run_json(env).stdout)
         check = self._check(report, "mcp-token")
         self.assertEqual(check["status"], "fail", check)
+
+    def test_mcp_token_map_mode_over_permissive_is_fail(self):
+        """PRR-001: an over-permissive map the hub would exit-2-refuse must
+        be a doctor FAIL, never a false-green pass (this fixture skips the
+        owner-only hardening on purpose and makes permissiveness explicit:
+        Everyone-read ACE on Windows, mode 0644 on POSIX)."""
+        import subprocess as _sp
+
+        map_path = self.tmp / "principals-permissive.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret": {
+                "principal": "alpha", "host": "dgx-fb", "harness": "claude",
+                "namespaces": ["project:zmem"]}}))
+        if os.name == "nt":
+            r = _sp.run(["icacls", str(map_path), "/grant", "*S-1-1-0:R"],
+                        capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        else:
+            os.chmod(str(map_path), 0o644)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+        self.assertIn("over-permissive", json.dumps(check).lower())
+
+    def test_mcp_token_map_mode_non_regular_file_is_fail(self):
+        """PRR-001: a non-regular file (a directory here — a FIFO on POSIX)
+        must be a structured FAIL, never a blocking open."""
+        map_path = self.tmp / "principals-dir.json"
+        map_path.mkdir()
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+        self.assertIn("regular file", json.dumps(check))
+
+    def test_mcp_token_map_mode_all_revoked_is_warn(self):
+        """PRR-001: a map that authenticates nobody (every principal
+        revoked) must WARN, never pass."""
+        map_path = self.tmp / "principals-revoked.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret-a": {
+                "principal": "alpha", "host": "dgx-fb", "harness": "claude",
+                "namespaces": ["project:zmem"], "revoked": True},
+            "doctor-map-secret-b": {
+                "principal": "beta", "host": "dgx-b", "harness": "claude",
+                "namespaces": ["project:zmem"], "revoked": True},
+        }))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["revoked_count"], 2, check)
 
     def test_mcp_token_map_mode_surrogate_key_is_structured_fail(self):
         # Plan-critic round 1: an escaped-surrogate token key makes the
@@ -1375,13 +1455,14 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
             "doctor-map-secret": {"principal": "alpha", "host": "h",
                                   "harness": "c", "namespaces": ["project:x"]}
         }).replace("doctor-map-secret", "doctor-\\ud800-map-secret"))
+        self._map_owner_only(map_path)
         env = self._env()
         env.pop("ZMEM_MCP_TOKEN", None)
         env.pop("ZMEM_MCP_TOKEN_FILE", None)
         env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
         report = json.loads(self._run_json(env).stdout)
         check = self._check(report, "mcp-token")
-        self.assertIn(check["status"], ("fail", "warn"), check)
+        self.assertEqual(check["status"], "fail", check)
 
     def test_mcp_token_map_mode_wins_over_legacy_env(self):
         # The map takes precedence server-side (resolve_token_auth); the
@@ -1391,6 +1472,7 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
             "doctor-map-secret": {
                 "principal": "alpha", "host": "dgx-fb",
                 "harness": "claude", "namespaces": ["project:zmem"]}}))
+        self._map_owner_only(map_path)
         env = self._env()
         env["ZMEM_MCP_TOKEN"] = "doctor-legacy-secret"
         env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)

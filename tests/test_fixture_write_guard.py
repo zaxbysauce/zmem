@@ -136,6 +136,7 @@ class GuardCiCarveOutPinTest(unittest.TestCase):
             env["HOME"] = fakehome
             env["USERPROFILE"] = fakehome
             for k in ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_ALLOW_REAL_STORE",
+                      "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
                       "CI", "GITHUB_ACTIONS"):
                 env.pop(k, None)
             env["CI"] = ci

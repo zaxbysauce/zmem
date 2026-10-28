@@ -1890,10 +1890,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 ),
             }
 
-    def _include_global_allowed() -> bool:
+    def _include_global_allowed(caller=None) -> bool:
         """Scoped tokens only get the implicit user:global union when
-        user:global is itself in the allow-list (reads never broaden scope)."""
-        caller = current_principal()
+        user:global is itself in the allow-list (reads never broaden scope).
+
+        ``caller`` (issue #371 single-capture): a tool holding a snapshot
+        passes it so the decision observes the same map generation as the
+        tool's other authorization decisions (swarm-pr-review PRR-014)."""
+        if caller is None:
+            caller = current_principal()
         if not caller.scoped:
             return True
         return "user:global" in (caller.namespaces or frozenset())
@@ -3773,7 +3778,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--for-injection",
             "--json",
         ]
-        if _include_global_allowed() and resolved_ns != "user:global":
+        if _include_global_allowed(caller=_session_caller) and resolved_ns != "user:global":
             args += ["--include-global", "--global-limit", "2"]
         # Issue #283 (T-04): scoped principals carry their allow-list so the
         # selector leg (--session-id below) filters the user:global and

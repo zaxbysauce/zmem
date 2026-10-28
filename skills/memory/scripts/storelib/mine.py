@@ -146,6 +146,12 @@ def _sanitize_error_text(text, limit: int = 200) -> str:
         return ""
     return _collapse_line_breaks(text)[:limit].strip()
 
+# Degraded-redaction visibility (swarm-pr-review PRR-009): the counter and
+# one-shot stderr notice let cmd_failures mark the result ``redaction_degraded``
+# so a silently-unprotected failure surface is observable, never silent.
+_REDACT_DEGRADE_COUNT = [0]
+_REDACT_DEGRADE_WARNED = False
+
 def _redact_failure_text(text, limit: int = 200) -> str:
     """Failure-record text renderer (issue #277): redact FIRST, then sanitize.
 
@@ -154,17 +160,25 @@ def _redact_failure_text(text, limit: int = 200) -> str:
     verbatim and render into reflect-hook prompts — so redaction runs BEFORE
     the 200-char truncation (a secret straddling the window is still caught)
     and before the line-break collapse. The redaction primitive failing
-    (absent module, unexpected shape) degrades to exactly _sanitize_error_text
-    behavior: failure capture must never die, and plain diagnostic text stays
-    byte-identical to the pre-#277 renderer (redact_text only rewrites
-    secret-shaped substrings).
+    (raising or malformed return) degrades to exactly _sanitize_error_text
+    behavior — loudly: the degrade increments a module counter, emits ONE
+    stderr notice, and cmd_failures marks the result ``redaction_degraded``
+    so the caller can see the protection is off (swarm-pr-review PRR-009).
+    Plain diagnostic text stays byte-identical to the pre-#277 renderer
+    (redact_text only rewrites secret-shaped substrings).
     """
+    global _REDACT_DEGRADE_WARNED
     if not text:
         return ""
     try:
         redacted, _redactions = redact_text(str(text))
     except Exception:
         redacted = str(text)
+        _REDACT_DEGRADE_COUNT[0] += 1
+        if not _REDACT_DEGRADE_WARNED:
+            _REDACT_DEGRADE_WARNED = True
+            print("[zmem] failures: secret redaction degraded — failure "
+                  "text is UNREDACTED this run", file=sys.stderr)
     return _collapse_line_breaks(redacted)[:limit].strip()
 
 def _sanitize_pack_content(text) -> str:
@@ -492,7 +506,10 @@ def _failures_from_db(db_path: str, session_id: str, *,
             details.append({
                 "tool": _sanitize_tool_name(r["tool_name"] or "?"),
                 "error": _redact_failure_text(r["error_message"] or ""),
-                "error_type": r["error_type"] or "",
+                # Same record, same trust level: redact + cap the type token
+                # too (swarm-pr-review PRR-007) — it is caller-adjacent free
+                # text and previously passed through raw and uncapped.
+                "error_type": _redact_failure_text(r["error_type"] or "", 100),
                 "retry_count": r["retry_count"] or 0,
                 "destructive": bool(r["destructive"]),
             })
@@ -545,6 +562,9 @@ def cmd_failures(session: str, transcript: str, db: str,
         else:
             count, details = _failures_from_db(db, session, timeout_s=db_timeout)
             result = {"count": count, "details": details, "rejections": []}
+        if _REDACT_DEGRADE_COUNT[0]:
+            # Degraded redaction is observable, never silent (PRR-009).
+            result["redaction_degraded"] = True
     except Exception as exc:
         msg = _sanitize_exc_text(str(exc))
         result = {"count": 0, "details": [], "rejections": [], "error": msg}

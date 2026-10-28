@@ -356,7 +356,8 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # NOTE: the wrapper must exec store.py THROUGH the interpreter
   # ([sys.executable] + argv) — a bare subprocess.call(argv) would exec the
   # .py file directly, which fails with ENOEXEC/WinError 193 everywhere
-  # (store.py has no shebang) and, being fire-and-forget with output in
+  # (bare .py dispatch is unreliable across platforms) and, being
+  # fire-and-forget with output in
   # BG_SINK, would silently kill maintenance on every box (reviewer gate
   # caught this pre-merge; CI was green because no test inspected the
   # worker's output — the test below now does).

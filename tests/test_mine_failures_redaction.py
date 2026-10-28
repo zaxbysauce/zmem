@@ -14,6 +14,7 @@ from __future__ import annotations
 import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -96,8 +97,14 @@ class FailureRedactionTest(unittest.TestCase):
             mine.redact_text = orig
 
     def test_redaction_precedes_truncation(self):
-        """A secret straddling the 200-char window is still redacted."""
-        filler = "x" * 190 + " "
+        """A secret whose tail lies BEYOND the 200-char window must still be
+        gone after the pipeline: redaction-before-truncation leaves the
+        ``[REDACTED`` placeholder inside the window, while truncate-then-
+        redact cuts the secret to a fragment no detector matches and no
+        placeholder survives (swarm-pr-review PRR-004 — the previous
+        fixture's secret sat fully inside the window and could not fail the
+        reversed ordering)."""
+        filler = "x" * 195 + " "
         records = [
             {"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "B"}]}},
@@ -108,7 +115,92 @@ class FailureRedactionTest(unittest.TestCase):
         ]
         details, _ = mine._failures_from_transcript(
             None, "\n".join(json.dumps(r) for r in records))
-        self.assertNotIn(SECRET, details[0]["error"])
+        err = details[0]["error"]
+        self.assertNotIn(SECRET, err)
+        self.assertIn("[REDACTED", err,
+                      "the redaction placeholder must survive truncation — "
+                      "its absence means redaction ran after the cap")
+
+    def test_db_leg_redacts_error_message_and_type(self):
+        """PRR-003: the db substrate leg (``_failures_from_db``) must redact
+        exactly like the transcript leg — reverting either call site is a
+        regression this file must catch."""
+        import sqlite3
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="zmem-redact-db-")
+        db = os.path.join(tmp, "db.sqlite")
+        conn = sqlite3.connect(db)
+        conn.execute("""CREATE TABLE tool_usage(
+            session_id TEXT, tool_name TEXT, read_only INT, status TEXT,
+            exit_code INT, error_message TEXT, error_type TEXT,
+            retry_count INT, destructive INT, completed_at TEXT)""")
+        conn.execute(
+            "INSERT INTO tool_usage VALUES "
+            "('s1', 'Bash', 0, 'error', 1, ?, ?, 2, 1, '2026-01-01')",
+            ("push failed: Authorization Bearer " + SECRET,
+             "AuthError api_key=" + SECRET_2))
+        conn.commit()
+        conn.close()
+        count, details = mine._failures_from_db(db, "s1")
+        self.assertEqual(count, 1)
+        blob = json.dumps(details)
+        for secret in (SECRET, SECRET_2):
+            self.assertNotIn(secret, blob)
+        self.assertIn("[REDACTED", details[0]["error_type"])
+
+    def test_degraded_redaction_is_visible(self):
+        """PRR-009: a failing redaction primitive degrades fail-open BUT is
+        observable — one stderr notice and ``redaction_degraded`` on the
+        cmd_failures result."""
+        import contextlib
+        import io
+        import os
+        import sqlite3
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="zmem-redact-degrade-")
+        db = os.path.join(tmp, "db.sqlite")
+        conn = sqlite3.connect(db)
+        conn.execute("""CREATE TABLE tool_usage(
+            session_id TEXT, tool_name TEXT, read_only INT, status TEXT,
+            exit_code INT, error_message TEXT, error_type TEXT,
+            retry_count INT, destructive INT, completed_at TEXT)""")
+        conn.execute(
+            "INSERT INTO tool_usage VALUES "
+            "('s1', 'Bash', 0, 'error', 1, 'Authorization Bearer " + SECRET
+            + "', 'AuthError', 2, 1, '2026-01-01')")
+        conn.commit()
+        conn.close()
+
+        def _boom(*a, **k):
+            raise RuntimeError("simulated absent redaction")
+
+        orig = mine.redact_text
+        mine.redact_text = _boom
+        outcap, errcap = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(outcap), \
+                    contextlib.redirect_stderr(errcap):
+                rc = mine.cmd_failures("s1", None, db=db)
+        finally:
+            mine.redact_text = orig
+        # Degrade never kills the checked-result contract (exit 0, JSON out).
+        self.assertEqual(rc, 0)
+        result = json.loads(outcap.getvalue())
+        self.assertEqual(result["count"], 1)
+        self.assertTrue(result.get("redaction_degraded"), result)
+        self.assertIn("UNREDACTED", errcap.getvalue())
+        # The details survive (fail-open) even though unprotected.
+        self.assertTrue(result["details"])
+
+    def test_error_type_is_redacted_and_capped(self):
+        """PRR-007: error_type rides the same failure record and previously
+        passed through raw and uncapped; the db-leg test above pins the
+        redaction, this pins the cap."""
+        long_type = "y" * 500
+        out = mine._redact_failure_text(long_type, 100)
+        self.assertLessEqual(len(out), 104)  # cap + ellipsis tolerance
 
 
 if __name__ == "__main__":

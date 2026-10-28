@@ -138,7 +138,11 @@ def _refuse_fixture_shaped_default_store_write(args: argparse.Namespace) -> None
     )
     if not shaped:
         return
-    home = Path(os.path.expanduser("~"))
+    # Resolve symlinks before containment (swarm-pr-review PRR-008): a
+    # ZMEM_STORE/ZMEM_DATA symlink pointing into ~/.zmem must be judged by
+    # its TARGET, not its lexical path. os.path.realpath is non-strict (fine
+    # for not-yet-existing paths) and platform-native.
+    home = Path(os.path.realpath(os.path.expanduser("~")))
     zmem_root = home / ".zmem"
     # The RESOLVED path this CLI would write, by host.resolve_store_path's
     # precedence — a scratch ZMEM_STORE/ZMEM_DATA keeps the write allowed
@@ -149,7 +153,7 @@ def _refuse_fixture_shaped_default_store_write(args: argparse.Namespace) -> None
         raw = os.environ.get(var, "").strip()
         if not raw:
             continue
-        p = Path(raw).expanduser()
+        p = Path(os.path.realpath(Path(raw).expanduser()))
         resolved = p if p.suffix == ".sqlite" else p / "store.sqlite"
         break
     if resolved is None:

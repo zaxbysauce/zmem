@@ -39,8 +39,9 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - v11 link surface present (`memory_link` table + `memory.trust_score` in
   range [0,1] — inspect deeper with `store.py links --id <uuid>`)
 - v13 episode storage present with counts, and the MCP token scope advisory
-  (`mcp-token`: warns `unscoped_token: true` on full-access operator tokens,
-  never reports the token value) (issue #65)
+  (`mcp-token`: warns `unscoped_token: true` on full-access operator tokens;
+  in principal-map mode (`ZMEM_MCP_TOKENS_FILE`) reports scoped/unscoped/
+  revoked counts instead — never a token value) (issues #65 #369)
 - Claude and Codex native-memory conflicts
 - ZCode native memory (`memoryEnabled` in `~/.zcode/v2/setting.json`; true
   fails cutover, false passes) (issue #185)
@@ -247,8 +248,9 @@ rule: builtin + one external provider).
 - Gateway note: a running Hermes gateway loads MCP servers at startup — if
   you change the config, restart the gateway once (Hermes runtime behavior,
   not zmem's).
-- Leftover second store: doctor's `second-stores` check FAILS when any live
-  row exists outside the canonical store; merge it once with
+- Leftover second store: doctor's `second-stores` check FAILS when canonical
+  is missing live rows that exist outside it (rows already tombstoned in
+  canonical are only a WARN — nothing to promote); merge it once with
   `store.py promote-store --from <path>` (idempotent — source ids are kept)
   and retire the old file.
 - Near-miss namespaces (`global`, `userglobal`, …): rows stranded by pre-guard
