@@ -97,14 +97,13 @@ class FailureRedactionTest(unittest.TestCase):
             mine.redact_text = orig
 
     def test_redaction_precedes_truncation(self):
-        """A secret whose tail lies BEYOND the 200-char window must still be
-        gone after the pipeline: redaction-before-truncation leaves the
-        ``[REDACTED`` placeholder inside the window, while truncate-then-
-        redact cuts the secret to a fragment no detector matches and no
-        placeholder survives (swarm-pr-review PRR-004 — the previous
-        fixture's secret sat fully inside the window and could not fail the
-        reversed ordering)."""
-        filler = "x" * 195 + " "
+        """PRR-004: redaction must receive the FULL pre-truncation text — a
+        truncate-first pipeline hands it the ≤200-char cut, losing any tail
+        the detector could have matched. Spy-pinned, because placeholder
+        presence in the OUTPUT is order-blind (the detector matches partial
+        secret fragments too — reviewer-verified mutation). The behavioral
+        guarantee (no verbatim secret survives) is pinned alongside."""
+        filler = "- " * 97  # 194 chars, then the secret starts past 200
         records = [
             {"type": "assistant", "message": {"content": [
                 {"type": "tool_use", "id": "t1", "name": "B"}]}},
@@ -113,13 +112,28 @@ class FailureRedactionTest(unittest.TestCase):
                  "is_error": True,
                  "content": filler + "Bearer " + SECRET}]}},
         ]
-        details, _ = mine._failures_from_transcript(
-            None, "\n".join(json.dumps(r) for r in records))
-        err = details[0]["error"]
-        self.assertNotIn(SECRET, err)
-        self.assertIn("[REDACTED", err,
-                      "the redaction placeholder must survive truncation — "
-                      "its absence means redaction ran after the cap")
+        text_in = "\n".join(json.dumps(r) for r in records)
+        seen = {}
+        orig = mine.redact_text
+
+        def _spy(text):
+            seen["len"] = len(text)
+            seen["text"] = text
+            return "[REDACTED_SECRET]", 1
+
+        mine.redact_text = _spy
+        try:
+            details, _ = mine._failures_from_transcript(None, text_in)
+        finally:
+            mine.redact_text = orig
+        self.assertGreater(
+            seen["len"], 200,
+            "redaction saw the post-truncation text — the cap ran first")
+        self.assertIn(
+            SECRET, seen["text"],
+            "the secret was truncated away before redaction saw it")
+        self.assertNotIn(SECRET, details[0]["error"])
+        self.assertLessEqual(len(details[0]["error"]), 204)
 
     def test_db_leg_redacts_error_message_and_type(self):
         """PRR-003: the db substrate leg (``_failures_from_db``) must redact
@@ -178,6 +192,12 @@ class FailureRedactionTest(unittest.TestCase):
 
         orig = mine.redact_text
         mine.redact_text = _boom
+        # Reset the module-global one-shot notice + counter: a sibling test
+        # (test_degraded_redaction_seam_fails_open) may already have fired
+        # them — order-dependent without this (reviewer round, PRR-009).
+        orig_count, orig_warned = mine._REDACT_DEGRADE_COUNT, mine._REDACT_DEGRADE_WARNED
+        mine._REDACT_DEGRADE_COUNT = [0]
+        mine._REDACT_DEGRADE_WARNED = False
         outcap, errcap = io.StringIO(), io.StringIO()
         try:
             with contextlib.redirect_stdout(outcap), \
@@ -185,6 +205,8 @@ class FailureRedactionTest(unittest.TestCase):
                 rc = mine.cmd_failures("s1", None, db=db)
         finally:
             mine.redact_text = orig
+            mine._REDACT_DEGRADE_COUNT = orig_count
+            mine._REDACT_DEGRADE_WARNED = orig_warned
         # Degrade never kills the checked-result contract (exit 0, JSON out).
         self.assertEqual(rc, 0)
         result = json.loads(outcap.getvalue())

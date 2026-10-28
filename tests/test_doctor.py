@@ -1446,6 +1446,27 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
         self.assertEqual(check["status"], "warn", check)
         self.assertEqual(check["details"]["revoked_count"], 2, check)
 
+    def test_mcp_token_map_mode_all_unscoped_is_warn(self):
+        """PRR-011: a map whose every principal is unscoped (full-store
+        access) must WARN, never pass — the scoped==0 boundary."""
+        map_path = self.tmp / "principals-unscoped.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret-a": {
+                "principal": "alpha", "host": "dgx-fb", "harness": "claude"},
+            "doctor-map-secret-b": {
+                "principal": "beta", "host": "dgx-b", "harness": "hermes"},
+        }))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["scoped_count"], 0, check)
+        self.assertEqual(check["details"]["unscoped_count"], 2, check)
+
     def test_mcp_token_map_mode_surrogate_key_is_structured_fail(self):
         # Plan-critic round 1: an escaped-surrogate token key makes the
         # validator's own UTF-8 encode raise; the whole map branch is
