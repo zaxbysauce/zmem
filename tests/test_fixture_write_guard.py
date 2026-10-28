@@ -118,6 +118,36 @@ class GuardCiCarveOutPinTest(unittest.TestCase):
     def test_ci_false_keeps_guard_armed(self):
         self.assertEqual(self._run_guard({"CI": "false"}), 1)
 
+    def test_js_guard_ci_truthiness_pinned(self):
+        """The JS twin of the carve-out pin (reviewer round-8 nit): node
+        _store_guard.js under the same store-file-present fake home —
+        CI=true exits 0, CI=false exits 1."""
+        import shutil
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node unavailable")
+        fakehome = tempfile.mkdtemp(prefix="zmem-fwg-js-")
+        os.makedirs(os.path.join(fakehome, ".zmem"), exist_ok=True)
+        Path(fakehome, ".zmem", "store.sqlite").write_bytes(b"")
+
+        def run_js(ci):
+            env = dict(os.environ)
+            env["HOME"] = fakehome
+            env["USERPROFILE"] = fakehome
+            for k in ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_ALLOW_REAL_STORE",
+                      "CI", "GITHUB_ACTIONS"):
+                env.pop(k, None)
+            env["CI"] = ci
+            r = subprocess.run(
+                [node, str(REPO_ROOT / "tests" / "_store_guard.js")],
+                capture_output=True, text=True, env=env, timeout=120,
+                cwd=str(REPO_ROOT))
+            return r.returncode
+
+        self.assertEqual(run_js("true"), 0)
+        self.assertEqual(run_js("false"), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
