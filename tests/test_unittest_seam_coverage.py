@@ -46,6 +46,16 @@ class UnittestSeamCoverageTest(unittest.TestCase):
                     f"{rel}: plain `import _store_guard` without the "
                     "file-location shim — ModuleNotFoundError under "
                     "`python -m unittest` (repo root on sys.path)")
+                continue
+            if PLAIN_GUARD.search(body):
+                # Order matters (critic round 3): the shim must EXECUTE
+                # before the import, so its offset must precede it —
+                # membership alone is order-blind.
+                if body.find(SHIM_MARKER) > body.find("import _store_guard"):
+                    bad.append(
+                        f"{rel}: shim appears AFTER `import _store_guard` — "
+                        "the import executes first and still dies under the "
+                        "-m seam")
         self.assertEqual(
             bad, [],
             "Files run via `python -m unittest` need the shim shape "
