@@ -1905,7 +1905,11 @@ if __name__ == "__main__":
             # F-04/UR-1: classify by structured PREFIX, never substring —
             # only the unavailable branch raises messages that start with
             # "MODEL_UNAVAILABLE:"; a DRIVER_ERROR (or any other failure)
-            # is a hard failure regardless of its message text.
+            # is a hard failure regardless of its message text. Every failed
+            # leg is recorded; the exit decision below distinguishes the
+            # all-model-unavailable set (named-INCOMPLETE banner, exit 0)
+            # from any other failure (exit 1).
+            failures.append(name)
             if not str(exc).startswith("MODEL_UNAVAILABLE:"):
                 model_unavailable_only = False
             print(f"FAIL {name}: {exc}")
