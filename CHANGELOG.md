@@ -5,6 +5,37 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.129.0] - 2026-10-29
+
+### Subject-aware dedup — distinct task facts survive similarity (issue #376)
+
+- One shared task-subject compatibility rule at every destructive admission
+  point: `add`, `update`, ingest (legacy + cached), and consolidation absorb.
+  Rows whose `task:<key>` tags carry explicitly different task subjects
+  (repository-qualified keys are distinct) never merge by similarity alone —
+  each statement, its tags, source_ref and evidence stay independently
+  addressable; a subject-compatible runner-up can still absorb the fold
+  (semantic window, indexed/legacy exact lanes, and the bounded per-ingest
+  cache all fall through a vetoed nearest).
+- Absent or malformed task identity stays compatible (unknown subjects dedupe
+  exactly as before); `lesson` rows generalize across task origins; arbitrary
+  non-task tags, sessions, sources and shared entities are never treated as
+  subject conflicts; the dedup threshold is unchanged (0.85).
+- Consolidation: one ordered admission algorithm (rowid-deterministic,
+  simulated keeper tag growth) shared by the dry-run preview and the real
+  absorb loop, applied before contested-cluster classification; an untagged
+  keeper that absorbs one subject will not then absorb a disjoint one.
+- Link propagation no longer unions task tags onto subject-incompatible
+  neighbors (edges and trust events still form) — closing the second
+  cross-subject tag-contamination channel.
+- Subject vetoes log a stable, privacy-safe code (`subject_veto` — names the
+  existing row id and similarity only, never content), and bounded candidate
+  work is observable via the `storelib.write.SUBJECT_COMPAT_EVALS` counter.
+- Acceptance contract: `tests/test_subject_dedup_contract.py` (independently
+  authored, 7 discriminating checks incl. real-MiniLM legs that hard-fail
+  with MODEL_UNAVAILABLE when the pinned model is absent) plus
+  `tests/test_subject_dedup_supp.py`. No schema change; no migration.
+
 ## [0.128.0] - 2026-10-28
 
 Collated operator-surface hygiene PR (issues #277 #371 #244 #369 #245 #294).

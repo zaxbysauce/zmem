@@ -281,7 +281,7 @@ def _link_neighbors_lexical(
     if not seed:
         return []
     rows = conn.execute(
-        "SELECT id, content, tags, namespace, confidence, signal "
+        "SELECT id, content, tags, type, namespace, confidence, signal "
         "FROM memory "
         "WHERE namespace=? AND superseded_at IS NULL AND id != ? "
         "ORDER BY ingestion_ts DESC LIMIT ?",
@@ -315,7 +315,7 @@ def _link_neighbors_vec(
         if sim < threshold:
             continue
         row = conn.execute(
-            "SELECT id, content, tags, namespace, confidence, signal "
+            "SELECT id, content, tags, type, namespace, confidence, signal "
             "FROM memory WHERE id=? AND superseded_at IS NULL AND namespace=?",
             (nid, namespace),
         ).fetchone()
@@ -324,9 +324,20 @@ def _link_neighbors_vec(
     return out
 
 
+def _subject_incompatible_neighbor(tags: str, type_: str | None, row) -> bool:
+    """Issue #376: True when tag propagation to this neighbor would cross an
+    explicit task-subject boundary (both sides carry disjoint identities and
+    neither row is a lesson). Function-local import for the cycle law above.
+    """
+    from storelib import subject as _subject
+    return _subject.incompatible(tags, type_, row["tags"] if "tags" in row.keys() else None,
+                                 row["type"] if "type" in row.keys() else None)
+
+
 def generate_links_on_write(
     conn: sqlite3.Connection, mid: str, *, content: str, namespace: str,
     tags: str, emb: bytes | None, propagate_tags: bool = True,
+    type_: str | None = None,
 ) -> dict:
     """Generate + persist automatic links for a freshly-inserted row (6.2).
 
@@ -349,6 +360,13 @@ def generate_links_on_write(
     still suppressed at the summary-write call site to keep user rows clean).
     Link EDGES and polarity/trust events are unaffected; only the neighbor
     tag-union + relink are skipped.
+
+    Issue #376: the tag-union is ALSO suppressed for a neighbor whose task
+    subject is incompatible with the incoming row (``subject.incompatible``
+    over both rows' tags+type — the same predicate dedup admission uses; the
+    ``lesson`` type carve-out applies). Edges and trust events still form;
+    only cross-subject tag contamination is blocked. ``type_`` is the
+    incoming row's type (None => unknown => treated as non-lesson).
 
     Deterministic — no LLM (see module doc). Returns a small report for the
     caller's stdout note.
@@ -383,7 +401,9 @@ def generate_links_on_write(
         # Attribute evolution: tags (and, via relink, entity links) flow into
         # the neighbor. First-seen tags win; empty new tags are a no-op.
         # Suppressed for structural-marker writes (``propagate_tags=False``).
-        if propagate_tags:
+        if propagate_tags and not _subject_incompatible_neighbor(
+            tags, type_, row,
+        ):
             new_tags = (tags or "").strip()
             if new_tags:
                 merged = _merge_tag_strings(row["tags"] or "", new_tags)

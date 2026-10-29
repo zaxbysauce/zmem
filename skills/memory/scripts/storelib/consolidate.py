@@ -613,7 +613,7 @@ def _gather_neighbors(
             sim = 1.0 - r["distance"]
             if sim >= effective_threshold:
                 row = conn.execute(
-                    "SELECT id, confidence, signal, tags, retrieval_count, "
+                    "SELECT id, confidence, signal, tags, type, rowid, retrieval_count, "
                     "surfaced_count, content, taint "
                     "FROM memory "
                     "WHERE id=? AND superseded_at IS NULL AND namespace=?",
@@ -623,6 +623,42 @@ def _gather_neighbors(
                     neighbors.append((row, sim))
 
     return neighbors, knn_truncated
+
+
+def _admitted_neighbors(seed, neighbors):
+    """Issue #376: filter a seed's gathered neighbors by task-subject
+    compatibility against the SIMULATED grown keeper (see the seed loop).
+    Returns the admitted subset in the original similarity order. Rows
+    missing tags/type (should not happen post-#376) are treated as absent
+    identity — admitted, never vetoed on unreadable metadata.
+    """
+    from storelib import subject as _subject
+    from storelib.write import _merge_tag_strings
+
+    def _fld(row, name):
+        return row[name] if name in row.keys() else None
+
+    keeper_tags = _fld(seed, "tags") or ""
+    keeper_type = _fld(seed, "type")
+    # rowid-order iteration decides who gets first dibs when the keeper
+    # starts untagged; the returned list preserves similarity order.
+    ordered = sorted(
+        neighbors,
+        key=lambda ns: (_fld(ns[0], "rowid") is None, _fld(ns[0], "rowid") or 0),
+    )
+    admitted: list = []
+    for nb, sim in ordered:
+        nb_tags = _fld(nb, "tags") or ""
+        nb_type = _fld(nb, "type")
+        if not _subject.incompatible(keeper_tags, keeper_type, nb_tags, nb_type):
+            admitted.append((nb, sim))
+            # Simulate the tag growth the real absorb would apply.
+            keeper_tags = _merge_tag_strings(keeper_tags, nb_tags)
+    # Returned in the SIMULATION's own admission order (rowid-ascending) so
+    # the dry-run preview, the real absorb loop, and the per-absorb
+    # revalidation all walk the identical sequence — preview == real by
+    # construction (no gather-order/rowid-order divergence).
+    return admitted
 
 
 def _prune_unrecalled_days() -> int:
@@ -1133,7 +1169,8 @@ def consolidate(
     # namespace gets its top-N examined regardless of total size (#36 M8).
     rows = conn.execute(
         f"""WITH ranked AS (
-               SELECT id, namespace, content, tags, confidence, signal,
+               SELECT id, namespace, content, tags, type, rowid,
+                      confidence, signal,
                       retrieval_count, surfaced_count, embedding,
                       embedding_model, ingestion_ts, taint, source_ref,
                       ROW_NUMBER() OVER (
@@ -1144,9 +1181,9 @@ def consolidate(
                FROM memory
                WHERE superseded_at IS NULL {embed_clause} {summary_clause} {ns_clause}{ids_clause}
            )
-           SELECT id, namespace, content, tags, confidence, signal, retrieval_count,
-                  surfaced_count, embedding, embedding_model, ingestion_ts, taint,
-                  source_ref
+           SELECT id, namespace, content, tags, type, rowid, confidence, signal,
+                  retrieval_count, surfaced_count, embedding, embedding_model,
+                  ingestion_ts, taint, source_ref
            FROM ranked
            WHERE rn <= ?
            ORDER BY confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
@@ -1202,6 +1239,7 @@ def consolidate(
         if seed["id"] in absorbed or seed["id"] in contested_ids:
             continue
 
+
         # Gather this seed's qualifying neighbors via the SHARED predicate
         # (issue #62, 7.2): consolidate's cluster loop and organize's
         # related-graph must decide "related at this threshold" identically,
@@ -1224,6 +1262,19 @@ def consolidate(
 
         if not neighbors:
             continue
+        # Issue #376: subject-aware ADMISSION before contested classification.
+        # One ordered algorithm: iterate the gathered neighbors in rowid order
+        # (deterministic), simulating the keeper's tag growth with the SAME
+        # _merge_tag_strings rule each real absorb applies; a neighbor whose
+        # task subject is incompatible with the SIMULATED keeper is not
+        # admitted (the untagged-seed bridge is modeled: an untagged keeper
+        # admits task:issue41, its simulated tags become task:issue41, and
+        # task:issue42 is then refused). The admitted set keeps the original
+        # similarity order so absorb sequencing is unchanged for
+        # all-compatible clusters. Applied identically to the dry-run and
+        # real paths below (both consume this filtered list), so the preview
+        # claims no merge the real run refuses.
+        neighbors = _admitted_neighbors(seed, neighbors)
 
         # Contradiction guard (issue #49 Deliverable A): similarity cannot
         # distinguish "always X" from "never X" — they are near-duplicates by
@@ -1419,11 +1470,27 @@ def consolidate(
         try:
             conn.execute("BEGIN")
             keeper_grew = False
+            cluster_absorbed = 0
             # v15 (#173 PR-review F30): ONE clock for the whole cluster
             # transaction — every absorb tombstone/merge and the
             # consolidated_at stamp below share it (contract line 137/AC7).
             cluster_now = now_iso()
             for nb_row, nb_sim in neighbors:
+                # Issue #376 defense-in-depth: revalidate this absorb against
+                # the keeper's CURRENT tags/type (grown by the absorbs above).
+                # The _admitted_neighbors simulation already decided the set;
+                # this must agree — a disagreement (concurrent tag change)
+                # skips the absorb and leaves the neighbor live.
+                from storelib import subject as _subject
+                _krow = conn.execute(
+                    "SELECT tags, type FROM memory WHERE id=?", (seed["id"],)
+                ).fetchone()
+                if _krow is not None and _subject.incompatible(
+                    _krow["tags"] or "", _krow["type"], nb_row["tags"] or "",
+                    nb_row["type"] if "type" in nb_row.keys() else None,
+                ):
+                    print(_subject.veto_line(nb_row["id"], nb_sim))
+                    continue
                 # Preserve absorbed content + record provenance + merge metadata
                 # + supersede (issue #19). consolidate-ONLY helper.
                 decision = _absorb_into_keeper(conn, seed, nb_row, now=cluster_now)
@@ -1435,6 +1502,7 @@ def consolidate(
                 # would also churn the summary member ids for nothing).
                 keeper_grew = keeper_grew or decision["will_append"]
                 absorbed.add(nb_row["id"])
+                cluster_absorbed += 1
             # Mark the keeper as consolidated.
             conn.execute(
                 "UPDATE memory SET consolidated_at=? WHERE id=?",
@@ -1445,7 +1513,12 @@ def consolidate(
             # writer must not turn this cluster's COMMIT into an immediate
             # rollback; the ROLLBACK path below stays the atomic backstop.
             _commit(conn)
-            merged_count += len(neighbors)
+            # Issue #376 (final-critic round 1): count the ABSORBS THAT
+            # LANDED, not the admitted neighbor count — the per-absorb
+            # revalidation above can veto a neighbor (concurrent tag change),
+            # and report["merged"] / the summary line must never claim a
+            # merge that did not happen (the PRR-001 truthful-audit class).
+            merged_count += cluster_absorbed
             if collect_run_ids and keeper_grew:
                 consolidated_ids.append(seed["id"])
             if contested_override and restatement_override:
@@ -1470,6 +1543,11 @@ def consolidate(
                     "keeper": seed["id"],
                     "namespace": seed["namespace"],
                     "merged": True,
+                    # Issue #376 (final-critic round 1): members list what the
+                    # admission DECIDED; actually_absorbed names the subset the
+                    # real loop superseded (a revalidation veto leaves its row
+                    # live — never reported as merged).
+                    "actually_absorbed": cluster_absorbed,
                     "members": [
                         {"id": mid, "polarity": "neg" if pol else "pos",
                          "content_preview": (mcontent or "")[:60]}
