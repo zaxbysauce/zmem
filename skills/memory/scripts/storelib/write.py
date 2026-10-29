@@ -999,6 +999,7 @@ def _detect_duplicate(
     conn: sqlite3.Connection, content: str, namespace: str,
     dedup_cache: dict | None = None, *,
     tags: str | None = None, type_: str | None = None,
+    emit: bool = True,
 ) -> tuple[sqlite3.Row | None, float, bytes | None]:
     """Find a duplicate live memory for `content` in `namespace`: semantic
     similarity (if embeddings are available) with an exact-match fallback.
@@ -1028,7 +1029,6 @@ def _detect_duplicate(
 
     existing = None
     dedup_sim = 0.0
-    semantic_had = False
     if emb is not None:
         # Semantic dedup: query vec0 for the ranked above-threshold window in
         # the same namespace, then fall through any subject-vetoed candidate
@@ -1036,11 +1036,13 @@ def _detect_duplicate(
         # first window entry is the nearest — byte-identical to the old
         # single-nearest behavior.
         raw_ranked = _find_semantic_duplicate(conn, emb, namespace, window=True)
-        semantic_had = bool(raw_ranked)
-        ranked = _subject_admit(raw_ranked, tags, type_)
+        ranked = _subject_admit(raw_ranked, tags, type_, emit=emit)
         if ranked:
             existing, dedup_sim = ranked[0]
-    if existing is None and not semantic_had:
+    # F-09: run the exact lane whenever no semantic candidate was ADMITTED —
+    # including the all-vetoed case, where a compatible exact duplicate
+    # beyond the semantic window would otherwise be inserted as a duplicate.
+    if existing is None:
         # Fallback: exact-match dedup.
         norm = _normalize_content(content)
         cache_key = (namespace, norm)
@@ -1698,9 +1700,11 @@ def add_memory(
         # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
         # dedup-on-write semantics to incoming rows without duplicating this logic.
         _warn_fake_active_once()
-        existing, dedup_sim, emb = _detect_duplicate(
-            conn, content, namespace, tags=tags, type_=type_)
-        if force_append or skip_dedup:
+        _bypass = force_append or skip_dedup
+        existing, dedup_sim, emb, _legacy = call_detect_duplicate(
+            _detect_duplicate, conn, content, namespace, tags=tags,
+            type_=type_, emit=not _bypass)
+        if _bypass:
             # #179: the card refresh path appends unconditionally — dedup
             # would fold the replacement card into the live card it is
             # replacing (the SHA-256 no-op check already ran above it).
@@ -1914,7 +1918,7 @@ SUBJECT_MAX_EXACT_CANDIDATES = 32
 _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
 
 
-def _subject_admit(ranked, tags, type_):
+def _subject_admit(ranked, tags, type_, emit: bool = True):
     """Issue #376: filter ranked ``(row, sim)`` candidates by task-subject
     compatibility, in rank order, falling through vetoed candidates.
 
@@ -1945,13 +1949,49 @@ def _subject_admit(ranked, tags, type_):
             out.append((row, sim))
             continue
         if _subject.identities(tags) and _subject.identities(cand_tags):
-            SUBJECT_COMPAT_EVALS += 1
+            if emit:
+                SUBJECT_COMPAT_EVALS += 1
             if _subject.incompatible(tags, type_, cand_tags, cand_type):
-                print(_subject.veto_line(row["id"], sim))
+                if emit:
+                    print(_subject.veto_line(row["id"], sim))
                 continue
         out.append((row, sim))
     return out
 
+
+
+def call_detect_duplicate(
+    detector, conn, content: str, namespace: str, *, dedup_cache=None,
+    tags=None, type_=None, emit=True,
+):
+    """Issue #376: invoke the CALLER-INSTALLED ``detector`` (the per-module
+    ``_detect_duplicate`` global — monkeypatch-replaceable) with
+    identity inputs when its signature accepts them (per-call
+    ``inspect.signature`` binding — the binding is a monkeypatch-replaceable
+    module global; a BINDING TypeError selects the plain 4-arg call and the
+    caller must apply the subject veto site-side after re-fetching the
+    candidate's metadata; an INTERNAL TypeError during execution always
+    propagates). ``emit=False`` suppresses the veto line and the
+    SUBJECT_COMPAT_EVALS increment on paths whose dedup result is discarded
+    (force_append / skip_dedup bypasses — UR-6).
+
+    Returns ``(existing, similarity, embedding, legacy)``.
+    """
+    import inspect
+
+    try:
+        inspect.signature(detector).bind(
+            conn, content, namespace, dedup_cache=dedup_cache,
+            tags=tags, type_=type_, emit=emit,
+        )
+    except TypeError:
+        out = detector(conn, content, namespace, dedup_cache=dedup_cache)
+        return out[0], out[1], out[2], True
+    out = detector(
+        conn, content, namespace, dedup_cache=dedup_cache,
+        tags=tags, type_=type_, emit=emit,
+    )
+    return out[0], out[1], out[2], False
 
 
 def _find_semantic_duplicate(
@@ -2464,8 +2504,9 @@ def update_memory(
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
         _warn_fake_active_once()
-        existing, dedup_sim, emb = _detect_duplicate(
-            conn, content_eff, ns, tags=tags_eff, type_=type_eff)
+        existing, dedup_sim, emb, _legacy = call_detect_duplicate(
+            _detect_duplicate, conn, content_eff, ns, tags=tags_eff,
+            type_=type_eff)
         # v11 (issue #61, 6.2): the same write-time polarity guard as add —
         # a contradiction is NOT a duplicate. Disagree ⇒ skip the merge and
         # insert the replacement row; generate_links_on_write below records

@@ -32,9 +32,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   existing row id and similarity only, never content), and bounded candidate
   work is observable via the `storelib.write.SUBJECT_COMPAT_EVALS` counter.
 - Acceptance contract: `tests/test_subject_dedup_contract.py` (independently
-  authored, 7 discriminating checks incl. real-MiniLM legs that hard-fail
-  with MODEL_UNAVAILABLE when the pinned model is absent) plus
-  `tests/test_subject_dedup_supp.py`. No schema change; no migration.
+  authored, 7 discriminating checks; the real-MiniLM legs FAIL with a
+  structured MODEL_UNAVAILABLE signal when the pinned model is absent —
+  hard under the frozen pytest argv form, an explicit named-INCOMPLETE
+  banner under the direct-python CI form, where only the model-free legs
+  are scored) plus `tests/test_subject_dedup_supp.py` (its link-formation
+  assertions are lane-conditional and skip model-absent). No schema change;
+  no migration. Writers older than 0.129.0 do not apply the subject guard;
+  mixed-fleet stores are structurally unaffected (no format change).
+- Feedback-round hardening (swarm review F-01..F-17): consolidation
+  re-reads seed/neighbor rows at live state before admission (a grown
+  keeper can no longer be re-absorbed via its stale snapshot, which could
+  drop earlier merged content from recall); admission vetoes are visible on
+  stderr and counted; report `merged` counts only absorbs that landed;
+  subject parsing is linear over the canonical `[,;\s]+` tag grammar with
+  case-folded keys and a 4096-char ingest tags cap; the `lesson` carve-out
+  is symmetric (BOTH rows must be lessons — a writer cannot opt one row out
+  by type); the ingest dedup cache keeps the newest window on both writers;
+  and the direct-form classifier is structural (prefix-typed), never
+  substring.
 
 ## [0.128.0] - 2026-10-28
 

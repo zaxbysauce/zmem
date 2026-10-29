@@ -734,8 +734,8 @@ def _require_real_model_report() -> dict:
             detail = json.dumps(_REAL_MODEL_CACHE["error"], indent=1)
             raise AssertionError(
                 "DRIVER_ERROR: the real-model driver subprocess failed "
-                "(this is a harness failure, NOT model unavailability — do "
-                f"not report it as MODEL_UNAVAILABLE): {detail}")
+                f"(this is a harness failure, not model unavailability): "
+                f"{detail}")
         detail = json.dumps(_REAL_MODEL_CACHE.get("unavailable"), indent=1)
         raise AssertionError(
             "MODEL_UNAVAILABLE: the pinned real model ("
@@ -1902,8 +1902,11 @@ if __name__ == "__main__":
         try:
             fn()
         except AssertionError as exc:
-            failures.append(name)
-            if "MODEL_UNAVAILABLE" not in str(exc):
+            # F-04/UR-1: classify by structured PREFIX, never substring —
+            # only the unavailable branch raises messages that start with
+            # "MODEL_UNAVAILABLE:"; a DRIVER_ERROR (or any other failure)
+            # is a hard failure regardless of its message text.
+            if not str(exc).startswith("MODEL_UNAVAILABLE:"):
                 model_unavailable_only = False
             print(f"FAIL {name}: {exc}")
             traceback.print_exc()

@@ -328,8 +328,15 @@ def _subject_incompatible_neighbor(tags: str, type_: str | None, row) -> bool:
     """Issue #376: True when tag propagation to this neighbor would cross an
     explicit task-subject boundary (both sides carry disjoint identities and
     neither row is a lesson). Function-local import for the cycle law above.
+    Counts a both-identities evaluation on the frozen observability seam.
     """
     from storelib import subject as _subject
+    import storelib.write as _write_mod
+    a_ids = _subject.identities(tags)
+    b_ids = _subject.identities(
+        row["tags"] if "tags" in row.keys() else None)
+    if a_ids and b_ids:
+        _write_mod.SUBJECT_COMPAT_EVALS += 1
     return _subject.incompatible(tags, type_, row["tags"] if "tags" in row.keys() else None,
                                  row["type"] if "type" in row.keys() else None)
 
@@ -383,7 +390,8 @@ def generate_links_on_write(
             conn, mid, content, tags, namespace, threshold
         )
 
-    report = {"related": 0, "contradicts": 0, "neighbors": len(neighbors)}
+    report = {"related": 0, "contradicts": 0, "neighbors": len(neighbors),
+              "subject_suppressed": 0}
     if not neighbors:
         return report
 
@@ -393,11 +401,16 @@ def generate_links_on_write(
     from storelib.write import _merge_tag_strings
     from storelib.entity import relink_memory
 
+    import sys as _sys
     for row, sim in neighbors:
         neighbor_pol = _polarity_signature(row["content"])
         relation = "related" if neighbor_pol == new_polarity else "contradicts"
         if add_link_pair(conn, mid, row["id"], relation, score=sim):
             report[relation] += 1
+        if propagate_tags and _subject_incompatible_neighbor(tags, type_, row):
+            # ST-4: the suppressed tag-union is visible (stderr summary) and
+            # counted in the report — never a silent suppression.
+            report["subject_suppressed"] += 1
         # Attribute evolution: tags (and, via relink, entity links) flow into
         # the neighbor. First-seen tags win; empty new tags are a no-op.
         # Suppressed for structural-marker writes (``propagate_tags=False``).
@@ -412,6 +425,14 @@ def generate_links_on_write(
                         "UPDATE memory SET tags=? WHERE id=?", (merged, row["id"])
                     )
                     relink_memory(conn, row["id"])
+    if report["subject_suppressed"]:
+        from storelib import subject as _veto_subject
+        print(
+            f"[zmem] links: subject guard suppressed tag propagation to "
+            f"{report['subject_suppressed']} neighbor(s) "
+            f"({_veto_subject.SUBJECT_VETO_CODE})",
+            file=_sys.stderr,
+        )
     return report
 
 

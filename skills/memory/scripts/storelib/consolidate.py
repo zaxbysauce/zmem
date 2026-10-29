@@ -625,12 +625,30 @@ def _gather_neighbors(
     return neighbors, knn_truncated
 
 
+def _refresh_live_row(conn, row_id):
+    """Issue #376 (feedback round, F-01): re-read one row at CURRENT live
+    state (same projection as the working-set CTE). Returns None when the
+    row was superseded by an earlier cluster this run."""
+    return conn.execute(
+        "SELECT id, namespace, content, tags, type, rowid, confidence, signal, "
+        "retrieval_count, surfaced_count, embedding, embedding_model, "
+        "ingestion_ts, taint, source_ref FROM memory "
+        "WHERE id=? AND superseded_at IS NULL",
+        (row_id,),
+    ).fetchone()
+
+
 def _admitted_neighbors(seed, neighbors):
-    """Issue #376: filter a seed's gathered neighbors by task-subject
-    compatibility against the SIMULATED grown keeper (see the seed loop).
-    Returns the admitted subset in the original similarity order. Rows
-    missing tags/type (should not happen post-#376) are treated as absent
-    identity — admitted, never vetoed on unreadable metadata.
+    """Issue #376: filter a seed's gathered (already live-refreshed)
+    neighbors by task-subject compatibility against the SIMULATED grown
+    keeper (see the seed loop). Returns the admitted subset in the
+    simulation's own ROWID-ASCENDING admission order — the dry-run preview,
+    the real absorb loop, and the per-absorb revalidation walk this identical
+    sequence, so preview == real by construction (feedback round F-07: the
+    earlier "original similarity order" wording was wrong for multi-neighbor
+    clusters; gather order is deliberately NOT preserved). Rows missing
+    tags/type are treated as absent identity — admitted, never vetoed on
+    unreadable metadata.
     """
     from storelib import subject as _subject
     from storelib.write import _merge_tag_strings
@@ -650,10 +668,21 @@ def _admitted_neighbors(seed, neighbors):
     for nb, sim in ordered:
         nb_tags = _fld(nb, "tags") or ""
         nb_type = _fld(nb, "type")
+        a_ids = _subject.identities(keeper_tags)
+        b_ids = _subject.identities(nb_tags)
+        if a_ids and b_ids:
+            # Frozen observability seam: this site evaluates compatibility
+            # on the consolidation decision path.
+            import storelib.write as _write_mod
+            _write_mod.SUBJECT_COMPAT_EVALS += 1
         if not _subject.incompatible(keeper_tags, keeper_type, nb_tags, nb_type):
             admitted.append((nb, sim))
             # Simulate the tag growth the real absorb would apply.
             keeper_tags = _merge_tag_strings(keeper_tags, nb_tags)
+        else:
+            # ST-4: admission refusals are visible (stderr), matching the
+            # write-path veto channel contract.
+            print(_subject.veto_line(nb["id"], sim), file=sys.stderr)
     # Returned in the SIMULATION's own admission order (rowid-ascending) so
     # the dry-run preview, the real absorb loop, and the per-absorb
     # revalidation all walk the identical sequence — preview == real by
@@ -1262,19 +1291,38 @@ def consolidate(
 
         if not neighbors:
             continue
+
+        # Issue #376 (feedback round, F-01): the snapshot rows gathered above
+        # are STALE for any row an earlier cluster mutated this run — a grown
+        # keeper's pre-growth tags made a later cluster absorb it under a
+        # different subject, dropping the earlier absorb's merged content
+        # from live recall. Re-fetch the seed and every neighbor at CURRENT
+        # live state before any admission/classification decision; rows
+        # superseded by an earlier cluster drop out here.
+        fresh_seed = _refresh_live_row(conn, seed["id"])
+        if fresh_seed is None:
+            continue  # the seed itself was absorbed by an earlier cluster
+        seed = fresh_seed
+        refreshed = []
+        for nb, sim in neighbors:
+            fresh = _refresh_live_row(conn, nb["id"])
+            if fresh is not None:
+                refreshed.append((fresh, sim))
+        neighbors = refreshed
+        if not neighbors:
+            continue
+
         # Issue #376: subject-aware ADMISSION before contested classification.
-        # One ordered algorithm: iterate the gathered neighbors in rowid order
-        # (deterministic), simulating the keeper's tag growth with the SAME
-        # _merge_tag_strings rule each real absorb applies; a neighbor whose
-        # task subject is incompatible with the SIMULATED keeper is not
+        # One ordered algorithm: iterate the refreshed neighbors in rowid
+        # order (deterministic), simulating the keeper's tag growth with the
+        # SAME _merge_tag_strings rule each real absorb applies; a neighbor
+        # whose task subject is incompatible with the SIMULATED keeper is not
         # admitted (the untagged-seed bridge is modeled: an untagged keeper
         # admits task:issue41, its simulated tags become task:issue41, and
-        # task:issue42 is then refused). The admitted set keeps the original
-        # similarity order so absorb sequencing is unchanged for
-        # all-compatible clusters. Applied identically to the dry-run and
-        # real paths below (both consume this filtered list), so the preview
-        # claims no merge the real run refuses.
-        neighbors = _admitted_neighbors(seed, neighbors)
+        # task:issue42 is then refused). Applied identically to the dry-run
+        # and real paths below (both consume this filtered list), so the
+        # preview claims no merge the real run refuses.
+        admitted = _admitted_neighbors(seed, neighbors)
 
         # Contradiction guard (issue #49 Deliverable A): similarity cannot
         # distinguish "always X" from "never X" — they are near-duplicates by
@@ -1286,6 +1334,10 @@ def consolidate(
         # would do: a contested cluster never appears as a would-APPEND
         # preview, only as the CONTESTED block below.
         member_pols = [(seed["id"], seed["content"], _polarity_signature(seed["content"]))]
+        # (``neighbors`` here is the REFRESHED full live set — admission-
+        # refused members still count for contested classification, so a
+        # mixed-polarity cross-subject cluster keeps its CONTESTED report;
+        # feedback-round finding UR-3.)
         member_pols += [
             (nb["id"], nb["content"], _polarity_signature(nb["content"]))
             for nb, _sim in neighbors
@@ -1391,6 +1443,12 @@ def consolidate(
                     contested_ids.update(mid for mid, _, _ in member_pols)
                     continue
 
+        # Issue #376 (feedback round, F-10): a cluster whose every neighbor
+        # was admission-refused merges nothing — no preview, no absorb, and
+        # no consolidated_at stamp.
+        if not admitted:
+            continue
+
         # The seed is the keeper. With the rows query ordered by
         # (confidence * (retrieval_count + surfaced_count) DESC, confidence DESC,
         # ingestion_ts ASC, id ASC), the seed has the highest
@@ -1414,7 +1472,7 @@ def consolidate(
             # go so successive absorbs see the keeper as the real merge would.
             dry_keeper_content = seed["content"] or ""
             grew_preview = False
-            for nb_row, nb_sim in neighbors:
+            for nb_row, nb_sim in admitted:
                 dec = _absorb_decision(dry_keeper_content, nb_row["content"] or "", nb_row["id"])
                 print(f"    absorb [{nb_row['id'][:8]}] sim={nb_sim:.3f}: "
                       f"conf={nb_row['confidence']} rc={nb_row['retrieval_count']} "
@@ -1439,7 +1497,7 @@ def consolidate(
                 else:
                     print("        already represented in keeper; nothing to append")
                 absorbed.add(nb_row["id"])  # track in dry-run too
-            merged_count += len(neighbors)
+            merged_count += len(admitted)
             if collect_run_ids and grew_preview:
                 consolidated_ids.append(seed["id"])
             if contested_override and restatement_override:
@@ -1475,7 +1533,7 @@ def consolidate(
             # transaction — every absorb tombstone/merge and the
             # consolidated_at stamp below share it (contract line 137/AC7).
             cluster_now = now_iso()
-            for nb_row, nb_sim in neighbors:
+            for nb_row, nb_sim in admitted:
                 # Issue #376 defense-in-depth: revalidate this absorb against
                 # the keeper's CURRENT tags/type (grown by the absorbs above).
                 # The _admitted_neighbors simulation already decided the set;
@@ -1530,7 +1588,7 @@ def consolidate(
                 report["uncontested_restatements"] += 1
                 print(f"[zmem] consolidate: merged restatement cluster around "
                       f"[{seed['id'][:8]}] (same-predicate restatement, "
-                      f"issue #71 G; {len(neighbors) + 1} members)")
+                      f"issue #71 G; {cluster_absorbed + 1} members absorbed)")
             elif contested_override:
                 # Appended only after the successful COMMIT, and printed so a
                 # real-run override is never invisible in human output (the
@@ -1538,11 +1596,11 @@ def consolidate(
                 # trail; PRR-001).
                 print(f"[zmem] consolidate: merged CONTESTED cluster around "
                       f"[{seed['id'][:8]}] (--merge-contested override; "
-                      f"{len(neighbors) + 1} members)")
+                      f"{cluster_absorbed + 1} members absorbed)")
                 report["contested_clusters"].append({
                     "keeper": seed["id"],
                     "namespace": seed["namespace"],
-                    "merged": True,
+                    "merged": cluster_absorbed > 0,
                     # Issue #376 (final-critic round 1): members list what the
                     # admission DECIDED; actually_absorbed names the subset the
                     # real loop superseded (a revalidation veto leaves its row

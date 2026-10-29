@@ -27,6 +27,7 @@ from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.state_expiry import validate_inject_until
 from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
+from storelib.write import SUBJECT_MAX_EXACT_CANDIDATES as _CAP
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
     EVIDENCE_KINDS,
@@ -568,6 +569,9 @@ def cmd_export_jsonl(
             conn.rollback()
 
 INGEST_MAX_CONTENT_CHARS = MAX_CONTENT_CHARS
+# ST-1/MX-3/F-06: remote tags are parse input for the subject identity
+# system; bound them like content (4096 chars is generous for task keys).
+INGEST_MAX_TAGS_CHARS = 4096
 
 # Shape guard for an incoming id: UUID-length hex-and-dashes. This is a
 # charset/length guard, not a UUID parser -- the point is that an id from a
@@ -1095,6 +1099,9 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     confidence = max(0.0, min(1.0, confidence))
 
     tags = _opt_str("tags")
+    if tags is not None and len(tags) > INGEST_MAX_TAGS_CHARS:
+        _err(f"tags field exceeds {INGEST_MAX_TAGS_CHARS} characters "
+             f"(got {len(tags)})")
     source_ref = _opt_str("source_ref")
     supersede_reason = _opt_str("supersede_reason")
     valid_from = _opt_str("valid_from")
@@ -1722,7 +1729,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 if _lx is not None and _subject.incompatible(
                     tags, type_, _lx["tags"], _lx["type"],
                 ):
-                    print(_subject.veto_line(existing["id"], _sim if _sim else 1.0))
+                    print(_subject.veto_line(existing["id"], _sim if _sim else 1.0),
+                          file=sys.stderr)
                     existing = None
         # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
         # guard add_memory/update_memory apply. A remote row that contradicts
@@ -1814,7 +1822,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 dedup_cache[_ck] = [mid]
             else:
                 _cv.append(mid)
-                if len(_cv) > 32:
+                if len(_cv) > _CAP:
                     del _cv[0]
         if started_tx:
             _commit(conn)
@@ -1840,21 +1848,12 @@ def _detect_duplicate_subject(
 
     Returns ``(existing, similarity, embedding, legacy)``.
     """
-    import inspect
-
-    try:
-        inspect.signature(_detect_duplicate).bind(
-            conn, content, namespace, dedup_cache=dedup_cache,
-            tags=tags, type_=type_,
-        )
-    except TypeError:
-        out = _detect_duplicate(conn, content, namespace, dedup_cache=dedup_cache)
-        return out[0], out[1], out[2], True
-    out = _detect_duplicate(
-        conn, content, namespace, dedup_cache=dedup_cache,
-        tags=tags, type_=type_,
+    from storelib.write import call_detect_duplicate
+    existing, sim, emb, legacy = call_detect_duplicate(
+        _detect_duplicate, conn, content, namespace, dedup_cache=dedup_cache,
+        tags=tags, type_=type_, emit=True,
     )
-    return out[0], out[1], out[2], False
+    return existing, sim, emb, legacy
 
 
 def _stage_sync_source(
@@ -2677,7 +2676,12 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     ids = dedup_cache.get(key)
                     if ids is None:
                         dedup_cache[key] = [r["id"]]
-                    elif len(ids) < _CAP:
+                    else:
+                        # F-08: sliding window keeps the NEWEST _CAP ids
+                        # (oldest-first order preserved) so both cache
+                        # writers agree and newest rows stay fold targets.
+                        if len(ids) >= _CAP:
+                            del ids[0]
                         ids.append(r["id"])
         except Exception:
             # If the pre-scan fails (e.g. transient lock/IO error), pass None so
