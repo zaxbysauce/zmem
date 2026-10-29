@@ -1100,8 +1100,8 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
 
     tags = _opt_str("tags")
     if tags is not None and len(tags) > INGEST_MAX_TAGS_CHARS:
-        _err(f"tags field exceeds {INGEST_MAX_TAGS_CHARS} characters "
-             f"(got {len(tags)})")
+        raise ValueError(f"field 'tags' is {len(tags)} chars, over the "
+                         f"{INGEST_MAX_TAGS_CHARS} limit")
     source_ref = _opt_str("source_ref")
     supersede_reason = _opt_str("supersede_reason")
     valid_from = _opt_str("valid_from")

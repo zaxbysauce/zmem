@@ -1920,12 +1920,15 @@ if __name__ == "__main__":
     print(f"\nRan {len(_ALL_TESTS)} tests")
     if failures:
         if model_unavailable_only:
-            print(
-                "MODEL_UNAVAILABLE-DIAGNOSTIC: every failure is a "
-                "MODEL_UNAVAILABLE signature; the real-model legs did NOT "
-                "run (diagnostic/incomplete lane — native approval requires "
-                "the provisioned pinned model; see the docstring)."
-            )
+            # F-03/F-04: the failure set is EXACTLY the model-absent
+            # signatures — named-INCOMPLETE banner, exit 0. Never claimed as
+            # a pass of the unrun legs; native approval requires the
+            # provisioned pinned model (see the docstring).
+            print("INCOMPLETE: real-model legs did not run (model-absent "
+                  f"environment): {', '.join(failures)}. These legs are "
+                  "enforced by the provisioned-model CI lane running the "
+                  "frozen pytest argvs; this direct-form exit reflects only "
+                  "the legs that ran.")
             sys.exit(0)
         print(f"FAILED ({len(failures)}): {', '.join(failures)}")
         sys.exit(1)

@@ -1072,7 +1072,7 @@ def _detect_duplicate(
                 ).fetchall() if ids else []
                 by_id = {r["id"]: r for r in rows}
                 ordered = [(by_id[i], 1.0) for i in ids if i in by_id]
-                admitted = _subject_admit(ordered, tags, type_)
+                admitted = _subject_admit(ordered, tags, type_, emit=emit)
                 if admitted:
                     existing, dedup_sim = admitted[0]
             # else: cache miss ⇒ no exact-match duplicate; skip the scan.
@@ -1098,7 +1098,7 @@ def _detect_duplicate(
                 ).fetchall()
                 admitted = _subject_admit(
                     [(r, 1.0) for r in rows[:SUBJECT_MAX_EXACT_CANDIDATES]],
-                    tags, type_)
+                    tags, type_, emit=emit)
                 if admitted:
                     existing, dedup_sim = admitted[0]
             except sqlite3.OperationalError:
@@ -1127,7 +1127,7 @@ def _detect_duplicate(
                 ).fetchall() if eq else []
                 by_id = {r["id"]: r for r in full}
                 ordered = [(by_id[r["id"]], 1.0) for r, _ in eq if r["id"] in by_id]
-                admitted = _subject_admit(ordered, tags, type_)
+                admitted = _subject_admit(ordered, tags, type_, emit=emit)
                 if admitted:
                     existing, dedup_sim = admitted[0]
     return existing, dedup_sim, emb
