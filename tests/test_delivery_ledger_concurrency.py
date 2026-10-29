@@ -38,6 +38,7 @@ Runs standalone: python tests/test_delivery_ledger_concurrency.py
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import json

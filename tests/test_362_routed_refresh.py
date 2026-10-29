@@ -8,6 +8,7 @@ already-delivered entry under the SAME upsert law the reducer implements
 
 Run standalone: python tests/test_362_routed_refresh.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import os
 import sys
 import tempfile

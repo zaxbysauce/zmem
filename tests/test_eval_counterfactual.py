@@ -1,6 +1,7 @@
 """Issue #157 contract tests: counterfactual replay evaluator."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import importlib.util

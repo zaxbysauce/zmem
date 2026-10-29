@@ -4,6 +4,7 @@ These checks use the frozen pages acceptance store but own their assertions.
 They do not regenerate or alter the frozen fixture corpus.
 """
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import json

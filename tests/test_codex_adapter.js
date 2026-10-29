@@ -10,6 +10,7 @@
 //   - noise preservation and sentinel-safe translation on the Codex lane
 
 "use strict";
+require("./_store_guard.js"); // issue #244 isolation guard
 
 const { spawnSync } = require("child_process");
 const fs = require("fs");

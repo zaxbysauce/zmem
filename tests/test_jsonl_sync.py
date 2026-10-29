@@ -44,6 +44,7 @@ Run: python -m pytest tests/test_jsonl_sync.py -q
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

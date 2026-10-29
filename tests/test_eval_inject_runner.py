@@ -9,6 +9,7 @@ determinism, the precompact (recent) arm, and the empty-render fence.
 
 Run: python tests/test_eval_inject_runner.py   (plain unittest, CI convention)
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import contextlib
 import json
 import os

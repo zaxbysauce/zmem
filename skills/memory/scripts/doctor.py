@@ -1371,8 +1371,138 @@ def _check_mcp_token() -> dict:
             default) -- details carry unscoped_token: true
       pass  scoped token -- details carry unscoped_token: false and the
             namespace count (plus reads_require_namespace guidance)
+
+    Issue #369: when the plural ZMEM_MCP_TOKENS_FILE (principal-map mode) is
+    set it WINS (matching the server's resolve_token_auth precedence) and the
+    check reports the map's scope shape instead: principal/scoped/unscoped/
+    revoked counts, mode="principal-map", never a token value.
     """
     env_tok = os.environ.get("ZMEM_MCP_TOKEN", "").strip()
+    # Issue #369: the principal-map auth mode (ZMEM_MCP_TOKENS_FILE, plural)
+    # WINS over the legacy vars server-side (resolve_token_auth precedence),
+    # so it is checked FIRST and returns — falling through to the legacy
+    # report would describe a mode the box is not running. Doctor parses the
+    # JSON directly (never imports server auth — its loaders exit 2, the
+    # same reason as the legacy branches) and reports the scope SHAPE only:
+    # counts, never token values, never principal hosts.
+    tokens_file = os.environ.get("ZMEM_MCP_TOKENS_FILE", "").strip()
+    if tokens_file:
+        # Fleet-lane parity hardening (swarm-pr-review PRR-001): the hub
+        # refuses non-regular files (a FIFO at the path would BLOCK the
+        # open — auth.py:1077) and over-permissive maps at load
+        # (_map_permission_problem, issue #406), and the fleet lane caps
+        # its diagnostic read at 4 MiB. This check runs on EVERY doctor
+        # invocation (the hardened fleet lane only under --fleet), so it
+        # must never report pass for a map the hub would exit 2 on, and
+        # must never block on a FIFO.
+        map_path = Path(tokens_file).expanduser()
+        try:
+            _st = map_path.stat()
+        except OSError as exc:
+            return _check(
+                "mcp-token", "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) stat failed: {exc}",
+                mode="principal-map", source="ZMEM_MCP_TOKENS_FILE",
+            )
+        if not _stat.S_ISREG(_st.st_mode):
+            return _check(
+                "mcp-token", "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) is not a regular "
+                "file — the hub refuses it (a FIFO/device would block the "
+                "open); doctor refuses rather than block too.",
+                mode="principal-map", source="ZMEM_MCP_TOKENS_FILE",
+            )
+        _perm_problem = _map_permission_problem(map_path, _st)
+        if _perm_problem:
+            return _check(
+                "mcp-token", "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) is configured but "
+                "the hub would refuse to load it: over-permissive: "
+                f"{_perm_problem}. Fix the file permissions (owner-only).",
+                mode="principal-map", source="ZMEM_MCP_TOKENS_FILE",
+            )
+        try:
+            raw = map_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return _check(
+                "mcp-token", "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) is configured but "
+                f"cannot be read: {exc}",
+                mode="principal-map", source="ZMEM_MCP_TOKENS_FILE",
+            )
+        if len(raw) > 4 * 1024 * 1024:
+            return _check(
+                "mcp-token", "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) exceeds the 4 MiB "
+                "diagnostic read cap.",
+                mode="principal-map", source="ZMEM_MCP_TOKENS_FILE",
+            )
+        try:
+            problems, principal_count = _fleet_principal_map_problems(raw)
+            if problems:
+                return _check(
+                    "mcp-token",
+                    "fail",
+                    "ZMEM_MCP_TOKENS_FILE is configured but the principal "
+                    "map is invalid (the hub would exit 2): "
+                    + "; ".join(problems[:3]),
+                    mode="principal-map",
+                    source="ZMEM_MCP_TOKENS_FILE",
+                )
+            import json as _json
+            obj = _json.loads(raw)
+            scoped = 0
+            unscoped = 0
+            revoked = 0
+            for entry in obj.values():
+                if not isinstance(entry, dict):
+                    continue
+                namespaces = entry.get("namespaces")
+                if namespaces:
+                    scoped += 1
+                else:
+                    unscoped += 1
+                if entry.get("revoked") is True:
+                    revoked += 1
+        except (ValueError, RecursionError, TypeError) as exc:
+            # Whole-branch containment (plan-critic round 1): structural
+            # validation itself encodes UTF-8 and can raise on escaped-
+            # surrogate token keys — any failure is a structured verdict,
+            # never an escaping exception.
+            return _check(
+                "mcp-token",
+                "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({tokens_file}) is configured but "
+                f"cannot be validated (the hub would exit 2): {exc}",
+                mode="principal-map",
+                source="ZMEM_MCP_TOKENS_FILE",
+            )
+        # An all-revoked map authenticates nobody (MapTokenVerifier refuses
+        # every token) — report warn, never pass (swarm-pr-review PRR-001).
+        all_revoked = bool(principal_count) and revoked == principal_count
+        verdict = ("warn" if all_revoked
+                   else ("pass" if scoped else "warn"))
+        msg = (
+            f"Principal-map auth mode: {principal_count} principal(s) "
+            f"({scoped} scoped, {unscoped} unscoped"
+            + (f", {revoked} revoked" if revoked else "")
+            + "). "
+            + ("Every principal is revoked — the hub refuses every token."
+               if all_revoked else
+               ("Unscoped principals have full store access."
+                if unscoped else "Every principal is namespace-scoped."))
+        )
+        return _check(
+            "mcp-token",
+            verdict,
+            msg,
+            mode="principal-map",
+            source="ZMEM_MCP_TOKENS_FILE",
+            principal_count=principal_count,
+            scoped_count=scoped,
+            unscoped_count=unscoped,
+            revoked_count=revoked,
+        )
     if env_tok:
         return _check(
             "mcp-token",
@@ -2233,25 +2363,36 @@ def _check_second_stores(
             **details,
         )
 
-    canonical_ids: set[str] | None = None
+    # Issue #245: classify against ALL canonical rows, not just live ones.
+    # A second-store row that canonical holds as a TOMBSTONE is not stranded
+    # — promote-store refuses to resurrect it by design — so it must never
+    # drive the cutover-blocking FAIL. Only ids absent from canonical
+    # entirely are real stranding.
+    canonical_live_ids: set[str] | None = None
+    canonical_all_ids: set[str] | None = None
     if canonical.exists():
         try:
             conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
             try:
-                canonical_ids = {
+                canonical_live_ids = {
                     r[0]
                     for r in conn.execute(
                         "SELECT id FROM memory WHERE superseded_at IS NULL"
                     )
                 }
+                canonical_all_ids = {
+                    r[0] for r in conn.execute("SELECT id FROM memory")
+                }
             finally:
                 conn.close()
         except sqlite3.Error:
-            canonical_ids = None
+            canonical_live_ids = None
+            canonical_all_ids = None
 
     results: list[dict] = []
     worst = "skip"
     unique_total = 0
+    tombstoned_total = 0
     for p in extra:
         entry: dict = {"path": _display_path(p)}
         live = 0
@@ -2274,18 +2415,50 @@ def _check_second_stores(
                 worst = "warn"
             continue
         entry["live_rows"] = live
-        if canonical_ids is None:
+        if canonical_all_ids is None:
             entry["missing_in_canonical"] = "unknown (canonical store unreadable)"
             entry["status"] = "warn" if live else "skip"
         else:
-            missing = len(ids - canonical_ids)
-            entry["missing_in_canonical"] = missing
+            missing_ids = ids - canonical_all_ids
+            tombstoned_ids = (ids & canonical_all_ids) - (canonical_live_ids
+                                                          or set())
+            missing = len(missing_ids)
+            tombstoned = len(tombstoned_ids)
             unique_total += missing
-            entry["status"] = "fail" if missing else ("warn" if live else "skip")
+            tombstoned_total += tombstoned
+            entry["missing_in_canonical"] = missing
+            entry["tombstoned_in_canonical"] = tombstoned
+            # Issue #245: tombstoned-in-canonical rows are informational
+            # (retire the store when convenient) — only genuinely absent
+            # ids strand on cutover.
+            entry["status"] = ("fail" if missing
+                               else ("warn" if live or tombstoned else "skip"))
         results.append(entry)
 
     statuses = {e["status"] for e in results}
     worst = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "skip"
+
+    # Issue #245 comment: the human summary carries a PER-PATH breakdown so
+    # a multi-store report cannot be misattributed to the first store. Full
+    # displayed paths, never basenames — every real candidate is named
+    # store.sqlite, so basenames would collide (swarm-pr-review PRR-002).
+    def _breakdown() -> str:
+        parts = []
+        for e in results:
+            name = str(e.get("path", "?"))
+            miss = e.get("missing_in_canonical")
+            tomb = e.get("tombstoned_in_canonical")
+            if isinstance(miss, int):
+                parts.append(
+                    f"{name}: {miss} absent, "
+                    f"{tomb if isinstance(tomb, int) else 0} "
+                    f"tombstoned-in-canonical, {e.get('live_rows', 0)} live"
+                )
+            elif "error" in e:
+                parts.append(f"{name}: unreadable")
+            else:
+                parts.append(f"{name}: canonical unreadable")
+        return "; ".join(parts)
 
     details["second_stores"] = results
     if worst == "fail":
@@ -2296,15 +2469,33 @@ def _check_second_stores(
             f"({_display_path(canonical)}) — cutover would strand them. Run "
             "`promote-store --from <path>` to merge them in, then retire the "
             "second store; also disable the old host's native memory (see "
-            "the claude-native-memory / codex-native-memory checks).",
+            "the claude-native-memory / codex-native-memory checks). "
+            f"Per store — {_breakdown()}.",
             **details,
         )
     if worst == "warn":
+        tomb_note = (
+            f" {tombstoned_total} row(s) are tombstoned in canonical "
+            "(already superseded there; nothing to promote)."
+            if tombstoned_total else ""
+        )
+        # PRR-010 (swarm-pr-review): when the canonical store was unreadable
+        # the containment claim is unverifiable — never assert it as fact.
+        unverified = any(
+            e.get("missing_in_canonical")
+            == "unknown (canonical store unreadable)"
+            for e in results)
+        warn_head = (
+            "A leftover second store exists but containment could NOT be "
+            "verified (the canonical store is unreadable); check it before "
+            "any cutover." if unverified else
+            "A leftover second store exists but every live row is already "
+            "in the canonical store (live or tombstoned); retire it when "
+            "convenient.")
         return _check(
             "second-stores",
             "warn",
-            "A leftover second store exists but every live row is already in "
-            "the canonical store; retire it when convenient.",
+            f"{warn_head}{tomb_note} Per store — {_breakdown()}.",
             **details,
         )
     return _check(
@@ -5136,7 +5327,18 @@ def _check_fleet_principal(hello: tuple[str, str, dict]) -> dict:
             return _check("fleet-principal", "fail",
                           f"ZMEM_MCP_TOKENS_FILE ({str(path)}) exceeds the "
                           "4 MiB diagnostic read cap.")
-        problems, count = _fleet_principal_map_problems(raw)
+        # PRR-015 (swarm-pr-review): the validator encodes token keys to
+        # UTF-8 and can raise on escaped-surrogate keys — contain it to a
+        # structured verdict like the mcp-token branch does (the hub's own
+        # parser handles the same input via its error paths).
+        try:
+            problems, count = _fleet_principal_map_problems(raw)
+        except (ValueError, RecursionError, TypeError) as exc:
+            return _check(
+                "fleet-principal", "fail",
+                f"ZMEM_MCP_TOKENS_FILE ({str(path)}) cannot be validated: "
+                f"{exc}",
+                principal_count=0)
         if problems:
             return _check("fleet-principal", "fail",
                           "; ".join(problems[:3]),

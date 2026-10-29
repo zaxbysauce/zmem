@@ -13,6 +13,7 @@ this file adds hardening only and never touches production state.
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

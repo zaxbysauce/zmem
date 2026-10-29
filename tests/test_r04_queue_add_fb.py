@@ -15,6 +15,7 @@ Run: python tests/test_r04_queue_add_fb.py
 Plain unittest, no third-party harness — matches the repo convention."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import atexit
 import json

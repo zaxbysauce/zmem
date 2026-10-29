@@ -15,6 +15,7 @@
 // Run: node tests/test_native_replace.js   (exit 0 = all pass)
 
 "use strict";
+require("./_store_guard.js"); // issue #244 isolation guard
 
 const { spawnSync, execFileSync } = require("child_process");
 const fs = require("fs");

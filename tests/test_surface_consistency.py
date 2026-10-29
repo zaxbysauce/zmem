@@ -21,6 +21,7 @@ Run: python tests/test_surface_consistency.py   (no pytest required — repo con
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import ast
 import json

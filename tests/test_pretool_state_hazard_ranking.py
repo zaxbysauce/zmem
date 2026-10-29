@@ -91,6 +91,7 @@ standalone: python -X utf8 tests/test_pretool_state_hazard_ranking.py
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

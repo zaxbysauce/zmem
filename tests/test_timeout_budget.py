@@ -10,6 +10,7 @@ No test asserts elapsed wall time: every deadline assertion drives the
 injected clock (the two integration tests bound total runtime with generous
 external guards purely to fail fast on a broken build, never to measure).
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import json

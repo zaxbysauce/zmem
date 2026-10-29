@@ -1,6 +1,7 @@
 """Combined-path pins for the #126/#167 recall integration seams."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import io

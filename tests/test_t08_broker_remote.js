@@ -27,6 +27,7 @@
 // Run: node tests/test_t08_broker_remote.js   (exit 0 = pass)
 
 "use strict";
+require("./_store_guard.js"); // issue #244 isolation guard
 
 const { spawn, spawnSync } = require("child_process");
 const assert = require("assert");

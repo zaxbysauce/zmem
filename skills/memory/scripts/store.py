@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """ZMem semantic store — public CLI entrypoint (thin shim).
 
 SPLIT (issue #57 / SOTA PR 2/10): all behaviour now lives in the ``storelib``

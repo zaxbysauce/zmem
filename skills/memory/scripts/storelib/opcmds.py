@@ -5,7 +5,8 @@ report's upgrade action plan, the schema dimension-mismatch fix hint, the
 backup rollback hints — must name an existing interpreter executable
 (shell-quoted) ahead of the script path, exactly like the hook-injected
 commands. A bare ``store.py`` token depends entirely on the caller's shell
-resolving ``python`` (no shebang), which on Windows can be the Store stub;
+resolution (the issue #294 shebang makes POSIX direct exec work, but on
+Windows the extension dispatch can still hit the Store ``python`` stub);
 a bare ``python`` token has the same hazard. The interpreter rendered is the
 one the store process itself ran under, and the script path is resolved from
 this file's location so the command is runnable from any working directory.

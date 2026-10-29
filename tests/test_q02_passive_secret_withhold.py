@@ -48,6 +48,7 @@ Run: python tests/test_q02_passive_secret_withhold.py   (no pytest required)
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import glob
 import json

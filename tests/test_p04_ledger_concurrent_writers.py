@@ -19,6 +19,7 @@ Runs standalone: python tests/test_p04_ledger_concurrent_writers.py
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

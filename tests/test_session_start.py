@@ -8,6 +8,7 @@ its invocations. The fast-timeout sub-run pins ZMEM_STORE_RECALL_TIMEOUT_S
 below 1.0 (the contract honors values below 8.0) so the suite never waits
 on a wall-clock deadline — no test asserts elapsed time.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

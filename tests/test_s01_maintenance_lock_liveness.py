@@ -43,6 +43,7 @@ DeadHolderLockTest.test_backdated_empty_lock_file_without_holder_does_not_block_
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import os
 import shutil

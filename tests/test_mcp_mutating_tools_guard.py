@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Source-contract guardrail for issue #109's defect class.
 
+#244-census-exempt: this file only READS mcp_server.py source text (a
+comment-only census match, no storelib import and no store.py spawn), so it
+is deliberately unwired from the store-isolation guard (swarm-pr-review
+pr410-20261028 PRR-005; pinned by tests/test_store_guard_wiring_census.py).
+
 Defect class: a store mutation reachable from the authenticated MCP surface
 WITHOUT namespace confinement of the caller's token. Issue #109 shipped
 exactly this shape for the two tombstone tools — `supersede` and

@@ -5,6 +5,7 @@ probe so an invalid operator setting cannot pass by observing an empty store.
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import contextlib
 import io

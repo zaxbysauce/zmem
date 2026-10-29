@@ -10,6 +10,7 @@ row must still land in the ledger through the admission path).
 
 Run standalone: python tests/test_362_inject_wiring.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import atexit
 import os
 import shutil

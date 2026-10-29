@@ -15,6 +15,7 @@ must hold on THAT path, not on the compatibility record() API.
 
 Run standalone: python tests/test_p06_routed_path_bounds.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 import os
 import sys
 import tempfile

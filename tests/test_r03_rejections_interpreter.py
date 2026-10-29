@@ -9,6 +9,7 @@ drives the fourth the same way and applies the same token rule.
 
 Run: python tests/test_r03_rejections_interpreter.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

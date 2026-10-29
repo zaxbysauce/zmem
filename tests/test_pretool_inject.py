@@ -27,6 +27,7 @@ python tests/test_pretool_inject.py
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

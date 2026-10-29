@@ -1,6 +1,7 @@
 """Issue #189 SessionEnd cleanup and Codex host contract tests."""
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import contextlib

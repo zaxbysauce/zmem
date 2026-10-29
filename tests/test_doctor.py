@@ -8,6 +8,7 @@ Run: python tests/test_doctor.py
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import json
@@ -1318,6 +1319,188 @@ class V13DoctorChecksTest(DoctorIssue49ChecksTest):
         check = self._check(report, "mcp-token")
         self.assertEqual(check["status"], "warn", check)
         self.assertIs(check["details"]["unscoped_token"], True, check)
+
+    # -- issue #369: principal-map auth mode knows the token-scope check ---
+
+    def _map_owner_only(self, path) -> None:
+        """The hub refuses group/world-readable maps (issue #406); a test
+        map must not depend on the directory's inherited ACL. Windows uses
+        icacls (0o600 keeps the write bit on NTFS); POSIX uses chmod."""
+        import subprocess as _sp
+
+        if os.name == "nt":
+            r = _sp.run(
+                ["icacls", str(path), "/inheritance:r",
+                 "/grant", os.environ.get("USERNAME", "") + ":(F)"],
+                capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        else:
+            os.chmod(str(path), 0o600)
+
+    def test_mcp_token_map_mode_reports_scope_shape(self):
+        map_path = self.tmp / "principals.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret-alpha": {
+                "principal": "alpha", "host": "dgx-fb",
+                "harness": "claude", "namespaces": ["project:zmem"]},
+            "doctor-map-secret-beta": {
+                "principal": "beta", "host": "dgx-b",
+                "harness": "claude",
+                "namespaces": ["project:zmem", "project:other"]},
+            "doctor-map-secret-ops": {
+                "principal": "ops", "host": "dgx-ops",
+                "harness": "hermes", "revoked": True},
+        }))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "pass", check)
+        d = check["details"]
+        self.assertEqual(d["mode"], "principal-map", check)
+        self.assertEqual(d["principal_count"], 3, check)
+        self.assertEqual(d["scoped_count"], 2, check)
+        self.assertEqual(d["unscoped_count"], 1, check)
+        self.assertEqual(d["revoked_count"], 1, check)
+        # Never a token value anywhere in the report.
+        self.assertNotIn("doctor-map-secret", json.dumps(report))
+
+    def test_mcp_token_map_mode_invalid_is_fail(self):
+        map_path = self.tmp / "principals-bad.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret": {"principal": "alpha", "host": "h",
+                                  "harness": "c", "namespaces": ["project:x"],
+                                  "revoke": True}}))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+
+    def test_mcp_token_map_mode_over_permissive_is_fail(self):
+        """PRR-001: an over-permissive map the hub would exit-2-refuse must
+        be a doctor FAIL, never a false-green pass (this fixture skips the
+        owner-only hardening on purpose and makes permissiveness explicit:
+        Everyone-read ACE on Windows, mode 0644 on POSIX)."""
+        import subprocess as _sp
+
+        map_path = self.tmp / "principals-permissive.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret": {
+                "principal": "alpha", "host": "dgx-fb", "harness": "claude",
+                "namespaces": ["project:zmem"]}}))
+        if os.name == "nt":
+            r = _sp.run(["icacls", str(map_path), "/grant", "*S-1-1-0:R"],
+                        capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr or r.stdout)
+        else:
+            os.chmod(str(map_path), 0o644)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+        self.assertIn("over-permissive", json.dumps(check).lower())
+
+    def test_mcp_token_map_mode_non_regular_file_is_fail(self):
+        """PRR-001: a non-regular file (a directory here — a FIFO on POSIX)
+        must be a structured FAIL, never a blocking open."""
+        map_path = self.tmp / "principals-dir.json"
+        map_path.mkdir()
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+        self.assertIn("regular file", json.dumps(check))
+
+    def test_mcp_token_map_mode_all_revoked_is_warn(self):
+        """PRR-001: a map that authenticates nobody (every principal
+        revoked) must WARN, never pass."""
+        map_path = self.tmp / "principals-revoked.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret-a": {
+                "principal": "alpha", "host": "dgx-fb", "harness": "claude",
+                "namespaces": ["project:zmem"], "revoked": True},
+            "doctor-map-secret-b": {
+                "principal": "beta", "host": "dgx-b", "harness": "claude",
+                "namespaces": ["project:zmem"], "revoked": True},
+        }))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["revoked_count"], 2, check)
+
+    def test_mcp_token_map_mode_all_unscoped_is_warn(self):
+        """PRR-011: a map whose every principal is unscoped (full-store
+        access) must WARN, never pass — the scoped==0 boundary."""
+        map_path = self.tmp / "principals-unscoped.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret-a": {
+                "principal": "alpha", "host": "dgx-fb", "harness": "claude"},
+            "doctor-map-secret-b": {
+                "principal": "beta", "host": "dgx-b", "harness": "hermes"},
+        }))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "warn", check)
+        self.assertEqual(check["details"]["scoped_count"], 0, check)
+        self.assertEqual(check["details"]["unscoped_count"], 2, check)
+
+    def test_mcp_token_map_mode_surrogate_key_is_structured_fail(self):
+        # Plan-critic round 1: an escaped-surrogate token key makes the
+        # validator's own UTF-8 encode raise; the whole map branch is
+        # contained, so doctor reports a structured fail, never a traceback.
+        map_path = self.tmp / "principals-surrogate.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret": {"principal": "alpha", "host": "h",
+                                  "harness": "c", "namespaces": ["project:x"]}
+        }).replace("doctor-map-secret", "doctor-\\ud800-map-secret"))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env.pop("ZMEM_MCP_TOKEN", None)
+        env.pop("ZMEM_MCP_TOKEN_FILE", None)
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "fail", check)
+
+    def test_mcp_token_map_mode_wins_over_legacy_env(self):
+        # The map takes precedence server-side (resolve_token_auth); the
+        # legacy ZMEM_MCP_TOKEN warn must NOT be reported in map mode.
+        map_path = self.tmp / "principals-win.json"
+        _write_text(map_path, json.dumps({
+            "doctor-map-secret": {
+                "principal": "alpha", "host": "dgx-fb",
+                "harness": "claude", "namespaces": ["project:zmem"]}}))
+        self._map_owner_only(map_path)
+        env = self._env()
+        env["ZMEM_MCP_TOKEN"] = "doctor-legacy-secret"
+        env["ZMEM_MCP_TOKENS_FILE"] = str(map_path)
+        report = json.loads(self._run_json(env).stdout)
+        check = self._check(report, "mcp-token")
+        self.assertEqual(check["status"], "pass", check)
+        self.assertEqual(check["details"]["mode"], "principal-map", check)
 
     def test_episode_tables_absent_store_is_skip(self):
         env = self._env()
@@ -3054,6 +3237,79 @@ class FeedbackDoctorTest(unittest.TestCase):
             positions, sorted(positions), f"labels out of order in summary: {summary!r}"
         )
         self.assertEqual(len(set(positions)), 7)
+
+
+class SecondStoresTombstoneTest(unittest.TestCase):
+    """Issue #245: tombstoned-in-canonical second-store rows are not
+    stranding FAILs; genuinely absent rows still are; the human summary
+    carries a per-path breakdown (the issue comment's two-store report)."""
+
+    def _build_store(self, path, rows):
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "CREATE TABLE memory (id TEXT PRIMARY KEY, superseded_at TEXT)")
+        conn.executemany(
+            "INSERT INTO memory (id, superseded_at) VALUES (?, ?)", rows)
+        conn.commit()
+        conn.close()
+
+    def _doctor(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+        return doctor
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-second-stores-"))
+        self.canonical = self.tmp / "canonical.sqlite"
+        # canonical: row-x tombstoned, row-z live; row-y absent entirely.
+        self._build_store(self.canonical, [
+            ("row-x", "2026-01-01T00:00:00Z"),
+            ("row-z", None),
+        ])
+
+    def test_tombstoned_only_store_warns_not_fails(self):
+        second = self.tmp / "second_a.sqlite"
+        self._build_store(second, [("row-x", None)])
+        doctor = self._doctor()
+        res = doctor._check_second_stores(
+            self.canonical, extra_candidates=[second])
+        self.assertEqual(res["status"], "warn", res)
+        entry = res["details"]["second_stores"][0]
+        self.assertEqual(entry["tombstoned_in_canonical"], 1, entry)
+        self.assertEqual(entry["missing_in_canonical"], 0, entry)
+
+    def test_absent_rows_still_fail_with_per_path_breakdown(self):
+        second_a = self.tmp / "second_a.sqlite"
+        second_b = self.tmp / "second_b.sqlite"
+        self._build_store(second_a, [("row-x", None)])
+        self._build_store(second_b, [("row-x", None), ("row-y", None)])
+        doctor = self._doctor()
+        res = doctor._check_second_stores(
+            self.canonical, extra_candidates=[second_a, second_b])
+        self.assertEqual(res["status"], "fail", res)
+        entries = {e["path"].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]:
+                   e for e in res["details"]["second_stores"]}
+        self.assertEqual(entries["second_b.sqlite"]["missing_in_canonical"],
+                         1, entries)
+        self.assertEqual(
+            entries["second_b.sqlite"]["tombstoned_in_canonical"], 1, entries)
+        self.assertEqual(entries["second_a.sqlite"]["missing_in_canonical"],
+                         0, entries)
+        # The human FAIL summary names BOTH stores with their own counts.
+        self.assertIn("second_a", res["summary"])
+        self.assertIn("second_b", res["summary"])
+
+    def test_warn_summary_names_tombstoned_counts(self):
+        second = self.tmp / "second_a.sqlite"
+        self._build_store(second, [("row-x", None)])
+        doctor = self._doctor()
+        res = doctor._check_second_stores(
+            self.canonical, extra_candidates=[second])
+        self.assertEqual(res["status"], "warn", res)
+        self.assertIn("tombstoned", res["summary"])
+        self.assertIn("second_a", res["summary"])
 
 
 if __name__ == "__main__":

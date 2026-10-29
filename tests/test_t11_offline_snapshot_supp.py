@@ -50,6 +50,7 @@ pins; ``S1``..``S14`` runs one; unknown selector exits 2).
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os

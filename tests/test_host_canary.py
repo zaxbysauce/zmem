@@ -7,6 +7,7 @@ fixture, which is exactly the AC4 never-touch-the-real-store contract.
 
 Runs standalone: python tests/test_host_canary.py
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import atexit
 import json

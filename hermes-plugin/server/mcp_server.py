@@ -1811,12 +1811,18 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         """add(): strip client host:/agent: tags, append the principal's
         stamp (map mode only; legacy passes through untouched). The strip
         tokenizes under the consumer grammar (issue #395: case-varied and
-        non-comma forged forms must not survive)."""
+        non-comma forged forms must not survive). Issue #371 AC1: under map
+        mode the strip no longer depends on the resolved principal's stamps —
+        a map reload that drops the presenting principal between the guard
+        and this stamp must not leave forged host:/agent: tags behind, so
+        the strip runs even when the stamps list is empty."""
         stamps = _attribution_tags(principal)
-        if not stamps:
+        if principal_map is None and not stamps:
             return raw_tags
+        if raw_tags is None and not stamps:
+            return None
         cleaned = [
-            t for t in _load_split_tag_tokens()(raw_tags or "")
+            t for t in _load_split_tag_tokens()(str(raw_tags or ""))
             if not t.lower().startswith(_ATTRIBUTION_TAG_PREFIXES)
         ]
         return ",".join(cleaned + stamps)
@@ -1829,14 +1835,19 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         stamp. Client-supplied tags keep the documented override semantics
         for benign tags (replace) with the stamp appended after the strip
         (consumer grammar, issue #395). Legacy mode passes client_tags
-        through untouched.
+        through untouched. Issue #371 AC1: under map mode the strip runs
+        even when the resolved principal yields no stamps, so a mid-call
+        reload can never leave forged or stale attribution tags on the
+        replacement row.
         """
         stamps = _attribution_tags(principal)
-        if not stamps:
+        if principal_map is None and not stamps:
             return client_tags
+        if client_tags is None and inherited_tags is None and not stamps:
+            return None
         base = client_tags if client_tags is not None else (inherited_tags or "")
         cleaned = [
-            t for t in _load_split_tag_tokens()(base)
+            t for t in _load_split_tag_tokens()(str(base))
             if not t.lower().startswith(_ATTRIBUTION_TAG_PREFIXES)
         ]
         return ",".join(cleaned + stamps)
@@ -1879,10 +1890,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 ),
             }
 
-    def _include_global_allowed() -> bool:
+    def _include_global_allowed(caller=None) -> bool:
         """Scoped tokens only get the implicit user:global union when
-        user:global is itself in the allow-list (reads never broaden scope)."""
-        caller = current_principal()
+        user:global is itself in the allow-list (reads never broaden scope).
+
+        ``caller`` (issue #371 single-capture): a tool holding a snapshot
+        passes it so the decision observes the same map generation as the
+        tool's other authorization decisions (swarm-pr-review PRR-014)."""
+        if caller is None:
+            caller = current_principal()
         if not caller.scoped:
             return True
         return "user:global" in (caller.namespaces or frozenset())
@@ -2516,7 +2532,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "user:global (near-miss forms like 'global' are "
                 "refused — they are unreachable from every automatic hook)"
             )
-        denied = _guard_namespace(ns)
+        # Issue #371 AC1/AC4: capture the presenting principal ONCE, thread
+        # the snapshot through the guard (the #284 seam) and the attribution
+        # stamp, and str()-coerce non-string tag payloads at the argv
+        # boundary as the pre-T call sites did.
+        caller = current_principal()
+        tags = None if tags is None else str(tags)
+        denied = _guard_namespace(ns, caller=caller)
         if denied:
             return denied
         t = (taint or "untrusted_tool").strip()
@@ -2524,7 +2546,6 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _error(
                 "taint must be one of: " + ", ".join(_ALLOWED_TAINTS)
             )
-        caller = current_principal()
         args = [
             "add",
             "--namespace", ns,
@@ -2748,7 +2769,10 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             )
         ns_override = (str(namespace or "")).strip()
         ns_pin = None
+        # Issue #371 AC1: one capture for the guard(s) AND the stamp.
         caller = current_principal()
+        # AC4: str()-coerce non-string tag payloads at the argv boundary.
+        tags = None if tags is None else str(tags)
         stamps = _attribution_tags(caller)
         target_tags = None
         if ns_override:
@@ -2758,7 +2782,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     "host:<name>, agent:<name>, domain:<name>, or the canonical "
                     "user:global (near-miss forms are refused)"
                 )
-            denied = _guard_namespace(ns_override)
+            denied = _guard_namespace(ns_override, caller=caller)
             if denied:
                 return denied
         elif caller.scoped:
@@ -2782,7 +2806,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             except (json.JSONDecodeError, AttributeError):
                 target_ns = ""
                 target_tags = ""
-            denied = _guard_namespace(target_ns)
+            denied = _guard_namespace(target_ns, caller=caller)
             if denied:
                 return denied
             # F6: PIN the verified namespace on the update itself. The
@@ -3754,7 +3778,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "--for-injection",
             "--json",
         ]
-        if _include_global_allowed() and resolved_ns != "user:global":
+        if _include_global_allowed(caller=_session_caller) and resolved_ns != "user:global":
             args += ["--include-global", "--global-limit", "2"]
         # Issue #283 (T-04): scoped principals carry their allow-list so the
         # selector leg (--session-id below) filters the user:global and
@@ -3997,7 +4021,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 "host:<name>, agent:<name>, domain:<name>, or the canonical "
                 "user:global"
             )
-        denied = _guard_namespace(resolved_ns)
+        # Issue #371 AC1: capture the presenting principal once, before the
+        # namespace guard; the attribution stamp below reads the SAME
+        # snapshot, so a map reload between guard and stamp can neither
+        # drop the stamp nor leak client attribution tags.
+        end_caller = current_principal()
+        denied = _guard_namespace(resolved_ns, caller=end_caller)
         if denied:
             return denied
         args = [
@@ -4014,7 +4043,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # session_end is a third write path: stamp the CALLER's attribution so
         # every stored row is attributable. Empty in legacy mode (no
         # host/harness), which keeps that path byte-identical.
-        _end_stamps = _attribution_tags(current_principal())
+        _end_stamps = _attribution_tags(end_caller)
         if _end_stamps:
             args += ["--tags", ",".join(_end_stamps)]
         input_text = None

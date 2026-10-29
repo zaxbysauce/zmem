@@ -23,6 +23,7 @@ python tests/test_t04_session_start_authz.py  (CI's direct-execution loop).
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import asyncio
 import importlib.util

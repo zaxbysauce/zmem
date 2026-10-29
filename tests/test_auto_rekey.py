@@ -25,6 +25,7 @@ Run: python tests/test_auto_rekey.py
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import datetime
 import json

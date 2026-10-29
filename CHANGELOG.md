@@ -5,6 +5,59 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.128.0] - 2026-10-28
+
+Collated operator-surface hygiene PR (issues #277 #371 #244 #369 #245 #294).
+
+### Fixed
+- **#277** — failure-record text is secret-redacted at creation: every failure
+  build site in `storelib/mine.py` (transcript details, both rejection-reason
+  sites, db details) applies the standard redaction filter before collapse and
+  truncation, degrading fail-open to the previous renderer if the redaction
+  call ever fails (surfaced as `redaction_degraded` plus a one-time stderr
+  notice), so credential-bearing tool errors never persist into
+  reflect-hook prompts or the #257 subagent sidecars.
+- **#371** — request-scoped principal hardening: `add`, `update`, and
+  `session_end` capture the presenting principal once and thread it through
+  the namespace guard (the #284 `caller=` seam) and the attribution stamp;
+  attribution prefixes are stripped under map mode even when the resolved
+  principal yields no stamps (a mid-call map reload can no longer leak forged
+  `host:`/`agent:` tags or drop a stamp); non-string tags are str()-coerced at
+  the argv boundary; the loader/verifier guard family (non-bool `revoked`,
+  oversize token, non-UTF-8-encodable token, SIGHUP path) is unit-pinned.
+- **#244** — test isolation is enforced, not advisory: a session guard
+  (python `tests/_store_guard.py` wired into every store-touching test file
+  minus one documented comment-only exception + pytest conftest; JS twin
+  `tests/_store_guard.js`) fails any run whose resolved store is the
+  operator's real `~/.zmem` area while the default store file exists
+  (explicit env shapes included; silent on ephemeral CI runners, which
+  self-identify via truthy `CI`/`GITHUB_ACTIONS` — `CI=false` keeps the
+  guard armed), and `store.py add` refuses fixture-shaped writes (seed-shaped
+  `--source-ref`, the known fixture namespaces) against that area regardless
+  of existence — opt-outs `ZMEM_ALLOW_REAL_STORE=1` /
+  `ZMEM_ALLOW_FIXTURE_WRITES=1`.
+- **#369** — doctor's token-scope check knows the principal-map auth mode:
+  `ZMEM_MCP_TOKENS_FILE` wins over the legacy vars (matching the server) and
+  reports the scope shape (principal/scoped/unscoped/revoked counts, never a
+  token value) with whole-branch fail-soft containment.
+- **#245** — doctor's second-stores check classifies rows tombstoned in the
+  canonical store as informational (WARN, never a cutover FAIL —
+  `promote-store` refuses to resurrect them by design); genuinely absent ids
+  still FAIL; the human summary carries a per-path breakdown.
+- Feedback round (swarm-pr-review pr410-20261028): doctor's principal-map
+  check gains the fleet lane's hardening — regular-file gate, permission
+  verdict, 4 MiB read cap, and an all-revoked map warns instead of passing —
+  and `doctor --fleet` contains validator encoding errors as a structured
+  fail; the second-stores per-path breakdown names full paths (basenames
+  collided); failure `error_type` is redacted and capped; the
+  fixture-refusal containment resolves symlinks; the store-guard wiring is
+  census-pinned; `session_start`'s include-global decision uses the captured
+  principal; stale shebang / second-stores / mcp-token docs corrected.
+- **#294** — `store.py` carries `#!/usr/bin/env python` on line 1 (sibling
+  -consistent), so the committed 100755 mode no longer invites ENOEXEC
+  shell-fallback execution on POSIX; shebang/LF/direct-exec pins added to
+  `tests/test_exec_bit.py` (POSIX smoke runs in the ubuntu lane).
+
 ## [0.127.0] - 2026-10-28
 
 ### Added

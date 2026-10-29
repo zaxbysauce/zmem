@@ -7,6 +7,7 @@ tests intentionally avoid depending on a private zmem callback name.
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import json

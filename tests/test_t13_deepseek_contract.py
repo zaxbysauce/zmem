@@ -22,6 +22,7 @@ no:cacheprovider -q tests/test_t13_deepseek_contract.py``) and standalone.
 """
 
 from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import importlib.util
 import json

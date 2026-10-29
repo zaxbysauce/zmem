@@ -11,6 +11,7 @@ payload key-set and whitespace-id validation, and the surrogate-safe digest.
 Store isolation pins land before any storelib-adjacent import (issue #61
 hazard); ~/.zmem is never touched.
 """
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import hashlib
 import importlib.util
