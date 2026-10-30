@@ -634,36 +634,49 @@ jobs:
           # minilm.onnx AND tokenizer.json in the SAME dir, and a stale
           # tokenizer must never survive under the model-only cache key.
           cp skills/memory/models/tokenizer.json "$ZMEM_MODELS_CACHE/tokenizer.json"
-      - name: Diagnose embedder availability (temporary, issue #413 CI round 2)
+      - name: Diagnose embedder availability (temporary, issue #413 CI round 3)
         shell: bash
         env:
           ZMEM_TEST_REAL_MODELS_DIR: ${{ env.ZMEM_MODELS_CACHE }}
         run: |
           set -e
           python -X utf8 - <<'PY'
-          import os, sys, json, traceback
-          sys.path.insert(0, os.path.join(os.getcwd(), "tests"))
+          import os, sys, json
           sys.path.insert(0, os.path.join(os.getcwd(), "skills", "memory", "scripts"))
-          os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
-          import importlib.util as ilu
-          spec = ilu.spec_from_file_location(
-              "s376", os.path.join(os.getcwd(), "tests", "test_subject_dedup_contract.py"))
-          m = ilu.module_from_spec(spec)
-          spec.loader.exec_module(m)
-          print("harness probe:", m._probe_real_models_dir()[1])
-          rep = m._real_model_report()
-          print("harness report is None:", rep is None)
-          print("harness cache keys:", list(m._REAL_MODEL_CACHE.keys()))
-          for k, v in m._REAL_MODEL_CACHE.items():
-              print("cache[%s]:" % k, json.dumps(v, sort_keys=True)[:1200])
-          # Direct embedder state under the DRIVER env the harness would set:
+          # The DRIVER env the harness constructs (tests/test_subject_dedup_contract.py
+          # _base_env + overrides): ZMEM_MODELS_DIR is what the embedder reads.
+          os.environ["ZMEM_MODELS_DIR"] = os.environ["ZMEM_TEST_REAL_MODELS_DIR"]
+          os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+          os.environ.pop("ZMEM_EMBED_PROFILE", None)
+          import embed_profiles
           import embeddings
-          print("is_available:", embeddings.is_available())
+          prof = embeddings.current_profile_name()
+          print("step1 current_profile_name:", repr(prof), "falsy:", not prof)
           try:
-              blob = embeddings.embed_text("diagnostic probe")
-              print("embed_text len:", None if blob is None else len(blob))
-          except Exception:
-              traceback.print_exc()
+              import onnxruntime
+              print("step2 import onnxruntime: OK", onnxruntime.__version__)
+          except ImportError as e:
+              print("step2 import onnxruntime: IMPORTERROR", e)
+          try:
+              from tokenizers import Tokenizer
+              print("step3 from tokenizers import Tokenizer: OK", Tokenizer)
+          except ImportError as e:
+              print("step3 from tokenizers import Tokenizer: IMPORTERROR", repr(e))
+          try:
+              import numpy
+              print("step4 import numpy: OK", numpy.__version__)
+          except ImportError as e:
+              print("step4 import numpy: IMPORTERROR", e)
+          md = embeddings._resolve_models_dir()
+          print("step5 _resolve_models_dir:", repr(md))
+          print("step6 model is_file:", (md / "minilm.onnx").is_file(),
+                "tokenizer is_file:", (md / "tokenizer.json").is_file())
+          print("FINAL is_available:", embeddings.is_available())
+          import inspect
+          src = inspect.getsource(embeddings._check_available)
+          print("(_check_available source hash:", __import__("hashlib").sha256(src.encode()).hexdigest()[:12], ")")
+          blob = embeddings.embed_text("diagnostic probe")
+          print("embed_text len:", None if blob is None else len(blob))
           PY
       - name: Run the frozen #376 contract argvs (real model present)
         shell: bash
