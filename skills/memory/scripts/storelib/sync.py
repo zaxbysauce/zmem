@@ -1479,6 +1479,8 @@ def _is_purged(conn: sqlite3.Connection, mid: str) -> bool:
 
 
 def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
+                 pair_expiry: dict | None = None,
+                 pair_outcome: dict | None = None,
                  capture_mode: str | None = None,
                  dedup_cache: dict | None = None,
                  preserve_ids: bool = False,
@@ -1811,6 +1813,45 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         link_memory_entities(
             conn, mid, content=content, tags=tags, namespace=namespace,
         )
+        if pair_expiry is not None:
+            # #347: a live state row commits atomically WITH its side record
+            # so no concurrent reader can observe the half-applied pair the
+            # buffered-apply window used to expose. Applied BEFORE the dedup-
+            # cache mutation below: a failure rolls back BOTH rows without
+            # leaving the cache pointing at a rolled-back id. The parent-
+            # liveness check inside _apply_expiry_record passes by
+            # construction -- the INSERT above is live and unsuperseded in
+            # this same transaction.
+            #
+            # Failure semantics mirror the base per-row contract (feedback
+            # PRR-007/008): a hostile/conflicting record must abort only the
+            # RECORD, never the parent row, and a degraded store without the
+            # side table must not destroy rows either. Both leave the record
+            # unconsumed -- the EOF phase owns it (its OperationalError path
+            # reports the unavailability once and counts every remaining
+            # record; its ValueError path counts a conflicting stored record
+            # malformed with the record's own line). The row lands bare in
+            # both cases, matching base's row-fate.
+            try:
+                _outcome = _apply_expiry_record(conn, pair_expiry)
+                # PR feedback PRR-024: an identical record is a no-op — the
+                # EOF leg counts it expiry_skipped, so the pair path must
+                # too (never as an apply). Reported through the out-param:
+                # this function's locals do not reach the caller's counters.
+                if pair_outcome is not None:
+                    pair_outcome["identical"] = _outcome == "identical"
+            except sqlite3.OperationalError:
+                # Side table unavailable (pre-v15 store): land the row bare;
+                # the record stays in the index for the EOF guard.
+                if pair_outcome is not None:
+                    pair_outcome["identical"] = None
+            except ValueError:
+                # Conflicting stored record for this id (orphan side row):
+                # the ROW still lands; leave the record for the EOF gates,
+                # whose ValueError handler counts it malformed with its own
+                # line number.
+                if pair_outcome is not None:
+                    pair_outcome["identical"] = None
         # Record this newly-inserted row in the per-ingest dedup cache so a
         # later row in the SAME batch with identical normalized content is
         # detected as a duplicate without a namespace rescan (#36 M9).
@@ -2598,9 +2639,85 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
             return 2
         finally:
             staged_source.close()
+    # #347 pass A: pre-index every memory_expiry record so each live state
+    # row can commit atomically WITH its first-in-file side record (the
+    # pair-commit seam in _ingest_row). Ordered per-parent lists preserve
+    # file order for the EOF gates (first applies, an identical repeat is
+    # skipped, a conflicting repeat counts malformed). Best-effort by
+    # contract: any read/parse failure here keeps the partial index and never
+    # raises -- pass B re-parses and counts every line exactly as before, and
+    # owns the documented decode/OS-error partial-progress semantics. Memory
+    # stays O(E) (E = expiry records in the file), the same order the EOF
+    # buffer holds today; the spool below is rewound explicitly for pass B.
+    known_expiry: dict[str, list[tuple[int, dict]]] = {}
+    # Line numbers of records CONSUMED by a pair commit (or its rollback) --
+    # pass B's parse guard must not re-append them once the pairing has
+    # popped them from the index (the guard runs AFTER the parent row for
+    # memory-first wire order).
+    consumed_expiry_lines: set[int] = set()
+    # Every line number pass A indexed (any parent). The pass-B parse guard
+    # is a SET membership test, not a per-parent linear scan: a hostile file
+    # with N identical-expiry records for one id made the any() form
+    # quadratic (feedback round: N=40000 -> 41s).
+    indexed_expiry_lines: set[int] = set()
+    _pre = io.TextIOWrapper(staged_source, encoding="utf-8",
+                            errors="replace", newline="\n")
+    try:
+        _ln = 0
+        while True:
+            _line = _pre.readline(MAX_LINE_CHARS)
+            if not _line:
+                break
+            _ln += 1
+            if len(_line) >= MAX_LINE_CHARS and not _line.endswith("\n"):
+                # Pass B's ambiguity shape: the line fills the read cap
+                # without a terminator. B does ONE lookahead read and, when
+                # that lookahead is "" (EOF right after the cap), treats the
+                # line as a COMPLETE exactly-MAX line and processes it
+                # normally; only a non-empty lookahead means genuinely
+                # oversized (B rejects it malformed and drains starting from
+                # that lookahead chunk). Mirror exactly -- the drain starts
+                # FROM _first_rest (it may already contain the line's
+                # terminating newline; draining past it would swallow the
+                # NEXT line and desync every later lineno -- feedback-round
+                # regression caught by ReviewR1OversizeNumberingTest).
+                _first_rest = _pre.readline(MAX_LINE_CHARS)
+                if _first_rest:
+                    _chunk = _first_rest
+                    while not (_chunk.endswith("\n")
+                               or len(_chunk) < MAX_LINE_CHARS):
+                        _chunk = _pre.readline(MAX_LINE_CHARS)
+                    continue
+                # else: "" -- EOF right after the cap: a complete
+                # exactly-MAX line (B processes it via its lookahead==""
+                # branch) -> fall through and index it.
+            _s = _line.strip()
+            if not _s:
+                continue
+            try:
+                _o = json.loads(_s)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(_o, dict) and _o.get("kind") == "memory_expiry":
+                try:
+                    _rec = _validate_expiry_record(_o, _ln)
+                except ValueError:
+                    continue
+                known_expiry.setdefault(_rec["memory_id"], []).append(
+                    (_ln, _rec))
+                indexed_expiry_lines.add(_ln)
+    except (UnicodeDecodeError, OSError):
+        pass
+    finally:
+        _pre.detach()
+    staged_source.seek(0)
     f = io.TextIOWrapper(staged_source, encoding="utf-8", newline="\n")
 
     added = tombstoned = tombstones_refused = deduped = skipped = malformed = 0
+    # #347: the expiry counters are hoisted out of the EOF phase so pair-time
+    # applies count against the same totals (each consumed record counted
+    # exactly once; the EOF phase never re-counts a consumed record).
+    expiry_applied = expiry_malformed = expiry_skipped = 0
     deduped_ids: set = set()
     namespace_refused = trust_clamped = 0
     _peer_resolvable = None
@@ -2636,7 +2753,9 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
     # counted malformed at apply time without aborting the rest of the file —
     # legacy commits per record, so "no partial commit" is a strict-only
     # property (AC6 tests it under --strict).
-    pending_expiry: list = []
+    # #347: pending_expiry is replaced by the pass-A ordered index
+    # (known_expiry) as the single pending representation -- nothing is
+    # retained twice.
     try:
         # Stream the file line by line instead of reading it whole into
         # memory first -- a giant hostile file would otherwise exhaust RAM
@@ -2778,10 +2897,17 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     continue
                 if _kind == "memory_expiry":
                     # v15 (issue #173): validate now (per-line guard counts a
-                    # bad record malformed), apply later (buffered, after every
-                    # memory row has landed).
-                    pending_expiry.append(
-                        (lineno, _validate_expiry_record(obj, lineno)))
+                    # bad record malformed), apply later (the pass-A ordered
+                    # index owns the record; pass B only validates).
+                    _rec_b = _validate_expiry_record(obj, lineno)
+                    _lst = known_expiry.setdefault(_rec_b["memory_id"], [])
+                    if (lineno not in consumed_expiry_lines
+                            and lineno not in indexed_expiry_lines):
+                        # Pass A could not have missed a line pass B parses
+                        # (pass A decodes with errors=replace, a superset);
+                        # this guard keeps that invariant structural. A
+                        # line already consumed by a pair commit stays out.
+                        _lst.append((lineno, _rec_b))
                     continue
                 if _kind != "memory":
                     raise ValueError(f"unknown kind {_kind!r}")
@@ -2921,10 +3047,25 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                                       resolvable_ids=_peer_resolvable):
                     trust_clamped += 1
 
+            # #347: a LIVE state row pairs with its first-in-file side
+            # record. History rows (superseded_at set) never pair -- their
+            # records stay for the EOF gates exactly as before. The record is
+            # consumed only on a successful live insert.
+            _pair = None
+            _pair_lineno = None
+            _pair_out: dict = {}
+            if (known_expiry and obj.get("type") == "state"
+                    and not obj.get("superseded_at")):
+                _plst = known_expiry.get(obj["id"])
+                if _plst:
+                    _pair = _plst[0][1]
+                    _pair_lineno = _plst[0][0]
             try:
                 outcome = _ingest_row(conn, obj, allow_tombstones=allow_tombstones,
                                       capture_mode=capture_mode,
-                                      dedup_cache=dedup_cache)
+                                      dedup_cache=dedup_cache,
+                                      pair_expiry=_pair,
+                                      pair_outcome=_pair_out)
             except Exception as e:
                 # A row that raises mid-apply must not abort the file and silently
                 # drop every row after it. Roll back first: _ingest_row commits at
@@ -2938,8 +3079,35 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 print(f"[zmem] ingest-jsonl: malformed line {lineno}: could not apply row: "
                       f"{type(e).__name__}: {_sanitize_error_text(str(e))}", file=sys.stderr)
                 malformed += 1
+                if _pair is not None:
+                    # #347: the pair rolled back together with its row.
+                    # Consume the record and mirror the EOF leg's accounting
+                    # exactly once, attributed to the EXPIRY record's line --
+                    # the EOF phase never sees it again.
+                    consumed_expiry_lines.add(_pair_lineno)
+                    known_expiry[obj["id"]].pop(0)
+                    print(f"[zmem] ingest-jsonl: malformed line {_pair_lineno}: "
+                          f"paired memory_expiry record rolled back with its "
+                          f"row", file=sys.stderr)
+                    expiry_malformed += 1
+                    malformed += 1
                 continue
 
+            if _pair is not None and outcome == "added" \
+                    and not obj.get("superseded_at") \
+                    and _pair_out.get("identical") is not None:
+                # The pair applied (or was an identical no-op) inside the
+                # row's transaction. Mark the line consumed so pass B's
+                # guard (which runs AFTER this for memory-first order)
+                # cannot re-append it. identical is None only on the
+                # degraded/conflict paths, where the record stays in the
+                # index for the EOF gates.
+                consumed_expiry_lines.add(_pair_lineno)
+                known_expiry[obj["id"]].pop(0)
+                if _pair_out["identical"]:
+                    expiry_skipped += 1
+                else:
+                    expiry_applied += 1
             if outcome == "added":
                 added += 1
                 if trust_policy is not None:
@@ -2995,6 +3163,20 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         decode_error = e
     finally:
         f.close()
+    # #347 review round 1 (MAJOR) + round 2: the partial-progress boundary
+    # for the EOF phase is drawn AT the decode failure -- nothing read
+    # after it applies there. The pass-A index is errors=replace (a
+    # superset of what strict pass B parsed), so its tail beyond the
+    # failure point holds records pass B never read. DELIBERATE
+    # EXCEPTION, disclosed (r2): the PAIR path may still pair a
+    # pre-failure live state row with a record indexed after the failure
+    # point -- _validate_expiry_record rebuilds the record from three
+    # ASCII-only shape-validated fields (replacement characters cannot
+    # ride through), the pair commits inside the row's own transaction,
+    # and the resulting store keeps the row+record invariant that base
+    # behavior VIOLATED in this corner (base landed the row bare and
+    # never buffered the record). Pinned by the ReviewR2 driver legs.
+    _last_parsed_lineno = 0 if decode_error is None else lineno
 
     if decode_error is not None:
         print(f"[zmem] ingest-jsonl: cannot read {in_path}: {decode_error}", file=sys.stderr)
@@ -3177,16 +3359,21 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                   file=sys.stderr)
             malformed += len(pending_episodes) + len(pending_memberships)
 
-    # v15 (issue #173): apply buffered memory_expiry records AFTER every memory
-    # row has landed (buffering makes file order irrelevant — AC5's reorder
-    # proxy). Legacy commits per record, so a store-time rejection (missing or
-    # non-state parent, conflicting duplicate) is counted malformed and
-    # reported, never aborting the rest of the file; "no partial commit" is a
-    # strict-only property (AC6 tests it under --strict).
-    expiry_applied = expiry_malformed = expiry_skipped = 0
-    if pending_expiry:
+    # v15 (issue #173), #347: apply every REMAINING memory_expiry record
+    # after all memory rows landed — records consumed by a pair commit are
+    # already applied; duplicates/conflicts behind a consumed first, and
+    # records whose parent never inserted this run (absent, malformed,
+    # duplicate-skipped, non-state, or tombstoned-history), keep today's
+    # buffered semantics: first applies, an identical repeat is skipped, a
+    # conflicting duplicate counts malformed, and file order decides which
+    # record is "first" (global order, via the line numbers).
+    _remaining_expiry = sorted(
+        [(ln, rec) for _lst in known_expiry.values() for (ln, rec) in _lst
+         if decode_error is None or ln <= _last_parsed_lineno],
+        key=lambda pair: pair[0])
+    if _remaining_expiry:
         try:
-            for lineno, e in pending_expiry:
+            for lineno, e in _remaining_expiry:
                 if trust_policy is not None:
                     # Issue #282 review blocker: a namespace gate alone let a
                     # peer retire a PRE-EXISTING LOCAL state row — an
@@ -3229,8 +3416,8 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                   f"side table unavailable ({_sanitize_error_text(str(e))}); "
                   "re-ingest after a writable open migrates this store to v15",
                   file=sys.stderr)
-            malformed += len(pending_expiry)
-            expiry_malformed += len(pending_expiry)
+            malformed += len(_remaining_expiry)
+            expiry_malformed += len(_remaining_expiry)
 
     print(f"[zmem] ingest-jsonl: added={added} tombstoned={tombstoned} "
           f"tombstones_refused={tombstones_refused} capture_refused={capture_refused} "

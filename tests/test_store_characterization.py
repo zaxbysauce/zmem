@@ -464,18 +464,29 @@ class CharacterizationTests(unittest.TestCase):
              "consolidated_at", "supersede_reason"],
             "v15 must not add/drop/reorder/rename a memory column (AC1)")
         # cid, name, type, notnull, dflt_value, pk -- pin the whole shape.
+        # #318: the DEFAULT column (dflt_value) joins the pin — the #173
+        # contract's Tests item 4 prescribes names, types, not-null flags,
+        # defaults, and primary-key positions, and a future additive-DDL
+        # mistake that alters a default must turn this red.
         self.assertEqual(
-            [(r[2], r[3], r[5]) for r in rows],
-            [("TEXT", 0, 1), ("TEXT", 1, 0), ("TEXT", 1, 0), ("TEXT", 1, 0),
-             ("TEXT", 1, 0), ("TEXT", 1, 0), ("TEXT", 1, 0), ("REAL", 1, 0),
-             ("TEXT", 1, 0), ("TEXT", 1, 0), ("TEXT", 0, 0), ("TEXT", 1, 0),
-             ("INTEGER", 1, 0), ("TEXT", 0, 0), ("INTEGER", 1, 0), ("TEXT", 0, 0),
-             ("TEXT", 0, 0), ("TEXT", 0, 0), ("TEXT", 1, 0), ("TEXT", 1, 0),
-             ("TEXT", 1, 0), ("REAL", 1, 0), ("INTEGER", 1, 0), ("INTEGER", 1, 0),
-             ("BLOB", 0, 0), ("TEXT", 0, 0), ("TEXT", 0, 0), ("TEXT", 0, 0),
-             ("TEXT", 0, 0)],
-            "memory column types/NOT-NULL/pk drifted -- the additive v15 "
-            "migration must leave this table alone")
+            [(r[2], r[3], r[4], r[5]) for r in rows],
+            [('TEXT', 0, None, 1), ('TEXT', 1, None, 0),
+             ('TEXT', 1, None, 0), ('TEXT', 1, None, 0),
+             ('TEXT', 1, "''", 0), ('TEXT', 1, "''", 0),
+             ('TEXT', 1, "''", 0), ('REAL', 1, '0.5', 0),
+             ('TEXT', 1, "'none'", 0), ('TEXT', 1, "''", 0),
+             ('TEXT', 0, None, 0), ('TEXT', 1, None, 0),
+             ('INTEGER', 1, '0', 0), ('TEXT', 0, None, 0),
+             ('INTEGER', 1, '0', 0), ('TEXT', 0, None, 0),
+             ('TEXT', 0, None, 0), ('TEXT', 0, None, 0),
+             ('TEXT', 1, "''", 0), ('TEXT', 1, "''", 0),
+             ('TEXT', 1, "'trusted_internal'", 0), ('REAL', 1, '1.0', 0),
+             ('INTEGER', 1, '0', 0), ('INTEGER', 1, '0', 0),
+             ('BLOB', 0, None, 0), ('TEXT', 0, "''", 0),
+             ('TEXT', 0, None, 0), ('TEXT', 0, None, 0),
+             ('TEXT', 0, "''", 0)],
+            "memory column types/NOT-NULL/default/pk drifted -- the "
+            "additive v15 migration must leave this table alone")
 
     def test_root_help_surface(self):
         r = _run_cli({}, "--help")

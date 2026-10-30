@@ -5,6 +5,16 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.130.0] - 2026-10-30
+
+### Fixed
+
+- **promote-store preserves `memory_expiry` records (#324).** A parent-outcome-aware copy pass lands side records only on destination ids that are live state rows — tombstoned and dedup-remapped parents are never revived; an existing destination record wins on conflict; `--dry-run` counts would-copies against the projected post-memory-pass live-state set. A promoted state row now updates without the `state memories require an existing memory_expiry row` refusal.
+- **Legacy `ingest-jsonl` commits state rows atomically with their expiry records (#347).** A pre-index pass lets each live state row commit in ONE transaction with its first-in-file side record, closing the half-applied window a concurrent reader could observe; duplicate/conflict semantics behind a consumed first record keep the buffered-apply contract, and unpaired legacy state rows behave as before.
+- **`state` memories are writable on every agent surface (#326).** `expiry_class`/`inject_until` flow through hermes `zmem_add`/`zmem_update`, MCP `add`/`update`, the remote transport, the ops applier (`apply_ops` no longer reports committed while silently dropping expiry), and the remote gate (a state add queues WITH its metadata; a state add WITHOUT `--expiry-class` is still refused up front). Loaded and degraded enums agree (F23); the remote CLI queues the pair for add/update.
+- **`update` resolves the target's type at action time for expiry flags (#317, owner-directed).** `add` keeps its parse-time refusal; `update` accepts the expiry flags with `--type` omitted on state targets, and genuinely non-state targets keep the writer's refusal. Documented in `update --help` and SKILL.md.
+- **Memory-table characterization pin covers column defaults (#318 remainder).** `(type, notnull, dflt_value, pk)` is pinned per column; the NOTICE byte-exact half had shipped with #173 F27 and is recorded as already-fixed on the issue.
+
 ## [0.129.0] - 2026-10-29
 
 ### Subject-aware dedup — distinct task facts survive similarity (issue #376)
@@ -51,6 +61,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   by type); the ingest dedup cache keeps the newest window on both writers;
   and the direct-form classifier is structural (prefix-typed), never
   substring.
+
 
 ## [0.128.0] - 2026-10-28
 

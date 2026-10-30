@@ -363,6 +363,55 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                     conn, _effective_namespace(args),
                     _scrub(str(args.get("content", ""))))
                 if _replay is not None:
+                    # Feedback FB-2: a fold must never report committed while
+                    # silently dropping requested expiry metadata. With
+                    # expiry args present, the op only commits when the
+                    # keeper's stored record already matches (a true replay);
+                    # a missing/differing record is a REJECTION naming the
+                    # reason -- the caller re-files via update, which owns
+                    # expiry transitions.
+                    _want_cls = (str(args["expiry_class"])
+                                 if args.get("expiry_class") else None)
+                    _want_until = (str(args["inject_until"])
+                                   if args.get("inject_until") else None)
+                    if kind in ("add", "capture") and _want_cls:
+                        _keeper_row = conn.execute(
+                            "SELECT type FROM memory WHERE id=?",
+                            (_replay,)).fetchone()
+                        _stored = conn.execute(
+                            "SELECT expiry_class, inject_until "
+                            "FROM memory_expiry WHERE memory_id=?",
+                            (_replay,)).fetchone()
+                        if (_keeper_row is None
+                                or _keeper_row[0] != "state"):
+                            receipts.append(_receipt(
+                                op_id, kind, "rejected",
+                                error="expiry_requires_state_target",
+                                canonical_id=_replay, deduped=True))
+                            conn.execute(
+                                "INSERT INTO applied_ops (op_id, principal,"
+                                " status, canonical_id, applied_at) VALUES"
+                                " (?, ?, 'rejected', ?, ?)",
+                                (op_id, principal or "", _replay, _now()))
+                            canonical[op_id] = _replay
+                            continue
+                        if (_stored is not None
+                                and _stored[0] == _want_cls
+                                and (_want_until is None
+                                     or _stored[1] == _want_until)):
+                            pass  # true replay: the stored record matches
+                        else:
+                            receipts.append(_receipt(
+                                op_id, kind, "rejected",
+                                error="expiry_record_mismatch_on_dedup",
+                                canonical_id=_replay, deduped=True))
+                            conn.execute(
+                                "INSERT INTO applied_ops (op_id, principal,"
+                                " status, canonical_id, applied_at) VALUES"
+                                " (?, ?, 'rejected', ?, ?)",
+                                (op_id, principal or "", _replay, _now()))
+                            canonical[op_id] = _replay
+                            continue
                     receipts.append(_receipt(
                         op_id, kind, "committed",
                         canonical_id=_replay, deduped=True))
@@ -479,6 +528,13 @@ def _apply_one(conn: sqlite3.Connection, op_id: str, kind: str,
             taint="untrusted_tool",  # network-fed route: client taint claims
             # are never trusted (the T-03 clamp; the hub's own tools hardcode
             # untrusted_tool for remote submissions).
+            # #326: state rows ride the queue with their expiry metadata --
+            # dropping these here made apply_ops report committed while the
+            # side record silently never landed.
+            expiry_class=(str(args["expiry_class"])
+                          if args.get("expiry_class") else None),
+            inject_until=(str(args["inject_until"])
+                          if args.get("inject_until") else None),
         )
         return _receipt(op_id, kind, "committed", canonical_id=str(result),
                         deduped=bool(getattr(result, "deduped", False)))
@@ -507,6 +563,12 @@ def _apply_one(conn: sqlite3.Connection, op_id: str, kind: str,
             taint="untrusted_tool",
             capture_mode=_capture_mode(args),
             expected_old_namespace=target_ns,
+            # #326: expiry updates ride the queue (the same forwarding the
+            # standalone update tool has had since #173).
+            expiry_class=(str(args["expiry_class"])
+                          if args.get("expiry_class") else None),
+            inject_until=(str(args["inject_until"])
+                          if args.get("inject_until") else None),
         )
         return _receipt(op_id, kind, "committed", canonical_id=str(result),
                         created_new=bool(created_new))
