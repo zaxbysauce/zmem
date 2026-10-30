@@ -634,49 +634,36 @@ jobs:
           # minilm.onnx AND tokenizer.json in the SAME dir, and a stale
           # tokenizer must never survive under the model-only cache key.
           cp skills/memory/models/tokenizer.json "$ZMEM_MODELS_CACHE/tokenizer.json"
-      - name: Diagnose embedder availability (temporary, issue #413 CI round 3)
+      - name: Diagnose embedder availability (temporary, issue #413 CI round 4)
         shell: bash
         env:
           ZMEM_TEST_REAL_MODELS_DIR: ${{ env.ZMEM_MODELS_CACHE }}
         run: |
           set -e
           python -X utf8 - <<'PY'
-          import os, sys, json
+          import os, sys, traceback
           sys.path.insert(0, os.path.join(os.getcwd(), "skills", "memory", "scripts"))
-          # The DRIVER env the harness constructs (tests/test_subject_dedup_contract.py
-          # _base_env + overrides): ZMEM_MODELS_DIR is what the embedder reads.
           os.environ["ZMEM_MODELS_DIR"] = os.environ["ZMEM_TEST_REAL_MODELS_DIR"]
-          os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-          os.environ.pop("ZMEM_EMBED_PROFILE", None)
-          import embed_profiles
-          import embeddings
-          prof = embeddings.current_profile_name()
-          print("step1 current_profile_name:", repr(prof), "falsy:", not prof)
+          import onnxruntime, tokenizers, numpy
+          print("versions: onnxruntime", onnxruntime.__version__,
+                "tokenizers", tokenizers.__version__, "numpy", numpy.__version__)
+          from pathlib import Path
+          md = Path(os.environ["ZMEM_MODELS_DIR"])
+          model_bytes = (md / "minilm.onnx").read_bytes()
+          print("model bytes:", len(model_bytes))
           try:
-              import onnxruntime
-              print("step2 import onnxruntime: OK", onnxruntime.__version__)
-          except ImportError as e:
-              print("step2 import onnxruntime: IMPORTERROR", e)
+              sess = onnxruntime.InferenceSession(model_bytes)
+              print("InferenceSession OK:", sess.get_inputs()[0].name)
+          except Exception:
+              print("InferenceSession FAILED:")
+              traceback.print_exc()
           try:
               from tokenizers import Tokenizer
-              print("step3 from tokenizers import Tokenizer: OK", Tokenizer)
-          except ImportError as e:
-              print("step3 from tokenizers import Tokenizer: IMPORTERROR", repr(e))
-          try:
-              import numpy
-              print("step4 import numpy: OK", numpy.__version__)
-          except ImportError as e:
-              print("step4 import numpy: IMPORTERROR", e)
-          md = embeddings._resolve_models_dir()
-          print("step5 _resolve_models_dir:", repr(md))
-          print("step6 model is_file:", (md / "minilm.onnx").is_file(),
-                "tokenizer is_file:", (md / "tokenizer.json").is_file())
-          print("FINAL is_available:", embeddings.is_available())
-          import inspect
-          src = inspect.getsource(embeddings._check_available)
-          print("(_check_available source hash:", __import__("hashlib").sha256(src.encode()).hexdigest()[:12], ")")
-          blob = embeddings.embed_text("diagnostic probe")
-          print("embed_text len:", None if blob is None else len(blob))
+              tok = Tokenizer.from_file(str(md / "tokenizer.json"))
+              print("Tokenizer.from_file OK:", type(tok).__name__)
+          except Exception:
+              print("Tokenizer.from_file FAILED:")
+              traceback.print_exc()
           PY
       - name: Run the frozen #376 contract argvs (real model present)
         shell: bash
