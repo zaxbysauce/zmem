@@ -1737,7 +1737,7 @@ def _build_snapshot_payload(
     # missing side row as live. Only records for rows SHIPPED in this
     # payload are emitted (never orphans).
     expiry: list[list[str]] = []
-    state_ids = [r[type_idx] for r in rows if r[type_idx] == "state"]
+    state_ids = [r[0] for r in rows if r[type_idx] == "state"]
     for start in range(0, len(state_ids), 500):
         batch = state_ids[start:start + 500]
         ph = ",".join("?" * len(batch))
