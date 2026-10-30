@@ -648,10 +648,10 @@ class DatasetExportTest(_StoreCase):
             newline="\n",
         )
         manifest = self.manifest(work)
-        families = {
-            family: ds._read_family(work, family, manifest["format"])
-            for family in ds.DATASET_FAMILIES
-        }
+        # #414: read via the optional-aware helper - the legacy fixture
+        # predates the memory_expiry family and carries no file for it.
+        families = ds._read_export_families(
+            work, manifest["format"], RuntimeError)
         manifest["source_snapshot_hash"] = ds._compute_snapshot_hash(
             families, True
         )

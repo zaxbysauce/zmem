@@ -2416,6 +2416,34 @@ def update_memory(
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
 
+        # Issue #416 (liveness TOCTOU): the liveness read above ran BEFORE
+        # the write lock, so a concurrent update of the same row can have
+        # tombstoned it (and committed) in the read-to-lock window. Re-check
+        # liveness UNDER the lock — the second writer must refuse, never
+        # mint a second live successor or re-tombstone history (the refusal
+        # mirrors supersede_memory's in-transaction guard). Rollback only
+        # when this function owns the transaction; a caller-owned
+        # transaction is left to the caller/savepoint owner.
+        locked_row = conn.execute(
+            "SELECT superseded_at FROM memory WHERE id=?", (mid,)
+        ).fetchone()
+        if locked_row is None:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                f"[zmem] no memory with id {mid}; cannot update "
+                "(the row vanished between read and write)"
+            )
+        if locked_row["superseded_at"] is not None:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                f"[zmem] memory {mid} is already superseded (at "
+                f"{locked_row['superseded_at']}); update refused — history "
+                "is append-only, this row is no longer live, and a "
+                "concurrent update won the race (issue #416)"
+            )
+
         # v15 (#173 PR-review F21): resolve the side-table pair against a
         # snapshot taken UNDER the write lock, so a concurrent purge/supersede
         # cannot vanish the old side row between the read and the tombstone.
@@ -2471,7 +2499,7 @@ def update_memory(
         if expected_old_namespace is not None:
             cur = conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
-                "WHERE id=? AND namespace=?",
+                "WHERE id=? AND namespace=? AND superseded_at IS NULL",
                 (ts, ts, normalized_reason, mid, expected_old_namespace),
             )
             if cur.rowcount == 0:
@@ -2479,16 +2507,30 @@ def update_memory(
                     conn.rollback()
                 raise ValueError(
                     f"[zmem] namespace guard: memory {mid} no longer lives "
-                    f"in namespace {expected_old_namespace} — the row moved "
-                    "or was deleted between read and write; refusing to "
-                    "update it (issue #109)"
+                    f"in namespace {expected_old_namespace} — the row moved, "
+                    "was deleted, or was superseded between read and write; "
+                    "refusing to update it (issue #109)"
                 )
         else:
-            conn.execute(
+            # Issue #416: the tombstone is conditional on the parent still
+            # being LIVE — an already-tombstoned row matches zero rows, so a
+            # second writer refuses instead of re-tombstoning history (a
+            # re-write would move superseded_at/valid_until forward, the
+            # as-of-resurrection hazard supersede_memory refuses). The
+            # rowcount backstop fails closed exactly like the pinned variant.
+            cur = conn.execute(
                 "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
-                "WHERE id=?",
+                "WHERE id=? AND superseded_at IS NULL",
                 (ts, ts, normalized_reason, mid),
             )
+            if cur.rowcount == 0:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
+                raise ValueError(
+                    f"[zmem] memory {mid} is already superseded or gone; "
+                    "update refused — history is append-only and tombstone "
+                    "timestamps are immutable (issue #416)"
+                )
         try:
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (mid,))
         except sqlite3.OperationalError:

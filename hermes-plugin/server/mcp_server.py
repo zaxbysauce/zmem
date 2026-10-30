@@ -1646,6 +1646,125 @@ def _parse_results(r: dict[str, Any]) -> dict[str, Any]:
 
 # -- FastMCP construction ----------------------------------------------------
 
+def _build_snapshot_payload(
+    conn,
+    *,
+    scoped: bool,
+    namespaces,
+    principal_id: str,
+    max_bytes: int = 64 * 1024 * 1024,
+    embed_profile: "str | None" = None,
+) -> dict[str, Any]:
+    """Assemble the T-11 offline snapshot payload (issues #290, #414).
+
+    Module-level and synchronous on purpose: the claim-gate tests drive the
+    REAL producer — payload shape (live rows, base64 embeddings, the
+    superseded-only revocation list, and the additive ``expiry`` family
+    carrying each shipped state row's ``memory_expiry`` side record), the
+    AC5 dual scope filter, and the 64 MB accounting over rows + revocations
+    + expiry — without booting a server. Raises ``ValueError`` when the
+    assembled payload exceeds ``max_bytes``; the caller renders the refusal.
+    """
+    import base64
+    import time as _time
+
+    # The counter-column names are composed (not contiguous) because
+    # tests/test_feedback_promote.py's passive-surface scan forbids the
+    # literals — they mark counter WRITES.  This builder only READS the
+    # columns into the snapshot payload; same precedent as the doc-drift
+    # gate assembling its own regex from parts.
+    _ctr_applied = "applied" + "_count"
+    _ctr_violated = "violated" + "_count"
+    columns = (
+        "id, namespace, type, content, tags, source_ref, confidence, "
+        "signal, valid_from, valid_until, update_of, taint, "
+        "ingestion_ts, superseded_at, supersede_reason, merged_from, "
+        "trust_score, " + _ctr_applied + ", " + _ctr_violated + ", "
+        "embedding, embedding_model, retrieval_count, last_retrieved, "
+        "surfaced_count, last_surfaced"
+    )
+    embedding_idx = 19
+    type_idx = 2  # id, namespace, type — positional in `columns` above
+    cutoff = _time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() - 30 * 86400))
+    active = {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT namespace FROM memory WHERE "
+            "max(coalesce(ingestion_ts,''), coalesce(last_retrieved,''), "
+            "coalesce(last_surfaced,'')) >= ?", (cutoff,)).fetchall()}
+    if scoped:
+        allowed = {ns for ns in (namespaces or frozenset())
+                   if ns != "user:global" and ns in active}
+    else:
+        allowed = {ns for ns in active if ns != "user:global"}
+    scope = {"user:global"} | allowed
+    placeholders = ",".join("?" * len(scope))
+    where = f"namespace IN ({placeholders})"
+    params = sorted(scope)
+    rows: list[list[Any]] = []
+    payload_bytes = 0
+    cur = conn.execute(
+        f"SELECT {columns} FROM memory WHERE {where} "
+        f"AND superseded_at IS NULL", params)
+    while True:
+        chunk = cur.fetchmany(500)
+        if not chunk:
+            break
+        for r in chunk:
+            row = list(r)
+            if row[embedding_idx] is not None:
+                row[embedding_idx] = base64.b64encode(
+                    row[embedding_idx]).decode("ascii")
+            payload_bytes += sum(len(str(v)) for v in row if v is not None)
+            rows.append(row)
+        if payload_bytes > max_bytes:
+            raise ValueError("payload exceeds the cap (rows)")
+    revoked = [
+        r[0] for r in conn.execute(
+            f"SELECT id FROM memory WHERE {where} "
+            f"AND superseded_at IS NOT NULL", params).fetchall()]
+    payload_bytes += sum(len(str(r)) for r in revoked)
+    # Scope law (final-critic B4): purged ids are unnamespaced post-purge —
+    # emitting them would leak other principals' row identifiers to a
+    # scoped token.  The revocation list is superseded-in-scope only; a
+    # purged row's ABSENCE from the live rows is its revocation.
+    if payload_bytes > max_bytes:
+        raise ValueError("payload exceeds the cap (revocations)")
+    # Issue #414: shipped state rows ride with their memory_expiry side
+    # records — an ADDITIVE payload family (older consumers ignore unknown
+    # keys) the broker restores into the offline store so the armed expiry
+    # gate withholds expired state rows offline instead of reading every
+    # missing side row as live. Only records for rows SHIPPED in this
+    # payload are emitted (never orphans).
+    expiry: list[list[str]] = []
+    state_ids = [r[0] for r in rows if r[type_idx] == "state"]
+    for start in range(0, len(state_ids), 500):
+        batch = state_ids[start:start + 500]
+        ph = ",".join("?" * len(batch))
+        expiry.extend(
+            [t[0], t[1], t[2]] for t in conn.execute(
+                f"SELECT memory_id, inject_until, expiry_class "
+                f"FROM memory_expiry WHERE memory_id IN ({ph})",
+                batch).fetchall())
+    payload_bytes += sum(
+        len(str(v)) for trip in expiry for v in trip)
+    if payload_bytes > max_bytes:
+        raise ValueError("payload exceeds the cap (expiry family)")
+    return {
+        "ok": True,
+        "principal": principal_id,
+        "rows": rows,
+        "columns": columns,
+        "embedding_b64": True,
+        "embed_profile": embed_profile
+        if embed_profile is not None else _embed_profile_name,
+        "revocations": revoked,
+        "expiry": expiry,
+        "snapshot_revision": len(rows) + len(revoked),
+        "payload_bytes": payload_bytes,
+    }
+
+
 def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # type: ignore[name-defined]
     from mcp.server.auth.settings import AuthSettings
     from mcp.server.fastmcp import FastMCP
@@ -2100,87 +2219,24 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             return _deadline_response(deadline)
         caller = current_principal()
         store_path = _authoritative_store_path() or _fallback_store_path()
-        max_bytes = 64 * 1024 * 1024
         try:
-            import base64
             import sqlite3 as _sqlite3
-            import time as _time
 
             conn = _sqlite3.connect(
                 f"file:{store_path}?mode=ro", uri=True, timeout=5.0)
         except (Exception, SystemExit):  # noqa: BLE001 - degrade, never raise
             return _error("snapshot: store unavailable")
-        # The counter-column names are composed (not contiguous) because
-        # tests/test_feedback_promote.py's passive-surface scan forbids
-        # the literals — they mark counter WRITES.  This tool only READS
-        # the columns into the snapshot payload; same precedent as the
-        # doc-drift gate assembling its own regex from parts.
-        _ctr_applied = "applied" + "_count"
-        _ctr_violated = "violated" + "_count"
-        columns = (
-            "id, namespace, type, content, tags, source_ref, confidence, "
-            "signal, valid_from, valid_until, update_of, taint, "
-            "ingestion_ts, superseded_at, supersede_reason, merged_from, "
-            "trust_score, " + _ctr_applied + ", " + _ctr_violated + ", "
-            "embedding, embedding_model, retrieval_count, last_retrieved, "
-            "surfaced_count, last_surfaced"
-        )
-        embedding_idx = 19
         try:
             conn.execute("BEGIN")
-            cutoff = _time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() - 30 * 86400))
-            active = {
-                r[0] for r in conn.execute(
-                    "SELECT DISTINCT namespace FROM memory WHERE "
-                    "max(coalesce(ingestion_ts,''), coalesce(last_retrieved,''), "
-                    "coalesce(last_surfaced,'')) >= ?", (cutoff,)).fetchall()}
-            if caller.scoped:
-                allowed = {ns for ns in (caller.namespaces or frozenset())
-                           if ns != "user:global" and ns in active}
-            else:
-                allowed = {ns for ns in active if ns != "user:global"}
-            scope = {"user:global"} | allowed
-            placeholders = ",".join("?" * len(scope))
-            where = f"namespace IN ({placeholders})"
-            params = sorted(scope)
-            rows: list[list[Any]] = []
-            payload_bytes = 0
-            oversize = False
-            cur = conn.execute(
-                f"SELECT {columns} FROM memory WHERE {where} "
-                f"AND superseded_at IS NULL", params)
-            while True:
-                chunk = cur.fetchmany(500)
-                if not chunk:
-                    break
-                for r in chunk:
-                    row = list(r)
-                    if row[embedding_idx] is not None:
-                        row[embedding_idx] = base64.b64encode(
-                            row[embedding_idx]).decode("ascii")
-                    payload_bytes += sum(
-                        len(str(v)) for v in row if v is not None)
-                    rows.append(row)
-                if payload_bytes > max_bytes:
-                    oversize = True
-                    break
-            if oversize:
-                return _error(
-                    "snapshot: payload exceeds the 64 MB cap; refused")
-            revoked = [
-                r[0] for r in conn.execute(
-                    f"SELECT id FROM memory WHERE {where} "
-                    f"AND superseded_at IS NOT NULL", params).fetchall()]
-            payload_bytes += sum(len(str(r)) for r in revoked)
-            # Scope law (final-critic B4): purged ids are unnamespaced
-            # post-purge — emitting them would leak other principals' row
-            # identifiers to a scoped token.  The revocation list is
-            # superseded-in-scope only; a purged row's ABSENCE from the
-            # live rows is its revocation (replacement semantics).
-            if payload_bytes > max_bytes:
-                return _error(
-                    "snapshot: payload exceeds the 64 MB cap; refused")
+            payload = _build_snapshot_payload(
+                conn, scoped=caller.scoped,
+                namespaces=caller.namespaces,
+                principal_id=caller.principal_id)
+        except ValueError:
+            # The 64 MB cap refusal (rows / revocations / expiry family) —
+            # the broker keeps its previous snapshot and retries later.
+            return _error(
+                "snapshot: payload exceeds the 64 MB cap; refused")
         except (Exception, SystemExit):  # noqa: BLE001 - degrade, never raise
             return _error("snapshot: consistent read failed")
         finally:
@@ -2188,17 +2244,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
-        return {
-            "ok": True,
-            "principal": caller.principal_id,
-            "rows": rows,
-            "columns": columns,
-            "embedding_b64": True,
-            "embed_profile": _embed_profile_name,
-            "revocations": revoked,
-            "snapshot_revision": len(rows) + len(revoked),
-            "payload_bytes": payload_bytes,
-        }
+        return payload
 
     @mcp.tool()
     async def recall(
