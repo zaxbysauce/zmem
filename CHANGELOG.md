@@ -5,6 +5,15 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.131.0] - 2026-10-30
+
+### Fixed
+
+- **True minilm pin provenance on every operator-facing surface (#413).** The pinned embedding trust root (sha256 `bbd7b466…`, 90,387,630 bytes) is the ORIGINAL OPERATOR-BOX ONNX export of all-MiniLM-L6-v2 — preserved byte-exact in this repo's Git LFS history at commit `3240ea1a0cf3…` — NOT the public Xenova HF export (`onnx/model.onnx`, oid `759c3cd2…`, 90,387,606 bytes). The false "pin is the Xenova export" claim is corrected on `embed_profiles.py` (comment + `MINILM_NOTES`), `SKILL.md` (registry table + notes), `README.md`, `embeddings.py`, `doctor.py` (checksum-mismatch remediation now restores from the release asset), the #376 contract docstring, and `test_embed_profiles.py`; a persistent provenance-contract test pins the full identifiers.
+- **Immutable public byte source for the pinned model (#413).** The pinned bytes are published as the GitHub release asset `model-minilm-bbd7b466/minilm.onnx` (never-retargeted tag, served bytes sha-verified against the pin). This completes the `ZMEM_MODEL_URL` operator remediation path and unblocks the CI lane. `PLAN.md` now carries an archive-first guard: any future `git filter-repo`/BFG history rewrite must land only AFTER that asset exists and verifies — the LFS blob is the only in-repo byte source.
+- **Provisioned-model CI lane (#413).** New `test-real-model` job in ci.yml: provisions the pinned bytes from the release asset, sha-verifies on EVERY run (cache hits included), ships a fresh `tokenizer.json` beside them (the production embedder requires both files in one dir), exports `ZMEM_TEST_REAL_MODELS_DIR`, and runs the seven frozen #376 contract argvs natively — the five real-model legs are no longer structured-INCOMPLETE on every CI run. Model-absent lanes keep the INCOMPLETE-banner discipline (pinned by a frozen PRESERVING check).
+- **Floor-table header count (#269).** `SKILL.md` says "Five distinct floors" over the five-row recall-path floor table (drifted at "Four" since #235 added the fifth); the doc-drift test is renamed to match and gains a count-parsing guardrail (header claim vs table rows, both derived) so the next added floor cannot drift silently.
+
 ## [0.130.0] - 2026-10-30
 
 ### Fixed
@@ -61,7 +70,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   by type); the ingest dedup cache keeps the newest window on both writers;
   and the direct-form classifier is structural (prefix-typed), never
   substring.
-
 
 ## [0.128.0] - 2026-10-28
 
@@ -543,8 +551,6 @@ on a shared store keeps working.
   fails with a diagnostic naming every line number when more than one exists;
   content under any heading is detected. The single-empty-section exit-0
   floor is unchanged.
-
-
 
 ## [0.113.0] - 2026-10-20
 
@@ -1527,7 +1533,6 @@ on a shared store keeps working.
 
 ## [0.94.0] - 2026-10-11
 
-
 ### Fixed
 - **The delivery ledger now records every row that was actually rendered
   (issue #250, Workstream P PR 2):** passive injection renders link-expansion
@@ -1561,7 +1566,6 @@ on a shared store keeps working.
   ones — is unaffected, and expansion still runs when nothing is excluded.
   `explain_recall` is deliberately untouched: it has no exclusion surface by
   design (`--exclude` is rejected alongside `--explain`).
-
 
 - **Operation feedback no longer rewards a supplementary neighbour (issue #250):**
   every delivery-ledger entry now records whether the row was bump-eligible, so
@@ -1598,8 +1602,6 @@ on a shared store keeps working.
   evicted while its neighbour survives; the parent then re-renders with the
   neighbour still suppressed. Reaching this needs more than 256 live entries
   inside the six-hour window, so it is a tail condition rather than a routine one.
-
-
 
 ## [0.93.0] - 2026-10-11
 
@@ -1708,7 +1710,6 @@ README.
 - **`store.py ops-append` contract flags (issue #163)**: the provider path passes `--namespace NS --session-id SESSION --tool TOOL --operation OP` (the former `--session`/`--op` spellings remain accepted as aliases; BREAKING: `--namespace` is now REQUIRED, so old invocations without it exit 2 with no stdout payload and must add the flag). A no-token derivation is now the declared successful no-op (`{"ok":true}`, exit 0, the writer is never invoked); a failed append prints `{"ok":false}` (exit 1) with stdout strictly machine-parseable. The `--namespace` value is validated non-empty and carried for the provider path (future fleet-parity routing); the ring itself stays keyed by session id.
 - **Post-append ring caps (issue #163)**: `append_ops_ring` now enforces BOTH bounds after the append — complete JSONL lines are dropped oldest-first until the ring holds at most 64 complete events AND at most 65536 UTF-8 bytes, rewritten atomically; 65 appends of any size can never leave 65 live events, and a torn trailing line is never retained. Readers are unaffected.
 - **Updated callers**: the capture-adapter bridge (`hooks/zmem-convention-capture.sh`) passes the new `ops-append` flags; README and the memory SKILL.md document the new shape.
-
 
 ## [0.89.0] - 2026-10-08
 

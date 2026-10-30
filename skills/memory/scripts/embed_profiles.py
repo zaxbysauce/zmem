@@ -12,8 +12,9 @@ Keep this module dependency-free (stdlib only): doctor and test harnesses must
 be able to import it without onnxruntime, numpy, or the writer stack.
 
 Profiles shipped:
-- ``minilm`` — the operator default: Xenova/all-MiniLM-L6-v2 ONNX, 384-dim,
-  checksum-pinned.
+- ``minilm`` — the operator default: all-MiniLM-L6-v2 ONNX (the operator-box
+  build pinned by sha256 — NOT the public Xenova HF export; see MINILM_NOTES),
+  384-dim.
 - ``fake``   — deterministic placeholder vectors for tests/CI that must run
   model-absent. Never for operator stores; doctor warns when a real store runs
   under it.
@@ -61,7 +62,7 @@ MINILM_NOTES = (
     "all-MiniLM-L6-v2 (preserved in this repo's LFS history at "
     "3240ea1a0cf3d972f6a7d472cee73abaddfc038d and served as the "
     "model-minilm-bbd7b466 release asset), not the public Xenova "
- "onnx/model.onnx export (oid "
+    "onnx/model.onnx export (oid "
     "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e) and "
     "not the sentence-transformers PyTorch weights — the builds are NOT "
     "byte-identical. A checksum_mismatch almost always means the wrong build "
