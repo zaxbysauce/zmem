@@ -219,6 +219,32 @@ class SkillDocDriftTest(unittest.TestCase):
         self.assertIn("INJECT_FLOOR_USER_GLOBAL_DEFAULT", text,
                       "SKILL.md must document INJECT_FLOOR_USER_GLOBAL_DEFAULT")
 
+    def test_minilm_provenance_surfaces_corrected(self):
+        # Issue #413 review (PRR-008): the provenance correction shipped on
+        # six+ surfaces; each one that regresses to the false "pin == the
+        # public Xenova export" wording must fail here, not only the
+        # embed_profiles constant test. Absence needles are the exact stale
+        # sentences; presence needles are the corrected remediation/source.
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "The published pin covers the Xenova ONNX export", skill,
+            "SKILL.md regressed to the false pin-source wording")
+        self.assertIn("3240ea1a0cf3d972f6a7d472cee73abaddfc038d", skill,
+                      "SKILL.md must name the LFS byte source")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "The pin covers the Xenova ONNX export", readme,
+            "README regressed to the false pin-source wording")
+        self.assertIn("model-minilm-bbd7b466", readme,
+                      "README must point at the release asset")
+        doctor = (REPO_ROOT / "skills" / "memory" / "scripts" / "doctor.py"
+                  ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Restore the correct Xenova ONNX export", doctor,
+            "doctor remediation regressed to the unverifiable export")
+        self.assertIn("model-minilm-bbd7b466", doctor,
+                      "doctor remediation must point at the release asset")
+
     def test_floor_header_count_matches_table(self):
         # Issue #269 guardrail: the "N distinct floors" sentence must state
         # the number of INJECT_FLOOR_* rows in the table directly under it.

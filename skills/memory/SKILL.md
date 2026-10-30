@@ -1717,7 +1717,9 @@ Notes:
   all-MiniLM-L6-v2 — preserved byte-exact in this repo's Git LFS history at
   commit `3240ea1a0cf3d972f6a7d472cee73abaddfc038d`
   (`skills/memory/models/minilm.onnx`, 90,387,630 bytes) and served as the
-  immutable GitHub release asset `model-minilm-bbd7b466/minilm.onnx`. It is
+  never-retargeted GitHub release asset `model-minilm-bbd7b466/minilm.onnx`
+  (the sha-256 check after fetching — not platform immutability — is the
+  trust boundary). It is
   NOT the public Xenova HF-repo export (`onnx/model.onnx`, oid
   `759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e`,
   90,387,606 bytes) and NOT the sentence-transformers PyTorch weights —

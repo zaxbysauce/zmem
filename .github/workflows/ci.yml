@@ -1,13 +1,15 @@
 name: CI
 
 # Runs the full test suite on pull requests and on pushes to main (pushes to
-# other branches are covered by their PR's run), without the ~90MB embedding
-# model (skills/memory/models/minilm.onnx is gitignored — Phase 10,
-# PLAN.md §7-P10). ZMEM_MODEL_AUTODOWNLOAD=0 guarantees no lazy-download is
-# attempted here either, so this job never fetches the model over the
-# network. All suites must (and do) pass model-absent: recall degrades to
-# FTS5, consolidate degrades to lexical token-overlap clustering — see
-# skills/memory/scripts/embeddings.py and store.py's `consolidate`.
+# other branches are covered by their PR's run). The test/ test-embeddings/
+# test-source-hermes jobs run MODEL-ABSENT (skills/memory/models/minilm.onnx
+# is gitignored — Phase 10, PLAN.md §7-P10; ZMEM_MODEL_AUTODOWNLOAD=0
+# guarantees no lazy-download): recall degrades to FTS5, consolidate degrades
+# to lexical token-overlap clustering — see skills/memory/scripts/embeddings.py
+# and store.py's `consolidate`. The ONE deliberate exception is the
+# test-real-model job (issue #413): it fetches the pinned bytes from the
+# model-minilm-bbd7b466 release asset, sha-verifies them against the in-repo
+# pin, and runs the #376 contract's real-model legs natively.
 
 on:
   push:
@@ -573,7 +575,8 @@ jobs:
   # model-absent lane by design; NATIVE approval of those legs requires a
   # checksum-verified pinned model (tests/test_subject_dedup_contract.py
   # docstring, frozen in the #376 checkpoint). This job provisions the pinned
-  # bytes from the immutable model-minilm-bbd7b466 release asset, sha-verifies
+  # bytes from the never-retargeted model-minilm-bbd7b466 release asset,
+  # sha-verifies
   # them against the in-repo pin ON EVERY RUN (cache hits included), and runs
   # the seven frozen pytest argvs. Runs on every PR — no path filter — so the
   # lane can never skip its own introducing changes.
@@ -623,6 +626,9 @@ jobs:
           fi
           python - <<'PY'
           import hashlib, os, sys
+          sys.path.insert(0, os.path.join("skills", "memory", "scripts"))
+          import embed_profiles
+          pin = embed_profiles.MINILM_SHA256
           cache = os.environ["ZMEM_MODELS_CACHE"]
           p = os.path.join(cache, "minilm.onnx")
           h = hashlib.sha256()
@@ -630,7 +636,6 @@ jobs:
               for chunk in iter(lambda: f.read(1 << 20), b""):
                   h.update(chunk)
           digest = h.hexdigest()
-          pin = "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5"
           if digest != pin:
               print(f"FATAL: cached/downloaded minilm.onnx sha256 {digest} != pin", file=sys.stderr)
               sys.exit(1)

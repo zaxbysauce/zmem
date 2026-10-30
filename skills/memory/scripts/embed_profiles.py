@@ -42,7 +42,7 @@ DEFAULT_PROFILE = "minilm"
 # ONNX export of all-MiniLM-L6-v2, bundled/downloaded as minilm.onnx. Those
 # bytes are preserved byte-exact in this repository's Git LFS history at commit
 # 3240ea1a0cf3d972f6a7d472cee73abaddfc038d (skills/memory/models/minilm.onnx,
-# 90,387,630 bytes) and served as the immutable GitHub release asset
+# 90,387,630 bytes) and served as the never-retargeted GitHub release asset
 # `model-minilm-bbd7b466/minilm.onnx`. They are NOT the public Xenova
 # HF-repo export (onnx/model.onnx oid
 # 759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e,
