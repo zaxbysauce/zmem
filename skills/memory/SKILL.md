@@ -1480,6 +1480,18 @@ negation polarity DISAGREES ("always X" vs "never X") is NOT merged — both
 rows stay live, link as `contradicts`, and each loses 0.10 trust. A
 polarity-AGREEING duplicate re-add is corroboration: the existing entry
 refreshes as before AND gains +0.05 trust.
+Dedup also has a subject guard (issue #376): two rows whose `task:<key>` tags
+carry explicitly DIFFERENT task subjects are never merged by similarity
+ALONE — each statement, its tags, source and evidence stay independently
+addressable on `add`, `update`, ingest and consolidation, the veto is logged
+with the stable code `subject_veto`, and a subject-compatible runner-up can
+still absorb the fold. Absent/malformed identity is compatible (unknown
+subjects dedupe as before), two rows BOTH typed `lesson` generalize across
+task origins (a single lesson row does not opt itself out of the guard), and
+subject-incompatible neighbors no longer receive each other's tags through
+link propagation. An admitted merge unions the survivor's task identities
+(bridge growth): a row that legitimately absorbed across compatible subjects
+can later merge with either subject.
 Link generation on write (v11, issue #61 6.2): after every `add`/`update`,
 the same namespace-aware neighbors dedup already computed (embedding cosine
 when the model is present, else Jaccard token overlap — model-absent stores

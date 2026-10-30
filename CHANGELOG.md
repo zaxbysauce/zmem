@@ -5,6 +5,53 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.129.0] - 2026-10-29
+
+### Subject-aware dedup — distinct task facts survive similarity (issue #376)
+
+- One shared task-subject compatibility rule at every destructive admission
+  point: `add`, `update`, ingest (legacy + cached), and consolidation absorb.
+  Rows whose `task:<key>` tags carry explicitly different task subjects
+  (repository-qualified keys are distinct) never merge by similarity alone —
+  each statement, its tags, source_ref and evidence stay independently
+  addressable; a subject-compatible runner-up can still absorb the fold
+  (semantic window, indexed/legacy exact lanes, and the bounded per-ingest
+  cache all fall through a vetoed nearest).
+- Absent or malformed task identity stays compatible (unknown subjects dedupe
+  exactly as before); `lesson` rows generalize across task origins; arbitrary
+  non-task tags, sessions, sources and shared entities are never treated as
+  subject conflicts; the dedup threshold is unchanged (0.85).
+- Consolidation: one ordered admission algorithm (rowid-deterministic,
+  simulated keeper tag growth) shared by the dry-run preview and the real
+  absorb loop, applied before contested-cluster classification; an untagged
+  keeper that absorbs one subject will not then absorb a disjoint one.
+- Link propagation no longer unions task tags onto subject-incompatible
+  neighbors (edges and trust events still form) — closing the second
+  cross-subject tag-contamination channel.
+- Subject vetoes log a stable, privacy-safe code (`subject_veto` — names the
+  existing row id and similarity only, never content), and bounded candidate
+  work is observable via the `storelib.write.SUBJECT_COMPAT_EVALS` counter.
+- Acceptance contract: `tests/test_subject_dedup_contract.py` (independently
+  authored, 7 discriminating checks; the real-MiniLM legs FAIL with a
+  structured MODEL_UNAVAILABLE signal when the pinned model is absent —
+  hard under the frozen pytest argv form, an explicit named-INCOMPLETE
+  banner under the direct-python CI form, where only the model-free legs
+  are scored) plus `tests/test_subject_dedup_supp.py` (its link-formation
+  assertions are lane-conditional and skip model-absent). No schema change;
+  no migration. Writers older than 0.129.0 do not apply the subject guard;
+  mixed-fleet stores are structurally unaffected (no format change).
+- Feedback-round hardening (swarm review F-01..F-17): consolidation
+  re-reads seed/neighbor rows at live state before admission (a grown
+  keeper can no longer be re-absorbed via its stale snapshot, which could
+  drop earlier merged content from recall); admission vetoes are visible on
+  stderr and counted; report `merged` counts only absorbs that landed;
+  subject parsing is linear over the canonical `[,;\s]+` tag grammar with
+  case-folded keys and a 4096-char ingest tags cap; the `lesson` carve-out
+  is symmetric (BOTH rows must be lessons — a writer cannot opt one row out
+  by type); the ingest dedup cache keeps the newest window on both writers;
+  and the direct-form classifier is structural (prefix-typed), never
+  substring.
+
 ## [0.128.0] - 2026-10-28
 
 Collated operator-surface hygiene PR (issues #277 #371 #244 #369 #245 #294).

@@ -931,14 +931,15 @@ class OversizedLineTest(_TwoStoreCase):
                           content="first row, ordinary length, has a newline")
         padded_row = _sync_row(id="55555555-7777-7777-7777-777777777777",
                                 content="final row padded to exactly the cap")
-        # tags has no length cap in _validate_sync_row (unlike content, capped
-        # at 65536), so it's the field to pad -- this keeps the row's content
-        # ordinary while landing the serialized line's total length EXACTLY
-        # on MAX_LINE_CHARS.
+        # Issue #376 feedback round: tags is now length-capped (4096) as
+        # parse input for the subject-identity system, so the free padding
+        # field is source_ref (validated as an opaque optional string) --
+        # this keeps the row's content ordinary while landing the
+        # serialized line's total length EXACTLY on MAX_LINE_CHARS.
         base_len = len(json.dumps(padded_row))
         pad_len = MAX_LINE_CHARS - base_len
         self.assertGreater(pad_len, 0)
-        padded_row["tags"] = "x" * pad_len
+        padded_row["source_ref"] = "x" * pad_len
         final_line = json.dumps(padded_row)
         self.assertEqual(len(final_line), MAX_LINE_CHARS)
 

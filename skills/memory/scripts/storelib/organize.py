@@ -977,7 +977,7 @@ def organize(
         with _scoped_tx(conn):
             link_rep = generate_links_on_write(
                 conn, r["id"], content=r["content"], namespace=r["namespace"],
-                tags=r["tags"], emb=r["embedding"],
+                tags=r["tags"], emb=r["embedding"], type_=r["type"],
             )
             if link_rep["neighbors"] > 0:
                 lb["backfilled"] += 1

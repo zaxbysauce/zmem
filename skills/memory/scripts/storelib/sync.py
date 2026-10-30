@@ -27,6 +27,7 @@ from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.state_expiry import validate_inject_until
 from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
+from storelib.write import SUBJECT_MAX_EXACT_CANDIDATES as _CAP
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
     EVIDENCE_KINDS,
@@ -568,6 +569,9 @@ def cmd_export_jsonl(
             conn.rollback()
 
 INGEST_MAX_CONTENT_CHARS = MAX_CONTENT_CHARS
+# ST-1/MX-3/F-06: remote tags are parse input for the subject identity
+# system; bound them like content (4096 chars is generous for task keys).
+INGEST_MAX_TAGS_CHARS = 4096
 
 # Shape guard for an incoming id: UUID-length hex-and-dashes. This is a
 # charset/length guard, not a UUID parser -- the point is that an id from a
@@ -1095,6 +1099,9 @@ def _validate_sync_row(obj: dict, lineno: int | None = None) -> dict:
     confidence = max(0.0, min(1.0, confidence))
 
     tags = _opt_str("tags")
+    if tags is not None and len(tags) > INGEST_MAX_TAGS_CHARS:
+        raise ValueError(f"field 'tags' is {len(tags)} chars, over the "
+                         f"{INGEST_MAX_TAGS_CHARS} limit")
     source_ref = _opt_str("source_ref")
     supersede_reason = _opt_str("supersede_reason")
     valid_from = _opt_str("valid_from")
@@ -1706,8 +1713,25 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # live row instead.
             existing, _sim, emb = None, None, None
         else:
-            existing, _sim, emb = _detect_duplicate(conn, content, namespace,
-                                                     dedup_cache=dedup_cache)
+            existing, _sim, emb, _legacy_det = _detect_duplicate_subject(
+                conn, content, namespace, dedup_cache=dedup_cache,
+                tags=tags, type_=type_,
+            )
+            if _legacy_det and existing is not None:
+                # Legacy 4-arg detector (patched stub): apply the issue #376
+                # subject veto site-side — the stub row lacks tags/type, so
+                # re-fetch them before deciding.
+                from storelib import subject as _subject
+                _lx = conn.execute(
+                    "SELECT tags, type FROM memory WHERE id=? AND superseded_at IS NULL",
+                    (existing["id"],),
+                ).fetchone()
+                if _lx is not None and _subject.incompatible(
+                    tags, type_, _lx["tags"], _lx["type"],
+                ):
+                    print(_subject.veto_line(existing["id"], _sim if _sim else 1.0),
+                          file=sys.stderr)
+                    existing = None
         # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
         # guard add_memory/update_memory apply. A remote row that contradicts
         # its dedup hit ("always X" vs "never X") must NOT be folded into the
@@ -1792,7 +1816,14 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         # detected as a duplicate without a namespace rescan (#36 M9).
         if dedup_cache is not None:
             norm_new = _normalize_content(content)
-            dedup_cache[(namespace, norm_new)] = mid
+            _ck = (namespace, norm_new)
+            _cv = dedup_cache.get(_ck)
+            if _cv is None:
+                dedup_cache[_ck] = [mid]
+            else:
+                _cv.append(mid)
+                if len(_cv) > _CAP:
+                    del _cv[0]
         if started_tx:
             _commit(conn)
         return "added"
@@ -1800,6 +1831,30 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         if started_tx and conn.in_transaction:
             conn.rollback()
         raise
+
+def _detect_duplicate_subject(
+    conn, content: str, namespace: str, *, dedup_cache=None,
+    tags=None, type_=None,
+):
+    """Issue #376: call the currently-installed ``_detect_duplicate`` with
+    identity inputs when its signature accepts them.
+
+    ``sync._detect_duplicate`` is a monkeypatch-replaceable module global
+    (tests patch a legacy 4-arg stub), so compatibility is decided PER CALL
+    by binding the installed callable's signature — a BINDING TypeError
+    selects the plain 4-arg call and the caller must apply the subject veto
+    site-side after re-fetching the candidate's metadata. A TypeError raised
+    during EXECUTION is never caught here and always propagates.
+
+    Returns ``(existing, similarity, embedding, legacy)``.
+    """
+    from storelib.write import call_detect_duplicate
+    existing, sim, emb, legacy = call_detect_duplicate(
+        _detect_duplicate, conn, content, namespace, dedup_cache=dedup_cache,
+        tags=tags, type_=type_, emit=True,
+    )
+    return existing, sim, emb, legacy
+
 
 def _stage_sync_source(
     in_path: str, *, force_strict: bool = False,
@@ -2605,12 +2660,29 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
         # the transaction (it never persists).
         dedup_cache: dict = {}
         try:
+            # Issue #376: each key maps to a BOUNDED ordered list of ids
+            # (oldest first; FIFO-evicted past SUBJECT_MAX_EXACT_CANDIDATES),
+            # so an exact-match hit can fall through a subject-incompatible
+            # candidate to a compatible one (newest served first, matching
+            # the pre-#376 last-inserted-wins empirics).
+            from storelib.write import SUBJECT_MAX_EXACT_CANDIDATES as _CAP
             for r in conn.execute(
-                "SELECT id, content, namespace FROM memory WHERE superseded_at IS NULL"
+                "SELECT id, content, namespace FROM memory "
+                "WHERE superseded_at IS NULL ORDER BY rowid"
             ).fetchall():
                 norm = _normalize_content(r["content"])
                 if norm:
-                    dedup_cache[(r["namespace"], norm)] = r["id"]
+                    key = (r["namespace"], norm)
+                    ids = dedup_cache.get(key)
+                    if ids is None:
+                        dedup_cache[key] = [r["id"]]
+                    else:
+                        # F-08: sliding window keeps the NEWEST _CAP ids
+                        # (oldest-first order preserved) so both cache
+                        # writers agree and newest rows stay fold targets.
+                        if len(ids) >= _CAP:
+                            del ids[0]
+                        ids.append(r["id"])
         except Exception:
             # If the pre-scan fails (e.g. transient lock/IO error), pass None so
             # _detect_duplicate falls back to the original per-row namespace

@@ -1,7 +1,7 @@
 {
  "schema": "zmem-deepseek-canary-v1",
  "generated_at": "2026-10-28T12:22:36.484Z",
- "zmem_version": "0.128.0",
+ "zmem_version": "0.129.0",
  "runtime": {
   "packages": {
    "@deepseek-ai/cordis": "4.0.5",

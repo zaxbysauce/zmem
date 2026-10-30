@@ -997,7 +997,9 @@ def _warn_degraded_embeddings_once(content: str) -> None:
 
 def _detect_duplicate(
     conn: sqlite3.Connection, content: str, namespace: str,
-    dedup_cache: dict | None = None,
+    dedup_cache: dict | None = None, *,
+    tags: str | None = None, type_: str | None = None,
+    emit: bool = True,
 ) -> tuple[sqlite3.Row | None, float, bytes | None]:
     """Find a duplicate live memory for `content` in `namespace`: semantic
     similarity (if embeddings are available) with an exact-match fallback.
@@ -1028,8 +1030,18 @@ def _detect_duplicate(
     existing = None
     dedup_sim = 0.0
     if emb is not None:
-        # Semantic dedup: query vec0 for nearest neighbor in the same namespace.
-        existing, dedup_sim = _find_semantic_duplicate(conn, emb, namespace)
+        # Semantic dedup: query vec0 for the ranked above-threshold window in
+        # the same namespace, then fall through any subject-vetoed candidate
+        # to a compatible runner-up (issue #376). With no identity inputs the
+        # first window entry is the nearest — byte-identical to the old
+        # single-nearest behavior.
+        raw_ranked = _find_semantic_duplicate(conn, emb, namespace, window=True)
+        ranked = _subject_admit(raw_ranked, tags, type_, emit=emit)
+        if ranked:
+            existing, dedup_sim = ranked[0]
+    # F-09: run the exact lane whenever no semantic candidate was ADMITTED —
+    # including the all-vetoed case, where a compatible exact duplicate
+    # beyond the semantic window would otherwise be inserted as a duplicate.
     if existing is None:
         # Fallback: exact-match dedup.
         norm = _normalize_content(content)
@@ -1041,13 +1053,28 @@ def _detect_duplicate(
             # duplicate exists (fetch it by id), a miss means none exists (no
             # namespace scan needed — this is what converts the ingest path
             # from O(n²) scans to O(1) lookups, #36 M9).
-            if cache_key in dedup_cache:
-                hit_id = dedup_cache[cache_key]
-                existing = conn.execute(
-                    "SELECT id, content FROM memory WHERE id=? AND superseded_at IS NULL",
-                    (hit_id,),
-                ).fetchone()
-                dedup_sim = 1.0 if existing else 0.0
+            hit = dedup_cache.get(cache_key)
+            if hit:
+                # Issue #376: the value is a bounded ordered id list (oldest
+                # first; a legacy single-id value still works). Serve
+                # NEWEST first — the pre-#376 single-entry cache served the
+                # last-inserted equal row, preserved here as the first
+                # candidate — batch-fetch in ONE query, restore cache order,
+                # and fall through subject-vetoed candidates.
+                ids = list(hit) if isinstance(hit, (list, tuple)) else [hit]
+                if isinstance(hit, list):
+                    ids = list(reversed(ids))
+                rows = conn.execute(
+                    "SELECT id, content, tags, type FROM memory "
+                    f"WHERE id IN ({','.join('?' * len(ids))}) "
+                    "AND superseded_at IS NULL",
+                    tuple(ids),
+                ).fetchall() if ids else []
+                by_id = {r["id"]: r for r in rows}
+                ordered = [(by_id[i], 1.0) for i in ids if i in by_id]
+                admitted = _subject_admit(ordered, tags, type_, emit=emit)
+                if admitted:
+                    existing, dedup_sim = admitted[0]
             # else: cache miss ⇒ no exact-match duplicate; skip the scan.
         else:
             # No cache (single-row add path): indexed lookup on content_norm
@@ -1057,26 +1084,52 @@ def _detect_duplicate(
             # former O(n) per-row Python normalize/compare. Fall back to the
             # legacy scan if the column is somehow absent (defensive: a
             # pre-v8 store that has not yet run migrate()).
+            # Issue #376: collect the bounded equal-content candidate window
+            # (rowid-ascending, LIMIT bound+1 with overflow detection) and
+            # fall through subject-vetoed candidates to a compatible
+            # runner-up; with no identity inputs the first row is the old
+            # LIMIT-1 result, byte-identical.
             try:
-                existing = conn.execute(
-                    "SELECT id, content FROM memory "
+                rows = conn.execute(
+                    "SELECT id, content, tags, type FROM memory "
                     "WHERE namespace=? AND content_norm=? AND superseded_at IS NULL "
-                    "LIMIT 1",
-                    (namespace, norm),
-                ).fetchone()
-                dedup_sim = 1.0 if existing else 0.0
+                    "ORDER BY rowid LIMIT ?",
+                    (namespace, norm, SUBJECT_MAX_EXACT_CANDIDATES + 1),
+                ).fetchall()
+                admitted = _subject_admit(
+                    [(r, 1.0) for r in rows[:SUBJECT_MAX_EXACT_CANDIDATES]],
+                    tags, type_, emit=emit)
+                if admitted:
+                    existing, dedup_sim = admitted[0]
             except sqlite3.OperationalError:
                 # content_norm column absent (pre-v8, unmigrated store): fall
-                # back to the legacy per-row scan so dedup still works.
+                # back to the legacy scan so dedup still works. Issue #376:
+                # collect normalized-equal rows up to the same hard bound in
+                # rowid order instead of stopping at the first match.
                 candidates = conn.execute(
-                    "SELECT id, content FROM memory WHERE namespace=? AND superseded_at IS NULL",
+                    "SELECT id, content FROM memory "
+                    "WHERE namespace=? AND superseded_at IS NULL ORDER BY rowid",
                     (namespace,),
-                ).fetchall()
+                )
+                eq: list[tuple[sqlite3.Row, float]] = []
+                overflow = False
                 for c in candidates:
                     if _normalize_content(c["content"]) == norm:
-                        existing = c
-                        dedup_sim = 1.0  # exact match
-                        break
+                        if len(eq) > SUBJECT_MAX_EXACT_CANDIDATES:
+                            overflow = True
+                            break
+                        eq.append((c, 1.0))
+                del overflow
+                full = conn.execute(
+                    "SELECT id, content, tags, type FROM memory WHERE id IN "
+                    f"({','.join('?' * len(eq))})",
+                    tuple(r["id"] for r, _ in eq),
+                ).fetchall() if eq else []
+                by_id = {r["id"]: r for r in full}
+                ordered = [(by_id[r["id"]], 1.0) for r, _ in eq if r["id"] in by_id]
+                admitted = _subject_admit(ordered, tags, type_, emit=emit)
+                if admitted:
+                    existing, dedup_sim = admitted[0]
     return existing, dedup_sim, emb
 
 _GLOBAL_NEAR_MISS_STEMS = {
@@ -1647,8 +1700,11 @@ def add_memory(
         # Shared with ingest-jsonl (Tier 3 sync import), which must apply the same
         # dedup-on-write semantics to incoming rows without duplicating this logic.
         _warn_fake_active_once()
-        existing, dedup_sim, emb = _detect_duplicate(conn, content, namespace)
-        if force_append or skip_dedup:
+        _bypass = force_append or skip_dedup
+        existing, dedup_sim, emb, _legacy = call_detect_duplicate(
+            _detect_duplicate, conn, content, namespace, tags=tags,
+            type_=type_, emit=not _bypass)
+        if _bypass:
             # #179: the card refresh path appends unconditionally — dedup
             # would fold the replacement card into the live card it is
             # replacing (the SHA-256 no-op check already ran above it).
@@ -1811,7 +1867,7 @@ def add_memory(
         # transaction as the INSERT: a failed link pass rolls back the write.
         link_report = generate_links_on_write(
             conn, mid, content=content, namespace=namespace, tags=tags, emb=emb,
-            propagate_tags=link_attr_propagate,
+            propagate_tags=link_attr_propagate, type_=type_,
         )
         if link_report["related"] or link_report["contradicts"]:
             print(f"[zmem] links: +{link_report['related']} related, "
@@ -1843,15 +1899,105 @@ def add_memory(
         raise
 
 DEDUP_SIMILARITY_THRESHOLD = _env_float("ZMEM_DEDUP_THRESHOLD", 0.85)
+
+# Issue #376: frozen observability seam. Process-local int, incremented
+# once per candidate-row subject-compatibility EVALUATION (only when both
+# the incoming row and the candidate carry at least one task identity).
+# Read by the frozen acceptance contract (tests/test_subject_dedup_contract.py)
+# to prove candidate work stays bounded; not persisted anywhere.
+SUBJECT_COMPAT_EVALS = 0
+
+# Issue #376: hard bound on equal-content candidate collection for the
+# indexed exact lane, the legacy exact scan, and the ingest cache window
+# (one slot reserved for overflow detection: collect LIMIT bound+1, walk
+# the first bound). Fail-safe: overflow stops collection, never scans on.
+SUBJECT_MAX_EXACT_CANDIDATES = 32
+
 # Signal rank for merge: higher = stronger.
 
 _SIGNAL_RANK = {"test": 5, "compile": 4, "lint": 3, "reviewer": 2, "user": 2, "none": 1}
 
 
+def _subject_admit(ranked, tags, type_, emit: bool = True):
+    """Issue #376: filter ranked ``(row, sim)`` candidates by task-subject
+    compatibility, in rank order, falling through vetoed candidates.
+
+    ``tags is None`` means the caller supplied no identity inputs (legacy
+    4-arg detector contract): the ranked list is returned untouched so
+    behavior stays byte-identical. A candidate missing tags/type columns
+    (legacy rows fetched before this change) is back-filled by id. Each
+    candidate whose BOTH sides carry identity increments the
+    SUBJECT_COMPAT_EVALS seam once; each vetoed above-threshold candidate
+    prints the stable privacy-safe veto line exactly once (reachable even
+    when a compatible runner-up is later selected, and when ALL candidates
+    are vetoed — the caller then inserts as its own row).
+    """
+    global SUBJECT_COMPAT_EVALS
+    if tags is None:
+        return list(ranked)
+    from storelib import subject as _subject
+    out = []
+    for row, sim in ranked:
+        keys = row.keys()
+        cand_tags = row["tags"] if "tags" in keys else None
+        cand_type = row["type"] if "type" in keys else None
+        if cand_tags is None or cand_type is None:
+            # Legacy projection (id, content only): identity is unknowable,
+            # treat as absent identity — compatible (never veto what we
+            # cannot read; the sync legacy path re-fetches full rows before
+            # calling here).
+            out.append((row, sim))
+            continue
+        if _subject.identities(tags) and _subject.identities(cand_tags):
+            if emit:
+                SUBJECT_COMPAT_EVALS += 1
+            if _subject.incompatible(tags, type_, cand_tags, cand_type):
+                if emit:
+                    print(_subject.veto_line(row["id"], sim))
+                continue
+        out.append((row, sim))
+    return out
+
+
+
+def call_detect_duplicate(
+    detector, conn, content: str, namespace: str, *, dedup_cache=None,
+    tags=None, type_=None, emit=True,
+):
+    """Issue #376: invoke the CALLER-INSTALLED ``detector`` (the per-module
+    ``_detect_duplicate`` global — monkeypatch-replaceable) with
+    identity inputs when its signature accepts them (per-call
+    ``inspect.signature`` binding — the binding is a monkeypatch-replaceable
+    module global; a BINDING TypeError selects the plain 4-arg call and the
+    caller must apply the subject veto site-side after re-fetching the
+    candidate's metadata; an INTERNAL TypeError during execution always
+    propagates). ``emit=False`` suppresses the veto line and the
+    SUBJECT_COMPAT_EVALS increment on paths whose dedup result is discarded
+    (force_append / skip_dedup bypasses — UR-6).
+
+    Returns ``(existing, similarity, embedding, legacy)``.
+    """
+    import inspect
+
+    try:
+        inspect.signature(detector).bind(
+            conn, content, namespace, dedup_cache=dedup_cache,
+            tags=tags, type_=type_, emit=emit,
+        )
+    except TypeError:
+        out = detector(conn, content, namespace, dedup_cache=dedup_cache)
+        return out[0], out[1], out[2], True
+    out = detector(
+        conn, content, namespace, dedup_cache=dedup_cache,
+        tags=tags, type_=type_, emit=emit,
+    )
+    return out[0], out[1], out[2], False
+
 
 def _find_semantic_duplicate(
-    conn: sqlite3.Connection, embedding: bytes, namespace: str, threshold: float = DEDUP_SIMILARITY_THRESHOLD
-) -> tuple[sqlite3.Row | None, float]:
+    conn: sqlite3.Connection, embedding: bytes, namespace: str,
+    threshold: float = DEDUP_SIMILARITY_THRESHOLD, *, window: bool = False,
+) -> tuple[sqlite3.Row | None, float] | list[tuple[sqlite3.Row, float]]:
     """Find the closest existing memory by embedding cosine similarity.
 
     Issue #58, 3.2: namespace-aware dedup window. Uses the shared
@@ -1864,6 +2010,11 @@ def _find_semantic_duplicate(
 
     Returns ``(row, similarity)`` or ``(None, 0.0)`` when no same-
     namespace duplicate above threshold was found.
+
+    Issue #376: with ``window=True`` the return is the RANKED list of ALL
+    above-threshold candidates in the KNN window (bounded by k), so the
+    caller can fall through a subject-vetoed nearest to a compatible
+    runner-up. The compat shape (``window=False``) is unchanged.
     """
     # Ask for 5 vec rows; PRR-012 fix: pass overfetch=None so the helper
     # honors ZMEM_VEC_NS_OVERFETCH exactly like the recall path (the
@@ -1872,20 +2023,26 @@ def _find_semantic_duplicate(
         conn, embedding, namespaces=[namespace], k=5, overfetch=None,
     )
     if not knn:
-        return None, 0.0
+        return [] if window else (None, 0.0)
 
+    ranked: list[tuple[sqlite3.Row, float]] = []
     for mid, distance in knn:
         # sqlite-vec distance is cosine distance (0 = identical, 2 = opposite).
         # Convert to cosine similarity: sim = 1 - distance.
         similarity = 1.0 - distance
         if similarity >= threshold:
             row = conn.execute(
-                "SELECT id, confidence, signal, tags FROM memory "
+                "SELECT id, confidence, signal, tags, type FROM memory "
                 "WHERE id=? AND superseded_at IS NULL AND namespace=?",
                 (mid, namespace),
             ).fetchone()
             if row:
-                return row, similarity
+                if window:
+                    ranked.append((row, similarity))
+                else:
+                    return row, similarity
+    if window:
+        return ranked
     return None, 0.0
 
 def _merge_on_dedup(
@@ -2347,7 +2504,9 @@ def update_memory(
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
         _warn_fake_active_once()
-        existing, dedup_sim, emb = _detect_duplicate(conn, content_eff, ns)
+        existing, dedup_sim, emb, _legacy = call_detect_duplicate(
+            _detect_duplicate, conn, content_eff, ns, tags=tags_eff,
+            type_=type_eff)
         # v11 (issue #61, 6.2): the same write-time polarity guard as add —
         # a contradiction is NOT a duplicate. Disagree ⇒ skip the merge and
         # insert the replacement row; generate_links_on_write below records
@@ -2518,7 +2677,7 @@ def update_memory(
         # evolution), inside the same transaction.
         link_report = generate_links_on_write(
             conn, new_id, content=content_eff, namespace=ns, tags=tags_eff,
-            emb=emb, propagate_tags=link_attr_propagate,
+            emb=emb, propagate_tags=link_attr_propagate, type_=type_eff,
         )
         if link_report["related"] or link_report["contradicts"]:
             print(f"[zmem] links: +{link_report['related']} related, "
