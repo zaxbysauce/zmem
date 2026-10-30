@@ -306,8 +306,8 @@ def _evidence_ref_problems(entry: dict, evidence,
 
 
 def support_report_problems(report, repo_root=ASSERTIONS_REPO_ROOT,
-                            allowed_local_runs=SUPPORT_EVIDENCE_SCENARIOS) \
-        -> list:
+                            allowed_local_runs=SUPPORT_EVIDENCE_SCENARIOS,
+                            expected_version=None) -> list:
     """Claim-gate validation for the committed T-14 support report
     (schema zmem-deepseek-support-v1): every claimed combination carries a
     per-combination evidence ref, tested floors are disclosed, and the
@@ -316,7 +316,12 @@ def support_report_problems(report, repo_root=ASSERTIONS_REPO_ROOT,
     First-class claims without evidence fail validation. ``repo_root`` is
     the root docs/ and tests/ evidence paths resolve against (default:
     the repo this validator lives in); ``allowed_local_runs`` is the
-    frozen scenario-name set local-run refs may cite."""
+    frozen scenario-name set local-run refs may cite; ``expected_version``
+    (issue #416 AC3) optionally binds ``report["zmem_version"]`` to the
+    release version exactly as ``canary_problems`` does — None (the
+    default, and the standing t14 call) preserves the legacy structural
+    checks only, so the committed support report's version lag does not
+    fail CI while it awaits its dsh-host regeneration."""
     if not isinstance(report, dict):
         return ["report is not a JSON object"]
     problems = []
@@ -357,4 +362,66 @@ def support_report_problems(report, repo_root=ASSERTIONS_REPO_ROOT,
     for gap in SUPPORT_GAP_DISCLOSURES:
         if gap not in gaps_text:
             problems.append(f"capability-gap disclosure missing: {gap}")
+    if expected_version is not None and \
+            report.get("zmem_version") != expected_version:
+        problems.append(
+            f"zmem_version {report.get('zmem_version')!r} != "
+            f"release-manifest version {expected_version!r}")
+    return problems
+
+
+# Issue #416 AC3 (plan-critic disclosure-ratchet): the KNOWN, deliberately
+# tolerated version lag of the committed support report while it awaits
+# its real dsh-host regeneration (the issue forbids hand-editing evidence
+# artifacts and names the regeneration as its own delivery). The standing
+# t14 gate asserts evidence_version_problems returns EXACTLY the single
+# disclosed-divergence entry for this tuple; any OTHER divergence — either
+# artifact moving without the other, or a stale disclosure left behind
+# after the regeneration — fails the gate. Remove this constant (and the
+# ratchet leg) in the regeneration PR, when both artifacts agree.
+SUPPORT_DISCLOSED_STALE_VERSION = "0.127.0"
+
+
+def evidence_version_problems(canary_report, support_report,
+                               release_version,
+                               known_divergence=None) -> list:
+    """Issue #416 AC3: bind canary-report.json, support-report.json, and
+    the current release version together and REPORT divergence instead of
+    letting the artifacts drift silently.
+
+    Returns one problem per pairwise divergence (canary-vs-release,
+    support-vs-release, canary-vs-support). ``known_divergence`` is the
+    plan-critic disclosure-ratchet seam: when it equals the observed
+    (canary_version, support_version) pair, the raw problems are replaced
+    by EXACTLY one 'known-divergence (disclosed)' entry — green only for
+    the deliberately disclosed lag, never for anything else."""
+    cv = canary_report.get("zmem_version") if isinstance(
+        canary_report, dict) else None
+    sv = support_report.get("zmem_version") if isinstance(
+        support_report, dict) else None
+    problems = []
+    if cv != release_version:
+        problems.append(
+            f"canary zmem_version {cv!r} != release version "
+            f"{release_version!r}")
+    if sv != release_version:
+        problems.append(
+            f"support zmem_version {sv!r} != release version "
+            f"{release_version!r}")
+    if cv != sv:
+        problems.append(
+            f"canary zmem_version {cv!r} != support zmem_version {sv!r}")
+    if problems:
+        if known_divergence == (cv, sv):
+            return [f"known-divergence (disclosed): canary {cv!r} vs support "
+                    f"{sv!r} at release {release_version!r} — the committed "
+                    "support report awaits its dsh-host regeneration "
+                    "(issue #416 named delivery)"]
+        return problems
+    if known_divergence is not None:
+        # Forcing function: once the artifacts agree, a leftover disclosure
+        # is itself a failure — the regeneration PR must retire it.
+        return [f"stale known-divergence disclosure: canary {cv!r} and "
+                f"support {sv!r} agree at release {release_version!r} — "
+                "retire SUPPORT_DISCLOSED_STALE_VERSION (regeneration PR)"]
     return problems
