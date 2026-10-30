@@ -1784,11 +1784,13 @@ lose semantic recall.
    `--profile` requires `--all`: without it the command refuses with exit 2
    rather than silently doing nothing.
 
-   Shipped profiles: `minilm` (Xenova/all-MiniLM-L6-v2 ONNX, 384-d,
+   Shipped profiles: `minilm` (all-MiniLM-L6-v2 ONNX, 384-d,
    checksum-pinned) and `fake` (16-d deterministic placeholders for
-   model-absent tests/CI only). The pin covers the Xenova ONNX export —
-   sentence-transformers PyTorch weights differ by design; verification has no
-   override or bypass.
+   model-absent tests/CI only). The pin covers the original operator-box ONNX
+   export (preserved in this repo's LFS history at commit 3240ea1a and served
+   as the `model-minilm-bbd7b466` release asset) — the public Xenova HF export
+   and the sentence-transformers PyTorch weights are different builds and hash
+   differently by design; verification has no override or bypass.
 
    Run `<interpreter> <store.py> reembed --check` for a read-only consistency census.
    It reports live rows missing vectors, orphan vector rows, and live embedding

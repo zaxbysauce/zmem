@@ -200,10 +200,10 @@ class SkillDocDriftTest(unittest.TestCase):
         self.assertIn("--as-of", text,
                       "SKILL.md recall documentation must list --as-of")
 
-    def test_three_floors_documented(self):
+    def test_five_floors_documented(self):
         text = SKILL_MD.read_text(encoding="utf-8")
-        # Three distinct floors with distinct env overrides. If any of
-        # these three constants is missing, the floor is ungrounded.
+        # Five distinct recall-path floors with distinct env overrides. If any
+        # of these five constants is missing, the floor is ungrounded.
         self.assertIn("INJECT_FLOOR_PROMPT_DEFAULT", text,
                       "SKILL.md must document INJECT_FLOOR_PROMPT_DEFAULT")
         self.assertIn("INJECT_FLOOR_RECENT_DEFAULT", text,
@@ -218,6 +218,68 @@ class SkillDocDriftTest(unittest.TestCase):
         # same way (gated-moment global-tier relevance on the passive lane).
         self.assertIn("INJECT_FLOOR_USER_GLOBAL_DEFAULT", text,
                       "SKILL.md must document INJECT_FLOOR_USER_GLOBAL_DEFAULT")
+
+    def test_minilm_provenance_surfaces_corrected(self):
+        # Issue #413 review (PRR-008): the provenance correction shipped on
+        # six+ surfaces; each one that regresses to the false "pin == the
+        # public Xenova export" wording must fail here, not only the
+        # embed_profiles constant test. Absence needles are the exact stale
+        # sentences; presence needles are the corrected remediation/source.
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "The published pin covers the Xenova ONNX export", skill,
+            "SKILL.md regressed to the false pin-source wording")
+        self.assertIn("3240ea1a0cf3d972f6a7d472cee73abaddfc038d", skill,
+                      "SKILL.md must name the LFS byte source")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "The pin covers the Xenova ONNX export", readme,
+            "README regressed to the false pin-source wording")
+        self.assertIn("model-minilm-bbd7b466", readme,
+                      "README must point at the release asset")
+        doctor = (REPO_ROOT / "skills" / "memory" / "scripts" / "doctor.py"
+                  ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Restore the correct Xenova ONNX export", doctor,
+            "doctor remediation regressed to the unverifiable export")
+        self.assertIn("model-minilm-bbd7b466", doctor,
+                      "doctor remediation must point at the release asset")
+
+    def test_floor_header_count_matches_table(self):
+        # Issue #269 guardrail: the "N distinct floors" sentence must state
+        # the number of INJECT_FLOOR_* rows in the table directly under it.
+        # Both sides are DERIVED (parse the claim, count the rows), so a
+        # future floor addition fails here until the header count is updated.
+        # Deliberately NOT compared against every INJECT_FLOOR_* constant in
+        # schema_meta.py: that module also defines non-recall-path floors
+        # (LEX/COS/ENT/GRAPH lanes) the table intentionally does not cover.
+        text = SKILL_MD.read_text(encoding="utf-8")
+        m = re.search(
+            r"^(\w+) distinct floors live on the recall path", text, re.M)
+        self.assertIsNotNone(m, "floor-count header sentence missing")
+        words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                 "six": 6, "seven": 7, "eight": 8, "nine": 9}
+        claimed = words.get(m.group(1).lower())
+        if claimed is None and m.group(1).isdigit():
+            claimed = int(m.group(1))
+        self.assertIsNotNone(
+            claimed, "unparseable floor count word: %r" % m.group(1))
+        after = text[m.end():]
+        # The table starts at the next "| Constant |" header after the
+        # sentence; count contiguous '|' rows from there (the sentence's own
+        # tail and the notes paragraph between them are skipped).
+        thead = after.find("| Constant |")
+        self.assertNotEqual(thead, -1,
+                            "floor table (| Constant | header) not found "
+                            "after the count sentence")
+        table_lines = after[thead:].splitlines()
+        rows = [ln for ln in table_lines[1:]
+                if ln.startswith("|") and "INJECT_FLOOR_" in ln
+                and "_DEFAULT`" in ln]
+        self.assertEqual(
+            claimed, len(rows),
+            "SKILL.md says %d distinct floors but the table has %d rows"
+            % (claimed, len(rows)))
 
     # -- issue #59, 4.x: the append-only revision surface is documented -------
 

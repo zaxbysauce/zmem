@@ -71,8 +71,11 @@ via tags — they measure the identity policy, not any production subject
 extractor (the issue's "disclose oracle/extracted identity differences";
 AC7 emits that disclosure in its structured rubric report).
 
-Real-model leg: the pinned MiniLM identity (Xenova/all-MiniLM-L6-v2 ONNX,
-384-dim, sha256 bbd7b466...) is probed read-only from (in order)
+Real-model leg: the pinned MiniLM identity (the original operator-box ONNX
+export of the all-MiniLM-L6-v2 checkpoint, 384-dim, sha256 bbd7b466... — the
+operator-box build preserved in this repo's LFS history at 3240ea1a and
+served as the model-minilm-bbd7b466 release asset, NOT the public Xenova
+export) is probed read-only from (in order)
 $ZMEM_TEST_REAL_MODELS_DIR, the plugin's bundled models dir
 (skills/memory/models), and the operator's shared model cache ~/.zmem/models
 (MODEL FILES ONLY — the canonical store at ~/.zmem/store.sqlite is never
@@ -84,12 +87,19 @@ never conflated. The real-model legs are never silently skipped, never
 substituted with another model or the `fake` profile, and the no-model
 deterministic fixtures never count as the real-model pass (AC1).
 
-Proposed CI lane (no workflow edits made here): NATIVE APPROVAL of the
-real-model legs REQUIRES a provisioned, checksum-verified pinned model —
-download the Xenova ONNX once, verify sha256
-bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5, place it
-in a cached models dir, and export ZMEM_TEST_REAL_MODELS_DIR — so
-AC1/AC3/AC6-semantic/AC7 run for real. On a model-absent lane the suite's
+Provisioned CI lane (the `test-real-model` job in .github/workflows/ci.yml,
+issue #413): NATIVE APPROVAL of the real-model legs REQUIRES a provisioned,
+checksum-verified pinned model — fetch the minilm.onnx asset from the
+model-minilm-bbd7b466 GitHub release (the immutable byte source; the LFS
+history URL at commit 3240ea1a is the in-repo alternate), verify sha256
+bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5 on every
+run (cache hits included), place it in a cached models dir alongside a fresh
+copy of the checkout's skills/memory/models/tokenizer.json (the production
+embedder requires both files in the same dir), and export
+ZMEM_TEST_REAL_MODELS_DIR — so the five model-gated legs
+(distinct_subjects, identity_controls, compatible_runner_up,
+compatibility_and_cost, held_out_evaluation) run for real. On a model-absent
+lane the suite's
 MODEL_UNAVAILABLE failures are DIAGNOSTIC evidence that the leg is
 INCOMPLETE, nothing more: they can never be counted as, converted to, or
 gated into an alternate pass, and no other model (and never the `fake`

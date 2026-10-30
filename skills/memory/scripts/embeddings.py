@@ -59,11 +59,13 @@ _model_checksum_ok: bool | None = None
 _model_load_failed: bool = False
 _MODEL_DIM = 384
 
-# sha256 of the Xenova ONNX export bundled/downloaded as minilm.onnx. Now a
-# RE-EXPORT of the registry value so `embed_profiles` stays the single source
-# of truth; kept as this module attribute because tests monkeypatch it here and
-# `verify_checksum` resolves its default at call time via this name (#36 M15;
-# issue #63 8.1 keeps that contract intact).
+# sha256 pinned for minilm.onnx: the original operator-box ONNX export of
+# all-MiniLM-L6-v2 (LFS commit 3240ea1a0cf3d972f6a7d472cee73abaddfc038d /
+# release asset model-minilm-bbd7b466), NOT the public Xenova onnx/model.onnx
+# export. Now a RE-EXPORT of the registry value so `embed_profiles` stays the
+# single source of truth; kept as this module attribute because tests
+# monkeypatch it here and `verify_checksum` resolves its default at call time
+# via this name (#36 M15; issue #63 8.1 keeps that contract intact).
 _MODEL_SHA256 = _profiles.MINILM_SHA256
 
 # Default source for a lazy download when the model file is absent. This is

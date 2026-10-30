@@ -519,7 +519,8 @@ class CiWorkflowContractTest(unittest.TestCase):
         blocks = [b for b in blocks if b.strip()]
         names = {b.split(":")[0] for b in blocks}
         self.assertTrue(
-            {"test", "test-embeddings", "test-source-hermes"} <= names, names)
+            {"test", "test-embeddings", "test-source-hermes",
+             "test-real-model"} <= names, names)
         for b in blocks:
             m = re.search(r"^    timeout-minutes: (.+)$", b, re.MULTILINE)
             self.assertIsNotNone(
@@ -537,6 +538,25 @@ class CiWorkflowContractTest(unittest.TestCase):
                 self.assertGreaterEqual(int(per_os.group(2)), 180)
             else:
                 self.assertRegex(m.group(1), r"^\d+$")
+
+    def test_real_model_lane_pinned(self):
+        # Issue #413 review (PRR-001): the provisioned-model lane is the ONLY
+        # place the #376 contract's real-model legs run natively; deleting the
+        # job (or just its sha-verify) must fail a repo test, not only the
+        # trace-local frozen check. Pin the job's existence and the needles
+        # whose removal would blind it.
+        self.assertIn("test-real-model:", self.yml,
+                      "ci.yml lost the test-real-model job")
+        self.assertIn("releases/download/model-minilm-bbd7b466/minilm.onnx",
+                      self.yml,
+                      "ci.yml lost the release-asset download")
+        self.assertIn("embed_profiles.MINILM_SHA256", self.yml,
+                      "ci.yml must derive the pin from the in-repo constant")
+        self.assertIn("lfs: true", self.yml,
+                      "ci.yml lost the LFS checkout (tokenizer.json is an LFS "
+                      "object; a plain checkout materializes the pointer)")
+        self.assertIn("ZMEM_TEST_REAL_MODELS_DIR", self.yml,
+                      "ci.yml lost the models-dir export the harness probes")
 
     def test_freshness_step_fetches_base_ref_before_the_gate(self):
         # The PR checkout is shallow and carries no origin/main ref; the

@@ -1,13 +1,15 @@
 name: CI
 
 # Runs the full test suite on pull requests and on pushes to main (pushes to
-# other branches are covered by their PR's run), without the ~90MB embedding
-# model (skills/memory/models/minilm.onnx is gitignored — Phase 10,
-# PLAN.md §7-P10). ZMEM_MODEL_AUTODOWNLOAD=0 guarantees no lazy-download is
-# attempted here either, so this job never fetches the model over the
-# network. All suites must (and do) pass model-absent: recall degrades to
-# FTS5, consolidate degrades to lexical token-overlap clustering — see
-# skills/memory/scripts/embeddings.py and store.py's `consolidate`.
+# other branches are covered by their PR's run). The test/ test-embeddings/
+# test-source-hermes jobs run MODEL-ABSENT (skills/memory/models/minilm.onnx
+# is gitignored — Phase 10, PLAN.md §7-P10; ZMEM_MODEL_AUTODOWNLOAD=0
+# guarantees no lazy-download): recall degrades to FTS5, consolidate degrades
+# to lexical token-overlap clustering — see skills/memory/scripts/embeddings.py
+# and store.py's `consolidate`. The ONE deliberate exception is the
+# test-real-model job (issue #413): it fetches the pinned bytes from the
+# model-minilm-bbd7b466 release asset, sha-verifies them against the in-repo
+# pin, and runs the #376 contract's real-model legs natively.
 
 on:
   push:
@@ -567,6 +569,109 @@ jobs:
         run: |
           set -e
           python -m unittest -v tests/test_consolidate_namespace.py tests/test_consolidate_contested.py tests/test_reembed.py tests/test_purge_vec.py tests/test_rekey_namespace_adversarial.py tests/test_rekey_namespace_map.py
+
+  # Issue #413 (AC6): the provisioned-model lane. The #376 subject-dedup
+  # contract's five real-model legs are MODEL_UNAVAILABLE/INCOMPLETE on every
+  # model-absent lane by design; NATIVE approval of those legs requires a
+  # checksum-verified pinned model (tests/test_subject_dedup_contract.py
+  # docstring, frozen in the #376 checkpoint). This job provisions the pinned
+  # bytes from the never-retargeted model-minilm-bbd7b466 release asset,
+  # sha-verifies
+  # them against the in-repo pin ON EVERY RUN (cache hits included), and runs
+  # the seven frozen pytest argvs. Runs on every PR — no path filter — so the
+  # lane can never skip its own introducing changes.
+  test-real-model:
+    name: test-real-model
+    runs-on: ubuntu-latest
+    # Cold cache: ~90MB fetch + five real-model driver executions (each
+    # subprocess re-runs the driver; its cache is process-local). 25 covers
+    # cold-fetch variance; warm runs finish well under 10.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+    env:
+      ZMEM_MODEL_AUTODOWNLOAD: "0"
+      ZMEM_MODELS_CACHE: ${{ github.workspace }}/.models-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # skills/memory/models/tokenizer.json is a Git LFS object; a plain
+          # checkout materializes the 131-byte pointer file instead of the
+          # 711,661-byte JSON, and tokenizers rejects the pointer with
+          # "expected value at line 1 column 1" (CI round 4 diagnosis).
+          lfs: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install embedding requirements + pytest
+        shell: bash
+        run: python -m pip install --disable-pip-version-check -r hermes-plugin/server/requirements-embeddings.txt pytest
+      - name: Restore models dir cache (keyed on the pin)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ZMEM_MODELS_CACHE }}
+          key: minilm-bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5
+      - name: Provision pinned model (download if absent; verify EVERY run)
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$ZMEM_MODELS_CACHE"
+          if [ ! -f "$ZMEM_MODELS_CACHE/minilm.onnx" ]; then
+            echo "cache miss: fetching pinned bytes from the release asset"
+            curl -fsSL --retry 3 -o "$ZMEM_MODELS_CACHE/minilm.onnx" \
+              "https://github.com/zaxbysauce/zmem/releases/download/model-minilm-bbd7b466/minilm.onnx"
+          else
+            echo "cache hit: re-verifying cached bytes"
+          fi
+          python - <<'PY'
+          import hashlib, os, sys
+          sys.path.insert(0, os.path.join("skills", "memory", "scripts"))
+          import embed_profiles
+          pin = embed_profiles.MINILM_SHA256
+          cache = os.environ["ZMEM_MODELS_CACHE"]
+          p = os.path.join(cache, "minilm.onnx")
+          h = hashlib.sha256()
+          with open(p, "rb") as f:
+              for chunk in iter(lambda: f.read(1 << 20), b""):
+                  h.update(chunk)
+          digest = h.hexdigest()
+          if digest != pin:
+              print(f"FATAL: cached/downloaded minilm.onnx sha256 {digest} != pin", file=sys.stderr)
+              sys.exit(1)
+          print(f"pin verified: {digest}")
+          PY
+          # Fresh tokenizer every run: the production embedder requires
+          # minilm.onnx AND tokenizer.json in the SAME dir, and a stale
+          # tokenizer must never survive under the model-only cache key.
+          # The JSON-validity assertion fails LOUDLY on an LFS-pointer
+          # checkout instead of surfacing as MODEL_UNAVAILABLE downstream.
+          cp skills/memory/models/tokenizer.json "$ZMEM_MODELS_CACHE/tokenizer.json"
+          python - <<'PY'
+          import json, os, sys
+          p = os.path.join(os.environ["ZMEM_MODELS_CACHE"], "tokenizer.json")
+          with open(p, "rb") as f:
+              head = f.read(64)
+          if head.lstrip().startswith(b"version https://git-lfs"):
+              print("FATAL: tokenizer.json is an LFS pointer, not the JSON "
+                    "(checkout without LFS content?)", file=sys.stderr)
+              sys.exit(1)
+          json.load(open(p, encoding="utf-8"))
+          print("tokenizer.json verified: valid JSON,", os.path.getsize(p), "bytes")
+          PY
+      - name: Run the frozen #376 contract argvs (real model present)
+        shell: bash
+        env:
+          ZMEM_TEST_REAL_MODELS_DIR: ${{ env.ZMEM_MODELS_CACHE }}
+        run: |
+          set -e
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_distinct_subjects
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_identity_controls
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_compatible_runner_up
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_all_write_surfaces
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_metadata_integrity
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_compatibility_and_cost
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_held_out_evaluation
 
   # Issue #139: C6 is the native Hermes provenance lane. It is separate from
   # the generic Python 3.11 loop because this acceptance fixture must use the
