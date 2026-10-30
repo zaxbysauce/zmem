@@ -393,11 +393,16 @@ def test_s7_chunked_flush_and_empty_principal():
 def test_s8_cross_principal_id_isolation():
     """S8 (review PRR-016): applied_ops is keyed (op_id, principal) — the
     same op_id from two principals commits BOTH rows and neither sees the
-    other's canonical id; a same-principal replay is still a duplicate."""
+    other's canonical id; a same-principal replay is still a duplicate.
+    #414: a non-empty principal must now RESOLVE - an unresolved id is
+    rejected for every kind (the old fail-open shape was the defect this
+    issue closes) - so the probe resolves both ids to unscoped legacy
+    identities; the ledger-isolation contract under test is unchanged."""
     from storelib import connect, init_db
     from storelib import ops as opslib
     conn = connect()
     init_db(conn)
+    lookup = lambda pid: opslib.LegacyPrincipal()  # noqa: E731
     shared = uuid.uuid4().hex
     # Distinct content per principal: the store's content dedup FOLDS
     # identical text across principals (a store-level rule), which would
@@ -407,15 +412,18 @@ def test_s8_cross_principal_id_isolation():
     op_b = {"op_id": shared, "op": "add",
             "args": {"content": "isolation probe p-b",
                      "namespace": "user:global"}}
-    r1 = opslib.apply_ops(conn, [dict(op)], principal="p-a")
-    r2 = opslib.apply_ops(conn, [dict(op_b)], principal="p-b")
+    r1 = opslib.apply_ops(conn, [dict(op)], principal="p-a",
+                          principal_lookup=lookup)
+    r2 = opslib.apply_ops(conn, [dict(op_b)], principal="p-b",
+                          principal_lookup=lookup)
     assert r1["receipts"][0]["status"] == "committed", r1
     assert r2["receipts"][0]["status"] == "committed", (
         "the same op_id under a DIFFERENT principal is a fresh op, not a "
         "duplicate leak, got: %r" % r2)
     assert (r1["receipts"][0]["canonical_id"]
             != r2["receipts"][0]["canonical_id"]), (r1, r2)
-    r3 = opslib.apply_ops(conn, [dict(op)], principal="p-a")
+    r3 = opslib.apply_ops(conn, [dict(op)], principal="p-a",
+                          principal_lookup=lookup)
     assert r3["receipts"][0]["status"] == "duplicate", r3
 
 
