@@ -634,6 +634,29 @@ jobs:
           # minilm.onnx AND tokenizer.json in the SAME dir, and a stale
           # tokenizer must never survive under the model-only cache key.
           cp skills/memory/models/tokenizer.json "$ZMEM_MODELS_CACHE/tokenizer.json"
+      - name: Diagnose embedder availability (temporary, issue #413 CI round 1)
+        shell: bash
+        env:
+          ZMEM_TEST_REAL_MODELS_DIR: ${{ env.ZMEM_MODELS_CACHE }}
+        run: |
+          set -e
+          python -X utf8 - <<'PY'
+          import os, sys, json, traceback
+          sys.path.insert(0, os.path.join(os.getcwd(), "skills", "memory", "scripts"))
+          os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
+          import embeddings, embed_profiles
+          print("profile env:", repr(os.environ.get("ZMEM_EMBED_PROFILE")))
+          print("current_profile_name:", repr(embeddings.current_profile_name()))
+          st = embeddings.availability_status()
+          print("availability_status:", json.dumps(st, sort_keys=True))
+          print("is_available:", embeddings.is_available())
+          try:
+              blob = embeddings.embed_text("diagnostic probe")
+              print("embed_text len:", None if blob is None else len(blob))
+          except Exception:
+              traceback.print_exc()
+          print("post status:", json.dumps(embeddings.availability_status(), sort_keys=True))
+          PY
       - name: Run the frozen #376 contract argvs (real model present)
         shell: bash
         env:
