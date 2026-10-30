@@ -414,6 +414,28 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
             "INSERT INTO memory (" + _SNAPSHOT_COLUMNS + ") VALUES (" +
             ",".join("?" * ncols) + ")",
             [_decode(r) for r in payload.get("rows", [])])
+        # Issue #414: restore the additive ``expiry`` family — the shipped
+        # state rows' memory_expiry side records. Older hubs omit the key
+        # (tolerated: every row stays live by the missing-side-row law);
+        # a newer hub ships [memory_id, inject_until, expiry_class]
+        # triplets, restored ONLY onto rows this payload actually shipped
+        # (a hostile or orphan triplet is skipped, not landed — foreign
+        # keys are inert, so the parent check is explicit) and INSERT OR
+        # IGNORE so a duplicate triplet can never error the build.
+        shipped = {str(r[0]) for r in payload.get("rows", [])
+                   if isinstance(r, (list, tuple)) and r}
+        expiry_rows = []
+        for triplet in payload.get("expiry") or []:
+            if (isinstance(triplet, (list, tuple)) and len(triplet) == 3
+                    and all(isinstance(v, str) for v in triplet)
+                    and triplet[0] in shipped):
+                expiry_rows.append(
+                    (triplet[0], triplet[1], triplet[2]))
+        if expiry_rows:
+            out.executemany(
+                "INSERT OR IGNORE INTO memory_expiry "
+                "(memory_id, inject_until, expiry_class) "
+                "VALUES (?, ?, ?)", expiry_rows)
         out.commit()
     finally:
         out.close()
