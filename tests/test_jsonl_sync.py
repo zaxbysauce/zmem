@@ -175,13 +175,17 @@ class _TwoStoreCase(unittest.TestCase):
         m = re.search(
             r"added=(\d+) tombstoned=(\d+) tombstones_refused=(\d+) "
             r"capture_refused=(\d+) quarantined=(\d+) quarantine_failed=(\d+) "
-            r"deduped=(\d+) skipped=(\d+) malformed=(\d+)",
+            r"deduped=(\d+) skipped=(\d+) malformed=(\d+) links_added=(\d+) "
+            r"links_skipped=(\d+) episodes_added=(\d+) episodes_skipped=(\d+) "
+            r"expiry_applied=(\d+) expiry_malformed=(\d+) expiry_skipped=(\d+)",
             stdout,
         )
         assert m, f"summary line not found in: {stdout!r}"
         keys = ("added", "tombstoned", "tombstones_refused", "capture_refused",
                 "quarantined", "quarantine_failed",
-                "deduped", "skipped", "malformed")
+                "deduped", "skipped", "malformed", "links_added",
+                "links_skipped", "episodes_added", "episodes_skipped",
+                "expiry_applied", "expiry_malformed", "expiry_skipped")
         return dict(zip(keys, (int(g) for g in m.groups())))
 
     def _write_jsonl(self, store: "Store", name: str, rows) -> str:
@@ -3359,6 +3363,394 @@ print(json.dumps({
 }))
 """
 
+
+
+# ---------------------------------------------------------------------------
+# #347: pair-atomic legacy ingest for state rows
+# ---------------------------------------------------------------------------
+class PairAtomicIngestTest(_TwoStoreCase):
+    """Issue #347: a live state row and its memory_expiry record commit as
+    ONE transaction, so no reader can observe a committed state row whose
+    side record is absent. The pass-A pre-index makes file order irrelevant;
+    duplicate/conflict semantics behind a consumed first record are exactly
+    the buffered-apply contract's (first applies, identical repeat skipped,
+    conflicting repeat malformed), and rows without any record in the file
+    keep today's unpaired legacy behavior."""
+
+    @staticmethod
+    def _exp(memory_id, expiry_class="setting",
+             inject_until="2027-06-01T00:00:00Z"):
+        return {"kind": "memory_expiry", "memory_id": memory_id,
+                "inject_until": inject_until, "expiry_class": expiry_class}
+
+    def _ingest(self, rows, store=None):
+        path = self._write_jsonl(store or self.b, "pair-feed.jsonl", rows)
+        return (store or self.b).run("ingest-jsonl", "--in", path)
+
+    def test_both_wire_orders_pair_and_land_identically(self):
+        sid = "70000000-0000-4000-8000-000000000001"
+        mem = _sync_row(id=sid, type="state",
+                        content="pair order probe: pool size is 8")
+        # (a) expiry AFTER parent, (b) expiry BEFORE parent.
+        r1 = self._ingest([mem, self._exp(sid)])
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(self._summary_counts(r1.stdout)["added"], 1)
+        first = self._expiry_pairs(self.b)
+        self.b2 = Store(tempfile.mkdtemp(prefix="zmem-jsonl-b2-"))
+        self.addCleanup(shutil.rmtree, self.b2.tmp, True)
+        self.b2.run("init")
+        r2 = self._ingest([self._exp(sid), dict(mem)], store=self.b2)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(self._expiry_pairs(self.b2), first,
+                         "wire order must not change the landed side record")
+
+    def test_conflicting_duplicate_expiry_first_in_file_wins(self):
+        sid = "70000000-0000-4000-8000-000000000002"
+        mem = _sync_row(id=sid, type="state",
+                        content="conflict probe: pool size is 9")
+        a = self._exp(sid, "setting", "2027-07-01T00:00:00Z")
+        b = self._exp(sid, "metric", "2027-08-01T00:00:00Z")
+        for order_name, rows in (("setting-first", [mem, a, b]),
+                                 ("metric-first", [b, a, mem])):
+            with self.subTest(order=order_name):
+                store = Store(tempfile.mkdtemp(prefix=f"zmem-pair-{order_name}-"))
+                self.addCleanup(shutil.rmtree, store.tmp, True)
+                store.run("init")
+                r = self._ingest(rows, store=store)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                counts = self._summary_counts(r.stdout)
+                self.assertEqual(counts["added"], 1)
+                self.assertEqual(counts["malformed"], 1,
+                                 f"conflicting repeat must count malformed: {r.stdout}")
+                # PRR-011: one applied (the first-in-file record) + one
+                # malformed (the conflicting repeat) — never 2 applies.
+                self.assertEqual(counts["expiry_applied"], 1)
+                self.assertEqual(counts["expiry_malformed"], 1)
+                self.assertEqual(counts["expiry_skipped"], 0)
+                winner = ("setting", "2027-07-01T00:00:00Z") if order_name == \
+                    "setting-first" else ("metric", "2027-08-01T00:00:00Z")
+                self.assertEqual(self._expiry_pairs(store), {winner})
+
+    def test_identical_duplicate_expiry_applies_once_and_skips_the_repeat(self):
+        sid = "70000000-0000-4000-8000-000000000003"
+        mem = _sync_row(id=sid, type="state",
+                        content="identical probe: pool size is 10")
+        r = self._ingest([mem, self._exp(sid), self._exp(sid)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 0)
+        # PRR-011: the exactly-once counters are pinned — one record applied
+        # at the pair, its identical repeat skipped at the EOF gates.
+        self.assertEqual(counts["expiry_applied"], 1)
+        self.assertEqual(counts["expiry_skipped"], 1)
+        self.assertEqual(counts["expiry_malformed"], 0)
+        self.assertEqual(len(self._expiry_pairs(self.b)), 1)
+
+    def test_malformed_side_record_adjacent_to_a_good_pair(self):
+        sid = "70000000-0000-4000-8000-000000000004"
+        mem = _sync_row(id=sid, type="state",
+                        content="adjacent probe: pool size is 11")
+        bad = self._exp("70000000-0000-4000-8000-000000000099")
+        bad["expiry_class"] = "not-a-class"
+        r = self._ingest([mem, bad, self._exp(sid)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(len(self._expiry_pairs(self.b)), 1,
+                         "the good pair must land atomically")
+
+    def test_tombstoned_history_state_row_never_pairs(self):
+        sid = "70000000-0000-4000-8000-000000000005"
+        mem = _sync_row(id=sid, type="state",
+                        content="history probe: pool size is 12",
+                        superseded_at="2026-01-02T00:00:00Z",
+                        supersede_reason="replaced upstream")
+        r = self._ingest([mem, self._exp(sid)])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["added"], 1, "the history row still lands")
+        self.assertEqual(counts["malformed"], 1,
+                         "its record counts malformed at EOF (parent not live)")
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "a tombstoned parent never gains a side record")
+
+    def test_unpaired_legacy_state_row_lands_without_a_side_record(self):
+        sid = "70000000-0000-4000-8000-000000000006"
+        mem = _sync_row(id=sid, type="state",
+                        content="legacy probe: pool size is 13")
+        r = self._ingest([mem])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._summary_counts(r.stdout)["added"], 1)
+        self.assertEqual(self._expiry_pairs(self.b), set(),
+                         "a state row with no record in the file keeps "
+                         "today's unpaired legacy behavior")
+
+    def test_repeat_ingest_after_pairing_is_idempotent(self):
+        sid = "70000000-0000-4000-8000-000000000007"
+        rows = [_sync_row(id=sid, type="state",
+                          content="reingest probe: pool size is 14"),
+                self._exp(sid)]
+        r1 = self._ingest(rows)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        landed = self._expiry_pairs(self.b)
+        r2 = self._ingest(rows)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(self._expiry_pairs(self.b), landed,
+                         "re-ingest must not duplicate or mutate the record")
+
+    def test_duplicate_content_across_pairs_keeps_first_keeper(self):
+        first_id = "70000000-0000-4000-8000-000000000008"
+        dup_id = "70000000-0000-4000-8000-000000000009"
+        content = "dedup probe: pool size is 15"
+        rows = [
+            _sync_row(id=first_id, type="state", content=content),
+            self._exp(first_id),
+            _sync_row(id=dup_id, type="state", content=content),
+            self._exp(dup_id, "metric"),
+        ]
+        r = self._ingest(rows)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["deduped"], 1,
+                         f"the later duplicate folds into the first keeper: {r.stdout}")
+        self.assertEqual(self._expiry_pairs(self.b),
+                         {("setting", "2027-06-01T00:00:00Z")},
+                         "the keeper's record is the one that survives")
+
+    def _in_process_sync(self, tmp):
+        """A scratch-bound store module + the shared sync module (explicit
+        conn pattern from the ingest-guard precedent in this file)."""
+        env = {
+            "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+            "ZMEM_MODELS_DIR": os.path.join(tmp, "no-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "zmem_pair_atomic_store", str(STORE_PY))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        conn = mod.connect()
+        mod.init_db(conn)
+        mod.migrate(conn)
+        self.addCleanup(conn.close)
+        from storelib import sync as sync_mod
+        return mod, conn, sync_mod
+
+    def test_commit_boundary_never_exposes_paired_row_without_record(self):
+        """The deterministic window guard: an observer at EVERY commit during
+        an in-process ingest must never see a live state row whose file
+        carried a memory_expiry record without that record landed."""
+        tmp = tempfile.mkdtemp(prefix="zmem-pair-window-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mod, conn, sync_mod = self._in_process_sync(tmp)
+
+        # Mutually DISSIMILAR contents: the legacy ingest lane's best-effort
+        # fuzzy dedup folds near-identical strings, which is not what this
+        # test exercises (same discipline as the organize fixtures).
+        contents = [
+            "window probe alpha: the api host is api.internal",
+            "window probe bravo: pool size stays 8",
+            "window probe charlie: queue depth 3 is normal",
+            "window probe delta: token budget is 900",
+            "window probe echo: retry backoff starts at 250ms",
+            "window probe foxtrot: snapshot interval is daily",
+        ]
+        rows = []
+        for i, content in enumerate(contents):
+            sid = f"7000000{i}-0000-4000-8000-00000000001{i}"
+            rows.append(_sync_row(id=sid, type="state", content=content))
+            rows.append(self._exp(sid))
+        feed = os.path.join(tmp, "feed.jsonl")
+        with open(feed, "w", encoding="utf-8", newline="\n") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        # The feed's state ids whose expiry record rides IN the file: the
+        # observer may only exempt rows whose record is still pending (a
+        # record line not yet reached). _sync_row rows carry no "kind" key
+        # (absent kind defaults to "memory" on the wire), so match on type.
+        with_record = {r["id"] for r in rows
+                       if r.get("type") == "state"}
+        self.assertTrue(with_record,
+                        "observer precondition: the feed carries state rows")
+
+        real_commit = sync_mod._commit
+        violations = []
+        seen = {"commits": 0}
+
+        def watch(c):
+            real_commit(c)
+            seen["commits"] += 1
+            unpaired = c.execute(
+                "select m.id from memory m left join memory_expiry e "
+                "on e.memory_id = m.id where m.type='state' "
+                "and m.superseded_at is null and e.memory_id is null"
+            ).fetchall()
+            for u in unpaired:
+                if u[0] in with_record:
+                    violations.append(u[0])
+
+        with unittest.mock.patch.object(sync_mod, "_commit", watch):
+            rc = sync_mod.cmd_ingest_jsonl(conn, in_path=feed, source_ref=None)
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(seen["commits"], len(with_record),
+                                "the observer must intercept EVERY commit "
+                                "(a pair-commit-per-row ingest commits at "
+                                "least once per state row)")
+        self.assertEqual(violations, [],
+                         "a paired state row was visible without its record")
+        self.assertEqual(len(mod_rows(conn)), 6)
+
+    def test_pair_failure_rolls_back_row_and_attributes_expiry_line(self):
+        """Fault injection at the pair apply: an UNEXPECTED failure (not a
+        record-contract ValueError, not a degraded-store OperationalError)
+        rolls the pair back together; the record is consumed with the EOF
+        leg's accounting (malformed AND expiry_malformed, attributed to the
+        EXPIRY line) and ingest continues."""
+        tmp = tempfile.mkdtemp(prefix="zmem-pair-fault-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mod, conn, sync_mod = self._in_process_sync(tmp)
+
+        sid = "70000000-0000-4000-8000-0000000000aa"
+        later = "70000000-0000-4000-8000-0000000000bb"
+        rows = [
+            _sync_row(id=sid, type="state",
+                      content="fault probe: pool size is 16"),
+            self._exp(sid),
+            _sync_row(id=later, type="state",
+                      content="fault probe: pool size is 17"),
+            self._exp(later, "metric"),
+        ]
+        feed = os.path.join(tmp, "feed.jsonl")
+        with open(feed, "w", encoding="utf-8", newline="\n") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+        real_apply = sync_mod._apply_expiry_record
+        calls = {"n": 0}
+
+        def flaky(c, rec):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("injected pair failure")
+            return real_apply(c, rec)
+
+        stderr_path = os.path.join(tmp, "stderr.log")
+        import contextlib
+        with unittest.mock.patch.object(sync_mod, "_apply_expiry_record",
+                                        flaky), \
+                open(stderr_path, "w", encoding="utf-8") as cap, \
+                contextlib.redirect_stderr(cap):
+            rc = sync_mod.cmd_ingest_jsonl(conn, in_path=feed, source_ref=None)
+        self.assertEqual(rc, 0, "a pair failure must not abort the file")
+        log = Path(stderr_path).read_text(encoding="utf-8")
+        # The expiry record's own line (2) is named for the rollback.
+        self.assertIn("malformed line 2: paired memory_expiry record rolled "
+                      "back", log)
+        # The FIRST pair rolled back; the SECOND landed intact.
+        ids = {r[0]: r[1] for r in conn.execute(
+            "select id, superseded_at from memory").fetchall()}
+        self.assertNotIn(sid, ids, "the faulted pair row must not land")
+        self.assertIn(later, ids)
+        self.assertEqual(
+            conn.execute("select count(*) from memory_expiry").fetchone()[0],
+            1, "only the surviving pair holds a side record")
+
+    def test_pair_valueerror_lands_row_and_defers_record_to_eof(self):
+        """Feedback PRR-007 base parity: a record-contract ValueError at the
+        pair seam (e.g. a conflicting stored record) aborts only the RECORD
+        -- the parent row LANDS bare (base behavior) and the record is
+        counted malformed at the EOF gates with its own line number."""
+        tmp = tempfile.mkdtemp(prefix="zmem-pair-verr-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mod, conn, sync_mod = self._in_process_sync(tmp)
+
+        sid = "70000000-0000-4000-8000-0000000000ca"
+        rows = [
+            _sync_row(id=sid, type="state",
+                      content="verr probe: pool size is 18"),
+            self._exp(sid, "metric"),
+        ]
+        feed = os.path.join(tmp, "feed.jsonl")
+        with open(feed, "w", encoding="utf-8", newline="\n") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+        real_apply = sync_mod._apply_expiry_record
+
+        def refusing(c, rec):
+            raise ValueError("memory_expiry conflicts with existing record")
+
+        stderr_path = os.path.join(tmp, "stderr.log")
+        stdout_path = os.path.join(tmp, "stdout.log")
+        import contextlib
+        with unittest.mock.patch.object(sync_mod, "_apply_expiry_record",
+                                        refusing), \
+                open(stderr_path, "w", encoding="utf-8") as cap, \
+                open(stdout_path, "w", encoding="utf-8") as oh, \
+                contextlib.redirect_stderr(cap), \
+                contextlib.redirect_stdout(oh):
+            rc = sync_mod.cmd_ingest_jsonl(conn, in_path=feed, source_ref=None)
+        self.assertEqual(rc, 0)
+        ids = {r[0] for r in conn.execute(
+            "select id from memory").fetchall()}
+        self.assertIn(sid, ids,
+                      "base parity: the parent row lands bare")
+        # The record was rejected: no side row in the store.
+        self.assertEqual(
+            conn.execute("select count(*) from memory_expiry").fetchone()[0],
+            0, "the rejected record must not land")
+        # The EOF leg's accounting: malformed AND expiry_malformed, with the
+        # summary counters exact (feedback PRR-011).
+        out = Path(stdout_path).read_text(encoding="utf-8")
+        summary = self._summary_counts(out)
+        self.assertEqual(summary["malformed"], 1)
+        self.assertEqual(summary["added"], 1)
+        log = Path(stderr_path).read_text(encoding="utf-8")
+        self.assertIn("malformed line 2", log)
+
+    def test_pair_operationalerror_lands_row_and_reports_unavailable(self):
+        """Feedback PRR-008 base parity: on a degraded store without the
+        side table (pre-v15), the pair seam must NOT destroy the parent row
+        -- the row lands bare and the missing side table is reported."""
+        tmp = tempfile.mkdtemp(prefix="zmem-pair-operr-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        mod, conn, sync_mod = self._in_process_sync(tmp)
+
+        sid = "70000000-0000-4000-8000-0000000000da"
+        rows = [
+            _sync_row(id=sid, type="state",
+                      content="operr probe: pool size is 19"),
+            self._exp(sid, "setting"),
+        ]
+        feed = os.path.join(tmp, "feed.jsonl")
+        with open(feed, "w", encoding="utf-8", newline="\n") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+
+        conn.execute("DROP TABLE memory_expiry")
+        conn.commit()
+
+        import contextlib
+        cap = os.path.join(tmp, "stderr.log")
+        with open(cap, "w", encoding="utf-8") as ch:
+            with contextlib.redirect_stderr(ch):
+                rc = sync_mod.cmd_ingest_jsonl(conn, in_path=feed,
+                                               source_ref=None)
+        self.assertEqual(rc, 0)
+        ids = {r[0] for r in conn.execute(
+            "select id from memory").fetchall()}
+        self.assertIn(sid, ids,
+                      "PRR-008: the paired row must LAND on a degraded "
+                      "store, not be destroyed by the missing side table")
+        log = Path(cap).read_text(encoding="utf-8")
+        self.assertIn("side table unavailable", log)
+
+
+def mod_rows(conn):
+    return conn.execute("select id from memory").fetchall()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

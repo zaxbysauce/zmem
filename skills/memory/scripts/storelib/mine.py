@@ -1765,6 +1765,23 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
             sconn_cols_cache[table] = tcols
             assoc_rows[table] = sconn.execute(
                 f"SELECT {', '.join(tcols)} FROM {table}").fetchall()
+        # #324: pre-read the v15 expiry side table the same way. It is
+        # deliberately NOT an _ASSOCIATED_TABLES entry: its copy is
+        # parent-outcome-aware (the apply pass below skips tombstoned and
+        # dedup-remapped parents), which the generic INSERT OR IGNORE loop
+        # cannot express — and foreign keys are inert, so nothing else would
+        # stop a revived orphan.
+        expiry_cols: list[str] = []
+        expiry_rows: list[tuple] = []
+        try:
+            expiry_cols = [r["name"] for r in
+                           sconn.execute("PRAGMA table_info(memory_expiry)")]
+        except sqlite3.Error:
+            expiry_cols = []
+        if expiry_cols:
+            expiry_rows = sconn.execute(
+                f"SELECT {', '.join(expiry_cols)} FROM memory_expiry"
+            ).fetchall()
     finally:
         sconn.close()
 
@@ -1787,6 +1804,7 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
 
     # Lazy import avoids a module-level cycle (sync imports write; mine is
     # imported by cli alongside both).
+    from storelib.schema import _normalize_content
     from storelib.sync import _ingest_row, _validate_sync_row
 
     tallies: dict[str, int] = {}
@@ -1796,6 +1814,11 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
     # (the destination's live id set), so the dry-run summary accounts for
     # EVERY source row: would_promote + would_skip + malformed == total.
     dry_skip_ids: set[str] = set()
+    # #324: dry-run projection of the post-memory-pass live state ids — the
+    # expiry side pass below counts would-copies against this projected set,
+    # because dry-run never inserts the parents (the CURRENT destination
+    # alone would count zero on a fresh destination).
+    dry_live_state_ids: set[str] = set()
     if dry_run:
         try:
             dry_skip_ids = {
@@ -1822,6 +1845,22 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
                 tallies["would_skip"] = tallies.get("would_skip", 0) + 1
             else:
                 tallies["would_promote"] = tallies.get("would_promote", 0) + 1
+                if (validated.get("type") == "state"
+                        and not validated.get("superseded_at")):
+                    # PRR-005: predict the content-dedup fold — a source row
+                    # whose normalized content already exists live in the
+                    # destination folds into the keeper and never lands
+                    # under its own id, so its expiry record must project
+                    # as an orphan skip, not a would-copy.
+                    _norm = _normalize_content(validated["content"])
+                    _fold = None
+                    if _norm:
+                        _fold = conn.execute(
+                            "SELECT 1 FROM memory WHERE namespace=? "
+                            "AND content_norm=? AND superseded_at IS NULL",
+                            (validated["namespace"], _norm)).fetchone()
+                    if _fold is None:
+                        dry_live_state_ids.add(validated["id"])
             continue
         try:
             outcome = _ingest_row(conn, validated, allow_tombstones=True,
@@ -1887,6 +1926,81 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
                       f"({type(exc).__name__}: {exc})")
                 tallies[f"{table}_failed"] = \
                     tallies.get(f"{table}_failed", 0) + 1
+
+    # #324: the v15 expiry side-table pass. Parent-outcome-aware — a record
+    # is copied ONLY onto a destination id that is a LIVE state row after the
+    # memory pass: tombstoned parents (an update already moved the side
+    # record to its replacement) and dedup-remapped parents (their rows were
+    # never inserted under the source id) are skipped, never revived.
+    # Conflict policy: INSERT OR IGNORE — an existing destination record wins
+    # (a repaired destination keeps its repair on re-promote).
+    if expiry_rows:
+        try:
+            dst_ecols = [r["name"] for r in
+                         conn.execute("PRAGMA table_info(memory_expiry)")]
+        except sqlite3.Error:
+            dst_ecols = []
+        common_ecols = [c for c in expiry_cols if c in dst_ecols]
+        if not common_ecols:
+            assoc_skipped.append("memory_expiry")
+        else:
+            e_idx = {c: expiry_cols.index(c) for c in common_ecols}
+            mid_idx = e_idx.get("memory_id")
+            for erow in expiry_rows:
+                src_mid = erow[mid_idx] if mid_idx is not None else None
+                if src_mid is None:
+                    continue
+                if dry_run:
+                    # Projected liveness: the parent either already sits live
+                    # in the destination, or is a state row this dry run
+                    # tallied would_promote (dedup/tombstone exclusions
+                    # carried by construction of the projected set).
+                    live = conn.execute(
+                        "SELECT 1 FROM memory WHERE id=? AND type='state' "
+                        "AND superseded_at IS NULL", (src_mid,)).fetchone()
+                    projected = live is not None or src_mid in dry_live_state_ids
+                    if not projected:
+                        tallies["memory_expiry_orphan_skipped"] = \
+                            tallies.get("memory_expiry_orphan_skipped", 0) + 1
+                        continue
+                    exists = conn.execute(
+                        "SELECT 1 FROM memory_expiry WHERE memory_id=?",
+                        (src_mid,)).fetchone()
+                    key = ("memory_expiry" if exists is None
+                           else "memory_expiry_would_skip")
+                    tallies[key] = tallies.get(key, 0) + 1
+                    continue
+                live = conn.execute(
+                    "SELECT 1 FROM memory WHERE id=? AND type='state' "
+                    "AND superseded_at IS NULL", (src_mid,)).fetchone()
+                if live is None:
+                    tallies["memory_expiry_orphan_skipped"] = \
+                        tallies.get("memory_expiry_orphan_skipped", 0) + 1
+                    continue
+                try:
+                    _cur = conn.execute(
+                        "INSERT OR IGNORE INTO memory_expiry ("
+                        + ", ".join(common_ecols) + ") VALUES ("
+                        + ", ".join("?" * len(common_ecols)) + ")",
+                        tuple(erow[e_idx[c]] for c in common_ecols))
+                    from storelib.schema import _commit
+                    _commit(conn)
+                    # Feedback FB-10/PRR-016: count only rows the INSERT
+                    # actually wrote (rowcount 0 = the destination already
+                    # held the record); the dry-run projection splits the
+                    # same outcome as memory_expiry_would_skip, so both
+                    # modes report identical shapes.
+                    if _cur.rowcount:
+                        tallies["memory_expiry"] = \
+                            tallies.get("memory_expiry", 0) + 1
+                    else:
+                        tallies["memory_expiry_skipped_existing"] = \
+                            tallies.get("memory_expiry_skipped_existing", 0) + 1
+                except sqlite3.Error as exc:
+                    print(f"[zmem] promote-store: memory_expiry row skipped "
+                          f"({type(exc).__name__}: {exc})")
+                    tallies["memory_expiry_failed"] = \
+                        tallies.get("memory_expiry_failed", 0) + 1
 
     summary = ", ".join(f"{k}={v}" for k, v in sorted(tallies.items())) or "no rows"
     verb = "dry-run" if dry_run else "promoted"

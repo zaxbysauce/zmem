@@ -574,58 +574,95 @@ class AllowedEnumV9RatchetTest(unittest.TestCase):
         self.assertIn('consts["ALLOWED_TYPES"]', hermes_src)
         self.assertIn('consts["ALLOWED_TAINTS"]', hermes_src)
 
-    def test_agent_add_surfaces_exclude_state_until_expiry_params_exist(self):
-        # #173 PR-review F22/F23: the hermes and MCP add surfaces advertise and
-        # write-validate only the types they can CREATE — `state` needs the
-        # expiry params neither surface takes, so it is pinned out of the add
-        # path, the schema enum, and the degraded fallback until the params are
-        # wired (follow-up issue). The pins tie the serviceable set to
-        # schema_meta: if a future type ships, the derived subset moves with
-        # it and these source pins keep the exclusion honest.
-        # #179 (Workstream K PR 8): `entity_card` extends the exclusion —
-        # a card-refresh-only type no interactive surface may create. The
-        # addable set is schema_meta.ALLOWED_TYPES minus {state,
-        # entity_card} and stays the six serviceable types; loaded and
-        # degraded paths agree.
+    def test_agent_add_surfaces_carry_state_with_expiry_params(self):
+        # #326 closes the #173 PR-review F22 stopgap: the hermes and MCP add
+        # surfaces take expiry_class/inject_until, so `state` is ADDABLE on
+        # both. The pins tie the serviceable set to schema_meta: if a future
+        # type ships, the derived subset moves with it and these source pins
+        # keep the wiring honest. Remaining exclusions, each for its own
+        # reason: `entity_card` is card-refresh-only (#179) and `event` needs
+        # occurrence endpoints neither surface takes (#178). Loaded and
+        # degraded paths agree (the F23 split-brain guard): the degraded
+        # fallback literals carry `state` too, and both surfaces expose the
+        # STATE_EXPIRY_CLASSES enum for the expiry params.
         self.assertIn("state", self.allowed_types,
-                      "precondition: the exclusion exists because state is shipped")
+                      "precondition: state ships in ALLOWED_TYPES")
         self.assertIn("entity_card", self.allowed_types,
                       "precondition: entity_card shipped in ALLOWED_TYPES "
                       "(the #179 reversal)")
-        # #178 (issue #178): `event` joins the exclusion — it needs
-        # occurrence endpoints neither agent surface takes. All three
-        # non-addable types are excluded; taking only one side of the
-        # rebase would have dropped the others' exclusion.
         serviceable = tuple(
             t for t in self.allowed_types
-            if t not in ("state", "entity_card", "event"))
+            if t not in ("entity_card", "event"))
         self.assertEqual(
             serviceable,
             ("fact", "lesson", "convention", "preference", "decision",
-             "constraint"))
+             "constraint", "state"))
+        # PRR-012: pin the PRODUCTION derived tuples, not just source
+        # strings — a derivation regression that re-excludes state must
+        # turn this red. Loaded via importlib with the same agent stubs the
+        # surface tests install (the plugin requires an agent package).
+        import importlib.util
+        import types as _types
+        import sys as _sys
+        _agent = _types.ModuleType("agent")
+        _sys.modules.setdefault("agent", _agent)
+        if not hasattr(_sys.modules["agent"], "memory_provider"):
+            _prov = _types.ModuleType("agent.memory_provider")
+
+            class _MemoryProvider:  # minimal stand-in
+                pass
+            _prov.MemoryProvider = _MemoryProvider
+            _sys.modules["agent.memory_provider"] = _prov
+            _agent.memory_provider = _prov
+        if "agent.skill_commands" not in _sys.modules:
+            _sc = _types.ModuleType("agent.skill_commands")
+            _sc.extract_user_instruction_from_skill_message = lambda m: m
+            _sys.modules["agent.skill_commands"] = _sc
+        _spec = importlib.util.spec_from_file_location(
+            "zmem_ns_schema_hermes_prod", HERMES_INIT)
+        _hmod = importlib.util.module_from_spec(_spec)
+        _sys.modules["zmem_ns_schema_hermes_prod"] = _hmod
+        _spec.loader.exec_module(_hmod)
+        self.assertEqual(tuple(_hmod._ADDABLE_TYPES), serviceable,
+                         "production hermes _ADDABLE_TYPES drifted from "
+                         "the serviceable set")
+        self.assertEqual(
+            tuple(_hmod._ADD_EXPIRY_ENUM),
+            ("endpoint", "setting", "metric"),
+            "production hermes expiry enum drifted")
         hermes_src = HERMES_INIT.read_text(encoding="utf-8")
-        self.assertIn('_STATE_TYPES = frozenset({"state", "event"})',
+        self.assertIn('_OCCURRENCE_TYPES = frozenset({"event"})',
                       hermes_src)
         self.assertIn(
             '_CARD_REFRESH_ONLY_TYPES = frozenset({"entity_card"})',
             hermes_src)
         self.assertIn("_ADD_TYPE_ENUM = list(_ADDABLE_TYPES)", hermes_src)
         self.assertIn("if mtype not in _ADDABLE_TYPES:", hermes_src)
+        # The expiry params are advertised and forwarded on both write tools.
+        self.assertIn('"expiry_class"', hermes_src)
+        self.assertIn('"inject_until"', hermes_src)
         # The degraded-mode fallback literal must be the serviceable subset —
-        # the split-brain guard (F23): degraded and loaded modes now agree.
+        # the split-brain guard (F23): degraded and loaded modes agree.
         self.assertIn(
             '"ALLOWED_TYPES": ("fact", "lesson", "convention", '
-            '"preference", "decision", "constraint")',
+            '"preference", "decision", "constraint", "state")',
+            hermes_src.replace("'", '"'))
+        self.assertIn(
+            '"STATE_EXPIRY_CLASSES": ("endpoint", "setting", "metric")',
             hermes_src.replace("'", '"'))
         mcp_src = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py"
                    ).read_text(encoding="utf-8")
-        # All THREE non-addable types are excluded on the MCP surface too.
+        # Only entity_card + event stay excluded on the MCP surface (#326).
         self.assertIn(
             '_ALLOWED_TYPES_ADDABLE = tuple(\n'
             '                t for t in types\n'
-            '                if t not in ("state", "entity_card", "event"))',
+            '                if t not in ("entity_card", "event"))',
             mcp_src)
         self.assertIn("if mtype not in _ALLOWED_TYPES_ADDABLE:", mcp_src)
+        self.assertIn(
+            '_ALLOWED_TYPES_ADDABLE = ("fact", "lesson", "convention", '
+            '"preference", "decision", "constraint", "state")',
+            mcp_src)
 
 
 if __name__ == "__main__":

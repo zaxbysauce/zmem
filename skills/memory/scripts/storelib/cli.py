@@ -2772,7 +2772,9 @@ def main():
                             "surfaces; stderr advisory lines are unchanged)")
     p_upd.add_argument("--expiry-class", type=str, dest="expiry_class", default=None,
                        choices=list(STATE_EXPIRY_CLASSES),
-                       help="state expiry class: endpoint, setting, or metric")
+                       help="state expiry class: endpoint, setting, or metric "
+                            "(the target's effective type resolves at action "
+                            "time, so --type state may be omitted — #317)")
     p_upd.add_argument("--inject-until", type=str, dest="inject_until", default=None,
                        help="explicit UTC ISO8601 injection expiry timestamp")
 
@@ -4059,10 +4061,14 @@ def main():
 
     args = ap.parse_args(parse_argv)
 
-    # v15 (#173): cross-field refusal. argparse `type=` sees only its own
-    # value, so the state-only coupling is enforced here as a post-parse hook
-    # (usage + message to stderr, exit 2 — matching argparse's own contract).
-    if (args.cmd in ("add", "update")
+    # v15 (#173) / #317: expiry coupling. ADD keeps the parse-time refusal —
+    # a new row's type must be stated, and argparse cannot consult the store.
+    # UPDATE resolves the TARGET's effective type at action time inside
+    # update_memory (#317's owner-directed action-time consult): a state
+    # target accepts the expiry flags with --type omitted, and genuinely
+    # non-state targets get the writer's own contract refusal, so no
+    # parse-time hook runs for update.
+    if (args.cmd == "add"
             and (args.expiry_class is not None or args.inject_until is not None)
             and getattr(args, "type", None) != "state"):
         ap.error("--expiry-class and --inject-until require --type state")

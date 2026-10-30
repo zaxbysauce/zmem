@@ -92,24 +92,25 @@ _READ_DEFAULTS: dict[str, dict[str, Any]] = {
     "get": {},
 }
 _WRITE_REFUSALS: dict[str, tuple[tuple[str, Any], ...]] = {
-    # add: the T-09 applier carries namespace/type/content/tags/signal/
-    # source_ref/capture_mode only; state/event types additionally need
-    # expiry/occurrence args the applier drops (write.py would refuse at
-    # apply time after a "pending" receipt — refused up front instead).
+    # add/update: the applier (storelib/ops.py) carries namespace/type/
+    # content/tags/signal/source_ref/capture_mode AND, since #326, the expiry
+    # pair — expiry_class/inject_until queue for both commands, so they left
+    # this table. `event` still needs occurrence endpoints the applier does
+    # not take, and a state ADD still needs its expiry metadata (the writer
+    # unconditionally requires expiry_class; see _refuse_write_flags).
     "add": (
         ("confidence", None), ("taint", None), ("evidence", None),
-        ("no_dedup", False), ("expiry_class", None), ("inject_until", None),
+        ("no_dedup", False),
         ("occurred_start", ""), ("occurred_end", ""), ("mentioned_at", ""),
     ),
     "update": (
         ("confidence", None), ("evidence", None), ("reason", None),
-        ("expiry_class", None), ("inject_until", None),
         ("expected_old_namespace", None), ("taint", None),
     ),
     "supersede": (("expected_namespace", None),),
     "invalidate": (("expected_namespace", None),),
 }
-_WRITE_REFUSED_TYPES = frozenset({"state", "event"})
+_WRITE_REFUSED_TYPES = frozenset({"event"})
 
 
 def is_remote_mode(env: Optional[dict[str, str]] = None) -> bool:
@@ -218,13 +219,45 @@ def _refuse_write_flags(cmd: str, args: Any) -> None:
             flag = dest.replace("_", "-")
             _refuse(
                 f"--{flag} is not supported in remote mode (ZMEM_REMOTE_URL "
-                f"is set); the queued-op route carries only content, type, "
-                f"tags, signal, source-ref and capture-mode semantics")
+                f"is set); the queued-op route carries only the fields this "
+                f"command's applier honors")
     if getattr(args, "type", None) in _WRITE_REFUSED_TYPES:
         _refuse(
             f"--type {args.type} is not supported in remote mode "
-            f"(ZMEM_REMOTE_URL is set); its expiry/occurrence semantics do "
+            f"(ZMEM_REMOTE_URL is set); its occurrence semantics do "
             f"not travel through the queued-op route")
+    # FB-4b: an update whose type is EXPLICITLY non-state can be refused up
+    # front (the writer would reject it at apply time; the action-time
+    # consult only covers an OMITTED type).
+    if (cmd == "update" and getattr(args, "type", None) is not None
+            and getattr(args, "type", None) != "state"
+            and (getattr(args, "expiry_class", None)
+                 or getattr(args, "inject_until", None))):
+        _refuse(
+            "--expiry-class/--inject-until require --type state or an "
+            "omitted --type (the target's type resolves at action time); "
+            "this update names a non-state type")
+    # FB-13: an inject_until that cannot parse is rejected up front rather
+    # than queued to fail at apply time.
+    if (cmd in ("add", "update")
+            and (getattr(args, "inject_until", None) or "").strip()):
+        try:
+            from storelib.state_expiry import validate_inject_until
+            validate_inject_until(str(args.inject_until).strip())
+        except ValueError as exc:
+            _refuse(f"--inject-until is not a valid UTC ISO-8601 instant: "
+                    f"{exc}")
+    if (cmd == "add" and getattr(args, "type", None) == "state"
+            and not (getattr(args, "expiry_class", None) or "").strip()):
+        # #326: the applier forwards the expiry pair now, so a state add
+        # CARRYING --expiry-class queues fine — but one without it would only
+        # convert this up-front refusal into a pending receipt that rejects
+        # at apply time (the writer unconditionally requires expiry_class
+        # for new state rows). Refuse up front, exactly like the T-09 rule.
+        _refuse(
+            "--type state in remote mode requires --expiry-class "
+            "(ZMEM_REMOTE_URL is set); a queued state add without expiry "
+            "metadata would be rejected at apply time")
 
 
 def _refuse_read_flags(cmd: str, args: Any) -> None:
@@ -273,6 +306,11 @@ def _enqueue_write(cmd: str, args: Any) -> None:
             "signal": args.signal,
             "capture_mode": _capture_mode(args),
         }
+        # #326: the expiry pair queues for updates (the applier forwards it).
+        if getattr(args, "expiry_class", None):
+            op_args["expiry_class"] = args.expiry_class
+        if getattr(args, "inject_until", None):
+            op_args["inject_until"] = args.inject_until
     elif cmd in ("supersede", "invalidate"):
         op_args = {"id": args.id, "reason": args.reason or ""}
     else:  # add
@@ -285,6 +323,12 @@ def _enqueue_write(cmd: str, args: Any) -> None:
             "source_ref": args.source_ref or "",
             "capture_mode": _capture_mode(args),
         }
+        # #326: a state add carries its expiry metadata (refused up front
+        # without --expiry-class; see _refuse_write_flags).
+        if getattr(args, "expiry_class", None):
+            op_args["expiry_class"] = args.expiry_class
+        if getattr(args, "inject_until", None):
+            op_args["inject_until"] = args.inject_until
     entry = opqueue.enqueue("local", cmd, op_args, env=dict(os.environ))
     queue_path = opqueue.queue_path("local", env=dict(os.environ))
     print(json.dumps({

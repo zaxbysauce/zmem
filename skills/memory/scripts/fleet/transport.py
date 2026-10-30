@@ -714,6 +714,8 @@ class McpHttp:
     def add(self, content: str, *, type_: str = "fact",
             namespace: str | None = None, signal: str = "none",
             source_ref: str = "", tags: str = "", taint: str = "untrusted_tool",
+            expiry_class: str | None = None,
+            inject_until: str | None = None,
             deadline_ms: int | None = None) -> dict[str, Any]:
         args: dict[str, Any] = {
             "content": content, "type": type_, "signal": signal,
@@ -722,6 +724,11 @@ class McpHttp:
         }
         if namespace is not None:
             args["namespace"] = namespace
+        # #326: state rows ride the hub with their expiry metadata.
+        if expiry_class is not None:
+            args["expiry_class"] = expiry_class
+        if inject_until is not None:
+            args["inject_until"] = inject_until
         return self._explicit_call("add", args, "empty-pool")
 
     def supersede(self, memory_id: str, reason: str = "",
@@ -736,6 +743,8 @@ class McpHttp:
                namespace: str | None = None, type_: str | None = None,
                tags: str | None = None, source_ref: str | None = None,
                signal: str | None = None, taint: str = "untrusted_tool",
+               expiry_class: str | None = None,
+               inject_until: str | None = None,
                deadline_ms: int | None = None) -> dict[str, Any]:
         args: dict[str, Any] = {
             "id": memory_id, "content": content, "taint": taint,
@@ -751,6 +760,12 @@ class McpHttp:
             args["source_ref"] = source_ref
         if signal is not None:
             args["signal"] = signal
+        # #326: expiry updates ride the hub (state targets resolve their
+        # effective type at apply time on the hub side).
+        if expiry_class is not None:
+            args["expiry_class"] = expiry_class
+        if inject_until is not None:
+            args["inject_until"] = inject_until
         return self._explicit_call("update", args, "empty-pool")
 
     def invalidate(self, memory_id: str, reason: str,

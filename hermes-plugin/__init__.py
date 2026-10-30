@@ -651,8 +651,15 @@ def _host():
 # enough that a stale local copy is safer than a hard failure here).
 _STORE_CONSTANTS = {
     "ALLOWED_SIGNALS": ("test", "compile", "lint", "reviewer", "user", "none"),
-    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference", "decision", "constraint"),
+    # #326: `state` joined the degraded enum when this surface gained the
+    # expiry params — loaded and degraded paths must agree (the F23
+    # split-brain guard). Deliberately the ADDABLE subset of
+    # schema_meta.ALLOWED_TYPES (minus entity_card/event), NOT a copy of it
+    # — test_namespace_schema pins this exact tuple.
+    "ALLOWED_TYPES": ("fact", "lesson", "convention", "preference", "decision", "constraint", "state"),
     "ALLOWED_TAINTS": ("trusted_internal", "untrusted_tool", "untrusted_web"),
+    # Degraded twin of schema_meta.STATE_EXPIRY_CLASSES (same byte rule).
+    "STATE_EXPIRY_CLASSES": ("endpoint", "setting", "metric"),
     "MAX_CONTENT_CHARS": 65536,
     # issue #87 / #85 direction 1: closed reason set for silent injects (the
     # session_start twin classifies with the SAME tuple the hook body uses).
@@ -710,6 +717,9 @@ def _store_constants() -> Dict[str, Any]:
             "INJECT_SILENT_REASONS": tuple(getattr(mod, "INJECT_SILENT_REASONS", _STORE_CONSTANTS["INJECT_SILENT_REASONS"])),
             "INJECT_REASON_INJECTED": getattr(mod, "INJECT_REASON_INJECTED", _STORE_CONSTANTS["INJECT_REASON_INJECTED"]),
             "INJECT_REASON_DISABLED": getattr(mod, "INJECT_REASON_DISABLED", _STORE_CONSTANTS["INJECT_REASON_DISABLED"]),
+            # #326: the expiry-class enum for the add/update expiry params
+            # (same fallback rule as every other constant above).
+            "STATE_EXPIRY_CLASSES": tuple(getattr(mod, "STATE_EXPIRY_CLASSES", _STORE_CONSTANTS["STATE_EXPIRY_CLASSES"])),
         }
     except Exception as exc:
         logger.debug("zmem: schema_meta constants load failed (%s); using defaults", exc)
@@ -1572,32 +1582,28 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
 # (no mid-process ZMEM_HOME change) the two are identical.
 _SCHEMA_CONSTANTS = _store_constants()
 # v15 (#173 PR-review F22): the advertised `type` enum must only list what this
-# surface can actually WRITE. The `state` type requires the mandatory
-# `--expiry-class`/`--inject-until` flags, which the hermes add tool does not
-# expose, so advertising `state` sells agents a write that always hard-fails
-# (`state memories require expiry_class`). Advertise only the writable types
-# until the expiry params are plumbed through (follow-up issue). The enum is
-# derived from the real ALLOWED_TYPES (minus `state`) rather than a fifth
-# hand-maintained literal, so a future type is advertised only if this surface
-# can write it; `_ADDABLE_TYPES` (below) is the runtime-write check twin.
-# `state` is excluded here (not read from schema_meta) because the degraded
-# fallback must stay usable when schema_meta is unreadable; the ratchet test
-# pins this set to schema_meta.ALLOWED_TYPES minus state.
-# ALL THREE exclusions in one chain, each for its own reason:
-#   `state`        — rides injection-expiry metadata this surface cannot set (#173)
+# surface can actually WRITE. `state` became writable here when the tool
+# gained the expiry params (#326): add requires expiry_class for it and
+# forwards both flags to store.py; update forwards them and lets the CLI's
+# action-time consult resolve the target's effective type (#317). The enum is
+# derived from the real ALLOWED_TYPES rather than a hand-maintained literal,
+# so a future type is advertised only if this surface can write it;
+# `_ADDABLE_TYPES` (below) is the runtime-write check twin.
+# TWO exclusions remain, each for its own reason:
 #   `entity_card`  — card-refresh-only, born only through the refresh path (#179)
 #   `event`        — needs occurrence endpoints this surface does not take (#178)
-# Taking either side of the rebase alone would have dropped the other's
-# exclusion. Loaded and degraded paths agree: the derivation below subtracts
-# all three from the real enum, and the degraded fallback literal already
-# stops at the six serviceable types, so the F23 split-brain guard holds.
-_STATE_TYPES = frozenset({"state", "event"})
+# Loaded and degraded paths agree: the derivation below subtracts both from
+# the real enum, and the degraded fallback literal carries `state` since
+# #326, so the F23 split-brain guard holds.
+_OCCURRENCE_TYPES = frozenset({"event"})
 _CARD_REFRESH_ONLY_TYPES = frozenset({"entity_card"})
 _ADDABLE_TYPES = tuple(
     t for t in _SCHEMA_CONSTANTS["ALLOWED_TYPES"]
-    if t not in _STATE_TYPES and t not in _CARD_REFRESH_ONLY_TYPES
+    if t not in _OCCURRENCE_TYPES and t not in _CARD_REFRESH_ONLY_TYPES
 )
 _ADD_TYPE_ENUM = list(_ADDABLE_TYPES)
+_ADD_EXPIRY_ENUM = list(_SCHEMA_CONSTANTS.get(
+    "STATE_EXPIRY_CLASSES", ("endpoint", "setting", "metric")))
 _ADD_SIGNAL_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_SIGNALS"])
 _ADD_TAINT_ENUM = list(_SCHEMA_CONSTANTS["ALLOWED_TAINTS"])
 
@@ -1648,6 +1654,19 @@ _ADD_SCHEMA: Dict[str, Any] = {
             "source_ref": {
                 "type": "string",
                 "description": "Provenance (e.g. session:<id>).",
+            },
+            "expiry_class": {
+                "type": "string",
+                "enum": _ADD_EXPIRY_ENUM,
+                "description": "Required for type=state: the expiry class "
+                               "(endpoint|setting|metric) governing this "
+                               "state memory's injection window (#326).",
+            },
+            "inject_until": {
+                "type": "string",
+                "description": "Optional for type=state: UTC ISO-8601 "
+                               "instant (e.g. 2027-01-01T00:00:00Z) after "
+                               "which passive injection stops.",
             },
         },
         "required": ["type", "content"],
@@ -1724,6 +1743,18 @@ _UPDATE_SCHEMA: Dict[str, Any] = {
                                "4.7). Default 'untrusted_tool'; the surviving "
                                "row keeps the WORST of this and the replaced "
                                "row's taint.",
+            },
+            "expiry_class": {
+                "type": "string",
+                "enum": _ADD_EXPIRY_ENUM,
+                "description": "Expiry class override for state targets "
+                               "(#326); with type omitted, the target's "
+                               "effective type resolves at apply time (#317).",
+            },
+            "inject_until": {
+                "type": "string",
+                "description": "UTC ISO-8601 instant override for state "
+                               "targets (e.g. 2027-01-01T00:00:00Z).",
             },
         },
         "required": ["id", "content"],
@@ -3910,10 +3941,10 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error("Missing required parameter: type")
         if not content:
             return _tool_error("Missing required parameter: content")
-        # v15 (#173 PR-review F22): runtime-write check twin of the advertised
-        # enum — `state` cannot be created here (no expiry params), so refuse
-        # it with the same shape as any unknown type instead of forwarding a
-        # guaranteed store-level failure.
+        # Runtime-write check twin of the advertised enum: refuse with the
+        # same shape as any unknown type. Since #326 `state` IS addable
+        # here (the tool takes expiry_class/inject_until); the exclusions
+        # that remain are event and entity_card (see _ADDABLE_TYPES).
         if mtype not in _ADDABLE_TYPES:
             return _tool_error(
                 "type must be one of: " + ", ".join(_ADDABLE_TYPES)
@@ -3953,13 +3984,27 @@ class ZmemMemoryProvider(MemoryProvider):
         source_ref = (args.get("source_ref") or "").strip()
         if not source_ref and self._session_id:
             source_ref = f"session:{self._session_id}"
+        # #326: state rows carry their expiry metadata through this surface.
+        # The class is validated at the boundary for a clean message; a state
+        # add without it is refused here (the store would refuse it anyway).
+        expiry_class = (str(args.get("expiry_class") or "")).strip()
+        inject_until = (str(args.get("inject_until") or "")).strip()
+        if expiry_class and expiry_class not in consts["STATE_EXPIRY_CLASSES"]:
+            return _tool_error(
+                "expiry_class must be one of: "
+                + ", ".join(consts["STATE_EXPIRY_CLASSES"])
+            )
+        if mtype == "state" and not expiry_class:
+            return _tool_error("type=state requires expiry_class")
         # Issue #289 (T-10): in MCP mode the write routes to the hub's add
         # tool through the provider transport — never a local store.py
         # subprocess (the hub stamps attribution and clamps taint itself).
         if self._remote_active():
             resp = self._transport.add(
                 content, type_=mtype, namespace=ns, signal=signal,
-                source_ref=source_ref, tags=tags, taint=taint)
+                source_ref=source_ref, tags=tags, taint=taint,
+                expiry_class=expiry_class or None,
+                inject_until=inject_until or None)
             return _transport_write_response(resp, ok_result="stored",
                                              action="Add")
         # PR-review PRR-L (issue #59 review round): Hermes writes are agent
@@ -3982,6 +4027,10 @@ class ZmemMemoryProvider(MemoryProvider):
             cli_args += ["--tags", tags]
         if source_ref:
             cli_args += ["--source-ref", source_ref]
+        if expiry_class:
+            cli_args += ["--expiry-class", expiry_class]
+        if inject_until:
+            cli_args += ["--inject-until", inject_until]
         # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
         # large-but-valid payloads never hit the Windows argv cap.
         input_text = None
@@ -4073,6 +4122,15 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error(
                 "taint must be one of: " + ", ".join(consts["ALLOWED_TAINTS"])
             )
+        # #326: expiry overrides ride the update (with type omitted, the
+        # target's effective type resolves at apply time — #317's consult).
+        expiry_class = (str(args.get("expiry_class") or "")).strip()
+        inject_until = (str(args.get("inject_until") or "")).strip()
+        if expiry_class and expiry_class not in consts["STATE_EXPIRY_CLASSES"]:
+            return _tool_error(
+                "expiry_class must be one of: "
+                + ", ".join(consts["STATE_EXPIRY_CLASSES"])
+            )
         # Issue #289 (T-10): MCP mode routes the update to the hub's update
         # tool (namespace-guarded, attribution-stamped server-side).
         if self._remote_active():
@@ -4080,10 +4138,16 @@ class ZmemMemoryProvider(MemoryProvider):
                 mid, content, namespace=ns_override or None,
                 type_=mtype or None, tags=tags or None,
                 source_ref=source_ref or None, signal=signal or None,
-                taint=taint)
+                taint=taint,
+                expiry_class=expiry_class or None,
+                inject_until=inject_until or None)
             return _transport_write_response(resp, ok_result="updated",
                                              action="Update")
         cli_args += ["--taint", taint]
+        if expiry_class:
+            cli_args += ["--expiry-class", expiry_class]
+        if inject_until:
+            cli_args += ["--inject-until", inject_until]
         # PR-review PRR-L: agent-surface update redacts secrets like MCP (#36
         # M4 parity). PR-review PRR-P: oversize content is piped via stdin.
         # v13 (issue #65, 10.8): --json for the structured write result.

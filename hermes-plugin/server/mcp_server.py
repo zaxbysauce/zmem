@@ -70,18 +70,23 @@ _MAX_QUERY_CHARS = 1000
 # Falls back to the historical literals if schema_meta can't be located.
 _MAX_CONTENT_CHARS = 65536
 _ALLOWED_SIGNALS = ("test", "compile", "lint", "reviewer", "user", "none")
-_ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint")
-# v15 (#173 PR-review F22): `add` may only create types this server can
-# express — `state` needs mandatory expiry params the tool does not take, so
-# it is advertised/validated against this serviceable subset. `update` keeps
-# the full set (content-only updates of pre-existing state rows inherit and
-# succeed). Fallback mirrors the six; the loader derives the subset from the
-# real ALLOWED_TYPES so the two can never silently diverge from schema_meta.
-# v18 (#178): `event` joins `state` in the non-addable set on this surface
-# (occurrence endpoints are add-time CLI/store parameters only) — the
-# #173 F22/F23 rule: advertise and write-validate only what the surface
-# can actually CREATE.
-_ALLOWED_TYPES_ADDABLE = ("fact", "lesson", "convention", "preference", "decision", "constraint")
+# #326: `state` joined BOTH sets when the add/update tools gained the expiry
+# params — loaded and degraded paths must agree (the F23 split-brain guard).
+# This degraded literal is the ADDABLE subset of schema_meta.ALLOWED_TYPES
+# (minus entity_card/event), NOT a copy of it; the loaded path overrides it
+# from schema_meta.
+_ALLOWED_TYPES = ("fact", "lesson", "convention", "preference", "decision", "constraint", "state")
+# `add` may only create types this server can express. With #326 the tool
+# takes expiry_class/inject_until, so `state` is serviceable again; the two
+# remaining non-addable types keep their own reasons: `entity_card` is
+# card-refresh-only (#179) and `event` needs occurrence endpoints this tool
+# does not take (#178) — the #173 F22/F23 rule: advertise and write-validate
+# only what the surface can actually CREATE. Fallback mirrors the loader
+# derivation so the two can never silently diverge from schema_meta.
+_ALLOWED_TYPES_ADDABLE = ("fact", "lesson", "convention", "preference", "decision", "constraint", "state")
+# #326: the expiry-class enum for the add/update expiry params (same
+# byte-identical fallback rule).
+_STATE_EXPIRY_CLASSES = ("endpoint", "setting", "metric")
 _ALLOWED_TAINTS = ("trusted_internal", "untrusted_tool", "untrusted_web")
 # Never invent a validator fallback. If the selected checkout cannot provide
 # the shared namespace validator, noncanonical namespaces fail closed.
@@ -494,7 +499,8 @@ def _load_store_constants() -> None:
     validator loading, matching the store.py subprocess it will execute.
     """
     global _MAX_CONTENT_CHARS, _ALLOWED_SIGNALS, _ALLOWED_TYPES, _ALLOWED_TAINTS
-    global _ALLOWED_TYPES_ADDABLE
+    global _ALLOWED_TYPES_ADDABLE, _STATE_EXPIRY_CLASSES
+
     global _NAMESPACE_VALIDATOR
     global _INJECT_LANES
     global _INJECT_SILENT_REASONS, _INJECT_REASON_INJECTED
@@ -533,21 +539,22 @@ def _load_store_constants() -> None:
         types = getattr(mod, "ALLOWED_TYPES", None)
         if types:
             _ALLOWED_TYPES = tuple(types)
-            # v15 (#173 PR-review F22): derive the addable subset from the
-            # real type set — anything this server cannot express as a create
-            # (today: `state`) stays out of the add surface's validation.
-            # BOTH non-addable types are excluded, each for its own reason.
-            # `state` rides injection-expiry metadata this surface cannot set.
-            # #179: `entity_card` is card-refresh-only (cards are born only
-            # through `entity-card build|refresh` and the cadence sweep).
-            # #178: `event` needs occurrence endpoints this tool does not
-            # take. Taking either side of the rebase alone would have deleted
-            # the other's exclusion, so the derivation subtracts BOTH and
-            # still matches the degraded fallback literal (the F23 split-brain
-            # guard). `update` keeps the full set, like the `state` precedent.
+            # v15 (#173 PR-review F22) / #326: derive the addable subset from
+            # the real type set — anything this server cannot express as a
+            # create stays out of the add surface's validation. With #326 the
+            # add tool takes expiry_class/inject_until, so `state` is
+            # serviceable and stays IN the set; the two exclusions keep their
+            # own reasons: `entity_card` is card-refresh-only (#179) and
+            # `event` needs occurrence endpoints this tool does not take
+            # (#178). The derivation subtracts BOTH and still matches the
+            # degraded fallback literal (the F23 split-brain guard). `update`
+            # keeps the full set.
             _ALLOWED_TYPES_ADDABLE = tuple(
                 t for t in types
-                if t not in ("state", "entity_card", "event"))
+                if t not in ("entity_card", "event"))
+        sec = getattr(mod, "STATE_EXPIRY_CLASSES", None)
+        if sec:
+            _STATE_EXPIRY_CLASSES = tuple(sec)
         taints = getattr(mod, "ALLOWED_TAINTS", None)
         if taints:
             _ALLOWED_TAINTS = tuple(taints)
@@ -2457,12 +2464,17 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         signal: str = "none",
         source_ref: Optional[str] = None,
         taint: str = "untrusted_tool",
+        expiry_class: Optional[str] = None,
+        inject_until: Optional[str] = None,
         client_protocol: object = None,
         deadline_ms: object = None,
     ) -> dict[str, Any]:
         """Capture a grounded memory to the shared store.
 
-        type: fact | lesson | convention | preference | decision | constraint.
+        type: fact | lesson | convention | preference | decision |
+        constraint | state. For type=state, expiry_class (endpoint|setting|
+        metric) is REQUIRED and governs the injection window; inject_until
+        (UTC ISO-8601) optionally bounds it (#326).
         signal: test | compile | lint | reviewer | user | none (how strongly
         grounded this is). taint: provenance/trust origin — default
         'untrusted_tool' (this agent's write is ungrounded self-opinion unless
@@ -2485,12 +2497,27 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         mtype = (type or "").strip()
         body = (content or "").strip()
         # v15 (#173 PR-review F22): creation is validated against the
-        # serviceable subset — `state` would otherwise pass this boundary and
-        # hard-fail in store.py (no expiry params on this tool).
+        # serviceable subset (#326: `state` is serviceable again — the tool
+        # carries its expiry params below).
         if mtype not in _ALLOWED_TYPES_ADDABLE:
             return _error(
                 "type must be one of: " + ", ".join(_ALLOWED_TYPES_ADDABLE)
             )
+        # #326: state rows carry their expiry metadata through this surface;
+        # the class is validated at the boundary for a clean message and a
+        # state add without it is refused here (the store would refuse it
+        # anyway).
+        expiry = (str(expiry_class).strip()
+                  if expiry_class is not None else "")
+        until = (str(inject_until).strip()
+                 if inject_until is not None else "")
+        if expiry and expiry not in _STATE_EXPIRY_CLASSES:
+            return _error(
+                "expiry_class must be one of: "
+                + ", ".join(_STATE_EXPIRY_CLASSES)
+            )
+        if mtype == "state" and not expiry:
+            return _error("type=state requires expiry_class")
         if not body:
             return _error("content is required")
         # Reject oversize content rather than silently truncating it — a silent
@@ -2571,6 +2598,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args += ["--tags", effective_tags]
         if source_ref:
             args += ["--source-ref", str(source_ref)]
+        # #326: forward the expiry pair (state rows).
+        if expiry:
+            args += ["--expiry-class", expiry]
+        if until:
+            args += ["--inject-until", until]
         # PR-review PRR-P: pipe oversize content via stdin (`--content -`) so
         # large-but-valid payloads never hit the Windows argv cap.
         input_text = None
@@ -2721,6 +2753,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         source_ref: Optional[str] = None,
         signal: Optional[str] = None,
         taint: str = "untrusted_tool",
+        expiry_class: Optional[str] = None,
+        inject_until: Optional[str] = None,
         client_protocol: object = None,
         deadline_ms: object = None,
     ) -> dict[str, Any]:
@@ -2729,7 +2763,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         Replaces the content of a LIVE memory with a NEW row, tombstones the
         old row (full history preserved), and links the new row back via
         update_of (lineage). Type/tags/source_ref/signal inherit from the old
-        row unless overridden here; confidence inherits. ``namespace`` is an
+        row unless overridden here; confidence inherits. ``expiry_class`` /
+        ``inject_until`` override a state target's expiry record (#326) —
+        with ``type`` omitted the target's effective type resolves at apply
+        time (#317's action-time consult), so a state row can be updated
+        without restating its type. ``namespace`` is an
         optional override that re-keys the replacement row to another
         namespace (issue #65, 10.3 — parity with the CLI ``update
         --namespace``; a scoped token must be allowed for the TARGET
@@ -2850,6 +2888,21 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     "type must be one of: " + ", ".join(_ALLOWED_TYPES)
                 )
             args += ["--type", mt]
+        # #326: expiry overrides ride the update; with type omitted the
+        # target's effective type resolves at apply time (#317).
+        expiry = (str(expiry_class).strip()
+                  if expiry_class is not None else "")
+        until = (str(inject_until).strip()
+                 if inject_until is not None else "")
+        if expiry and expiry not in _STATE_EXPIRY_CLASSES:
+            return _error(
+                "expiry_class must be one of: "
+                + ", ".join(_STATE_EXPIRY_CLASSES)
+            )
+        if expiry:
+            args += ["--expiry-class", expiry]
+        if until:
+            args += ["--inject-until", until]
         # Issue #281 AC3: in map mode an unscoped principal with an
         # inherited-tags update (tags=None) still needs the target row's
         # current tags to merge the server-side stamp onto (the scoped

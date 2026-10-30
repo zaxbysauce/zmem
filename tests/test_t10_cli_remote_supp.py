@@ -1628,11 +1628,69 @@ def test_hub_run_store_strips_remote_url_from_children():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+# -- pin 5 (#326) -------------------------------------------------------------
+
+def test_expiry_write_route_queues_state_add_with_metadata():
+    """#326: the remote write route carries the expiry pair. A state add WITH
+    --expiry-class queues (exit 0) with both fields in the op payload; an
+    update with expiry flags queues them too. A state add WITHOUT
+    --expiry-class keeps its up-front exit-2 refusal (the writer would only
+    reject the pending receipt at apply time) — pin 4's `add --type state`
+    case stays the refusal guard."""
+    tmp = _pinned_scratch("p5")
+    try:
+        env = _remote_subproc_env(tmp, _dead_port_url())
+        proc = _run_store_env(
+            env, "add", "--namespace", "user:global", "--type", "state",
+            "--content", "expiry queue probe: pool size is 8",
+            "--expiry-class", "setting",
+            "--inject-until", "2027-06-01T00:00:00Z")
+        assert proc.returncode == 0, (
+            f"remote state add with expiry metadata must queue, got "
+            f"{proc.returncode}; stderr={_tail(proc.stderr)!r}")
+        entries = _queue_entries(tmp)
+        assert len(entries) == 1, f"expected one queued op, got {len(entries)}"
+        args = entries[0].get("args") or {}
+        assert args.get("expiry_class") == "setting", args
+        assert args.get("inject_until") == "2027-06-01T00:00:00Z", args
+        assert args.get("type") == "state", args
+
+        some_id = str(uuid.uuid4())
+        proc = _run_store_env(
+            env, "update", "--id", some_id,
+            "--content", "replacement body for the expiry queue probe",
+            "--expiry-class", "metric")
+        assert proc.returncode == 0, (
+            f"remote update with expiry flags must queue, got "
+            f"{proc.returncode}; stderr={_tail(proc.stderr)!r}")
+        entries = _queue_entries(tmp)
+        assert len(entries) == 2, f"expected two queued ops, got {len(entries)}"
+        upd_args = entries[1].get("args") or {}
+        assert upd_args.get("expiry_class") == "metric", upd_args
+        assert not _store_exists(tmp), (
+            "the remote route must never open a local store")
+
+        # PRR-013: the state-add-without-expiry refusal message is pinned
+        # EXACTLY (pin 4's substring "state" would pass any wording).
+        proc = _run_store_env(
+            env, "add", "--namespace", "user:global", "--type", "state",
+            "--content", "expiry refusal probe: pool size is 9")
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        assert proc.returncode == 2, proc.returncode
+        assert ("--type state in remote mode requires --expiry-class"
+                in combined), _tail(combined)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 _ALL_TESTS = (
     test_hook_env_band_allow_local_commands_execute_under_zmem_data,
     test_config_error_names_store_data_and_remote_url,
     test_refuse_band_beyond_frozen_six_refuses_and_never_creates_store,
     test_write_flag_refusals_name_the_refused_flag,
+    test_expiry_write_route_queues_state_add_with_metadata,
     test_local_update_reason_empty_refusal_and_default_reason_survive,
     test_read_flag_refusals_and_positive_remote_search,
     test_remote_add_content_dash_reads_stdin_into_queued_op,

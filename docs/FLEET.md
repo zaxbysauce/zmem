@@ -460,13 +460,16 @@ subcommand into four bands — no split-brain local store on a remote box:
 - **ROUTE-WRITE** (`add`, `update`, `supersede`, `invalidate`): enqueue a
   T-09 typed op (`fleet/opqueue`, principal `local`) and print one JSON
   receipt line `{ok, op_id, op, status: pending, queue, result: queued}`;
-  never open a local store. The routed write carries ONLY the flags the
-  T-09 applier honors (`--namespace/--type/--content/--tags/--signal/
+  never open a local store. The routed write carries the flags the T-09
+  applier honors (`--namespace/--type/--content/--tags/--signal/
   --source-ref/--capture-mode` for add; `--id/--content` + the same
-  metadata set for update; `--id/--reason` for supersede/invalidate).
-  Everything else — `--confidence`, `--taint`, `--evidence`,
-  `--no-dedup`, expiry/occurrence flags, `--expected-namespace`,
-  `--type state|event` (whose expiry semantics do not travel) — is
+  metadata set for update; `--id/--reason` for supersede/invalidate) and,
+  since 0.129.0 (issue #326), `--expiry-class/--inject-until` on add and
+  update — a state add requires `--expiry-class`, and an update naming a
+  non-state type while carrying expiry flags is refused. Everything else
+  — `--confidence`, `--taint`, `--evidence`, `--no-dedup`,
+  occurrence flags, `--expected-namespace`, `--type event` (occurrence
+  semantics do not travel), and a state add without `--expiry-class` — is
   REFUSED with exit 2 naming the flag rather than silently dropped.
   `--content -` reads stdin before enqueue; capture-mode resolves the
   `ZMEM_CAPTURE_MODE` intent exactly like the local dispatch.

@@ -42,13 +42,16 @@ every `store.py` subcommand routes through the fleet backend — no local
 - **Writes** (`add`, `update`, `supersede`, `invalidate`) enqueue a durable
   op and print a receipt line `{"ok": true, "op_id": ..., "status":
   "pending", ...}` — the op flushes to the hub on the next read moment.
-  The routed write accepts only `--namespace --type --content --tags
-  --signal --source-ref --capture-mode` (add) / `--id --content` + the
-  same set (update) / `--id --reason` (supersede/invalidate); any other
-  flag — `--confidence`, `--taint`, `--evidence`, `--no-dedup`, expiry or
-  occurrence flags, `--type state|event` — exits 2 naming the flag (its
-  semantics do not travel through the queue). `--content -` still reads
-  stdin.
+  The routed write accepts `--namespace --type --content --tags --signal
+  --source-ref --capture-mode` and, since 0.129.0 (issue #326), the expiry
+  pair `--expiry-class --inject-until` on `add` and `update` (a state add
+  requires `--expiry-class`; an `update` may omit `--type` and the target's
+  type resolves when the hub applies the op — issue #317). Occurrence
+  flags (`--occurred-*`, `--mentioned-at`) and `--type event` still exit 2
+  naming the flag (occurrence semantics do not travel); so do
+  `--confidence --taint --evidence --no-dedup --reason`, an update that
+  names a non-state type while carrying expiry flags, and a state add
+  without `--expiry-class`. `--content -` still reads stdin.
 - **Reads** (`recall`, `search`, `recent`, `list`, `get`) always print the
   JSON envelope (with or without `--json`) plus a `[PENDING]` trailer for
   ops queued but not yet confirmed by the hub. Reads accept only the
@@ -1424,7 +1427,10 @@ and bypasses the TTL. The side table is INJECTION-ONLY: it records when a row
 should stop being injected, it never deletes the row or hides it from explicit
 `recall`/`search`. Passing either flag with a non-state type, or omitting
 `--expiry-class` on a state add, is refused exit 2. `update` carries the same
-two flags and the same rules.
+two flags and the same rules, and (issue #317) resolves the TARGET's
+effective type at action time: `--type` may be omitted on an update that
+carries the expiry flags — a state target accepts them, and a genuinely
+non-state target is refused by the writer with the same exit code.
 
 Since 0.98.0 (issue #174) the recorded expiry is ENFORCED on read: passive
 injection (`recall --for-injection`, `recent --for-injection`, the Hermes
