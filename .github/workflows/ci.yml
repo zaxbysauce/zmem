@@ -592,6 +592,12 @@ jobs:
       ZMEM_MODELS_CACHE: ${{ github.workspace }}/.models-cache
     steps:
       - uses: actions/checkout@v4
+        with:
+          # skills/memory/models/tokenizer.json is a Git LFS object; a plain
+          # checkout materializes the 131-byte pointer file instead of the
+          # 711,661-byte JSON, and tokenizers rejects the pointer with
+          # "expected value at line 1 column 1" (CI round 4 diagnosis).
+          lfs: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -633,37 +639,20 @@ jobs:
           # Fresh tokenizer every run: the production embedder requires
           # minilm.onnx AND tokenizer.json in the SAME dir, and a stale
           # tokenizer must never survive under the model-only cache key.
+          # The JSON-validity assertion fails LOUDLY on an LFS-pointer
+          # checkout instead of surfacing as MODEL_UNAVAILABLE downstream.
           cp skills/memory/models/tokenizer.json "$ZMEM_MODELS_CACHE/tokenizer.json"
-      - name: Diagnose embedder availability (temporary, issue #413 CI round 4)
-        shell: bash
-        env:
-          ZMEM_TEST_REAL_MODELS_DIR: ${{ env.ZMEM_MODELS_CACHE }}
-        run: |
-          set -e
-          python -X utf8 - <<'PY'
-          import os, sys, traceback
-          sys.path.insert(0, os.path.join(os.getcwd(), "skills", "memory", "scripts"))
-          os.environ["ZMEM_MODELS_DIR"] = os.environ["ZMEM_TEST_REAL_MODELS_DIR"]
-          import onnxruntime, tokenizers, numpy
-          print("versions: onnxruntime", onnxruntime.__version__,
-                "tokenizers", tokenizers.__version__, "numpy", numpy.__version__)
-          from pathlib import Path
-          md = Path(os.environ["ZMEM_MODELS_DIR"])
-          model_bytes = (md / "minilm.onnx").read_bytes()
-          print("model bytes:", len(model_bytes))
-          try:
-              sess = onnxruntime.InferenceSession(model_bytes)
-              print("InferenceSession OK:", sess.get_inputs()[0].name)
-          except Exception:
-              print("InferenceSession FAILED:")
-              traceback.print_exc()
-          try:
-              from tokenizers import Tokenizer
-              tok = Tokenizer.from_file(str(md / "tokenizer.json"))
-              print("Tokenizer.from_file OK:", type(tok).__name__)
-          except Exception:
-              print("Tokenizer.from_file FAILED:")
-              traceback.print_exc()
+          python - <<'PY'
+          import json, os, sys
+          p = os.path.join(os.environ["ZMEM_MODELS_CACHE"], "tokenizer.json")
+          with open(p, "rb") as f:
+              head = f.read(64)
+          if head.lstrip().startswith(b"version https://git-lfs"):
+              print("FATAL: tokenizer.json is an LFS pointer, not the JSON "
+                    "(checkout without LFS content?)", file=sys.stderr)
+              sys.exit(1)
+          json.load(open(p, encoding="utf-8"))
+          print("tokenizer.json verified: valid JSON,", os.path.getsize(p), "bytes")
           PY
       - name: Run the frozen #376 contract argvs (real model present)
         shell: bash
