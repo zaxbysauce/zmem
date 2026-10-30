@@ -40,6 +40,15 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Module-level scratch pin + the #244 isolation guard (the supp-file
+# pattern: pin BEFORE import so the guard is silent on a dev machine;
+# per-test subprocess envs are built separately in _child_env).
+_MOD_TMP = __import__("tempfile").mkdtemp(prefix="zmem-c3-mod-")
+__import__("os").environ["ZMEM_STORE"] = _MOD_TMP + "/store.sqlite"
+__import__("os").environ["ZMEM_MODELS_DIR"] = _MOD_TMP + "/no-models"
+__import__("os").environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+import _store_guard  # noqa: E402,F401  (issue #244 isolation guard)
 STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
 PYTHON = sys.executable
 FUTURE = "2099-01-01T00:00:00Z"
