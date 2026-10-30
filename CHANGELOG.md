@@ -4,6 +4,20 @@ All notable changes to the **zmem** plugin are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.132.0] - 2026-10-30
+
+### Fixed
+
+- **The apply-ops route enforces principal scope for every kind (#414).** The applier's principal rebuild now carries the map entry's `namespaces` allow-list (previously every map principal arrived unscoped, making the engine namespace gate a no-op on the CLI/MCP apply-ops route); an add with an omitted namespace by a scoped principal no longer lands in `user:global`; an update naming an explicit destination namespace outside the principal's scope is refused exactly as the dedicated update tool refuses it; and a non-empty `--principal` that resolves to nothing (unknown id, no map configured, or an entry that fails the map discipline) fails closed for EVERY kind, including add/capture.
+- **The hub `snapshot` payload carries `memory_expiry`; offline serve withholds expired state rows (#414).** The payload gains an additive `expiry` family (older consumers ignore it; the 64 MB accounting covers rows + revocations + expiry with the cap refusal re-checked after assembly), and the broker restores the shipped side records into the offline store — an expired state row is no longer injected offline through the missing-side-row-is-live window.
+- **Datasets round-trip `memory_expiry` (#414).** Export emits a fifth `memory_expiry` family; import restores records onto live state parents only (tombstoned and filtered-out parents never gain records — the #324 parent-outcome rule), dest-wins on conflict; held-back publication filters the family to surviving parents; exports produced before the family carry no file and still verify (absence tolerated, tampering still fails the snapshot hash).
+- **`update_memory` liveness is checked under the write lock (#416).** Two concurrent updates of one live row can no longer both commit: the second writer now refuses (exactly one live successor), and neither tombstone path re-tombstones already-tombstoned history or overwrites tombstone timestamps — `WHERE ... AND superseded_at IS NULL` predicates with rowcount backstops, rollback only when the function owns the transaction.
+
+### Changed
+
+- **deepseek-plugin `package.json`/`package-lock.json` declare the release version (#416).** The package surfaces are bumped in the same release commit as `plugin.json` and pinned by a parity driver so the drift cannot re-open silently.
+- **Evidence versions are bound together (#416).** `support_report_problems` gains an optional `expected_version` binding (mirroring the canary gate) and a new `evidence_version_problems` cross-check binds canary-report, support-report, and the release version; the standing t14 gate tolerates only agreement or the exactly-tracked known divergence while the committed support report awaits its dsh-host regeneration (the separate delivery issue #416 names — undisclosed drift fails, and the regeneration PR must retire the disclosure).
+
 
 ## [0.131.0] - 2026-10-30
 
