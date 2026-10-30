@@ -447,7 +447,7 @@ Hermes `_tool_search` — byte-identical; MCP `recall` unfolds for free).
 
 #### Confidence floors (issue #58, 3.8)
 
-Four distinct floors live on the recall path. Each reflects a different
+Five distinct floors live on the recall path. Each reflects a different
 surface's precision-vs-coverage tradeoff. They are env-overridable; the
 constants live in `schema_meta.py`.
 
@@ -1709,13 +1709,21 @@ the store first.
 
 | Profile | hf_id | dim | sha256 | Purpose |
 |---|---|---|---|---|
-| `minilm` | `Xenova/all-MiniLM-L6-v2` | 384 | `bbd7b466…46f0c5` (Xenova **ONNX export** blob) | Operator default; semantic recall/dedup |
+| `minilm` | `Xenova/all-MiniLM-L6-v2` | 384 | `bbd7b466…46f0c5` (original operator-box ONNX export; see notes) | Operator default; semantic recall/dedup |
 | `fake` | — | 16 | — (no files/network by design) | Model-absent tests/CI ONLY; deterministic placeholders; doctor warns on non-temporary stores |
 
 Notes:
-- The published pin covers the Xenova ONNX export (`onnx/model.onnx`), NOT the
-  sentence-transformers PyTorch weights — different builds of the same checkpoint
-  hash differently. `checksum_mismatch` therefore means "wrong build installed";
+- The published pin covers the ORIGINAL OPERATOR-BOX ONNX export of
+  all-MiniLM-L6-v2 — preserved byte-exact in this repo's Git LFS history at
+  commit `3240ea1a0cf3d972f6a7d472cee73abaddfc038d`
+  (`skills/memory/models/minilm.onnx`, 90,387,630 bytes) and served as the
+  immutable GitHub release asset `model-minilm-bbd7b466/minilm.onnx`. It is
+  NOT the public Xenova HF-repo export (`onnx/model.onnx`, oid
+  `759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e`,
+  90,387,606 bytes) and NOT the sentence-transformers PyTorch weights —
+  different builds of the same checkpoint hash differently.
+  `checksum_mismatch` therefore means "wrong build installed"; restore the
+  pinned bytes from the release asset (or point `ZMEM_MODEL_URL` at it);
   doctor prints this note verbatim. Verification has NO escape hatch:
   `ZMEM_MODEL_ALLOW_UNVERIFIED` does not exist and never will.
 - A third ONNX profile was evaluated and deliberately OMITTED per the release

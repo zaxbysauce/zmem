@@ -4104,7 +4104,8 @@ def _recommendations(checks: list[dict]) -> list[str]:
             notes.append(
                 "The installed minilm.onnx FAILED its checksum pin. "
                 + note
-                + " Restore the correct Xenova ONNX export (or point "
+                + " Restore the pinned bytes from the model-minilm-bbd7b466 "
+                "release asset (or point "
                 "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
                 "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
             )

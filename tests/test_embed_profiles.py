@@ -57,7 +57,9 @@ class RegistryShape(unittest.TestCase):
         self.assertTrue(m["sha256"], "pinned sha256 must be non-empty")
         self.assertEqual(
             m["sha256"], "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5",
-            "the pin is the Xenova ONNX export; changing it is a trust-root event",
+            "the pin is the operator-box ONNX export preserved at LFS commit "
+            "3240ea1a (see test_documented_note_states_true_provenance); "
+            "changing it is a trust-root event",
         )
 
     def test_fake_profile_self_describing(self):
@@ -75,6 +77,27 @@ class RegistryShape(unittest.TestCase):
     def test_documented_note_names_xenova_distinction(self):
         self.assertIn("ONNX", ep.MINILM_NOTES)
         self.assertIn("sentence-transformers", ep.MINILM_NOTES)
+
+    def test_documented_note_states_true_provenance(self):
+        # Issue #413 provenance contract (guardrail for the false "pin == the
+        # public Xenova export" claim that shipped on eight surfaces): the
+        # notes must name the TRUE byte source (operator-box export, LFS
+        # commit, release asset) and distinguish the public Xenova export by
+        # its full oid. Renaming either identifier, or reverting the notes to
+        # the false "Published sha256 is of the Xenova export" wording, fails.
+        self.assertIn(
+            "3240ea1a0cf3d972f6a7d472cee73abaddfc038d", ep.MINILM_NOTES,
+            "MINILM_NOTES must name the LFS commit preserving the pinned bytes")
+        self.assertIn(
+            "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e",
+            ep.MINILM_NOTES,
+            "MINILM_NOTES must name the public Xenova export oid as a DIFFERENT build")
+        self.assertIn("model-minilm-bbd7b466", ep.MINILM_NOTES,
+                      "MINILM_NOTES must point operators at the release asset")
+        self.assertNotIn(
+            "Published sha256 is of the Xenova/all-MiniLM-L6-v2 ONNX export",
+            ep.MINILM_NOTES,
+            "the false pre-#413 provenance wording must not return")
 
 
 class ProfileResolution(unittest.TestCase):

@@ -37,11 +37,19 @@ from schema_meta import normalize_content
 PROFILE_ENV = "ZMEM_EMBED_PROFILE"
 DEFAULT_PROFILE = "minilm"
 
-# The trust root for the default profile: sha256 of the Xenova ONNX export
-# blob bundled/downloaded as minilm.onnx. This pins the Xenova ONNX FILE, NOT
-# the sentence-transformers PyTorch weights — different exports of the same
-# checkpoint hash differently by design. Mismatch therefore usually means "the
-# wrong build got installed", never "disable verification".
+# The trust root for the default profile: sha256 of the original operator-box
+# ONNX export of all-MiniLM-L6-v2, bundled/downloaded as minilm.onnx. Those
+# bytes are preserved byte-exact in this repository's Git LFS history at commit
+# 3240ea1a0cf3d972f6a7d472cee73abaddfc038d (skills/memory/models/minilm.onnx,
+# 90,387,630 bytes) and served as the immutable GitHub release asset
+# `model-minilm-bbd7b466/minilm.onnx`. They are NOT the public Xenova
+# HF-repo export (onnx/model.onnx oid
+# 759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e,
+# 90,387,606 bytes) — same checkpoint, different builds, different bytes; this
+# pins an ONNX FILE, not the sentence-transformers PyTorch weights, and
+# different exports of the same checkpoint hash differently by design.
+# Mismatch therefore usually means "the wrong build got installed", never
+# "disable verification".
 # `ZMEM_MODEL_ALLOW_UNVERIFIED` does not exist and must not be added; there is
 # deliberately also no env override for this constant itself (removed in #42's
 # hardening round) so attacker-writable environment can never lower the trust
@@ -49,11 +57,17 @@ DEFAULT_PROFILE = "minilm"
 MINILM_SHA256 = "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5"
 
 MINILM_NOTES = (
-    "Published sha256 is of the Xenova/all-MiniLM-L6-v2 ONNX export "
-    "(onnx/model.onnx), not the sentence-transformers PyTorch weights — "
-    "the two builds are NOT byte-identical. A checksum_mismatch almost always "
-    "means the wrong build was placed/downloaded; replace it with the Xenova "
-    "ONNX export rather than disabling verification."
+    "Published sha256 is of the original operator-box ONNX export of "
+    "all-MiniLM-L6-v2 (preserved in this repo's LFS history at "
+    "3240ea1a0cf3d972f6a7d472cee73abaddfc038d and served as the "
+    "model-minilm-bbd7b466 release asset), not the public Xenova "
+ "onnx/model.onnx export (oid "
+    "759c3cd2b7fe7e93933ad23c4c9181b7396442a2ed746ec7c1d46192c469c46e) and "
+    "not the sentence-transformers PyTorch weights — the builds are NOT "
+    "byte-identical. A checksum_mismatch almost always means the wrong build "
+    "was placed/downloaded; restore the pinned bytes from the "
+    "model-minilm-bbd7b466 release asset (or point ZMEM_MODEL_URL at it) "
+    "rather than disabling verification."
 )
 
 FAKE_DIM = 16
