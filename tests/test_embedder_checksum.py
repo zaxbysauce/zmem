@@ -79,23 +79,32 @@ class ChecksumSemantics(unittest.TestCase):
 def _provision(models_dir: Path, onnx_bytes: bytes, sha_pin: str):
     models_dir.mkdir(parents=True, exist_ok=True)
     (models_dir / "minilm.onnx").write_bytes(onnx_bytes)
-    (models_dir / "tokenizer.json").write_text("[]")  # deliberately broken
+    tok_bytes = b"[]"  # deliberately broken for the load stage
+    (models_dir / "tokenizer.json").write_bytes(tok_bytes)
     import importlib
 
     saved = embeddings._MODEL_SHA256
+    saved_tok = embeddings._TOKENIZER_SHA256
     embeddings._MODEL_SHA256 = sha_pin
-    # Full lazy-global reset — these five survive across tests otherwise.
+    # #418: the tokenizer pin is verified BEFORE construction now — patch it
+    # to whatever bytes we wrote so the pre-existing tests exercise the LOAD
+    # stage exactly as they did before the tokenizer gate existed.
+    embeddings._TOKENIZER_SHA256 = _sha(tok_bytes)
+    # Full lazy-global reset — these survive across tests otherwise.
     embeddings._model_available = None
     embeddings._model_checksum_ok = None
     embeddings._model_load_failed = False
+    embeddings._checksum_failed_artifact = None
     embeddings._session = None
     embeddings._tokenizer = None
 
     def restore():
         embeddings._MODEL_SHA256 = saved
+        embeddings._TOKENIZER_SHA256 = saved_tok
         embeddings._model_available = None
         embeddings._model_checksum_ok = None
         embeddings._model_load_failed = False
+        embeddings._checksum_failed_artifact = None
         embeddings._session = None
         embeddings._tokenizer = None
     return restore
@@ -292,6 +301,184 @@ class TamperedModelRefusalDeplessDoctorBranch(TamperedModelRefusal):
         # class covers the dep-less branch as pure logic above.
         raise unittest.SkipTest("dep-less mapping covered by "
                                 "test_depless_mapping_is_pure_and_ci_faithful")
+
+
+class TamperedTokenizerRefusal(unittest.TestCase):
+    """#418 AC1: the minilm tokenizer is digest-pinned on the LOAD path from
+    the same buffer the Tokenizer is constructed from. A tampered
+    tokenizer.json refuses (fail-open degraded) with the artifact named for
+    doctor; matching bytes construct via from_buffer, never from_file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-tokpin-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        env_names = ("ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+                     ep.PROFILE_ENV)
+        self._saved = {n: os.environ.get(n) for n in env_names}
+        os.environ["ZMEM_MODELS_DIR"] = str(self.tmp / "models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop(ep.PROFILE_ENV, None)
+        self.addCleanup(self._restore_env)
+        import types
+
+        good_model = b"CORRECT-MODEL-BYTES"
+
+        class _StubTokenizer:
+            constructed_from: list = []
+
+            @classmethod
+            def from_file(cls, *_a, **_k):
+                cls.constructed_from.append("from_file")
+                return cls()
+
+            @classmethod
+            def from_buffer(cls, _b):
+                cls.constructed_from.append("from_buffer")
+                return cls()
+
+            def enable_padding(self, length=128):
+                pass
+
+            def enable_truncation(self, max_length=128):
+                pass
+
+        class _FakeSession:
+            def __init__(self, model_bytes):
+                assert isinstance(model_bytes, (bytes, bytearray))
+
+        fake_np = types.ModuleType("numpy")
+        fake_ort = types.ModuleType("onnxruntime")
+        fake_ort.InferenceSession = _FakeSession
+        fake_tok_mod = types.ModuleType("tokenizers")
+        fake_tok_mod.Tokenizer = _StubTokenizer
+        self._StubTokenizer = _StubTokenizer
+        self._modules_backup = {k: sys.modules.get(k)
+                                for k in ("onnxruntime", "tokenizers",
+                                          "numpy")}
+        sys.modules["onnxruntime"] = fake_ort
+        sys.modules["tokenizers"] = fake_tok_mod
+        sys.modules["numpy"] = fake_np
+        self.addCleanup(self._restore_modules)
+
+        # Model pin matches its bytes so the flow reaches the tokenizer gate.
+        models = self.tmp / "models"
+        models.mkdir(parents=True, exist_ok=True)
+        (models / "minilm.onnx").write_bytes(good_model)
+        saved_model = embeddings._MODEL_SHA256
+        saved_tok = embeddings._TOKENIZER_SHA256
+        embeddings._MODEL_SHA256 = _sha(good_model)
+        # Sub-tests overwrite the tokenizer file + pin.
+        embeddings._model_available = None
+        embeddings._model_checksum_ok = None
+        embeddings._model_load_failed = False
+        embeddings._checksum_failed_artifact = None
+        embeddings._session = None
+        embeddings._tokenizer = None
+
+        def restore():
+            embeddings._MODEL_SHA256 = saved_model
+            embeddings._TOKENIZER_SHA256 = saved_tok
+            embeddings._model_available = None
+            embeddings._model_checksum_ok = None
+            embeddings._model_load_failed = False
+            embeddings._checksum_failed_artifact = None
+            embeddings._session = None
+            embeddings._tokenizer = None
+
+        self.addCleanup(restore)
+
+    def _restore_modules(self):
+        for k, v in self._modules_backup.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    def _restore_env(self):
+        for n, v in self._saved.items():
+            if v is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = v
+
+    def _write_tokenizer(self, payload: bytes, pin: str):
+        (self.tmp / "models" / "tokenizer.json").write_bytes(payload)
+        embeddings._TOKENIZER_SHA256 = pin
+        embeddings._model_available = None
+        embeddings._model_checksum_ok = None
+        embeddings._model_load_failed = False
+        embeddings._checksum_failed_artifact = None
+        embeddings._session = None
+        embeddings._tokenizer = None
+        self._StubTokenizer.constructed_from = []
+
+    def test_tampered_tokenizer_refuses_fail_open(self):
+        payload = b"WRONG-TOKENIZER-BYTES"
+        self._write_tokenizer(payload, _sha(b"different-canonical-bytes"))
+        embeddings._ensure_loaded()
+        st = embeddings.availability_status()
+        self.assertIsNone(embeddings._session)  # never constructed
+        self.assertFalse(st["available"])
+        self.assertEqual(st["reason"], "model_checksum_mismatch")
+        self.assertIs(st["checksum_ok"], False)
+        # #418: the mismatching artifact is named — doctor text picks the
+        # tokenizer remediation, never blaming minilm.onnx.
+        self.assertEqual(st["checksum_artifact"], "tokenizer")
+        self.assertEqual(self._StubTokenizer.constructed_from, [])
+        self.assertIsNone(embeddings.embed_text("anything"))
+
+    def test_matching_tokenizer_constructs_from_buffer(self):
+        payload = b"CORRECT-TOKENIZER-BYTES"
+        self._write_tokenizer(payload, _sha(payload))
+        embeddings._ensure_loaded()
+        st = embeddings.availability_status()
+        self.assertEqual(st["reason"], "ok")
+        self.assertEqual(st["checksum_ok"], True)
+        self.assertEqual(self._StubTokenizer.constructed_from, ["from_buffer"])
+        self.assertIsNotNone(embeddings._tokenizer)
+
+
+class DoctorArtifactAccurateRecommendations(unittest.TestCase):
+    """#418: the model_checksum_mismatch remediation names the artifact that
+    actually mismatched (checksum_artifact); absent checksum_artifact —
+    doctor's own synthesized probe status — keeps the minilm.onnx wording."""
+
+    def _recs(self, artifact):
+        import doctor  # noqa: E402
+
+        details = {
+            "available": False,
+            "reason": "model_checksum_mismatch",
+            "checksum_ok": False,
+            "note": "note-text",
+        }
+        if artifact is not None:
+            details["checksum_artifact"] = artifact
+        checks = [{
+            "id": "embeddings",
+            "status": "warn",  # the embeddings remediation notes gate on warn
+            "summary": "s",
+            "details": details,
+        }]
+        return "\n".join(doctor._recommendations(checks))
+
+    def test_tokenizer_mismatch_names_tokenizer(self):
+        recs = self._recs("tokenizer")
+        self.assertIn("tokenizer.json FAILED its SHA-256 pin", recs)
+        self.assertNotIn("minilm.onnx FAILED", recs)
+        self.assertIn("git lfs checkout", recs)
+
+    def test_model_mismatch_keeps_model_wording(self):
+        recs = self._recs("model")
+        self.assertIn("minilm.onnx FAILED its checksum pin", recs)
+        self.assertNotIn("tokenizer.json FAILED", recs)
+
+    def test_absent_artifact_defaults_to_model_wording(self):
+        # doctor's separately synthesized probe status (doctor.py ~:938-944)
+        # sets no checksum_artifact — the pre-#418 sentence remains.
+        recs = self._recs(None)
+        self.assertIn("minilm.onnx FAILED its checksum pin", recs)
+        self.assertNotIn("tokenizer.json FAILED", recs)
 
 
 if __name__ == "__main__":

@@ -592,6 +592,13 @@ class CrossEncoderProfileAndBudgetTests(unittest.TestCase):
             PROFILE_SHA256,
             f"profile digest must be the exact lowercase pin, got {digest}",
         )
+        # #418: the tokenizer half of the pair ships its own pin — the
+        # fixture-pair artifact digest (shape + value asserted here; the
+        # import-time registry validator is the recurrence guardrail).
+        tok_digest = entry.get("tokenizer_sha256")
+        self.assertIsInstance(tok_digest, str)
+        self.assertEqual(len(tok_digest), 64)
+        self.assertEqual(tok_digest, TOKENIZER_SHA256)
         self.assertEqual(entry["model_file"], "mini_pair_scorer.onnx")
         self.assertEqual(entry["tokenizer_file"], "tokenizer.json")
         self.assertEqual(entry["url"], "")
@@ -710,8 +717,16 @@ class CrossEncoderProfileAndBudgetTests(unittest.TestCase):
         fake_tok = types.ModuleType("tokenizers")
 
         class _FakeTok:
+            constructed_from: list[str] = []
+
             @staticmethod
             def from_file(_path):
+                _FakeTok.constructed_from.append("from_file")
+                return _FakeTok()
+
+            @staticmethod
+            def from_buffer(_b):
+                _FakeTok.constructed_from.append("from_buffer")
                 return _FakeTok()
 
             def enable_padding(self, **_k):
@@ -738,12 +753,170 @@ class CrossEncoderProfileAndBudgetTests(unittest.TestCase):
             self.assertEqual(
                 _FakeSession.instances, 0, "session constructed despite digest mismatch"
             )
-            # Gate (simulated) absent: the same file WOULD load — proving
-            # the refusal above came from the digest gate.
+            self.assertEqual(ce._last_load_failure, "load-error")
+            # #418 (plan-critic F-1 migration): the OLD second arm patched
+            # verify_profile_file to True and REQUIRED the mismatched model
+            # to load — pinning the verify-then-reopen window this PR
+            # closes. The buffer-level gate must STILL refuse wrong-digest
+            # bytes even when the path-level verifier vouches.
             with mock.patch.object(profiles, "verify_profile_file", return_value=True):
-                self.assertIsNotNone(ce._local_scorer())
-                self.assertGreaterEqual(_FakeSession.instances, 1)
+                self.assertIsNone(ce._local_scorer())
+                self.assertEqual(_FakeSession.instances, 0)
+                self.assertEqual(ce._last_load_failure, "load-error")
         ce.set_scorer(None)
+
+    def test_profile_path_builds_when_both_pins_match(self):
+        # #418 positive guard: with BOTH profile pins patched to the on-disk
+        # bytes' digests, the profile leg builds the scorer from the VERIFIED
+        # buffers — tokenizer via from_buffer (never from_file) and the
+        # session receiving exactly the pinned model buffer.
+        import types
+        from unittest import mock
+        import cross_encoder_profiles as profiles
+        from storelib import cross_encoder as ce
+
+        model_bytes = b"pair-fixture-bytes-418"
+        tok_bytes = b'{"tokenizer": "pair-fixture"}'
+        models_dir = Path(os.environ["ZMEM_MODELS_DIR"])
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "mini_pair_scorer.onnx").write_bytes(model_bytes)
+        (models_dir / "tokenizer.json").write_bytes(tok_bytes)
+
+        fake_ort = types.ModuleType("onnxruntime")
+
+        class _FakeSession:
+            instances = 0
+            last_model_bytes = None
+
+            def __init__(self, model_bytes):
+                _FakeSession.instances += 1
+                _FakeSession.last_model_bytes = model_bytes
+
+            def run(self, _names, _feeds):
+                return [[[0.0]]]
+
+        fake_ort.InferenceSession = _FakeSession
+        fake_tok = types.ModuleType("tokenizers")
+
+        class _FakeTok:
+            constructed_from: list[str] = []
+            last_buffer = None
+
+            @staticmethod
+            def from_file(_path):
+                _FakeTok.constructed_from.append("from_file")
+                return _FakeTok()
+
+            @staticmethod
+            def from_buffer(buf):
+                _FakeTok.constructed_from.append("from_buffer")
+                _FakeTok.last_buffer = buf
+                return _FakeTok()
+
+            def enable_padding(self, **_k):
+                pass
+
+            def enable_truncation(self, **_k):
+                pass
+
+            def encode(self, _q, _t):
+                class _Enc:
+                    ids = [1]
+                    attention_mask = [1]
+
+                return _Enc()
+
+        fake_tok.Tokenizer = _FakeTok
+        entry = profiles.PROFILES[profiles.DEFAULT_PROFILE]
+        saved = (entry["sha256"], entry.get("tokenizer_sha256"))
+        ce.set_scorer(None)
+        _FakeSession.instances = 0
+        try:
+            entry["sha256"] = hashlib.sha256(model_bytes).hexdigest()
+            entry["tokenizer_sha256"] = hashlib.sha256(tok_bytes).hexdigest()
+            with mock.patch.dict(
+                sys.modules, {"onnxruntime": fake_ort, "tokenizers": fake_tok}
+            ):
+                scorer = ce._local_scorer()
+                self.assertIsNotNone(scorer)
+                self.assertGreaterEqual(_FakeSession.instances, 1)
+                self.assertEqual(_FakeSession.last_model_bytes, model_bytes)
+                self.assertIn("from_buffer", _FakeTok.constructed_from)
+                self.assertNotIn("from_file", _FakeTok.constructed_from)
+                self.assertEqual(_FakeTok.last_buffer, tok_bytes)
+                self.assertIsNone(ce._last_load_failure)
+        finally:
+            entry["sha256"], entry["tokenizer_sha256"] = saved
+            ce.set_scorer(None)
+
+    def test_profile_path_refuses_tokenizer_digest_mismatch(self):
+        # #418: the tokenizer half of the pair is pinned too — model bytes
+        # matching their pin with a TAMPERED tokenizer refuses closed with
+        # the same terminal reason (load-error), never building a session.
+        import types
+        from unittest import mock
+        import cross_encoder_profiles as profiles
+        from storelib import cross_encoder as ce
+
+        model_bytes = b"pair-fixture-bytes-418"
+        models_dir = Path(os.environ["ZMEM_MODELS_DIR"])
+        models_dir.mkdir(parents=True, exist_ok=True)
+        (models_dir / "mini_pair_scorer.onnx").write_bytes(model_bytes)
+        (models_dir / "tokenizer.json").write_bytes(b"tampered-tokenizer-bytes")
+
+        fake_ort = types.ModuleType("onnxruntime")
+
+        class _FakeSession:
+            instances = 0
+
+            def __init__(self, model_bytes):
+                _FakeSession.instances += 1
+
+            def run(self, _names, _feeds):
+                return [[[0.0]]]
+
+        fake_ort.InferenceSession = _FakeSession
+        fake_tok = types.ModuleType("tokenizers")
+
+        class _FakeTok:
+            @staticmethod
+            def from_file(_path):
+                return _FakeTok()
+
+            @staticmethod
+            def from_buffer(_b):
+                return _FakeTok()
+
+            def enable_padding(self, **_k):
+                pass
+
+            def enable_truncation(self, **_k):
+                pass
+
+            def encode(self, _q, _t):
+                class _Enc:
+                    ids = [1]
+                    attention_mask = [1]
+
+                return _Enc()
+
+        fake_tok.Tokenizer = _FakeTok
+        entry = profiles.PROFILES[profiles.DEFAULT_PROFILE]
+        saved = (entry["sha256"], entry.get("tokenizer_sha256"))
+        ce.set_scorer(None)
+        _FakeSession.instances = 0
+        try:
+            entry["sha256"] = hashlib.sha256(model_bytes).hexdigest()
+            entry["tokenizer_sha256"] = hashlib.sha256(b"canonical-tok").hexdigest()
+            with mock.patch.dict(
+                sys.modules, {"onnxruntime": fake_ort, "tokenizers": fake_tok}
+            ):
+                self.assertIsNone(ce._local_scorer())
+                self.assertEqual(_FakeSession.instances, 0)
+                self.assertEqual(ce._last_load_failure, "load-error")
+        finally:
+            entry["sha256"], entry["tokenizer_sha256"] = saved
+            ce.set_scorer(None)
 
     def test_checksum_mismatch_fails_open(self):
         import cross_encoder_profiles as profiles

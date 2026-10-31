@@ -408,19 +408,23 @@ class LoadPathChecksumTests(unittest.TestCase):
         d = Path(self.tmp) / "corrupttok"
         d.mkdir()
         fake_model = b"not a real onnx model " * 50
+        tok_bytes = b"{}"  # present so _check_available passes
         (d / "minilm.onnx").write_bytes(fake_model)
-        (d / "tokenizer.json").write_bytes(b"{}")  # present so _check_available passes
+        (d / "tokenizer.json").write_bytes(tok_bytes)
         fake_sha = embeddings._sha256_file(d / "minilm.onnx")
+        fake_tok_sha = embeddings._sha256_file(d / "tokenizer.json")
         env = {**os.environ, "ZMEM_MODELS_DIR": str(d),
                "ZMEM_MODEL_AUTODOWNLOAD": "0"}
-        # Patch _MODEL_SHA256 so the checksum gate PASSES on the fake model —
-        # forcing execution to reach the InferenceSession load (which fails).
+        # Patch _MODEL_SHA256 (and, since #418, _TOKENIZER_SHA256) so BOTH
+        # checksum gates PASS on the fake bytes — forcing execution to reach
+        # the InferenceSession load (which fails).
         script = (
             "import sys\n"
             f"sys.path.insert(0, {str(SCRIPTS_DIR)!r})\n"
             "import embeddings\n"
             "import onnxruntime  # present so _check_available passes the import gate\n"
             f"embeddings._MODEL_SHA256 = {fake_sha!r}\n"  # checksum gate now passes
+            f"embeddings._TOKENIZER_SHA256 = {fake_tok_sha!r}\n"  # #418 tokenizer gate passes
             "embeddings._ensure_loaded()\n"
             "print('raised= False')\n"
             "print('session=', embeddings._session)\n"
