@@ -75,26 +75,46 @@ def _version_problems(problems) -> list:
 class DeepseekEvidenceVersionParityTest(unittest.TestCase):
     """The harness reports evidence version divergence."""
 
-    def test_leg1_live_divergence_detected(self):
+    def test_leg1_live_agreement_and_detection(self):
+        """Post-#420 regeneration shape (CHECK_WRONG amendment): the LIVE
+        committed artifacts agree with the release — the 0.133.0
+        regeneration closed the disclosed support-report lag, so the
+        standing contract is agreement with NO tolerance, and the
+        detection legs run against a synthetically drifted copy of the
+        LIVE support report (the original leg-1 premise — a committed live
+        divergence — was the #416 disclosure itself, retired with it)."""
         canary = _load(_EVIDENCE / "canary-report.json")
         support = _load(_EVIDENCE / "support-report.json")
         release = _load(REPO_ROOT / "release-manifest.json")["version"]
-        # (i) the expected_version kwarg — TypeError at base (nothing caught)
+        # (0) the standing post-regeneration contract: live agreement.
+        self.assertEqual(
+            da.evidence_version_problems(canary, support, release), [],
+            "the live evidence reports must agree with the release "
+            "(the #420 regeneration closed the disclosed lag; no "
+            "tolerance is tolerated)")
+        self.assertEqual(
+            da.support_report_problems(support, expected_version=release),
+            [],
+            "the live support report must validate against the release "
+            "version with no problems")
+        # (i) the expected_version kwarg fires on a drifted COPY.
+        drifted_support = dict(support, zmem_version="0.0.0-drifted")
         kwarg_problems = da.support_report_problems(
-            support, expected_version=release)
+            drifted_support, expected_version=release)
         self.assertTrue(
             _version_problems(kwarg_problems),
             "support_report_problems(expected_version=...) reported no "
             f"zmem_version problem for support-report zmem_version="
-            f"{support.get('zmem_version')!r} vs release {release!r}: "
-            f"{kwarg_problems}")
-        # (ii) the cross-check binding — AttributeError at base
-        divergences = da.evidence_version_problems(canary, support, release)
+            f"{drifted_support.get('zmem_version')!r} vs release "
+            f"{release!r}: {kwarg_problems}")
+        # (ii) the cross-check binding fires on the same drifted copy.
+        divergences = da.evidence_version_problems(
+            canary, drifted_support, release)
         self.assertTrue(
             divergences,
             "evidence_version_problems reported nothing for canary="
             f"{canary.get('zmem_version')!r} support="
-            f"{support.get('zmem_version')!r} release={release!r}")
+            f"{drifted_support.get('zmem_version')!r} release={release!r}")
         joined = " ".join(str(d) for d in divergences)
         self.assertTrue(
             "version" in joined.lower(),

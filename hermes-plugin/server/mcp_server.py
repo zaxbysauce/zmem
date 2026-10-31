@@ -3568,11 +3568,36 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         args = ["apply-ops", "--in", "-", "--json"]
         if cli_principal:
             args += ["--principal", cli_principal]
+        elif principal_map is None and getattr(resolved, "scoped", False):
+            # Issue #420 (scope passthrough): a SCOPED legacy single-token
+            # caller (no map entry the engine could resolve --principal
+            # against) gets its allow-list forwarded directly, so the
+            # engine's in-transaction enforcement covers by-id mutation
+            # targets (id_or_dep-first, the engine's own resolution) and
+            # update destination rekeys — the same enforcement map-mode
+            # principals get, closing the disclosed by-id residual. The
+            # hub-side pre-guard above still fast-refuses declared and
+            # omitted op namespaces.
+            args += ["--namespace-scope",
+                     ",".join(sorted(resolved.namespaces))]
         result = await _run_store_async(
             args, input_text=input_text, deadline=deadline, pool="write")
+        # Issue #420 (deadline choke point): apply_ops' failure returns
+        # previously emitted literal store_failure envelopes without
+        # consulting the deadline markers, so a deadline-killed write —
+        # possibly partially committed — collapsed into a clean-looking
+        # failure and broke the op-queue's unknown-outcome receipt
+        # contract (fleet/opqueue.py per-chunk receipts). Route both
+        # failure sites through the same choke every sibling tool uses.
         if not isinstance(result, dict):
+            if isinstance(result, str) and result == _ERROR_DEADLINE_EXCEEDED:
+                return _store_failure({"ok": False,
+                                       "error": _ERROR_DEADLINE_EXCEEDED})
             return {"ok": False, "error": "store_failure",
                     "detail": str(result)[:200]}
+        if (result.get("error") == _ERROR_DEADLINE_EXCEEDED
+                or result.get("deadline_exceeded")):
+            return _store_failure(result)
         # The store layer prints the receipt envelope on stdout; the async
         # wrapper returns the parsed stdout when --json is present.
         receipts = result.get("receipts")

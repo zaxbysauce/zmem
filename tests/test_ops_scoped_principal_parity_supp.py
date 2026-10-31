@@ -17,6 +17,19 @@ Every leg drives the REAL ``principal_lookup_from_env`` (temp
 - (f) GREEN CONTROL: a scoped principal's EXPLICIT in-scope add commits
   inside ``project:allowed``.
 
+Issue #420 supplement (frozen C11 parity) — LEGACY single-token mode's
+target-scope class: a SCOPED legacy identity (the ``--namespace-scope``
+passthrough the hub forwards for single-token callers the engine has no
+map entry for — cli.py builds exactly this ``LegacyPrincipal`` with
+``scoped=True`` + an allow-list) must get the SAME in-transaction
+enforcement map-mode principals get, on the ENGINE's own target
+resolution (``id_or_dep``-first) and the ``id`` alias alike: foreign
+by-id mutation targets refuse per-op (``namespace_not_allowed``) with no
+successor and a live parent, destination rekeys refuse, in-scope targets
+still commit, and mixed batches keep per-op receipts.  The class also
+pins the CLI flag surface: ``--namespace-scope`` refuses ``--principal``
+and malformed lists with exit 2.
+
 The principal is NEVER a hand-built class.  Isolation follows the frozen
 C1 exactly.  Standalone: ``python -X utf8 tests/\
 test_ops_scoped_principal_parity_supp.py``
@@ -28,6 +41,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -318,6 +332,215 @@ class ScopedPrincipalMatrixTest(unittest.TestCase):
         self.assertEqual(self._row_ns(receipt), "project:allowed",
                          "leg f: the committed row must land inside the "
                          "explicitly allowed namespace")
+
+
+FOREIGN_NS = "project:outside"
+
+
+class LegacyScopedTargetScopeTest(unittest.TestCase):
+    """Issue #420 (frozen C11 parity): a SCOPED LEGACY identity — the
+    engine-side representation of a scoped single-token caller (the hub
+    forwards ``--namespace-scope`` and cli.py builds this exact
+    ``LegacyPrincipal`` with ``scoped=True`` + the allow-list) — enforces
+    the by-id TARGET scope on the engine's own resolution: foreign by-id
+    mutation targets are per-op ``namespace_not_allowed`` refusals with no
+    successor and a live parent, destination rekeys refuse, in-scope
+    targets commit, and mixed batches keep per-op receipts."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-c1s-legacy-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.environ["ZMEM_STORE"] = os.path.join(self.tmp, "store.sqlite")
+        os.environ["ZMEM_DATA"] = self.tmp
+        storelib._refresh_env_state()
+        self.conn = storelib.connect()
+        storelib.init_db(self.conn)
+        storelib.migrate(self.conn)
+        self.addCleanup(self.conn.close)
+        # The scoped legacy identity, built exactly like the fixed cli.py
+        # builds it for --namespace-scope (LegacyPrincipal narrowed to an
+        # allow-list) — never a hand-rolled duck type.
+        self.scoped = ops.LegacyPrincipal()
+        self.scoped.namespaces = frozenset({"user:global"})
+        self.scoped.scoped = True
+
+    def _apply(self, ops_list, default_principal):
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            return ops.apply_ops(self.conn, [dict(o) for o in ops_list],
+                                 principal="", principal_lookup=None,
+                                 default_principal=default_principal)
+
+    def _apply_scoped(self, ops_list):
+        return self._apply(ops_list, self.scoped)
+
+    def _seed(self, namespace, content="c1s target"):
+        """Seed through the engine's own path under the UNSCOPED legacy
+        identity (the operator route — every namespace is in scope)."""
+        op = {"op_id": uuid.uuid4().hex, "op": "add",
+              "args": {"type": "fact",
+                       "content": f"{content} {uuid.uuid4().hex}",
+                       "namespace": namespace, "tags": "c1s",
+                       "source": "c1s"}}
+        receipt = self._apply([op], ops.LegacyPrincipal())["receipts"][0]
+        self.assertEqual(receipt["status"], "committed",
+                         f"seed must commit: {receipt}")
+        return receipt["canonical_id"]
+
+    def _successors(self, mid):
+        return [row[0] for row in self.conn.execute(
+            "SELECT id FROM memory WHERE update_of=? "
+            "AND superseded_at IS NULL", (mid,))]
+
+    def _assert_parent_live(self, mid, leg):
+        row = self.conn.execute(
+            "SELECT superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
+        self.assertIsNotNone(row, f"{leg}: the parent row must still exist")
+        self.assertIsNone(row[0], f"{leg}: the parent must stay live "
+                                  f"(superseded_at={row[0]!r})")
+        self.assertEqual(self._successors(mid), [],
+                         f"{leg}: a refused op must mint NO successor")
+
+    def test_legacy_a_foreign_by_id_update_via_id_refused(self):
+        """(a) the ``id`` alias (not the engine's primary selector) naming
+        a foreign-namespace target refuses per-op."""
+        target = self._seed(FOREIGN_NS)
+        op = {"op_id": uuid.uuid4().hex, "op": "update",
+              "args": {"id": target,
+                       "content": f"c1s pwned {uuid.uuid4().hex}"}}
+        receipt = self._apply_scoped([op])["receipts"][0]
+        self.assertEqual(receipt["status"], "rejected",
+                         f"leg a: {receipt}")
+        self.assertEqual(receipt.get("error"), "namespace_not_allowed",
+                         f"leg a: the refusal must be namespace_not_allowed "
+                         f"(got {receipt})")
+        self._assert_parent_live(target, "leg a")
+
+    def test_legacy_b_foreign_by_id_via_id_or_dep_all_kinds_refused(self):
+        """(b) the PRIMARY selector ``id_or_dep`` refuses for update AND
+        supersede AND invalidate — each per-op, no successor, no
+        tombstone."""
+        kinds = (
+            ("update", lambda mid: {"id_or_dep": mid,
+                                    "content": f"c1s up {uuid.uuid4().hex}"}),
+            ("supersede", lambda mid: {"id_or_dep": mid,
+                                       "reason": "c1s supersede"}),
+            ("invalidate", lambda mid: {"id_or_dep": mid,
+                                        "reason": "c1s retired"}),
+        )
+        for kind, make_args in kinds:
+            target = self._seed(FOREIGN_NS)
+            op = {"op_id": uuid.uuid4().hex, "op": kind,
+                  "args": make_args(target)}
+            receipt = self._apply_scoped([op])["receipts"][0]
+            self.assertEqual(
+                receipt["status"], "rejected",
+                f"leg b ({kind}): a foreign by-id {kind} must be a per-op "
+                f"refusal (got {receipt})")
+            self.assertEqual(
+                receipt.get("error"), "namespace_not_allowed",
+                f"leg b ({kind}): the refusal must be "
+                f"namespace_not_allowed (got {receipt})")
+            self._assert_parent_live(target, f"leg b ({kind})")
+
+    def test_legacy_c_in_scope_by_id_update_commits(self):
+        """(c) GREEN CONTROL: a within-scope by-id update still commits —
+        the target gate narrows, it does not block the token's own
+        namespace."""
+        target = self._seed("user:global")
+        op = {"op_id": uuid.uuid4().hex, "op": "update",
+              "args": {"id": target,
+                       "content": f"c1s in-scope up {uuid.uuid4().hex}"}}
+        receipt = self._apply_scoped([op])["receipts"][0]
+        self.assertEqual(receipt["status"], "committed",
+                         f"leg c (green control): {receipt}")
+        parent = self.conn.execute(
+            "SELECT superseded_at FROM memory WHERE id=?",
+            (target,)).fetchone()
+        self.assertIsNotNone(parent[0],
+                             "leg c: the successful update must tombstone "
+                             "the parent")
+        self.assertEqual(len(self._successors(target)), 1,
+                         "leg c: the successful update must mint exactly "
+                         "ONE live successor")
+
+    def test_legacy_d_destination_rekey_refused(self):
+        """(d) an update naming an IN-SCOPE target with a FOREIGN
+        destination namespace (a rekey) refuses per-op."""
+        target = self._seed("user:global")
+        op = {"op_id": uuid.uuid4().hex, "op": "update",
+              "args": {"id_or_dep": target, "namespace": FOREIGN_NS,
+                       "content": f"c1s rekey {uuid.uuid4().hex}"}}
+        receipt = self._apply_scoped([op])["receipts"][0]
+        self.assertEqual(receipt["status"], "rejected",
+                         f"leg d: {receipt}")
+        self.assertEqual(receipt.get("error"), "namespace_not_allowed",
+                         f"leg d: the destination rekey must be "
+                         f"namespace_not_allowed (got {receipt})")
+        self._assert_parent_live(target, "leg d")
+
+    def test_legacy_e_mixed_batch_keeps_per_op_receipts(self):
+        """(e) a mixed batch (one in-scope add + one foreign by-id update):
+        the add COMMITS, the update REJECTS — the refusal is per-op, never
+        whole-batch and never fail-open."""
+        foreign = self._seed(FOREIGN_NS)
+        batch = [
+            {"op_id": uuid.uuid4().hex, "op": "add",
+             "args": {"type": "fact",
+                      "content": f"c1s mixed add {uuid.uuid4().hex}",
+                      "namespace": "user:global"}},
+            {"op_id": uuid.uuid4().hex, "op": "update",
+             "args": {"id": foreign,
+                      "content": f"c1s mixed pwn {uuid.uuid4().hex}"}},
+        ]
+        receipts = self._apply_scoped(batch)["receipts"]
+        self.assertEqual(receipts[0]["status"], "committed",
+                         f"leg e: the in-scope add must commit (got "
+                         f"{receipts[0]})")
+        self.assertEqual(receipts[1]["status"], "rejected",
+                         f"leg e: the foreign by-id update must reject "
+                         f"(got {receipts[1]})")
+        self.assertEqual(receipts[1].get("error"), "namespace_not_allowed",
+                         receipts[1])
+        self._assert_parent_live(foreign, "leg e")
+
+    def _run_cli_apply_ops(self, extra_args):
+        ops_path = Path(self.tmp) / "cli-ops.jsonl"
+        ops_path.write_text(json.dumps({
+            "op_id": uuid.uuid4().hex, "op": "add",
+            "args": {"type": "fact", "content": "c1s cli flag probe",
+                     "namespace": "user:global"}}) + "\n", encoding="utf-8")
+        argv = [sys.executable,
+                str(REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"),
+                "apply-ops", "--in", str(ops_path), "--json",
+                *extra_args]
+        return subprocess.run(argv, env=dict(os.environ),
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=180)
+
+    def test_cli_namespace_scope_with_principal_refused(self):
+        """CLI: ``--namespace-scope`` combined with ``--principal`` refuses
+        the whole batch (one identity mechanism per call) with exit 2."""
+        run = self._run_cli_apply_ops(
+            ["--principal", "p-x", "--namespace-scope", "user:global"])
+        self.assertEqual(
+            run.returncode, 2,
+            f"the flag combination must exit 2 (rc={run.returncode}, "
+            f"stdout={run.stdout[:200]!r}, stderr={run.stderr[:200]!r})")
+        self.assertIn("--namespace-scope", run.stderr)
+        self.assertIn("cannot be combined with --principal", run.stderr)
+
+    def test_cli_namespace_scope_malformed_list_refused(self):
+        """CLI: a malformed ``--namespace-scope`` list (an empty item, e.g.
+        ``a,,b``) refuses with exit 2."""
+        run = self._run_cli_apply_ops(["--namespace-scope", "a,,b"])
+        self.assertEqual(
+            run.returncode, 2,
+            f"a malformed scope list must exit 2 (rc={run.returncode}, "
+            f"stdout={run.stdout[:200]!r}, stderr={run.stderr[:200]!r})")
+        self.assertIn("--namespace-scope", run.stderr)
+        self.assertIn("non-empty namespaces", run.stderr)
 
 
 if __name__ == "__main__":

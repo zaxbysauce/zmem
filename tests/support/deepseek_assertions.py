@@ -370,22 +370,14 @@ def support_report_problems(report, repo_root=ASSERTIONS_REPO_ROOT,
     return problems
 
 
-# Issue #416 AC3 (plan-critic disclosure-ratchet): the KNOWN, deliberately
-# tolerated version lag of the committed support report while it awaits
-# its real dsh-host regeneration (the issue forbids hand-editing evidence
-# artifacts and names the regeneration as its own delivery). The standing
-# t14 gate asserts evidence_version_problems returns EXACTLY the single
-# disclosed-divergence entry for this tuple; any OTHER divergence — either
-# artifact moving without the other, or a stale disclosure left behind
-# after the regeneration — fails the gate. Remove this constant (and the
-# ratchet leg) in the regeneration PR, when both artifacts agree.
-SUPPORT_DISCLOSED_STALE_VERSION = "0.127.0"
-# The release the disclosure was granted AT (review F6): binding the
-# ratchet tuple to THIS literal (not the live release version) makes the
-# tolerance EXPIRE at the next bump — a 0.133.0-era pair no longer matches
-# the disclosed tuple and fails as undisclosed drift, forcing the
-# regeneration PR to retire the disclosure.
-SUPPORT_DISCLOSED_RELEASE = "0.133.0"
+# Issue #420 (the #416-named regeneration PR): the disclosure-ratchet
+# constants (SUPPORT_DISCLOSED_STALE_VERSION="0.127.0" /
+# SUPPORT_DISCLOSED_RELEASE="0.132.0") are RETIRED — both evidence reports
+# were regenerated together at 0.133.0 from a real dsh-host run and the
+# known-divergence tolerance expired by design. evidence_version_problems
+# keeps its ``known_divergence`` seam (the function's contract parameter)
+# but no standing caller passes a tolerance: the t14 parity gate demands
+# agreement with none.
 
 
 def evidence_version_problems(canary_report, support_report,
@@ -426,8 +418,9 @@ def evidence_version_problems(canary_report, support_report,
         return problems
     if known_divergence is not None:
         # Forcing function: once the artifacts agree, a leftover disclosure
-        # is itself a failure — the regeneration PR must retire it.
+        # is itself a failure — retired by the #420 regeneration PR.
         return [f"stale known-divergence disclosure: canary {cv!r} and "
                 f"support {sv!r} agree at release {release_version!r} — "
-                "retire SUPPORT_DISCLOSED_STALE_VERSION (regeneration PR)"]
+                "no tolerance is tolerated (the #420 regeneration closed "
+                "the disclosed lag)"]
     return problems

@@ -651,6 +651,29 @@ def _cmd_apply_ops(conn, args) -> int:
     # --principal means legacy (capabilities None => allowed), mirroring the
     # MCP layer's current_principal() legacy-mode semantics.
     default_principal = opslib.LegacyPrincipal()
+    # Issue #420 (scope passthrough): --namespace-scope narrows the legacy
+    # identity to a namespace allow-list, giving single-token hub callers
+    # (no map entry the engine could resolve) the SAME in-transaction
+    # enforcement map-mode principals get — op namespaces, by-id mutation
+    # targets (id_or_dep-first, the engine's own resolution), and update
+    # destination rekeys, all via _namespace_allowed. Malformed input or
+    # combining it with --principal refuses the batch (one identity
+    # mechanism per call).
+    scope_raw = str(getattr(args, "namespace_scope", "") or "")
+    if scope_raw:
+        if args.principal:
+            print("[zmem] apply-ops: --namespace-scope cannot be combined"
+                  " with --principal (one identity mechanism per call)",
+                  file=_sys.stderr)
+            return 2
+        scopes = [part.strip() for part in scope_raw.split(",")]
+        if not scopes or any(not part for part in scopes):
+            print("[zmem] apply-ops: --namespace-scope must be a comma-"
+                  "separated list of non-empty namespaces", file=_sys.stderr)
+            return 2
+        default_principal = opslib.LegacyPrincipal()
+        default_principal.namespaces = frozenset(scopes)
+        default_principal.scoped = True
     lookup = opslib.principal_lookup_from_env()
     if len(parsed) > 256:
         print("[zmem] apply-ops: batch exceeds the 256-op limit",
@@ -3564,6 +3587,13 @@ def main():
     ap_ops.add_argument("--principal", default="",
                         help="principal id the batch applies as (empty ="
                              " the legacy/operator identity)")
+    ap_ops.add_argument(
+        "--namespace-scope", dest="namespace_scope", default="",
+        help="comma-separated namespace allow-list applied to the legacy "
+             "identity (issue #420: the hub-side scope passthrough for "
+             "single-token callers the engine has no map entry for; can "
+             "only NARROW the otherwise-unscoped legacy identity; "
+             "mutually exclusive with --principal)")
     ap_ops.add_argument("--json", action="store_true",
                         help="emit the receipt envelope as one JSON document")
 

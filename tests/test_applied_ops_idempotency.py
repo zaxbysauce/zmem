@@ -23,6 +23,18 @@ never observe the operator's store.  tearDownModule restores the env and
 the previous sys.modules state and deletes the temp dir.  The canonical
 store is never touched; no network; no model download.
 
+Issue #420 supplement (frozen C9 parity) — the dedup fold's expiry guard:
+
+- an add/capture replay carrying ``inject_until`` WITHOUT ``expiry_class``
+  (the until-only shape — it can only ever reach the fold as a REPLAY of
+  byte-identical content, never as a fresh op) must NOT fold
+  ``committed, deduped=True`` while silently dropping the requested
+  deadline: the receipt is REJECTED (expiry_requires_state_target /
+  expiry_record_mismatch_on_dedup);
+- the pre-existing TRUE-replay shape (an expiry_class-carrying replay
+  against a matching state row) still commits/dedupes — a preserving pin
+  that the widened guard did not over-reject.
+
 Runs under pytest and standalone (CI convention):
 ``python -X utf8 tests/test_applied_ops_idempotency.py``
 """
@@ -305,6 +317,111 @@ class AppliedOpsReplayIdempotencyTest(unittest.TestCase):
                              "replay")
         finally:
             conn2.close()
+
+    def test_until_only_replay_against_plain_add_seed_is_rejected(self):
+        """Issue #420 (frozen C9): an add REPLAY carrying inject_until
+        WITHOUT expiry_class must never fold committed+deduped while
+        dropping the requested deadline.  The until-only shape can only
+        reach the fold as a replay — write-side _resolve_expiry refuses it
+        for state (requires expiry_class) and non-state (forbids both)
+        targets — so op A seeds the live row as a PLAIN add through the
+        engine's own path, op B replays byte-identical content carrying
+        the deadline.  The fold's expiry guard must key on EVERY want-field
+        the match predicate honors: the receipt is REJECTED naming the
+        reason (never committed with memory_expiry holding no matching
+        inject_until).  RED at base — the guard keyed on _want_cls alone
+        and the deadline was silently dropped."""
+        UNTIL = "2031-01-01T00:00:00Z"
+        conn = self._connect()
+        try:
+            content = "420 until-only replay probe row (arm's-length check)"
+            op_a = {"op_id": uuid.uuid4().hex, "op": "add",
+                    "args": {"type": "fact", "content": content,
+                             "namespace": "user:global"}}
+            first = self._apply(conn, op_a)
+            receipt_a = first["receipts"][0]
+            self.assertEqual(receipt_a["status"], "committed", first)
+            self.assertFalse(receipt_a["deduped"], first)
+            keeper = receipt_a["canonical_id"]
+
+            # Op B: byte-identical content carrying inject_until ONLY —
+            # the #363 replay guard matches, and the fold's expiry guard
+            # is the only defense against dropping the deadline.
+            op_b = {"op_id": uuid.uuid4().hex, "op": "add",
+                    "args": {"type": "fact", "content": content,
+                             "namespace": "user:global",
+                             "inject_until": UNTIL}}
+            second = self._apply(conn, op_b)
+            receipt_b = second["receipts"][0]
+            self.assertEqual(
+                receipt_b["status"], "rejected",
+                "an until-only replay must be REJECTED, never folded "
+                f"committed (got {receipt_b})")
+            self.assertIn(
+                receipt_b.get("error"),
+                ("expiry_requires_state_target",
+                 "expiry_record_mismatch_on_dedup"),
+                f"the rejection must name the expiry reason (got "
+                f"{receipt_b})")
+            # Nothing folded, nothing dropped: the plain-add keeper stays
+            # the single live row and carries no expiry record.
+            self.assertEqual(self._content_rows(conn, content), 1,
+                             "the until-only replay must not add a row")
+            stored = conn.execute(
+                "SELECT inject_until FROM memory_expiry WHERE memory_id=?",
+                (keeper,)).fetchone()
+            self.assertNotEqual(
+                None if stored is None else stored[0], UNTIL,
+                "a rejected until-only replay must never write the "
+                "requested deadline behind the receipt's back")
+        finally:
+            conn.close()
+
+    def test_state_expiry_true_replay_still_folds(self):
+        """Issue #420 preserving pin: the widened fold guard must not
+        over-reject.  An expiry_class-carrying add REPLAY against a MATCHING
+        state row (the keeper IS a state memory whose stored expiry_class
+        equals the requested one) is a TRUE replay — it still folds
+        committed + deduped=True, exactly the pre-#420 receipt contract."""
+        conn = self._connect()
+        try:
+            content = "420 state true-replay probe row (arm's-length check)"
+            op_a = {"op_id": uuid.uuid4().hex, "op": "add",
+                    "args": {"type": "state", "content": content,
+                             "namespace": "user:global",
+                             "expiry_class": "setting"}}
+            first = self._apply(conn, op_a)
+            receipt_a = first["receipts"][0]
+            self.assertEqual(receipt_a["status"], "committed", first)
+            self.assertFalse(receipt_a["deduped"], first)
+            keeper = receipt_a["canonical_id"]
+            row = conn.execute(
+                "SELECT type FROM memory WHERE id=?", (keeper,)).fetchone()
+            self.assertEqual(row["type"], "state",
+                             "setup: the seed must land as a state memory")
+            stored = conn.execute(
+                "SELECT expiry_class FROM memory_expiry WHERE memory_id=?",
+                (keeper,)).fetchone()
+            self.assertEqual(stored["expiry_class"], "setting",
+                             "setup: the seed's expiry record must exist")
+
+            # The true-replay shape: identical content, same expiry_class,
+            # no inject_until (a missing want-field matches any stored
+            # timestamp — the predicate's _want_until is None branch).
+            op_b = {"op_id": uuid.uuid4().hex, "op": "add",
+                    "args": {"type": "state", "content": content,
+                             "namespace": "user:global",
+                             "expiry_class": "setting"}}
+            second = self._apply(conn, op_b)
+            receipt_b = second["receipts"][0]
+            self.assertEqual(receipt_b["status"], "committed", second)
+            self.assertTrue(receipt_b["deduped"], second)
+            self.assertEqual(receipt_b["canonical_id"], keeper, second)
+            self.assertEqual(self._content_rows(conn, content), 1,
+                             "the true replay must fold into the keeper, "
+                             "never add a second row")
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
