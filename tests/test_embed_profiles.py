@@ -62,6 +62,31 @@ class RegistryShape(unittest.TestCase):
             "changing it is a trust-root event",
         )
 
+    def test_tokenizer_pin_shape_and_artifact_digest(self):
+        # #418: the tokenizer trust root is a 64-hex constant pinned to the
+        # CHECKED-IN artifact's bytes (the LFS oid IS the content digest).
+        # Skips honestly on a pointer-only checkout (LFS content absent) —
+        # the CI provisioned lane asserts the same pin on real bytes.
+        import hashlib
+        import re
+
+        pin = ep.TOKENIZER_SHA256
+        self.assertIsInstance(pin, str)
+        self.assertRegex(pin, re.compile(r"^[0-9a-f]{64}$"))
+        artifact = REPO_ROOT / "skills" / "memory" / "models" / "tokenizer.json"
+        data = artifact.read_bytes()
+        if data.lstrip().startswith(b"version https://git-lfs"):
+            raise unittest.SkipTest(
+                "tokenizer.json is an LFS pointer in this checkout; the "
+                "provisioned-model CI lane asserts the pin on real bytes"
+            )
+        self.assertEqual(
+            hashlib.sha256(data).hexdigest(),
+            pin,
+            "TOKENIZER_SHA256 must equal the checked-in tokenizer.json "
+            "digest; changing either is a trust-root event",
+        )
+
     def test_fake_profile_self_describing(self):
         f = ep.PROFILES["fake"]
         self.assertEqual(f["dim"], 16)

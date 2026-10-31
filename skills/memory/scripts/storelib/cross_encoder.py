@@ -27,8 +27,11 @@ POLICY (load-bearing — do not weaken):
 - Model resolution: ZMEM_CROSS_ENCODER_MODEL (operator-supplied, operator
   vouched, sibling tokenizer.json) wins; otherwise the checked-in
   `mini-pair-scorer` profile resolves through `cross_encoder_profiles` on
-  EVERY load and its file is checksum-gated by `verify_profile_file` before
-  use. The profile URL ships EMPTY — profile download is disabled until
+  EVERY load and BOTH its artifacts (model AND tokenizer) are digest-gated
+  on the LOAD path against the profile pins — the sha256 of the same buffer
+  each runtime object is constructed from (#418; the pre-#418
+  verify-then-reopen gate is closed). The profile URL ships EMPTY — profile
+  download is disabled until
   ZMEM_CROSS_ENCODER_MODEL_URL supplies one, and even then a download
   happens only when ZMEM_MODEL_AUTODOWNLOAD is exactly "1" (call-time, one
   attempt, digest-verified, atomic replace; the loader never executes an
@@ -300,9 +303,14 @@ def _local_scorer():
         return None
     explicit = bool((os.environ.get(MODEL_PATH_ENV) or "").strip())
     _last_load_failure = None
+    profile = None
     if not explicit:
-        # Profile path: checksum-gate BEFORE load, and offer exactly one
-        # call-time download attempt when the file is absent.
+        # Profile path: offer exactly one call-time download attempt when
+        # the file is absent. The download itself digest-verifies the .part
+        # before the atomic replace; the LOAD-path digest gate happens below
+        # on the same buffer the session is constructed from (#418) — the
+        # old pre-load verify_profile_file call verified the PATH and then
+        # re-opened it, leaving a verify-then-reopen window.
         try:
             profile = _profiles.resolve_profile()
         except ValueError:
@@ -313,9 +321,6 @@ def _local_scorer():
             if outcome != "ok" or not os.path.isfile(model_path):
                 _last_load_failure = outcome if outcome != "ok" else "load-error"
                 return None
-        if not _profiles.verify_profile_file(Path(model_path), profile):
-            _last_load_failure = "load-error"
-            return None
     elif not os.path.isfile(model_path):
         _last_load_failure = "missing-model"
         return None
@@ -342,22 +347,40 @@ def _local_scorer():
     # MS-MARCO-class exporters expect. Inputs are plain python int lists —
     # ORT converts them, and mocks/tests stay trivially inspectable.
     try:
+        import hashlib
+
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
-        # TOCTOU parity with embeddings.py (zax-review follow-up): stat for
-        # cache freshness, then load ONE buffer for the session so a swap
-        # between freshness check and construction cannot take effect here.
+        # TOCTOU closure (#418): stat for cache freshness, then load ONE
+        # buffer for each artifact and verify the digest of THAT buffer
+        # before construction, so a swap between any two operations cannot
+        # take effect. On the PROFILE leg both digests are compared to the
+        # profile pins; the explicit leg (ZMEM_CROSS_ENCODER_MODEL) stays
+        # operator-vouched per the module POLICY — an operator-named custom
+        # model has no profile pin to compare against.
         with open(model_path, "rb") as fh:
             model_bytes = fh.read()
-        sess = ort.InferenceSession(model_bytes)
+        if profile is not None:
+            _model_sha = hashlib.sha256(model_bytes).hexdigest()
+            if _model_sha != (profile.get("sha256") or "").lower():
+                _last_load_failure = "load-error"
+                return None
         if not tok_path or not os.path.isfile(tok_path):
             # Copilot review finding: a present model with a missing
             # sibling tokenizer is a load failure, not an absent model -
             # label it so the terminal reason stays actionable.
             _last_load_failure = "load-error"
             return None
-        tok = Tokenizer.from_file(tok_path)
+        with open(tok_path, "rb") as fh:
+            tok_bytes = fh.read()
+        if profile is not None:
+            _tok_sha = hashlib.sha256(tok_bytes).hexdigest()
+            if _tok_sha != (profile.get("tokenizer_sha256") or "").lower():
+                _last_load_failure = "load-error"
+                return None
+        sess = ort.InferenceSession(model_bytes)
+        tok = Tokenizer.from_buffer(tok_bytes)
         tok.enable_padding(length=128)
         tok.enable_truncation(max_length=128)
 

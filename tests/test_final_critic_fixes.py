@@ -66,6 +66,13 @@ class FakeLocalScorerExecutes(unittest.TestCase):
             def from_file(cls, path):
                 return cls(path)
 
+            # #418: the loader now constructs the tokenizer from the read
+            # buffer on BOTH legs (from_buffer); keep from_file on the stub
+            # only so a regression back to path-construction is observable.
+            @classmethod
+            def from_buffer(cls, buf):
+                return cls(buf)
+
             def encode(self, query, text=None):
                 return FakeEnc(text if text is not None else query)
 

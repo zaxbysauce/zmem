@@ -973,6 +973,7 @@ def _check_embeddings() -> dict:
         profile=profile,
         dim=st.get("dim"),
         checksum_ok=st.get("checksum_ok"),
+        checksum_artifact=st.get("checksum_artifact"),
         **({"note": st["note"]} if st.get("note") else {}),
     )
 
@@ -4086,29 +4087,50 @@ def _recommendations(checks: list[dict]) -> list[str]:
                 )
         elif reason in ("model_file_missing", "tokenizer_missing"):
             # Both files are required — say so explicitly so a tokenizer-only
-            # outage isn't mis-diagnosed as "add the model".
+            # outage isn't mis-diagnosed as "add the model". Both files are
+            # digest-verified on the load path against their pinned SHA-256s
+            # (#418): minilm.onnx against the MINILM_SHA256 pin (model-
+            # minilm-bbd7b466 asset) and tokenizer.json against its LFS-oid
+            # pin — state each file's actual verification state, not an
+            # operator-action claim.
             notes.append(
                 "Embeddings are disabled because minilm.onnx and/or tokenizer.json "
-                "are absent from the resolved models dir. Both files are required: "
-                "place a checksum-verified minilm.onnx AND tokenizer.json there "
-                "(or set ZMEM_MODEL_URL to a source matching the pinned SHA-256 "
-                "plus ZMEM_MODEL_AUTODOWNLOAD=1). After enabling, run `reembed` "
-                "to backfill existing rows. Degraded FTS5/lexical operation is "
-                "supported meanwhile."
+                "are absent from the resolved models dir. Both files are required, "
+                "and both are SHA-256-verified at load: minilm.onnx against the "
+                "pinned model digest (set ZMEM_MODEL_URL to a source matching it "
+                "plus ZMEM_MODEL_AUTODOWNLOAD=1) and tokenizer.json against its "
+                "pinned digest (restore the checked-in bytes: git lfs checkout "
+                "skills/memory/models/tokenizer.json). After enabling, run "
+                "`reembed` to backfill existing rows. Degraded FTS5/lexical "
+                "operation is supported meanwhile."
             )
         elif reason == "model_checksum_mismatch":
             # Issue #63, 8.1: name WHY a hash can differ from what the operator
             # expected, so nobody 'fixes' verification by disabling it. There
-            # is deliberately NO unverified-load escape hatch.
+            # is deliberately NO unverified-load escape hatch. #418: the
+            # reason covers BOTH artifacts' pins — name the file that
+            # actually mismatched (checksum_artifact) instead of always
+            # blaming minilm.onnx. Absent checksum_artifact (doctor's own
+            # synthesized probe status) keeps the model wording.
             note = details.get("note") or ""
-            notes.append(
-                "The installed minilm.onnx FAILED its checksum pin. "
-                + note
-                + " Restore the pinned bytes from the model-minilm-bbd7b466 "
-                "release asset (or point "
-                "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
-                "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
-            )
+            if details.get("checksum_artifact") == "tokenizer":
+                notes.append(
+                    "The installed tokenizer.json FAILED its SHA-256 pin. "
+                    + note
+                    + " Restore the checked-in bytes (git lfs checkout "
+                    "skills/memory/models/tokenizer.json — the pin is the "
+                    "LFS oid); the tokenizer stays refused until then and "
+                    "embeddings stay degraded."
+                )
+            else:
+                notes.append(
+                    "The installed minilm.onnx FAILED its checksum pin. "
+                    + note
+                    + " Restore the pinned bytes from the model-minilm-bbd7b466 "
+                    "release asset (or point "
+                    "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
+                    "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
+                )
         else:
             notes.append(
                 "Embeddings are disabled; semantic recall/dedup is off (degraded "
@@ -4536,7 +4558,8 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         # model against the mini-pair-scorer profile digest regardless of
         # how the path was resolved — an operator-supplied file whose bytes
         # differ reports "mismatch" informationally while the load policy
-        # stays operator-vouched.
+        # stays operator-vouched. #418: load_policy names that policy
+        # explicitly per leg (see the load_policy construction below).
         ce_profile = ce_profile_name = None
         ce_model_resolved = ""
         ce_checksum_state = "missing"
@@ -4581,6 +4604,14 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         passive_on = os.environ.get("ZMEM_CROSS_ENCODER_PASSIVE", "0") == "1"
         shadow_on = os.environ.get("ZMEM_CROSS_ENCODER_SHADOW", "0") == "1"
         autodl = os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1"
+        # #418: state the LOAD-POLICY truth for each leg. Explicit leg: the
+        # operator named the model file, so BOTH it and its sibling
+        # tokenizer.json are operator-vouched (no pins apply; checksum_state
+        # above stays informational). Profile leg: BOTH artifacts are
+        # digest-verified on the load path against the profile pins.
+        ce_load_policy = (
+            "explicit-operator-vouched" if ce_model_cfg else "profile-pinned"
+        )
         details["cross_encoder"] = {
             "enabled": ce_enabled,
             "model_path_configured": ce_model_cfg,
@@ -4589,6 +4620,7 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
             "profile": ce_profile_name,
             "model_path": ce_model_resolved,
             "checksum_state": ce_checksum_state,
+            "load_policy": ce_load_policy,
             "passive": passive_on,
             "shadow": shadow_on,
             "autodownload": "enabled" if autodl else "disabled",
