@@ -402,10 +402,27 @@ def test_recovery_and_diagnostics():
             committed = (isinstance(receipts, list) and any(
                 str(r.get("status") or "").find("commit") >= 0
                 for r in receipts if isinstance(r, dict)))
-            if not committed and queue.is_file():
-                entries = harness.queue_entries(queue)
-                committed = any(e.get("status") not in (None, "pending")
-                                or e.get("receipt") for e in entries)
+            # The reconnect flush is asynchronous on the client side: the
+            # scenario's captured pluginState can predate the flush landing
+            # (a still-pending receipt observed single-shot raced — the
+            # flake the 418-420 implementation review caught). Poll the
+            # DURABLE queue file (the on-disk flush surface) to a bounded
+            # deadline instead of a single-shot read.
+            deadline = time.monotonic() + 60.0
+            while (not committed and time.monotonic() < deadline):
+                if queue.is_file():
+                    try:
+                        entries = harness.queue_entries(queue)
+                    except (OSError, ValueError):
+                        entries = []
+                    committed = any(
+                        e.get("status") not in (None, "pending")
+                        or e.get("receipt") for e in entries)
+                else:
+                    # The queue file itself vanished: fully drained.
+                    committed = True
+                if not committed:
+                    time.sleep(1.0)
             assert committed, (
                 f"after the reconnect the queued ops must flush to the "
                 f"live hub and the receipts commit: receipts={receipts!r}")
