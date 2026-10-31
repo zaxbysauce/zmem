@@ -371,9 +371,9 @@ def support_report_problems(report, repo_root=ASSERTIONS_REPO_ROOT,
 
 
 # Issue #420 (the #416-named regeneration PR): the disclosure-ratchet
-# constants (SUPPORT_DISCLOSED_STALE_VERSION="0.127.0" /
-# SUPPORT_DISCLOSED_RELEASE="0.132.0") are RETIRED — both evidence reports
-# were regenerated together at 0.133.0 from a real dsh-host run and the
+# constants — the disclosed stale support version and the release the
+# tolerance was granted at — are RETIRED: both evidence reports were
+# regenerated together at 0.133.0 from a real dsh-host run and the
 # known-divergence tolerance expired by design. evidence_version_problems
 # keeps its ``known_divergence`` seam (the function's contract parameter)
 # but no standing caller passes a tolerance: the t14 parity gate demands
