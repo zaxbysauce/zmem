@@ -208,24 +208,36 @@ class DatasetExpiryRoundTripTest(unittest.TestCase):
             "expiry rows (idempotent; an existing record wins)")
 
     def test_leg4_absence_tolerance_family_file_optional(self):
+        # F7 (second review): the post-fix export ALWAYS writes the family
+        # file, so the old skip-based leg asserted nothing at head. Real
+        # absence tolerance is pinned against the COMMITTED legacy fixture
+        # (tests/fixtures/dataset manifest-v1: four families, no expiry
+        # file) — a pre-family import must succeed with zero expiry rows.
+        fixture_dir = os.path.join(REPO_ROOT, "tests", "fixtures", "dataset")
         export_dir = os.path.join(self.store.tmp, "export-legacy")
-        manifest = self.store.export(export_dir)
+        import shutil
+        shutil.copytree(fixture_dir, export_dir)
+        shutil.copy2(os.path.join(export_dir, "manifest-v1.json"),
+                     os.path.join(export_dir, "manifest.json"))
         data_dir = Path(export_dir) / "data"
         names = [p.name.lower() for p in data_dir.iterdir()] \
             if data_dir.is_dir() else []
-        if any("expiry" in n for n in names):
-            raise unittest.SkipTest(
-                "LEG-REQUIRES-PLAN-SEAM: the export now carries an expiry "
-                "family file; simulating an older producer (family file "
-                "absent AND manifest still verifying) requires the plan's "
-                "family/hash seam")
+        self.assertFalse(
+            any("expiry" in n for n in names),
+            "leg 4 fixture precondition: the legacy fixture must carry NO "
+            f"expiry family file (found {names})")
+        legacy_manifest = json.loads(
+            Path(export_dir, "manifest.json").read_text(encoding="utf-8"))
         snap = self.store.import_snapshot(
-            export_dir, manifest["source_snapshot_hash"],
+            export_dir, legacy_manifest["source_snapshot_hash"],
             os.path.join(self.store.tmp, "imported-legacy"))
-        memory, _ = _snapshot_census(snap)
+        memory, expiry = _snapshot_census(snap)
         self.assertGreaterEqual(
             memory, 1,
             "leg 4: an export WITHOUT an expiry family must still import")
+        self.assertEqual(
+            expiry, 0,
+            "leg 4: a pre-family import lands ZERO expiry records")
 
 
 if __name__ == "__main__":

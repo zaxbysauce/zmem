@@ -3456,8 +3456,14 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ``invalidate`` require the ``mutate`` (or ``admin``) capability for
         non-legacy principals; revoked or unknown principals deny; ``add``
         is never capability-gated. Namespace scope is enforced engine-side
-        for every op — declared namespaces AND each mutation target row's
-        own namespace, including omitted-namespace defaults.
+        for every MAP principal — the principal id is forwarded to the
+        store subprocess, which re-resolves the same map file — covering
+        declared namespaces, each mutation target row's own namespace, and
+        omitted-namespace defaults. Legacy single-token mode cannot
+        forward the id (the engine has no map entry for it): the hub
+        guards declared namespaces and the omitted-namespace add/capture
+        default there, while a legacy by-id mutation target's namespace is
+        a disclosed residual (PR #417 follow-up).
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
@@ -3501,14 +3507,18 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 resolved = request_principal
             else:
                 resolved = request_principal
-                # The capability gate runs in the store subprocess; an
-                # EMPTY --principal there degrades to the legacy-allow
-                # identity. Route the authenticated principal's id through
-                # so a map-mode no-mutate caller cannot bypass the gate by
-                # omitting the optional param (review finding F3).
-                if (getattr(resolved, "capabilities", None) is not None
-                        and getattr(resolved, "principal_id", "legacy")
-                        not in ("", "legacy")):
+                # Issue #414 AC1 (review PRR-001 / F1): MAP mode forwards
+                # ANY map principal's id — the store subprocess resolves
+                # the SAME map file (ZMEM_MCP_TOKENS_FILE), so the engine
+                # gets the scoped identity regardless of capabilities (a
+                # capabilities-None entry stays legacy-allow engine-side;
+                # only namespace enforcement is added). Legacy
+                # single-token mode MUST NOT forward: the engine has no
+                # map entry for the token id ("zmem-operator") and would
+                # deny every op with unknown_principal; its scope is
+                # enforced hub-side in the pre-guard below.
+                if principal_map is not None and getattr(
+                        resolved, "principal_id", ""):
                     cli_principal = str(resolved.principal_id)
         else:
             cli_principal = principal.strip()
@@ -3523,17 +3533,31 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                 resolved = request_principal
                 if getattr(resolved, "revoked", False):
                     return {"ok": False, "error": "capability_denied"}
-                if (getattr(resolved, "capabilities", None) is not None
-                        and getattr(resolved, "principal_id", "legacy")
-                        not in ("", "legacy")):
+                # Map-mode forward (see the authenticated branch above):
+                # any map principal's id reaches the engine, not just
+                # capabilities-carrying entries.
+                if principal_map is not None and getattr(
+                        resolved, "principal_id", ""):
                     cli_principal = str(resolved.principal_id)
         for op in ops:
             if not isinstance(op, dict):
                 return _error("each op must be an object")
-            ns = (op.get("args") or {}).get("namespace") if isinstance(
-                op.get("args"), dict) else None
-            if ns:
-                denied = _guard_namespace(str(ns), caller=resolved)
+            args_dict = op.get("args") if isinstance(
+                op.get("args"), dict) else {}
+            ns = args_dict.get("namespace")
+            kind = op.get("op")
+            # Issue #414 AC1 (review F1): the guard sees the EFFECTIVE
+            # namespace. Map mode enforces per-op engine-side (the id is
+            # forwarded above); legacy single-token mode cannot forward,
+            # so the hub guards the omitted-namespace add/capture default
+            # (user:global) here — its by-id mutation-target residual is
+            # disclosed on the PR.
+            effective_ns = str(ns) if ns else (
+                "user:global"
+                if kind in ("add", "capture") and principal_map is None
+                else None)
+            if effective_ns:
+                denied = _guard_namespace(effective_ns, caller=resolved)
                 if denied:
                     return {"ok": False, **denied}
 

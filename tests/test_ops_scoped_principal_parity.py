@@ -188,12 +188,18 @@ class ScopedPrincipalParityTest(unittest.TestCase):
                   "args": {"id_or_dep": seed_id, "namespace": "user:global",
                            "content": "c1 leg b v2 " + uuid.uuid4().hex}}
         receipt = self._apply(update, "p-scoped")["receipts"][0]
-        self.assertNotEqual(
-            receipt["status"], "committed",
+        # F7 (second review, mutant-proven): the refusal CODE is pinned —
+        # a generic bad_op/store_refused would keep this leg green while
+        # breaking the namespace contract.
+        self.assertEqual(
+            receipt["status"], "rejected",
             "leg B: a scoped principal re-keyed a project:allowed row into "
             "user:global (a namespace foreign to the principal) — the "
             "dedicated update tool refuses this and apply-ops must too: "
             f"{receipt}")
+        self.assertEqual(
+            receipt.get("error"), "namespace_not_allowed",
+            f"leg B: wrong refusal code {receipt}")
 
     def test_leg_c_unresolved_principal_add_refused(self):
         op = {"op_id": uuid.uuid4().hex, "op": "add",
@@ -201,10 +207,16 @@ class ScopedPrincipalParityTest(unittest.TestCase):
                        "content": "c1 leg c " + uuid.uuid4().hex,
                        "tags": "c1", "source": "c1"}}
         receipt = self._apply(op, "ghost-unknown")["receipts"][0]
-        self.assertNotEqual(
-            receipt["status"], "committed",
+        # F7 (second review, mutant-proven): exact code — add is not
+        # capability-gated, so the gate that fires is unknown_principal;
+        # capability_denied or bad_op would signal a gate-order break.
+        self.assertEqual(
+            receipt["status"], "rejected",
             "leg C: a non-empty principal id resolving to NOTHING failed "
             f"OPEN for add (receipt {receipt}); it must be rejected")
+        self.assertEqual(
+            receipt.get("error"), "unknown_principal",
+            f"leg C: wrong refusal code {receipt}")
 
 
 if __name__ == "__main__":

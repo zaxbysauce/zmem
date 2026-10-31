@@ -231,6 +231,49 @@ class ProducerExpiryFamilyTest(unittest.TestCase):
                          "leg a: the already-EXPIRED state row's triplet "
                          "must ship too (the consumer withholds it)")
 
+    def _restore(self, payload):
+        tmp = tempfile.mkdtemp(prefix="zmem-c2s-f5-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
+        env["ZMEM_DATA"] = tmp
+        snap._build_from_payload(payload, env)
+
+    def test_leg_c_restore_refuses_malformed_families(self):
+        """F5 (second review): the broker restore REFUSES malformed
+        families (ValueError -> the refresh's designed degrade) instead of
+        silently arming the expiry gate on a non-state row. Control: the
+        valid family restores; each mutation refuses."""
+        payload = self._build()
+        good_expiry = list(payload.get("expiry"))
+        self.assertTrue(good_expiry, "leg c precondition: family non-empty")
+        fact_triplet = [self.fact_id, FUTURE, "endpoint"]
+
+        def with_expiry(value):
+            mutated = dict(payload)
+            mutated["expiry"] = value
+            return mutated
+
+        self._restore(payload)  # control: valid family restores
+
+        cases = [
+            ("length-4 triplet", with_expiry(
+                good_expiry + [fact_triplet + ["extra"]])),
+            ("non-list family", with_expiry("not-a-list")),
+            ("unshipped id", with_expiry(
+                good_expiry + [["0" * 32, FUTURE, "endpoint"]])),
+            ("non-state parent", with_expiry(
+                good_expiry + [list(fact_triplet)])),
+            ("malformed inject_until", with_expiry(
+                good_expiry + [[self.live_id, "not-a-timestamp",
+                                "endpoint"]])),
+            ("unknown expiry_class", with_expiry(
+                good_expiry + [[self.live_id, FUTURE, "not-a-class"]])),
+        ]
+        for name, mutated in cases:
+            with self.assertRaises(ValueError, msg=f"leg c ({name})"):
+                self._restore(mutated)
+
     def test_leg_b_end_to_end_withhold_expired_serve_live(self):
         payload = self._build()
         tmp = tempfile.mkdtemp(prefix="zmem-c2s-leg2-")

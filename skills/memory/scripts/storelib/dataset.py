@@ -20,7 +20,8 @@ SQLite store:
 Identity (two-pass, non-circular): pass-1 row checksums are computed over
 canonical bytes of rows WITHOUT ``export_snapshot_id``;
 ``source_snapshot_hash`` is SHA-256 over LF lines ``record_kind + "\\0" +
-checksum`` in family order memories, episodes, episode_members, links; then
+checksum`` in family order memories, episodes, episode_members, links,
+memory_expiry; then
 ``export_snapshot_id := source_snapshot_hash`` is stamped onto memory rows
 and each memory row's final stored ``row_checksum`` is recomputed over the
 completed row. Import re-verifies both layers.
@@ -850,9 +851,14 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         # Issue #414: a held-back state parent must not publish its expiry
         # side record either — the uploaded expiry family carries only the
         # SURVIVING parents (same outcome-aware rule as memberships/links).
-        uploaded_families["memory_expiry"] = [
-            e for e in families.get("memory_expiry", [])
-            if e["memory_id"] in kept_ids]
+        # Review F3: guarded on family presence — a pre-family export must
+        # not gain an empty family file (the published artifact stays
+        # four-family; it still verifies because an EMPTY family
+        # contributes no hash lines either way).
+        if "memory_expiry" in families:
+            uploaded_families["memory_expiry"] = [
+                e for e in families.get("memory_expiry", [])
+                if e["memory_id"] in kept_ids]
         # Episode summaries anchored on a held-back row are blanked to the
         # no-summary value (the episode and its surviving memberships stay;
         # the secret-linking reference does not). Re-stamp each touched
@@ -1144,12 +1150,36 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     "AND superseded_at IS NULL", (emid,)).fetchone()
                 if live is None:
                     continue
+                # Issue #414 review F4: restore records satisfy the SAME
+                # writer contract the sync path enforces (sync.py's
+                # _validate_expiry_record) — a crafted dataset cannot
+                # plant non-ISO deadlines (epoch-0.0 = permanent
+                # withhold) or unknown enum strings; a malformed record
+                # is a DatasetError, never a silent drop.
+                inject_until = erow.get("inject_until")
+                expiry_class = erow.get("expiry_class")
+                if not isinstance(inject_until, str):
+                    raise DatasetError(
+                        "malformed memory_expiry record: inject_until "
+                        "must be a string")
+                from storelib.schema import STATE_EXPIRY_CLASSES  # noqa: PLC0415
+                from storelib.state_expiry import validate_inject_until  # noqa: PLC0415
+                try:
+                    inject_until = validate_inject_until(inject_until)
+                except ValueError:
+                    raise DatasetError(
+                        "malformed memory_expiry record: inject_until "
+                        "must be UTC ISO-8601")
+                if not isinstance(expiry_class, str) \
+                        or expiry_class not in STATE_EXPIRY_CLASSES:
+                    raise DatasetError(
+                        "malformed memory_expiry record: expiry_class "
+                        "must be one of " + ", ".join(STATE_EXPIRY_CLASSES))
                 conn.execute(
                     "INSERT OR IGNORE INTO memory_expiry "
                     "(memory_id, inject_until, expiry_class) "
                     "VALUES (?, ?, ?)",
-                    (emid, erow.get("inject_until"),
-                     erow.get("expiry_class")))
+                    (emid, inject_until, expiry_class))
             episodes = [e for e in families["episodes"]
                         if namespace is None or e["namespace"] == namespace]
             # Endpoint validation after filtering: a summary reference to a

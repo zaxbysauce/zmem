@@ -4,6 +4,7 @@ All notable changes to the **zmem** plugin are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [0.132.0] - 2026-10-30
 
 ### Fixed
@@ -16,7 +17,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - **deepseek-plugin `package.json`/`package-lock.json` declare the release version (#416).** The package surfaces are bumped in the same release commit as `plugin.json` and pinned by a parity driver so the drift cannot re-open silently.
-- **Evidence versions are bound together (#416).** `support_report_problems` gains an optional `expected_version` binding (mirroring the canary gate) and a new `evidence_version_problems` cross-check binds canary-report, support-report, and the release version; the standing t14 gate tolerates only agreement or the exactly-tracked known divergence while the committed support report awaits its dsh-host regeneration (the separate delivery issue #416 names — undisclosed drift fails, and the regeneration PR must retire the disclosure).
+- **Evidence versions are bound together (#416).** `support_report_problems` gains an optional `expected_version` binding (mirroring the canary gate) and a new `evidence_version_problems` cross-check binds canary-report, support-report, and the release version; the standing t14 gate tolerates only agreement or the exactly-tracked known divergence while the committed support report awaits its dsh-host regeneration; undisclosed drift fails, and the disclosure is pinned to the release that granted it so it retires at the next bump.
 
 
 ## [0.131.0] - 2026-10-30

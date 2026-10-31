@@ -162,6 +162,60 @@ class DatasetExpirySupplementTest(unittest.TestCase):
         self.assertEqual(manifest["format"], "parquet")
         return manifest
 
+    def test_leg_e_import_refuses_invalid_expiry_values(self):
+        """F4 (second review): a checksum-consistent dataset carrying a
+        NON-ISO inject_until (or an unknown expiry_class) must be refused
+        with the designed DatasetError at import — never silently dropped
+        (a non-ISO deadline parses to epoch 0.0 = permanent withhold) and
+        never stored raw. Same craft machinery as leg a."""
+        live_id = _add_state(
+            self.env, "c3s leg-e live state: endpoint api-e.example.com")
+        export_dir = os.path.join(self.tmp, "export-e")
+        manifest = self._export(export_dir)
+        fmt = manifest["format"]
+        families = ds._read_export_families(
+            Path(export_dir), fmt, ds.DatasetError)
+        base = dict(families["memory_expiry"][0])
+        assert base["memory_id"] == live_id, base
+
+        for name, mutate in (
+                ("non-iso inject_until",
+                 lambda r: r.update(inject_until="not-a-timestamp")),
+                ("unknown expiry_class",
+                 lambda r: r.update(expiry_class="not-a-class")),
+                ("non-string inject_until",
+                 lambda r: r.update(inject_until=None))):
+            row = dict(base)
+            mutate(row)
+            row["row_checksum"] = ds.row_checksum(row)
+            families["memory_expiry"] = [row]
+            ds._write_family(Path(export_dir), "memory_expiry",
+                             [row], fmt)
+            reread = ds._read_export_families(
+                Path(export_dir), fmt, ds.DatasetError)
+            new_hash = ds._compute_snapshot_hash(reread, True)
+            m2 = dict(manifest)
+            m2["source_snapshot_hash"] = new_hash
+            m2["export_snapshot_id"] = new_hash
+            (Path(export_dir) / "manifest.json").write_bytes(
+                ds.canonical_row_bytes(m2))
+            dest = os.path.join(self.tmp, "imported-e-" + name[:6])
+            proc = _run.__globals__  # noqa: F841 - noqa silencer
+            r = subprocess.run(
+                [sys.executable, "-X", "utf8",
+                 str(REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"),
+                 "import-dataset", export_dir, "--revision", new_hash,
+                 "--dest", dest],
+                env=self.env, capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(
+                r.returncode, 0,
+                f"leg e ({name}): the import must FAIL on a malformed "
+                f"expiry record; stdout={r.stdout[-200:]}")
+            self.assertIn(
+                "malformed memory_expiry record", r.stderr,
+                f"leg e ({name}): the refusal must name the malformed "
+                f"record; stderr={r.stderr[-300:]}")
+
     def test_leg_a_doctored_record_for_tombstoned_parent_not_restored(self):
         live_id = _add_state(
             self.env, "c3s live state: endpoint api-c3s-live.example.com")

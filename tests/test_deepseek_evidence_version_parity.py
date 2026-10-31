@@ -14,11 +14,14 @@ contract only and never modifies the support module):
     (canary vs support, support vs release, canary vs release as
     applicable).
 
-Legs:
-1. LIVE divergence — the COMMITTED canary-report (0.130.0),
-   support-report (0.127.0) and release-manifest (0.130.0) disagree; the
-   new bindings must report it.  At base neither the kwarg nor the
-   function exists -> TypeError/AttributeError -> RED (nothing caught).
+Legs (version facts at the freeze anchor; the LIVE leg reads whatever the
+committed artifacts + release-manifest actually hold — it pins the DETECTION
+contract, not a specific stale triple; the t14 disclosure-ratchet owns the
+tolerated state and its retirement):
+1. LIVE divergence — the COMMITTED canary-report, support-report and
+   release-manifest disagree; the new bindings must report it.  At base
+   neither the kwarg nor the function exists -> TypeError/AttributeError
+   -> RED (nothing caught).
 2. synthetic agreement — fixture reports whose versions all equal the
    release version report NO version problems.
 3. synthetic divergence in each direction — the odd version out is

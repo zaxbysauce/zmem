@@ -94,7 +94,9 @@ def principal_lookup_from_env(env=None):
     CLI mirror of the hub-side map lookup so the capability gate enforces
     IDENTICALLY on the CLI and MCP routes; the parse is deliberately minimal
     (id, capabilities, revoked) and fail-closed: any unreadable/malformed map
-    or unknown id resolves to None => denied for the mutating kinds."""
+    or unknown id resolves to None => denied for EVERY kind (issue #414:
+    the unknown_principal gate rejects a non-empty unresolved principal
+    regardless of op kind)."""
 
     import json as _json
     import os as _os

@@ -380,6 +380,12 @@ def support_report_problems(report, repo_root=ASSERTIONS_REPO_ROOT,
 # after the regeneration — fails the gate. Remove this constant (and the
 # ratchet leg) in the regeneration PR, when both artifacts agree.
 SUPPORT_DISCLOSED_STALE_VERSION = "0.127.0"
+# The release the disclosure was granted AT (review F6): binding the
+# ratchet tuple to THIS literal (not the live release version) makes the
+# tolerance EXPIRE at the next bump — a 0.133.0-era pair no longer matches
+# the disclosed tuple and fails as undisclosed drift, forcing the
+# regeneration PR to retire the disclosure.
+SUPPORT_DISCLOSED_RELEASE = "0.132.0"
 
 
 def evidence_version_problems(canary_report, support_report,

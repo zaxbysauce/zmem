@@ -156,6 +156,60 @@ class ScopedPrincipalMatrixTest(unittest.TestCase):
             "SELECT namespace FROM memory WHERE id=?", (row_id,)
         ).fetchone()["namespace"]
 
+    def test_hub_forwarding_condition_structural(self):
+        """F1 (reviews PRR-001/F1): the MCP apply-ops handler forwards
+        --principal for ANY map principal (mode-aware), and the old
+        capabilities-gated forward is GONE from the handler. Structural
+        pin (repo convention: t09-s2); the engine leg is behaviorally
+        pinned by the frozen C1 + the executed probe recorded in the
+        review artifacts — this leg cannot drive the hub tool itself
+        (the SDK route is not importable here), which is its disclosed
+        limit."""
+        src = (REPO_ROOT / "hermes-plugin" / "server" / "mcp_server.py")
+        text = src.read_text(encoding="utf-8")
+        start = text.index("async def apply_ops")
+        end = text.index("async def ", start + 10)
+        segment = text[start:end]
+        self.assertGreaterEqual(
+            segment.count("if principal_map is not None and getattr("), 2,
+            "the map-mode forward condition must appear in BOTH routing "
+            "branches of the apply_ops handler")
+        self.assertNotIn(
+            'getattr(resolved, "capabilities", None) is not None',
+            segment,
+            "the old capabilities-gated forward must be absent from the "
+            "handler")
+
+    def test_map_principal_target_row_foreign_namespace_refused(self):
+        """F7/TC-06: the TARGET-ROW scope gate (mutations refuse when the
+        target row lives outside the allow-list) composed with a
+        MAP-DERIVED scoped principal via the REAL map loader (the frozen
+        t09 pin uses a hand-built class; the frozen C1 covers the
+        destination-namespace half)."""
+        lookup = self._install([
+            _entry("p-seed-unscoped"),
+            _entry("p-tc6", namespaces=["project:allowed"],
+                   capabilities=["mutate"]),
+        ])
+        seed = self._add(namespace="user:global", content="tc6 seed")
+        seed_receipt = self._apply([seed], "p-seed-unscoped",
+                                   lookup)["receipts"][0]
+        self.assertEqual(seed_receipt["status"], "committed",
+                         f"TC-06 seed must commit: {seed_receipt}")
+        seed_id = (seed_receipt.get("canonical_id")
+                   or seed_receipt.get("new_id"))
+        op = {"op_id": uuid.uuid4().hex, "op": "update",
+              "args": {"id_or_dep": seed_id,
+                       "content": "tc6 update attempt "
+                                  + uuid.uuid4().hex}}
+        receipt = self._apply([op], "p-tc6", lookup)["receipts"][0]
+        self.assertEqual(receipt["status"], "rejected", receipt)
+        self.assertEqual(
+            receipt.get("error"), "namespace_not_allowed",
+            f"TC-06: the map-derived scoped principal's update of a "
+            f"foreign-namespace TARGET row must be "
+            f"namespace_not_allowed, got {receipt}")
+
     def test_leg_a_absent_namespaces_stays_unscoped_legacy(self):
         lookup = self._install([_entry("p-unscoped")])
         receipt = self._apply([self._add()], "p-unscoped", lookup)["receipts"][0]
