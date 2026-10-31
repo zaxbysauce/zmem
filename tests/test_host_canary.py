@@ -633,8 +633,16 @@ class CanarySelfTestTest(unittest.TestCase):
             embeddings_mod = importlib.import_module("embeddings")
         seeded_sha = hashlib.sha256(
             (models / "minilm.onnx").read_bytes()).hexdigest()
+        seeded_tok_sha = hashlib.sha256(
+            (models / "tokenizer.json").read_bytes()).hexdigest()
         pinned = embeddings_mod._MODEL_SHA256
         embeddings_mod._MODEL_SHA256 = seeded_sha
+        # #418: the lane probe ALSO digest-checks tokenizer.json against
+        # embed_profiles.TOKENIZER_SHA256 — pin that to the seeded b"{}"
+        # bytes the same way for the duration of the probe.
+        import embed_profiles as _canary_ep
+        pinned_tok = _canary_ep.TOKENIZER_SHA256
+        _canary_ep.TOKENIZER_SHA256 = seeded_tok_sha
         # verify_checksum_cached memoizes POSITIVE verdicts on (mtime, size);
         # a matching verdict for these exact bytes was never cached before, so
         # the probe hashes them fresh against the patched pin.
@@ -642,6 +650,7 @@ class CanarySelfTestTest(unittest.TestCase):
             lanes = mod.lane_health(str(d), str(store))
         finally:
             embeddings_mod._MODEL_SHA256 = pinned
+            _canary_ep.TOKENIZER_SHA256 = pinned_tok
         vector = lanes["vector"]
         self.assertEqual(vector["status"], "active", lanes)
 

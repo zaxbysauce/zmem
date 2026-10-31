@@ -385,7 +385,7 @@ SUPPORT_DISCLOSED_STALE_VERSION = "0.127.0"
 # tolerance EXPIRE at the next bump — a 0.133.0-era pair no longer matches
 # the disclosed tuple and fails as undisclosed drift, forcing the
 # regeneration PR to retire the disclosure.
-SUPPORT_DISCLOSED_RELEASE = "0.132.0"
+SUPPORT_DISCLOSED_RELEASE = "0.133.0"
 
 
 def evidence_version_problems(canary_report, support_report,

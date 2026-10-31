@@ -2485,6 +2485,177 @@ class EmbeddingsHealthCheckTest(unittest.TestCase):
             [],
         )
 
+    def test_cross_encoder_load_policy_per_leg(self):
+        """PR-419 F-005/PRR-011: the cross_encoder health block states the
+        per-leg load policy — an explicit ZMEM_CROSS_ENCODER_MODEL stays
+        operator-vouched (no pins apply to an operator-named artifact);
+        with it unset (the profile leg) BOTH artifacts are digest-pinned.
+        Built through the REAL _check_embeddings_health in-process and
+        asserted on its details dict."""
+        import doctor
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor-loadpolicy-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        names = ("ZMEM_CROSS_ENCODER_MODEL", "ZMEM_MODELS_DIR",
+                 "ZMEM_EMBED_PROFILE", "ZMEM_MODEL_AUTODOWNLOAD",
+                 "ZMEM_DATA", "ZMEM_STORE")
+        saved = {n: os.environ.get(n) for n in names}
+
+        def _restore():
+            for n, v in saved.items():
+                if v is None:
+                    os.environ.pop(n, None)
+                else:
+                    os.environ[n] = v
+        self.addCleanup(_restore)
+        os.environ["ZMEM_DATA"] = str(tmp / "data")
+        os.environ["ZMEM_STORE"] = str(tmp / "data" / "store.sqlite")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_MODELS_DIR"] = str(tmp / "models")
+        os.environ.pop("ZMEM_EMBED_PROFILE", None)
+
+        explicit = tmp / "explicit" / "ranker.onnx"
+        explicit.parent.mkdir(parents=True, exist_ok=True)
+        explicit.write_bytes(b"explicit-leg-model-bytes")
+        no_store = tmp / "no-store-yet.sqlite"
+
+        # Leg 1: the operator NAMED the model file — it and its sibling
+        # tokenizer.json are operator-vouched (checksum_state stays
+        # informational on this leg).
+        os.environ["ZMEM_CROSS_ENCODER_MODEL"] = str(explicit)
+        ce = doctor._check_embeddings_health(no_store)["details"][
+            "cross_encoder"]
+        self.assertEqual(ce["load_policy"], "explicit-operator-vouched", ce)
+        self.assertEqual(ce["model_path_configured"], str(explicit))
+        self.assertTrue(ce["model_path"].endswith("ranker.onnx"), ce)
+
+        # Leg 2: unset — the profile leg resolves the checked-in profile and
+        # BOTH its artifacts are digest-verified against the profile pins.
+        os.environ.pop("ZMEM_CROSS_ENCODER_MODEL", None)
+        ce2 = doctor._check_embeddings_health(no_store)["details"][
+            "cross_encoder"]
+        self.assertEqual(ce2["load_policy"], "profile-pinned", ce2)
+        self.assertEqual(ce2["model_path_configured"], "")
+        self.assertTrue(
+            ce2["model_path"].endswith("mini_pair_scorer.onnx"), ce2)
+        # #418 (PRR-008): the tokenizer half is reported with its own
+        # path + state alongside the model's checksum_state.
+        self.assertTrue(ce2["tokenizer_path"].endswith("tokenizer.json"), ce2)
+        self.assertIn(
+            ce2["tokenizer_state"],
+            ("missing", "unreadable", "verified", "mismatch"),
+            ce2,
+        )
+
+    def test_doctor_tokenizer_arm_synthesized_probe_isolation(self):
+        """PRR-001 killer for the #418 tokenizer arm — scope labeled
+        honestly: SYNTHESIZED-PROBE ISOLATION. embeddings
+        .verify_checksum_cached is stubbed at the hashlib boundary (True
+        for minilm.onnx, False for tokenizer.json) while the REAL
+        doctor._check_embeddings synthesis, the REAL _recommendations
+        tokenizer branch, and the REAL _report_lane_status arm run on top
+        of it. A subprocess cannot isolate the tokenizer arm: doctor's
+        probe hashes minilm.onnx unconditionally when available, and
+        satisfying the real model pin needs the 90 MB release asset — a
+        scratch model would trip the model arm first. The raw hashlib path
+        is covered by the frozen #418 checks and by
+        tests/test_embedder_checksum.py."""
+        import types
+        from unittest import mock
+        import doctor
+        import embeddings
+
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-doctor-tokarm-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        names = ("ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+                 "ZMEM_EMBED_PROFILE", "ZMEM_DATA", "ZMEM_STORE")
+        saved = {n: os.environ.get(n) for n in names}
+
+        def _restore():
+            for n, v in saved.items():
+                if v is None:
+                    os.environ.pop(n, None)
+                else:
+                    os.environ[n] = v
+        self.addCleanup(_restore)
+        os.environ["ZMEM_MODELS_DIR"] = str(tmp / "models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ["ZMEM_DATA"] = str(tmp / "data")
+        os.environ["ZMEM_STORE"] = str(tmp / "data" / "store.sqlite")
+        os.environ.pop("ZMEM_EMBED_PROFILE", None)
+        models = tmp / "models"
+        models.mkdir()
+        # Presence is all availability_status needs; the digests are
+        # answered by the boundary stub below (model leg vouched, tokenizer
+        # leg failing) so the tokenizer arm is isolated.
+        (models / "minilm.onnx").write_bytes(b"scratch-model-bytes")
+        (models / "tokenizer.json").write_bytes(b"tampered")
+
+        def _reset_embeddings():
+            embeddings._model_available = None
+            embeddings._profile_cache_key = None
+            embeddings._model_checksum_ok = None
+            embeddings._model_load_failed = False
+            embeddings._checksum_failed_artifact = None
+            embeddings._session = None
+            embeddings._tokenizer = None
+        _reset_embeddings()
+        self.addCleanup(_reset_embeddings)
+
+        # Presence probes import onnxruntime/tokenizers/numpy — stub them
+        # so the test stays deterministic on dep-less runners too.
+        class _StubTok:
+            @classmethod
+            def from_buffer(cls, _buf):
+                return cls()
+
+        fake_np = types.ModuleType("numpy")
+        fake_ort = types.ModuleType("onnxruntime")
+        fake_tok = types.ModuleType("tokenizers")
+        fake_tok.Tokenizer = _StubTok
+        mods_backup = {k: sys.modules.get(k)
+                       for k in ("onnxruntime", "tokenizers", "numpy")}
+
+        def _restore_mods():
+            for k, v in mods_backup.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        sys.modules["onnxruntime"] = fake_ort
+        sys.modules["tokenizers"] = fake_tok
+        sys.modules["numpy"] = fake_np
+        self.addCleanup(_restore_mods)
+
+        def _vcc(path, expected=None):
+            if str(path).endswith("minilm.onnx"):
+                return True
+            if str(path).endswith("tokenizer.json"):
+                return False
+            raise AssertionError("unexpected probe path: %r" % (path,))
+
+        with mock.patch.object(embeddings, "verify_checksum_cached", _vcc):
+            check = doctor._check_embeddings()
+            lanes = doctor._report_lane_status(
+                tmp / "data" / "store.sqlite")
+
+        # The REAL _check_embeddings synthesized the tokenizer mismatch...
+        self.assertNotEqual(check["status"], "pass")
+        self.assertEqual(check["status"], "warn", check)
+        d = check["details"]
+        self.assertEqual(d["reason"], "model_checksum_mismatch", d)
+        self.assertEqual(d["checksum_artifact"], "tokenizer", d)
+        self.assertIs(d["available"], False)
+        self.assertIs(d["checksum_ok"], False)
+        # ...and the REAL remediation branch names tokenizer.json only.
+        recs = "\n".join(doctor._recommendations([check]))
+        self.assertIn("tokenizer.json FAILED its SHA-256 pin", recs)
+        self.assertNotIn("minilm.onnx FAILED", recs)
+        # Lane leg: the tokenizer arm alone flips the vector lane degraded.
+        self.assertEqual(lanes["vector"]["status"], "degraded", lanes)
+        self.assertEqual(
+            lanes["vector"]["reason"], "model_checksum_mismatch", lanes)
+
     # ------------------------------------------------------------------
     # Issue #131: the top-level `lanes` object (advisory lane statuses).
     # ------------------------------------------------------------------

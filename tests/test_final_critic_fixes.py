@@ -66,6 +66,17 @@ class FakeLocalScorerExecutes(unittest.TestCase):
             def from_file(cls, path):
                 return cls(path)
 
+            # #418: the loader constructs the tokenizer from the read
+            # buffer on BOTH legs (from_buffer). from_file stays on this
+            # stub ONLY for API compatibility — it records nothing, so it
+            # cannot make a path-construction regression observable here;
+            # the real construction guard is the from_buffer assertion in
+            # tests/test_cross_encoder.py
+            # (test_profile_path_builds_when_both_pins_match).
+            @classmethod
+            def from_buffer(cls, buf):
+                return cls(buf)
+
             def encode(self, query, text=None):
                 return FakeEnc(text if text is not None else query)
 

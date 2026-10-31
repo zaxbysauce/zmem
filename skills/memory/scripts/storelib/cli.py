@@ -1315,6 +1315,11 @@ def cmd_embedding_health(as_json: bool = False) -> int:
             "notice_present": notice_present,
             "models_dir": st.get("models_dir"),
             "profile": st.get("profile"),
+            **(
+                {"checksum_artifact": st.get("checksum_artifact")}
+                if st.get("checksum_artifact")
+                else {}
+            ),
             "last_successful_embed": last_embed,
             "last_successful_index": last_index,
             "unembedded_backlog": backlog,
