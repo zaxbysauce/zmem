@@ -389,6 +389,7 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
     if src.exists():
         src.unlink()
     out = sqlite3.connect(str(src))
+    os.chmod(src, 0o600)  # owner-only (review D: the scratch holds the decoded payload)
     ncols = len(_SNAPSHOT_COLUMNS.split(","))
     embedding_idx = 19  # position of `embedding` in _SNAPSHOT_COLUMNS
 
@@ -469,10 +470,20 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
         out.commit()
     finally:
         out.close()
-    return build_snapshot(
-        source_store=str(src), data_dir=str(_broker_dir(env)),
-        principal=str(payload.get("principal", "local")),
-        env=env, revision=payload.get("snapshot_revision"))
+    # Review D: the scratch holds the decoded payload (raw embedding
+    # blobs) — remove it once the build has consumed it (success or
+    # failure); the file is owner-only from creation.
+    try:
+        result = build_snapshot(
+            source_store=str(src), data_dir=str(_broker_dir(env)),
+            principal=str(payload.get("principal", "local")),
+            env=env, revision=payload.get("snapshot_revision"))
+    finally:
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+    return result
 
 
 def _refresh(http: Any, env: dict[str, str],
