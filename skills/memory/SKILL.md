@@ -1198,10 +1198,14 @@ EXPLICIT lane covers CLI `recall` invocations that are not `--no-bump`/
 `ZMEM_CROSS_ENCODER_MODEL` at a LOCAL pair-scoring `.onnx` plus sibling
 `tokenizer.json` keeps the operator-vouched load path. Issue #125 adds a
 checked-in `mini-pair-scorer` profile
-(`skills/memory/scripts/cross_encoder_profiles.py`, exact SHA-256 pin) used
+(`skills/memory/scripts/cross_encoder_profiles.py`, exact SHA-256 pins for
+BOTH the model and its tokenizer) used
 when `ZMEM_CROSS_ENCODER_MODEL` is unset — resolved from `ZMEM_MODELS_DIR`
-or the shared models dir, and loaded ONLY after `verify_profile_file`
-confirms the digest; `ZMEM_CROSS_ENCODER_MODEL_URL` plus exact
+or the shared models dir, and loaded ONLY after the digest of the exact
+BUFFER each runtime object is constructed from matches its profile pin at
+scorer BUILD time (#418; there is no verify-then-reopen window — the
+path-level `verify_profile_file` helper is a diagnostic API, no longer the
+load gate); `ZMEM_CROSS_ENCODER_MODEL_URL` plus exact
 `ZMEM_MODEL_AUTODOWNLOAD=1` permits one digest-verified, atomic-download
 attempt at scorer-load time. A second opt-in, `ZMEM_CROSS_ENCODER_PASSIVE=1`,
 lets the PASSIVE injection lane score its final admitted set through
@@ -1713,6 +1717,12 @@ the store first.
 | `fake` | — | 16 | — (no files/network by design) | Model-absent tests/CI ONLY; deterministic placeholders; doctor warns on non-temporary stores |
 
 Notes:
+- The minilm pair's SECOND executed artifact, `tokenizer.json`, ships its
+  own pin: `TOKENIZER_SHA256 = da0e7993…` (the full 64-hex constant in
+  `embed_profiles.py` — the checked-in tokenizer artifact's byte digest).
+  The loader digest-verifies it from the same buffer the `Tokenizer` is
+  constructed from (`from_buffer`), and `embeddings._TOKENIZER_SHA256`
+  re-exports the same constant (#418).
 - The published pin covers the ORIGINAL OPERATOR-BOX ONNX export of
   all-MiniLM-L6-v2 — preserved byte-exact in this repo's Git LFS history at
   commit `3240ea1a0cf3d972f6a7d472cee73abaddfc038d`
@@ -1757,16 +1767,21 @@ Notes:
   readers proceed on WAL snapshots. Schedule large conversions for idle
   windows.
 
-**Cross-encoder trust note** (issue #63 review round; updated by issue #125):
-the operator-supplied `ZMEM_CROSS_ENCODER_MODEL` path stays
+**Cross-encoder trust note** (issue #63 review round; updated by issues
+#125 and #418): the operator-supplied `ZMEM_CROSS_ENCODER_MODEL` path stays
 operator-vouched (no checksum pin — treat it with the same caution as any
-executable), while the DEFAULT `mini-pair-scorer` profile path is
-digest-gated by `verify_profile_file` on every load and any download is
-digest-verified before an atomic install. doctor's
+executable), while the DEFAULT `mini-pair-scorer` profile path digest-gates
+BOTH artifacts (model AND tokenizer) at scorer BUILD time — each runtime
+object is constructed only from the buffer whose SHA-256 just matched its
+profile pin, closing the verify-then-reopen window (#418) — and any
+download is digest-verified before an atomic install. doctor's
 `embeddings_health.cross_encoder` block now surfaces
-`profile`/`model_path`/`checksum_state` (`verified|mismatch|missing|
-unreadable`)/`passive`/`shadow`/`autodownload` so a missing-model silent
-degrade and the passive/shadow opt-in state stay visible.
+`profile`/`model_path`/`tokenizer_path`/`checksum_state`
+(`verified|mismatch|missing|unreadable`)/`tokenizer_state`
+(`not-applicable|missing|unreadable|verified|mismatch`)/`load_policy`
+(`explicit-operator-vouched`|`profile-pinned`)/`passive`/`shadow`/
+`autodownload` so a missing-model silent degrade and the passive/shadow
+opt-in state stay visible.
 
 ### episode-open / episode-add / episode-close / episode-list — session containers (v13, issue #65 10.7)
 

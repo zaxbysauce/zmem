@@ -31,6 +31,7 @@ SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import embed_profiles as ep  # noqa: E402
+import embeddings  # noqa: E402
 
 
 def _save_env(*names):
@@ -60,6 +61,46 @@ class RegistryShape(unittest.TestCase):
             "the pin is the operator-box ONNX export preserved at LFS commit "
             "3240ea1a (see test_documented_note_states_true_provenance); "
             "changing it is a trust-root event",
+        )
+
+    def test_tokenizer_pin_shape_and_artifact_digest(self):
+        # #418: the tokenizer trust root is a 64-hex constant pinned to the
+        # CHECKED-IN artifact's bytes (the LFS oid IS the content digest).
+        # Skips honestly on a pointer-only checkout (LFS content absent) —
+        # the CI provisioned lane asserts the same pin on real bytes.
+        import hashlib
+        import re
+
+        pin = ep.TOKENIZER_SHA256
+        self.assertIsInstance(pin, str)
+        self.assertRegex(pin, re.compile(r"^[0-9a-f]{64}$"))
+        artifact = REPO_ROOT / "skills" / "memory" / "models" / "tokenizer.json"
+        data = artifact.read_bytes()
+        if data.lstrip().startswith(b"version https://git-lfs"):
+            raise unittest.SkipTest(
+                "tokenizer.json is an LFS pointer in this checkout; the "
+                "provisioned-model CI lane asserts the pin on real bytes"
+            )
+        self.assertEqual(
+            hashlib.sha256(data).hexdigest(),
+            pin,
+            "TOKENIZER_SHA256 must equal the checked-in tokenizer.json "
+            "digest; changing either is a trust-root event",
+        )
+
+    def test_embeddings_reexports_the_same_tokenizer_pin(self):
+        # #418 re-export contract: embeddings._TOKENIZER_SHA256 is the
+        # LOAD-PATH gate (the call-time attr tests monkeypatch); ep
+        # .TOKENIZER_SHA256 is the published pin (doctor's probe and the CI
+        # lane's needle). They must be the SAME constant — a divergent
+        # re-export would gate the loader on a digest no other surface
+        # checks.
+        self.assertEqual(
+            embeddings._TOKENIZER_SHA256,
+            ep.TOKENIZER_SHA256,
+            "embeddings._TOKENIZER_SHA256 must re-export "
+            "embed_profiles.TOKENIZER_SHA256; a divergence is a trust-root "
+            "event",
         )
 
     def test_fake_profile_self_describing(self):

@@ -57,6 +57,21 @@ DEFAULT_PROFILE = "minilm"
 # root.
 MINILM_SHA256 = "bbd7b466f6d58e646fdc2bd5fd67b2f5e93c0b687011bd4548c420f7bd46f0c5"
 
+# Trust root for the checked-in tokenizer artifact (issue #418): sha256 of
+# skills/memory/models/tokenizer.json preserved byte-exact in this
+# repository's Git LFS history (711,661 bytes; the LFS oid IS the content
+# digest, so `git lfs ls-files` cross-checks this constant). This pin covers
+# the MINILM EMBEDDER's tokenizer load only — the cross-encoder
+# mini-pair-scorer profile pins its OWN (different, fixture-pair) tokenizer
+# as `tokenizer_sha256` in cross_encoder_profiles.py; two artifacts, two
+# pins. Same laws as
+# MINILM_SHA256: no env override, no unverified-load escape hatch; a mismatch
+# means "the wrong tokenizer bytes got installed", never "disable
+# verification". The load path verifies from the SAME buffer the Tokenizer is
+# constructed from (Tokenizer.from_buffer), extending the #36 M15
+# verify-then-reopen closure to the tokenizer.
+TOKENIZER_SHA256 = "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0"
+
 MINILM_NOTES = (
     "Published sha256 is of the original operator-box ONNX export of "
     "all-MiniLM-L6-v2 (preserved in this repo's LFS history at "

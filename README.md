@@ -1846,9 +1846,14 @@ The digest must match the pinned SHA-256 in
 actions — either one restores the vector lane when the runtime deps import
 and the active profile is valid (`imports_missing` needs the embedding
 runtime installed; `unknown_profile` needs a valid `ZMEM_EMBED_PROFILE`):
-(1) install a checksum-matching `minilm.onnx` (plus `tokenizer.json`) at
-the resolved models dir; or (2) set `ZMEM_MODEL_URL` to a source whose
-bytes match the pinned SHA-256 together with `ZMEM_MODEL_AUTODOWNLOAD=1`.
+(1) install a checksum-matching `minilm.onnx` AND a `tokenizer.json` whose
+bytes match its own pinned SHA-256 (`embed_profiles.TOKENIZER_SHA256` —
+the tokenizer is digest-verified at load exactly like the model; restore it
+from the plugin-bundled copy at `skills/memory/models/tokenizer.json`, or
+fetch the upstream `Xenova/all-MiniLM-L6-v2` tokenizer.json whose digest
+equals the pin) at the resolved models dir; or (2) set `ZMEM_MODEL_URL` to
+a source whose bytes match the pinned SHA-256 together with
+`ZMEM_MODEL_AUTODOWNLOAD=1`.
 Note that the default Xenova export URL is NOT byte-identical to the
 pinned hash — different ONNX export toolchains produce different bytes
 for the same weights, which is exactly what the checksum refuses. No

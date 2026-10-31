@@ -927,22 +927,35 @@ def _check_embeddings() -> dict:
             )
         except Exception:
             ck_ok = None
-        if ck_ok is False:
-            note = ""
-            try:
-                import embed_profiles as _ep
+        # #418: the tokenizer is a SECOND executed artifact with its own pin
+        # (embed_profiles.TOKENIZER_SHA256). The same fresh-process blind spot
+        # applies: the load never ran here, so a tampered tokenizer.json would
+        # read as healthy forever. Hash both pins; the FIRST mismatching
+        # artifact names itself via checksum_artifact so the remediation
+        # branch below stays artifact-accurate through the doctor CLI.
+        try:
+            import embed_profiles as _ep_tok  # noqa: E402
 
-                note = _ep.PROFILES[_ep.DEFAULT_PROFILE]["notes"]
-            except Exception:
-                pass
+            tok_ok = embeddings.verify_checksum_cached(
+                Path(st["models_dir"]) / "tokenizer.json",
+                expected=_ep_tok.TOKENIZER_SHA256,
+            )
+        except Exception:
+            tok_ok = None
+        mismatch_artifact = None
+        if ck_ok is False:
+            mismatch_artifact = "model"
+        elif tok_ok is False:
+            mismatch_artifact = "tokenizer"
+        if mismatch_artifact is not None:
             st = {
                 **st,
                 "available": False,
                 "reason": "model_checksum_mismatch",
                 "checksum_ok": False,
-                **({"note": note} if note else {}),
+                "checksum_artifact": mismatch_artifact,
             }
-        elif ck_ok is True and st.get("checksum_ok") is None:
+        elif ck_ok is True and tok_ok is True and st.get("checksum_ok") is None:
             st = {**st, "checksum_ok": True}
 
     status = "pass" if st["available"] else "warn"
@@ -973,6 +986,7 @@ def _check_embeddings() -> dict:
         profile=profile,
         dim=st.get("dim"),
         checksum_ok=st.get("checksum_ok"),
+        checksum_artifact=st.get("checksum_artifact"),
         **({"note": st["note"]} if st.get("note") else {}),
     )
 
@@ -4086,29 +4100,60 @@ def _recommendations(checks: list[dict]) -> list[str]:
                 )
         elif reason in ("model_file_missing", "tokenizer_missing"):
             # Both files are required — say so explicitly so a tokenizer-only
-            # outage isn't mis-diagnosed as "add the model".
+            # outage isn't mis-diagnosed as "add the model". Both files are
+            # digest-verified on the load path against their pinned SHA-256s
+            # (#418): minilm.onnx against the MINILM_SHA256 pin (model-
+            # minilm-bbd7b466 asset) and tokenizer.json against its LFS-oid
+            # pin — state each file's actual verification state, not an
+            # operator-action claim.
             notes.append(
                 "Embeddings are disabled because minilm.onnx and/or tokenizer.json "
-                "are absent from the resolved models dir. Both files are required: "
-                "place a checksum-verified minilm.onnx AND tokenizer.json there "
-                "(or set ZMEM_MODEL_URL to a source matching the pinned SHA-256 "
-                "plus ZMEM_MODEL_AUTODOWNLOAD=1). After enabling, run `reembed` "
-                "to backfill existing rows. Degraded FTS5/lexical operation is "
-                "supported meanwhile."
+                "are absent from the resolved models dir. Both files are required, "
+                "and both are SHA-256-verified at load: minilm.onnx against the "
+                "pinned model digest (set ZMEM_MODEL_URL to a source matching it "
+                "plus ZMEM_MODEL_AUTODOWNLOAD=1) and tokenizer.json against its "
+                "pinned digest (copy the tokenizer.json bundled with your zmem "
+                "plugin install — skills/memory/models/tokenizer.json — into the "
+                "resolved models dir; in a git checkout, `git lfs checkout "
+                "skills/memory/models/tokenizer.json` works too). After enabling, "
+                "run `reembed` to backfill existing rows. Degraded FTS5/lexical "
+                "operation is supported meanwhile."
             )
         elif reason == "model_checksum_mismatch":
             # Issue #63, 8.1: name WHY a hash can differ from what the operator
             # expected, so nobody 'fixes' verification by disabling it. There
-            # is deliberately NO unverified-load escape hatch.
+            # is deliberately NO unverified-load escape hatch. #418: the
+            # reason covers BOTH artifacts' pins — name the file that
+            # actually mismatched (checksum_artifact) instead of always
+            # blaming minilm.onnx. Absent checksum_artifact (an older client's
+            # status shape) keeps the model wording.
             note = details.get("note") or ""
-            notes.append(
-                "The installed minilm.onnx FAILED its checksum pin. "
-                + note
-                + " Restore the pinned bytes from the model-minilm-bbd7b466 "
-                "release asset (or point "
-                "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
-                "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
-            )
+            if details.get("checksum_artifact") == "tokenizer":
+                # Tokenizer remediation must stay tokenizer-scoped: no
+                # interpolation of the MODEL provenance note (that was the
+                # PR-419 review finding — model release-asset advice rendered
+                # under a tokenizer failure).
+                notes.append(
+                    "The installed tokenizer.json FAILED its SHA-256 pin "
+                    "(the pin equals the byte digest of the upstream "
+                    "Xenova/all-MiniLM-L6-v2 tokenizer.json). Restore the "
+                    "pinned bytes: copy the tokenizer.json bundled with your "
+                    "zmem plugin install (skills/memory/models/tokenizer.json) "
+                    "into the resolved models dir, or download "
+                    "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/"
+                    "main/tokenizer.json — its SHA-256 must equal the pin; "
+                    "the tokenizer stays refused until then and embeddings "
+                    "stay degraded."
+                )
+            else:
+                notes.append(
+                    "The installed minilm.onnx FAILED its checksum pin. "
+                    + note
+                    + " Restore the pinned bytes from the model-minilm-bbd7b466 "
+                    "release asset (or point "
+                    "ZMEM_MODEL_URL at a source matching the pinned SHA-256 with "
+                    "ZMEM_MODEL_AUTODOWNLOAD=1); the model stays refused until then."
+                )
         else:
             notes.append(
                 "Embeddings are disabled; semantic recall/dedup is off (degraded "
@@ -4536,10 +4581,13 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
         # model against the mini-pair-scorer profile digest regardless of
         # how the path was resolved — an operator-supplied file whose bytes
         # differ reports "mismatch" informationally while the load policy
-        # stays operator-vouched.
+        # stays operator-vouched. #418: load_policy names that policy
+        # explicitly per leg (see the load_policy construction below).
         ce_profile = ce_profile_name = None
         ce_model_resolved = ""
+        ce_tok_resolved = ""
         ce_checksum_state = "missing"
+        ce_tokenizer_state = "not-applicable"
         try:
             # doctor.py lives in the scripts dir itself; make the sibling
             # profile/cross-encoder modules importable when doctor is loaded
@@ -4554,6 +4602,7 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
             ce_profile_name = _ce_profiles.DEFAULT_PROFILE
             model_path, _tok_path = _ce.resolve_model_paths()
             ce_model_resolved = model_path or ""
+            ce_tok_resolved = _tok_path or ""
             if model_path:
                 model_file = Path(model_path)
                 if not model_file.is_file():
@@ -4576,11 +4625,42 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                             ce_checksum_state = "verified"
                         else:
                             ce_checksum_state = "mismatch"
+            # #418 (PR-419 review PRR-008): the tokenizer half of the pair is
+            # pinned too — report its OWN state so "verified" on the model can
+            # no longer coexist silently with a loader-refused tokenizer.
+            ce_tokenizer_state = "not-applicable"
+            if _tok_path and ce_profile:
+                tok_file = Path(_tok_path)
+                if not tok_file.is_file():
+                    ce_tokenizer_state = "missing"
+                else:
+                    try:
+                        tok_digest = hashlib.sha256()
+                        with open(tok_file, "rb") as fh:
+                            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                                tok_digest.update(chunk)
+                    except OSError:
+                        ce_tokenizer_state = "unreadable"
+                    else:
+                        ce_tokenizer_state = (
+                            "verified"
+                            if tok_digest.hexdigest()
+                            == (ce_profile.get("tokenizer_sha256") or "").lower()
+                            else "mismatch"
+                        )
         except Exception:
             ce_profile = None
         passive_on = os.environ.get("ZMEM_CROSS_ENCODER_PASSIVE", "0") == "1"
         shadow_on = os.environ.get("ZMEM_CROSS_ENCODER_SHADOW", "0") == "1"
         autodl = os.environ.get("ZMEM_MODEL_AUTODOWNLOAD", "0") == "1"
+        # #418: state the LOAD-POLICY truth for each leg. Explicit leg: the
+        # operator named the model file, so BOTH it and its sibling
+        # tokenizer.json are operator-vouched (no pins apply; checksum_state
+        # above stays informational). Profile leg: BOTH artifacts are
+        # digest-verified on the load path against the profile pins.
+        ce_load_policy = (
+            "explicit-operator-vouched" if ce_model_cfg else "profile-pinned"
+        )
         details["cross_encoder"] = {
             "enabled": ce_enabled,
             "model_path_configured": ce_model_cfg,
@@ -4588,7 +4668,10 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
             "tokenizer_file_present": ce_tok_present if ce_model_cfg else None,
             "profile": ce_profile_name,
             "model_path": ce_model_resolved,
+            "tokenizer_path": ce_tok_resolved,
             "checksum_state": ce_checksum_state,
+            "tokenizer_state": ce_tokenizer_state,
+            "load_policy": ce_load_policy,
             "passive": passive_on,
             "shadow": shadow_on,
             "autodownload": "enabled" if autodl else "disabled",
@@ -6210,10 +6293,20 @@ def _report_lane_status(resolved_store: Path) -> dict:
                 and st.get("models_dir")):
             try:
                 from pathlib import Path as _PD
-                if embeddings.verify_checksum_cached(
-                        _PD(st["models_dir"]) / "minilm.onnx") is False:
+                import embed_profiles as _ep_lane  # noqa: E402
+                model_bad = embeddings.verify_checksum_cached(
+                    _PD(st["models_dir"]) / "minilm.onnx") is False
+                # #418: the tokenizer pin gets the same lane probe so all
+                # three lane surfaces agree with the load path on either
+                # artifact's mismatch.
+                tok_bad = embeddings.verify_checksum_cached(
+                    _PD(st["models_dir"]) / "tokenizer.json",
+                    expected=_ep_lane.TOKENIZER_SHA256) is False
+                if model_bad or tok_bad:
                     st = dict(st, available=False,
-                              reason="model_checksum_mismatch")
+                              reason="model_checksum_mismatch",
+                              checksum_artifact=(
+                                  "model" if model_bad else "tokenizer"))
             except Exception:
                 pass
     except Exception:

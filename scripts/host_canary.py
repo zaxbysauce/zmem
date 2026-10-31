@@ -272,12 +272,24 @@ def lane_health(data_dir, store_path):
             if (availability.get("available")
                     and availability.get("models_dir")):
                 try:
-                    if _embeddings.verify_checksum_cached(
-                            Path(availability["models_dir"])
-                            / "minilm.onnx") is False:
+                    import embed_profiles as _ep_canary  # noqa: E402
+
+                    model_bad = _embeddings.verify_checksum_cached(
+                        Path(availability["models_dir"])
+                        / "minilm.onnx") is False
+                    # #418: the tokenizer pin gets the same probe so the
+                    # canary lane agrees with doctor and the load path on
+                    # either artifact's mismatch.
+                    tok_bad = _embeddings.verify_checksum_cached(
+                        Path(availability["models_dir"])
+                        / "tokenizer.json",
+                        expected=_ep_canary.TOKENIZER_SHA256) is False
+                    if model_bad or tok_bad:
                         availability = dict(
                             availability, available=False,
-                            reason="model_checksum_mismatch")
+                            reason="model_checksum_mismatch",
+                            checksum_artifact=(
+                                "model" if model_bad else "tokenizer"))
                 except Exception:
                     pass
         except Exception as exc:

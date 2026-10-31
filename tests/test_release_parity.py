@@ -552,6 +552,13 @@ class CiWorkflowContractTest(unittest.TestCase):
                       "ci.yml lost the release-asset download")
         self.assertIn("embed_profiles.MINILM_SHA256", self.yml,
                       "ci.yml must derive the pin from the in-repo constant")
+        # #418: the lane asserts the TOKENIZER pin from the in-repo constant
+        # too — a wrong-bytes tokenizer must fail at provisioning, not
+        # surface downstream.
+        self.assertIn("embed_profiles.TOKENIZER_SHA256", self.yml,
+                      "ci.yml must assert the tokenizer pin from the "
+                      "in-repo constant (the #418 lane sha-verifies "
+                      "tokenizer.json)")
         self.assertIn("lfs: true", self.yml,
                       "ci.yml lost the LFS checkout (tokenizer.json is an LFS "
                       "object; a plain checkout materializes the pointer)")

@@ -57,6 +57,12 @@ _model_checksum_ok: bool | None = None
 # tokenizer.json, unparseable ONNX, etc.). Distinct from a checksum mismatch so
 # availability_status can report an accurate reason (cubic-2 final-critic).
 _model_load_failed: bool = False
+# WHICH artifact failed its load-path checksum ("model" | "tokenizer"; None
+# until a mismatch fires). The machine-readable reason stays
+# model_checksum_mismatch for lockstep compatibility — this attribute exists
+# so availability_status()/doctor can name the right FILE in their text
+# instead of blaming minilm.onnx for a tokenizer.json mismatch (#418).
+_checksum_failed_artifact: str | None = None
 _MODEL_DIM = 384
 
 # sha256 pinned for minilm.onnx: the original operator-box ONNX export of
@@ -67,6 +73,12 @@ _MODEL_DIM = 384
 # monkeypatch it here and `verify_checksum` resolves its default at call time
 # via this name (#36 M15; issue #63 8.1 keeps that contract intact).
 _MODEL_SHA256 = _profiles.MINILM_SHA256
+
+# sha256 pinned for tokenizer.json (issue #418): the checked-in LFS artifact
+# (LFS oid IS the content digest). Re-export of the registry value so
+# `embed_profiles` stays the single source of truth; kept as this module
+# attribute for the same test-patching contract as `_MODEL_SHA256`.
+_TOKENIZER_SHA256 = _profiles.TOKENIZER_SHA256
 
 # Default source for a lazy download when the model file is absent. This is
 # the widely-used Xenova ONNX export of all-MiniLM-L6-v2 (same architecture/
@@ -389,7 +401,7 @@ def _check_available() -> bool:
 
 def _ensure_loaded():
     """Lazy-load the ONNX session and tokenizer. Called on first embed."""
-    global _session, _tokenizer, _model_available, _model_checksum_ok, _model_load_failed
+    global _session, _tokenizer, _model_available, _model_checksum_ok, _model_load_failed, _checksum_failed_artifact
     if _session is not None:
         return
     if current_profile_name() == "fake":
@@ -419,6 +431,7 @@ def _ensure_loaded():
     except OSError:
         _model_available = False
         _model_checksum_ok = False
+        _checksum_failed_artifact = "model"
         # Unreadable model file: availability_status() reports this as a
         # checksum mismatch via the _model_checksum_ok=False ladder — pin the
         # same slug here so the notice vocabulary stays single-sourced.
@@ -427,6 +440,7 @@ def _ensure_loaded():
     if actual_sha != _MODEL_SHA256:  # call-time attr: tests patch it
         _model_available = False
         _model_checksum_ok = False
+        _checksum_failed_artifact = "model"
         try:
             print(
                 "[zmem] WARNING: refusing to load minilm.onnx — checksum mismatch "
@@ -440,13 +454,49 @@ def _ensure_loaded():
             pass
         _maybe_notice_degraded()
         return
-    # Load the session + tokenizer. A corrupt/unreadable tokenizer.json (or any
-    # load-time error) must fail OPEN to the degraded path, not propagate into
-    # unguarded callers (add/hybrid-search hard-failing). This mirrors the
-    # checksum-mismatch fail-open above (cubic-1/2, #36 M15 residual).
+    # Tokenizer pin (#418): read tokenizer.json ONCE and verify the digest of
+    # the SAME buffer the Tokenizer is constructed from below — the #36 M15
+    # verify-then-reopen closure extended to the second executed artifact. A
+    # mismatch fails OPEN to the degraded path exactly like a model mismatch;
+    # the reason stays model_checksum_mismatch (lockstep vocabulary) while
+    # _checksum_failed_artifact names the file for doctor's remediation text.
+    try:
+        tok_bytes = (models_dir / "tokenizer.json").read_bytes()
+        tok_actual = hashlib.sha256(tok_bytes).hexdigest()
+    except OSError:
+        _model_available = False
+        _model_checksum_ok = False
+        _checksum_failed_artifact = "tokenizer"
+        _maybe_notice_degraded("model_checksum_mismatch")
+        return
+    if tok_actual != _TOKENIZER_SHA256:  # call-time attr: tests patch it
+        _model_available = False
+        _model_checksum_ok = False
+        _checksum_failed_artifact = "tokenizer"
+        try:
+            print(
+                "[zmem] WARNING: refusing to load tokenizer.json — checksum "
+                "mismatch (the file at the models dir does not match the pinned "
+                "SHA-256). Falling back to degraded FTS5/lexical operation. "
+                "Restore the pinned bytes: copy the tokenizer.json bundled with "
+                "your zmem plugin install (skills/memory/models/tokenizer.json) "
+                "into the resolved models dir, or fetch the upstream "
+                "Xenova/all-MiniLM-L6-v2 tokenizer.json — its SHA-256 must "
+                "equal the pin (run `zmem doctor` for details).",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        _maybe_notice_degraded()
+        return
+    # Load the session + tokenizer. A digest-VERIFIED but still unloadable
+    # artifact (unparseable ONNX, broken tokenizers install) must fail OPEN to
+    # the degraded path, not propagate into unguarded callers (add/
+    # hybrid-search hard-failing). This mirrors the checksum-mismatch
+    # fail-open above (cubic-1/2, #36 M15 residual).
     try:
         _session = ort.InferenceSession(model_bytes)
-        _tokenizer = Tokenizer.from_file(str(models_dir / "tokenizer.json"))
+        _tokenizer = Tokenizer.from_buffer(tok_bytes)
         _tokenizer.enable_padding(length=128)
         _tokenizer.enable_truncation(max_length=128)
         _model_checksum_ok = True
@@ -658,6 +708,7 @@ def availability_status() -> dict:
                 "missing_imports": missing, "models_dir": str(models_dir),
                 "interpreter": sys.executable or "", "model_file": model_file,
                 "tokenizer_file": tokenizer_file, "checksum_ok": False,
+                "checksum_artifact": _checksum_failed_artifact,
                 "load_failed": _model_load_failed}
     return {**base_note, "available": True, "reason": "ok",
             "missing_imports": missing, "models_dir": str(models_dir),
@@ -733,6 +784,11 @@ def degraded_notice(reason: str, *, data_dir=None, now=None) -> bool:
             import time
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     payload = (
+        # The four-line shape is a BYTE CONTRACT (issue #131, pinned by
+        # test_model_fallback's canonical-notice battery): reason /
+        # models_dir / profile / timestamp. #418's artifact attribution
+        # rides the CLI JSON and the write-path warning instead — NOT here
+        # (review round 2: the extra line broke the pinned contract).
         f"reason={reason}\n"
         f"models_dir={_resolve_models_dir()}\n"
         f"profile={current_profile_name() or 'unknown'}\n"

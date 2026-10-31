@@ -957,12 +957,21 @@ def _warn_degraded_embeddings_once(content: str) -> None:
             models_dir = st.get("models_dir") or "(unknown)"
             missing = st.get("missing_imports") or []
             detail = ""
+            artifact = None
             if reason == "imports_missing" and missing:
                 detail = f" (missing python modules: {', '.join(missing)})"
             elif reason == "model_file_missing":
                 detail = " (minilm.onnx absent from the resolved models dir)"
             elif reason == "tokenizer_missing":
                 detail = " (tokenizer.json absent from the resolved models dir)"
+            elif reason == "model_checksum_mismatch":
+                # #418: the same reason covers both executed artifacts' pins;
+                # name the one that failed so the operator fixes the right
+                # file (the availability dict carries it additively).
+                artifact = st.get("checksum_artifact") or "model"
+                detail = (
+                    f" (the installed {artifact + '.onnx' if artifact == 'model' else artifact + '.json'}"
+                    " failed its SHA-256 pin; run `zmem doctor` for the restore steps)")
             # Issue #131: the write path is the first-live-capture surface for
             # presence-level reasons (is_available()'s gate short-circuits
             # before _ensure_loaded, so a missing model never reaches the load
@@ -976,9 +985,9 @@ def _warn_degraded_embeddings_once(content: str) -> None:
                 "[zmem] WARNING: memory stored without an embedding — semantic "
                 "dedup-on-write, vector recall, and embedding-seeded "
                 f"consolidation are disabled for this row. Reason: {reason}{detail}. "
-                f"Resolved models_dir: {models_dir}. To enable embeddings, place a "
-                "checksum-verified minilm.onnx there (or set ZMEM_MODEL_URL to a "
-                "source matching the pinned SHA-256 plus ZMEM_MODEL_AUTODOWNLOAD=1), "
+                f"Resolved models_dir: {models_dir}. To enable embeddings, restore the "
+                "pinned bytes of the failing file (see the reason above; run `zmem doctor` "
+                "for per-artifact restore steps), "
                 "install onnxruntime/tokenizers/numpy, then run `reembed` to "
                 "backfill. Degraded FTS5/lexical operation remains supported.",
                 file=sys.stderr,

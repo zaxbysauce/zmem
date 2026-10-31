@@ -5,6 +5,21 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.133.0] - 2026-10-31
+
+### Fixed
+
+- **Model-artifact load-path integrity: every executed artifact on a leg where a pin can exist is now digest-verified from the same buffer it is constructed from (#418).** The minilm tokenizer (`embeddings.py`) is loaded via `Tokenizer.from_buffer` on bytes whose SHA-256 was just compared against the new `embed_profiles.TOKENIZER_SHA256` pin (the checked-in LFS artifact's digest, `da0e7993…`) — a tampered tokenizer now fails open to the degraded path exactly like a tampered model, with `checksum_artifact` naming the file so doctor's remediation names tokenizer.json instead of blaming minilm.onnx (additive availability key; the machine-readable reason vocabulary is unchanged). The explicit `ZMEM_CROSS_ENCODER_MODEL` leg stays operator-vouched, as the cross-encoder bullet below states.
+- **Upgrade note (review F-013): hosts whose `tokenizer.json` bytes are not the pinned digest move from embeddings-enabled to degraded after this upgrade.** The tokenizer pin is NEW in this release; the bytes at the resolved models dir must equal the bundled copy (`skills/memory/models/tokenizer.json`) or the upstream Xenova/all-MiniLM-L6-v2 tokenizer.json digest — otherwise embeddings degrade (FTS5/lexical) until the pinned bytes are restored, with doctor naming tokenizer.json as the failing artifact.
+- **Cross-encoder profile leg closes the verify-then-reopen window (#418).** `storelib/cross_encoder.py` previously verified the model via a path read (`verify_profile_file`) and then built the session from a second read; both artifacts (model AND tokenizer) are now verified by the digest of the exact buffer that reaches `InferenceSession`/`Tokenizer.from_buffer`, refusing closed to the degraded no-rerank path (`load-error`) on mismatch. The profile registry pins its own tokenizer half (`tokenizer_sha256`, the fixture-pair artifact digest `caef352a…`, import-time validated alongside the model pin). The explicit `ZMEM_CROSS_ENCODER_MODEL` leg stays operator-vouched per the module's load-bearing policy — an operator-named custom artifact has no profile pin — and doctor now states that per leg via a structured `load_policy` field (`explicit-operator-vouched` | `profile-pinned`).
+- **Doctor wording truth (#418).** The embedding remediation no longer claims a "checksum-verified … AND tokenizer.json" state that did not exist; it now states each file's actual verification state (both are SHA-256-verified at load against their pins) and, on a checksum mismatch, names the artifact that actually failed. Doctor's probe digest-verifies BOTH artifacts (minilm.onnx and tokenizer.json) through the real CLI and the remediation names the failing one — pinned end-to-end by the in-process doctor test in `tests/test_doctor.py` (`test_doctor_tokenizer_arm_synthesized_probe_isolation`, which stubs only the hashlib boundary and runs the real `_check_embeddings` synthesis, `_recommendations` branch, and `_report_lane_status` arm).
+- **Provisioned-model CI lane asserts the tokenizer digest (#418).** The `test-real-model` job sha-verifies the provisioned `tokenizer.json` against `embed_profiles.TOKENIZER_SHA256` in the same loud provisioning boundary that catches LFS-pointer checkouts — wrong-bytes tokenizers now fail at provisioning instead of surfacing downstream.
+- **Tests pinning the pre-#418 shapes migrated.** `test_cross_encoder.py`'s digest-gate proof no longer requires the verify-then-reopen bypass to succeed (the buffer gate is pinned directly: path-verifier vouched + wrong-digest bytes still refuses; a both-pins-match positive arm constructs from the verified buffers); `test_final_critic_fixes.py` and `test_model_fallback.py` stubs/patches follow the unified `from_buffer` construction and the tokenizer pin seam.
+
+### Companion (cross-repo)
+
+- zmem #309 closes via the ZaxbyHub/opencode-swarm PR that word-boundaries the deferred-work scanner's bare markers (fix branch `fix/scan-deferred-word-boundary-309`): `ZMEM_MODEL_AUTODOWNLOAD` no longer false-positives the scan, the plural list-header marker shape still reports, and regression cases run in that repo's suite on all three CI operating systems.
+
 ## [0.132.0] - 2026-10-30
 
 ### Fixed
@@ -18,7 +33,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - **deepseek-plugin `package.json`/`package-lock.json` declare the release version (#416).** The package surfaces are bumped in the same release commit as `plugin.json` and pinned by a parity driver so the drift cannot re-open silently.
 - **Evidence versions are bound together (#416).** `support_report_problems` gains an optional `expected_version` binding (mirroring the canary gate) and a new `evidence_version_problems` cross-check binds canary-report, support-report, and the release version; the standing t14 gate tolerates only agreement or the exactly-tracked known divergence while the committed support report awaits its dsh-host regeneration; undisclosed drift fails, and the disclosure is pinned to the release that granted it so it retires at the next bump.
-
 
 ## [0.131.0] - 2026-10-30
 
