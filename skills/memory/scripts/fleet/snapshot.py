@@ -420,10 +420,10 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
         # state rows' memory_expiry side records. Older hubs omit the key
         # (tolerated: every row stays live by the missing-side-row law);
         # a newer hub ships [memory_id, inject_until, expiry_class]
-        # triplets, restored ONLY onto rows this payload actually shipped
-        # (a hostile or orphan triplet is skipped, not landed — foreign
-        # keys are inert, so the parent check is explicit) and INSERT OR
-        # IGNORE so a duplicate triplet can never error the build.
+        # triplets, and ANY violation (malformed shape, unshipped id,
+        # non-live-state parent, value-contract breach) is a ValueError —
+        # the refresh's designed degrade that keeps the previous pair —
+        # never a silent skip or a landed orphan (review F5).
         shipped = {str(r[0]) for r in payload.get("rows", [])
                    if isinstance(r, (list, tuple)) and r}
         expiry_rows = []

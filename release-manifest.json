@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "8f5dc6c495fc93a631370a8921e8b3624e6de80da8f0ba595116b255b148b2a2",
+  "digest": "1f112cc23d2d5ec1016bcc63ddd4d8ace499e466706b585e3f02fb4fa128303b",
   "files": {
     ".agents/plugins/marketplace.json": "3b2e8b3bf6a9df8701b609f982a07a6b12d688eba7e489f25d7066285c5e3375",
     ".claude-plugin/marketplace.json": "0cdd2de9e8518da47bb14260737269bbf1429d0622c698fe2b791d58fef34082",
@@ -94,7 +94,7 @@
     "skills/memory/scripts/fleet/broker_cli.py": "3fff83f4fe59922cb3b5bedc4ad7fa4e0fdec25c506e3ba584f95754efba6e2d",
     "skills/memory/scripts/fleet/map_perms.py": "0a2b4f4ab7c9dd274ff24f63ddc0717338ea85e691fcb8673e041e6104a2aab3",
     "skills/memory/scripts/fleet/opqueue.py": "a42444214c5a8dbe3237f103b83677c2b923896caff14b9ace7a52de4dbaf650",
-    "skills/memory/scripts/fleet/snapshot.py": "a82e6988776f153bdd9fc934d974da010e00dc86ba10e3161310cadcc4877017",
+    "skills/memory/scripts/fleet/snapshot.py": "3300d4e3b8bfb54fa3cb737557d1940fa78656909e7bf97ebe4d50cd0ac112e4",
     "skills/memory/scripts/fleet/transport.py": "c3aeed4eae93d368332a2b3b14435fc946b890a0204be37197a350352f2454f1",
     "skills/memory/scripts/history_mining.py": "83cf4930a502fb581818ef174a17753bc525e28e7295cf7d3d48292ca42f6672",
     "skills/memory/scripts/host.py": "a44b9b783c0c681e9674f32ad8a18a6f7e6c7b1de0c017902848b4b977950465",
@@ -111,7 +111,7 @@
     "skills/memory/scripts/storelib/config.py": "36448a1f80cdfc60b5ddd101a679a166f1522ad1e2eb3555139bac351ec7fc38",
     "skills/memory/scripts/storelib/consolidate.py": "f4f30c9d7dcf69cdc17a01235af56f87918000f630c53cc377d28979f72fae82",
     "skills/memory/scripts/storelib/cross_encoder.py": "ade337864a64e697178792426c442aaa5e01a5002526e18531eb6da4c001e6d2",
-    "skills/memory/scripts/storelib/dataset.py": "78545a1eb707f7a6e368a596062a8520a3415a96611c60777983bf7df83e65b8",
+    "skills/memory/scripts/storelib/dataset.py": "b0ae6bc8dad5ff0afe66f1d005b6be5131430c1db03faf92e7e81b2cf7abad4d",
     "skills/memory/scripts/storelib/decision_report.py": "453107144d11e8a41f68e0cdb2db9bd9cf78a231fb001ded42d62d562af9c2e1",
     "skills/memory/scripts/storelib/delivery_ledger.py": "031aedebf2f90237ae7e14940cf0124dd043d4c940669bb5b474016fb2b1ada0",
     "skills/memory/scripts/storelib/entity.py": "880754b2219909a8d79e510707ed251b7bed53e029ada1e0fbd1586bec3352f7",

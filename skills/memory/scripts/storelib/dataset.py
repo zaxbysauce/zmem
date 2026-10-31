@@ -905,9 +905,10 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
                 "status": "unscanned", "override": "--allow-unscanned"}
         for family in DATASET_FAMILIES:
             if family not in uploaded_families:
-                # Additive family absent from a pre-family export: writing
-                # an empty file would change the recomputed snapshot hash
-                # and make the published artifact unverifiable — publish
+                # Additive family absent from a pre-family export: keep the
+                # published artifact four-family (an EMPTY family would
+                # contribute no hash lines either way, but writing one would
+                # advertise a family the export never evaluated) — publish
                 # exactly the families the export carried.
                 continue
             rows = uploaded_families[family]
