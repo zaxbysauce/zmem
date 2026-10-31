@@ -20,7 +20,8 @@ SQLite store:
 Identity (two-pass, non-circular): pass-1 row checksums are computed over
 canonical bytes of rows WITHOUT ``export_snapshot_id``;
 ``source_snapshot_hash`` is SHA-256 over LF lines ``record_kind + "\\0" +
-checksum`` in family order memories, episodes, episode_members, links; then
+checksum`` in family order memories, episodes, episode_members, links,
+memory_expiry; then
 ``export_snapshot_id := source_snapshot_hash`` is stamped onto memory rows
 and each memory row's final stored ``row_checksum`` is recomputed over the
 completed row. Import re-verifies both layers.
@@ -88,8 +89,15 @@ EPISODE_COLUMNS = ("id", "namespace", "started_at", "ended_at",
                    "summary_memory_id", "token_count")
 MEMBER_COLUMNS = ("episode_id", "memory_id", "added_at")
 LINK_COLUMNS = ("src", "dst", "relation", "score", "created_at")
+# Issue #414: the v15 expiry side table rides the dataset as a FIFTH
+# family so a round-trip keeps state rows gated and updatable. ADDITIVE:
+# exports produced before the family carry no file and still verify at
+# import (absence tolerated; a file added to or removed from an existing
+# dataset changes the recomputed snapshot hash and fails as tampering).
+EXPIRY_COLUMNS = ("memory_id", "inject_until", "expiry_class")
 
-DATASET_FAMILIES = ("memories", "episodes", "episode_members", "links")
+DATASET_FAMILIES = ("memories", "episodes", "episode_members", "links",
+                    "memory_expiry")
 
 
 class DatasetError(RuntimeError):
@@ -185,18 +193,23 @@ _FAMILY_COLUMNS = {
     "episodes": EPISODE_COLUMNS + ("row_checksum",),
     "episode_members": MEMBER_COLUMNS + ("row_checksum",),
     "links": LINK_COLUMNS + ("row_checksum",),
+    "memory_expiry": EXPIRY_COLUMNS + ("row_checksum",),
 }
 _FAMILY_TYPES = {
     "memories": _MEMORY_PARQUET_TYPES,
     "episodes": _EPISODE_PARQUET_TYPES,
     "episode_members": _MEMBER_PARQUET_TYPES,
     "links": _LINK_PARQUET_TYPES,
+    # memory_expiry: all three payload columns are strings (row_checksum
+    # too) — no typed fields, so an empty type map is the full mapping.
+    "memory_expiry": {},
 }
 _FAMILY_FILES = {
     "memories": "memories-000",
     "episodes": "episodes-000",
     "episode_members": "episode_members-000",
     "links": "links-000",
+    "memory_expiry": "memory_expiry-000",
 }
 def _import_pyarrow():
     try:
@@ -363,12 +376,26 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
                 + f" AND dst_id IN ({marks}) ORDER BY src_id, dst_id, relation",
                 tuple(memory_ids) + tuple(memory_ids))
         ]
+        # Issue #414: the v15 expiry side records of the exported memory
+        # set (a healthy store only carries records for live state rows —
+        # tombstones clear them at write time; an audit view that somehow
+        # holds an orphan restores nothing: import is parent-outcome-aware).
+        expiry_rows = [
+            {col: r[col] for col in EXPIRY_COLUMNS}
+            for r in conn.execute(
+                "SELECT " + ", ".join(EXPIRY_COLUMNS)
+                + f" FROM memory_expiry WHERE memory_id IN ({marks})"
+                + " ORDER BY memory_id", tuple(memory_ids))
+        ]
+    else:
+        expiry_rows = []
 
     families: dict[str, list[dict]] = {
         "memories": memory_rows,
         "episodes": episode_rows,
         "episode_members": member_rows,
         "links": link_rows,
+        "memory_expiry": expiry_rows,
     }
     source_snapshot_hash = _compute_snapshot_hash(
         families, memories_have_snapshot_id=False)
@@ -377,7 +404,7 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
         row["export_snapshot_id"] = source_snapshot_hash
         row["generator_revision"] = GENERATOR_REVISION
         row["row_checksum"] = row_checksum(row)
-    for family in ("episodes", "episode_members", "links"):
+    for family in ("episodes", "episode_members", "links", "memory_expiry"):
         for row in families[family]:
             row["row_checksum"] = row_checksum(row)
 
@@ -661,17 +688,42 @@ def _validate_manifest_shape(manifest: dict, err: type) -> None:
                   "namespaces / source_snapshot_hash)")
 
 
+def _read_export_families(source: Path, fmt: str, err) -> dict[str, list]:
+    """Read the dataset families with the additive ``memory_expiry`` family
+    OPTIONAL (issue #414): exports produced before the family existed carry
+    no file and read as a four-family dataset (their snapshot hash still
+    verifies — the hash covers exactly the families read); a file added to
+    or removed from an existing dataset changes the recomputed hash and is
+    refused downstream as tampering. Every family present is read with the
+    same per-record checksum contract as before.
+    """
+    source = Path(source)
+    families = {family: _read_family(source, family, fmt)
+                for family in DATASET_FAMILIES
+                if family != "memory_expiry"}
+    stem = _FAMILY_FILES["memory_expiry"]
+    if ((source / "data" / f"{stem}.parquet").is_file()
+            or (source / "data" / f"{stem}.jsonl").is_file()):
+        families["memory_expiry"] = _read_family(
+            source, "memory_expiry", fmt)
+    else:
+        # Absence is only tolerated for the ADDITIVE family; the original
+        # four must always exist (their _read_family call above raises).
+        _ = err  # the required-four errors surface from _read_family
+    return families
+
+
 def _read_export_records(export_dir: Path, manifest: dict) -> dict[str, list]:
     _validate_manifest_shape(manifest, PublishError)
     fmt = manifest.get("format", DATASET_FORMAT_PARQUET)
     if fmt not in (DATASET_FORMAT_PARQUET, DATASET_FORMAT_JSONL):
         raise PublishError(f"unsupported dataset format: {fmt}")
-    families = {family: _read_family(export_dir, family, fmt)
-                for family in DATASET_FAMILIES}
+    families = _read_export_families(export_dir, fmt, PublishError)
     required = {"memories": ("id", "namespace"),
                 "episodes": ("id", "namespace"),
                 "episode_members": ("episode_id", "memory_id"),
-                "links": ("src", "dst")}
+                "links": ("src", "dst"),
+                "memory_expiry": ("memory_id",)}
     for family, rows in families.items():
         for row in rows:
             for key in required[family]:
@@ -715,8 +767,8 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         payload_rows.append(("memories", row["id"]))
         payloads.append(_egress_aux_bytes(row))
         payload_rows.append(("memories", row["id"]))
-    for family in ("episodes", "episode_members", "links"):
-        for row in families[family]:
+    for family in ("episodes", "episode_members", "links", "memory_expiry"):
+        for row in families.get(family, []):
             payloads.append(canonical_row_bytes(row))
             payload_rows.append((family, None))
     payloads.append((export_path / "README.md").read_bytes())
@@ -796,6 +848,17 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         uploaded_families["links"] = [
             l for l in families["links"]
             if l["src"] in kept_ids and l["dst"] in kept_ids]
+        # Issue #414: a held-back state parent must not publish its expiry
+        # side record either — the uploaded expiry family carries only the
+        # SURVIVING parents (same outcome-aware rule as memberships/links).
+        # Review F3: guarded on family presence — a pre-family export must
+        # not gain an empty family file (the published artifact stays
+        # four-family; it still verifies because an EMPTY family
+        # contributes no hash lines either way).
+        if "memory_expiry" in families:
+            uploaded_families["memory_expiry"] = [
+                e for e in families.get("memory_expiry", [])
+                if e["memory_id"] in kept_ids]
         # Episode summaries anchored on a held-back row are blanked to the
         # no-summary value (the episode and its surviving memberships stay;
         # the secret-linking reference does not). Re-stamp each touched
@@ -824,6 +887,8 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
         upload_manifest["row_counts"]["memories"] = len(uploaded)
         if held:
             for family in DATASET_FAMILIES:
+                if family not in uploaded_families:
+                    continue  # additive family absent from a pre-family export
                 upload_manifest["row_counts"][family] = \
                     len(uploaded_families[family])
             # F-005: the published manifest must advertise exactly the
@@ -839,6 +904,13 @@ def publish_dataset(export_dir: str, target: str, *, yes: bool = False,
             upload_manifest["governance"]["egress_scan"] = {
                 "status": "unscanned", "override": "--allow-unscanned"}
         for family in DATASET_FAMILIES:
+            if family not in uploaded_families:
+                # Additive family absent from a pre-family export: keep the
+                # published artifact four-family (an EMPTY family would
+                # contribute no hash lines either way, but writing one would
+                # advertise a family the export never evaluated) — publish
+                # exactly the families the export carried.
+                continue
             rows = uploaded_families[family]
             fmt = manifest.get("format", DATASET_FORMAT_PARQUET)
             if fmt == DATASET_FORMAT_JSONL:
@@ -992,12 +1064,12 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
     fmt = manifest.get("format", DATASET_FORMAT_PARQUET)
     if fmt not in (DATASET_FORMAT_PARQUET, DATASET_FORMAT_JSONL):
         raise DatasetError(f"unsupported dataset format: {fmt}")
-    families = {family: _read_family(source_path, family, fmt)
-                for family in DATASET_FAMILIES}
+    families = _read_export_families(source_path, fmt, DatasetError)
     required = {"memories": ("id", "namespace"),
                 "episodes": ("id", "namespace"),
                 "episode_members": ("episode_id", "memory_id"),
-                "links": ("src", "dst")}
+                "links": ("src", "dst"),
+                "memory_expiry": ("memory_id",)}
     for family, rows in families.items():
         for row in rows:
             for key in required[family]:
@@ -1064,6 +1136,51 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     + ", ".join("?" * len(_MEMORY_STORE_COLUMNS)) + ")",
                     tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
             kept_ids = {row["id"] for row in kept}
+            # Issue #414 (#324 parent-outcome-aware rule): expiry records
+            # restore onto LIVE STATE parents only — a tombstoned or
+            # filtered-out parent never gains a record (an orphan side row
+            # would make a dead row reappear live in the next round-trip);
+            # dest-wins on conflict (INSERT OR IGNORE), the promote-store
+            # conflict policy (mine.py's memory_expiry copy).
+            for erow in families.get("memory_expiry", []):
+                emid = erow.get("memory_id")
+                if emid not in kept_ids:
+                    continue
+                live = conn.execute(
+                    "SELECT 1 FROM memory WHERE id=? AND type='state' "
+                    "AND superseded_at IS NULL", (emid,)).fetchone()
+                if live is None:
+                    continue
+                # Issue #414 review F4: restore records satisfy the SAME
+                # writer contract the sync path enforces (sync.py's
+                # _validate_expiry_record) — a crafted dataset cannot
+                # plant non-ISO deadlines (epoch-0.0 = permanent
+                # withhold) or unknown enum strings; a malformed record
+                # is a DatasetError, never a silent drop.
+                inject_until = erow.get("inject_until")
+                expiry_class = erow.get("expiry_class")
+                if not isinstance(inject_until, str):
+                    raise DatasetError(
+                        "malformed memory_expiry record: inject_until "
+                        "must be a string")
+                from storelib.schema import STATE_EXPIRY_CLASSES  # noqa: PLC0415
+                from storelib.state_expiry import validate_inject_until  # noqa: PLC0415
+                try:
+                    inject_until = validate_inject_until(inject_until)
+                except ValueError:
+                    raise DatasetError(
+                        "malformed memory_expiry record: inject_until "
+                        "must be UTC ISO-8601")
+                if not isinstance(expiry_class, str) \
+                        or expiry_class not in STATE_EXPIRY_CLASSES:
+                    raise DatasetError(
+                        "malformed memory_expiry record: expiry_class "
+                        "must be one of " + ", ".join(STATE_EXPIRY_CLASSES))
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_expiry "
+                    "(memory_id, inject_until, expiry_class) "
+                    "VALUES (?, ?, ?)",
+                    (emid, inject_until, expiry_class))
             episodes = [e for e in families["episodes"]
                         if namespace is None or e["namespace"] == namespace]
             # Endpoint validation after filtering: a summary reference to a

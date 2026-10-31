@@ -94,7 +94,9 @@ def principal_lookup_from_env(env=None):
     CLI mirror of the hub-side map lookup so the capability gate enforces
     IDENTICALLY on the CLI and MCP routes; the parse is deliberately minimal
     (id, capabilities, revoked) and fail-closed: any unreadable/malformed map
-    or unknown id resolves to None => denied for the mutating kinds."""
+    or unknown id resolves to None => denied for EVERY kind (issue #414:
+    the unknown_principal gate rejects a non-empty unresolved principal
+    regardless of op kind)."""
 
     import json as _json
     import os as _os
@@ -135,20 +137,40 @@ class _PrincipalIndex:
 
     def __call__(self, principal_id):
         entry = self._by_id.get((principal_id or "").strip())
-        if entry is None:
+        if not isinstance(entry, dict):
             return None
         caps = entry.get("capabilities")
         principal = LegacyPrincipal()
         principal.principal_id = (principal_id or "").strip()
         principal.revoked = bool(entry.get("revoked", False))
         if caps is None:
-            return principal
-        if not isinstance(caps, (list, tuple, set, frozenset)):
+            pass  # legacy token behaviour: no capability restrictions
+        elif not isinstance(caps, (list, tuple, set, frozenset)) or not caps:
             # Malformed capability metadata fails CLOSED (auth.py's map
             # discipline), never to the legacy allow.
             principal.capabilities = frozenset()
         else:
             principal.capabilities = frozenset(str(c) for c in caps)
+        # Issue #414: carry the entry's namespace scope through the rebuild.
+        # auth.py's map discipline verbatim in effect: absent/None namespaces
+        # = an UNSCOPED legacy entry (the hub's semantics for entries without
+        # scope); a present value must be a non-empty list of non-empty
+        # strings (auth.py additionally validates namespace shape and fails
+        # the WHOLE map at load; a garbage shape here can never match a real
+        # namespace, so the principal is deny-all either way). Any malformed
+        # value fails closed for THIS principal — the lookup yields nothing,
+        # the same as an unknown id — instead of silently unscoping it.
+        scopes = entry.get("namespaces")
+        if scopes is None:
+            pass  # unscoped legacy entry (class defaults)
+        elif (isinstance(scopes, (list, tuple)) and scopes
+              and all(isinstance(ns, str) and ns.strip()
+                      for ns in scopes)):
+            principal.namespaces = frozenset(
+                str(ns).strip() for ns in scopes)
+            principal.scoped = True
+        else:
+            return None
         return principal
 
 
@@ -333,6 +355,17 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                     op_id, kind, "rejected", error="capability_denied"))
                 continue
 
+            # 3a. Issue #414: a NON-EMPTY batch principal that resolved to
+            # nothing (no lookup configured, an unknown id, or an entry that
+            # fails the map discipline) fails CLOSED for EVERY kind — the
+            # hub denies unknown ids on every route; previously only the
+            # mutating kinds were denied, leaving add/capture to pass with a
+            # vacuous namespace gate (effective=None is always "allowed").
+            if principal and effective is None:
+                receipts.append(_receipt(op_id, kind, "rejected",
+                                         error="unknown_principal"))
+                continue
+
             # 3b. Namespace scope for EVERY kind: the declared namespace
             # (add/capture) and the TARGET row's namespace (the mutation
             # kinds — a by-id op must not escape its row's scope). Checked
@@ -429,6 +462,18 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                              if target_probe else None)
                 if target_ns is not None and not _namespace_allowed(
                         effective, target_ns):
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected",
+                        error="namespace_not_allowed"))
+                    continue
+                # Issue #414: an update's explicit DESTINATION namespace is
+                # a re-key — it must be inside the principal's scope exactly
+                # as the standalone update tool enforces (the gate above
+                # sees only the TARGET row's namespace; the destination was
+                # previously forwarded to the writer unguarded).
+                if (kind == "update" and args.get("namespace")
+                        and not _namespace_allowed(
+                            effective, str(args["namespace"]))):
                     receipts.append(_receipt(
                         op_id, kind, "rejected",
                         error="namespace_not_allowed"))

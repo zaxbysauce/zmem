@@ -821,6 +821,20 @@ def test_native_canary_claim_gate():
 
 # -- standalone runner (the t-series convention) -------------------------------
 
+def test_package_json_matches_release():
+    """F7/TC-10: deepseek-plugin/package.json is bound to the release
+    version (C5 pins package.json == plugin.json; the release gate pins
+    plugin.json == release; this closes the last edge: package.json vs
+    release-manifest directly). No runtime."""
+    import json as _json
+    pkg = _json.loads((harness.PLUGIN_DIR / "package.json")
+                      .read_text(encoding="utf-8"))
+    assert pkg.get("version") == harness.release_version(), (
+        "deepseek-plugin/package.json version "
+        f"{pkg.get('version')!r} != release version "
+        f"{harness.release_version()!r}")
+
+
 _CHECKS = {
     "first_request_delivery": test_first_request_delivery,
     "backend_parity": test_backend_parity,
@@ -829,6 +843,7 @@ _CHECKS = {
     "offline_snapshot": test_offline_snapshot,
     "install_release_contract": test_install_release_contract,
     "native_canary_claim_gate": test_native_canary_claim_gate,
+    "package_json_matches_release": test_package_json_matches_release,
 }
 
 

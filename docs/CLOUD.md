@@ -59,7 +59,8 @@ embeddings or derived index bytes ever leave the store through it.
 ```
 
 Writes `manifest.json`, `README.md`, and `data/*.parquet` (one record file
-per family: memories, episodes, episode_members, links). Deterministic: two
+per family: memories, episodes, episode_members, links, and — since the
+#414 round — memory_expiry side records). Deterministic: two
 exports from one store snapshot produce byte-identical artifacts. Tombstones
 are audit-only by default; `--include-tombstones` produces the audit view.
 An unscoped export (every namespace) demands `--all-namespaces --yes`, and

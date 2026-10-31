@@ -389,6 +389,7 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
     if src.exists():
         src.unlink()
     out = sqlite3.connect(str(src))
+    os.chmod(src, 0o600)  # owner-only (review D: the scratch holds the decoded payload)
     ncols = len(_SNAPSHOT_COLUMNS.split(","))
     embedding_idx = 19  # position of `embedding` in _SNAPSHOT_COLUMNS
 
@@ -402,7 +403,8 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
         return tuple(row)
 
     try:
-        from storelib.schema import init_db, migrate  # noqa: PLC0415 - lazy
+        from storelib.schema import (  # noqa: PLC0415 - lazy
+            STATE_EXPIRY_CLASSES, init_db, migrate)
         # init_db creates the base tables; migrate() brings the LATER
         # columns the selector reads (supersede_reason, embedding, …) —
         # the same pair connect()/_prepare_store runs on a real store.
@@ -414,13 +416,74 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
             "INSERT INTO memory (" + _SNAPSHOT_COLUMNS + ") VALUES (" +
             ",".join("?" * ncols) + ")",
             [_decode(r) for r in payload.get("rows", [])])
+        # Issue #414: restore the additive ``expiry`` family — the shipped
+        # state rows' memory_expiry side records. Older hubs omit the key
+        # (tolerated: every row stays live by the missing-side-row law);
+        # a newer hub ships [memory_id, inject_until, expiry_class]
+        # triplets, and ANY violation (malformed shape, unshipped id,
+        # non-live-state parent, value-contract breach) is a ValueError —
+        # the refresh's designed degrade that keeps the previous pair —
+        # never a silent skip or a landed orphan (review F5).
+        shipped = {str(r[0]) for r in payload.get("rows", [])
+                   if isinstance(r, (list, tuple)) and r}
+        expiry_rows = []
+        expiry_raw = payload.get("expiry")
+        if expiry_raw is not None and not isinstance(expiry_raw, list):
+            raise ValueError("payload expiry family is not a list")
+        for triplet in expiry_raw or []:
+            # Issue #414 review F5: strict restore — shape, shipped
+            # membership, LIVE-STATE parent (the dataset.py/mine.py
+            # restore discipline), and the writer's value contract
+            # (validate_inject_until + STATE_EXPIRY_CLASSES). Any
+            # violation raises ValueError -> _refresh's designed
+            # degrade (keep the previous snapshot pair), never a
+            # silent side-row on a non-state row (which the recall
+            # gate would withhold forever).
+            if not (isinstance(triplet, (list, tuple)) and len(triplet) == 3
+                    and all(isinstance(v, str) for v in triplet)):
+                raise ValueError("payload expiry triplet is malformed")
+            mid, inject_until, expiry_class = triplet
+            if mid not in shipped:
+                raise ValueError(
+                    "payload expiry triplet names an unshipped row")
+            live_state = out.execute(
+                "SELECT 1 FROM memory WHERE id=? AND type='state' "
+                "AND superseded_at IS NULL", (mid,)).fetchone()
+            if live_state is None:
+                raise ValueError(
+                    "payload expiry triplet names a non-live-state parent")
+            from storelib.state_expiry import validate_inject_until  # noqa: PLC0415
+            try:
+                inject_until = validate_inject_until(inject_until)
+            except ValueError:
+                raise ValueError(
+                    "payload expiry triplet has a malformed inject_until")
+            if expiry_class not in STATE_EXPIRY_CLASSES:
+                raise ValueError(
+                    "payload expiry triplet has an unknown expiry_class")
+            expiry_rows.append((mid, inject_until, expiry_class))
+        if expiry_rows:
+            out.executemany(
+                "INSERT OR IGNORE INTO memory_expiry "
+                "(memory_id, inject_until, expiry_class) "
+                "VALUES (?, ?, ?)", expiry_rows)
         out.commit()
     finally:
         out.close()
-    return build_snapshot(
-        source_store=str(src), data_dir=str(_broker_dir(env)),
-        principal=str(payload.get("principal", "local")),
-        env=env, revision=payload.get("snapshot_revision"))
+    # Review D: the scratch holds the decoded payload (raw embedding
+    # blobs) — remove it once the build has consumed it (success or
+    # failure); the file is owner-only from creation.
+    try:
+        result = build_snapshot(
+            source_store=str(src), data_dir=str(_broker_dir(env)),
+            principal=str(payload.get("principal", "local")),
+            env=env, revision=payload.get("snapshot_revision"))
+    finally:
+        try:
+            os.unlink(src)
+        except OSError:
+            pass
+    return result
 
 
 def _refresh(http: Any, env: dict[str, str],

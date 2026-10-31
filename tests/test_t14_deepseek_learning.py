@@ -27,7 +27,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "support"))
 import deepseek_harness as harness  # noqa: E402
 from deepseek_assertions import (  # noqa: E402
-    capture_queue, support_report_problems, zmem_msgs)
+    SUPPORT_DISCLOSED_RELEASE, SUPPORT_DISCLOSED_STALE_VERSION,
+    capture_queue, evidence_version_problems, support_report_problems,
+    zmem_msgs)
 
 SECRET_TOKEN = ('AKIAZMEMT13' + 'SECRETAKIA'
                + 'ZMEMT13SECRET')  # concatenated (push hygiene)
@@ -528,6 +530,56 @@ def test_compatibility_claim_gate():
         "a report with the frozen capability-gap disclosures removed must "
         "FAIL validation")
 
+def test_evidence_version_agreement_ratchet():
+    """Issue #416 AC3 standing gate (plan-critic disclosure-ratchet): the
+    canary report, the support report, and the release version are bound
+    together — the ONLY tolerated state is agreement, or a divergence
+    that EXACTLY equals the tracked disclosure (the committed support
+    report's known lag while it awaits its dsh-host regeneration, the
+    delivery issue #416 names). Any other drift — either artifact moving
+    without the other, a support regen landing without retiring the
+    disclosure, or a stale canary — fails. No runtime."""
+    assert harness.CANARY_REPORT.is_file() and harness.SUPPORT_REPORT.is_file()
+    canary = json.loads(harness.CANARY_REPORT.read_text(encoding="utf-8"))
+    support = json.loads(harness.SUPPORT_REPORT.read_text(encoding="utf-8"))
+    release = harness.release_version()
+    # F6 (second review): the disclosure tuple is pinned to the release
+    # it was granted AT — at the next bump the observed pair no longer
+    # matches and the gate FAILS as undisclosed drift, forcing the
+    # regeneration PR to retire the disclosure (a self-renewing tolerance
+    # bound to the live release would never expire).
+    problems = evidence_version_problems(
+        canary, support, release,
+        known_divergence=(SUPPORT_DISCLOSED_RELEASE,
+                          SUPPORT_DISCLOSED_STALE_VERSION))
+    disclosed = [p for p in problems if p.startswith("known-divergence")]
+    raw = [p for p in problems if not p.startswith("known-divergence")]
+    assert not raw, "undisclosed evidence-version drift: " + "; ".join(raw)
+    assert len(problems) == 1 and len(disclosed) == 1, (
+        "the evidence versions must either agree (no problems) or match "
+        "the tracked disclosure EXACTLY (one disclosed entry); got: "
+        + "; ".join(problems))
+    # Sanity legs for the ratchet itself: an undisclosed drift fails, and
+    # agreement with a stale disclosure left behind fails (the forcing
+    # function that retires this gate in the regeneration PR).
+    drifted = dict(support, zmem_version="0.0.0-drifted")
+    assert evidence_version_problems(
+        canary, drifted, release,
+        known_divergence=(release, SUPPORT_DISCLOSED_STALE_VERSION)), (
+        "an undisclosed support-version drift must FAIL the ratchet")
+    regenerated = dict(support, zmem_version=release)
+    assert evidence_version_problems(
+        canary, regenerated, release,
+        known_divergence=(SUPPORT_DISCLOSED_RELEASE,
+                          SUPPORT_DISCLOSED_STALE_VERSION)), (
+        "after regeneration the stale disclosure itself must FAIL "
+        "(retire SUPPORT_DISCLOSED_STALE_VERSION in that PR)")
+    # F7/TC-02 positive leg: with the disclosure RETIRED, agreement
+    # passes cleanly — the tolerated end state after the regeneration PR.
+    assert evidence_version_problems(
+        canary, regenerated, release) == [], (
+        "agreement with a retired disclosure must produce NO problems")
+
 
 _CHECKS = {
     "corrections_and_failures": test_corrections_and_failures,
@@ -536,6 +588,7 @@ _CHECKS = {
     "source_provenance": test_source_provenance,
     "recovery_and_diagnostics": test_recovery_and_diagnostics,
     "compatibility_claim_gate": test_compatibility_claim_gate,
+    "evidence_version_agreement_ratchet": test_evidence_version_agreement_ratchet,
 }
 
 

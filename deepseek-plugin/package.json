@@ -1,6 +1,6 @@
 {
   "name": "@zaxbyhub/zmem-deepseek",
-  "version": "0.127.0",
+  "version": "0.132.0",
   "private": true,
   "type": "module",
   "main": "index.mjs",
