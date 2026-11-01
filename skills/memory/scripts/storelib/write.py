@@ -2465,11 +2465,13 @@ def update_memory(
                 or locked_row["namespace"] != old["namespace"]):
             if started_tx and conn.in_transaction:
                 conn.rollback()
+            # Content-free on the values (review PRR-006): this message
+            # passes verbatim through the hub update tool's sanitizer, so
+            # it must not disclose the row's (possibly foreign, rekeyed)
+            # namespace or trust lineage — field NAMES only.
             raise ValueError(
                 f"[zmem] memory {mid} changed under the write lock "
-                f"(taint {old['taint']!r}->{locked_row['taint']!r}, "
-                f"namespace {old['namespace']!r}->"
-                f"{locked_row['namespace']!r}); update refused — the "
+                "(taint and/or namespace drift); update refused — the "
                 "successor's trust lineage and namespace derive from the "
                 "pre-lock read; re-read and retry (issue #420)"
             )

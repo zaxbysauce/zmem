@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "cc7128b7383ae187596827d51c714b9f05a6ba9d6b0557d803a0fb7032c61fe8",
+  "digest": "360cceab741e8b49de76270284a07a86dd5f59b282017f14c0eec13fa25eacc8",
   "files": {
     ".agents/plugins/marketplace.json": "5e1dfc9fcbbd672528a7fb7d7ce1ab0290af1d84b17d171e608ca122cbff4226",
     ".claude-plugin/marketplace.json": "77af7661a4e21d0c7459e8df2fded5ed72683b49be9b73eec626253abaf31642",
@@ -27,7 +27,7 @@
     "hermes-plugin/server/auth.py": "a19930bc442f97e87829bb0d08042ca552d24ffc630e8a3b4b0c99b09114ea11",
     "hermes-plugin/server/bind_guard.py": "3539d23ea8c2f9f4a60b398975e5cd79a8518aef3e61f86068b22f7eb0cf6372",
     "hermes-plugin/server/mcp_client.py": "10d813205de2d518e41896bcac7bd01d013ed3cc1c5f4f6c4962489a7064fdd9",
-    "hermes-plugin/server/mcp_server.py": "bb5326e3e3c9a91cc9e2c59d9ce3b11be98785ab6b4da98c3bb1131da7aa9b9b",
+    "hermes-plugin/server/mcp_server.py": "d0cd541495ff6a237bc4d9f3b57af91d1fddfa0c7fee3b98bad1d4d9f9072a7b",
     "hermes-plugin/server/requirements-embeddings.txt": "437505a8ebb55933f5b50e9334849e88a9ce0b57ee534c5f6864a5cda1f8aca6",
     "hermes-plugin/server/requirements.txt": "799aad6ca2a111d8c21b746fae1a2770278b29554900f95b9241c686d7149189",
     "hermes-plugin/transport.py": "1159614acec2d95725ff13dff95bd9bcf74af2a57375afdb3ea346b374ddefd0",
@@ -107,7 +107,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "e541f95b55127b1edb8e453329248e9a4b29bc1e91dd24e1710e7461813e1f0e",
     "skills/memory/scripts/storelib/beliefs.py": "ebfc03f9be2b12cddfbad0185b0348406d924d04b2a704b1aebe595048d6ddb4",
-    "skills/memory/scripts/storelib/cli.py": "9dda68ad917e543c4ee3de4eeea59c698da6ab541187b1446250fea887b3378e",
+    "skills/memory/scripts/storelib/cli.py": "67560ae4ce8e154ab4a40dc44fe746f36dcc4b5f9eedf50c4f36eed7969d53f9",
     "skills/memory/scripts/storelib/config.py": "36448a1f80cdfc60b5ddd101a679a166f1522ad1e2eb3555139bac351ec7fc38",
     "skills/memory/scripts/storelib/consolidate.py": "f4f30c9d7dcf69cdc17a01235af56f87918000f630c53cc377d28979f72fae82",
     "skills/memory/scripts/storelib/cross_encoder.py": "548b8292ed7c1e0545e3d1d85d10987dca3ff37ac555cff459168230bb1af023",
@@ -128,7 +128,7 @@
     "skills/memory/scripts/storelib/miss_rate.py": "8986c72f235dafefcb268454dfa69c3284ba470c75811119b794e0de3219898c",
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
     "skills/memory/scripts/storelib/opcmds.py": "d34b7dc219e6aa95b1b85cce59d3ff525451df0051e1b36167255f8feacabbe0",
-    "skills/memory/scripts/storelib/ops.py": "21f8878510405ff1ba6278deede514539717997a0dab41a07b8c4e9efc7f3732",
+    "skills/memory/scripts/storelib/ops.py": "ad560cc5c3f57f026d9428af62244a31b180d8118f9acdea8bf71002d861e648",
     "skills/memory/scripts/storelib/ops_tokens.py": "4df8d2dbfb023fe90eb30b32fe11cc68e38ce1304084d77f0b73573c139180c1",
     "skills/memory/scripts/storelib/organize.py": "dffbb0e076d5e62ca6fab07a6bf9bd4092713acc8fe60249be2b794e73ad70fb",
     "skills/memory/scripts/storelib/pages.py": "f656bbae3f68dfa9853c81fe78240df04de61817858c5d8c2f84efb2db45cf00",
@@ -150,7 +150,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "8ccdbf690660eec2bc838953e9b31dde607865fa3e8dee2123227f7585b348c3",
+    "skills/memory/scripts/storelib/write.py": "92740d93006b32a4b8b9bf5a79bcf642e5abf273a69c4f1bfbba9b911262044a",
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },

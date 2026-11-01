@@ -428,7 +428,12 @@ switch. Namespace scope is enforced engine-side for EVERY op: a scoped
 principal's declared namespace AND each mutation target row's own
 namespace must be in the allow-list — an op that omits the namespace
 defaults to `user:global` and is refused for a scoped principal unless
-that is allow-listed (the sibling tools' #109 rule).
+that is allow-listed (the sibling tools' #109 rule). A scoped
+single-token caller (no principal map) reaches the same engine-side
+enforcement through apply-ops' `--namespace-scope` flag (issue #420): a
+newline-separated allow-list the hub forwards from the token config;
+it can only narrow the legacy identity, refuses an explicit empty
+value, and is mutually exclusive with `--principal`.
 
 Read-your-writes: pending ops overlay the broker's read-moment envelopes
 as bounded, fence-neutralized `[PENDING]` lines — in BOTH hub states,

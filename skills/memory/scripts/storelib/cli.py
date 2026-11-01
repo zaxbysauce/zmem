@@ -656,20 +656,38 @@ def _cmd_apply_ops(conn, args) -> int:
     # (no map entry the engine could resolve) the SAME in-transaction
     # enforcement map-mode principals get — op namespaces, by-id mutation
     # targets (id_or_dep-first, the engine's own resolution), and update
-    # destination rekeys, all via _namespace_allowed. Malformed input or
+    # destination rekeys, all via _namespace_allowed. Malformed input,
+    # an EXPLICIT empty value (argparse default None distinguishes it from
+    # flag-absent — the fail-closed half of the #420 review PRR-005), or
     # combining it with --principal refuses the batch (one identity
     # mechanism per call).
-    scope_raw = str(getattr(args, "namespace_scope", "") or "")
-    if scope_raw:
+    #
+    # Transport (review PRR-001): the list separator is NEWLINE, not comma —
+    # NAMESPACE_RE has no DOTALL, so no grammar-valid namespace can contain
+    # a newline, making the join/split round-trip injective (a comma-bearing
+    # namespace like "project:a,b" round-trips exactly; a comma separator
+    # silently split it into a wider, wrong scope set). Every split item is
+    # additionally grammar-validated so a corrupt transport fails CLOSED
+    # here instead of minting a mangled allow-list engine-side.
+    scope_raw = getattr(args, "namespace_scope", None)
+    if scope_raw is not None:
+        scope_raw = str(scope_raw)
         if args.principal:
             print("[zmem] apply-ops: --namespace-scope cannot be combined"
                   " with --principal (one identity mechanism per call)",
                   file=_sys.stderr)
             return 2
-        scopes = [part.strip() for part in scope_raw.split(",")]
-        if not scopes or any(not part for part in scopes):
-            print("[zmem] apply-ops: --namespace-scope must be a comma-"
+        scopes = [part.strip() for part in scope_raw.split("\n")]
+        if (not scope_raw.strip() or not scopes
+                or any(not part for part in scopes)):
+            print("[zmem] apply-ops: --namespace-scope must be a newline-"
                   "separated list of non-empty namespaces", file=_sys.stderr)
+            return 2
+        from schema_meta import is_valid_namespace
+        bad = [part for part in scopes if not is_valid_namespace(part)]
+        if bad:
+            print("[zmem] apply-ops: --namespace-scope entries are not "
+                  f"valid namespaces: {bad!r}", file=_sys.stderr)
             return 2
         default_principal = opslib.LegacyPrincipal()
         default_principal.namespaces = frozenset(scopes)
@@ -3588,12 +3606,12 @@ def main():
                         help="principal id the batch applies as (empty ="
                              " the legacy/operator identity)")
     ap_ops.add_argument(
-        "--namespace-scope", dest="namespace_scope", default="",
-        help="comma-separated namespace allow-list applied to the legacy "
-             "identity (issue #420: the hub-side scope passthrough for "
-             "single-token callers the engine has no map entry for; can "
-             "only NARROW the otherwise-unscoped legacy identity; "
-             "mutually exclusive with --principal)")
+        "--namespace-scope", dest="namespace_scope", default=None,
+        help="newline-separated namespace allow-list applied to the legacy "
+             "identity (issue #420: the scope passthrough for single-token "
+             "callers the engine has no map entry for; can only NARROW the "
+             "otherwise-unscoped legacy identity; an EXPLICIT empty value "
+             "is refused; mutually exclusive with --principal)")
     ap_ops.add_argument("--json", action="store_true",
                         help="emit the receipt envelope as one JSON document")
 

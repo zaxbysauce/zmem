@@ -407,7 +407,12 @@ def test_recovery_and_diagnostics():
             # (a still-pending receipt observed single-shot raced — the
             # flake the 418-420 implementation review caught). Poll the
             # DURABLE queue file (the on-disk flush surface) to a bounded
-            # deadline instead of a single-shot read.
+            # deadline instead of a single-shot read. There is NO
+            # vanished-file branch: opqueue never deletes the queue file
+            # on drain (entries are rewritten in place — cubic
+            # 4434387852), so a missing file means the write never landed
+            # and the read-your-writes recall assertion below is the
+            # backstop.
             deadline = time.monotonic() + 60.0
             while (not committed and time.monotonic() < deadline):
                 if queue.is_file():
@@ -418,9 +423,6 @@ def test_recovery_and_diagnostics():
                     committed = any(
                         e.get("status") not in (None, "pending")
                         or e.get("receipt") for e in entries)
-                else:
-                    # The queue file itself vanished: fully drained.
-                    committed = True
                 if not committed:
                     time.sleep(1.0)
             assert committed, (
@@ -550,8 +552,8 @@ def test_evidence_version_agreement_ratchet():
     """Issue #416 AC3 standing gate, post-#420 regeneration form: the
     canary report, the support report, and the release version are bound
     together and the ONLY tolerated state is AGREEMENT — the #416
-    disclosure-ratchet tolerance was retired by the 0.133.0 regeneration
-    PR (both reports regenerated together from a real dsh-host run), and a
+    disclosure-ratchet tolerance was retired by the 0.134.0 regeneration
+    (both reports regenerated together from a real dsh-host run), and a
     reintroduced tolerance is itself a failure. Any drift — either
     artifact moving without the other, or a stale release binding — fails.
     No runtime."""

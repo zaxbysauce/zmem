@@ -357,12 +357,22 @@ class AppliedOpsReplayIdempotencyTest(unittest.TestCase):
                 receipt_b["status"], "rejected",
                 "an until-only replay must be REJECTED, never folded "
                 f"committed (got {receipt_b})")
-            self.assertIn(
-                receipt_b.get("error"),
-                ("expiry_requires_state_target",
-                 "expiry_record_mismatch_on_dedup"),
-                f"the rejection must name the expiry reason (got "
-                f"{receipt_b})")
+            # Review PRR-017: the plain-add keeper can only reach the
+            # state-target branch — pin THAT reason exactly.
+            self.assertEqual(receipt_b.get("error"),
+                             "expiry_requires_state_target",
+                             f"the rejection must name the expiry reason "
+                             f"(got {receipt_b})")
+            # Review PRR-014: the recorded-rejected op replays as
+            # 'rejected' (naming that history), never as a misleading
+            # already-applied 'duplicate'.
+            resend = self._apply(conn, dict(op_b, op_id=op_b["op_id"]))
+            receipt_r = resend["receipts"][0]
+            self.assertEqual(receipt_r["status"], "rejected",
+                             f"the rejected op's resend: {receipt_r}")
+            self.assertEqual(receipt_r.get("error"),
+                             "previously_rejected_on_replay",
+                             f"the rejected op's resend: {receipt_r}")
             # Nothing folded, nothing dropped: the plain-add keeper stays
             # the single live row and carries no expiry record.
             self.assertEqual(self._content_rows(conn, content), 1,

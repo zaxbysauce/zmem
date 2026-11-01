@@ -327,6 +327,16 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                 " WHERE op_id=? AND principal=?",
                 (op_id, principal or "")).fetchone()
             if row is not None:
+                # Review PRR-014: replay the RECORDED status — a recorded
+                # 'rejected' op replays as 'rejected' (with the reason it
+                # carried), never as a misleading already-applied
+                # 'duplicate'. Only a recorded commit answers duplicate.
+                if row["status"] == "rejected":
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected",
+                        error="previously_rejected_on_replay",
+                        canonical_id=row["canonical_id"]))
+                    continue
                 receipts.append(_receipt(
                     op_id, kind, "duplicate",
                     canonical_id=row["canonical_id"]))
@@ -413,12 +423,16 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                     # `expiry_class` previously bypassed this guard entirely
                     # and folded `committed, deduped=True` while silently
                     # dropping the requested deadline (the FB-2 invariant at
-                    # the head of this block). Note until-only add/capture can
+                    # the head of this block). An until-only add/capture can
                     # never commit as a NEW op (write-side _resolve_expiry
                     # requires expiry_class), so the until-only shape reaches
-                    # this fold only as a replay against a plain-add seed —
-                    # and there the fold must either find the deadline
-                    # already stored (true replay) or reject.
+                    # this fold only as a replay — and for that shape the
+                    # stored-match predicate can never pass (memory_expiry
+                    # .expiry_class is NOT NULL while the request omits the
+                    # class), so the SANCTIONED outcome is the named
+                    # rejection: the caller re-files via update, which owns
+                    # expiry transitions (review PRR-004; issue #420 AC3
+                    # permits honor-or-reject).
                     if kind in ("add", "capture") and (_want_cls or _want_until):
                         _keeper_row = conn.execute(
                             "SELECT type FROM memory WHERE id=?",

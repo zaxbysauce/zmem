@@ -76,13 +76,11 @@ class DeepseekEvidenceVersionParityTest(unittest.TestCase):
     """The harness reports evidence version divergence."""
 
     def test_leg1_live_agreement_and_detection(self):
-        """Post-#420 regeneration shape (CHECK_WRONG amendment): the LIVE
-        committed artifacts agree with the release — the 0.133.0
-        regeneration closed the disclosed support-report lag, so the
-        standing contract is agreement with NO tolerance, and the
-        detection legs run against a synthetically drifted copy of the
-        LIVE support report (the original leg-1 premise — a committed live
-        divergence — was the #416 disclosure itself, retired with it)."""
+        """Post-#420 contract: the LIVE committed artifacts agree with the
+        release — the 0.134.0 regeneration closed the disclosed
+        support-report lag, so the standing contract is agreement with NO
+        tolerance, and the detection legs run against a synthetically
+        drifted copy of the LIVE support report."""
         canary = _load(_EVIDENCE / "canary-report.json")
         support = _load(_EVIDENCE / "support-report.json")
         release = _load(REPO_ROOT / "release-manifest.json")["version"]

@@ -3462,8 +3462,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         omitted-namespace defaults. Legacy single-token mode cannot
         forward the id (the engine has no map entry for it): the hub
         guards declared namespaces and the omitted-namespace add/capture
-        default there, while a legacy by-id mutation target's namespace is
-        a disclosed residual (PR #417 follow-up).
+        default there, and — since the #420 scope passthrough — forwards
+        a SCOPED legacy caller's namespace allow-list to the engine, so
+        by-id mutation targets and destination rekeys are enforced for
+        it exactly as for map principals (an unscoped legacy token was
+        never namespace-limited to begin with).
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
@@ -3505,6 +3508,18 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                             "detail": "the tool-level principal must name "
                                       "the authenticated request principal"}
                 resolved = request_principal
+                # Issue #420 review (cubic 4434387867): in LEGACY
+                # single-token mode a tool-level principal naming the
+                # caller's own id is a harmless self-assertion — but
+                # forwarding it would make the engine deny every op
+                # (no map entry, unknown_principal), a dead end. The
+                # authenticated identity is already authoritative, so
+                # the self-assertion is dropped and the scoped caller
+                # routes through the --namespace-scope passthrough
+                # below (the CLI refuses --principal+--namespace-scope,
+                # so forwarding both is not an option).
+                if principal_map is None:
+                    cli_principal = ""
             else:
                 resolved = request_principal
                 # Issue #414 AC1 (review PRR-001 / F1): MAP mode forwards
@@ -3550,8 +3565,9 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # namespace. Map mode enforces per-op engine-side (the id is
             # forwarded above); legacy single-token mode cannot forward,
             # so the hub guards the omitted-namespace add/capture default
-            # (user:global) here — its by-id mutation-target residual is
-            # disclosed on the PR.
+            # (user:global) here — the by-id half is enforced engine-side
+            # via the --namespace-scope passthrough for scoped legacy
+            # callers (issue #420).
             effective_ns = str(ns) if ns else (
                 "user:global"
                 if kind in ("add", "capture") and principal_map is None
@@ -3575,11 +3591,16 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # engine's in-transaction enforcement covers by-id mutation
             # targets (id_or_dep-first, the engine's own resolution) and
             # update destination rekeys — the same enforcement map-mode
-            # principals get, closing the disclosed by-id residual. The
-            # hub-side pre-guard above still fast-refuses declared and
-            # omitted op namespaces.
+            # principals get, closing the formerly-disclosed by-id
+            # residual. The hub-side pre-guard above still fast-refuses
+            # declared and omitted op namespaces. Transport = NEWLINE
+            # separators (review PRR-001): no grammar-valid namespace can
+            # contain a newline (NAMESPACE_RE has no DOTALL), so the
+            # join/split round-trip is injective — a comma separator was
+            # not (a comma-bearing scope silently split into a wider,
+            # wrong set).
             args += ["--namespace-scope",
-                     ",".join(sorted(resolved.namespaces))]
+                     "\n".join(sorted(resolved.namespaces))]
         result = await _run_store_async(
             args, input_text=input_text, deadline=deadline, pool="write")
         # Issue #420 (deadline choke point): apply_ops' failure returns
