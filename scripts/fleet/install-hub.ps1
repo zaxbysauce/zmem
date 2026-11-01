@@ -113,7 +113,7 @@ if (-not $serve) {
     $status = tailscale serve status 2>$null | Out-String
     $lines = $status -split "`r?`n"
     $occupier = @($lines | Where-Object {
-        $_ -match '^https?://[^/ ]+(:443)?(\s|$)' -or
+        $_ -match '^https?://[^/: ]+(:443)?(\s|$)' -or
         $_ -match '^\|-- tcp://[^ ]+:443 '
     }).Count -gt 0
     $ours = @($lines | Where-Object {

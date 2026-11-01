@@ -126,7 +126,7 @@ if command -v tailscale >/dev/null 2>&1; then
         case "$line" in
             *"|"*"-- tcp://"*":443 "*) OCCUPIER=1 ;;
         esac
-        printf '%s' "$line" | grep -Eq '^https?://[^/ ]+(:443)?([[:space:]]|$)' && OCCUPIER=1
+        printf '%s' "$line" | grep -Eq '^https?://[^/: ]+(:443)?([[:space:]]|$)' && OCCUPIER=1
         printf '%s' "$line" | grep -Eq "proxy http://127\.0\.0\.1:$PORT([^0-9]|\$)" && OURS=1
     done <<EOF_STATUS
 $SERVE_STATUS

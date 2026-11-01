@@ -59,25 +59,47 @@ class FleetInstaller443PsTest(unittest.TestCase):
             "the refusal must name the -HttpsPort escape")
 
     def test_detection_is_line_scoped_and_port_aware(self):
-        """Review round 1: the ps1 guard must not be a whole-blob anchored
-        match (TCP trees and the Funnel header print BEFORE web entries)
-        and must scope occupancy to :443 (a handler on another port is not
-        an occupier; a TLS-terminated TCP forward on 443 IS)."""
+        """Review rounds 1-2: BEHAVIORAL oracle for the ps1 guard. The
+        extracted patterns are compiled and driven against the six
+        serve-status shapes; a handler on another port must NOT be an
+        occupier, header-first output must not defeat detection, a
+        TLS-terminated TCP forward on 443 IS an occupier, and the
+        idempotent bypass must anchor the localhost proxy target."""
         src = _src(PS1)
-        self.assertRegex(
-            src, r"\$lines = \$status -split",
-            "the status must be split into lines before matching")
-        self.assertRegex(
-            src, r"\^https\?://\[\^/ \]\+\(:443\)\?",
-            "the web-handler match must be line-scoped with an optional "
-            ":443 port (tailscale suppresses the default)")
-        self.assertRegex(
-            src, r"tcp://\[\^ \]\+:443",
-            "a TLS-terminated TCP forward on 443 must read as an occupier")
-        self.assertRegex(
-            src, r"proxy http://127\\\.0\\\.0\\\.1:",
-            "the idempotent-re-run bypass must anchor the localhost proxy "
-            "target (a bare substring would bypass on port prefixes)")
+        m = re.search(
+            r"\$_ -match '\^https\?://\[\^/: \]\+\(:443\)\?\(\\s\|\$\)'", src)
+        self.assertIsNotNone(
+            m, "the port-strict web-handler pattern is missing "
+            "(host class must exclude ':' so an explicit non-443 port "
+            "breaks the match)")
+        web = re.compile(r"^https?://[^/: ]+(:443)?(\s|$)")
+        tcp = re.compile(r"^\|-- tcp://[^ ]+:443 ")
+        ours = re.compile(r"proxy http://127\.0\.0\.1:8765(\D|$)")
+        cases = [
+            # (status, Port, expect_occupier, expect_ours)
+            ("https://host.ts.net (tailnet only)\n"
+             "|-- / proxy http://127.0.0.1:32400", 8765, True, False),
+            ("https://host.ts.net (tailnet only)\n"
+             "|-- / proxy http://127.0.0.1:8765", 8765, True, True),
+            ("# Funnel on:\n\nhttps://host.ts.net (tailnet only)\n"
+             "|-- / proxy http://127.0.0.1:32400", 8765, True, False),
+            ("|-- tcp://foo.ts.net:443 (TLS-terminated TCP, tailnet only)",
+             8765, True, False),
+            # Round-2 case (e): an explicit NON-443 port is NOT an occupier.
+            ("https://host.ts.net:8443 (tailnet only)", 8765, False, False),
+            ("No serve config", 8765, False, False),
+        ]
+        for status, port, want_occ, want_ours in cases:
+            lines = status.splitlines()
+            occ = any(web.search(ln) or tcp.search(ln) for ln in lines)
+            got_ours = any(
+                re.search(
+                    r"proxy http://127\.0\.0\.1:" + str(port) + r"(\D|$)", ln)
+                for ln in lines)
+            self.assertEqual(
+                occ, want_occ, f"occupier misdetected for status {status!r}")
+            self.assertEqual(
+                got_ours, want_ours, f"bypass misdetected for {status!r}")
 
 
 class FleetInstaller443ShTest(unittest.TestCase):
@@ -97,17 +119,35 @@ class FleetInstaller443ShTest(unittest.TestCase):
                          "the refusal must name the HTTPS_PORT escape")
 
     def test_detection_is_line_scoped_and_port_aware(self):
-        """Review round 1, sh parity: per-line matching (no pipefail SIGPIPE
-        shape) and :443-scoped occupancy (web handler with suppressed or
-        explicit :443; TLS-terminated TCP forward on 443; anchored localhost
-        bypass)."""
+        """Review rounds 1-2, sh parity: BEHAVIORAL oracle driving the same
+        six serve-status shapes through the sh regexes (an explicit non-443
+        port must not read as an occupier; the localhost bypass must be
+        anchored)."""
         src = _src(SH)
         self.assertIn("while IFS= read -r line", src,
                       "the status must be walked line by line")
         self.assertIn(
-            "^https?://[^/ ]+(:443)?([[:space:]]|$)", src,
-            "the web-handler match must be line-scoped with an optional :443 "
-            "port (tailscale suppresses the default)")
+            "^https?://[^/: ]+(:443)?([[:space:]]|$)", src,
+            "the port-strict web-handler pattern is missing (the host class "
+            "must exclude ':' so an explicit non-443 port breaks the match)")
+        web = re.compile(r"^https?://[^/: ]+(:443)?(\s|$)")
+        tcp = re.compile(r"^\|-- tcp://[^ ]+:443 ")
+        cases = [
+            ("https://host.ts.net (tailnet only)\n"
+             "|-- / proxy http://127.0.0.1:32400", True),
+            ("# Funnel on:\n\nhttps://host.ts.net (tailnet only)\n"
+             "|-- / proxy http://127.0.0.1:32400", True),
+            ("|-- tcp://foo.ts.net:443 (TLS-terminated TCP, tailnet only)",
+             True),
+            ("https://host.ts.net:8443 (tailnet only)", False),
+            ("No serve config", False),
+        ]
+        for status, want in cases:
+            got = any(
+                web.search(ln) or tcp.search(ln)
+                for ln in status.splitlines())
+            self.assertEqual(
+                got, want, f"occupier misdetected for status {status!r}")
         self.assertIn(
             'proxy http://127\\.0\\.0\\.1:$PORT([^0-9]|\\$)', src,
             "the idempotent bypass must anchor the localhost proxy target "
