@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "8c32176a38af50033f46695abe7083c13a6e1447c7fc81c732e662cf16c1a413",
+  "digest": "24ae15fc40c069597c9db7ca7fd6a50c4dcbec7d3be53196d165dc2d99fbb560",
   "files": {
     ".agents/plugins/marketplace.json": "a14c66350d1ec0a52b00509a5ce804ff88c5d5d822bae9208c9eeb7c9b4b0e6c",
     ".claude-plugin/marketplace.json": "f21c9c691f0ea47b2bac5bcd40377cada78528e8b0428898a7fb2d3ac8cd9a62",
@@ -14,8 +14,8 @@
     "deepseek-plugin/index.mjs": "7b06eb6cdef25661e5672b982e0bbfefa8719a52319e5ee4aeaa85ceaf3b2483",
     "deepseek-plugin/install.mjs": "fce36e8235d194c564365dbbfc1d130dcb3d5143252a52d52a7b7e0d22714b60",
     "deepseek-plugin/launcher.mjs": "610db8ce08d85ad9a6c3498b1a3a41279e702dd6d7bf2cc43057b30a1095aabd",
-    "deepseek-plugin/package-lock.json": "be908f62883f5a39186bffb4f07a1e3aa880264809b5c23e2392fd1df5159640",
-    "deepseek-plugin/package.json": "0f26570ec6c656adf9e3c32381b359d911534d00f99daf41c36f92649d8ed4e7",
+    "deepseek-plugin/package-lock.json": "2d32b44662d7bdf943d7d66b6125a941f181d31e2d0ddbc712cdc283481758a8",
+    "deepseek-plugin/package.json": "3561886b4eee3b0ecb91c98790adf56e50305952ef75ba600ec8ebc30a9d824d",
     "deepseek-plugin/plugin.json": "c8c03dd9a2ba45aacafcc22cd5c78e48db61205a09d575b980afbc50c8cd266d",
     "deepseek-plugin/tools.mjs": "c51a4e02d4473e44b110294a554c093843d6d1bad39c62f10489ccaec7d56a95",
     "hermes-plugin/__init__.py": "0dc4ee9f838e1d99ba704e905ae1462568425f77097015cbf47ad8fbe2d3e23c",
