@@ -1,6 +1,6 @@
 {
   "schema": "zmem-deepseek-support-v1",
-  "generated_at": "2026-11-01T00:25:05.891Z",
+  "generated_at": "2026-11-01T13:59:44.681Z",
   "zmem_version": "0.134.0",
   "tested_floors": {
     "runtime": "@deepseek-ai/* 0.2.1-rc.2 (cordis 4.0.5)",
@@ -32,5 +32,5 @@
     "local-run:native_canary"
   ],
   "first_class_support": false,
-  "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed."
+  "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed. Provenance note (review PRR-009/018): the canary's git_sha records the run-time HEAD, which necessarily precedes the release commit that carries the artifact (self-reference is impossible); the zero-runtime-code delta between the recorded revision and the release commit is disclosed in the release notes, and the reservation/uuid fields are fresh per run by design — byte-identical regeneration is not a property this artifact promises."
 }
