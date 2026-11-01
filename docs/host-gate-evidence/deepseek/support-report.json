@@ -1,36 +1,36 @@
 {
-  "schema": "zmem-deepseek-support-v1",
-  "generated_at": "2026-11-01T13:59:44.681Z",
-  "zmem_version": "0.134.0",
-  "tested_floors": {
-    "runtime": "@deepseek-ai/* 0.2.1-rc.2 (cordis 4.0.5)",
-    "node": ">=20 (verified on v24.16.0, Windows x64)",
-    "delivery": "first accepted agent/pre-step fenced append; reservation ack after observed session admission"
-  },
-  "claimed": [
-    {
-      "carrier": "headless",
-      "platform": "win32",
-      "evidence": "docs/host-gate-evidence/deepseek/canary-report.json",
-      "runtime": "dsh 0.2.1-rc.2, node v24.16.0"
-    }
-  ],
-  "capability_gaps": [
-    "compaction-synthetic: reaction pinned with synthetic markers only",
-    "real-compactor-absent: the dsh compactor package is not part of the published 0.2.1-rc.2 runtime",
-    "desktop-carrier-not-tested: desktop/Web carriers untested",
-    "profile-loader-contract-level-only: the dsh product loader (cordis.yml row) is not part of the published packages; install validated at the profile-row/package-contract level only",
-    "non-win32-native-runs-unclaimed: native dsh canary evidence exists only for win32/headless"
-  ],
-  "evidence_refs": [
-    "docs/host-gate-evidence/deepseek/canary-report.json",
-    "tests/test_t13_deepseek_contract.py",
-    "tests/test_t14_deepseek_learning.py",
-    "#374",
-    "#375",
-    "local-run:first_request_delivery",
-    "local-run:native_canary"
-  ],
-  "first_class_support": false,
-  "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed. Provenance note (review PRR-009/018): the canary's git_sha records the run-time HEAD, which necessarily precedes the release commit that carries the artifact (self-reference is impossible); the zero-runtime-code delta between the recorded revision and the release commit is disclosed in the release notes, and the reservation/uuid fields are fresh per run by design — byte-identical regeneration is not a property this artifact promises."
+ "schema": "zmem-deepseek-support-v1",
+ "generated_at": "2026-11-01T21:28:50Z",
+ "zmem_version": "0.137.0",
+ "tested_floors": {
+  "runtime": "@deepseek-ai/* 0.2.1-rc.2 (cordis 4.0.5)",
+  "node": ">=20 (verified on v24.16.0, Windows x64)",
+  "delivery": "first accepted agent/pre-step fenced append; reservation ack after observed session admission"
+ },
+ "claimed": [
+  {
+   "carrier": "headless",
+   "platform": "win32",
+   "evidence": "docs/host-gate-evidence/deepseek/canary-report.json",
+   "runtime": "dsh 0.2.1-rc.2, node v24.16.0"
+  }
+ ],
+ "capability_gaps": [
+  "compaction-synthetic: reaction pinned with synthetic markers only",
+  "real-compactor-absent: the dsh compactor package is not part of the published 0.2.1-rc.2 runtime",
+  "desktop-carrier-not-tested: desktop/Web carriers untested",
+  "profile-loader-contract-level-only: the dsh product loader (cordis.yml row) is not part of the published packages; install validated at the profile-row/package-contract level only",
+  "non-win32-native-runs-unclaimed: native dsh canary evidence exists only for win32/headless"
+ ],
+ "evidence_refs": [
+  "docs/host-gate-evidence/deepseek/canary-report.json",
+  "tests/test_t13_deepseek_contract.py",
+  "tests/test_t14_deepseek_learning.py",
+  "#374",
+  "#375",
+  "local-run:first_request_delivery",
+  "local-run:native_canary"
+ ],
+ "first_class_support": false,
+ "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed. Provenance note (review PRR-009/018): the canary's git_sha records the run-time HEAD, which necessarily precedes the release commit that carries the artifact (self-reference is impossible); the zero-runtime-code delta between the recorded revision and the release commit is disclosed in the release notes, and the reservation/uuid fields are fresh per run by design — byte-identical regeneration is not a property this artifact promises. Regenerated at 0.137.0 on the release branch: real dsh-host canary run 7/7 lanes at git baf44695c6ed; support fields unchanged except version/generated_at (zero runtime-code delta)."
 }

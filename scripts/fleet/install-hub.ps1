@@ -23,6 +23,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DataDir,
     [Parameter(Mandatory = $true)][string]$TokensFile,
     [int]$Port = 8765,
+    [int]$HttpsPort = 443,
     [string]$TaskName = "zmem-hub"
 )
 
@@ -30,6 +31,9 @@ $ErrorActionPreference = "Stop"
 
 if ($Port -lt 1 -or $Port -gt 65535) {
     Write-Error "-Port must be 1-65535 (got: $Port)"
+}
+if ($HttpsPort -lt 1 -or $HttpsPort -gt 65535) {
+    Write-Error "-HttpsPort must be 1-65535 (got: $HttpsPort)"
 }
 
 # --- refuse a broad-ACL principal map (SID-based, locale-independent) -------
@@ -90,11 +94,39 @@ if ($state -ne "Running") {
 }
 
 # --- tailscale serve: tailnet HTTPS -> localhost ONLY -----------------------
+# Issue #423: the serve HTTPS port is a parameter, and an occupied target
+# port is REFUSED before re-pointing serve -- configuring a handler over a
+# live non-zmem backend would silently break that service, and the
+# documented idempotent re-point makes it worse on re-runs.
 $serve = Get-Command tailscale -ErrorAction SilentlyContinue
 if (-not $serve) {
-    Write-Warning "tailscale not found - install it, then run: tailscale serve --bg --https=443 http://127.0.0.1:$Port"
+    Write-Warning "tailscale not found - install it, then run: tailscale serve --bg --https=$HttpsPort http://127.0.0.1:$Port"
 } else {
-    tailscale serve --bg --https=443 "http://127.0.0.1:$Port"
+    # Review round 1: detection is LINE-scoped and PORT-aware. Tailscale
+    # prints TCP-forward trees and the Funnel header BEFORE web entries, so
+    # an anchored whole-blob match no-ops on exactly the busy hosts this
+    # guard exists for; and a handler on another port is not a :443
+    # occupier. An occupier line is a web handler whose host carries no
+    # explicit port or :443 (tailscale suppresses the default) or a
+    # TLS-terminated TCP forward on 443. A web handler that already proxies
+    # OUR localhost port is the idempotent re-run and never an occupier.
+    # Final-critic round 1: -Width 4096 stops Out-String word-wrap from splitting the very lines the matcher reads (default 80 on non-interactive hosts).
+    $status = tailscale serve status 2>$null | Out-String -Width 4096
+    $lines = $status -split "`r?`n"
+    $occupier = @($lines | Where-Object {
+        $_ -match '^https?://[^/: ]+(:443)?(\s|$)' -or
+        $_ -match '^\|-- tcp://[^ ]+:443 '
+    }).Count -gt 0
+    $ours = @($lines | Where-Object {
+        $_ -match ("proxy http://127\.0\.0\.1:" + $Port + "(\D|$)")
+    }).Count -gt 0
+    if ($HttpsPort -eq 443 -and $occupier -and -not $ours) {
+        Write-Error ("REFUSED: tailscale serve already has a handler on " +
+            ":443 (an operator service is live there). Re-run with an " +
+            "explicit -HttpsPort <n> to publish the hub on another " +
+            "port instead of replacing it. Current serve status:`n$status")
+    }
+    tailscale serve --bg --https=$HttpsPort "http://127.0.0.1:$Port"
     if ($LASTEXITCODE -ne 0) { Write-Error "tailscale serve failed (exit $LASTEXITCODE)" }
     tailscale serve status
 }

@@ -19,10 +19,11 @@
 
 set -euo pipefail
 
-REPO_ROOT="${1:?usage: install-hub.sh REPO_ROOT DATA_DIR TOKENS_FILE [PORT]}"
+REPO_ROOT="${1:?usage: install-hub.sh REPO_ROOT DATA_DIR TOKENS_FILE [PORT [HTTPS_PORT]]}"
 DATA_DIR="${2:?DATA_DIR required}"
 TOKENS_FILE="${3:?TOKENS_FILE required}"
 PORT="${4:-8765}"
+HTTPS_PORT="${5:-443}"
 
 if ! command -v systemctl >/dev/null 2>&1; then
     echo "install-hub: systemd (systemctl) is required - this installer targets Linux hosts only" >&2
@@ -31,6 +32,11 @@ fi
 case "$PORT" in
     ''|*[!0-9]*) echo "install-hub: PORT must be numeric (got: $PORT)" >&2; exit 2 ;;
     *) [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { echo "install-hub: PORT must be 1-65535 (got: $PORT)" >&2; exit 2; } ;;
+esac
+# Issue #423: the serve HTTPS port is a parameter (default 443).
+case "$HTTPS_PORT" in
+    ''|*[!0-9]*) echo "install-hub: HTTPS_PORT must be numeric (got: $HTTPS_PORT)" >&2; exit 2 ;;
+    *) [ "$HTTPS_PORT" -ge 1 ] && [ "$HTTPS_PORT" -le 65535 ] || { echo "install-hub: HTTPS_PORT must be 1-65535 (got: $HTTPS_PORT)" >&2; exit 2; } ;;
 esac
 case "$DATA_DIR$TOKENS_FILE$REPO_ROOT" in
     *[\\\#\$\'\"]*)
@@ -104,11 +110,40 @@ if ! systemctl --no-pager --lines=5 status zmem-hub.service; then
 fi
 
 # --- tailscale serve: tailnet HTTPS -> localhost ONLY -----------------------
+# Issue #423: refuse an occupied :443 before re-pointing serve (a live
+# non-zmem handler there would be silently replaced); -HttpsPort/HTTPS_PORT
+# publishes the hub on another port instead.
 if command -v tailscale >/dev/null 2>&1; then
-    tailscale serve --bg --https=443 "http://127.0.0.1:$PORT"
+    SERVE_STATUS="$(tailscale serve status 2>/dev/null || true)"
+    # Review round 1: line-scoped (herestring, not a pipe - no SIGPIPE under
+    # pipefail) and PORT-aware detection. An occupier is a web handler with
+    # no explicit port or :443 (tailscale suppresses the default) or a
+    # TLS-terminated TCP forward on 443; a handler on another port is NOT a
+    # :443 occupier, and a web handler already proxying OUR localhost port
+    # is the idempotent re-run.
+    OCCUPIER=0; OURS=0
+    while IFS= read -r line; do
+        case "$line" in
+            *"|"*"-- tcp://"*":443 "*) OCCUPIER=1 ;;
+        esac
+        printf '%s' "$line" | grep -Eq '^https?://[^/: ]+(:443)?([[:space:]]|$)' && OCCUPIER=1
+        printf '%s' "$line" | grep -Eq "proxy http://127\.0\.0\.1:$PORT([^0-9]|\$)" && OURS=1
+    done <<EOF_STATUS
+$SERVE_STATUS
+EOF_STATUS
+    if [ "$HTTPS_PORT" = "443" ] && [ "$OCCUPIER" = 1 ] && [ "$OURS" = 0 ]; then
+        echo "install-hub: REFUSED: tailscale serve already has a handler on :443" >&2
+        echo "(an operator service is live there). Re-run with an explicit" >&2
+        echo "HTTPS_PORT=<n> (5th arg) to publish the hub on another port" >&2
+        echo "instead of replacing it. Current serve status:" >&2
+        printf '%s
+' "$SERVE_STATUS" >&2
+        exit 2
+    fi
+    tailscale serve --bg --https="$HTTPS_PORT" "http://127.0.0.1:$PORT"
     tailscale serve status
 else
-    echo "install-hub: tailscale not found - install it, then run: tailscale serve --bg --https=443 http://127.0.0.1:$PORT" >&2
+    echo "install-hub: tailscale not found - install it, then run: tailscale serve --bg --https=$HTTPS_PORT http://127.0.0.1:$PORT" >&2
 fi
 
 echo
