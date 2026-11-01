@@ -2433,9 +2433,18 @@ def update_memory(
         # mirrors supersede_memory's in-transaction guard). Rollback only
         # when this function owns the transaction; a caller-owned
         # transaction is left to the caller/savepoint owner.
+        # Issue #420 (stale-derive refusal): the successor's namespace and
+        # taint lineage derive from the PRE-lock read above (the namespace
+        # guard, `ns` inheritance, and `incoming_taint`), so the under-lock
+        # re-read must revalidate THOSE fields too — a lock re-check only
+        # revalidates the fields it reads. An in-place, non-superseding
+        # mutation (consolidate taint-raise, namespace rekey) committed in
+        # the read-to-lock window otherwise mints a successor with a stale
+        # taint or a pre-rekey namespace. Value drift ONLY — a no-op
+        # concurrent write cannot spuriously refuse.
         locked_row = conn.execute(
-            "SELECT superseded_at FROM memory WHERE id=?", (mid,)
-        ).fetchone()
+            "SELECT superseded_at, taint, namespace FROM memory WHERE id=?",
+            (mid,)).fetchone()
         if locked_row is None:
             if started_tx and conn.in_transaction:
                 conn.rollback()
@@ -2451,6 +2460,20 @@ def update_memory(
                 f"{locked_row['superseded_at']}); update refused — history "
                 "is append-only, this row is no longer live, and a "
                 "concurrent update won the race (issue #416)"
+            )
+        if (locked_row["taint"] != old["taint"]
+                or locked_row["namespace"] != old["namespace"]):
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            # Content-free on the values (review PRR-006): this message
+            # passes verbatim through the hub update tool's sanitizer, so
+            # it must not disclose the row's (possibly foreign, rekeyed)
+            # namespace or trust lineage — field NAMES only.
+            raise ValueError(
+                f"[zmem] memory {mid} changed under the write lock "
+                "(taint and/or namespace drift); update refused — the "
+                "successor's trust lineage and namespace derive from the "
+                "pre-lock read; re-read and retry (issue #420)"
             )
 
         # v15 (#173 PR-review F21): resolve the side-table pair against a

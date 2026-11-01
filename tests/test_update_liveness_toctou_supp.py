@@ -24,6 +24,22 @@ hook; writer A commits a full update of the same row inside the window.
   — ONE live successor, A's tombstone timestamps unchanged; B's own
   (self-owned) transaction IS rolled back.
 
+Issue #420 supplement (frozen C8 parity) — the stale taint/namespace
+derive legs.  The under-lock re-read must revalidate the fields the
+successor DERIVES from the pre-lock snapshot, not just liveness; an
+in-place (non-superseding) mutation committed on a separate connection
+inside the same ``_validate_namespace`` window must refuse:
+
+- (c) TAINT-RAISE leg: ``UPDATE memory SET taint='untrusted_web'`` in the
+  window -> ValueError naming the drift ("changed under the write lock"
+  + "taint"), NO successor minted, parent still live (now untrusted_web);
+- (d) NAMESPACE-REKEY leg: ``UPDATE memory SET namespace='user:rekeyed'``
+  in the window -> refusal naming namespace, no successor, parent live;
+- (e) NO-DRIFT control: the same window shape with a value-preserving
+  write (``SET taint=taint``) must NOT refuse — the drift check compares
+  VALUES, so a no-op concurrent write cannot spuriously refuse and the
+  update commits (one live successor, parent tombstoned).
+
 Isolation follows the frozen C4 exactly.  Standalone:
 ``python -X utf8 tests/test_update_liveness_toctou_supp.py``
 """
@@ -246,6 +262,126 @@ class UpdateToctouSupplementTest(unittest.TestCase):
         self.assertEqual(
             len(live), 1,
             f"leg b: exactly ONE live successor must remain (found {live})")
+
+    def _interleave_inplace(self, conn_b, mid, mutate_sql, mutate_params=()):
+        """The frozen C8 interleave (issue #420): B paused between its
+        pre-lock ``SELECT *`` and the ``BEGIN IMMEDIATE`` by the one-shot
+        _validate_namespace hook; a racing writer commits an IN-PLACE
+        (non-superseding) mutation on its OWN connection inside the window.
+        Returns the ValueError message (None when update_memory returned
+        normally)."""
+        conn_a = self._connect()  # the racing writer's own connection
+        original = writelib._validate_namespace
+        state = {"fired": False}
+
+        def hooked(conn, ns):
+            result = original(conn, ns)
+            if not state["fired"]:
+                state["fired"] = True
+                conn_a.execute(mutate_sql, mutate_params)
+                conn_a.commit()
+            return result
+
+        error = None
+        writelib._validate_namespace = hooked
+        try:
+            _quiet(writelib.update_memory, conn_b, mid=mid,
+                   content="c4s replacement " + uuid.uuid4().hex,
+                   supersede_reason="updated", now=B_NOW)
+        except ValueError as exc:
+            error = str(exc)
+        finally:
+            writelib._validate_namespace = original
+            conn_a.close()
+        return error
+
+    def _row(self, mid):
+        conn = sqlite3.connect(self.store_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(
+                "SELECT taint, namespace, superseded_at FROM memory "
+                "WHERE id=?", (mid,)).fetchone()
+        finally:
+            conn.close()
+
+    def test_leg_c_taint_raise_in_window_refuses_stale_derive(self):
+        conn_b = self._connect()
+        parent = self._seed(conn_b)
+        error = self._interleave_inplace(
+            conn_b, parent,
+            "UPDATE memory SET taint='untrusted_web' WHERE id=?", (parent,))
+        row = self._row(parent)
+        self.assertEqual(
+            row["taint"], "untrusted_web",
+            f"leg c: the racing writer's taint raise must land on the "
+            f"parent (found {tuple(row)!r})")
+        self.assertIsNotNone(
+            error,
+            "leg c: update_memory must refuse a successor whose taint "
+            "lineage derives from the pre-lock view (the row was raised to "
+            "untrusted_web in the read-to-lock window)")
+        self.assertIn(
+            "changed under the write lock", error,
+            f"leg c: the refusal must name the drift: {error!r}")
+        self.assertIn("taint", error.lower(),
+                      f"leg c: the refusal must name taint: {error!r}")
+        self.assertEqual(
+            self._live_successors(parent), [],
+            "leg c: a refused update must mint NO successor")
+        self.assertIsNone(
+            row["superseded_at"],
+            f"leg c: the parent must stay live (found {tuple(row)!r})")
+
+    def test_leg_d_namespace_rekey_in_window_refuses_stale_derive(self):
+        conn_b = self._connect()
+        parent = self._seed(conn_b)
+        error = self._interleave_inplace(
+            conn_b, parent,
+            "UPDATE memory SET namespace='user:rekeyed' WHERE id=?",
+            (parent,))
+        row = self._row(parent)
+        self.assertEqual(
+            row["namespace"], "user:rekeyed",
+            f"leg d: the racing writer's rekey must land on the parent "
+            f"(found {tuple(row)!r})")
+        self.assertIsNotNone(
+            error,
+            "leg d: update_memory must refuse a successor minted into the "
+            "pre-rekey namespace derived from the pre-lock view")
+        self.assertIn(
+            "changed under the write lock", error,
+            f"leg d: the refusal must name the drift: {error!r}")
+        self.assertIn("namespace", error.lower(),
+                      f"leg d: the refusal must name namespace: {error!r}")
+        self.assertEqual(
+            self._live_successors(parent), [],
+            "leg d: a refused update must mint NO successor")
+        self.assertIsNone(
+            row["superseded_at"],
+            f"leg d: the parent must stay live (found {tuple(row)!r})")
+
+    def test_leg_e_no_drift_control_still_commits(self):
+        conn_b = self._connect()
+        parent = self._seed(conn_b)
+        error = self._interleave_inplace(
+            conn_b, parent,
+            "UPDATE memory SET taint=taint WHERE id=?", (parent,))
+        self.assertIsNone(
+            error,
+            f"leg e (no-drift control): a value-preserving concurrent write "
+            f"must NOT refuse (the drift check compares VALUES, not write "
+            f"activity): {error!r}")
+        row = self._row(parent)
+        self.assertIsNotNone(
+            row["superseded_at"],
+            f"leg e: the parent must be tombstoned by the successful "
+            f"update (found {tuple(row)!r})")
+        live = self._live_successors(parent)
+        self.assertEqual(
+            len(live), 1,
+            f"leg e: the successful update must mint exactly ONE live "
+            f"successor (found {live})")
 
 
 if __name__ == "__main__":
