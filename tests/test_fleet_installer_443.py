@@ -96,7 +96,13 @@ class HttpsPortParameterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     _loader = unittest.TestLoader()
-    _suite = _loader.loadTestsFromModule(sys.modules[__name__])
+    _argv = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if _argv:
+        _suite = unittest.TestSuite()
+        for _name in _argv:
+            _suite.addTests(_loader.loadTestsFromName(_name, sys.modules[__name__]))
+    else:
+        _suite = _loader.loadTestsFromModule(sys.modules[__name__])
     _result = unittest.TextTestRunner(verbosity=2).run(_suite)
     print("CHECK-PASS" if _result.wasSuccessful() else "CHECK-FAIL")
     sys.exit(0 if _result.wasSuccessful() else 1)
