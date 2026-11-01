@@ -58,6 +58,27 @@ class FleetInstaller443PsTest(unittest.TestCase):
             src, r"-HttpsPort <n>",
             "the refusal must name the -HttpsPort escape")
 
+    def test_detection_is_line_scoped_and_port_aware(self):
+        """Review round 1: the ps1 guard must not be a whole-blob anchored
+        match (TCP trees and the Funnel header print BEFORE web entries)
+        and must scope occupancy to :443 (a handler on another port is not
+        an occupier; a TLS-terminated TCP forward on 443 IS)."""
+        src = _src(PS1)
+        self.assertRegex(
+            src, r"\$lines = \$status -split",
+            "the status must be split into lines before matching")
+        self.assertRegex(
+            src, r"\^https\?://\[\^/ \]\+\(:443\)\?",
+            "the web-handler match must be line-scoped with an optional "
+            ":443 port (tailscale suppresses the default)")
+        self.assertRegex(
+            src, r"tcp://\[\^ \]\+:443",
+            "a TLS-terminated TCP forward on 443 must read as an occupier")
+        self.assertRegex(
+            src, r"proxy http://127\\\.0\\\.0\\\.1:",
+            "the idempotent-re-run bypass must anchor the localhost proxy "
+            "target (a bare substring would bypass on port prefixes)")
+
 
 class FleetInstaller443ShTest(unittest.TestCase):
     """AC2 — the Linux installer applies the same refusal."""
@@ -74,6 +95,23 @@ class FleetInstaller443ShTest(unittest.TestCase):
             "the occupied-:443 refusal is missing")
         self.assertRegex(src, r"HTTPS_PORT=<n>",
                          "the refusal must name the HTTPS_PORT escape")
+
+    def test_detection_is_line_scoped_and_port_aware(self):
+        """Review round 1, sh parity: per-line matching (no pipefail SIGPIPE
+        shape) and :443-scoped occupancy (web handler with suppressed or
+        explicit :443; TLS-terminated TCP forward on 443; anchored localhost
+        bypass)."""
+        src = _src(SH)
+        self.assertIn("while IFS= read -r line", src,
+                      "the status must be walked line by line")
+        self.assertIn(
+            "^https?://[^/ ]+(:443)?([[:space:]]|$)", src,
+            "the web-handler match must be line-scoped with an optional :443 "
+            "port (tailscale suppresses the default)")
+        self.assertIn(
+            'proxy http://127\\.0\\.0\\.1:$PORT([^0-9]|\\$)', src,
+            "the idempotent bypass must anchor the localhost proxy target "
+            "(a bare substring would bypass on port prefixes)")
 
 
 class HttpsPortParameterTest(unittest.TestCase):

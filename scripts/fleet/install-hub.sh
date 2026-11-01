@@ -115,9 +115,23 @@ fi
 # publishes the hub on another port instead.
 if command -v tailscale >/dev/null 2>&1; then
     SERVE_STATUS="$(tailscale serve status 2>/dev/null || true)"
-    if [ "$HTTPS_PORT" = "443" ]             && printf '%s
-' "$SERVE_STATUS" | grep -q '^https\?://'             && ! printf '%s
-' "$SERVE_STATUS"                 | grep -qF "127.0.0.1:$PORT"; then
+    # Review round 1: line-scoped (herestring, not a pipe - no SIGPIPE under
+    # pipefail) and PORT-aware detection. An occupier is a web handler with
+    # no explicit port or :443 (tailscale suppresses the default) or a
+    # TLS-terminated TCP forward on 443; a handler on another port is NOT a
+    # :443 occupier, and a web handler already proxying OUR localhost port
+    # is the idempotent re-run.
+    OCCUPIER=0; OURS=0
+    while IFS= read -r line; do
+        case "$line" in
+            *"|"*"-- tcp://"*":443 "*) OCCUPIER=1 ;;
+        esac
+        printf '%s' "$line" | grep -Eq '^https?://[^/ ]+(:443)?([[:space:]]|$)' && OCCUPIER=1
+        printf '%s' "$line" | grep -Eq "proxy http://127\.0\.0\.1:$PORT([^0-9]|\$)" && OURS=1
+    done <<EOF_STATUS
+$SERVE_STATUS
+EOF_STATUS
+    if [ "$HTTPS_PORT" = "443" ] && [ "$OCCUPIER" = 1 ] && [ "$OURS" = 0 ]; then
         echo "install-hub: REFUSED: tailscale serve already has a handler on :443" >&2
         echo "(an operator service is live there). Re-run with an explicit" >&2
         echo "HTTPS_PORT=<n> (5th arg) to publish the hub on another port" >&2

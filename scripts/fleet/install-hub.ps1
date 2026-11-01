@@ -102,16 +102,28 @@ $serve = Get-Command tailscale -ErrorAction SilentlyContinue
 if (-not $serve) {
     Write-Warning "tailscale not found - install it, then run: tailscale serve --bg --https=$HttpsPort http://127.0.0.1:$Port"
 } else {
+    # Review round 1: detection is LINE-scoped and PORT-aware. Tailscale
+    # prints TCP-forward trees and the Funnel header BEFORE web entries, so
+    # an anchored whole-blob match no-ops on exactly the busy hosts this
+    # guard exists for; and a handler on another port is not a :443
+    # occupier. An occupier line is a web handler whose host carries no
+    # explicit port or :443 (tailscale suppresses the default) or a
+    # TLS-terminated TCP forward on 443. A web handler that already proxies
+    # OUR localhost port is the idempotent re-run and never an occupier.
     $status = tailscale serve status 2>$null | Out-String
-    if ($HttpsPort -eq 443 -and $status -match "^https?://.+") {
-        # :443 is the default listener: ANY existing https handler on it is
-        # an occupier unless it already proxies OUR localhost port.
-        if ($status -notmatch [regex]::Escape("127.0.0.1:$Port")) {
-            Write-Error ("REFUSED: tailscale serve already has a handler on " +
-                ":443 (an operator service is live there). Re-run with an " +
-                "explicit -HttpsPort <n> to publish the hub on another " +
-                "port instead of replacing it. Current serve status:`n$status")
-        }
+    $lines = $status -split "`r?`n"
+    $occupier = @($lines | Where-Object {
+        $_ -match '^https?://[^/ ]+(:443)?(\s|$)' -or
+        $_ -match '^\|-- tcp://[^ ]+:443 '
+    }).Count -gt 0
+    $ours = @($lines | Where-Object {
+        $_ -match ("proxy http://127\.0\.0\.1:" + $Port + "(\D|$)")
+    }).Count -gt 0
+    if ($HttpsPort -eq 443 -and $occupier -and -not $ours) {
+        Write-Error ("REFUSED: tailscale serve already has a handler on " +
+            ":443 (an operator service is live there). Re-run with an " +
+            "explicit -HttpsPort <n> to publish the hub on another " +
+            "port instead of replacing it. Current serve status:`n$status")
     }
     tailscale serve --bg --https=$HttpsPort "http://127.0.0.1:$Port"
     if ($LASTEXITCODE -ne 0) { Write-Error "tailscale serve failed (exit $LASTEXITCODE)" }
