@@ -20,6 +20,8 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 
+import schema_meta  # single authority for ENTITY_KINDS (issue #356)
+
 try:
     from storelib.opcmds import command_prefix
 except ImportError:  # direct-script import context
@@ -582,6 +584,14 @@ MAINTENANCE_POLL_SECONDS = _env_float("ZMEM_MAINTENANCE_POLL_SECONDS", 0.05)
 
 MAINTENANCE_GRACE_DEFAULT_SECONDS = 10.0
 
+# Empty-token grace for the schema-lock phantom classifier (issue #357).
+# A valid "<pid>:<token>" holder is broken as soon as the PID is PROVABLY
+# dead, with no age delay; the grace window only governs stripped-empty
+# files (create-then-token-write races). The maintenance default is the
+# conservative bound reused here — the schema acquirer writes the token
+# with the same one-syscall shape.
+SCHEMA_LOCK_GRACE_SECONDS = MAINTENANCE_GRACE_DEFAULT_SECONDS
+
 
 def _clamped_maintenance_grace(raw: float) -> float:
     """Clamp the ZMEM_MAINTENANCE_LOCK_GRACE_SECONDS knob (issue #262).
@@ -732,20 +742,21 @@ def _release_named_lock(name: str, token: str | None) -> None:
         return
     _host.release_lock(_lock_path(name), token)
 
-def _inspect_maintenance_phantom(path: Path) -> tuple[bool, str]:
-    """Classify the maintenance lock at `path` without touching it (issue #262).
+def _inspect_lock_phantom(path: Path, grace_seconds: float) -> tuple[bool, str]:
+    """Classify the lock at `path` without touching it (issue #262; generalized
+    for the schema lock by issue #357).
 
     Returns ``(is_phantom, expected_token)``. ``expected_token`` is the EXACT
     stripped content the classification observed — break_phantom_lock must
     confirm that same content and never a re-read, because a second read could
     observe a live successor's token and unlink its lock. Only two shapes are
     PROVABLY a phantom: a parsed holder whose PID no longer exists, and a
-    stripped-empty file older than MAINTENANCE_LOCK_GRACE_SECONDS (past any
-    live acquirer's create-then-token-write window). Everything else — a live
+    stripped-empty file older than the grace window (past any live
+    acquirer's create-then-token-write window). Everything else — a live
     or untestable holder, a vanished file, and non-empty unparseable content
     (foreign artifacts, which a content-match break could not remove anyway)
     — is ``(False, "")`` so the caller keeps today's poll-then-refuse
-    behavior; those files intentionally retain the 1800 s stale window.
+    behavior; those files intentionally retain the stale window.
     """
     if _host is None:
         return (False, "")
@@ -758,12 +769,64 @@ def _inspect_maintenance_phantom(path: Path) -> tuple[bool, str]:
             age = time.time() - os.stat(str(path)).st_mtime
         except OSError:
             return (False, "")
-        if age > MAINTENANCE_LOCK_GRACE_SECONDS:
+        if age > grace_seconds:
             return (True, "")
         return (False, "")
     if _host.process_alive(pid) is False:
         return (True, token)
     return (False, "")
+
+
+def _inspect_maintenance_phantom(path: Path) -> tuple[bool, str]:
+    """Maintenance-lock view of _inspect_lock_phantom (issue #262 shape)."""
+    return _inspect_lock_phantom(path, MAINTENANCE_LOCK_GRACE_SECONDS)
+
+
+def _acquire_schema_lock_with_liveness(
+    *, wait_seconds: float = 0.0,
+    poll_seconds: float = SCHEMA_LOCK_POLL_SECONDS,
+) -> str | None:
+    """``_strict_acquire_lock("schema", ...)`` plus holder liveness (issue
+    #357), PRESERVING the caller's bounded wait for live holders.
+
+    A non-blocking probe first; when the lock is held, classify it — a
+    PROVABLY dead holder's phantom is broken (identity-checked) and the
+    acquire retried once, so a process that died mid-migration no longer
+    blocks every store command (read-only ones included) for the full
+    SCHEMA_LOCK_STALE_SECONDS window. When the holder is live, unclassifiable,
+    or the break claim is contended, this falls through to the SAME bounded
+    wait/poll loop _strict_acquire_lock provides — live-holder timing and
+    refusals are byte-identical to before; only the dead-holder
+    false-positive class is gone.
+    """
+    path = _lock_path("schema")
+    token = _strict_acquire_lock(
+        "schema",
+        SCHEMA_LOCK_STALE_SECONDS,
+        wait_seconds=0.0,
+    )
+    if token is not None:
+        return token
+    is_phantom, expected = _inspect_lock_phantom(
+        path, SCHEMA_LOCK_GRACE_SECONDS)
+    if is_phantom and _host is not None \
+            and _host.break_phantom_lock(
+                path, expected, SCHEMA_LOCK_GRACE_SECONDS):
+        token = _strict_acquire_lock(
+            "schema",
+            SCHEMA_LOCK_STALE_SECONDS,
+            wait_seconds=0.0,
+        )
+        if token is not None:
+            return token
+    # Live holder, unclassifiable holder, or contended break: identical
+    # bounded-wait behavior to a plain _strict_acquire_lock call.
+    return _strict_acquire_lock(
+        "schema",
+        SCHEMA_LOCK_STALE_SECONDS,
+        wait_seconds=wait_seconds,
+        poll_seconds=poll_seconds,
+    )
 
 
 def _acquire_maintenance_lock_with_liveness() -> str | None:
@@ -874,10 +937,14 @@ def _release_writer_lease(lease: Path | None) -> None:
         pass
 
 def _prepare_store(conn: sqlite3.Connection) -> None:
-    """Serialize cold-open WAL/init/migrate work behind the schema lock."""
-    token = _strict_acquire_lock(
-        "schema",
-        SCHEMA_LOCK_STALE_SECONDS,
+    """Serialize cold-open WAL/init/migrate work behind the schema lock.
+
+    Routes through _acquire_schema_lock_with_liveness (issue #357) so a
+    holder that died mid-migration is broken instead of blocking every
+    command for the stale window; a LIVE holder still gets the full bounded
+    wait and the identical refusal below.
+    """
+    token = _acquire_schema_lock_with_liveness(
         wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
         poll_seconds=SCHEMA_LOCK_POLL_SECONDS,
     )
@@ -898,6 +965,18 @@ def _prepare_store(conn: sqlite3.Connection) -> None:
         migrate(conn)
     finally:
         _release_named_lock("schema", token)
+
+def _entity_ddl_sql() -> str:
+    """Render the entity-kind CHECK list from the single authority (issue #356).
+
+    Every DDL site that constrains ``entity.kind`` (init_db's fresh DDL,
+    _ENTITY_V16_DDL_RECREATED, _migrate_v16's staging table, and the legacy
+    migration block) interpolates this fragment, so the vocabulary has
+    exactly one definition — schema_meta.ENTITY_KINDS — and a future kind
+    append cannot leave a fresh store and a migrated store disagreeing.
+    """
+    return ", ".join(f"'{k}'" for k in schema_meta.ENTITY_KINDS)
+
 
 def init_db(conn: sqlite3.Connection) -> None:
     """Create schema if absent. Idempotent."""
@@ -1028,8 +1107,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS entity (
             id             TEXT PRIMARY KEY,
             kind           TEXT NOT NULL
-                CHECK (kind IN ('person','project','tool','preference','host','service',
-                                'model','repo','file','command','error_class','other')),
+                CHECK (kind IN (""" + _entity_ddl_sql() + """)),
             canonical_name TEXT NOT NULL,
             created_at     TEXT NOT NULL,
             updated_at     TEXT NOT NULL
@@ -1559,14 +1637,16 @@ def _migrate_v15(conn: sqlite3.Connection) -> None:
 
 
 # The v16 rebuilt `entity` shape (issue #175): the twelve-value v2 kind CHECK
-# over the same five columns. Used by init_db's fresh DDL (inline literal) and
-# by _migrate_v16's recreate step so both sites carry the identical CHECK.
+# over the same five columns, DERIVED from schema_meta.ENTITY_KINDS (issue
+# #356: the kind list has exactly one authority; every DDL site renders from
+# it, so a vocabulary append can never leave fresh and migrated stores
+# disagreeing). Used by init_db's fresh DDL (via _entity_ddl_sql) and by
+# _migrate_v16's recreate step so both sites carry the identical CHECK.
 _ENTITY_V16_DDL_RECREATED = """
     CREATE TABLE entity (
       id TEXT PRIMARY KEY,
       kind TEXT NOT NULL CHECK (kind IN (
-        'person','project','tool','preference','host','service',
-        'model','repo','file','command','error_class','other'
+        """ + _entity_ddl_sql() + """
       )),
       canonical_name TEXT NOT NULL,
       created_at TEXT NOT NULL,
@@ -1647,8 +1727,7 @@ def _migrate_v16(conn: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS entity_v16 (
               id TEXT PRIMARY KEY,
               kind TEXT NOT NULL CHECK (kind IN (
-                'person','project','tool','preference','host','service',
-                'model','repo','file','command','error_class','other'
+                """ + _entity_ddl_sql() + """
               )),
               canonical_name TEXT NOT NULL,
               created_at TEXT NOT NULL,
@@ -2439,8 +2518,7 @@ def migrate(conn: sqlite3.Connection) -> None:
             CREATE TABLE IF NOT EXISTS entity (
                 id             TEXT PRIMARY KEY,
                 kind           TEXT NOT NULL
-                    CHECK (kind IN ('person','project','tool','preference','host','service',
-                                    'model','repo','file','command','error_class','other')),
+                    CHECK (kind IN (""" + _entity_ddl_sql() + """)),
                 canonical_name TEXT NOT NULL,
                 created_at     TEXT NOT NULL,
                 updated_at     TEXT NOT NULL

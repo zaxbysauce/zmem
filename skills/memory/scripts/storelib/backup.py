@@ -20,7 +20,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.opcmds import command_prefix
-from storelib.schema import MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _acquire_maintenance_lock_with_liveness, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, now_iso
+from storelib.schema import _acquire_schema_lock_with_liveness, MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _acquire_maintenance_lock_with_liveness, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, now_iso
 
 SNAPSHOT_PREFIX = "store-"
 
@@ -669,9 +669,9 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
               "running - destination untouched; re-run when it finishes",
               file=sys.stderr)
         return 2
-    s_token = _strict_acquire_lock(
-        "schema",
-        SCHEMA_LOCK_STALE_SECONDS,
+    # Issue #357: dead schema-lock holders are broken; live holders keep
+    # the identical bounded wait and refusal below.
+    s_token = _acquire_schema_lock_with_liveness(
         wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
         poll_seconds=SCHEMA_LOCK_POLL_SECONDS,
     )

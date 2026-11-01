@@ -1082,6 +1082,19 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
             manifest.get("source_snapshot_hash"):
         raise DatasetError("checksum mismatch")
 
+    # Issue #353: dataset bulk load was the remaining writer that copied
+    # memory ids verbatim (checksum + key-presence checks only). Validate
+    # every memory row's id BEFORE filtering or destination creation so
+    # even a filtered-out malformed id refuses the snapshot -- the id set
+    # stays closed by construction at every writer.
+    from .sync import _INGEST_ID_RE
+    for row in families["memories"]:
+        mid = row.get("id")
+        if not isinstance(mid, str) or not _INGEST_ID_RE.fullmatch(mid):
+            raise DatasetError(
+                f"dataset refused: memory id {mid!r} is not UUID-shaped "
+                "(import-dataset refuses non-uuid ids)")
+
     memories = families["memories"]
     available = {row["namespace"] for row in memories}
     if namespace is not None and namespace not in available:
