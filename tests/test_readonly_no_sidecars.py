@@ -267,6 +267,11 @@ class ReadonlyNoSidecarsTest(unittest.TestCase):
     def test_doctor_expiring_command_end_to_end_no_sidecars(self):
         store = _build_store(self.scratch / "doctor-cmd")
         env = _pin_env(store.parent)
+        # Hermeticity: doctor's claude-native-memory check reads the REAL
+        # ~/.claude state and FAILS when it is absent (CI runners, sandboxed
+        # HOME). The check's own documented override makes this leg depend
+        # only on the scratch store.
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         proc = subprocess.run(
             [sys.executable, "-X", "utf8", str(SCRIPTS_DIR / "doctor.py"),
              "--expiring", "7d", "--store", str(store)],
