@@ -1310,7 +1310,7 @@ def _backup_warn_days() -> float:
     return _cadence_days("ZMEM_BACKUP_INTERVAL_DAYS", 1.0) * 2.0
 
 
-def _open_store_ro(store_path: Path):
+def _open_store_ro(store_path: Path, lock_aware: bool = False):
     """Open the store read-only. None if absent or unreadable.
 
     doctor is read-only by contract: this routes through storelib.readonly
@@ -1318,12 +1318,14 @@ def _open_store_ro(store_path: Path):
     operator's data directory — arm A (immutable) on a quiesced store, arm B
     (private residue copy) when WAL/journal residue exists. Returns a
     ReadOnlyHandle whose close() the caller MUST run in a finally block.
+    ``lock_aware=True`` surfaces a non-WAL exclusive lock as a read failure
+    (fail-closed surfaces; issue #342).
     """
     if not store_path.exists():
         return None
     try:
         from storelib import readonly as _readonly
-        return _readonly.open_readonly(store_path)
+        return _readonly.open_readonly(store_path, lock_aware=lock_aware)
     except Exception:
         return None
 
@@ -6197,7 +6199,7 @@ def _scan_expiry_states(store_path: Path, horizon: str, now: str | None) -> tupl
     horizon_e = now_e + days * 86400.0
     if not store_path.is_file():
         return ([], [])
-    conn = _open_store_ro(store_path)
+    conn = _open_store_ro(store_path, lock_aware=True)
     if conn is None:
         raise sqlite3.OperationalError("store unreadable read-only")
     out: list[dict] = []

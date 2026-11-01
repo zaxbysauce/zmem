@@ -275,6 +275,45 @@ class ReadonlyNoSidecarsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
         self.assertEqual(_sidecars(store.parent), [])
 
+    def test_lock_aware_open_observes_non_wal_exclusive_lock(self):
+        """Fail-closed surfaces (doctor's expiry scan, issue #342): on a
+        NON-WAL store, lock_aware=True keeps a plain mode=ro open so an
+        EXCLUSIVE holder fails the read instead of being silently bypassed
+        by immutable/copy; on a quiesced WAL store it stays sidecar-free."""
+        import contextlib
+        import io
+        import sqlite3
+
+        from storelib import readonly
+
+        store = _build_store(self.scratch / "lock-aware", journal_wal="delete")
+        holder = sqlite3.connect(str(store), timeout=5.0)
+        try:
+            holder.execute("PRAGMA locking_mode=EXCLUSIVE")
+            holder.execute("BEGIN EXCLUSIVE")
+            holder.execute("SELECT COUNT(*) FROM memory").fetchone()
+            with self.assertRaises(sqlite3.OperationalError):
+                ro = readonly.open_readonly(store, lock_aware=True)
+                try:
+                    ro.conn.execute(
+                        "SELECT count(*) FROM memory").fetchone()
+                finally:
+                    ro.close()
+        finally:
+            holder.rollback()
+            holder.close()
+        # Quiesced WAL store + lock_aware: still the sidecar-free arm A.
+        wal_store = _build_store(self.scratch / "lock-aware-wal")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            handle = readonly.open_readonly(wal_store, lock_aware=True)
+            try:
+                handle.conn.execute("SELECT count(*) FROM memory").fetchone()
+            finally:
+                handle.close()
+        self.assertEqual(_sidecars(wal_store.parent), [])
+        self.assertNotIn("private snapshot", err.getvalue())
+
     def test_deliberate_mode_ro_open_still_sees_live_wal_rows(self):
         """PRESERVING pin for the kept WAL-aware surfaces (query-rewrite,
         source scans): a plain mode=ro connection observes committed WAL

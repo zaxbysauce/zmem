@@ -48,6 +48,20 @@ class ReadOnlyStoreError(RuntimeError):
     """A read-only open refused the store (unreadable or torn copy)."""
 
 
+def _is_wal_store(store: Path) -> bool:
+    """True when the database header declares WAL journal mode.
+
+    Read from the raw header (bytes 18-19 == 0x02 0x02) so the check itself
+    opens nothing and creates no sidecars.
+    """
+    try:
+        with open(store, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return False
+    return len(head) >= 20 and head[18:20] == b"\x02\x02"
+
+
 def _discard_stage(stage: Path | None) -> str | None:
     """Remove a staging directory, reporting whether it actually went away.
 
@@ -120,12 +134,23 @@ class ReadOnlyHandle:
             print("[zmem] readonly: %s" % leftover, file=sys.stderr)
 
 
-def open_readonly(store_path: Path | str) -> ReadOnlyHandle:
+def open_readonly(store_path: Path | str,
+                  lock_aware: bool = False) -> ReadOnlyHandle:
     """Open an existing store strictly read-only, sidecar-free.
 
     Raises FileNotFoundError when the store does not exist, and
     ReadOnlyStoreError when a residue copy is torn/unreadable. The caller
     owns cleanup: ``handle.close()`` in a finally block.
+
+    ``lock_aware=True`` (fail-closed surfaces, e.g. doctor's expiry scan —
+    issue #342): a NON-WAL store with no journal residue opens through a
+    plain ``?mode=ro`` connection instead of immutable. On a non-WAL store a
+    reader never creates ``-wal``/``-shm`` (they are WAL machinery), so the
+    sidecar-free guarantee holds — AND the open stays lock-observable: a
+    ``BEGIN EXCLUSIVE`` holder fails the read with OperationalError, which
+    the immutable/copy arms structurally cannot surface. WAL-mode stores
+    always take the snapshot arms (readers do not block writers in WAL, and
+    the arm-B notice discloses the snapshot).
     """
     store = Path(store_path)
     if not store.is_file():
@@ -133,6 +158,14 @@ def open_readonly(store_path: Path | str) -> ReadOnlyHandle:
     wal = Path(str(store) + "-wal")
     journal = Path(str(store) + "-journal")
     has_residue = wal.exists() or journal.exists()
+
+    if (lock_aware and not has_residue and not _is_wal_store(store)):
+        conn = sqlite3.connect(
+            store.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=1")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return ReadOnlyHandle(conn, None)
 
     if not has_residue:
         # Arm A: nothing to recover, nothing to miss — immutable reads the
