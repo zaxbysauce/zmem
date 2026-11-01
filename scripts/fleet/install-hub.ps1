@@ -23,6 +23,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DataDir,
     [Parameter(Mandatory = $true)][string]$TokensFile,
     [int]$Port = 8765,
+    [int]$HttpsPort = 443,
     [string]$TaskName = "zmem-hub"
 )
 
@@ -30,6 +31,9 @@ $ErrorActionPreference = "Stop"
 
 if ($Port -lt 1 -or $Port -gt 65535) {
     Write-Error "-Port must be 1-65535 (got: $Port)"
+}
+if ($HttpsPort -lt 1 -or $HttpsPort -gt 65535) {
+    Write-Error "-HttpsPort must be 1-65535 (got: $HttpsPort)"
 }
 
 # --- refuse a broad-ACL principal map (SID-based, locale-independent) -------
@@ -90,11 +94,26 @@ if ($state -ne "Running") {
 }
 
 # --- tailscale serve: tailnet HTTPS -> localhost ONLY -----------------------
+# Issue #423: the serve HTTPS port is a parameter, and an occupied target
+# port is REFUSED before re-pointing serve -- configuring a handler over a
+# live non-zmem backend would silently break that service, and the
+# documented idempotent re-point makes it worse on re-runs.
 $serve = Get-Command tailscale -ErrorAction SilentlyContinue
 if (-not $serve) {
-    Write-Warning "tailscale not found - install it, then run: tailscale serve --bg --https=443 http://127.0.0.1:$Port"
+    Write-Warning "tailscale not found - install it, then run: tailscale serve --bg --https=$HttpsPort http://127.0.0.1:$Port"
 } else {
-    tailscale serve --bg --https=443 "http://127.0.0.1:$Port"
+    $status = tailscale serve status 2>$null | Out-String
+    if ($HttpsPort -eq 443 -and $status -match "^https?://.+") {
+        # :443 is the default listener: ANY existing https handler on it is
+        # an occupier unless it already proxies OUR localhost port.
+        if ($status -notmatch [regex]::Escape("127.0.0.1:$Port")) {
+            Write-Error ("REFUSED: tailscale serve already has a handler on " +
+                ":443 (an operator service is live there). Re-run with an " +
+                "explicit -HttpsPort <n> to publish the hub on another " +
+                "port instead of replacing it. Current serve status:`n$status")
+        }
+    }
+    tailscale serve --bg --https=$HttpsPort "http://127.0.0.1:$Port"
     if ($LASTEXITCODE -ne 0) { Write-Error "tailscale serve failed (exit $LASTEXITCODE)" }
     tailscale serve status
 }
