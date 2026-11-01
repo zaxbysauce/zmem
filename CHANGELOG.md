@@ -5,6 +5,44 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.135.0] - 2026-11-01
+
+### Fixed
+
+- **Read-only surfaces no longer create WAL sidecars (issue #345).**
+  `classify-state`, `doctor --expiring`, and every store read reachable from
+  the doctor report and the shared CLI read-only opener now open through a
+  WAL/journal-aware helper: a quiesced store reads `mode=ro&immutable=1`
+  (creates nothing), and a store with `-wal`/`-journal` residue is read
+  through a private copy staged outside the data directory (guarded by
+  `quick_check`, disclosed on stderr). Doctor's expiry scan keeps a
+  lock-observable open on non-WAL stores so the #342 fail-closed contract
+  holds. Surfaces that deliberately need live WAL rows (page refresh,
+  query-rewrite, source scans, mining/metrics/snapshot builders) are
+  unchanged and pinned by a live-visibility test.
+- **Issue #174 fixtures are tamper-evident (issue #346).** The four fixture
+  files now carry test-side SHA-256 pins and both generators' verify modes
+  run in-suite; a hand-edited fixture fails CI.
+- **classify-state's changed count is actionable (issue #348).** Endpoint
+  matching no longer accepts ordinary filenames (`config.json`,
+  `US.East`, `deploy.sh`, `image.ai`, `archive.br`, ...): bare hosts require
+  a TLD that is not a filename extension; SETTING matches require a
+  modifier+noun pair or a `noun=value` assignment, so ordinary prose stops
+  matching while the golden mapping is byte-stable.
+## [0.134.0] - 2026-11-01
+
+### Fixed
+
+- **`update_memory` refuses on under-lock taint/namespace drift (#420, Priority).** The #416 under-lock re-read now revalidates the fields the successor actually derives from — taint lineage and namespace inheritance — not just liveness: a consolidate taint-raise or namespace rekey committed in the read-to-lock window refuses the update (value drift only; retryable) instead of minting a successor with stale trust lineage or a pre-rekey namespace.
+- **The dedup fold never drops a requested `inject_until` (#420).** The fold entry guard keys on every want-field its match predicate honors (`_want_cls or _want_until`); an add/capture replay carrying `inject_until` against a plain-add seed is now rejected (`expiry_requires_state_target`/`expiry_record_mismatch_on_dedup`) instead of folding `committed, deduped=True` with the deadline silently dropped. Shape answer recorded: until-only add/capture is not a legal NEW op; on the fold path the deadline is either already stored (true replay) or the op is rejected.
+- **`apply_ops` failures route through the deadline choke point (#420).** Both failure returns consult the sibling deadline markers and produce the `_store_failure` unknown-outcome envelope, so a deadline-killed write — possibly partially committed — no longer collapses into a clean-looking `store_failure` and the op-queue receipt contract (per-chunk unknown-outcome) holds.
+- **Legacy single-token scope reaches the engine (`--namespace-scope`, #420).** A scoped legacy caller (no map entry the engine could resolve `--principal` against) gets its namespace allow-list forwarded to apply-ops, closing the disclosed by-id residual: the engine's in-transaction enforcement now covers by-id mutation targets (id_or_dep-first, the engine's own resolution) and update destination rekeys for legacy callers exactly as for map-mode principals — no hub-side TOCTOU. The flag can only narrow the otherwise-unscoped legacy identity and refuses when combined with `--principal`.
+
+### Changed
+
+- **DeepSeek evidence regenerated at the shipping release; the disclosure ratchet retires (#420).** Both host-gate reports (`canary-report.json`, `support-report.json`) are regenerated from a real dsh-host run at 0.134.0 — the committed support report's known 0.127.0 lag (re-anchored to 0.133.0 by #419) closes for good — and the `SUPPORT_DISCLOSED_*` constants plus the t14 known-divergence tolerance leg are removed: the standing parity gate now demands agreement with no tolerance (undisclosed drift still fails; a reintroduced tolerance is itself a failure).
+- **The t14 reconnect-flush observation is bounded (#420 review).** The queued-ops flush check polls the durable queue file to a fixed 60s deadline instead of a single-shot read (the race the 418-420 implementation review caught).
+
 ## [0.133.0] - 2026-10-31
 
 ### Fixed

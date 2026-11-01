@@ -23,6 +23,7 @@ from pathlib import Path
 from storelib.backup import BACKUP_DEFAULT_RETENTION, CONSOLIDATE_LOCK_STALE_SECONDS, SENTINEL_SWEEP_DAYS_DEFAULT, SNAPSHOT_GLOB, _acquire_lock, _release_lock, cmd_backup, cmd_restore, cmd_sweep
 from storelib.consolidate import CONSOLIDATE_DEFAULT_THRESHOLD, consolidate
 from storelib import beliefs as _beliefs
+from storelib import readonly as _readonly_store
 from storelib.organize import organize
 from storelib.entity import (
     ENTITY_KINDS,
@@ -651,6 +652,29 @@ def _cmd_apply_ops(conn, args) -> int:
     # --principal means legacy (capabilities None => allowed), mirroring the
     # MCP layer's current_principal() legacy-mode semantics.
     default_principal = opslib.LegacyPrincipal()
+    # Issue #420 (scope passthrough): --namespace-scope narrows the legacy
+    # identity to a namespace allow-list, giving single-token hub callers
+    # (no map entry the engine could resolve) the SAME in-transaction
+    # enforcement map-mode principals get — op namespaces, by-id mutation
+    # targets (id_or_dep-first, the engine's own resolution), and update
+    # destination rekeys, all via _namespace_allowed. Malformed input or
+    # combining it with --principal refuses the batch (one identity
+    # mechanism per call).
+    scope_raw = str(getattr(args, "namespace_scope", "") or "")
+    if scope_raw:
+        if args.principal:
+            print("[zmem] apply-ops: --namespace-scope cannot be combined"
+                  " with --principal (one identity mechanism per call)",
+                  file=_sys.stderr)
+            return 2
+        scopes = [part.strip() for part in scope_raw.split(",")]
+        if not scopes or any(not part for part in scopes):
+            print("[zmem] apply-ops: --namespace-scope must be a comma-"
+                  "separated list of non-empty namespaces", file=_sys.stderr)
+            return 2
+        default_principal = opslib.LegacyPrincipal()
+        default_principal.namespaces = frozenset(scopes)
+        default_principal.scoped = True
     lookup = opslib.principal_lookup_from_env()
     if len(parsed) > 256:
         print("[zmem] apply-ops: batch exceeds the 256-op limit",
@@ -1192,19 +1216,18 @@ def _connect_existing_store() -> sqlite3.Connection:
     return conn
 
 
-def _connect_existing_store_readonly() -> sqlite3.Connection:
+def _connect_existing_store_readonly() -> "_readonly_store.ReadOnlyHandle":
     """Open an already-created store strictly read-only (issue #181 review:
     a byte-identity-contracted read surface must not hold a rw handle — on a
     WAL store, an rw connection's last-close checkpoint can rewrite the main
-    database file). No init, migration, or parent mkdir."""
-    if not STORE_PATH.is_file():
-        raise FileNotFoundError(STORE_PATH)
-    uri = STORE_PATH.resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=1")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    database file; and issue #345: a plain ``?mode=ro`` open still
+    materializes -wal/-shm sidecars on a quiesced WAL store). No init,
+    migration, or parent mkdir. WAL/journal-aware and sidecar-free —
+    ``storelib.readonly.open_readonly`` arm A (immutable) on a quiesced
+    store, arm B (private residue copy) otherwise. Returns a handle whose
+    ``close()`` the caller MUST run in a finally block — close owns the
+    staging-dir cleanup."""
+    return _readonly_store.open_readonly(STORE_PATH)
 
 
 def cmd_embedding_health(as_json: bool = False) -> int:
@@ -1225,16 +1248,18 @@ def cmd_embedding_health(as_json: bool = False) -> int:
     import embeddings as _embeddings
 
     try:
-        conn = _connect_existing_store_readonly()
+        ro = _connect_existing_store_readonly()
+        conn = ro.conn
         # sqlite3.connect is lazy: a non-SQLite (corrupt) file opens fine and
         # fails on the first real read. Touch the store HERE so a corrupt file
         # reaches the documented "store unreadable" exit 1 instead of being
         # absorbed by the per-probe except handlers below and reported as a
         # healthy lane with fabricated (null/0) metrics.
         conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
-    except (FileNotFoundError, OSError, sqlite3.Error):
+    except (FileNotFoundError, OSError, sqlite3.Error,
+            _readonly_store.ReadOnlyStoreError):
         try:
-            conn.close()
+            ro.close()
         except Exception:
             pass
         print("[zmem] embedding-health: store unreadable", file=sys.stderr)
@@ -1350,8 +1375,8 @@ def cmd_embedding_health(as_json: bool = False) -> int:
         return 0
     finally:
         try:
-            conn.close()
-        except sqlite3.Error:
+            ro.close()
+        except Exception:
             pass
 
 
@@ -3564,6 +3589,13 @@ def main():
     ap_ops.add_argument("--principal", default="",
                         help="principal id the batch applies as (empty ="
                              " the legacy/operator identity)")
+    ap_ops.add_argument(
+        "--namespace-scope", dest="namespace_scope", default="",
+        help="comma-separated namespace allow-list applied to the legacy "
+             "identity (issue #420: the hub-side scope passthrough for "
+             "single-token callers the engine has no map entry for; can "
+             "only NARROW the otherwise-unscoped legacy identity; "
+             "mutually exclusive with --principal)")
     ap_ops.add_argument("--json", action="store_true",
                         help="emit the receipt envelope as one JSON document")
 
@@ -4175,6 +4207,7 @@ def main():
     if args.cmd == "rescan-secrets":
         scan_lease = None
         scan_conn = None
+        scan_ro = None
         try:
             # Every failure below renders as `[zmem] rescan-secrets: ...` +
             # exit 2 (review round: the maintenance probe used to sit outside
@@ -4190,13 +4223,13 @@ def main():
                 # v8-v14 migrations, and assert_store_schema_compatible only
                 # refuses NEWER stores — an unmigrated older store would fail
                 # mid-batch with an opaque sqlite error. Refuse it up front.
-                _probe = _connect_existing_store_readonly()
+                _probe_ro = _connect_existing_store_readonly()
                 try:
-                    stamp = _probe.execute(
+                    stamp = _probe_ro.conn.execute(
                         "SELECT value FROM meta WHERE key='schema_version'"
                     ).fetchone()
                 finally:
-                    _probe.close()
+                    _probe_ro.close()
                 if stamp is None or str(stamp[0]) != str(SUPPORTED_SCHEMA_VERSION):
                     raise RuntimeError(
                         "store schema version "
@@ -4206,8 +4239,11 @@ def main():
             # Dry-run opens strictly read-only: its byte-identity contract
             # must hold on WAL stores too, where an rw connection's
             # last-close checkpoint can rewrite the main database file.
-            scan_conn = (_connect_existing_store() if args.apply
-                         else _connect_existing_store_readonly())
+            if args.apply:
+                scan_conn = _connect_existing_store()
+            else:
+                scan_ro = _connect_existing_store_readonly()
+                scan_conn = scan_ro.conn
             assert_store_schema_compatible(scan_conn, STORE_PATH)
             if args.apply:
                 # update_memory embeds when the embeddings module is
@@ -4230,6 +4266,8 @@ def main():
         finally:
             if scan_conn is not None:
                 scan_conn.close()
+            if scan_ro is not None:
+                scan_ro.close()
             _release_writer_lease(scan_lease)
 
     # Issue #176 (Workstream K PR 5): reclassify-entities dispatches EARLY on
@@ -4246,6 +4284,7 @@ def main():
             ap.error("exactly one of --dry-run or --apply is required")
         rc_lease = None
         rc_conn = None
+        rc_ro = None
         try:
             _wait_for_maintenance_clear("reclassify-entities")
             if _schema_host is not None:
@@ -4259,7 +4298,8 @@ def main():
                 # Read-only handle: on a WAL store, an rw connection's
                 # last-close checkpoint can rewrite the main database file —
                 # dry-run must never hold one (rescan-secrets review).
-                rc_conn = _connect_existing_store_readonly()
+                rc_ro = _connect_existing_store_readonly()
+                rc_conn = rc_ro.conn
             assert_store_schema_compatible(rc_conn, STORE_PATH)
             sys.exit(cmd_reclassify_entities(
                 rc_conn, apply_mode=args.apply, as_json=args.json))
@@ -4271,6 +4311,8 @@ def main():
         finally:
             if rc_conn is not None:
                 rc_conn.close()
+            if rc_ro is not None:
+                rc_ro.close()
             _release_writer_lease(rc_lease)
 
     if args.cmd == "reembed" and args.check:
@@ -4360,7 +4402,7 @@ def main():
     if args.cmd == "classify-state":
         import storelib.state as _state_mod
         try:
-            _cs_conn = _connect_existing_store_readonly()
+            _cs_ro = _connect_existing_store_readonly()
             try:
                 # PR #341 review (PRR-013): every sibling read-only
                 # early-dispatch surface certifies the store schema on the
@@ -4368,11 +4410,11 @@ def main():
                 # rescan-secrets at :3560, reembed --check). Without it this
                 # command would scan a store whose schema_version is newer
                 # than this build understands.
-                assert_store_schema_compatible(_cs_conn, STORE_PATH)
+                assert_store_schema_compatible(_cs_ro.conn, STORE_PATH)
                 _result = _state_mod.classify_state_candidates(
-                    _cs_conn, dry_run=True)
+                    _cs_ro.conn, dry_run=True)
             finally:
-                _cs_conn.close()
+                _cs_ro.close()
             if args.json:
                 # PR #341 review (PRR-010): byte-identity contract — write
                 # through sys.stdout.buffer so Windows text mode cannot turn

@@ -407,7 +407,19 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                                  if args.get("expiry_class") else None)
                     _want_until = (str(args["inject_until"])
                                    if args.get("inject_until") else None)
-                    if kind in ("add", "capture") and _want_cls:
+                    # Issue #420 (until-only deadline drop): the entry guard
+                    # must key on EVERY want-field the match predicate below
+                    # honors — an add/capture carrying `inject_until` without
+                    # `expiry_class` previously bypassed this guard entirely
+                    # and folded `committed, deduped=True` while silently
+                    # dropping the requested deadline (the FB-2 invariant at
+                    # the head of this block). Note until-only add/capture can
+                    # never commit as a NEW op (write-side _resolve_expiry
+                    # requires expiry_class), so the until-only shape reaches
+                    # this fold only as a replay against a plain-add seed —
+                    # and there the fold must either find the deadline
+                    # already stored (true replay) or reject.
+                    if kind in ("add", "capture") and (_want_cls or _want_until):
                         _keeper_row = conn.execute(
                             "SELECT type FROM memory WHERE id=?",
                             (_replay,)).fetchone()

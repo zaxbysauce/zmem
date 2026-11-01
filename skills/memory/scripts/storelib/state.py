@@ -13,12 +13,38 @@ from __future__ import annotations
 import re
 import sqlite3
 
+# Filename-collision policy (issue #348): a TLD is bare-host-eligible only
+# when it is not a common filename extension; scheme-ful URLs accept any
+# host; a retained collision requires a documented, reachable-host-family
+# exception. Complete label audit (plan rev 4):
+#   DENIED bare (filename-colliding, no host-family case): sh me in co pl
+#   ai app au br.   EXCEPTION-JUSTIFIED: com (the canonical endpoint TLD;
+#   the #174 golden's api.example.com bare row depends on it), svc
+#   (Kubernetes service DNS like kubernetes.default.svc — a first-class
+#   host family for this repo's fleet surfaces).   Everything else below
+#   is clean (not a filename extension).
+_TLD_ALLOWLIST = frozenset({
+    "com", "org", "net", "io", "dev", "edu", "gov", "info", "biz", "xyz",
+    "uk", "de", "fr", "jp", "ca", "ru", "eu", "nl", "se", "no", "fi", "ch",
+    "at", "it", "es", "tr", "us", "local", "internal", "svc", "localhost",
+})
+# SETTING vocabulary split: a bare common word is prose, not a setting; a
+# match needs a modifier+noun pair ("configured timeout", "default
+# timeout") or a noun directly assigned a value ("timeout=30",
+# "version: 3"). Bare nouns ("version 3 of the plan") stay unmatched.
+_SETTING_MODIFIERS = ("current", "active", "configured", "default",
+                      "enabled", "disabled")
+_SETTING_NOUNS = ("timeout", "version")
 ENDPOINT = re.compile(
-    r"(?i)\b(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::[0-9]{1,5})?\b")
+    r"(?i)\b(?:https?://(?:[a-z0-9-]+\.)+[a-z]{2,}(?::[0-9]{1,5})?\b"
+    r"|(?:[a-z0-9-]+\.)+(%s)(?::[0-9]{1,5})?\b)"
+    % "|".join(sorted(_TLD_ALLOWLIST)))
 METRIC = re.compile(
     r"(?i)\b(?:metric|latency|count|rate|percent|p95)\b")
 SETTING = re.compile(
-    r"(?i)\b(?:current|active|configured|default|enabled|disabled|timeout|version)\b")
+    r"(?i)\b(?:" + "|".join(_SETTING_MODIFIERS) + r")\s+"
+    r"(?:" + "|".join(_SETTING_NOUNS) + r")\b"
+    r"|\b(?:" + "|".join(_SETTING_NOUNS) + r")\s*[=:]\s*\S")
 
 # Precedence: endpoint, then metric, then setting (issue #174 Design step 7).
 _RULES = (

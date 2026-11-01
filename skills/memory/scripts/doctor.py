@@ -1118,11 +1118,15 @@ def _check_store_access(resolved_store: Path) -> dict:
     store_read = None
     if store_exists:
         try:
-            uri = resolved_store.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            conn.execute("SELECT 1").fetchone()
-            conn.close()
-            store_read = True
+            ro = _open_store_ro(resolved_store)
+            if ro is None:
+                store_read = False
+            else:
+                try:
+                    ro.conn.execute("SELECT 1").fetchone()
+                finally:
+                    ro.close()
+                store_read = True
         except Exception:
             store_read = False
 
@@ -1168,14 +1172,15 @@ def _read_schema_version(store_path: Path) -> tuple[int | None, str | None]:
     if not store_path.exists():
         return None, None
     try:
-        uri = store_path.resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
+        ro = _open_store_ro(store_path)
+        if ro is None:
+            return None, "store unreadable"
         try:
-            row = conn.execute(
+            row = ro.conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
         finally:
-            conn.close()
+            ro.close()
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}"
 
@@ -1305,17 +1310,22 @@ def _backup_warn_days() -> float:
     return _cadence_days("ZMEM_BACKUP_INTERVAL_DAYS", 1.0) * 2.0
 
 
-def _open_store_ro(store_path: Path) -> sqlite3.Connection | None:
+def _open_store_ro(store_path: Path, lock_aware: bool = False):
     """Open the store read-only. None if absent or unreadable.
 
-    doctor is read-only by contract; the mode=ro URI guarantees no write can
-    ever happen here, and reuses the same pattern as _read_schema_version.
+    doctor is read-only by contract: this routes through storelib.readonly
+    (issue #345), so a read never materializes -wal/-shm sidecars in the
+    operator's data directory — arm A (immutable) on a quiesced store, arm B
+    (private residue copy) when WAL/journal residue exists. Returns a
+    ReadOnlyHandle whose close() the caller MUST run in a finally block.
+    ``lock_aware=True`` surfaces a non-WAL exclusive lock as a read failure
+    (fail-closed surfaces; issue #342).
     """
     if not store_path.exists():
         return None
     try:
-        uri = store_path.resolve().as_uri() + "?mode=ro"
-        return sqlite3.connect(uri, uri=True)
+        from storelib import readonly as _readonly
+        return _readonly.open_readonly(store_path, lock_aware=lock_aware)
     except Exception:
         return None
 
@@ -1659,10 +1669,8 @@ def _check_episode_tables(resolved_store: Path) -> dict:
             "No store yet; the first writable run will create the v13 "
             "episode tables.",
         )
-    uri = resolved_store.resolve().as_uri() + "?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except Exception:
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
         return _check(
             "episode-tables",
             "skip",
@@ -2385,8 +2393,8 @@ def _check_second_stores(
     canonical_live_ids: set[str] | None = None
     canonical_all_ids: set[str] | None = None
     if canonical.exists():
-        try:
-            conn = sqlite3.connect(f"file:{canonical}?mode=ro", uri=True)
+        conn = _open_store_ro(canonical)
+        if conn is not None:
             try:
                 canonical_live_ids = {
                     r[0]
@@ -2397,11 +2405,11 @@ def _check_second_stores(
                 canonical_all_ids = {
                     r[0] for r in conn.execute("SELECT id FROM memory")
                 }
+            except sqlite3.Error:
+                canonical_live_ids = None
+                canonical_all_ids = None
             finally:
                 conn.close()
-        except sqlite3.Error:
-            canonical_live_ids = None
-            canonical_all_ids = None
 
     results: list[dict] = []
     worst = "skip"
@@ -2411,16 +2419,20 @@ def _check_second_stores(
         entry: dict = {"path": _display_path(p)}
         live = 0
         ids: set[str] = set()
+        conn = _open_store_ro(p)
+        if conn is None:
+            entry["error"] = "store unreadable read-only"
+            entry["status"] = "warn"
+            results.append(entry)
+            if worst == "skip":
+                worst = "warn"
+            continue
         try:
-            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-            try:
-                rows = conn.execute(
-                    "SELECT id FROM memory WHERE superseded_at IS NULL"
-                ).fetchall()
-                live = len(rows)
-                ids = {r[0] for r in rows}
-            finally:
-                conn.close()
+            rows = conn.execute(
+                "SELECT id FROM memory WHERE superseded_at IS NULL"
+            ).fetchall()
+            live = len(rows)
+            ids = {r[0] for r in rows}
         except sqlite3.Error as exc:
             entry["error"] = f"{type(exc).__name__}: {exc}"
             entry["status"] = "warn"
@@ -2428,6 +2440,8 @@ def _check_second_stores(
             if worst == "skip":
                 worst = "warn"
             continue
+        finally:
+            conn.close()
         entry["live_rows"] = live
         if canonical_all_ids is None:
             entry["missing_in_canonical"] = "unknown (canonical store unreadable)"
@@ -3103,22 +3117,24 @@ def _check_orphan_stores(
         error = None
         conn = None
         try:
-            uri = candidate.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            try:
-                row = conn.execute(
-                    "SELECT value FROM meta WHERE key='schema_version'"
-                ).fetchone()
-                raw_version = row[0] if row else None
-                if raw_version is not None:
-                    try:
-                        schema_version = int(str(raw_version).strip())
-                    except (TypeError, ValueError):
-                        schema_version = str(raw_version)
-                count_row = conn.execute("SELECT count(*) FROM memory").fetchone()
-                rows = int(count_row[0]) if count_row else 0
-            except sqlite3.Error as exc:
-                error = f"{type(exc).__name__}: {exc}"
+            conn = _open_store_ro(candidate)
+            if conn is None:
+                error = "store unreadable read-only"
+            else:
+                try:
+                    row = conn.execute(
+                        "SELECT value FROM meta WHERE key='schema_version'"
+                    ).fetchone()
+                    raw_version = row[0] if row else None
+                    if raw_version is not None:
+                        try:
+                            schema_version = int(str(raw_version).strip())
+                        except (TypeError, ValueError):
+                            schema_version = str(raw_version)
+                    count_row = conn.execute("SELECT count(*) FROM memory").fetchone()
+                    rows = int(count_row[0]) if count_row else 0
+                except sqlite3.Error as exc:
+                    error = f"{type(exc).__name__}: {exc}"
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -4453,9 +4469,8 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
     last_index = None
     store_ok = False
     if resolved_store.exists():
-        try:
-            uri = resolved_store.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+        conn = _open_store_ro(resolved_store)
+        if conn is not None:
             try:
                 row = conn.execute(
                     "SELECT COUNT(*), "
@@ -4513,11 +4528,11 @@ def _check_embeddings_health(resolved_store: Path) -> dict:
                     last_index = row6[0] if row6 else None
                 except sqlite3.Error:
                     last_index = None
+                store_ok = True
+            except sqlite3.Error:
+                store_ok = False
             finally:
                 conn.close()
-            store_ok = True
-        except sqlite3.Error:
-            store_ok = False
 
     details.update(
         store_read=store_ok,
@@ -5684,8 +5699,9 @@ def _fleet_snapshot_state(resolved_store: Path) -> tuple[str, dict]:
     # The sqlite half must actually BE a snapshot: a truncated or foreign
     # file with no memory table is corrupt, never fresh (PRR-020).
     try:
-        _snap_conn = sqlite3.connect(f"file:{snap.resolve()}?mode=ro",
-                                     uri=True, timeout=2.0)
+        _snap_conn = _open_store_ro(snap)
+        if _snap_conn is None:
+            return ("corrupt", {})
         try:
             _snap_row = _snap_conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -6183,13 +6199,12 @@ def _scan_expiry_states(store_path: Path, horizon: str, now: str | None) -> tupl
     horizon_e = now_e + days * 86400.0
     if not store_path.is_file():
         return ([], [])
-    uri = store_path.resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-    conn.row_factory = sqlite3.Row
+    conn = _open_store_ro(store_path, lock_aware=True)
+    if conn is None:
+        raise sqlite3.OperationalError("store unreadable read-only")
     out: list[dict] = []
     unreadable: list[dict] = []
     try:
-        conn.execute("PRAGMA query_only=1")
         rows = conn.execute(
             "SELECT me.memory_id, me.inject_until, me.expiry_class, "
             "m.namespace, m.content, m.superseded_at "
@@ -6326,8 +6341,11 @@ def _report_lane_status(resolved_store: Path) -> dict:
     conn = None
     try:
         if resolved_store.exists():
-            uri = resolved_store.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = _open_store_ro(resolved_store)
+            if conn is None:
+                # Unreadable store: degrade through the shared lane guard
+                # below exactly like the pre-existing open-failure path.
+                raise OSError("store unreadable read-only")
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             try:
                 conn.execute(

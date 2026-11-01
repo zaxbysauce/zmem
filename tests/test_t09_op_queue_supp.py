@@ -557,6 +557,100 @@ def test_s11_quarantine_under_default_intent():
     assert rows, "the quarantine JSONL must exist in the data dir"
 
 
+def test_s12_apply_ops_deadline_failure_routes_through_choke():
+    """S12 (#420): the apply_ops tool's failure returns must route through
+    the _store_failure choke point — a deadline-killed write (possibly
+    partially committed) returns the stable deadline_exceeded envelope
+    (error + deadline_ms; the unknown-outcome receipt contract), never the
+    bare literal store_failure.  Both deadline marker shapes the sibling
+    sites recognize: the queue/entry path's error token and the
+    subprocess-kill path's boolean flag.  _run_store_async is stubbed to
+    each shape; the stub must be REACHED (the batch travels under the
+    authenticated p-mut principal so the capability gate passes)."""
+    import asyncio
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "hermes-plugin" / "server"))
+    import mcp_server
+
+    server = mcp_server.build_server(host="127.0.0.1", port=0,
+                                     use_tls=False)
+    from mcp.server.auth.middleware.auth_context import auth_context_var
+    from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
+    class _AccessToken:  # attribute bag, matching the SDK shape in use
+        def __init__(self, client_id):
+            self.token = "tok"
+            self.client_id = client_id
+            self.scopes = []
+
+    def _unwrap(raw):
+        # mcp returns the tool's dict directly from call_tool; newer SDKs
+        # may wrap it — unwrap defensively without inventing content.
+        if isinstance(raw, tuple) and len(raw) == 2:
+            raw = raw[0]
+        if isinstance(raw, list) and raw:
+            raw = raw[0]
+        text = getattr(raw, "text", None)
+        if isinstance(text, str):
+            try:
+                return json.loads(text)
+            except ValueError:
+                return raw
+        return raw
+
+    shapes = (
+        ("queue-error-token", {
+            "ok": False, "stdout": "",
+            "stderr": "caller deadline already expired at queue admission",
+            "returncode": 504, "error": "deadline_exceeded",
+            "deadline_ms": "3000/2500/2000",
+        }),
+        ("subprocess-kill-flag", {
+            "ok": False, "stdout": "",
+            "stderr": "store.py timed out after 3.0s",
+            "returncode": 124, "deadline_exceeded": True,
+        }),
+    )
+
+    original = mcp_server._run_store_async
+    try:
+        for label, shape in shapes:
+            calls = []
+
+            async def stub(args, input_text=None, timing=None,
+                           deadline=None, pool="write", _shape=dict(shape)):
+                calls.append(list(args))
+                return _shape
+
+            batch = [{"op_id": uuid.uuid4().hex, "op": "add",
+                      "args": {"type": "fact",
+                               "content": "s12 deadline probe "
+                                          + uuid.uuid4().hex,
+                               "namespace": "user:global"}}]
+            mcp_server._run_store_async = stub
+            saved = auth_context_var.set(
+                AuthenticatedUser(_AccessToken("p-mut")))
+            try:
+                result = _unwrap(asyncio.run(server._tool_manager.call_tool(
+                    "apply_ops", {"ops": batch}, context=None)))
+            finally:
+                auth_context_var.reset(saved)
+                mcp_server._run_store_async = original
+
+            assert calls and calls[0][:1] == ["apply-ops"], (
+                f"s12 leg {label}: the apply_ops tool never reached the "
+                f"store call (stub saw {calls!r})")
+            assert (isinstance(result, dict)
+                    and result.get("error") == "deadline_exceeded"
+                    and "deadline_ms" in result), (
+                f"s12 leg {label}: the failure return must route through "
+                f"the deadline choke point, got {result!r} (base returns "
+                "the bare literal "
+                "{'ok': False, 'error': 'store_failure', ...} envelope)")
+    finally:
+        mcp_server._run_store_async = original
+
+
 
 def main() -> int:
     if not MCP_AVAILABLE:
@@ -576,7 +670,8 @@ def main() -> int:
                    test_s8_cross_principal_id_isolation,
                    test_s9_namespace_scope_enforced_engine_side,
                    test_s10_poison_op_is_per_op_rejected,
-                   test_s11_quarantine_under_default_intent):
+                   test_s11_quarantine_under_default_intent,
+                   test_s12_apply_ops_deadline_failure_routes_through_choke):
             try:
                 fn()
                 print(f"PASS {fn.__name__}")

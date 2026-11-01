@@ -1,6 +1,6 @@
 {
   "name": "@zaxbyhub/zmem-deepseek",
-  "version": "0.133.0",
+  "version": "0.135.0",
   "private": true,
   "type": "module",
   "main": "index.mjs",
@@ -17,7 +17,9 @@
     "@deepseek-ai/dsh-session-persistence": "0.2.1-rc.2"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-session-persistence": { "optional": true }
+    "@deepseek-ai/dsh-session-persistence": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
@@ -30,5 +32,7 @@
     "@deepseek-ai/dsh-agent-loop": "0.2.1-rc.2",
     "@deepseek-ai/dsh-session-persistence": "0.2.1-rc.2"
   },
-  "engines": { "node": ">=22" }
+  "engines": {
+    "node": ">=22"
+  }
 }
