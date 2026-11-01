@@ -1,7 +1,7 @@
 {
   "schema": "zmem-deepseek-support-v1",
-  "generated_at": "2026-10-31T21:02:46.055Z",
-  "zmem_version": "0.133.0",
+  "generated_at": "2026-11-01T00:25:05.891Z",
+  "zmem_version": "0.134.0",
   "tested_floors": {
     "runtime": "@deepseek-ai/* 0.2.1-rc.2 (cordis 4.0.5)",
     "node": ">=20 (verified on v24.16.0, Windows x64)",
@@ -32,5 +32,5 @@
     "local-run:native_canary"
   ],
   "first_class_support": false,
-  "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.133.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed."
+  "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed."
 }
