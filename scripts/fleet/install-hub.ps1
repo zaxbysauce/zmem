@@ -110,7 +110,8 @@ if (-not $serve) {
     # explicit port or :443 (tailscale suppresses the default) or a
     # TLS-terminated TCP forward on 443. A web handler that already proxies
     # OUR localhost port is the idempotent re-run and never an occupier.
-    $status = tailscale serve status 2>$null | Out-String
+    # Final-critic round 1: -Width 4096 stops Out-String word-wrap from splitting the very lines the matcher reads (default 80 on non-interactive hosts).
+    $status = tailscale serve status 2>$null | Out-String -Width 4096
     $lines = $status -split "`r?`n"
     $occupier = @($lines | Where-Object {
         $_ -match '^https?://[^/: ]+(:443)?(\s|$)' -or
