@@ -1,7 +1,7 @@
 {
   "name": "@zaxbyhub/zmem-deepseek",
   "description": "ZMem native DeepSeek Harness (dsh/Cordis) adapter: broker-backed passive recall on the first accepted pre-step, explicit zmem_* memory tools through the same backend, capture with always-on redaction, and offline snapshot delivery (issues #374/#375).",
-  "version": "0.134.0",
+  "version": "0.136.0",
   "runtime": {
     "kind": "dsh-cordis",
     "packages": "@deepseek-ai/*",
