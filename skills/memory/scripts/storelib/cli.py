@@ -1256,7 +1256,8 @@ def cmd_embedding_health(as_json: bool = False) -> int:
         # absorbed by the per-probe except handlers below and reported as a
         # healthy lane with fabricated (null/0) metrics.
         conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
-    except (FileNotFoundError, OSError, sqlite3.Error):
+    except (FileNotFoundError, OSError, sqlite3.Error,
+            _readonly_store.ReadOnlyStoreError):
         try:
             ro.close()
         except Exception:
