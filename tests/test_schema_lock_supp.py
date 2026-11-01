@@ -24,6 +24,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"

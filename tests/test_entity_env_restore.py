@@ -36,6 +36,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
