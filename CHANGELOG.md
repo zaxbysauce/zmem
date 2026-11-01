@@ -5,6 +5,30 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.135.0] - 2026-11-01
+
+### Fixed
+
+- **Read-only surfaces no longer create WAL sidecars (issue #345).**
+  `classify-state`, `doctor --expiring`, and every store read reachable from
+  the doctor report and the shared CLI read-only opener now open through a
+  WAL/journal-aware helper: a quiesced store reads `mode=ro&immutable=1`
+  (creates nothing), and a store with `-wal`/`-journal` residue is read
+  through a private copy staged outside the data directory (guarded by
+  `quick_check`, disclosed on stderr). Doctor's expiry scan keeps a
+  lock-observable open on non-WAL stores so the #342 fail-closed contract
+  holds. Surfaces that deliberately need live WAL rows (page refresh,
+  query-rewrite, source scans, mining/metrics/snapshot builders) are
+  unchanged and pinned by a live-visibility test.
+- **Issue #174 fixtures are tamper-evident (issue #346).** The four fixture
+  files now carry test-side SHA-256 pins and both generators' verify modes
+  run in-suite; a hand-edited fixture fails CI.
+- **classify-state's changed count is actionable (issue #348).** Endpoint
+  matching no longer accepts ordinary filenames (`config.json`,
+  `US.East`, `deploy.sh`, `image.ai`, `archive.br`, ...): bare hosts require
+  a TLD that is not a filename extension; SETTING matches require a
+  modifier+noun pair or a `noun=value` assignment, so ordinary prose stops
+  matching while the golden mapping is byte-stable.
 ## [0.134.0] - 2026-11-01
 
 ### Fixed
