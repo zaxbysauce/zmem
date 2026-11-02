@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from storelib.schema import (
+    _acquire_schema_lock_with_liveness,
     STORE_PATH,
     SCHEMA_LOCK_POLL_SECONDS,
     SCHEMA_LOCK_STALE_SECONDS,
@@ -1157,8 +1158,10 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         return 4
     s_token = b_token = c_token = None
     try:
-        s_token = _strict_acquire_lock(
-            "schema", SCHEMA_LOCK_STALE_SECONDS,
+        # Issue #357: a dead schema-lock holder is broken instead of
+        # blocking purge for the stale window; a live holder keeps the
+        # identical bounded wait and refusal below.
+        s_token = _acquire_schema_lock_with_liveness(
             wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
             poll_seconds=SCHEMA_LOCK_POLL_SECONDS)
         if s_token is None:

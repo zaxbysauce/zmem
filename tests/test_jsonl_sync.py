@@ -1381,10 +1381,10 @@ class IngestValidationTest(_TwoStoreCase):
         kinds = {row[0] for row in linked}
         self.assertIn("host", kinds,
                       f"expected a host-kind entity, got {kinds!r}")
-        # And the JSONL itself carries no entity fields (the v10 decision).
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                self.assertNotIn("entities", line)
+        # Issue #360: the trailing self-fixture assertion (absence of
+        # `entities` in the JSONL this test itself wrote) is removed — it
+        # inspected its own fixture instead of a production surface and
+        # could only fail if _sync_row changed shape.
 
     def test_string_and_nan_confidence_fall_back_and_recall_and_pack_survive(self):
         """THE regression for HIGH-1/HIGH-2.

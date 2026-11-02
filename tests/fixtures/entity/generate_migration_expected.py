@@ -1,10 +1,13 @@
 """Deterministic v15->v16 entity-migration fixture generator (issue #175).
 
-CLI (from the repository root):
+CLI (from the repository root; --allow-tracked is required because the
+documented targets ARE the tracked fixtures — the guard exists so a caller
+pointing --input/--store at a fixture by ACCIDENT is stopped, issue #360):
 
     python tests/fixtures/entity/generate_migration_expected.py \
         --input tests/fixtures/entity/migration-input.jsonl \
-        --out   tests/fixtures/entity/migration-expected.json
+        --out   tests/fixtures/entity/migration-expected.json \
+        --allow-tracked
 
 Phases:
   full  (default) — write the five fixed records to --input, seed the isolated
@@ -261,6 +264,12 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--store", default=None)
     ap.add_argument("--phase", choices=("full", "seed", "dump"), default="full")
+    ap.add_argument(
+        "--allow-tracked", action="store_true",
+        help="explicitly permit --input/--store paths inside the repository's "
+             "tracked tests/fixtures/ tree (the documented regeneration "
+             "workflow); without it those paths are refused so a caller "
+             "cannot clobber a tracked fixture by accident (issue #360)")
     args = ap.parse_args()
 
     if args.phase != "dump" and not args.input:
@@ -272,6 +281,22 @@ def main() -> int:
         Path(args.store).resolve() if args.store
         else in_path.parent / "store.sqlite"
     )
+
+    # Issue #360: refuse to overwrite the tracked fixtures (and refuse a
+    # tracked path as the seeded store) unless the caller passes the
+    # explicit unlock. The documented regeneration command carries it.
+    fixtures_root = (REPO_ROOT / "tests" / "fixtures").resolve()
+    if not args.allow_tracked:
+        for label, path in (("--input", in_path), ("--store", store_path)):
+            if path is not None:
+                try:
+                    path.relative_to(fixtures_root)
+                except ValueError:
+                    continue
+                ap.error(
+                    f"{label} {path} is inside the tracked tests/fixtures/ "
+                    "tree; pass --allow-tracked to regenerate the committed "
+                    "fixtures deliberately")
 
     if args.phase == "dump":
         payload = {"post": snapshot(store_path)}

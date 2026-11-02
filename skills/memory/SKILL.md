@@ -997,7 +997,18 @@ kind as a `kind:Name` tag prefix). The v15→v16 migration REBUILDS the
 table, recreate `entity` with the new CHECK, copy back) in one BEGIN
 IMMEDIATE transaction with `PRAGMA foreign_key_check` before commit; every
 `entity`, `entity_alias`, and `memory_entity` row
-survives unchanged. This is NOT an additive bump: a changed SQL constraint is
+survives unchanged. Since 0.136.0 every entity-kind CHECK is rendered from
+the single `schema_meta.ENTITY_KINDS` authority (issue #356) — no DDL site
+hand-copies the vocabulary — and the schema lock gained holder-liveness
+(issue #357): the first open after an upgrade runs the rebuild under the
+lock (expect seconds, proportional to entity count; later commands wait up
+to `ZMEM_SCHEMA_LOCK_WAIT_SECONDS` then refuse with a clear message), while
+a holder that DIED mid-migration has its lock broken automatically by PID
+liveness (SQLite rolls back the uncommitted transaction, so the store is
+never half-migrated). Recovery path for a bad migration: stop sessions,
+`store.py restore` the newest good snapshot from `ZMEM_BACKUP_DIR`
+(default `<store dir>/backups`), re-run; `import-store.py` only replaces
+its destination after every acceptance gate passes. This is NOT an additive bump: a changed SQL constraint is
 outside the forward-compat window, so per the v16 contract
 `SUPPORTED_SCHEMA_VERSION` is 16 while `FORWARD_COMPAT_SCHEMA_VERSION`
 deliberately stays 15 — every client older than the v16 release REFUSES a

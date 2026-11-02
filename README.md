@@ -1396,10 +1396,31 @@ The full command reference is in the `memory` skill (type `/memory` in ZCode).
 Schema 16 expands the entity `kind` vocabulary to exactly twelve kinds —
 `person`, `project`, `tool`, `preference`, `host`, `service`, `model`,
 `repo`, `file`, `command`, `error_class`, `other` — enforced by the `entity`
-table's SQL CHECK. Migrating a v15 store to v16 REBUILDS that table (the
+table's SQL CHECK, rendered at every DDL site from the single
+`schema_meta.ENTITY_KINDS` authority (a vocabulary append now updates every
+site at once). Migrating a v15 store to v16 REBUILDS that table (the
 CHECK cannot be altered in place) in one atomic transaction; every entity,
 alias, and memory link row is preserved, verified against the committed
 canonical fixture (`tests/fixtures/entity/migration-expected.json`).
+
+**First-open rebuild and the schema lock (operator guide, issue #357).** The
+first command that opens an older store after an upgrade runs the migration
+chain — including the v16 entity rebuild — under the schema lock, so the
+first open takes noticeably longer than a normal command (typically seconds;
+proportional to entity count). While a LIVE holder has the lock, later
+commands wait up to `ZMEM_SCHEMA_LOCK_WAIT_SECONDS` (default 15 s) and then
+refuse with a clear message — re-run when the migration finishes. A holder
+that DIED mid-migration (crash, kill) is detected by PID liveness and its
+lock is broken automatically for the next writer: SQLite rolls back the
+uncommitted rebuild transaction, so the store is never half-migrated, and a
+dead process no longer blocks every command for the 300 s stale window.
+**Backup and restore:** `store.py backup` snapshots the store on a daily
+cadence to `ZMEM_BACKUP_DIR` (default `<store dir>/backups`, off-volume
+recommended); `store.py restore` is the inverse ladder. To recover from a
+bad migration, stop zmem sessions, restore the newest good snapshot, and
+re-run; `import-store.py` additionally builds a sanitized copy with the
+destination only replaced on success, so a failed import never touches the
+prior store.
 
 This schema change is UPGRADE-REQUIRED, not additive: `SUPPORTED_SCHEMA_VERSION`
 becomes 16 while `FORWARD_COMPAT_SCHEMA_VERSION` stays 15, so every client

@@ -731,18 +731,20 @@ class MigrationTest(V16SchemaTestMixin, _Store):
 
         # Deny DROP TABLE inside the rebuild: the migration must roll the
         # whole transaction back and leave v15 untouched.
-        os.environ["ZMEM_STORE"] = str(store)
-        os.environ["ZMEM_DATA"] = str(Path(self.tmp))
-        os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
-        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
-        # PR #355 review PRR-015: these are process-global; restore them
-        # so a later in-process test in this process is not redirected.
+        # Issue #360: snapshot the process-global env BEFORE the first
+        # mutation — the old order captured the already-mutated values, so
+        # the restore replayed them and leaked this test's fixture pins to
+        # every later in-process test.
         _saved_env = {
             k: os.environ.get(k) for k in (
                 "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
                 "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_ALLOW_NEWER_SCHEMA")
         }
+        os.environ["ZMEM_STORE"] = str(store)
+        os.environ["ZMEM_DATA"] = str(Path(self.tmp))
+        os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
 
         def _restore_env():
             for _k, _v in _saved_env.items():
@@ -750,6 +752,14 @@ class MigrationTest(V16SchemaTestMixin, _Store):
                     os.environ.pop(_k, None)
                 else:
                     os.environ[_k] = _v
+            # Issue #360 (plan-critic R4): storelib freezes STORE_PATH at
+            # first import, so this test's import under the fixture pin
+            # strands a binding to a store this test then DELETES. Purge
+            # the cached storelib modules after restoring the env so later
+            # in-process tests re-import under their own pins.
+            for _mod in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+                del sys.modules[_mod]
 
         self.addCleanup(_restore_env)
         from storelib import schema as schema_mod
@@ -812,16 +822,19 @@ class MigrationTest(V16SchemaTestMixin, _Store):
         conn.commit()
         conn.close()
 
-        os.environ["ZMEM_STORE"] = str(self.store)
-        os.environ["ZMEM_DATA"] = str(Path(self.tmp))
-        os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
-        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
+        # Issue #360: snapshot BEFORE mutating (see the first migration
+        # test's note) and purge the storelib module cache on restore so
+        # the import-time STORE_PATH binding cannot outlive this fixture.
         _saved_env2 = {
             k: os.environ.get(k) for k in (
                 "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
                 "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_ALLOW_NEWER_SCHEMA")
         }
+        os.environ["ZMEM_STORE"] = str(self.store)
+        os.environ["ZMEM_DATA"] = str(Path(self.tmp))
+        os.environ["ZMEM_MODELS_DIR"] = str(Path(self.tmp) / "no-models")
+        os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        os.environ.pop("ZMEM_ALLOW_NEWER_SCHEMA", None)
 
         def _restore_env2():
             for _k, _v in _saved_env2.items():
@@ -829,6 +842,9 @@ class MigrationTest(V16SchemaTestMixin, _Store):
                     os.environ.pop(_k, None)
                 else:
                     os.environ[_k] = _v
+            for _mod in [m for m in list(sys.modules)
+                         if m == "storelib" or m.startswith("storelib.")]:
+                del sys.modules[_mod]
 
         self.addCleanup(_restore_env2)
         from storelib import schema as schema_mod

@@ -576,9 +576,12 @@ INGEST_MAX_TAGS_CHARS = 4096
 # Shape guard for an incoming id: UUID-length hex-and-dashes. This is a
 # charset/length guard, not a UUID parser -- the point is that an id from a
 # remote file can never be an arbitrary string that some later consumer
-# interpolates somewhere it shouldn't.
+# interpolates somewhere it shouldn't. The pattern is anchored with \Z (not
+# $) so a trailing newline can never ride through a .match() call site --
+# Python's `$` matches before a final newline (issue #353: a 36-hex+LF id
+# passed every gate); \Z makes every .match() user fullmatch-equivalent.
 
-_INGEST_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
+_INGEST_ID_RE = re.compile(r"^[0-9a-fA-F-]{36}\Z")
 
 # Reject a forged-future ingestion_ts beyond this much clock skew. Recency is
 # a ranking input (compute_score), so an unbounded future timestamp is a
