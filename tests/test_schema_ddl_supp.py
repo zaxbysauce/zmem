@@ -22,6 +22,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 
@@ -32,7 +34,6 @@ import schema_meta
 # Patch the single authority BEFORE storelib.schema imports it.
 schema_meta.ENTITY_KINDS = tuple(schema_meta.ENTITY_KINDS) + ("thirteenth",)
 import storelib.schema as schema
-import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 kind_sql = schema._entity_ddl_sql()
 assert "'thirteenth'" in kind_sql, "helper did not render the patched kind"
