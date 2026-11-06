@@ -32,6 +32,58 @@ _CONVENTION_COUNT_KEY = "hermes_convention_count_{session}"
 _VERIFY_PROMPTED_KEY = "hermes_verify_prompted_{session}"
 
 
+def _parse_convention_count(value) -> int:
+    """Counter count from a meta value: canonical JSON {"count": N,
+    "last_seen": <exact canonical UTC timestamp>} first, legacy bare integer
+    digits fallback, 0 for anything malformed — including a corrupt
+    last_seen, which carries no age evidence (issue #128, release 0.144.0;
+    impl-review round 1 finding 3).
+
+    LOCAL TWIN of schema_meta.parse_convention_count: this hook must also run
+    on a box where the storelib tree is not importable (see _resolve_store_path's
+    fallback), so it carries its own copy instead of importing. A lockstep test
+    (tests/test_meta_table_bound.py VerifyHookParityTest.test_parser_lockstep_matrix)
+    pins this equal to schema_meta's over a value matrix -- change both together."""
+    if value is None:
+        return 0
+    text = value if isinstance(value, str) else str(value)
+    stripped = text.strip()
+    if stripped.isdigit():
+        return int(stripped)
+    try:
+        obj = json.loads(stripped)
+    except (ValueError, TypeError):
+        return 0
+    if not isinstance(obj, dict):
+        return 0
+    count = obj.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return 0
+    last_seen = obj.get("last_seen")
+    if not isinstance(last_seen, str) or not last_seen:
+        return 0
+    # Exact canonical shape + a strftime round-trip: strptime alone ACCEPTS
+    # second=60 (which the epoch parser resolves as 0.0), so the round-trip
+    # is what catches normalizable-but-unresolvable shapes (impl-review r2).
+    import re as _re
+    import time as _time
+    if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", last_seen):
+        return 0
+    try:
+        _parsed = _time.strptime(last_seen, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return 0
+    # strptime accepts leap seconds (tm_sec 60/61) that strftime renders
+    # back verbatim; the explicit range gates catch what the round-trip
+    # cannot (impl-review r2, twin of schema_meta._valid_convention_last_seen).
+    if not (0 <= _parsed.tm_hour <= 23 and 0 <= _parsed.tm_min <= 59
+            and 0 <= _parsed.tm_sec <= 59):
+        return 0
+    if _time.strftime("%Y-%m-%dT%H:%M:%SZ", _parsed) != last_seen:
+        return 0
+    return count
+
+
 def _resolve_store_path() -> Path:
     """Resolve the store path via the SAME authoritative resolver as the
     provider and store.py (host.resolve_store_path). Previously this hook
@@ -145,7 +197,7 @@ def main() -> int:
         row = conn.execute(
             "SELECT value FROM meta WHERE key = ?", (count_key,)
         ).fetchone()
-        count = int(row[0]) if row and str(row[0]).isdigit() else 0
+        count = _parse_convention_count(row[0]) if row else 0
         if count <= 0:
             _emit_empty()
             return 0

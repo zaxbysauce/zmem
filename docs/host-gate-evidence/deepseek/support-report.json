@@ -1,36 +1,36 @@
 {
- "schema": "zmem-deepseek-support-v1",
- "generated_at": "2026-11-06T14:30:59.984793Z",
- "zmem_version": "0.143.0",
- "tested_floors": {
-  "runtime": "@deepseek-ai/* 0.2.1-rc.2 (cordis 4.0.5)",
-  "node": ">=20 (verified on v24.16.0, Windows x64)",
-  "delivery": "first accepted agent/pre-step fenced append; reservation ack after observed session admission"
- },
- "claimed": [
-  {
-   "carrier": "headless",
-   "platform": "win32",
-   "evidence": "docs/host-gate-evidence/deepseek/canary-report.json",
-   "runtime": "dsh 0.2.1-rc.2, node v24.16.0"
-  }
- ],
- "capability_gaps": [
-  "compaction-synthetic: reaction pinned with synthetic markers only",
-  "real-compactor-absent: the dsh compactor package is not part of the published 0.2.1-rc.2 runtime",
-  "desktop-carrier-not-tested: desktop/Web carriers untested",
-  "profile-loader-contract-level-only: the dsh product loader (cordis.yml row) is not part of the published packages; install validated at the profile-row/package-contract level only",
-  "non-win32-native-runs-unclaimed: native dsh canary evidence exists only for win32/headless"
- ],
- "evidence_refs": [
-  "docs/host-gate-evidence/deepseek/canary-report.json",
-  "tests/test_t13_deepseek_contract.py",
-  "tests/test_t14_deepseek_learning.py",
-  "#374",
-  "#375",
-  "local-run:first_request_delivery",
-  "local-run:native_canary"
- ],
- "first_class_support": false,
- "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed. Provenance note (review PRR-009/018): the canary's git_sha records the run-time HEAD, which necessarily precedes the release commit that carries the artifact (self-reference is impossible); the zero-runtime-code delta between the recorded revision and the release commit is disclosed in the release notes, and the reservation/uuid fields are fresh per run by design — byte-identical regeneration is not a property this artifact promises. Regenerated at 0.136.0 on the release branch: real dsh-host canary run 7/7 lanes at git c1ce99044cba; support fields unchanged except version/generated_at (zero runtime-code delta). Retarget regen (0.138.0 rebased onto 0.136.0): real dsh-host canary rerun, 0 failing lanes; generated_at is this report's own write time, seconds after the canary rerun - not a mirror. | 0.139.0 rebump alongside the real canary run above (same release: PR #427 closeout D-2b hook store-error reason); hand-regenerated per the documented release procedure. | 0.140.0 PR #436 feedback round: report re-stamped at the feedback fix head (canary regenerated 7/7 lanes, git_sha 52a3018c196a — an ancestor of the merge head, correcting the amend-orphan sha found by review PRR-001); notes extended per review PRR-004. Delta disclosure per the zero-runtime-code contract: 52a3018c196a -> the merge head touches ONLY tests/ and these evidence docs (canary + support reports) — zero runtime-code delta; the release-commit runtime surface is byte-identical to the canary run's. Regenerated at the 0.141.0 release (PR #422 retarget) from a fresh real dsh-host canary run at git 7f0805cc (7/7 lanes pass; supersedes the cba8ce9ba941, 73ba8d40f56a, 62a28ee1cf49 and 49b72fa9d604 runs, the latter having superseded an amend-orphaned sha). Delta from the canary commit to the evidence commit touches only the two evidence reports and the release manifest (whose digest changes with the CLI fix's runtime surface) — no .py/.js/.mjs runtime file changes beyond the recorded canary commit itself. Version binding retargeted 0.141.0->0.143.0 at 2026-11-05 (sibling PR #440 holds 0.142.0); findings unchanged. Provenance refresh (PR #441 feedback round, PRR-006): generated_at re-stamped so the report no longer predates the canary it certifies (canary regenerated 2026-11-05T20:03:21Z at git 6914391fb15c); findings unchanged — the canary was run at git 6914391fb15c; the PR #441 feedback round after it touched the snapshot-refresh classification, the reflection-filter classifier/cap order and counter-lock/retention hygiene (lock-token reclaim, counter sweep, counter-write stderr in hooks/zmem-subagent-reflect.sh, PRR-003/008b/c), the evidence guard, and the provider remote reason (runtime code), none of which the deepseek support lanes exercise. The canary also predates this PR's rebase onto the 0.142.0 base, so the total 6914391fb15c-to-ship delta additionally carries the sibling PR #440 fence-content/delivery-accounting surface (hermes-plugin mcp_server.py, storelib inject.py/recall.py/sync.py) — runtime code covered by the 0.142.0 canary run at 9d8e5c53 (7/7 lanes, per main's support-report note); the feedback-round surfaces named above remain the only post-rebase runtime delta."
+  "schema": "zmem-deepseek-support-v1",
+  "generated_at": "2026-11-06T20:09:15Z",
+  "zmem_version": "0.144.0",
+  "tested_floors": {
+    "runtime": "@deepseek-ai/* 0.2.1-rc.2 (cordis 4.0.5)",
+    "node": ">=20 (verified on v24.16.0, Windows x64)",
+    "delivery": "first accepted agent/pre-step fenced append; reservation ack after observed session admission"
+  },
+  "claimed": [
+    {
+      "carrier": "headless",
+      "platform": "win32",
+      "evidence": "docs/host-gate-evidence/deepseek/canary-report.json",
+      "runtime": "dsh 0.2.1-rc.2, node v24.16.0"
+    }
+  ],
+  "capability_gaps": [
+    "compaction-synthetic: reaction pinned with synthetic markers only",
+    "real-compactor-absent: the dsh compactor package is not part of the published 0.2.1-rc.2 runtime",
+    "desktop-carrier-not-tested: desktop/Web carriers untested",
+    "profile-loader-contract-level-only: the dsh product loader (cordis.yml row) is not part of the published packages; install validated at the profile-row/package-contract level only",
+    "non-win32-native-runs-unclaimed: native dsh canary evidence exists only for win32/headless"
+  ],
+  "evidence_refs": [
+    "docs/host-gate-evidence/deepseek/canary-report.json",
+    "tests/test_t13_deepseek_contract.py",
+    "tests/test_t14_deepseek_learning.py",
+    "#374",
+    "#375",
+    "local-run:first_request_delivery",
+    "local-run:native_canary"
+  ],
+  "first_class_support": false,
+  "notes": "Preview-scoped (issue #374 AC7): first-class claims are allowed only for combinations with passing evidence; the win32/headless entry above is the only claimed combination. Regenerated at the 0.134.0 release from the same-day real dsh-host canary run (generated_at mirrors the canary report); every lane passed. Provenance note (review PRR-009/018): the canary's git_sha records the run-time HEAD, which necessarily precedes the release commit that carries the artifact (self-reference is impossible); the zero-runtime-code delta between the recorded revision and the release commit is disclosed in the release notes, and the reservation/uuid fields are fresh per run by design — byte-identical regeneration is not a property this artifact promises. Regenerated at 0.136.0 on the release branch: real dsh-host canary run 7/7 lanes at git c1ce99044cba; support fields unchanged except version/generated_at (zero runtime-code delta). Retarget regen (0.138.0 rebased onto 0.136.0): real dsh-host canary rerun, 0 failing lanes; generated_at is this report's own write time, seconds after the canary rerun - not a mirror. | 0.139.0 rebump alongside the real canary run above (same release: PR #427 closeout D-2b hook store-error reason); hand-regenerated per the documented release procedure. | 0.140.0 PR #436 feedback round: report re-stamped at the feedback fix head (canary regenerated 7/7 lanes, git_sha 52a3018c196a — an ancestor of the merge head, correcting the amend-orphan sha found by review PRR-001); notes extended per review PRR-004. Delta disclosure per the zero-runtime-code contract: 52a3018c196a -> the merge head touches ONLY tests/ and these evidence docs (canary + support reports) — zero runtime-code delta; the release-commit runtime surface is byte-identical to the canary run's. Regenerated at the 0.141.0 release (PR #422 retarget) from a fresh real dsh-host canary run at git 7f0805cc (7/7 lanes pass; supersedes the cba8ce9ba941, 73ba8d40f56a, 62a28ee1cf49 and 49b72fa9d604 runs, the latter having superseded an amend-orphaned sha). Delta from the canary commit to the evidence commit touches only the two evidence reports and the release manifest (whose digest changes with the CLI fix's runtime surface) — no .py/.js/.mjs runtime file changes beyond the recorded canary commit itself. 0.142.0 retarget bump: sibling PR #422 consumed 0.141.0 on main mid-wait; version-only edit plus this note (main's 0.141.0 report content preserved). 0.142.0 final: canary run at the re-gate head 9d8e5c53c262f23a671a7c9cccf2964776fc57a8 (7/7 lanes pass; supersedes the inherited #422 report and the earlier pre-review, round-1 and round-2 0.142.0 runs — this run exercises the fence/inject changes plus all re-gate fixes). The recorded sha is derived from the canary report (never retyped), resolves via git cat-file, and is a reachable ancestor of the evidence commit; delta from the canary commit to the evidence commit touches only the two evidence reports — zero .py/.js/.mjs runtime-code delta. generated_at is this report's own write time (2026-11-06T03:12:12Z), after the canary write (2026-11-06T03:11:04.037Z). | 0.144.0 release (issues #443 + #128 collated: list/export-pack credential-withhold, dataset import namespace control refusal, bounded convention-counter meta + canonical JSON counter shape): report re-stamped alongside the real dsh-host canary run at git 9272b0fb6fc8 (7/7 lanes pass). generated_at is this report's own write time (2026-11-06T17:11:05Z), seconds after the canary write. Support fields otherwise unchanged (zero support-surface delta in this release). | 0.144.0 provenance correction (impl-review round 1): the canary was re-run at the committed release head ab4a52dbea73 (7/7 lanes pass), replacing the earlier run recorded against the pre-commit working tree (git 9272b0fb); this release DOES change runtime code (list/export-pack withhold, dataset/episode admission, counter/meta maintenance), and the canary at the release head exercises it. Support fields otherwise unchanged. | 0.144.0 final provenance: canary re-run at the final release head (git ab8c9eae0fd8, 7/7 lanes pass) after the round-1/round-2 review-fix commits — the recorded sha is an ancestor of the release head and the canary exercises the shipped runtime; support fields otherwise unchanged. | 0.144.0 retarget provenance: sibling PR #441 merged 0.143.0 mid-wait; this release rebased onto it (zero implementation conflicts; only release surfaces reconstructed) and the canary was re-run at the post-rebase head (git afe4f8c62171, 7/7 lanes pass, an ancestor of the release head; the delta from the canary commit to the evidence commit is the two evidence reports + the release manifest only). Support fields otherwise unchanged."
 }

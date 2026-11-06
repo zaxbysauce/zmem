@@ -437,9 +437,157 @@ def _sweep_candidate_dirs() -> list[Path]:
             pass  # fail-open: an unreadable scan root must never break the sweep
     return dirs
 
+CONVENTION_META_PREFIXES = (
+    "convention_count_",          # retired hook-era writer (orphaned rows)
+    "convention_count_sess_",     # retired hook-era writer (orphaned rows)
+    "hermes_convention_count_",   # live hermes ring writer (0.144.0 JSON shape)
+)
+
+# Set by cmd_sweep after every run so callers that drive the sweep in-process
+# (session-cadence) can fold the meta counts into their own summary without
+# re-deriving them. None means "meta pruning skipped" (absent/locked/
+# unreadable/newer-schema store) or "cmd_sweep not yet run".
+last_meta_prune: "tuple[int, int, int] | None" = None
+
+
+def prune_convention_meta(store_path, *, cutoff_epoch: float,
+                          current_session: str,
+                          dry_run: bool = False,
+                          now_epoch: "float | None" = None) -> "tuple[int, int, int] | None":
+    """Bound the per-session convention-counter meta rows (issue #128).
+
+    Deletes/updates ONLY keys under CONVENTION_META_PREFIXES (true-prefix
+    predicates — never a LIKE wildcard match), in one transaction:
+
+    - non-current LEGACY integer rows are stale by construction (no age
+      evidence, no live writer for the retired families) -> removed;
+    - non-current JSON rows whose ``last_seen`` epoch is strictly older than
+      ``cutoff_epoch`` -> removed (strict ``<``: a row exactly at the cutoff
+      survives);
+    - the CURRENT session's rows are always retained, and a retained legacy
+      row is UPGRADED in the same transaction to the canonical JSON shape
+      with its count UNCHANGED and ``last_seen`` = the injected now
+      (#128 AC2; a dry run returns the same counts and leaves every byte);
+    - malformed JSON rows are retained and counted ``unparseable`` — never
+      deleted (an operator must be able to inspect a corrupted counter).
+
+    Returns ``(removed, retained, unparseable)``, or ``None`` when the store
+    is absent, locked, unreadable, or stamped with a schema version newer
+    than this client supports (skip: the sweep must never break on, or
+    touch, a store it cannot safely open). Mid-transaction sqlite errors roll
+    the transaction back and re-raise. The connection is opened RAW (URI
+    mode=rw for real runs / mode=ro for dry runs — never ``connect()``: the
+    pre-connect sweep must not create stores, rewrite WAL headers, migrate,
+    or rekey) and the schema gate runs INSIDE the write transaction so a
+    concurrent migration cannot race the check."""
+    from schema_meta import (
+        SUPPORTED_SCHEMA_VERSION,
+        classify_convention_count,
+        convention_count_last_seen,
+        convention_count_value,
+        parse_convention_count,
+    )
+    store_path = Path(store_path)
+    if not store_path.is_file():
+        return None
+    mode = "ro" if dry_run else "rw"
+    uri = store_path.resolve().as_uri() + f"?mode={mode}"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return None
+    try:
+        conn.row_factory = sqlite3.Row
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+        # Schema gate inside the transaction (race-free vs a concurrent
+        # migration); a missing stamp is a pre-init store — leave it alone.
+        stamp = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        try:
+            version = int(stamp[0]) if stamp else None
+        except (TypeError, ValueError):
+            version = None
+        if version is None or version > SUPPORTED_SCHEMA_VERSION:
+            if not dry_run:
+                conn.rollback()
+            return None
+
+        now = time.time() if now_epoch is None else float(now_epoch)
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        current_session = (current_session or "").strip()
+
+        removed = retained = unparseable = 0
+        rows: "dict[str, object]" = {}
+        for prefix in CONVENTION_META_PREFIXES:
+            for row in conn.execute(
+                    "SELECT key, value FROM meta WHERE substr(key,1,?) = ?",
+                    (len(prefix), prefix)):
+                # Dedupe by key: 'convention_count_' is itself a prefix of
+                # 'convention_count_sess_', so that family's rows match TWO
+                # prefix scans -- without the dict they would be classified
+                # (and deleted) twice.
+                rows[row["key"]] = row["value"]
+        for key, value in rows.items():
+            suffix = None
+            for prefix in sorted(CONVENTION_META_PREFIXES, key=len,
+                                  reverse=True):
+                if key.startswith(prefix):
+                    suffix = key[len(prefix):]
+                    break
+            is_current = bool(current_session) and suffix == current_session
+            kind = classify_convention_count(value)
+            if is_current:
+                retained += 1
+                if kind == "legacy" and not dry_run:
+                    # #128 AC2: upgrade the retained current-session legacy
+                    # row to canonical JSON, count unchanged.
+                    conn.execute(
+                        "UPDATE meta SET value = ? WHERE key = ?",
+                        (convention_count_value(
+                            parse_convention_count(value), now_iso), key))
+                continue
+            if kind == "legacy":
+                # Non-current legacy rows carry no age evidence and no live
+                # writer exists for any family's integer shape -> stale.
+                removed += 1
+                if not dry_run:
+                    conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+                continue
+            if kind == "json":
+                # classify == "json" guarantees last_seen is an exact
+                # canonical timestamp (schema_meta._valid_convention_last_seen,
+                # impl-review round 1 finding 3), so the ISO parse is exact and
+                # a corrupt heartbeat can never fall through to epoch 0.
+                epoch = _parse_iso_to_epoch(convention_count_last_seen(value))
+                if epoch < cutoff_epoch:
+                    removed += 1
+                    if not dry_run:
+                        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+                else:
+                    retained += 1
+                continue
+            # malformed: retained, counted, never deleted
+            retained += 1
+            unparseable += 1
+        if not dry_run:
+            conn.commit()
+        return (removed, retained, unparseable)
+    except sqlite3.Error:
+        if not dry_run:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        conn.close()
+
+
 def cmd_sweep(marker_dir: str | None = None,
               max_age_days: float | None = None,
-              dry_run: bool = False) -> int:
+              dry_run: bool = False,
+              now_epoch: "float | None" = None) -> int:
     """Remove stale per-session cooldown sentinel files (issue #23).
 
     Idempotent, fail-open, bounded: sweeps only the (few) directories the
@@ -468,7 +616,10 @@ def cmd_sweep(marker_dir: str | None = None,
         print(f"[zmem] sweep: --max-age-days must be a finite, non-negative number "
               f"(got {max_age_days!r})", file=sys.stderr)
         return 2
-    cutoff = time.time() - max_age_days * 86400
+    # Issue #128: one injected clock (now_epoch) supplies BOTH the file
+    # cutoff and the meta-prune/upgrade timestamps; None uses the real clock.
+    now = time.time() if now_epoch is None else float(now_epoch)
+    cutoff = now - max_age_days * 86400
     dirs = [Path(marker_dir)] if marker_dir else _sweep_candidate_dirs()
     removed = 0
     for d in dirs:
@@ -592,6 +743,27 @@ def cmd_sweep(marker_dir: str | None = None,
         verb = "would prune" if dry_run else "pruned"
         print(f"[zmem] sweep: {verb} {removed} stale session "
               "sentinel(s)/sidecar(s)")
+    # Issue #128: bound the per-session convention-counter meta rows on the
+    # SAME cutoff. Best-effort and fail-open by contract: an absent, locked,
+    # unreadable, or newer-schema store skips the meta phase entirely and
+    # preserves the successful file-sweep result above. The current session
+    # rides the AMBIENT ZMEM_SESSION (exported by the session launcher for
+    # cadence runs), so the live session's rows always survive.
+    global last_meta_prune
+    last_meta_prune = None
+    try:
+        _counts = prune_convention_meta(
+            STORE_PATH, cutoff_epoch=cutoff,
+            current_session=os.environ.get("ZMEM_SESSION", ""),
+            dry_run=dry_run, now_epoch=now)
+    except Exception:
+        _counts = None
+    last_meta_prune = _counts
+    if _counts is not None:
+        verb = "would prune —" if dry_run else "pruned;"
+        print(f"[zmem] sweep: {verb} meta convention rows "
+              f"removed={_counts[0]} retained={_counts[1]} "
+              f"unparseable={_counts[2]}", file=sys.stderr)
     return 0
 
 def _integrity_check_readonly(path: Path) -> str:

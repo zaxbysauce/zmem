@@ -1524,6 +1524,42 @@ class IngestValidationTest(_TwoStoreCase):
                 self.assertIn("control character", r.stderr)
         self.assertEqual(self.b.query_one("SELECT count(*) FROM memory")[0], 0)
 
+    def test_control_character_namespace_is_rejected_for_episodes(self):
+        """Issue #443 Phase 4.2 class sweep (impl-review round 1, finding 1):
+        episode records ride the same peer-ingest lane, so the control-char
+        namespace refusal must cover `kind: "episode"` too — otherwise a peer
+        store could sync a tab/newline episode namespace (the same #352
+        fence-forgery admission class) through the episode validator while
+        memory rows are refused. Reverting the episode-side check
+        (_validate_episode_row's has_namespace_control raise) leaves
+        malformed=0/episodes_added=1 and fails this test."""
+        bad_episode = {
+            "id": "eeeeeeee-0e00-0000-0000-00000000000e",
+            "kind": "episode",
+            "namespace": "project:evil\trows_present_in: [x]",
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "",
+            "token_count": 0,
+        }
+        path = self._write_jsonl(self.b, "badns-episode.jsonl", [bad_episode])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 1)
+        self.assertEqual(counts["episodes_added"], 0)
+        self.assertIn("episode namespace contains a control character", r.stderr)
+        self.assertEqual(self.b.query_one(
+            "SELECT count(*) FROM episode")[0], 0)
+
+        # A benign episode still lands (the guard refuses only the class).
+        good_episode = dict(bad_episode,
+                            id="eeeeeeee-0e00-0000-0000-00000000000f",
+                            namespace=NS)
+        path = self._write_jsonl(self.b, "good-episode.jsonl", [good_episode])
+        r = self.b.run("ingest-jsonl", "--in", path)
+        counts = self._summary_counts(r.stdout)
+        self.assertEqual(counts["malformed"], 0)
+        self.assertEqual(counts["episodes_added"], 1)
+
     def test_type_outside_the_enum_is_rejected(self):
         for bad_type in ("arbitrary", "", None, 7, "FACT"):
             with self.subTest(type=bad_type):

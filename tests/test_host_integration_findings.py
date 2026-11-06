@@ -294,7 +294,17 @@ class M10HermesHooksUseStoreCli(unittest.TestCase):
                 evidence,
                 ("edit", "hermes-compat", "pretool", "src/compat-boundary.py"),
             )
-            self.assertEqual(convention_count, ("1",))
+            # Issue #128 (0.144.0): the counter value is the canonical JSON
+            # shape {"count": N, "last_seen": <ISO-Z>} — one event means
+            # count == 1 (the shape's law lives in schema_meta).
+            self.assertIsNotNone(convention_count)
+            try:
+                _counter = json.loads(convention_count[0])
+            except (TypeError, ValueError):
+                _counter = None
+            self.assertIsInstance(_counter, dict)
+            self.assertEqual(_counter.get("count"), 1)
+            self.assertIsInstance(_counter.get("last_seen"), str)
 
     def test_convention_finishes_before_detached_evidence_starts(self):
         """A real copied hook must not overlap its two store-writer children."""

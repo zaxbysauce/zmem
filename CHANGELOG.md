@@ -5,6 +5,70 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.144.0] - 2026-11-06
+
+### Fixed (issues #443 + #128, collated)
+
+- **`list` operator surface joins the credential-withhold law (#443 AC1).**
+  `store.py list` now selects full content/source_ref/tags, classifies every
+  row with the shared `_classify_credential` registry, and renders withheld
+  rows as `[WITHHELD: SECRET]` (human arm) / `preview: ""` +
+  `withheld_for_secret: true` (JSON arm, additive key — the hub
+  `list_memories`/remote route consumers are subset-semantics safe). A
+  credential-shaped NAMESPACE is blanked on both arms and in the top-level
+  JSON `namespace` echo; withheld rows keep every existing key
+  (`superseded_at` status, blanked `tags`, and the injection-risk marker
+  computed from the original fixed-vocabulary tag).
+- **`export-pack` render surfaces withhold credentials (#443 AC3).** The pack
+  body (project AND `user:global` sections), the `# Memory pack:` title, and
+  the empty-pack stderr refusal line no longer echo credential content or a
+  credential-shaped namespace; withheld rows render the shared marker and are
+  never silently dropped. `export-jsonl` and dataset export stay raw fidelity
+  artifacts (a withhold would break ingest/checksum round-trips by
+  construction); `source show/scan` already redact.
+- **Dataset import refuses control-character namespaces (#443 AC2).** The
+  import path validates the ORIGINAL namespace string (no `.strip()`
+  pre-normalization — leading/trailing C0 previously passed and landed
+  verbatim) for BOTH the memories and episodes families, whole-snapshot, in
+  the #353 fail-closed position. import-store's hindsight lane was already
+  covered via the sync validator (PR #440).
+- **The per-session convention-counter meta rows are bounded (#128).**
+  `prune_convention_meta` runs inside the sweep under the same
+  `--max-age-days` cutoff (raw non-creating URI open; schema gate inside the
+  transaction; absent/locked/unreadable/newer-schema stores skip the meta
+  phase and keep the file-sweep result): retired legacy
+  `convention_count_*`/`_sess_*` rows and non-current legacy
+  `hermes_convention_count_*` rows are removed (no age evidence, no live
+  writer), stale JSON rows are removed by strict-`<` `last_seen` age, the
+  current session's rows always survive (a retained legacy row is upgraded
+  to canonical JSON with its count unchanged), malformed rows are retained
+  and counted `unparseable`, and every delete/update runs in one
+  transaction with rollback. The sweep reports
+  `meta convention rows removed=N retained=N unparseable=N`
+  (`would prune` under `--dry-run`) and `session-cadence` folds the counts
+  into its summary (current-session retention rides the ambient
+  `ZMEM_SESSION` the session launcher exports).
+- **The live hermes counter value is canonical JSON (#128 AC5).**
+  `hermes_convention_count_<session>` now stores
+  `{"count": N, "last_seen": "<ISO-Z>"}` (atomic single-transaction
+  increment; legacy integers upgrade in place; concurrent ring events do not
+  lose updates). The verify hook's twin parser (`_parse_convention_count`,
+  kept importable without storelib) reads both shapes — with the old
+  `isdigit()` parse the JSON shape would have silently read as 0 and killed
+  the convention nudge.
+
+### Deferred (owner-disclosed)
+
+- #128 design 1-3 (re-adding the retired `convention-count` writer +
+  convention-hook rewiring) is intentionally NOT implemented: the convention
+  hook moved to a marker-file cadence and no consumer reads
+  `convention_count_*` rows at current main — re-adding the writer would be
+  write-only code. The pruner/reporting half of the contract ships in full.
+  Residual unbounded marker families (`hermes_pending_failure_`,
+  `hermes_failure_captured_` — functional nudge lifecycle;
+  `hermes_pending_convention_` — write-only, #323 census owns it;
+  `hermes_verify_prompted_`) are disclosed for a follow-up decision.
+
 ## [0.143.0] - 2026-11-05
 
 ### Fixed

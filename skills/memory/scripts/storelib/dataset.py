@@ -1110,6 +1110,26 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     f"dataset refused: {family.rstrip('s') if family != 'memories' else 'memory'} id {mid!r} is not "
                     "UUID-shaped (import-dataset refuses non-uuid ids)")
 
+    # Issue #443 AC2: the writer (write._validate_namespace) and sync ingest
+    # (sync._validate_sync_row, PR #440) refuse C0/DEL control characters in
+    # namespaces -- a newline renders as a column-0 line in the untrusted
+    # fence, where the delivery ledger's bullet grammar can credit it as a
+    # delivery (the #352 forgery class). Dataset import was the remaining
+    # admission path with no such check. Validate the ORIGINAL string (never
+    # a stripped form: leading/trailing controls would otherwise pass the
+    # check and land verbatim), for BOTH namespace-bearing families, BEFORE
+    # any filtering or destination work -- the #353 whole-snapshot refusal
+    # law: even a filtered-out malformed row refuses the snapshot.
+    from schema_meta import has_namespace_control
+    for family in ("memories", "episodes"):
+        for row in families[family]:
+            ns_value = row.get("namespace")
+            if isinstance(ns_value, str) and has_namespace_control(ns_value):
+                raise DatasetError(
+                    f"dataset refused: {family.rstrip('s') if family != 'memories' else 'memory'} "
+                    f"namespace {ns_value!r} contains a control character; "
+                    "the writer path refuses the same class")
+
     memories = families["memories"]
     available = {row["namespace"] for row in memories}
     if namespace is not None and namespace not in available:

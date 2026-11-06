@@ -549,7 +549,14 @@ process.stdout.write(JSON.stringify({
                 legacy = conn.execute(
                     "SELECT value FROM meta WHERE key='hermes_convention_count_s-legacy'"
                 ).fetchone()
-                self.assertEqual(legacy, ("1",), conn.execute("SELECT key,value FROM meta").fetchall())
+                # Issue #128 (0.144.0): the counter value is the canonical
+                # JSON shape (count == 1 after one event); the NO-MIGRATION
+                # property under test is the schema_version/evidence asserts
+                # above, which must keep holding.
+                self.assertIsNotNone(legacy)
+                counter = json.loads(legacy[0])
+                self.assertEqual(counter.get("count"), 1,
+                                 conn.execute("SELECT key,value FROM meta").fetchall())
             finally:
                 conn.close()
 

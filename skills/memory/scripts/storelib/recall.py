@@ -5874,27 +5874,78 @@ def list_memory(conn, *, namespace=None, limit=50, include_superseded=False,
         clauses.append("superseded_at IS NULL")
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
-    rows = conn.execute(
-        f"SELECT id, namespace, type, substr(content,1,80) AS preview, confidence, "
-        f"signal, tags, superseded_at FROM memory {where} ORDER BY ingestion_ts DESC LIMIT ?",
+    # Issue #443 AC1: select the FULL content plus source_ref and tags -- the
+    # shared credential classifier (_classify_credential) reads the
+    # content/source_ref/tags blob, so an 80-char preview window would miss a
+    # credential past the boundary. Display truncation happens AFTER the
+    # withhold pass, never before classification.
+    rows = [dict(r) for r in conn.execute(
+        f"SELECT id, namespace, type, content, source_ref, tags, confidence, "
+        f"signal, superseded_at FROM memory {where} "
+        f"ORDER BY ingestion_ts DESC LIMIT ?",
         params,
-    ).fetchall()
+    ).fetchall()]
+    # The #352/#256 credential-withhold law, extended to this operator
+    # surface (issue #443): every row runs through the shared builder -- a
+    # scrub-bypassing row (manual surgery, pre-pattern legacy store, foreign
+    # write) surfaces as the shared stub on recall/recent/explain, the
+    # passive lane, and now list. The stub blanks content and a
+    # credential-shaped namespace but keeps the fixed-vocabulary marker keys.
+    # The stub deliberately carries only a subset of the row's keys (never
+    # source_ref/tags/superseded_at -- any may be the matching field, and
+    # superseded_at is structural), so MERGE it over the original row: every
+    # existing key survives on the withheld entry (tags blanked below at
+    # render), with the stub's blanked content/namespace winning.
+    _withheld = _withhold_credential_rows(rows)
+    _merged = []
+    for _orig, _r in zip(rows, _withheld):
+        if _r is _orig:
+            _merged.append(_orig)
+        else:
+            _m = dict(_orig)
+            _m.update(_r)
+            _m["withheld_for_secret"] = True
+            _merged.append(_m)
+    rows = _merged
+    # A credential-shaped NAMESPACE on a row that is NOT otherwise withheld
+    # (the classifier's input set is content/source_ref/tags by law -- the
+    # namespace alone never triggers it) is blanked at render time on both
+    # arms, mirroring the stub's own ns-blanking rule.
+    for r in rows:
+        if isinstance(r.get("namespace"), str) and _credential_shaped_text(
+                r["namespace"]):
+            r["namespace"] = ""
+
+    def _preview(r):
+        if r.get("withheld_for_secret"):
+            return ""
+        return (r.get("content") or "")[:80]
+
     if as_json:
         # Issue #289 (T-10): the JSON shape consumed by the remote read
-        # route and the hub list_memories tool.
+        # route and the hub list_memories tool. Withheld entries keep every
+        # existing key (tags blanked -- tags may be the field that matched
+        # the credential registry) and gain the additive
+        # ``withheld_for_secret`` row key; remote_gate's subset-semantics
+        # key check tolerates additive row keys by construction. The
+        # top-level ``namespace`` echo of a credential-shaped scoped request
+        # is blanked (#443, critic probe: the filter itself leaked).
         print(json.dumps({
-            "namespace": namespace,
+            "namespace": ("" if isinstance(namespace, str)
+                          and _credential_shaped_text(namespace) else namespace),
             "count": len(rows),
             "memories": [
                 {
                     "id": r["id"],
                     "namespace": r["namespace"],
                     "type": r["type"],
-                    "preview": r["preview"],
+                    "preview": _preview(r),
                     "confidence": r["confidence"],
                     "signal": r["signal"],
-                    "tags": r["tags"],
+                    "tags": "" if r.get("withheld_for_secret") else r["tags"],
                     "superseded_at": r["superseded_at"],
+                    **({"withheld_for_secret": True}
+                       if r.get("withheld_for_secret") else {}),
                 }
                 for r in rows
             ],
@@ -5905,10 +5956,16 @@ def list_memory(conn, *, namespace=None, limit=50, include_superseded=False,
     for r in rows:
         status = "SUPERSEDED" if r["superseded_at"] else "live"
         # Surface the prompt-injection-risk tag as a visible marker so the
-        # detector is actionable at read time, not write-only (#36 M5).
-        marker = " \u26a0injection-risk" if _has_injection_risk_tag(r["tags"]) else ""
+        # detector is actionable at read time, not write-only (#36 M5). The
+        # marker is computed from the ORIGINAL tags' fixed-vocabulary tag (a
+        # boolean fact about the row, never the tag text), so it survives on
+        # withheld rows whose tags field is blanked (#443).
+        marker = " \u26a0injection-risk" if _has_injection_risk_tag(
+            r["tags"]) else ""
+        preview = "[WITHHELD: SECRET]" if r.get("withheld_for_secret") \
+            else _preview(r)
         print(f"[{r['id']}] {status} ns={r['namespace']} type={r['type']} "
-              f"conf={r['confidence']} sig={r['signal']}{marker} :: {r['preview']}")
+              f"conf={r['confidence']} sig={r['signal']}{marker} :: {preview}")
 
 def stats(conn):
     n_total = conn.execute("SELECT count(*) AS c FROM memory").fetchone()["c"]

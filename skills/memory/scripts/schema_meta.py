@@ -21,7 +21,9 @@ env-var parsing.
 
 from __future__ import annotations
 
+import json
 import re
+import time
 
 
 # Namespace admission grammar (issue #166). Project and user values preserve
@@ -43,6 +45,111 @@ NAMESPACE_NEAR_MISS_RE = re.compile(
 def has_namespace_control(namespace: str) -> bool:
     """Return whether a namespace contains C0 or DEL characters."""
     return any(ord(char) < 0x20 or ord(char) == 0x7F for char in namespace)
+
+
+# ---------------------------------------------------------------------------
+# Per-session convention counter value (issue #128, release 0.144.0)
+#
+# The ``meta`` rows ``hermes_convention_count_<session>`` (the live writer:
+# storelib/cli.py cmd_hermes_convention; the live reader:
+# hermes-plugin/hooks/zmem-hermes-verify.py) carry a canonical JSON value
+# ``{"count": <int>, "last_seen": "<YYYY-MM-DDTHH:MM:SSZ>"}`` so the sweep
+# can age-prune stale sessions. Pre-0.144.0 rows are bare decimal integers;
+# they stay readable (legacy shape) and are upgraded in place on the next
+# increment / retained-current-session sweep. Everything else is MALFORMED
+# (parses as 0, retained by the pruner and counted ``unparseable``).
+#
+# hermes-plugin/hooks/zmem-hermes-verify.py keeps a LOCAL twin of
+# ``parse_convention_count`` (``_parse_convention_count``) because the hook
+# must run on a box where this module is not importable; a lockstep test
+# (tests/test_meta_table_bound.py VerifyHookParityTest) pins the two equal
+# over a value matrix. Change them together.
+# ---------------------------------------------------------------------------
+
+CONVENTION_COUNT_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _valid_convention_last_seen(value: object) -> bool:
+    """True when last_seen is an exact canonical UTC timestamp string that the
+    epoch parser can resolve. A JSON counter with a corrupt timestamp has no
+    age evidence and must classify MALFORMED (retained by the pruner, counted
+    unparseable) rather than parse as epoch 0 and be deleted as ancient —
+    _parse_iso_to_epoch is total and cannot signal failure (impl-review
+    rounds 1+2 finding 3: strptime alone ACCEPTS second=60, e.g.
+    2026-11-06T18:00:60Z, which the epoch parser then resolves as 0.0 — the
+    strftime round-trip catches every shape strptime normalizes)."""
+    if not isinstance(value, str) or not value:
+        return False
+    import re as _re
+    import time as _time
+    if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        parsed = _time.strptime(value, CONVENTION_COUNT_TS_FORMAT)
+    except ValueError:
+        return False
+    # strptime is POSIX-lenient: it accepts tm_sec 60/61 (leap seconds) and
+    # normalizes overflow, and strftime renders them back verbatim — so the
+    # round-trip alone cannot catch them, and _parse_iso_to_epoch resolves
+    # such shapes to its 0.0 failure sentinel. Explicit range gates.
+    if not (0 <= parsed.tm_hour <= 23 and 0 <= parsed.tm_min <= 59
+            and 0 <= parsed.tm_sec <= 59):
+        return False
+    return _time.strftime(CONVENTION_COUNT_TS_FORMAT, parsed) == value
+
+
+def classify_convention_count(value: object) -> str:
+    """Classify a counter value: ``"json"`` (canonical shape), ``"legacy"``
+    (bare non-negative decimal integer), or ``"malformed"`` (anything else,
+    including JSON with a missing/wrong-typed ``count`` or a ``last_seen``
+    that is not an exact canonical timestamp)."""
+    if value is None:
+        return "malformed"
+    text = value if isinstance(value, str) else str(value)
+    stripped = text.strip()
+    if stripped.isdigit():
+        return "legacy"
+    try:
+        obj = json.loads(stripped)
+    except (ValueError, TypeError):
+        return "malformed"
+    if not isinstance(obj, dict):
+        return "malformed"
+    count = obj.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return "malformed"
+    if not _valid_convention_last_seen(obj.get("last_seen")):
+        return "malformed"
+    return "json"
+
+
+def parse_convention_count(value: object) -> int:
+    """The counter's integer count: canonical JSON ``count``, a legacy bare
+    integer, or 0 for a malformed value. Twin: zmem-hermes-verify.py
+    ``_parse_convention_count`` (keep byte-equivalent in behaviour)."""
+    kind = classify_convention_count(value)
+    if kind == "legacy":
+        return int(str(value).strip())
+    if kind == "json":
+        return int(json.loads(str(value).strip())["count"])
+    return 0
+
+
+def convention_count_last_seen(value: object) -> str | None:
+    """The canonical JSON value's ``last_seen`` string, or None for legacy/
+    malformed shapes (which carry no age evidence)."""
+    if classify_convention_count(value) != "json":
+        return None
+    return str(json.loads(str(value).strip())["last_seen"])
+
+
+def convention_count_value(count: int, now_iso: str | None = None) -> str:
+    """Render the canonical JSON counter value (sorted keys, compact
+    separators -- byte-stable for the sweep's byte-identity pins)."""
+    if now_iso is None:
+        now_iso = time.strftime(CONVENTION_COUNT_TS_FORMAT, time.gmtime())
+    return json.dumps({"count": int(count), "last_seen": now_iso},
+                      sort_keys=True, separators=(",", ":"))
 
 
 def is_valid_namespace(namespace: object) -> bool:
