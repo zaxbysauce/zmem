@@ -189,8 +189,18 @@ class DbWiringIntegrationTest(unittest.TestCase):
         import os as _os
         import sqlite3 as _sqlite3
         import tempfile as _tempfile
+
+        def _cleanup_db(p):
+            # main db + sqlite3 -wal/-shm siblings (NEW-3a leak pin)
+            for s in ("", "-wal", "-shm"):
+                try:
+                    _os.remove(p + s)
+                except OSError:
+                    pass
+
         fd, path = _tempfile.mkstemp(suffix=".sqlite")
         _os.close(fd)
+        self.addCleanup(_cleanup_db, path)
         conn = _sqlite3.connect(path)
         cols = ("session_id TEXT, tool_name TEXT, read_only INT, "
                 "status TEXT, exit_code INT, error_message TEXT, "
