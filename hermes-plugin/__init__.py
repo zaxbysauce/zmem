@@ -489,10 +489,30 @@ def _offline_snapshot_envelope(query: str, namespace: str,
         module = importlib.util.module_from_spec(spec)
         sys.modules["zmem_fleet_snapshot_offline"] = module
         spec.loader.exec_module(module)
-        envelope, _state = module._serve_offline_read(  # noqa: SLF001
-            dict(os.environ), query=query, namespace=namespace,
-            moment="user_prompt", session_id=session_id,
-            lane="hermes-provider", prompt_timestamp=prompt_timestamp)
+        # PR #458 review IA-1: the snapshot module is loaded from the
+        # ZMEM_HOME checkout, which may predate this server's
+        # prompt_timestamp kwarg — mirror `_transport_call_with_prompt_ts`:
+        # retry once without the kwarg on the signature TypeError so a
+        # valid snapshot still serves (wall clock) instead of the whole
+        # offline lane silently dying under the version skew. The call
+        # stays keyword-shaped (`env, **kwargs`) exactly like the
+        # pre-fix call — a positional dict would trip the signature's
+        # keyword-only boundary on EVERY call (closeout-critic round 1).
+        serve_kwargs = {
+            "query": query, "namespace": namespace,
+            "moment": "user_prompt", "session_id": session_id,
+            "lane": "hermes-provider", "prompt_timestamp": prompt_timestamp}
+        try:
+            envelope, _state = module._serve_offline_read(  # noqa: SLF001
+                dict(os.environ), **serve_kwargs)
+        except TypeError:
+            logger.warning(
+                "zmem: offline snapshot serve rejected prompt_timestamp "
+                "(store checkout at ZMEM_HOME predates this server); "
+                "serving wall-clock instead")
+            serve_kwargs.pop("prompt_timestamp", None)
+            envelope, _state = module._serve_offline_read(  # noqa: SLF001
+                dict(os.environ), **serve_kwargs)
         return envelope
     except Exception:  # noqa: BLE001 - offline serve fails open
         logger.debug("zmem: offline snapshot serve failed open", exc_info=True)
@@ -883,12 +903,18 @@ def _decode_rendered_envelope(result: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 # Issue #389 (AC8): strict ISO-8601 gate for a payload/tool-supplied prompt
 # timestamp.  The parse mirrors the store CLI's argparse ``_iso8601`` type
-# exactly, so any value admitted here is guaranteed to parse there — a
-# forwarded timestamp can never exit-2 the store child.  An absent,
-# non-string, or unparseable value is DROPPED with a debug log (never an
-# error); the store keeps its ZMEM_TEST_NOW/now clock seam.  This body is
-# duplicated verbatim in the hook body / fleet transport / MCP server (one
-# rule, four trees — the plugin never pulls the store library in-process).
+# exactly — including its conditional ``astimezone(utc)`` conversion
+# (tz-aware values only) — so any value admitted here is guaranteed to
+# convert there: a forwarded timestamp can never crash (exit 1) or exit-2
+# the store child.  (PR #458 review CS-1: offset boundary instants parse
+# but their astimezone raises OverflowError, so the conversion runs here
+# under the same try; naive values never call into the platform's
+# local-time functions, which on Windows raise OSError outside ~1970-3001
+# — closeout-critic round 1.)  An absent, non-string, or unconvertible
+# value is DROPPED with a debug log (never an error); the store keeps its
+# ZMEM_TEST_NOW/now clock seam.  This body is duplicated verbatim in the
+# hook body / fleet transport / MCP server (one rule, four trees — the
+# plugin never pulls the store library in-process).
 _PROMPT_TS_MAX = 64
 
 
@@ -899,8 +925,10 @@ def _valid_prompt_timestamp(value: object) -> Optional[str]:
     if not value or len(value) > _PROMPT_TS_MAX:
         return None
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
     return value
 

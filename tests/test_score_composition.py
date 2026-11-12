@@ -625,6 +625,11 @@ class RrBindsIntegrationTest(unittest.TestCase):
             ZMEM_INJECT_FLOOR_LEX=None, ZMEM_INJECT_FLOOR_COS=None,
             ZMEM_INJECT_FLOOR_ENT=None, ZMEM_INJECT_FLOOR_GRAPH=None,
             ZMEM_INJECT_FLOOR_TRUST=None))
+        # PR #458 review CUBIC-11: this integration test owns a CLEAN pool —
+        # without the frozen-store reset its rank-ratio fixture re-seeds on
+        # top of RecallLaneCompositionTest's rows in the same namespace when
+        # this class runs second (one-process canary order dependence).
+        _reset_frozen_store()
         cls.conn = connect()
         _prepare_store(cls.conn)
         original = write_mod._embeddings

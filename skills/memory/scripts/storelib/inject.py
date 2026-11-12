@@ -1071,9 +1071,15 @@ def select_and_budget_for_injection(
 
     prompt_timestamp (issue #389, AC8): the prompt's own clock for the
     temporal arm — threaded verbatim into BOTH dispatch branches
-    (``recall_memory``/``recent_memory``), where an invalid value
-    normalizes to the ZMEM_TEST_NOW/now seam (never an error).  ``None``
-    keeps that seam exactly.
+    (``recall_memory``/``recent_memory``).  PR #458 review UIB-1 (honest
+    contract): an UNPARSEABLE value is NOT replaced by the
+    ZMEM_TEST_NOW/now seam — ``_normalize_as_of`` returns it unchanged, so
+    ``_temporal_window`` treats it as truthy, skips the seam, and the
+    temporal arm silently answers empty.  ``None`` and empty-string keep
+    the seam exactly; every production boundary (hook body, fleet
+    transport, hermes, MCP server) drops unparseable values before
+    threading, so in-process callers must do the same (or pass
+    ``None``/``""`` for the seam).
     """
     if moment not in INJECTION_MOMENTS:
         raise ValueError("invalid injection moment: {!r}".format(moment))

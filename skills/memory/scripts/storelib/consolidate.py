@@ -495,10 +495,11 @@ def _absorb_into_keeper(
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
     except sqlite3.OperationalError:
         pass
-    # v15 (#173): the absorbed row's side-table record is removed in the SAME
-    # transaction as its tombstone — one of the cleanup sites (update,
-    # supersede, consolidate absorb, organize stale-summary, sync tombstone,
-    # plus the hard-DELETE paths in purge/import-store, which reach it through
+    # v15 (#173): the absorbed row's memory_expiry record is removed in the
+    # SAME transaction as its tombstone (PR #458 review CUBIC-4: scoped to
+    # expiry only since #389's two-tier law — occurrence is RETAINED here;
+    # the generated-row cleanup sites are organize stale-summary and entity
+    # reconcile, plus the hard-DELETE paths in purge/import-store through
     # purge._ID_SIDE_TABLES).
     _clear_expiry(conn, absorbed["id"])
     # Issue #389: the absorbed row's occurrence row is intentionally

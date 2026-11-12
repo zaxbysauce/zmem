@@ -210,6 +210,33 @@ class ParseBgLogTest(unittest.TestCase):
         self.assertEqual(lines[1]["reason"], "empty-pool")
         self.assertEqual(lines[2]["arms"], "fts:1/15")  # pre-#120 shape intact
 
+    def test_pts_tail_parses_writer_emitted_shape(self):
+        # PR #458 review PO-1 (reader parity): the additive pts= tail rides
+        # the exact writer-emitted line shape (after state=). The shipped
+        # reader must parse it (a silent skip would reclassify delivered
+        # rows as misses in the #100-gated report) and pre-pts lines must
+        # keep parsing with pts=None.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "zmem-bg.log")
+            Path(path).write_text(
+                _WRITER_TAIL_LINE + "\n"
+                "[1780000001] zmem-hook status=injected reason=injected"
+                " ids=['m1'] all=['m1'] sid=sess-a moment=recall\n",
+                encoding="utf-8")
+            lines = miss_rate.parse_bg_log(path)
+        self.assertEqual(
+            len(lines), 2,
+            "both the pts-carrying and the pre-pts line must parse")
+        self.assertEqual(
+            lines[0]["pts"], "2026-09-10T15:30:00Z",
+            "the additive pts field must round-trip verbatim")
+        self.assertIsNone(
+            lines[1]["pts"],
+            "a pre-pts line must parse with pts=None (additive only)")
+        # Reader-parity also covers the OLD terminal field: snapshot_refresh
+        # stays intact next to the new tail.
+        self.assertIsNone(lines[0]["snapshot_refresh"])
+
 
 def _enriched_bg_line(ts: int, ids, *, lane=None,
                       moment="user_prompt", version="0.36.0", t_ms=0,
@@ -225,6 +252,17 @@ def _enriched_bg_line(ts: int, ids, *, lane=None,
     if t_ms is not None:
         line += f" t_ms={t_ms}"
     return line
+
+
+# PR #458 review PO-1: the EXACT writer-emitted line tail for a recall
+# decision under a prompt clock — status/reason/ids/all/sid/moment then the
+# additive tails ending state=<...> pts=<strict-ISO>. Used verbatim in the
+# parse-parity and join-replay tests below.
+_WRITER_TAIL_LINE = (
+    "[1780000000] zmem-hook status=injected reason=injected"
+    " ids=['m1'] all=['m1', 'm2'] sid=sess-a moment=recall"
+    " lane=zcode ver=0.151.0 t_ms=4 arms=fts:1/15,temporal:1/5"
+    " state=clean pts=2026-09-10T15:30:00Z")
 
 
 class MissRateMomentTest(unittest.TestCase):
@@ -1612,6 +1650,109 @@ class FeedbackReportTest(unittest.TestCase):
              "memory_id": self.FB_M126, "overlap": 2,
              "evidence_id": self.FB_EV131},
         ], "exactly five fields per row, sorted by session/event/memory")
+
+
+class PromptClockReplayTest(_JoinFixture, unittest.TestCase):
+    """PR #458 review PO-1: the #100-gated join replays the recall with the
+    decision line's prompt clock (pts=) — report-time wall clock must not
+    govern temporal delivered/missed accounting.
+
+    Writer+reader+join all ride the same commit per the decision-log
+    READER-PARITY convention (PR #193 C-F3-001): the parse parity leg lives
+    in ParseBgLogTest, the writer-side shape pins in test_decision_log.py /
+    test_bg_log_sid.py, and the join contract here.
+    """
+
+    PTS = "2026-09-10T15:30:00Z"
+
+    def _replay_clocks(self, bg_lines, sid="sess-a"):
+        """Run the join with recall_memory stubbed to record the
+        prompt_timestamp it receives; return (clocks, report)."""
+        import unittest.mock as mock
+        from storelib import recall as recall_mod
+
+        real_recall = recall_mod.recall_memory
+        clocks = []
+
+        def fake_recall(conn, query, namespace, limit, no_bump,
+                        no_telemetry, link_hops, prompt_timestamp=None):
+            clocks.append(prompt_timestamp)
+            return [{"id": self.row_id, "namespace": self.NS,
+                     "content": self.LESSON}]
+
+        with mock.patch.object(recall_mod, "recall_memory", fake_recall):
+            self._bg_log(bg_lines)
+            report = self._run()
+        return clocks, report
+
+    def test_join_replays_recall_with_the_decision_line_pts(self):
+        self._fixture()
+        clocks, report = self._replay_clocks([
+            _bg_line(self.now, [self.row_id], sid="sess-a",
+                     reason="injected", status="injected")
+            + " pts=" + self.PTS,
+        ])
+        self.assertEqual(
+            clocks, [self.PTS],
+            "the replay must ride the decision line's prompt clock, "
+            "never report-time wall clock")
+        self.assertEqual(report["counts"]["surfaced_sid"], 1)
+        self.assertEqual(report["counts"]["missed"], 0)
+
+    def test_join_without_pts_replays_at_wall_clock(self):
+        self._fixture()
+        clocks, report = self._replay_clocks([
+            _bg_line(self.now, [self.row_id], sid="sess-a",
+                     reason="injected", status="injected"),
+        ])
+        self.assertEqual(
+            clocks, [None],
+            "a pre-pts decision line must replay exactly as before "
+            "(prompt_timestamp=None)")
+        self.assertEqual(report["counts"]["surfaced_sid"], 1)
+
+    def test_newest_sid_proofed_candidate_pts_wins(self):
+        # Two same-session injected lines in-window; the replay takes the
+        # clock of the newest candidate (latest ts, log order on ties).
+        self._fixture()
+        clocks, _report = self._replay_clocks([
+            _bg_line(self.now - 60, [self.row_id], sid="sess-a",
+                     reason="injected", status="injected")
+            + " pts=2026-09-10T14:00:00Z",
+            _bg_line(self.now, [self.row_id], sid="sess-a",
+                     reason="injected", status="injected")
+            + " pts=" + self.PTS,
+        ])
+        self.assertEqual(
+            clocks, [self.PTS],
+            "the newest candidate line's clock must win")
+        # Same ts twice: the later line in log order wins (deterministic).
+        clocks, _report = self._replay_clocks([
+            _bg_line(self.now, [self.row_id], sid="sess-a",
+                     reason="injected", status="injected")
+            + " pts=2026-09-10T13:00:00Z",
+            _bg_line(self.now, [self.row_id], sid="sess-a",
+                     reason="injected", status="injected")
+            + " pts=" + self.PTS,
+        ])
+        self.assertEqual(
+            clocks, [self.PTS],
+            "on equal ts the last candidate in log order must win")
+
+    def test_cross_session_pts_is_not_used(self):
+        # Another session's clock must not govern this failure's replay —
+        # sid-correlation follows the surfaced_sid attribution rule (M6).
+        self._fixture()
+        clocks, report = self._replay_clocks([
+            _bg_line(self.now, [self.row_id], sid="sess-b",
+                     reason="injected", status="injected")
+            + " pts=" + self.PTS,
+        ])
+        self.assertEqual(
+            clocks, [None],
+            "a sid-proofed foreign line must not lend its clock")
+        self.assertEqual(report["counts"]["missed"], 1,
+                         "the failure stays unattributed (genuine miss)")
 
 
 if __name__ == "__main__":

@@ -338,6 +338,65 @@ class HookLegTest(unittest.TestCase):
         self.assertIsNone(_flag_value(
             _recall_invocation(invocations2), "--prompt-timestamp"))
 
+    def test_adversarial_values_never_reach_argv(self):
+        """PR #458 review ST-2: the argv-injection and control-char shapes
+        the validator must never admit — option-shaped, shell-metachar,
+        quote, and the newline-separator form that fromisoformat ACCEPTS
+        (the separator slot is single-char; the converted value is dropped
+        by the astimezone boundary only for offset forms).  Whatever the
+        parser admits, the option-shaped strings must never forward."""
+        for bad in ("--dangerous-flag", "--prompt-timestamp=--evil",
+                    '"; rm -rf /', "' OR 1=1 --", "2026-11-12\n10:00:00",
+                    "2026-11-12\t10:00:00"):
+            rc, invocations = _run_body(self._event(prompt_timestamp=bad))
+            self.assertEqual(rc, 0, bad)
+            argv = _recall_invocation(invocations)
+            self.assertIsNotNone(argv, bad)
+            forwarded = _flag_value(argv, "--prompt-timestamp")
+            if forwarded is not None:
+                # A value that survives the gate must never be
+                # option-shaped (leading dash) nor contain quotes or
+                # shell metacharacters — the newline-separator ISO form
+                # may forward verbatim (it is a legal datetime), but it
+                # rides list-argv (never a shell) and the store's
+                # _iso8601 re-canonicalizes it.
+                self.assertFalse(forwarded.startswith("-"), bad)
+                self.assertNotIn('"', forwarded, bad)
+                self.assertNotIn("'", forwarded, bad)
+                self.assertNotIn(";", forwarded, bad)
+                self.assertNotIn("|", forwarded, bad)
+                self.assertNotIn("&", forwarded, bad)
+            self.assertNotIn("--dangerous-flag", argv, bad)
+
+    def test_boundary_instant_offsets_drop_cleanly(self):
+        """PR #458 review CS-1: offset boundary instants parse via
+        fromisoformat but their astimezone(utc) overflows — the gate must
+        drop them (never forward a value that crashes the store child's
+        _iso8601), and the hook must stay exit-0 with no flag. The
+        conversion is conditional (tz-aware only): NAIVE values —
+        including naive boundary instants that would raise OSError on
+        Windows under an unconditional astimezone — are ADMITTED, exactly
+        like _iso8601/_normalize_as_of admit them (closeout-critic
+        round 1)."""
+        for bad in ("0001-01-01T00:00:00+05:00",
+                    "9999-12-31T23:59:59-05:00"):
+            rc, invocations = _run_body(self._event(prompt_timestamp=bad))
+            self.assertEqual(rc, 0, bad)
+            argv = _recall_invocation(invocations)
+            self.assertIsNotNone(argv, bad)
+            self.assertIsNone(_flag_value(argv, "--prompt-timestamp"), bad)
+        # naive boundary instants are ADMITTED (mirrors _iso8601; a
+        # Windows host must never see an OSError from the gate)
+        for naive in ("0001-01-01T00:00:00",
+                      "1969-12-31T00:00:00",
+                      "9999-12-31T23:59:59"):
+            rc, invocations = _run_body(self._event(prompt_timestamp=naive))
+            self.assertEqual(rc, 0, naive)
+            argv = _recall_invocation(invocations)
+            self.assertIsNotNone(argv, naive)
+            self.assertEqual(
+                _flag_value(argv, "--prompt-timestamp"), naive, naive)
+
 
 class TemporalWindowTest(unittest.TestCase):
     """Explicit prompt time beats a divergent ZMEM_TEST_NOW (probe leg 2)."""
@@ -563,6 +622,86 @@ class HermesProviderTest(unittest.TestCase):
         self.assertEqual(len(serves), 1)
         self.assertEqual(serves[0]["prompt_timestamp"], PROMPT_TS)
 
+    def test_offline_envelope_call_shape_and_legacy_retry(self):
+        """PR #458 review IA-1 (+ closeout-critic round 1): the hermes
+        offline-snapshot lane calls `_serve_offline_read(env, **kwargs)`
+        keyword-shaped with the prompt_timestamp kwarg; against the
+        CURRENT signature it serves exactly once; against a LEGACY
+        signature (kwarg rejected) it warns naming the stale checkout
+        and retries WITHOUT the kwarg — the retry must actually serve.
+        Both signature eras are faked as real files at the ZMEM_HOME-
+        resolved snapshot path (the production resolution seam)."""
+        def _write_fake_snapshot(home: Path, accepts_kw: bool) -> None:
+            scripts = home / "skills" / "memory" / "scripts"
+            fleet_dir = scripts / "fleet"
+            fleet_dir.mkdir(parents=True, exist_ok=True)
+            capture = home / "serve-capture.jsonl"
+            (fleet_dir / "__init__.py").write_text("", encoding="utf-8")
+            body = (
+                "import json\n"
+                f"CAPTURE = r'{capture}'\n"
+                "def _serve_offline_read(env, **kwargs):\n"
+                "    with open(CAPTURE, 'a', encoding='utf-8') as fh:\n"
+                "        fh.write(json.dumps(sorted(kwargs)) + '\\n')\n"
+                "    if 'prompt_timestamp' in kwargs and not "
+                f"{accepts_kw}:\n"
+                "        raise TypeError(\"_serve_offline_read() got an "
+                "unexpected keyword argument 'prompt_timestamp'\")\n"
+                "    return ({'results': [], 'rendered': 'row', "
+                "'reason': 'ok', 'count': 0, 'omitted': 0}, None)\n")
+            (fleet_dir / "snapshot.py").write_text(body, encoding="utf-8")
+
+        for accepts_kw in (True, False):
+            with self.subTest(accepts_kw=accepts_kw):
+                home = Path(tempfile.mkdtemp(
+                    prefix="zmem-ia1-offline-"))
+                self.addCleanup(shutil.rmtree, home, True)
+                _write_fake_snapshot(home, accepts_kw)
+                capture = home / "serve-capture.jsonl"
+                mod = _hermes()
+                saved_home = os.environ.get("ZMEM_HOME")
+                os.environ["ZMEM_HOME"] = str(home)
+                try:
+                    with mock.patch.object(
+                            mod.logger, "warning") as warned:
+                        envelope = mod._offline_snapshot_envelope(
+                            "probe query", NAMESPACE, SESSION_ID,
+                            prompt_timestamp=PROMPT_TS)
+                finally:
+                    if saved_home is None:
+                        os.environ.pop("ZMEM_HOME", None)
+                    else:
+                        os.environ["ZMEM_HOME"] = saved_home
+                self.assertIsNotNone(
+                    envelope,
+                    "the fake snapshot module must serve an envelope "
+                    "(accepts_kw=%s)" % accepts_kw)
+                calls = [json.loads(ln) for ln in
+                         capture.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(
+                    calls[0], ["lane", "moment", "namespace",
+                               "prompt_timestamp", "query", "session_id"],
+                    "the first serve must forward prompt_timestamp "
+                    "keyword-shaped")
+                if accepts_kw:
+                    self.assertEqual(
+                        len(calls), 1, "no retry on the current signature")
+                    self.assertEqual(len(warned.call_args_list), 0)
+                else:
+                    self.assertEqual(
+                        len(calls), 2, "exactly one retry on the legacy "
+                        "signature")
+                    self.assertEqual(
+                        calls[1], ["lane", "moment", "namespace", "query",
+                                   "session_id"],
+                        "the retry must drop the kwarg")  # noqa: E501 (alphabetical: no prompt_timestamp)
+                    self.assertEqual(
+                        len(warned.call_args_list), 1,
+                        "exactly one loud warning on the legacy path")
+                    self.assertIn(
+                        "predates this server",
+                        str(warned.call_args_list[0]))
+
     def test_mixed_version_transport_typeerror_retries_once_warned(self):
         # Mixed-version guard: a transport predating prompt_timestamp raises
         # TypeError on the kwarg; the guarded call sites retry once WITHOUT
@@ -660,6 +799,69 @@ class FleetTransportTest(unittest.TestCase):
                        prompt_timestamp="garbage")
         self.assertIsNone(
             _flag_value(executor.commands[2], "--prompt-timestamp"))
+
+    def test_local_subprocess_prefetch_mixed_version_sniff(self):
+        """PR #458 review CS-3/PRR-458-003 (+ closeout-critic round 1:
+        coverage gap — no suite executed the sniff branch): against a
+        store checkout predating --prompt-timestamp, argparse exit-2s
+        naming the flag; the transport must sniff that stderr shape on
+        the empty-stdout path and emit the LOUD actionable warning, then
+        fail open into the empty envelope like every other transport
+        failure. Unrelated stderr shapes stay silent."""
+        from fleet import transport as transport_mod
+
+        def _stub(exit_code, stderr_text):
+            stub = Path(_TMP) / "old-store-stub.py"
+            stub.write_text(
+                "import sys\n"
+                "sys.stderr.write(%r)\n" % stderr_text +
+                "sys.exit(%d)\n" % exit_code,
+                encoding="utf-8")
+            return str(stub)
+
+        flag_stderr = (
+            "usage: store.py prefetch [-h] ...\\n"
+            "store.py prefetch: error: unrecognized arguments: "
+            "--prompt-timestamp\\n")
+        cases = (
+            # (label, exit_code, stderr, expect_warning)
+            ("flag-naming exit-2", 2, flag_stderr, True),
+            ("unrelated exit-2", 2, "some unrelated usage error\\n", False),
+            ("exit-0 empty stdout", 0, "", False),
+        )
+        for label, code, stderr, expect_warning in cases:
+            with self.subTest(case=label):
+                local = transport_mod.LocalSubprocess(
+                    store_py=_stub(code, stderr),
+                    executor=transport_mod.DeadlineExecutor(),
+                    deadline_s=10.0)
+                with mock.patch.object(
+                        transport_mod.logger, "warning") as warned:
+                    envelope = local.prefetch(
+                        "q", namespace=NAMESPACE, session_id=SESSION_ID,
+                        moment="user_prompt", ops_tokens=[],
+                        prompt_timestamp=PROMPT_TS)
+                self.assertEqual(
+                    envelope.get("reason"), "empty-pool",
+                    "the failure must fail open into the empty envelope")
+                self.assertEqual(
+                    len(warned.call_args_list), 1 if expect_warning else 0,
+                    "warning count for %s" % label)
+                if expect_warning:
+                    self.assertIn(
+                        "predates this server",
+                        str(warned.call_args_list[0]))
+        # No clock forwarded -> the sniff never fires even on the
+        # flag-naming stderr shape (the failure is then not about the
+        # kwarg; the store would also accept the legacy argv).
+        local = transport_mod.LocalSubprocess(
+            store_py=_stub(2, flag_stderr),
+            executor=transport_mod.DeadlineExecutor(), deadline_s=10.0)
+        with mock.patch.object(transport_mod.logger, "warning") as warned:
+            local.prefetch("q", namespace=NAMESPACE, session_id=SESSION_ID,
+                           moment="user_prompt", ops_tokens=[])
+        self.assertEqual(len(warned.call_args_list), 0,
+                         "no warning without a forwarded clock")
 
 
 class BrokerTest(unittest.TestCase):

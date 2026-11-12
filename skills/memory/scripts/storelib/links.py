@@ -477,7 +477,13 @@ def graph_seed_ids(
     # ``_fetch_by_ids`` below; the edge-selection query now applies the
     # same "at or before that instant" law as ``expand_recall_links``
     # (fail-closed on malformed edge timestamps; lexical fallback only for
-    # an invalid PROGRAMMATIC as_of value).
+    # an invalid PROGRAMMATIC as_of value).  Precision parity (PR #458
+    # review CUBIC-14): the canonical ``as_of`` arriving here is
+    # second-resolution by the shared ``_iso8601``/``_normalize_as_of``
+    # normalizers — an edge created within the truncated fractional-second
+    # sliver is rejected exactly as ``expand_recall_links`` rejects it, so
+    # both edge-time arms stay consistent; sub-second ``as_of`` precision
+    # is an upstream normalizer property, not this walk's decision.
     as_of_dt = _parse_iso_utc(as_of) if as_of else None
     try:
         edges = conn.execute(

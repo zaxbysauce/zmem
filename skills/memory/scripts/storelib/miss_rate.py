@@ -161,6 +161,12 @@ _BG_LINE_RE = re.compile(
     # index before it (eval_replay reads lane/ver/t_ms at groups[11..13])
     # is preserved; same additive rule as every field above.
     r"(?: snapshot_refresh=(\S+))?"
+    # PR #458 review PO-1: the prompt clock that governed the decision's
+    # temporal arm (pts=<strict-ISO value>, hook lane only) — appended after
+    # snapshot_refresh so every positional group index stays stable; the
+    # miss-rate join replays the recall with this clock so temporal
+    # delivered/missed accounting is reproducible under host clock skew.
+    r"(?: pts=(\S+))?"
     r"\s*$"
 )
 
@@ -275,7 +281,7 @@ def parse_bg_log(path) -> list:
              exc, sid, moment, lane, version, t_ms_raw, arms, _batch,
              _tools, _paths, margin, margin_pruned_raw, _store_timeout,
              rewrite_raw, _state_hint,
-             snapshot_refresh) = m.groups()
+             snapshot_refresh, pts) = m.groups()
             try:
                 ts = int(ts)
             except ValueError:
@@ -359,6 +365,14 @@ def parse_bg_log(path) -> list:
                 # (snapshot_refresh=refused). None on every line that
                 # predates the field — additive parsed parity only.
                 "snapshot_refresh": snapshot_refresh,
+                # PR #458 review PO-1: the prompt clock the hook used for
+                # the decision's temporal arm (pts=<strict-ISO value>).
+                # None on hook lines that predate the field and on every
+                # non-hook lane — additive parsed parity only; the join
+                # replays the recall with this clock so temporal
+                # delivered/missed accounting is reproducible under host
+                # clock skew.
+                "pts": pts,
             }
             if rewrite:
                 parsed_row["rewrite"] = True
@@ -1129,20 +1143,26 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
     if recall_cache is None:
         recall_cache = {}
 
-    def _recall(query: str):
+    def _recall(query: str, prompt_timestamp: str | None = None):
         """Zero-write recall; returns the row list, or None when the recall
         itself errored (swarm-review PRR-003: a retrieval failure must be
-        distinguishable from a genuine capture gap, never counted as one)."""
-        if query in recall_cache:
-            return recall_cache[query]
+        distinguishable from a genuine capture gap, never counted as one).
+        PR #458 review PO-1: the replay rides the decision line's prompt
+        clock (pts=) so temporal delivered/missed accounting is
+        reproducible from the log alone, never steerable by report-time
+        wall clock."""
+        cache_key = (query, prompt_timestamp or "")
+        if cache_key in recall_cache:
+            return recall_cache[cache_key]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
                 rows = recall_memory(conn, query=query, namespace=None,
-                                     limit=5, **_JOIN_RECALL_KWARGS)
+                                     limit=5, **_JOIN_RECALL_KWARGS,
+                                     prompt_timestamp=prompt_timestamp)
             except Exception:
                 rows = None
-        recall_cache[query] = rows
+        recall_cache[cache_key] = rows
         return rows
 
     for f in failures:
@@ -1161,7 +1181,43 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
         if not query:
             counts["no_query"] += 1
             continue
-        rows = _recall(query)
+        # Broad-review M6: only a REAL session id on both sides proves
+        # attribution. sid-less lines (pre-#94) AND sid=unknown lines
+        # (a host that supplied no session id — e.g. non-launcher
+        # session-start invocations) get the weaker legacy treatment,
+        # never sid-proof and never attribution-dead.
+        f_sid = sanitize_sid(f.get("session_id", ""))
+        f_sid_real = bool((f.get("session_id") or "").strip())
+        ts_s = f.get("ts_s") or 0
+        lo = ts_s - int(window_before_s)
+        hi = ts_s + int(window_after_s)
+        # PR #458 review PO-1: replay the recall with the SAME prompt clock
+        # the hook decided under, taken from the newest sid-proofed
+        # candidate decision line in the failure's window that carries
+        # pts= (hook lane lines only). Pre-pts lines replay at wall clock
+        # exactly as before, so the metric stays comparable across mixed
+        # logs. Deterministic: the last candidate in log order wins ties
+        # at equal ts (>= keeps the chronologically-newest line for
+        # append-ordered logs). Sid-less legacy candidates are excluded —
+        # a sid-less line is not attributable to THIS session's failure,
+        # and pre-#94 hook lines predate the field entirely.
+        cand_sid = []
+        cand_legacy = []
+        replay_pts = None
+        replay_pts_ts = None
+        for ln in injected:
+            if not (lo <= ln["ts"] <= hi):
+                continue
+            ln_sid = ln.get("sid")
+            if ln_sid is None or ln_sid == "unknown":
+                cand_legacy.append(ln)
+            elif ln_sid == f_sid and f_sid_real:
+                cand_sid.append(ln)
+                if ln.get("pts") and (replay_pts_ts is None
+                                      or ln["ts"] >= replay_pts_ts):
+                    replay_pts = ln["pts"]
+                    replay_pts_ts = ln["ts"]
+        rows = _recall(query, replay_pts)
         if rows is None:
             # PRR-003: a failed recall is a measurement error, not a
             # capture gap — exclude from every rate with a caveat.
@@ -1176,26 +1232,6 @@ def run_miss_report(store_path, db_path=None, transcripts=(),
             if rid:
                 id_meta[rid] = (r.get("namespace") or "",
                                 (r.get("content") or "")[:120])
-        ts_s = f.get("ts_s") or 0
-        lo = ts_s - int(window_before_s)
-        hi = ts_s + int(window_after_s)
-        # Broad-review M6: only a REAL session id on both sides proves
-        # attribution. sid-less lines (pre-#94) AND sid=unknown lines
-        # (a host that supplied no session id — e.g. non-launcher
-        # session-start invocations) get the weaker legacy treatment,
-        # never sid-proof and never attribution-dead.
-        f_sid = sanitize_sid(f.get("session_id", ""))
-        f_sid_real = bool((f.get("session_id") or "").strip())
-        cand_sid = []
-        cand_legacy = []
-        for ln in injected:
-            if not (lo <= ln["ts"] <= hi):
-                continue
-            ln_sid = ln.get("sid")
-            if ln_sid is None or ln_sid == "unknown":
-                cand_legacy.append(ln)
-            elif ln_sid == f_sid and f_sid_real:
-                cand_sid.append(ln)
         if any(matched & set(ln["ids"]) for ln in cand_sid):
             counts["surfaced_sid"] += 1
         elif any(matched & set(ln["ids"]) for ln in cand_legacy):

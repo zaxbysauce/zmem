@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime as _dt
+from datetime import timezone as _dt_tz
 
 
 _POSTTOOLBATCH_QUERY_CAP = 500
@@ -206,7 +207,7 @@ def _log_inject_decision(
     tool_names=None, path_basenames=None, margin=None,
     margin_pruned_ids=None, store_timeout=False,
     lane=None, version=None, t_ms=None, rewrite=False,
-    repo_state=None,
+    repo_state=None, prompt_timestamp=None,
 ) -> None:
     """Append a sanitized decision line; sid and moment are audit joins.
 
@@ -316,6 +317,37 @@ def _log_inject_decision(
             # outcome for the pretool lane. Additive last field; legacy
             # lines (and lines from other lanes) never carry it.
             fields.append("state=" + repo_state)
+        if isinstance(prompt_timestamp, str) and prompt_timestamp:
+            # PR #458 review PO-1 (reader parity): the prompt clock that
+            # governed this decision's temporal arm rides the line so the
+            # miss-rate join can replay the recall with the same window.
+            # Additive tail (after state=, the previous last field).
+            # Stage-B reviewer round: the gate mirrors datetime.fromisoformat,
+            # which ALSO admits space/tab/newline date-time separators — a
+            # whitespace form logged verbatim would cost the whole decision
+            # line in the #100-gated reader (regex end-anchor) or truncate
+            # the replay clock. The writer therefore re-emits the parsed
+            # instant in canonical UTC T/Z form, so EVERY gate-admitted
+            # value round-trips as exactly one \S+ token (same instant the
+            # store's _normalize_as_of computes; the gate's naive-input
+            # local interpretation is preserved by the shared parse).
+            try:
+                _pts_dt = _dt.fromisoformat(
+                    prompt_timestamp.replace("Z", "+00:00"))
+                # Naive inputs are treated as UTC — mirroring the store's
+                # _normalize_as_of exactly (aware → astimezone(utc), naive
+                # stays as-is) so the logged token ALWAYS carries the same
+                # instant the store's replay computes; an unconditional
+                # astimezone would log local-as-UTC for naive forms and
+                # skew the join's replay clock.
+                if _pts_dt.tzinfo is not None:
+                    _pts_dt = _pts_dt.astimezone(_dt_tz.utc)
+                _pts_fmt = "%Y-%m-%dT%H:%M:%S"
+                if _pts_dt.microsecond:
+                    _pts_fmt += ".%f"
+                fields.append("pts=" + _pts_dt.strftime(_pts_fmt + "Z"))
+            except (ValueError, OverflowError):
+                pass  # fail-open writer: omit the field, never break the line
         with open(log_path, "a", encoding="utf-8") as handle:
             handle.write(" ".join(fields) + "\n")
     except Exception:
@@ -638,12 +670,18 @@ def _argv_safe(value: str) -> bool:
 
 # Issue #389 (AC8): strict ISO-8601 gate for a payload-supplied prompt
 # timestamp.  The parse mirrors the store CLI's argparse ``_iso8601`` type
-# exactly, so any value admitted here is guaranteed to parse there — a
-# forwarded timestamp can never exit-2 the store child.  An absent,
-# non-string, or unparseable value is DROPPED (no forwarding, no error);
-# the store keeps its ZMEM_TEST_NOW/now clock seam.  The #158 boundary
-# keeps the store library out of this adapter, so this body is duplicated
-# verbatim in the fleet broker/hermes/MCP surfaces (one rule, four trees).
+# exactly — including its conditional ``astimezone(utc)`` conversion
+# (tz-aware values only) — so any value admitted here is guaranteed to
+# convert there: a forwarded timestamp can never crash (exit 1) or exit-2
+# the store child.  (PR #458 review CS-1: offset boundary instants parse
+# but their astimezone raises OverflowError, so the conversion runs here
+# under the same try; naive values never call into the platform's
+# local-time functions, which on Windows raise OSError outside ~1970-3001
+# — closeout-critic round 1.)  An absent, non-string, or unconvertible
+# value is DROPPED (no forwarding, no error); the store keeps its
+# ZMEM_TEST_NOW/now clock seam.  The #158 boundary keeps the store
+# library out of this adapter, so this body is duplicated verbatim in
+# the fleet broker/hermes/MCP surfaces (one rule, four trees).
 _PROMPT_TS_MAX = 64
 
 
@@ -654,8 +692,15 @@ def _valid_prompt_timestamp(value: object) -> str | None:
     if not value or len(value) > _PROMPT_TS_MAX:
         return None
     try:
-        _dt.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed = _dt.fromisoformat(value.replace("Z", "+00:00"))
+        # A naive value never calls into the platform's local-time
+        # functions: Windows raises OSError [Errno 22] outside ~1970-3001
+        # (uncaught at HEAD), and _iso8601/_normalize_as_of convert only
+        # when the value is tz-aware — so the gate mirrors exactly that
+        # (closeout-critic round 1).
+        if parsed.tzinfo is not None:
+            parsed.astimezone(_dt_tz.utc)
+    except (ValueError, OverflowError):
         return None
     return value
 
@@ -1139,6 +1184,7 @@ def main() -> int:
         t_ms=attribution_t_ms,
         rewrite=rewrite_applied,
         repo_state=repo_state or None,
+        prompt_timestamp=(_prompt_ts if command == "recall" else None),
     )
     _emit(rendered, envelope.get("effective_ops"))
     # Issue #131: bounded lane-health probe AFTER the context was emitted —

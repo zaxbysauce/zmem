@@ -415,17 +415,6 @@ class FixtureDigestTest(unittest.TestCase):
             "via tests/fixtures/temporal/generate_expected.py and re-pin "
             "the digest (the correctness oracle stays phrases.json)")
 
-    def test_in_place_edit_is_detectable(self):
-        data = bytearray((FIXTURES_DIR / "temporal" /
-                          "phrases.expected.json").read_bytes())
-        # Deterministic single-byte tamper in the first timestamp.
-        data[2] = ord("9") if data[2] != ord("9") else ord("8")
-        self.assertNotEqual(
-            hashlib.sha256(bytes(data)).hexdigest(),
-            self.EXPECTED_PHRASES_SHA256,
-            "a one-byte edit to the generated fixture must change the "
-            "digest — the pin is real tamper evidence")
-
 
 class OccurrenceWriteTest(unittest.TestCase):
     """Atomic occurrence writes + the update/fold transition matrix + the

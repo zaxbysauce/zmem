@@ -71,7 +71,10 @@ ENV_WRITING_MODULES = [
 ]
 
 PYTEST_MODULES = TEMPORAL_MODULES + ENV_WRITING_MODULES
-TIMEOUT_S = 1800
+# PR #458 review RP-3: sized to FIRE inside the CI job's timeout-minutes:
+# 20 (green runs measure ~4-7 min/order locally; a hung order must produce
+# this canary's own FAIL diagnostic, not an opaque runner kill).
+TIMEOUT_S = 540
 TAIL_LINES = 60
 
 
@@ -106,10 +109,17 @@ def _run_order(label: str, modules: list[str], scratch: str) -> int:
 
 
 def main() -> int:
-    modules = [m for m in PYTEST_MODULES if (REPO_ROOT / m).is_file()]
+    # PR #458 review CUBIC-10: a declared module that is missing from the
+    # tree is a FAIL, never a silent skip — the canary cannot report
+    # success with reduced coverage after a rename/removal.  (The trace
+    # probe keeps a skip lane for its pre-implementation base leg; this
+    # committed runner pins the shipped contract.)
     missing = [m for m in PYTEST_MODULES if not (REPO_ROOT / m).is_file()]
     if missing:
-        print(f"[canary] NOTE: modules listed but absent, skipped: {missing}")
+        print(f"[canary] FAIL: declared modules absent from the tree: "
+              f"{missing}")
+        return 1
+    modules = list(PYTEST_MODULES)
     if not modules:
         print("[canary] FAIL: no modules resolved")
         return 1

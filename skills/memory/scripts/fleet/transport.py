@@ -43,7 +43,7 @@ import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import logging
 from pathlib import Path
@@ -228,13 +228,19 @@ def _query_args(query: str) -> list[str]:
 
 # Issue #389 (AC8): strict ISO-8601 gate for a prompt-supplied timestamp at
 # the transport boundary.  The parse mirrors the store CLI's argparse
-# ``_iso8601`` type exactly, so any value admitted here is guaranteed to
-# parse there — a forwarded timestamp can never exit-2 the store child.
-# An absent, non-string, or unparseable value is dropped (never an error);
-# the store keeps its ZMEM_TEST_NOW/now clock seam.  This body is the
-# canonical fleet copy (the broker shares it); the hook body, the hermes
-# plugin, and the MCP server carry verbatim duplicates (one rule, four
-# trees — each must stay standalone-importable).
+# ``_iso8601`` type exactly — including its conditional ``astimezone(utc)``
+# conversion (tz-aware values only) — so any value admitted here is
+# guaranteed to convert there: a forwarded timestamp can never crash
+# (exit 1) or exit-2 the store child.  (PR #458 review CS-1: offset
+# boundary instants like 0001-01-01T00:00:00+05:00 parse but their
+# astimezone raises OverflowError, so the conversion runs here under the
+# same try; naive values never call into the platform's local-time
+# functions, which on Windows raise OSError outside ~1970-3001 —
+# closeout-critic round 1.)  An absent, non-string, or unconvertible value
+# is dropped (never an error); the store keeps its ZMEM_TEST_NOW/now clock
+# seam.  This body is the canonical fleet copy (the broker shares it); the
+# hook body, the hermes plugin, and the MCP server carry verbatim duplicates
+# (one rule, four trees — each must stay standalone-importable).
 _PROMPT_TS_MAX = 64
 
 
@@ -245,8 +251,10 @@ def _valid_prompt_timestamp(value: object) -> Optional[str]:
     if not value or len(value) > _PROMPT_TS_MAX:
         return None
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
     return value
 
@@ -258,13 +266,18 @@ class _LocalOperation:
         self._cmd = cmd
         self._env = env
         self._proc: Optional[subprocess.Popen] = None
+        # PR #458 review CS-3: retained so the caller can sniff a mixed-
+        # version argparse rejection (exit 2 names the flag on stderr)
+        # even though the run contract returns stdout only.
+        self.stderr_text: str = ""
 
     def __call__(self) -> str:
         self._proc = subprocess.Popen(
             self._cmd, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", env=self._env)
-        out, _err = self._proc.communicate()
+        out, err = self._proc.communicate()
+        self.stderr_text = err or ""
         return out or ""
 
     def cancel(self) -> None:
@@ -849,23 +862,37 @@ class LocalSubprocess:
         if consume_tasktext:
             argv.append("--consume-tasktext")
         # Issue #389 (AC8): forward the prompt's own clock to the local
-        # store argv — strict-ISO validated at this argv boundary, so a
-        # forwarded value can never exit-2 the store child's argparse and
-        # an absent/invalid one forwards nothing (the store keeps its
-        # ZMEM_TEST_NOW/now seam).
+        # store argv — strict-ISO validated at this argv boundary (the gate
+        # mirrors the store's parse AND its UTC conversion, so a forwarded
+        # value can never be rejected by the store's parser), and an
+        # absent/invalid one forwards nothing (the store keeps its
+        # ZMEM_TEST_NOW/now seam).  PR #458 review CS-3: against a store
+        # checkout PREDATING this flag the argparse still exit-2s — that
+        # mixed-version skew is sniffed below and fails LOUD (the hub lane's
+        # "Fail LOUD with an actionable message" convention), never silent.
         prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
         if prompt_ts:
             argv.extend(["--prompt-timestamp", prompt_ts])
         argv.append("--json")
+        child_env = os.environ.copy()
+        child_env.setdefault("ZMEM_CAPTURE", "1")
+        op = _LocalOperation(argv, child_env)
         try:
-            child_env = os.environ.copy()
-            child_env.setdefault("ZMEM_CAPTURE", "1")
-            stdout = self._executor.run(
-                _LocalOperation(argv, child_env), self._deadline_s)
+            stdout = self._executor.run(op, self._deadline_s)
         except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - fail open
             logger.debug("zmem transport: local prefetch failed open: %s", exc)
             return _empty_envelope()
         if stdout is None or not stdout.strip():
+            if prompt_ts and "unrecognized arguments" in op.stderr_text \
+                    and "prompt-timestamp" in op.stderr_text:
+                # PRR-458-003: mirror the hub lane's mixed-version
+                # actionability (mcp_server sniff) — LOUD, never a silent
+                # empty-envelope blackout.
+                logger.warning(
+                    "zmem transport: store.py at ZMEM_HOME predates this "
+                    "server (no prefetch --prompt-timestamp support): "
+                    "update the zmem checkout ZMEM_HOME points at to "
+                    ">= 0.151.0")
             logger.debug("zmem transport: local prefetch returned no output")
             return _empty_envelope()
         try:

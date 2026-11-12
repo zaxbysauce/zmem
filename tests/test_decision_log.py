@@ -529,6 +529,76 @@ class DecisionLogAttributionTest(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_pts_tail_canonicalizes_whitespace_and_offsets(self):
+        # PR #458 review PO-1 round 2 (Stage-B reviewer): the gate mirrors
+        # datetime.fromisoformat, which ALSO admits space/tab/newline
+        # date-time separators, and the ST-2 adversarial leg documents that
+        # such a value forwards verbatim. The writer must therefore re-emit
+        # the parsed instant in canonical UTC T/Z form so the pts tail is
+        # ALWAYS one \S+ token: a whitespace form must never drop the whole
+        # decision line from the #100-gated reader (regex end-anchor) or
+        # truncate the join's replay clock. Offset forms land in UTC;
+        # microseconds survive.
+        body = self._body_module()
+        with tempfile.TemporaryDirectory(prefix="zmem-153-pts-") as tmp:
+            saved = {k: os.environ.pop(k) for k in
+                     ("ZMEM_STORE", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")
+                     if k in os.environ}
+            try:
+                with mock.patch.dict(os.environ, {"ZMEM_DATA": tmp},
+                                     clear=False):
+                    for raw, expected in (
+                            # space separator + explicit offset
+                            ("2026-09-10 12:00:00+02:00",
+                             "2026-09-10T10:00:00Z"),
+                            # newline separator, same instant
+                            ("2026-09-10\n12:00:00+02:00",
+                             "2026-09-10T10:00:00Z"),
+                            # NAIVE space-separated form: the store's
+                            # _normalize_as_of treats naive as UTC (no
+                            # astimezone), so the logged token must too —
+                            # an unconditional astimezone would log
+                            # local-as-UTC and skew the join replay
+                            ("2026-09-10 12:00:00",
+                             "2026-09-10T12:00:00Z"),
+                            # naive canonical form, same rule
+                            ("2026-09-10T12:00:00",
+                             "2026-09-10T12:00:00Z"),
+                            # canonical Z form with microseconds
+                            ("2026-09-10T12:00:00.123456Z",
+                             "2026-09-10T12:00:00.123456Z"),
+                            # canonical second-resolution Z form
+                            ("2026-09-10T12:00:00Z",
+                             "2026-09-10T12:00:00Z")):
+                        for stale in Path(tmp).glob("zmem-decisions.log*"):
+                            stale.unlink()
+                        body._log_inject_decision(
+                            [], [], "injected", "injected",
+                            all_ids=["m1"], session_id="pts-canon",
+                            moment="user_prompt",
+                            prompt_timestamp=raw)
+                        line = (Path(tmp) / "zmem-decisions.log"
+                                ).read_text(encoding="utf-8").strip()
+                        self.assertIn(
+                            "pts=" + expected, line,
+                            "raw %r must be logged as the canonical UTC "
+                            "token pts=%s; line: %r" % (raw, expected, line))
+                        # The exact writer-emitted line must survive the
+                        # shipped reader (the whole line, not a truncation).
+                        from storelib.miss_rate import parse_bg_log
+                        rows = parse_bg_log(
+                            Path(tmp) / "zmem-decisions.log")
+                        self.assertEqual(
+                            len(rows), 1,
+                            "the emitted line must parse as exactly one "
+                            "row; got %d for %r" % (len(rows), line))
+                        self.assertEqual(
+                            rows[0]["pts"], expected,
+                            "the reader must round-trip the canonical "
+                            "token")
+            finally:
+                os.environ.update(saved)
+
     def test_production_manifest_resolution_and_legacy_fallback(self):
         """The real hook writer follows served-tree/home manifests safely."""
         ns = "project:manifest-153"
@@ -714,7 +784,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=injected", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153 additive tails
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?(?: pts=\S+)?$")  # issue #136/#153 additive tails
 
     def test_pretool_mode_moment(self):
         _run_body(self._tmp, "pretool",
@@ -722,7 +792,7 @@ class MomentFieldBodyTest(_SeededStore):
                    "tool_input": {"command": "git stash pop"}},
                   self.ns)
         line = _decision_lines(self._tmp)[-1]
-        self.assertRegex(line, r" sid=\S+ moment=pretool(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153
+        self.assertRegex(line, r" sid=\S+ moment=pretool(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?(?: pts=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_body_line_carries_mode_moment(self):
         _run_body(self._tmp, "user_prompt",
@@ -730,7 +800,7 @@ class MomentFieldBodyTest(_SeededStore):
                   self.ns, ZMEM_INJECT="0")
         line = _decision_lines(self._tmp)[-1]
         self.assertIn("status=silent reason=disabled", line)
-        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153
+        self.assertRegex(line, r" sid=\S+ moment=user_prompt(?: lane=\S+)? ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?(?: pts=\S+)?$")  # issue #136/#153
 
 
 class MomentFieldSessionStartTest(unittest.TestCase):
@@ -785,7 +855,7 @@ class MomentFieldSessionStartTest(unittest.TestCase):
         self.assertEqual(r.returncode == 0, True, r.stderr[-800:])
         lines = _decision_lines(self._tmp)
         self.assertTrue(lines, "session-start decision line missing")
-        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start lane=zcode ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?$")  # issue #136/#153
+        self.assertRegex(lines[-1], r" sid=\S+ moment=session_start lane=zcode ver=\d+\.\d+\.\d+ t_ms=\d+(?: arms=\S+)?(?: state=\S+)?(?: pts=\S+)?$")  # issue #136/#153
 
     def test_kill_switch_line_carries_session_start_moment(self):
         # The kill-switch block resolves the sid from the env chain (the

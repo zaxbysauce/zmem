@@ -37,7 +37,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1667,11 +1667,15 @@ def _legacy_unscoped_flag(namespace: Optional[str]) -> list[str]:
 # Issue #389 (AC8): strict ISO-8601 gate for a client-supplied prompt
 # timestamp.  The parse mirrors the store CLI's argparse ``_iso8601`` type
 # exactly, so any value admitted here is guaranteed to parse there — a
-# forwarded timestamp can never exit-2 the store child.  An absent,
-# non-string, or unparseable value is dropped with a debug log (never an
-# error on a passive lane); the store keeps its ZMEM_TEST_NOW/now clock
-# seam.  Verbatim duplicate of the hook body / fleet transport / hermes
-# plugin copies (one rule, four standalone trees).
+# forwarded timestamp can never exit-2 the store child.  The conversion is
+# conditional (tz-aware values only), mirroring _iso8601 exactly: naive
+# values never call into the platform's local-time functions, which on
+# Windows raise OSError outside ~1970-3001 (PR #458 review CS-1 +
+# closeout-critic round 1).  An absent, non-string, or unparseable value
+# is dropped with a debug log (never an error on a passive lane); the
+# store keeps its ZMEM_TEST_NOW/now clock seam.  Verbatim duplicate of the
+# hook body / fleet transport / hermes plugin copies (one rule, four
+# standalone trees).
 _PROMPT_TS_MAX = 64
 
 
@@ -1682,8 +1686,10 @@ def _valid_prompt_timestamp(value: object) -> Optional[str]:
     if not value or len(value) > _PROMPT_TS_MAX:
         return None
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
     return value
 

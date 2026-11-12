@@ -1198,7 +1198,14 @@ def _normalize_as_of(as_of: str | None) -> str | None:
     except ValueError:
         return as_of
     if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc)
+        # PR #458 review CS-1: offset boundary instants (e.g.
+        # 0001-01-01T00:00:00+05:00) overflow astimezone — degrade to the
+        # unchanged input (same fail-open contract as unparseable input)
+        # instead of raising on the hot path.
+        try:
+            dt = dt.astimezone(timezone.utc)
+        except OverflowError:
+            return as_of
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 # Issue #397: closed state-hazard lexicon + bump helpers (see the bump site in _recall_one_tier).
@@ -1748,14 +1755,19 @@ def _recall_one_tier(
         }))
         # Issue #389 item 2: temporal-arm rows carry the occurrence triple —
         # WHEN the event happened, distinct from valid_from (when it was
-        # written). Additive tail keys on exactly the temporal candidates
-        # (never on non-temporal rows, never overwriting); stripping the
-        # three keys reproduces the pre-change envelope bytes exactly.
-        occ_triple = temporal_occ.get(r["id"])
-        if occ_triple is not None:
-            row_dict = scored[-1][1]
-            (row_dict["occurred_start"], row_dict["occurred_end"],
-             row_dict["mentioned_at"]) = occ_triple
+        # written). Additive tail keys on exactly the rows the CAPPED
+        # temporal arm contributed (PR #458 review CS-4: keyed on the
+        # pre-cap match set before — a beyond-cap row arriving via another
+        # lane wrongly carried the keys; the graph lane's attribution is
+        # capped the same way). Never on non-temporal rows, never
+        # overwriting; stripping the three keys reproduces the pre-change
+        # envelope bytes exactly.
+        if r["id"] in set(temporal_fused):
+            occ_triple = temporal_occ.get(r["id"])
+            if occ_triple is not None:
+                row_dict = scored[-1][1]
+                (row_dict["occurred_start"], row_dict["occurred_end"],
+                 row_dict["mentioned_at"]) = occ_triple
         if collect_lanes:
             scored[-1][1]["_lanes"] = {
                 "bm25_rank": fts_r,

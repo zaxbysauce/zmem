@@ -187,13 +187,26 @@ class TemporalProjectionTest(unittest.TestCase):
                              "non-temporal rows must not carry %s" % k)
 
     def test_dual_source_row_carries_triple(self):
-        # The event's content ALSO matches the query tokens, so the row is
-        # reached by BOTH the fts arm and the temporal arm.
+        # PR #458 review TF-1: a DUAL-source pin must prove BOTH arrivals —
+        # the fts arm matched the row (content shares the query tokens) AND
+        # the temporal arm matched (arms post >= 1), so the triple rides a
+        # row whose candidate set spans both arms.
         env = _recall(self.conn)
+        self.assertGreaterEqual(
+            env.get("arms", {}).get("fts", {}).get("post", 0), 1,
+            "the fts arm must contribute the row (dual-source precondition)")
+        self.assertGreaterEqual(
+            env.get("arms", {}).get("temporal", {}).get("post", 0), 1,
+            "the temporal arm must also contribute (dual-source "
+            "precondition)")
         row = [r for r in env["results"] if r["id"] == self.event_id][0]
         self.assertEqual(
             (row.get("occurred_start"), row.get("occurred_end"),
              row.get("mentioned_at")), TRIPLE)
+        self.assertTrue(
+            row.get("_rel_lex") is not None,
+            "the row must carry a measured lexical rank (_rel_lex, the "
+            "fts arm's arrival proof)")
 
     def test_normal_json_lane_carries_triple(self):
         env = _recall_normal(self.conn)

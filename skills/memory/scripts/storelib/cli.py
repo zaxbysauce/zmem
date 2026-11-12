@@ -962,7 +962,8 @@ def evidence_association_page_limit(value: str) -> int:
     return parsed
 
 def _iso8601(value: str) -> str:
-    """argparse type= for --as-of (issue #58, 3.6): accept an ISO-8601
+    """argparse type= for every ISO-8601 timestamp flag (--as-of per issue
+    #58 3.6; --prompt-timestamp per issue #389): accept an ISO-8601
     timestamp, validate strictly (garbage → argparse error), and return the
     canonical Z-suffixed UTC form the store's lexicographic predicate
     compares against. PRR-022 fix: normalization now covers ANY zone offset
@@ -970,19 +971,26 @@ def _iso8601(value: str) -> str:
     'Z' vs '+' ASCII ordering silently mis-filters otherwise. The same
     normalization is applied at recall_memory/recent_memory entry for
     programmatic callers; this type= additionally enforces argparse-level
-    validation.
+    validation. PR #458 review CS-1: offset boundary instants overflow
+    ``astimezone`` — reported as a clean argparse error instead of an
+    uncaught OverflowError traceback.
     """
     from datetime import datetime
     if not value:
-        raise argparse.ArgumentTypeError("--as-of requires a non-empty ISO-8601 timestamp")
+        raise argparse.ArgumentTypeError(
+            "requires a non-empty ISO-8601 timestamp")
     normalized = value.strip()
     try:
         dt = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid ISO-8601 for --as-of: {exc}")
+        raise argparse.ArgumentTypeError(f"invalid ISO-8601 timestamp: {exc}")
     if dt.tzinfo is not None:
         from datetime import timezone
-        dt = dt.astimezone(timezone.utc)
+        try:
+            dt = dt.astimezone(timezone.utc)
+        except OverflowError as exc:
+            raise argparse.ArgumentTypeError(
+                f"timestamp out of range for UTC conversion: {exc}")
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
 
