@@ -36,7 +36,12 @@ TEMPORAL_MODULES = [
     "tests/test_explain_per_lane.py",
     "tests/test_explain_recall.py",
     "tests/test_dataset.py",
-    "tests/test_subject_dedup_contract.py",
+    # NOT tests/test_subject_dedup_contract.py: its five real-model legs
+    # are pytest-FAILING DIAGNOSTICS on a model-absent lane BY THE MODULE'S
+    # OWN CONTRACT (green only where ~/.zmem/models or
+    # ZMEM_TEST_REAL_MODELS_DIR provides the pinned minilm — the dedicated
+    # test-real-model CI job). The one-process isolation contract does not
+    # cover it; its env hygiene is exercised by the main per-file lane.
 ]
 
 ENV_WRITING_MODULES = [
