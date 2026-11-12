@@ -957,10 +957,16 @@ class EntityCardSweepTest(_CardStoreTestCase):
         _seed(self.store, SIX_RECORDS, with_beta=True)
         _seed_qualifying_beta(conn)
         # One acme mention grows past the content cap; the rendered card
-        # embeds its single-lined text, so the card itself overflows.
+        # embeds its single-lined text, so the card itself overflows. The
+        # filler is BENIGN whitespace-separated words, not a long x-run:
+        # a MAX_CONTENT_CHARS run of base64-alphabet characters is a shared-
+        # registry secret shape, and the issue #459 card-composition mask
+        # legitimately replaces it with [REDACTED_SECRET] (shrinking the card
+        # under the cap), so a benign oversized filler is what still
+        # exercises the ContentTooLarge isolation path this test pins.
         conn.execute(
             "UPDATE memory SET content=? WHERE id=?",
-            ("Acme deployment 4 " + "x" * MAX_CONTENT_CHARS,
+            ("Acme deployment 4 " + "filler " * (MAX_CONTENT_CHARS // 7 + 4),
              "00000000-0000-4000-8000-000000000174"))
         conn.commit()
 

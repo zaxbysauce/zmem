@@ -1228,6 +1228,11 @@ Release. zmem compares the served tree against it in two places:
   one drift line total until the marker is cleared. Markers are reaped by the
   session sweep after the standard sentinel TTL (7 days,
   `ZMEM_SENTINEL_SWEEP_DAYS`), like the capture/convention prompt markers.
+  Since 0.152.0 (issue #213) the notice survives budget saturation via a
+  guarded co-fit retry — the content is re-fitted at the budget minus the
+  message's encoded marginal size — under a content-wins floor: a retry that
+  would leave less than 256 bytes of content drops the notice and keeps the
+  full-budget content fit.
 
 To force a refresh per host when doctor reports drift:
 
