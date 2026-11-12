@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime as _dt
 
 
 _POSTTOOLBATCH_QUERY_CAP = 500
@@ -635,6 +636,44 @@ def _argv_safe(value: str) -> bool:
         return False
 
 
+# Issue #389 (AC8): strict ISO-8601 gate for a payload-supplied prompt
+# timestamp.  The parse mirrors the store CLI's argparse ``_iso8601`` type
+# exactly, so any value admitted here is guaranteed to parse there — a
+# forwarded timestamp can never exit-2 the store child.  An absent,
+# non-string, or unparseable value is DROPPED (no forwarding, no error);
+# the store keeps its ZMEM_TEST_NOW/now clock seam.  The #158 boundary
+# keeps the store library out of this adapter, so this body is duplicated
+# verbatim in the fleet broker/hermes/MCP surfaces (one rule, four trees).
+_PROMPT_TS_MAX = 64
+
+
+def _valid_prompt_timestamp(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _PROMPT_TS_MAX:
+        return None
+    try:
+        _dt.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
+def _payload_prompt_timestamp(event: dict) -> str | None:
+    """Issue #389 (AC8): the hook payload's prompt clock.  The
+    ``prompt_timestamp`` key wins over ``timestamp`` when both are present
+    (first VALID key in that precedence order); no valid key forwards
+    nothing — behavior stays byte-identical to a payload without one."""
+    if not isinstance(event, dict):
+        return None
+    for key in ("prompt_timestamp", "timestamp"):
+        value = _valid_prompt_timestamp(event.get(key))
+        if value:
+            return value
+    return None
+
+
 def _strict_json_object(pairs):
     result = {}
     for key, value in pairs:
@@ -917,6 +956,17 @@ def main() -> int:
             args.extend(_free_text_arg("--consume-agent-id", _consume_id))
     if command == "recall":
         args[1:1] = _free_text_arg("--query", query)
+    # Issue #389 (AC8): thread the payload's prompt clock onto the recall
+    # argv so the store resolves relative temporal phrases against the
+    # moment the HOST submitted the prompt, not this adapter's wall clock
+    # (`prompt_timestamp` key with precedence over `timestamp`; strict ISO
+    # validated locally — an absent or invalid value forwards NOTHING and
+    # keeps byte-identical argv, and a forwarded value can never exit-2 the
+    # store child).  Forwarded only on the recall command: the recent
+    # parser has no such flag.
+    _prompt_ts = _payload_prompt_timestamp(event)
+    if command == "recall" and _prompt_ts:
+        args.extend(_free_text_arg("--prompt-timestamp", _prompt_ts))
     # Issue #397: pretool-only repository-state hint. Computed once per
     # invocation; the flag is omitted entirely when the state is
     # "unavailable" (fail-open: the store never sees an unknown value and

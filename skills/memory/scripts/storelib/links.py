@@ -450,7 +450,10 @@ def graph_seed_ids(
     before recall. The walk is ONE batched indexed query (placeholders exactly
     4 + 2*len(seeds); the PR #147 bounding rule: never per-seed round-trips),
     namespace/liveness re-verified per neighbor through the same
-    ``_fetch_by_ids`` eligibility the other lanes use.
+    ``_fetch_by_ids`` eligibility the other lanes use. When ``as_of`` is
+    set, an edge is eligible only when its ``created_at`` is at or before
+    that instant (issue #248) — the same edge-time law as
+    ``expand_recall_links``.
 
     Returns ``(capped_ids, rel_map)`` where ``rel_map[mid]`` is the BEST
     entry-edge score clamped to [0, 1] — the graph lane's measured relevance
@@ -469,9 +472,17 @@ def graph_seed_ids(
     seeds = list(dict.fromkeys(seed_ids))  # dedup, preserve rank order
     rel_ph = ",".join("?" * len(GRAPH_SEED_RELATIONS))
     seed_ph = ",".join("?" * len(seeds))
+    # Issue #248: the edge itself must have EXISTED at the requested
+    # instant. ``as_of`` is already applied to NEIGHBOR eligibility via
+    # ``_fetch_by_ids`` below; the edge-selection query now applies the
+    # same "at or before that instant" law as ``expand_recall_links``
+    # (fail-closed on malformed edge timestamps; lexical fallback only for
+    # an invalid PROGRAMMATIC as_of value).
+    as_of_dt = _parse_iso_utc(as_of) if as_of else None
     try:
         edges = conn.execute(
-            f"SELECT src_id, dst_id, relation, score FROM memory_link "
+            f"SELECT src_id, dst_id, relation, score, created_at "
+            f"FROM memory_link "
             f"WHERE relation IN ({rel_ph}) "
             f"AND (src_id IN ({seed_ph}) OR dst_id IN ({seed_ph}))",
             [*GRAPH_SEED_RELATIONS, *seeds, *seeds],
@@ -486,6 +497,18 @@ def graph_seed_ids(
     seed_set = set(seeds)
     best: dict[str, tuple[float, str, str]] = {}
     for e in edges:
+        if as_of:
+            created_at = e["created_at"]
+            if as_of_dt is not None:
+                created_at_dt = _parse_iso_utc(created_at)
+                if created_at_dt is None or created_at_dt > as_of_dt:
+                    continue  # edge did not exist yet (or is unreadable)
+            elif (not isinstance(as_of, str) or
+                  not isinstance(created_at, str) or
+                  created_at > as_of):
+                # Preserve the established never-raise lexical fallback
+                # for an invalid programmatic as_of value.
+                continue
         other = e["dst_id"] if e["src_id"] in seed_set else e["src_id"]
         if other in seed_set:
             continue  # a seed is already an entity-lane candidate

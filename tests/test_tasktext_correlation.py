@@ -79,12 +79,27 @@ STORE_PY = SCRIPTS / "store.py"
 BODY = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
 
 _MODULE_SCRATCH = tempfile.mkdtemp(prefix="zmem-428-correlation-")
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (registered after the unittest import; standalone runs execute
+# doModuleCleanups, one-process runs never depend on it).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP")}
 os.environ["ZMEM_STORE"] = os.path.join(_MODULE_SCRATCH, "store.sqlite")
 os.environ["ZMEM_DATA"] = _MODULE_SCRATCH
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_MODULE_SCRATCH, "missing-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 for _k in ("ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP"):
     os.environ.pop(_k, None)
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 
@@ -99,6 +114,8 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(SCRIPTS))
+
+unittest.addModuleCleanup(_restore_module_env)
 
 from storelib import delivery_ledger as dl  # noqa: E402
 

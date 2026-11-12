@@ -532,6 +532,63 @@ jobs:
             node "$f"
           done
 
+  # Issue #389 item 4 (AC9): the single-process isolation canary lane. The
+  # per-file loop above proves every suite green STANDALONE; this lane
+  # proves the SAME 26 env-writing/temporal suites green in ONE pytest
+  # process, TWICE — the second run with the module order SWAPPED — pinning
+  # the one-process isolation contract: driver-pinned import-frozen
+  # constants (shared ZMEM_STORE scratch, ZMEM_LINK_THRESHOLD=1.01,
+  # ZMEM_MODEL_AUTODOWNLOAD=0), per-class ZMEM_EMBED_PROFILE/ZMEM_TEST_NOW
+  # pins with cleanup restores, and the shared frozen
+  # storelib.schema.STORE_PATH invariant for every fixture access path.
+  # Decision record: bounded to a single ubuntu leg at ~10-15 min (two
+  # ~4-minute pytest orders plus pip installs; 20 = floor covering install
+  # variance) — windows is excluded because the canary's failure mode
+  # (module-order env pollution) is OS-independent and the windows matrix
+  # leg already carries the longest CI tail. tests/
+  # run_temporal_isolation_canary.py is deliberately NOT named test_*.py so
+  # the per-file loop above cannot collect it (26 separate processes would
+  # not pin this contract). No docs/ci/required-check-evidence.json exists
+  # in this repo, so no required-checks contract needed amending for this
+  # lane.
+  test-isolation-canary:
+    name: test-isolation-canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # Same degraded-mode guarantee as the main test job: never download
+      # the model; UTF-8 mode for every python child.
+      ZMEM_MODEL_AUTODOWNLOAD: "0"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The canary spawns `python -m pytest` over the same module set the
+      # per-file loop runs, so it needs that loop's dependency closure:
+      # pytest itself, sqlite-vec (the vec-gated fixture paths must RUN, not
+      # degrade), the MCP transport requirements, and the dataset layer's
+      # pyarrow/huggingface_hub (tests/test_dataset.py is in the module
+      # list).
+      - name: Install canary dependencies
+        shell: bash
+        run: |
+          set -e
+          python -m pip install --disable-pip-version-check \
+            "pytest>=8" "sqlite-vec>=0.1.6,<1.0" \
+            "jsonschema>=4,<5" "huggingface_hub>=0.30" \
+            -r hermes-plugin/server/requirements.txt \
+            -r skills/memory/scripts/requirements-training.txt
+      - name: Run single-process isolation canary (issue #389 item 4)
+        shell: bash
+        run: |
+          set -e
+          python -X utf8 tests/run_temporal_isolation_canary.py
+
   # Issue #77: dependency-enforcing vector lane. This job installs the
   # embedding requirements (sqlite-vec included) and runs the NON-SKIPPING
   # smoke test, so a missing or broken vector dependency fails CI instead of

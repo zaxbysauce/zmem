@@ -5,40 +5,65 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.150.0] - 2026-11-11
-### Security
-- Entity report surfaces now mask credential-shaped names at display time
-  (issues #455, #366): `entity-list` (names and alias lists), `entity-merge`
-  dry-run (both name sites and the alias-collision join),
-  `reclassify-entities` dry-run/apply envelopes, and
-  `reconcile-entity-aliases` dry-run/apply envelopes (orphan names, suffixes,
-  `merged_rows` names, owner names) render `[REDACTED_SECRET]` instead of the
-  raw value. Detection = exact secret-head tokens (password/passwd/secret/
-  token/api-key/api_key/apikey/credential/auth as whitespace-trimmed
-  `[:_=-]`-delimited segments or adjacent pairs — attribute-assignment
-  shapes like `DB_PASSWORD=12345`, `DB_PASSWORD = 12345`, and dot-joined
-  keys like `db.password=12345` — including behind an earlier separator
-  (`redis:db.password=12345`, `--config=db.password=12345`) and the
-  dot-joined head spelling `api.key=12345` — mask too, while bare
-  whitespace without punctuation, bare dotted hostnames, and non-head env
-  suffixes (`db.password-prod=1`) do not) plus the shared redaction
-  registry; legal `label:port`
-  names (`localhost:8080`, `server:8080`) render unmasked, and
-  prefix-shaped words (`tokenized-service`, `authentication-service`,
-  `author`) are not masked. Masking is display-only — stored entity/alias
-  rows, the classifier, resolve/write paths, and entity-card construction
-  are untouched — and fail-closed: the reports never fall back to raw
-  output (a registry that becomes unavailable after startup makes the
-  renderer refuse — dry-run exits 2 with empty stdout, apply reports from
-  the committed state; a registry missing at process start fails the CLI at
-  import before any report runs).
-### Documentation
-- `skills/memory/SKILL.md` carries the dated, owner-confirmed #366
-  entity-kind classifier decision record (five precision rows keep
-  spec-literal with no guards; the 30-row `classify.json` fixture stays
-  frozen; the linear host regex + ASCII-strict IPv4 hardening landed via
-  #365), plus the PRR-013 recall `--json`/`--explain` no-LF-contract record
-  and the #455 masking contract.
+## [0.151.0] - 2026-11-12
+### Fixed
+- The graph-seed recall arm honors `--as-of` on EDGES, not just rows (issue
+  #248): a `memory_link` created after the requested instant can no longer
+  pull a pre-cutoff neighbor into an as-of candidate pool. Edge eligibility
+  now follows the same "created at or before that instant" law as one-hop
+  link expansion — offset spellings compare as UTC instants, and a
+  malformed edge timestamp fails closed (the edge is not traversed);
+  invalid programmatic `as_of` values keep the established lexical
+  fallback. Live recall (no `as_of`) is byte-identical.
+- Belief-head correction quotes select the truly newest `updates` edge
+  (issue #248): `memory_link.created_at` is now ordered as its parsed UTC
+  instant — offset-aware and subsecond spellings order correctly, and a
+  malformed timestamp ranks below every parseable instant instead of
+  sorting above every date string. Microsecond precision (ties past the
+  sixth fractional digit resolve by the documented (src, dst) tiebreak).
+### Changed
+- **Occurrence retention contract (issue #389 item 1):** `memory_occurrence`
+  rows now SURVIVE soft tombstones of USER event rows (`update`,
+  `supersede`, consolidate absorb — including imported tombstones, which
+  route through `supersede`): historical `--as-of` recall surfaces the
+  event inside the tombstoned row's validity window instead of permanently
+  losing it at the first update. Generated-row writers (organize stale
+  summaries, entity reconcile) keep same-transaction cleanup, and hard
+  deletes (`purge`, import-store) still remove occurrence rows through the
+  side-table registry. Event→event updates additionally inherit the
+  occurrence onto the replacement row; validity windows partition at the
+  tombstone instant (no as-of double-count).
+- The temporal recall arm projects the occurrence triple onto recalled
+  event rows (issue #389 item 2): rows reached via the temporal arm carry
+  additive `occurred_start` / `occurred_end` / `mentioned_at` (WHEN the
+  event happened) alongside `valid_from` (when it was written). Purely
+  additive — stripping the three keys reproduces the pre-change envelope
+  bytes exactly; documented in SKILL.md.
+- `--prompt-timestamp` is threaded through the PASSIVE surfaces (issue #389
+  item 3): the UserPromptSubmit hook forwards the payload's prompt
+  timestamp (`prompt_timestamp` key preferred over `timestamp`; strict
+  ISO-8601 validated, dropped silently when invalid — never a store-child
+  exit 2), the Hermes provider search/prefetch paths (schema, cache keys,
+  queued background jobs, offline snapshot serving), the MCP
+  recall/search/prefetch tools, the fleet transports, and the remote
+  broker accept and forward it, so a divergent `ZMEM_TEST_NOW` never
+  overrides an explicitly supplied prompt time on any lane that has one.
+  The wall clock remains the fallback where no prompt time exists
+  (disclosed exception: the CLI offline remote-gate still resolves
+  wall-clock; its callers have no payload-owning timestamp).
+### Added
+- One-process test isolation for the temporal/env-writing suites (issue
+  #389 item 4): the affected modules run green in ONE pytest invocation
+  with the module order swapped (reset helpers, direct SQLite seeding,
+  subprocess stores, and module constants unified on the frozen shared
+  store path; ambient clock mutations moved to per-class setup with
+  cleanup; import-frozen constants pinned by the driver). A committed
+  canary (`tests/run_temporal_isolation_canary.py`) runs both orders and
+  is wired as a bounded CI lane.
+- The generated temporal fixture is digest-pinned (issue #389 item 5):
+  `tests/test_temporal.py` asserts the SHA-256 of
+  `phrases.expected.json` so in-place edits are detectable; the
+  hand-authored `phrases.json` literals remain the correctness oracle.
 
 ## [0.149.0] - 2026-11-10
 ### Added

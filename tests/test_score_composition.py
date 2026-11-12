@@ -57,6 +57,27 @@ for _k in (
 ):
     os.environ.pop(_k, None)
 
+# Issue #389 AC9: every RETAINED module-level mutation above is paired with
+# an explicit unittest.addModuleCleanup restore (registered after the
+# unittest import below). Standalone runs execute doModuleCleanups;
+# one-process runs never depend on them — there the per-class pins below
+# carry isolation (the profile resolves CALL-TIME, so a co-run's ambient
+# must never decide which embedder builds a fixture).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_THRESHOLD", "ZMEM_DATA",
+    "ZMEM_BACKUP_DIR", "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
+    "ZMEM_INJECT_FLOOR_ENT")}
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import calendar  # noqa: E402
@@ -68,13 +89,63 @@ import unittest  # noqa: E402
 from unittest import mock  # noqa: E402
 
 import storelib.recall as recall_mod  # noqa: E402  (env pinned above)
-import storelib.write as write_mod  # noqa: E402
+import storelib.write as write_mod  # noqa: E402  (env pinned above)
+from storelib import schema as schema_mod  # noqa: E402
 from storelib.inject import (
     classify_silent_reason,
     selective_inject_filter,
 )  # noqa: E402
 from storelib.schema import _prepare_store, connect  # noqa: E402
 from storelib.write import add_memory  # noqa: E402
+
+unittest.addModuleCleanup(_restore_module_env)
+
+
+def _pin_env_values(**pins):
+    """Set each `pins` key (a None value POPS it) and return a restore
+    callable for addCleanup/addClassCleanup (issue #389 AC9)."""
+    prior = {k: os.environ.get(k) for k in pins}
+    for key, value in pins.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+    def _restore():
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return _restore
+
+
+def _pin_profile(name):
+    """Pin ZMEM_EMBED_PROFILE to `name` and return a restore callable.
+    Call-time resolution (embed_profiles.resolve_active_profile) means the
+    pin covers every fixture built after it; the immediate assertion is the
+    plan's build-time profile check."""
+    import embed_profiles as _ep
+    restore = _pin_env_values(ZMEM_EMBED_PROFILE=name)
+    active = _ep.resolve_active_profile()
+    assert active == name, (
+        "build-time profile assertion failed: pinned %r but ambient "
+        "resolved %r" % (name, active))
+    return restore
+
+
+def _reset_frozen_store():
+    """Delete the FROZEN store file (storelib.schema.STORE_PATH — the path
+    the first storelib import in this process froze) so the next connect()
+    creates it fresh: in a one-process co-run the previous module's store —
+    possibly born under a different embedding profile dim — must never leak
+    into this module's fixture (issue #389 AC9 shared-frozen-path
+    invariant). Standalone this is a no-op on a fresh module scratch."""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(str(schema_mod.STORE_PATH) + suffix)
+        except OSError:
+            pass
 
 # Deterministic scoring clock: ingestion instant == now => recency == 1.0 for
 # every row, so score deltas below come from relevance lanes ONLY.
@@ -345,6 +416,13 @@ class RecallLaneCompositionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Issue #389 AC9: pin the 'fake' profile BEFORE the fixture build
+        # (add_memory resolves the profile at call time; a co-run ambient
+        # 'minilm' would silently degrade the vec lane this suite measures)
+        # and reset the shared frozen store so this class owns a fresh 16-dim
+        # memory_vec (standalone: no-op on the fresh module scratch).
+        cls.addClassCleanup(_pin_profile("fake"))
+        _reset_frozen_store()
         cls.conn = connect()
         _prepare_store(cls.conn)
         cls.ids: dict[str, str] = {}
@@ -538,6 +616,16 @@ class RrBindsIntegrationTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Issue #389 AC9: same per-class pins as RecallLaneCompositionTest —
+        # 'fake' profile before the build, plus the inject floors pinned at
+        # their defaults (a co-run sibling's module-level floor override,
+        # e.g. ZMEM_INJECT_FLOOR_LEX=0, must not flip the floor-trip pin in
+        # test_deep_pool_cov_full_row_trips_the_lexical_floor).
+        cls.addClassCleanup(_pin_profile("fake"))
+        cls.addClassCleanup(_pin_env_values(
+            ZMEM_INJECT_FLOOR_LEX=None, ZMEM_INJECT_FLOOR_COS=None,
+            ZMEM_INJECT_FLOOR_ENT=None, ZMEM_INJECT_FLOOR_GRAPH=None,
+            ZMEM_INJECT_FLOOR_TRUST=None))
         cls.conn = connect()
         _prepare_store(cls.conn)
         original = write_mod._embeddings
@@ -616,6 +704,15 @@ class RrBindsIntegrationTest(unittest.TestCase):
 
 class GatePrecedenceTest(unittest.TestCase):
     """Trust gate first, per-lane relevance floors second (issue #113)."""
+
+    def setUp(self):
+        # Issue #389 AC9: the floors this class asserts are DEFAULTS — pin
+        # them absent per test (a co-run sibling's module-level floor
+        # override, e.g. ZMEM_INJECT_FLOOR_LEX=0, must not leak in).
+        self.addCleanup(_pin_env_values(
+            ZMEM_INJECT_FLOOR_LEX=None, ZMEM_INJECT_FLOOR_COS=None,
+            ZMEM_INJECT_FLOOR_ENT=None, ZMEM_INJECT_FLOOR_GRAPH=None,
+            ZMEM_INJECT_FLOOR_TRUST=None))
 
     @staticmethod
     def _row(**over) -> dict:

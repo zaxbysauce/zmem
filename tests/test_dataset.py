@@ -13,12 +13,28 @@ import sys
 import tempfile
 
 _TMP = tempfile.mkdtemp(prefix="zmem-test-dataset-")
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (registered after the unittest import; standalone runs execute
+# doModuleCleanups, one-process runs never depend on it).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_MODELS_DIR",
+    "ZMEM_MODEL_AUTODOWNLOAD", "PYTHONIOENCODING")}
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ.pop("ZMEM_DATA", None)
 os.environ.pop("ZMEM_BACKUP_DIR", None)
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "no-such-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 os.environ["PYTHONIOENCODING"] = "utf-8"
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 for _key in list(sys.modules):
     if _key == "storelib" or _key.startswith("storelib."):
@@ -32,6 +48,8 @@ import subprocess  # noqa: E402
 import unittest  # noqa: E402
 from pathlib import Path  # noqa: E402
 from unittest import mock  # noqa: E402
+
+unittest.addModuleCleanup(_restore_module_env)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STORE_PY = os.path.join(REPO_ROOT, "skills", "memory", "scripts", "store.py")

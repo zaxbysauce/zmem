@@ -53,6 +53,24 @@ os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 os.environ.pop("ZMEM_INJECT_FLOOR_TRUST", None)  # PRR: floor default must hold
+# Issue #389 AC9: every module-level mutation above is paired with an
+# explicit unittest.addModuleCleanup restore. Standalone runs execute
+# doModuleCleanups; one-process runs never depend on them (per-class pins
+# and the shared frozen path below carry isolation there).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+    "ZMEM_EMBED_PROFILE", "ZMEM_INJECT_FLOOR_TRUST")}
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+unittest.addModuleCleanup(_restore_module_env)
 
 
 def _pin_env(store: str) -> dict:
@@ -476,6 +494,32 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
 
 
 class ExplainSafetyTests(ExplainFixtureBase):
+
+    @classmethod
+    def setUpClass(cls):
+        # Issue #389 AC9: this class holds the file's one IN-PROCESS
+        # storelib leg (test_fail_open_explain_unavailable below). Pin the
+        # 'fake' profile for the whole class — at the START of setUpClass,
+        # before any fixture the class builds — with the build-time
+        # resolution assertion; never trust the module-level ambient a
+        # one-process co-run may have overwritten by collection time.
+        sys.path.insert(0, str(SCRIPTS_DIR))
+        import embed_profiles as _ep
+        prior = os.environ.get("ZMEM_EMBED_PROFILE")
+        os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+        assert _ep.resolve_active_profile() == "fake", (
+            "build-time profile assertion failed: ambient resolved %r"
+            % _ep.resolve_active_profile())
+
+        def _restore_profile():
+            if prior is None:
+                os.environ.pop("ZMEM_EMBED_PROFILE", None)
+            else:
+                os.environ["ZMEM_EMBED_PROFILE"] = prior
+
+        cls.addClassCleanup(_restore_profile)
+        super().setUpClass()
+
     def test_explain_is_zero_write_subprocess(self):
         # Keep the telemetry directory in the fixture sandbox too: explain
         # must not create or mutate either SQLite sidecars or audit logs.
@@ -516,13 +560,19 @@ class ExplainSafetyTests(ExplainFixtureBase):
         # Unit-level: a THROWN TRACER (the verdict computation, not the
         # pipeline) must degrade to one explain_unavailable verdict while the
         # pipeline results still print/return. Runs IN-PROCESS against the
-        # module-pinned INPROC store (never the home store).
+        # FROZEN storelib.schema.STORE_PATH (issue #389 AC9: the seed
+        # subprocess, the direct-SQLite insert, and the in-process frozen
+        # connect() must all resolve the SAME file — standalone that IS the
+        # module-pinned INPROC store, because this module's import froze it;
+        # a one-process co-run freezes the shared canary path instead).
+        from storelib import schema as schema_mod
+        inproc_store = str(schema_mod.STORE_PATH)
         r = subprocess.run(
             [PYTHON, str(STORE_PY), "init"],
-            env=_pin_env(INPROC_STORE), capture_output=True, text=True,
+            env=_pin_env(inproc_store), capture_output=True, text=True,
             timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
-        conn = sqlite3.connect(INPROC_STORE)
+        conn = sqlite3.connect(inproc_store)
         try:
             conn.execute(
                 """INSERT INTO memory

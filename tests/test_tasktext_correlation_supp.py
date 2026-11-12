@@ -718,6 +718,9 @@ class RemoteReadFlagCompletenessTest(unittest.TestCase):
             # selector never bumps retrieval_count", issue #159): dropping
             # it remotely changes nothing, so it needs no hub parameter.
             "no_bump",
+            # --prompt-timestamp (issue #389 AC8/F5): forwarded — the
+            # e2e forward-capture leg lives in RemoteBehaviorPinTest.
+            "prompt_timestamp",
         }
         actual = _dests(self.subs["prefetch"])
         self.assertEqual(

@@ -368,6 +368,39 @@ def _ack_reservation(http: transport.McpHttp, env: Mapping[str, str],
 
 # --- read moments ------------------------------------------------------
 
+def _payload_prompt_timestamp(payload: Mapping[str, Any],
+                              event: str = "read") -> Optional[str]:
+    """Issue #389 (AC8): the hook payload's prompt clock for read moments.
+
+    The ``prompt_timestamp`` key wins over ``timestamp`` when both are
+    present (first VALID key in that precedence order — the same rule and
+    strict-ISO validation as the local hook body, hooks/lib/
+    zmem-recall-body.py, via the shared fleet transport helper).  A present
+    but invalid value is dropped with ONE broker-log line (never an error,
+    never an unparseable value on the hub request); the hub/store keeps its
+    ZMEM_TEST_NOW/now clock seam.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    raw_seen = False
+    for key in ("prompt_timestamp", "timestamp"):
+        raw = payload.get(key)
+        if not raw:
+            continue
+        raw_seen = True
+        value = transport._valid_prompt_timestamp(raw)
+        if value:
+            return value
+    if raw_seen:
+        _log_record({
+            "ts": int(time.time()), "event": event,
+            "reason": "prompt-timestamp-dropped",
+            "detail": "payload timestamp keys failed strict ISO-8601",
+            "elapsed_ms": 0,
+        })
+    return None
+
+
 def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
                  payload: Mapping[str, Any], started: float,
                  namespace: Optional[str] = None) -> dict[str, str]:
@@ -375,6 +408,13 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
     session_id = _event_text(payload, "session_id", "sessionId")
     moment = _moment_for(event)
     ns = namespace or _namespace(payload, env)
+    # Issue #389 (AC8): the payload's prompt clock (``prompt_timestamp``
+    # key with precedence over ``timestamp``; strict ISO, drop-with-log on
+    # invalid — no zmem-launch.js change, the broker owns the payload).
+    # It rides the hub prefetch AND the offline-snapshot serve below, so
+    # relative temporal phrases resolve against the moment the HOST
+    # submitted the prompt, not this broker's wall clock.
+    prompt_ts = _payload_prompt_timestamp(payload, event)
     remaining_ms = _remaining_ms(started, env)
     # Bound for EVERY event before the branch below: the unreachable
     # serve (issue #290) references it on the SessionStart path too,
@@ -397,7 +437,11 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
                 # store-side task-text consume (the remote half of the
                 # #253 bridge). Every other remote moment keeps the
                 # default-off grant and cannot drain a parked delegation.
-                consume_tasktext=(moment == "subagent"))
+                consume_tasktext=(moment == "subagent"),
+                # Issue #389 (AC8): the validated prompt clock (None when
+                # absent/invalid — the transport forwards only valid
+                # values onto the hub request).
+                prompt_timestamp=prompt_ts)
     except Exception as exc:  # noqa: BLE001 - fail open
         return _fail_open(event, "broker-error", str(exc), started)
     # Read-your-writes (issue #288 AC3) holds in BOTH hub states: render
@@ -418,7 +462,11 @@ def _handle_read(http: transport.McpHttp, env: Mapping[str, str], event: str,
             pass
         envelope_off, state = fleet_snapshot._serve_offline_read(  # noqa: SLF001
             env, query=query, namespace=ns, moment=moment,
-            session_id=session_id or "", lane=lane)
+            session_id=session_id or "", lane=lane,
+            # Issue #389 (AC8): the offline serve resolves relative temporal
+            # phrases through the SAME selector, so the prompt clock threads
+            # there too (never the broker's wall clock).
+            prompt_timestamp=prompt_ts)
         if state == "expired":
             _log_record({
                 "ts": time.time(), "event": event,

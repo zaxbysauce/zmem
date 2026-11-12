@@ -451,6 +451,7 @@ def _supersede_stale_summaries(
             # tombstone, in the SAME transaction — one of the cleanup sites.
             # `tomb_at` is computed once above, so this transaction
             # writes a single timestamp (AC7).
+            # Two-tier law (#389): generated rows KEEP this cleanup.
             _clear_expiry(conn, row["id"])
             _clear_occurrence(conn, row["id"])
 

@@ -67,6 +67,7 @@ import unittest  # noqa: E402
 import uuid  # noqa: E402
 
 import storelib.recall as recall_mod  # noqa: E402
+from storelib import schema as schema_mod  # noqa: E402
 from storelib.inject import _lane_floors, selective_inject_filter  # noqa: E402
 from storelib.links import add_link_pair  # noqa: E402
 from storelib.schema import (  # noqa: E402
@@ -75,7 +76,64 @@ from storelib.write import add_memory  # noqa: E402
 
 PIN_TS = "2026-06-01T00:00:00Z"
 FIXED_NOW = float(calendar.timegm((2026, 6, 1, 0, 0, 0)))
-os.environ["ZMEM_TEST_NOW"] = PIN_TS
+# Issue #389 AC9: ZMEM_TEST_NOW used to be set HERE at module import — the
+# exact cross-module ambient leak the one-process canary pins. The frozen
+# clock now rides the _StoreClassPins mixin below (class-scoped set +
+# addClassCleanup restore), applied BEFORE any fixture is built; every
+# RETAINED module-level mutation above is paired with an explicit
+# unittest.addModuleCleanup restore (registered right after the unittest
+# import below). Standalone runs execute doModuleCleanups; one-process runs
+# never depend on them.
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_THRESHOLD", "ZMEM_DATA",
+    "ZMEM_GRAPH_SEED", "ZMEM_ARM_CAP_FTS", "ZMEM_ARM_CAP_VEC",
+    "ZMEM_ARM_CAP_ENTITY", "ZMEM_ARM_CAP_GRAPH", "ZMEM_INJECT_FLOOR_GRAPH",
+    "ZMEM_TEST_NOW")}
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def _pin_env_values(**pins):
+    """Set each `pins` key (a None value POPS it) and return a restore
+    callable for addCleanup/addClassCleanup (issue #389 AC9)."""
+    prior = {k: os.environ.get(k) for k in pins}
+    for key, value in pins.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+    def _restore():
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return _restore
+
+
+def _pin_profile(name):
+    """Pin ZMEM_EMBED_PROFILE to `name` and return a restore callable.
+    Call-time resolution (embed_profiles.resolve_active_profile) means the
+    pin covers every fixture built after it; the immediate assertion is the
+    plan's build-time profile check."""
+    import embed_profiles as _ep
+    restore = _pin_env_values(ZMEM_EMBED_PROFILE=name)
+    active = _ep.resolve_active_profile()
+    assert active == name, (
+        "build-time profile assertion failed: pinned %r but ambient "
+        "resolved %r" % (name, active))
+    return restore
+
+
+unittest.addModuleCleanup(_restore_module_env)
 
 NS = "project:grapharm"
 QUERY = "search code with rg"   # normalized terms: search, code, rg
@@ -99,8 +157,17 @@ def _build_store(edges=(), with_entity_on="H", extra_rows=None):
     Each build DELETES the (frozen-path) store file first: storelib freezes
     STORE_PATH at import, so per-class isolation comes from resetting the
     file while no connection is open (classes close their conn in
-    tearDownClass)."""
-    base = os.environ["ZMEM_STORE"]
+    tearDownClass). Issue #389 AC9 invariant: the reset — like every other
+    fixture access path in this module — resolves storelib.schema.STORE_PATH
+    (the FIRST storelib import in this process froze it), never
+    os.environ["ZMEM_STORE"] at call time; standalone the frozen path IS
+    this module's own pin above."""
+    import embed_profiles as _ep
+    assert _ep.resolve_active_profile() == "minilm", (
+        "build-time profile assertion failed: _build_store needs the "
+        "model-absent 'minilm' shape, ambient resolved %r"
+        % _ep.resolve_active_profile())
+    base = str(schema_mod.STORE_PATH)
     for suffix in ("", "-wal", "-shm"):
         try:
             os.unlink(base + suffix)
@@ -139,6 +206,15 @@ def _build_store(edges=(), with_entity_on="H", extra_rows=None):
     conn.commit()
     for a, b, rel, score in edges:
         add_link_pair(conn, ids[a], ids[b], rel, score=score)
+        # F1 (#248 AC1) coherence: backdate both directed halves of the pair
+        # to the fixture's frozen PIN_TS, exactly like the rows above — the
+        # graph arm's as_of edge-time predicate (at-or-before) must judge the
+        # SAME instant the fixture backdates everything else to, never the
+        # wall clock (add_link_pair accepts no created_at).
+        for src, dst in ((ids[a], ids[b]), (ids[b], ids[a])):
+            conn.execute(
+                "UPDATE memory_link SET created_at=? WHERE src_id=? AND "
+                "dst_id=?", (PIN_TS, src, dst))
     return conn, ids
 
 
@@ -180,12 +256,28 @@ class _FloorEnvHermetic:
                 os.environ[k] = v
 
 
-class GoldRescueTest(_FloorEnvHermetic, unittest.TestCase):
+class _StoreClassPins:
+    """Issue #389 AC9: the fixture clock (ZMEM_TEST_NOW, formerly a
+    module-level ambient write) and the model-absent profile are CLASS pins
+    applied at the START of setUpClass — BEFORE any store fixture is built
+    (the write path resolves the profile at call time) — and restored with
+    addClassCleanup. The immediate resolve_active_profile() assertion is the
+    plan's build-time profile check."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.addClassCleanup(_pin_env_values(ZMEM_TEST_NOW=PIN_TS))
+        cls.addClassCleanup(_pin_profile("minilm"))
+        super().setUpClass()
+
+
+class GoldRescueTest(_StoreClassPins, _FloorEnvHermetic, unittest.TestCase):
     """AC1: entity-linked, content-disjoint target enters via the graph arm
     and passes the C-2 floor through its measured graph lane."""
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.conn, cls.ids = _build_store(
             edges=(("H", "T", "related", 0.85),))
         cls.addClassCleanup(cls.conn.close)
@@ -239,13 +331,15 @@ class GoldRescueTest(_FloorEnvHermetic, unittest.TestCase):
             os.environ.pop("ZMEM_INJECT_FLOOR_GRAPH", None)
 
 
-class NegativeNeighborTest(_FloorEnvHermetic, unittest.TestCase):
+class NegativeNeighborTest(_StoreClassPins, _FloorEnvHermetic,
+                           unittest.TestCase):
     """AC2: the sub-threshold neighbor is judged and dropped (this also
     cures the pre-#136 false injection where N rode expansion as an
     all-absent floor-exempt row)."""
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.conn, cls.ids = _build_store(edges=(
             ("H", "T", "related", 0.85),
             ("H", "N", "related", 0.40),
@@ -263,12 +357,13 @@ class NegativeNeighborTest(_FloorEnvHermetic, unittest.TestCase):
         self.assertIn(self.ids["H"], result_ids)
 
 
-class SeedPolicyTest(_FloorEnvHermetic, unittest.TestCase):
+class SeedPolicyTest(_StoreClassPins, _FloorEnvHermetic, unittest.TestCase):
     """AC6 + AC7: contradicts never seeds the arm; the post-result
     [CONTESTED LINK] expansion still surfaces the neighbor."""
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.conn, cls.ids = _build_store(
             edges=(("H", "C", "contradicts", 1.0),),
             extra_rows={"C": C_CONTENT})
@@ -297,11 +392,12 @@ class SeedPolicyTest(_FloorEnvHermetic, unittest.TestCase):
         self.assertIs(c_rows[0].get("contested_link"), True)
 
 
-class PerArmCapsTest(_FloorEnvHermetic, unittest.TestCase):
+class PerArmCapsTest(_StoreClassPins, _FloorEnvHermetic, unittest.TestCase):
     """AC3: caps truncate BEFORE fusion; envelopes report pre/post/cap."""
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.conn, cls.ids = _build_store(edges=(
             ("H", "T", "related", 0.85),
             ("H", "N", "related", 0.40),
@@ -362,7 +458,8 @@ class PerArmCapsTest(_FloorEnvHermetic, unittest.TestCase):
             os.environ.pop("ZMEM_GRAPH_SEED", None)
 
 
-class ByteIdenticalNoLinksTest(_FloorEnvHermetic, unittest.TestCase):
+class ByteIdenticalNoLinksTest(_StoreClassPins, _FloorEnvHermetic,
+                               unittest.TestCase):
     """AC5: entities without edges — arm on vs off is byte-identical."""
 
     def test_no_links_store_byte_identical(self):
@@ -388,7 +485,7 @@ class ByteIdenticalNoLinksTest(_FloorEnvHermetic, unittest.TestCase):
         self.assertEqual(on_raw, off_raw)
 
 
-class TwoTierArmsMergeTest(unittest.TestCase):
+class TwoTierArmsMergeTest(_StoreClassPins, unittest.TestCase):
     """F12 (review round): the ONE shared arms dict accumulates across the
     project + user:global tiers — post is the merged count, never the last
     tier's overwrite."""
@@ -412,7 +509,7 @@ class TwoTierArmsMergeTest(unittest.TestCase):
                       {r["namespace"] for r in env["results"]})
 
 
-class RecentSurfaceGraphKeyTest(unittest.TestCase):
+class RecentSurfaceGraphKeyTest(_StoreClassPins, unittest.TestCase):
     """F12 (review round): the recent surface's candidate_lanes keeps the
     graph key (None everywhere — the recent lane runs no recall tiers), so
     the lane schema stays uniform across surfaces."""
@@ -433,7 +530,7 @@ class RecentSurfaceGraphKeyTest(unittest.TestCase):
                           "recent runs no tiers — graph lane stays unmeasured")
 
 
-class AsOfGraphArmTest(_FloorEnvHermetic, unittest.TestCase):
+class AsOfGraphArmTest(_StoreClassPins, _FloorEnvHermetic, unittest.TestCase):
     """F12 (review round): the graph arm honors the as_of time-travel
     predicate — a row invisible at the as_of instant cannot enter via the
     arm either."""
@@ -450,6 +547,84 @@ class AsOfGraphArmTest(_FloorEnvHermetic, unittest.TestCase):
                          "nothing is visible before the rows exist — the "
                          "graph arm must not conjure them")
         self.assertNotIn(ids["T"], before["candidate_ids"])
+
+
+class AsOfEdgeTimeTest(_StoreClassPins, _FloorEnvHermetic, unittest.TestCase):
+    """#248 AC1/AC3: the graph arm's EDGE-TIME as-of predicate — an edge is
+    eligible only when its created_at is at or before the requested
+    instant (the expand_recall_links law), offset spellings compare as UTC
+    instants, and malformed edge timestamps fail closed."""
+
+    CUTOFF = "2026-06-01T12:00:00Z"
+
+    def _store_with_edge_at(self, created_at):
+        conn, ids = _build_store(edges=(("H", "T", "related", 0.85),))
+        # _build_store backdates the pair to PIN_TS; re-stamp BOTH directed
+        # halves to the leg's edge instant (rows stay at PIN_TS, so row
+        # eligibility never masks the edge decision).
+        for src, dst in ((ids["H"], ids["T"]), (ids["T"], ids["H"])):
+            conn.execute(
+                "UPDATE memory_link SET created_at=? WHERE src_id=? AND "
+                "dst_id=?", (created_at, src, dst))
+        conn.commit()
+        return conn, ids
+
+    def _graph_post(self, conn, **kw):
+        return _recall_envelope(conn, **kw)["arms"]["graph"]["post"]
+
+    def test_post_cutoff_edge_not_traversed(self):
+        conn, ids = self._store_with_edge_at("2026-06-02T00:00:00Z")
+        self.addCleanup(conn.close)
+        after = _recall_envelope(conn, as_of="2026-06-03T00:00:00Z")
+        self.assertGreaterEqual(after["arms"]["graph"]["post"], 1)
+        self.assertIn(ids["T"], after["candidate_ids"])
+        at = _recall_envelope(conn, as_of=self.CUTOFF)
+        self.assertEqual(at["arms"]["graph"]["post"], 0,
+                         "an edge created after the cutoff must not be "
+                         "traversed even when both ROWS predate it")
+        self.assertNotIn(ids["T"], at["candidate_ids"])
+
+    def test_offset_edge_compared_as_utc_instant(self):
+        # 2026-06-01T08:00:00-04:00 == 2026-06-01T12:00:00Z == the cutoff:
+        # eligible AT equality; a later offset spelling is refused before
+        # its UTC instant, accepted after it. Two builds: the first conn is
+        # CLOSED before the second build (the frozen-path reset in
+        # _build_store requires no open connection).
+        conn, ids = self._store_with_edge_at("2026-06-01T08:00:00-04:00")
+        try:
+            self.assertGreaterEqual(
+                self._graph_post(conn, as_of=self.CUTOFF), 1,
+                "an edge AT the cutoff instant (offset spelling) is "
+                "eligible")
+        finally:
+            conn.close()
+        conn2, ids2 = self._store_with_edge_at("2026-06-01T22:00:00-04:00")
+        self.addCleanup(conn2.close)
+        # 22:00-04:00 == 2026-06-02T02:00Z — after the cutoff.
+        self.assertEqual(self._graph_post(conn2, as_of=self.CUTOFF), 0,
+                         "an offset spelling of a post-cutoff instant must "
+                         "be refused")
+        self.assertGreaterEqual(
+            self._graph_post(conn2, as_of="2026-06-02T03:00:00Z"), 1)
+
+    def test_malformed_edge_fails_closed_only_for_historical_recall(self):
+        conn, ids = self._store_with_edge_at("not-a-timestamp")
+        self.addCleanup(conn.close)
+        self.assertEqual(
+            self._graph_post(conn, as_of=self.CUTOFF), 0,
+            "a malformed edge timestamp must fail closed under as_of")
+        live = _recall_envelope(conn)
+        self.assertGreaterEqual(live["arms"]["graph"]["post"], 1,
+                                "live recall (no as_of) still traverses the "
+                                "edge — the predicate is historical-only")
+
+    def test_at_cutoff_equality_eligible(self):
+        conn, ids = self._store_with_edge_at(self.CUTOFF)
+        self.addCleanup(conn.close)
+        self.assertGreaterEqual(
+            self._graph_post(conn, as_of=self.CUTOFF), 1,
+            "an edge created exactly AT the cutoff is eligible "
+            "(at-or-before)")
 
 
 class RrfFuseUnitTest(unittest.TestCase):

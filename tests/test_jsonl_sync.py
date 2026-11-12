@@ -709,16 +709,18 @@ class TombstonePropagationTest(_TwoStoreCase):
                          "the imported tombstone must delete B's side row in the "
                          "same transaction -- no memory_expiry orphan may survive")
 
-    def test_imported_event_tombstone_deletes_occurrence_row(self):
-        # Issue #178 reviewer finding -- the #173 expiry-cleanup precedent
-        # (test_imported_state_tombstone_deletes_expiry_row directly above)
-        # mirrored for the occurrence side table: an ingest that tombstones an
-        # imported event row must leave NO memory_occurrence row. Occurrence
-        # data does NOT travel through export/ingest (the #178 sync scoping:
-        # export-jsonl skips occurrence records), so B's occurrence row is
-        # planted directly below -- standing in for any local source of that
-        # data -- and the tombstone import must still reap it in the same
-        # transaction: no memory_occurrence row may outlive its parent.
+    def test_imported_event_tombstone_retains_occurrence_row(self):
+        # Issue #389 retention: an ingest that tombstones an imported event
+        # row routes through supersede_memory (the sync tombstone path), a
+        # USER-event soft tombstone -- so the occurrence row must SURVIVE it
+        # (as-of recall surfaces it inside the tombstoned row's validity
+        # window). Occurrence data does NOT travel through export/ingest
+        # (the #178 sync scoping: export-jsonl skips occurrence records),
+        # so B's occurrence row is planted directly below -- standing in for
+        # any local source of that data. Contrast the #173 expiry twin
+        # directly above: expiry keeps same-transaction cleanup; only a
+        # hard delete (purge / import-store via _ID_SIDE_TABLES) removes
+        # the occurrence row.
         r = self.a.run("add", "--namespace", NS, "--type", "event",
                        "--content", "incident event rotated upstream",
                        "--signal", "test",
@@ -766,8 +768,9 @@ class TombstonePropagationTest(_TwoStoreCase):
         # A tombstones the row, then ships the tombstone downstream.
         r = self.a.run("supersede", "--id", mid, "--reason", "rotated upstream")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self._occurrence_ids(self.a), set(),
-                         "A's own supersede must clean its occurrence row too")
+        self.assertEqual(self._occurrence_ids(self.a), {mid},
+                         "A's own supersede must RETAIN its occurrence row "
+                         "(issue #389)")
         export_a2 = os.path.join(self.a.tmp, "tombstone_event.jsonl")
         r = self.a.run("export-jsonl", "--out", export_a2, "--include-superseded")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -778,11 +781,10 @@ class TombstonePropagationTest(_TwoStoreCase):
         # B's row is now tombstoned (superseded_at set)...
         self.assertIsNotNone(self.b.query_one(
             "SELECT superseded_at FROM memory WHERE id=?", (mid,))[0])
-        # ...and its occurrence row went with it in the same transaction.
-        self.assertEqual(self._occurrence_ids(self.b), set(),
-                         "the imported tombstone must delete B's occurrence row "
-                         "in the same transaction -- no memory_occurrence "
-                         "orphan may survive")
+        # ...and its occurrence row SURVIVES the imported soft tombstone.
+        self.assertEqual(self._occurrence_ids(self.b), {mid},
+                         "the imported tombstone (supersede_memory path) must "
+                         "RETAIN B's occurrence row -- issue #389 retention")
 
 
 # ---------------------------------------------------------------------------

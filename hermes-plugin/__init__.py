@@ -439,9 +439,14 @@ except Exception:  # pragma: no cover - a broken transport must not break import
 
 
 def _offline_snapshot_envelope(query: str, namespace: str,
-                               session_id: str) -> Optional[dict]:
+                               session_id: str,
+                               prompt_timestamp: Optional[str] = None,
+                               ) -> Optional[dict]:
     """Issue #290 (T-11): serve one provider read from the fleet's offline
     snapshot via the SAME selector (``fleet.snapshot._serve_offline_read``).
+    ``prompt_timestamp`` (issue #389, AC8) threads the prompt's own clock
+    into the offline serve so relative temporal phrases resolve against the
+    submitter's window, exactly like the live lane.
 
     Loads ``fleet/snapshot.py`` beside the checkout's scripts dir with a
     UNIQUE module name and a scoped (restored) ``sys.path`` entry — the
@@ -487,7 +492,7 @@ def _offline_snapshot_envelope(query: str, namespace: str,
         envelope, _state = module._serve_offline_read(  # noqa: SLF001
             dict(os.environ), query=query, namespace=namespace,
             moment="user_prompt", session_id=session_id,
-            lane="hermes-provider")
+            lane="hermes-provider", prompt_timestamp=prompt_timestamp)
         return envelope
     except Exception:  # noqa: BLE001 - offline serve fails open
         logger.debug("zmem: offline snapshot serve failed open", exc_info=True)
@@ -876,6 +881,30 @@ def _decode_rendered_envelope(result: Dict[str, Any]) -> Optional[Dict[str, Any]
     return payload
 
 
+# Issue #389 (AC8): strict ISO-8601 gate for a payload/tool-supplied prompt
+# timestamp.  The parse mirrors the store CLI's argparse ``_iso8601`` type
+# exactly, so any value admitted here is guaranteed to parse there — a
+# forwarded timestamp can never exit-2 the store child.  An absent,
+# non-string, or unparseable value is DROPPED with a debug log (never an
+# error); the store keeps its ZMEM_TEST_NOW/now clock seam.  This body is
+# duplicated verbatim in the hook body / fleet transport / MCP server (one
+# rule, four trees — the plugin never pulls the store library in-process).
+_PROMPT_TS_MAX = 64
+
+
+def _valid_prompt_timestamp(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _PROMPT_TS_MAX:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
 def _passive_store_args(
     command: str,
     *,
@@ -886,14 +915,26 @@ def _passive_store_args(
     session_id: str,
     moment: str,
     lane: str,
+    prompt_timestamp: Optional[str] = None,
 ) -> List[str]:
-    """Build one store-owned passive-injection subprocess invocation."""
+    """Build one store-owned passive-injection subprocess invocation.
+
+    ``prompt_timestamp`` (issue #389, AC8): the prompt's own clock for
+    resolving relative temporal phrases.  Strict-ISO validated here at the
+    argv boundary — an absent or invalid value forwards nothing (the store
+    keeps its ZMEM_TEST_NOW/now seam) and can never exit-2 the child.
+    Forwarded only on the recall command: the recent parser has no such
+    flag.
+    """
     args = [command]
     if command == "recall":
         # argparse treats a leading-dash free-text value as another option;
         # attach only that value to preserve ordinary argv shapes.
         args.extend(["--query=" + query] if query.startswith("-")
                     else ["--query", query])
+    prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+    if command == "recall" and prompt_ts:
+        args.extend(["--prompt-timestamp", prompt_ts])
     args.extend([
         "--limit", str(limit),
         "--include-global", "--global-limit", str(global_limit),
@@ -1567,6 +1608,16 @@ _SEARCH_SCHEMA: Dict[str, Any] = {
             "limit": {
                 "type": "integer",
                 "description": "Max results (default 5, hard-max 50).",
+            },
+            "prompt_timestamp": {
+                "type": "string",
+                "description": (
+                    "Optional ISO-8601 timestamp of the prompt being worked "
+                    "on (e.g. 2026-09-10T15:30:00Z). Resolves relative "
+                    "temporal phrases like 'last week' against the prompt's "
+                    "own clock instead of wall time; invalid values are "
+                    "ignored."
+                ),
             },
         },
         "required": ["query"],
@@ -3097,20 +3148,24 @@ class ZmemMemoryProvider(MemoryProvider):
             logger.debug("zmem: core.md read failed: %s", exc)
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "",
+                 prompt_timestamp: Optional[str] = None) -> str:
         """Passive recall before each turn: 30 s cache, then the transport.
 
         Issue #162 layering on top of the #160 boundary: the (session,
         fingerprint) key covers the normalized query, namespace, moment and
-        lane; a fresh ``_PrefetchCache`` hit returns the cached envelope's
-        ``rendered`` with zero transport calls; a miss runs the live
-        transport call through ``self._deadline.run`` (never joining a
-        pending background job).  The transport boundary returns the
-        complete parsed #158/#159 envelope and the store subprocess owns
-        selection, budget, the delivery ledger, and the user_prompt query
-        rewrite; the provider performs no local selection and no rewrite of
-        its own.  Transport failures are recognized (coerced empty envelope:
-        empty ``arms`` and zero budget) and never cached.
+        lane — plus the validated prompt timestamp when one is supplied
+        (issue #389, AC8: a differently-timed prefetch can never reuse a
+        wrong-window cache entry); a fresh ``_PrefetchCache`` hit returns
+        the cached envelope's ``rendered`` with zero transport calls; a
+        miss runs the live transport call through ``self._deadline.run``
+        (never joining a pending background job).  The transport boundary
+        returns the complete parsed #158/#159 envelope and the store
+        subprocess owns selection, budget, the delivery ledger, and the
+        user_prompt query rewrite; the provider performs no local selection
+        and no rewrite of its own.  Transport failures are recognized
+        (coerced empty envelope: empty ``arms`` and zero budget) and never
+        cached.
         """
         # Issue #110 (P0-5): passive-injection kill switch — no store
         # subprocess, empty delivery, one log line carrying the marker.
@@ -3126,6 +3181,10 @@ class ZmemMemoryProvider(MemoryProvider):
             return ""
         raw_query = query if isinstance(query, str) else ""
         q = raw_query.strip()[:_MAX_PROMPT_CHARS]
+        # Issue #389 (AC8): the prompt's own clock, validated once at this
+        # entry — every downstream seam (cache key, live transport call,
+        # background job closure) carries the SAME validated value.
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
         prompt_digest = _hermes_prompt_digest(q)
         explicit_session = str(session_id or "").strip()
         with self._turn_ticket_lock:
@@ -3160,7 +3219,8 @@ class ZmemMemoryProvider(MemoryProvider):
                 return ""
             if omitted_blocked:
                 return ""
-        key, normalized = self._prefetch_request(q, sid, namespace)
+        key, normalized = self._prefetch_request(q, sid, namespace,
+                                                 prompt_timestamp=prompt_ts)
         if not key[1]:
             # Empty or trivial query: no store call, status count 0 (#162).
             self._set_status_count(0)
@@ -3177,7 +3237,8 @@ class ZmemMemoryProvider(MemoryProvider):
 
         envelope = self._deadline.run(
             lambda: self._run_live_prefetch(normalized, sid, namespace,
-                                            transport),
+                                            transport,
+                                            prompt_timestamp=prompt_ts),
             self._deadline_s)
         if not isinstance(envelope, dict):
             logger.debug(
@@ -3228,12 +3289,17 @@ class ZmemMemoryProvider(MemoryProvider):
         return envelope["rendered"]
 
     def _prefetch_request(self, query: str, session_id: str,
-                          namespace: str) -> tuple[tuple[str, str], str]:
+                          namespace: str,
+                          prompt_timestamp: Optional[str] = None,
+                          ) -> tuple[tuple[str, str], str]:
         """Build the #162 cache key and the normalized transport query.
 
         ``namespace`` is a REQUIRED parameter fed solely from the caller's
         lock-captured value (never ``self._namespace`` re-read here) so the
         fingerprint and the transport call always name the same namespace.
+        ``prompt_timestamp`` (issue #389, AC8) joins the hashed payload ONLY
+        when present, so the no-timestamp key bytes stay byte-identical and
+        a differently-timed prefetch can never reuse a wrong-window entry.
         """
         normalized = " ".join(str(query or "").split())[:_MAX_QUERY_CHARS]
         if not normalized or _is_trivial_query(normalized):
@@ -3242,12 +3308,16 @@ class ZmemMemoryProvider(MemoryProvider):
         payload = (b"zmem-prefetch-v1\0" + normalized.encode("utf-8")
                    + b"\0" + str(namespace).encode("utf-8")
                    + b"\0user_prompt\0hermes-provider")
+        if prompt_timestamp:
+            payload += b"\0" + str(prompt_timestamp).encode("utf-8")
         digest = hashlib.sha256(payload).hexdigest()
         return ((sid, digest), normalized)
 
     def _run_live_prefetch(self, query: str, session_id: str,
                            namespace: str,
-                           transport: Any) -> Optional[Dict[str, Any]]:
+                           transport: Any,
+                           prompt_timestamp: Optional[str] = None,
+                           ) -> Optional[Dict[str, Any]]:
         """One live transport recall with the lock-captured pairing (#162).
 
         Takes the captured namespace AND the pinned transport instance — no
@@ -3255,13 +3325,21 @@ class ZmemMemoryProvider(MemoryProvider):
         """
         if transport is None:
             return None
-        envelope = transport.prefetch(
-            query,
+        prefetch_kwargs: Dict[str, Any] = dict(
             namespace=namespace,
             session_id=session_id,
             moment="user_prompt",
             ops_tokens=[],
             lane="hermes-provider",
+        )
+        # Issue #389 (AC8): thread the prompt clock ONLY when present — a
+        # transport predating the parameter keeps the exact historical call
+        # shape on the no-timestamp path (provider mixed-version safety).
+        if prompt_timestamp:
+            prefetch_kwargs["prompt_timestamp"] = prompt_timestamp
+        envelope = transport.prefetch(
+            query,
+            **prefetch_kwargs,
         )
         if isinstance(envelope, dict) and "context" in envelope:
             # The #159 MCP server adds an additive `context` alias that
@@ -3341,7 +3419,8 @@ class ZmemMemoryProvider(MemoryProvider):
         """The last recall status observed by this provider (#162)."""
         return self._last_status
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(self, query: str, *, session_id: str = "",
+                       prompt_timestamp: Optional[str] = None) -> None:
         """Queue one deduplicated background warm per (session, key) (#162).
 
         Returns without submitting when the kill switch is on, the seam is
@@ -3349,13 +3428,20 @@ class ZmemMemoryProvider(MemoryProvider):
         cache entry exists, the key is already pending, or no transport is
         configured.  The pending key check-and-insert is one atomic
         ``_state_lock`` section; a submit failure removes the key and never
-        raises into Hermes.
+        raises into Hermes.  ``prompt_timestamp`` (issue #389, AC8) rides
+        the cache key AND the submit-time closure, so the queued job
+        resolves the window its submitter asked for, not the job's wall
+        clock.
         """
         scheduler = self._scheduler
         if scheduler is None or _inject_disabled():
             return None
         raw_query = query if isinstance(query, str) else ""
         q = raw_query.strip()[:_MAX_PROMPT_CHARS]
+        # Issue #389 (AC8): validated once here; the same value feeds the
+        # key and the background closure (a divergent job-time clock can
+        # never win).
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
         explicit_session = str(session_id or "").strip()
         with self._turn_ticket_lock:
             transport = self._transport
@@ -3366,7 +3452,8 @@ class ZmemMemoryProvider(MemoryProvider):
             if not sid:
                 return None
             namespace = self._namespace
-        key, normalized = self._prefetch_request(q, sid, namespace)
+        key, normalized = self._prefetch_request(q, sid, namespace,
+                                                 prompt_timestamp=prompt_ts)
         if not key[1]:
             return None
         if self._prefetch_cache.get(key) is not None:
@@ -3381,7 +3468,8 @@ class ZmemMemoryProvider(MemoryProvider):
             scheduler.submit(
                 lambda: self._run_prefetch_job(key, normalized, sid,
                                                namespace, transport,
-                                               generation, token))
+                                               generation, token,
+                                               prompt_timestamp=prompt_ts))
         except Exception:
             with self._state_lock:
                 if self._pending_keys.get(key) == token:
@@ -3390,7 +3478,8 @@ class ZmemMemoryProvider(MemoryProvider):
 
     def _run_prefetch_job(self, key: tuple[str, str], query: str,
                           session_id: str, namespace: str, transport: Any,
-                          generation: int, token: str) -> None:
+                          generation: int, token: str,
+                          prompt_timestamp: Optional[str] = None) -> None:
         """Background warm body: bounded fetch, era-gated store, no raises.
 
         The fetch uses the submit-time pinned transport and namespace (no
@@ -3398,7 +3487,8 @@ class ZmemMemoryProvider(MemoryProvider):
         side effects under the wrong namespace even with a gated put).  The
         pending-check and ``cache.put`` are one ``_state_lock`` critical
         section; the job never touches ``_last_status`` and never writes the
-        ledger.
+        ledger.  ``prompt_timestamp`` (issue #389, AC8) is the submit-time
+        captured clock — the job resolves the submitter's window.
         """
         try:
             if transport is None:
@@ -3416,7 +3506,9 @@ class ZmemMemoryProvider(MemoryProvider):
                     return
             envelope = self._deadline.run(
                 lambda: self._run_live_prefetch(query, session_id, namespace,
-                                                transport),
+                                                transport,
+                                                prompt_timestamp=(
+                                                    prompt_timestamp)),
                 self._deadline_s)
             if not isinstance(envelope, dict) \
                     or self._is_transport_failure(envelope) \
@@ -3623,6 +3715,10 @@ class ZmemMemoryProvider(MemoryProvider):
             else pending_nudge
         query = _compose_provider_query(" ".join(
             (source_text or "").split()), ops_snapshot)
+        # Issue #389 (AC8): the host may supply the prompt's own clock; it
+        # is validated here and rides the live transport call and the
+        # offline-snapshot fallback alike (absent/invalid → wall clock).
+        prompt_ts = _valid_prompt_timestamp(kwargs.get("prompt_timestamp"))
 
         transport = self._transport
         if transport is None or not hasattr(transport, "prefetch"):
@@ -3630,13 +3726,19 @@ class ZmemMemoryProvider(MemoryProvider):
         deadline = self._deadline
 
         def _call() -> Any:
-            return transport.prefetch(
-                query,
+            prefetch_kwargs: Dict[str, Any] = dict(
                 namespace=namespace,
                 session_id=session_id,
                 moment="user_prompt",
                 ops_tokens=list(ops_snapshot),
                 lane="hermes-provider",
+            )
+            # Threaded only when present (mixed-version transport shape).
+            if prompt_ts:
+                prefetch_kwargs["prompt_timestamp"] = prompt_ts
+            return transport.prefetch(
+                query,
+                **prefetch_kwargs,
             )
 
         try:
@@ -3665,6 +3767,9 @@ class ZmemMemoryProvider(MemoryProvider):
             # degrade below ({} — the matrix's "if none" row).  No stamp,
             # no refresh on this lane (a broker-bearing machine owns both).
             offline = _offline_snapshot_envelope(query, namespace, session_id)
+            if offline is not None:
+                offline = _offline_snapshot_envelope(query, namespace, session_id,
+                                                 prompt_timestamp=prompt_ts)
             if offline is not None:
                 envelope = offline
         if not self._provider_envelope_is_valid(envelope):
@@ -3828,6 +3933,9 @@ class ZmemMemoryProvider(MemoryProvider):
         if not query:
             return _tool_error("Missing required parameter: query")
         limit = _clamp_limit(args.get("limit"))
+        # Issue #389 (AC8): the tool schema's optional prompt clock —
+        # validated at this boundary, dropped (never an error) when invalid.
+        prompt_ts = _valid_prompt_timestamp(args.get("prompt_timestamp"))
         # Namespace: explicit arg wins; '*' means "search everything"; default
         # is the session namespace (per-user isolation on shared gateway boxes).
         ns_arg = (args.get("namespace") or "").strip()
@@ -3863,6 +3971,11 @@ class ZmemMemoryProvider(MemoryProvider):
             # recall as an implicit scoped call and can hide foreign rows.
             cli_args += ["--include-global", "--global-limit", "3"]
             cli_args += ["--legacy-unscoped"]
+        # Issue #389 (AC8): forward the validated prompt clock on the local
+        # recall argv (strict ISO — an invalid value already dropped above,
+        # so the store child can never exit-2 on it).
+        if prompt_ts:
+            cli_args += ["--prompt-timestamp", prompt_ts]
         # Empty namespace defaults to the session namespace above; '*' remains
         # unscoped via the compatibility marker above.
         # Issue #289 (T-10): MCP mode routes the search through the hub's
@@ -3875,8 +3988,15 @@ class ZmemMemoryProvider(MemoryProvider):
                 remote_ns = self._namespace
             else:
                 remote_ns = None  # '*' — legacy unscoped union
+            search_kwargs: Dict[str, Any] = {
+                "namespace": remote_ns, "limit": limit}
+            # Issue #389 (AC8): thread the prompt clock to the hub search —
+            # only when present, so a transport predating the parameter keeps
+            # the exact historical call shape.
+            if prompt_ts:
+                search_kwargs["prompt_timestamp"] = prompt_ts
             resp = self._transport.search(query[:_MAX_QUERY_CHARS],
-                                          namespace=remote_ns, limit=limit)
+                                          **search_kwargs)
             if not isinstance(resp, dict) or resp.get("ok") is False \
                     or resp.get("error"):
                 detail = (resp.get("error") or resp.get("reason")

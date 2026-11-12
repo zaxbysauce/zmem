@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 
 from storelib.schema import now_iso
 from storelib.write import _SIGNAL_RANK
@@ -469,8 +470,21 @@ def refresh_belief_heads(conn: sqlite3.Connection, *,
 
 def _newest_updates_dst(conn: sqlite3.Connection, members: list[dict]) -> str | None:
     """The dst of the newest in-topic ``updates`` edge
-    (created_at DESC, src DESC, dst DESC), or None."""
+    (created_at DESC by UTC INSTANT, src DESC, dst DESC), or None.
+
+    Issue #248: ``created_at`` is compared as its parsed UTC instant —
+    offset-aware and subsecond spellings order correctly — never as a raw
+    string. Malformed/empty values rank strictly BELOW every parseable
+    instant (fail-closed: they can never win "newest" while any parseable
+    edge exists; a malformed-only topic still selects deterministically by
+    (src, dst)). Precision is datetime's microsecond resolution: forms
+    with more than six fractional digits truncate, so instants distinct
+    only past the sixth digit tie and resolve by (src, dst).
+    """
+    from storelib.links import _parse_iso_utc
+
     member_ids = sorted({m["id"] for m in members})
+    oldest = (0, datetime.min.replace(tzinfo=timezone.utc))
     best = None
     for src, dst, rel, created_at in conn.execute(
         "SELECT src_id, dst_id, relation, created_at FROM memory_link "
@@ -480,7 +494,9 @@ def _newest_updates_dst(conn: sqlite3.Connection, members: list[dict]) -> str | 
     ):
         if rel != "updates":
             continue
-        key = (created_at or "", src, dst)
+        parsed = _parse_iso_utc(created_at)
+        rank = (1, parsed) if parsed is not None else oldest
+        key = (rank, src, dst)
         if best is None or key > best[0]:
             best = (key, dst)
     return best[1] if best else None

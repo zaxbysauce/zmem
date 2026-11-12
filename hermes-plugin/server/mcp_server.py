@@ -37,6 +37,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1663,6 +1664,30 @@ def _legacy_unscoped_flag(namespace: Optional[str]) -> list[str]:
     return ["--legacy-unscoped"] if not ns or ns == "*" else []
 
 
+# Issue #389 (AC8): strict ISO-8601 gate for a client-supplied prompt
+# timestamp.  The parse mirrors the store CLI's argparse ``_iso8601`` type
+# exactly, so any value admitted here is guaranteed to parse there — a
+# forwarded timestamp can never exit-2 the store child.  An absent,
+# non-string, or unparseable value is dropped with a debug log (never an
+# error on a passive lane); the store keeps its ZMEM_TEST_NOW/now clock
+# seam.  Verbatim duplicate of the hook body / fleet transport / hermes
+# plugin copies (one rule, four standalone trees).
+_PROMPT_TS_MAX = 64
+
+
+def _valid_prompt_timestamp(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _PROMPT_TS_MAX:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
 # Namespace admission goes through the selected checkout's shared validator.
 def _valid_mcp_namespace(namespace: str) -> bool:
     ns = (namespace or "").strip()
@@ -2327,6 +2352,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         query: str,
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
+        prompt_timestamp: Optional[str] = None,
         client_protocol: object = None,
         deadline_ms: object = None,
     ) -> dict[str, Any]:
@@ -2356,6 +2382,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         unfold_hop — after the query-matched results; does not apply to
         session_start / prefetch (those are passive and never unfold).
 
+        Issue #389 (AC8): ``prompt_timestamp`` (optional ISO-8601, e.g.
+        2026-09-10T15:30:00Z) is the prompt's own clock — relative temporal
+        phrases like 'last week' resolve against it instead of wall time.
+        Invalid values are ignored.
+
         Issue #285: ``client_protocol`` (optional, your protocol major —
         see the ``hello`` tool) is refused with the stable
         ``protocol_incompatible`` error when outside the hub's supported
@@ -2374,6 +2405,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         denied = _guard_namespace(namespace)
         if denied:
             return denied
+        # Issue #389 (AC8): validated at this boundary — an invalid value is
+        # dropped (logged at debug), never an error and never an
+        # argparse-exit-2 value on the store child.
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if isinstance(prompt_timestamp, str) and not prompt_ts:
+            logger.debug("recall: dropping invalid prompt_timestamp")
         n = min(_clamp_limit(limit), _HARD_LIMIT_MAX - _LINK_BUDGET_RESERVED)
         args = [
             "recall",
@@ -2386,6 +2423,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args.insert(3, "--include-global")
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
+        if prompt_ts:
+            args += ["--prompt-timestamp", prompt_ts]
         return _parse_results(await _run_store_async(args, deadline=deadline, pool="read"))
 
     @mcp.tool()
@@ -2742,6 +2781,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         query: str,
         namespace: Optional[str] = None,
         limit: int = _DEFAULT_LIMIT,
+        prompt_timestamp: Optional[str] = None,
         client_protocol: object = None,
         deadline_ms: object = None,
     ) -> dict[str, Any]:
@@ -2754,9 +2794,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
 
         v13 (issue #65): reads without a namespace are denied for scoped
         tokens; the response carries the read envelope counts.
-        ``client_protocol`` (issue #285, see ``hello``) is refused with
-        the stable ``protocol_incompatible`` error when outside the
-        window.
+        ``prompt_timestamp`` (issue #389, AC8; optional ISO-8601) is the
+        prompt's own clock for resolving relative temporal phrases —
+        invalid values are ignored. ``client_protocol`` (issue #285, see
+        ``hello``) is refused with the stable ``protocol_incompatible``
+        error when outside the window.
         """
         if not _protocol_allowed(client_protocol):
             return _protocol_refusal(client_protocol)
@@ -2771,6 +2813,12 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         denied = _guard_namespace(namespace)
         if denied:
             return denied
+        # Issue #389 (AC8): validated at this boundary — an invalid value is
+        # dropped (logged at debug), never an error and never an
+        # argparse-exit-2 value on the store child.
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if isinstance(prompt_timestamp, str) and not prompt_ts:
+            logger.debug("search: dropping invalid prompt_timestamp")
         n = _clamp_limit(limit)
         args = [
             "recall",
@@ -2791,6 +2839,8 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             args.insert(3, "--include-global")
         args += _namespace_flag(namespace)
         args += _legacy_unscoped_flag(namespace)
+        if prompt_ts:
+            args += ["--prompt-timestamp", prompt_ts]
         return _parse_results(await _run_store_async(args, deadline=deadline, pool="read"))
 
     @mcp.tool()
@@ -3302,6 +3352,7 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         ops_tokens: list[str] = [],
         reserve: bool = False,
         consume_tasktext: bool = False,
+        prompt_timestamp: Optional[str] = None,
         client_protocol: object = None,
         deadline_ms: object = None,
     ) -> dict[str, Any]:
@@ -3319,6 +3370,11 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         authorized allow-list, so cross-project rows are admitted only from
         allow-listed namespaces (issue #283; the #236 foreign-project
         exclusion is enforced there). ``lane=None`` stays None.
+
+        Issue #389 (AC8): ``prompt_timestamp`` (optional ISO-8601) is the
+        prompt's own clock — relative temporal phrases resolve against it
+        instead of wall time. Invalid values are dropped (never an error on
+        this passive lane).
 
         Issue #285: ``client_protocol`` (see ``hello``) outside the hub's
         supported window FAILS OPEN — the empty envelope with reason
@@ -3405,6 +3461,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         # paired upgrade).
         if consume_tasktext:
             args += ["--consume-tasktext"]
+        # Issue #389 (AC8): the prompt's own clock, validated at this
+        # boundary — an absent or invalid value forwards nothing (never an
+        # error on this passive lane) and a forwarded value can never
+        # exit-2 the store child's argparse.
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if isinstance(prompt_timestamp, str) and not prompt_ts:
+            logger.debug("prefetch: dropping invalid prompt_timestamp")
+        if prompt_ts:
+            args += ["--prompt-timestamp", prompt_ts]
         if caller.scoped:
             for _ns in sorted(caller.namespaces or frozenset()):
                 args += ["--authorized-namespace", _ns]
@@ -3451,6 +3516,15 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
                     "store.py at ZMEM_HOME predates this server "
                     "(no --consume-tasktext support): update the zmem "
                     "checkout ZMEM_HOME points at to >= 0.138.0")
+            if "--prompt-timestamp" in stderr \
+                    and "unrecognized arguments" in stderr:
+                # Issue #389 (AC8): prefetch --prompt-timestamp is NEW on
+                # the prefetch parser (recall's flag predates it) — same
+                # mixed-version actionability as the flags above.
+                return _error(
+                    "store.py at ZMEM_HOME predates this server "
+                    "(no prefetch --prompt-timestamp support): update the "
+                    "zmem checkout ZMEM_HOME points at to >= 0.151.0")
             if "--reserve" in stderr and "unrecognized arguments" in stderr:
                 # PRR-011: same mixed-version actionability as the flag
                 # above. --reserve first shipped in 0.109.0 (verified by

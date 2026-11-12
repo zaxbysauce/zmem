@@ -137,6 +137,7 @@ import sys
 import tempfile
 import time
 import traceback
+import unittest
 import uuid
 from pathlib import Path
 
@@ -153,12 +154,31 @@ PYTHON = sys.executable
 # subprocesses.
 # ---------------------------------------------------------------------------
 _MODULE_TMP = tempfile.mkdtemp(prefix="zmem-s376-module-")
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (standalone runs execute doModuleCleanups; one-process runs never
+# depend on it — this module's legs are subprocess-driven with scrubbed
+# envs).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+    "ZMEM_MODEL_AUTODOWNLOAD")}
 os.environ["ZMEM_STORE"] = os.path.join(_MODULE_TMP, "store.sqlite")
 os.environ.pop("ZMEM_DATA", None)
 os.environ.pop("CLAUDE_PLUGIN_DATA", None)
 os.environ.pop("ZCODE_PLUGIN_DATA", None)
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"  # never download a model
 atexit.register(shutil.rmtree, _MODULE_TMP, True)
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+unittest.addModuleCleanup(_restore_module_env)
 
 import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 

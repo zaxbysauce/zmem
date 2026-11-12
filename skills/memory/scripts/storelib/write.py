@@ -134,11 +134,15 @@ def _resolve_occurrence(
 
 
 def _clear_occurrence(conn: sqlite3.Connection, memory_id: str) -> None:
-    """Drop the v17 occurrence row for a memory being tombstoned/absorbed.
+    """Drop the v17 occurrence row for a GENERATED row being tombstoned.
 
-    Same defect-class guardrail as `_clear_expiry`: every writer that
-    tombstones or hard-removes a memory row calls this in the SAME
-    transaction so a `memory_occurrence` row can never outlive its parent.
+    Two-tier law (issue #389): called ONLY by generated-row tombstone
+    writers — organize's stale summaries and the entity reconcile merge —
+    which keep same-transaction cleanup. User-event tombstones (update /
+    supersede / consolidate-absorb) RETAIN the occurrence row per issue
+    #389 (as-of recall surfaces it inside the tombstoned row's validity
+    window); hard deletes (purge / import-store) still remove it through
+    purge._ID_SIDE_TABLES.
     """
     conn.execute(
         "DELETE FROM memory_occurrence WHERE memory_id=?", (memory_id,))
@@ -2214,7 +2218,10 @@ def supersede_memory(
         # stale-summary, sync tombstone, plus the hard-DELETE paths in
         # purge/import-store via purge._ID_SIDE_TABLES).
         _clear_expiry(conn, mid)
-        _clear_occurrence(conn, mid)
+        # Issue #389: the occurrence row is intentionally RETAINED on this
+        # soft tombstone — as-of recall surfaces it inside the tombstoned
+        # row's validity window; hard delete via purge/_ID_SIDE_TABLES
+        # still removes it.
         if started_tx:
             _commit(conn)
     except Exception:
@@ -2573,7 +2580,10 @@ def update_memory(
         # inherited pair), so the side table never holds a record keyed to a
         # dead parent.
         _clear_expiry(conn, mid)
-        _clear_occurrence(conn, mid)
+        # Issue #389: the OLD row's occurrence row is intentionally RETAINED
+        # on this soft tombstone — as-of recall surfaces it inside the
+        # tombstoned row's validity window; hard delete via
+        # purge/_ID_SIDE_TABLES still removes it.
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.

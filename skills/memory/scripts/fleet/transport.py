@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime
 from enum import Enum
 import logging
 from pathlib import Path
@@ -223,6 +224,31 @@ def _coerce_envelope(payload: Any) -> dict[str, Any]:
 def _query_args(query: str) -> list[str]:
     """One ``--query`` pair; a leading-dash value rides the ``=`` form."""
     return ["--query=" + query] if query.startswith("-") else ["--query", query]
+
+
+# Issue #389 (AC8): strict ISO-8601 gate for a prompt-supplied timestamp at
+# the transport boundary.  The parse mirrors the store CLI's argparse
+# ``_iso8601`` type exactly, so any value admitted here is guaranteed to
+# parse there — a forwarded timestamp can never exit-2 the store child.
+# An absent, non-string, or unparseable value is dropped (never an error);
+# the store keeps its ZMEM_TEST_NOW/now clock seam.  This body is the
+# canonical fleet copy (the broker shares it); the hook body, the hermes
+# plugin, and the MCP server carry verbatim duplicates (one rule, four
+# trees — each must stay standalone-importable).
+_PROMPT_TS_MAX = 64
+
+
+def _valid_prompt_timestamp(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _PROMPT_TS_MAX:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
 
 
 class _LocalOperation:
@@ -491,7 +517,8 @@ class McpHttp:
                  client_protocol: int = CLIENT_PROTOCOL_MAJOR,
                  deadline_ms: int | None = None,
                  reserve: bool = False,
-                 consume_tasktext: bool = False) -> dict[str, Any]:
+                 consume_tasktext: bool = False,
+                 prompt_timestamp: str | None = None) -> dict[str, Any]:
         arguments: dict[str, Any] = {
             "query": query,
             "namespace": namespace,
@@ -510,6 +537,12 @@ class McpHttp:
         # delegation.
         if consume_tasktext:
             arguments["consume_tasktext"] = True
+        # Issue #389 (AC8): the prompt's own clock rides the hub request
+        # ONLY when a strict-ISO value is present (validated here; the hub
+        # tool validates again at its own store argv boundary).
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if prompt_ts:
+            arguments["prompt_timestamp"] = prompt_ts
         return self._envelope_call("prefetch", arguments)
 
     def session_start(self, namespace: str, session_id: str,
@@ -681,12 +714,19 @@ class McpHttp:
 
     def search(self, query: str, *, namespace: str | None = None,
                limit: int | None = None,
+               prompt_timestamp: str | None = None,
                deadline_ms: int | None = None) -> dict[str, Any]:
         args: dict[str, Any] = {"query": query, "deadline_ms": deadline_ms}
         if namespace is not None:
             args["namespace"] = namespace
         if limit is not None:
             args["limit"] = limit
+        # Issue #389 (AC8): the prompt's own clock rides the hub search
+        # request only when a strict-ISO value is present (the hub's search
+        # tool validates again at its store argv boundary).
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if prompt_ts is not None:
+            args["prompt_timestamp"] = prompt_ts
         return self._explicit_call("search", args, "hub-response-invalid")
 
     def recent(self, *, namespace: str | None = None,
@@ -796,7 +836,8 @@ class LocalSubprocess:
     def prefetch(self, query: str, *, namespace: str, session_id: str,
                  moment: str, ops_tokens: list[str],
                  lane: str = "hermes-provider",
-                 consume_tasktext: bool = False) -> dict[str, Any]:
+                 consume_tasktext: bool = False,
+                 prompt_timestamp: str | None = None) -> dict[str, Any]:
         argv = [sys.executable or "python", self._store_py, "prefetch"]
         argv.extend(_query_args(query))
         argv.extend(["--namespace", namespace, "--session-id", session_id,
@@ -807,6 +848,14 @@ class LocalSubprocess:
         # store argv (mirror of the hub-side MCP param).
         if consume_tasktext:
             argv.append("--consume-tasktext")
+        # Issue #389 (AC8): forward the prompt's own clock to the local
+        # store argv — strict-ISO validated at this argv boundary, so a
+        # forwarded value can never exit-2 the store child's argparse and
+        # an absent/invalid one forwards nothing (the store keeps its
+        # ZMEM_TEST_NOW/now seam).
+        prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if prompt_ts:
+            argv.extend(["--prompt-timestamp", prompt_ts])
         argv.append("--json")
         try:
             child_env = os.environ.copy()

@@ -895,13 +895,17 @@ def _serve_offline_recent(env: dict[str, str], namespace: str | None,
 def _serve_offline_read(env: dict[str, str], *, query: str,
                         namespace: str, moment: str, session_id: str,
                         lane: str | None = None,
+                        prompt_timestamp: str | None = None,
                         limit: int = 5) -> tuple[dict | None, str]:
     """Serve one read moment from the snapshot via the SAME selector.
 
     Returns (envelope, state): envelope None when the state is none or
     expired.  Zero-write: the selector runs with ``reserve=False`` and
     ``no_telemetry=True``; the label is prepended to the rendered fence
-    as a broker-emitted header line.
+    as a broker-emitted header line.  ``prompt_timestamp`` (issue #389,
+    AC8) threads the submitter's prompt clock into the selector — the
+    serve resolves relative temporal phrases at serve time, so it must
+    not silently fall back to the serving process's wall clock.
     """
     try:
         conn, meta = _load(env)
@@ -933,7 +937,8 @@ def _serve_offline_read(env: dict[str, str], *, query: str,
             conn, query=query, namespace=namespace, moment=moment,
             session_id=session_id, lane=lane, limit=limit,
             budget_tokens=inject_token_budget(),
-            authorized_namespaces=None, reserve=False, no_telemetry=True)
+            authorized_namespaces=None, reserve=False, no_telemetry=True,
+            prompt_timestamp=prompt_timestamp)
     except Exception:  # noqa: BLE001 - the offline serve fails open
         return None, state
     finally:

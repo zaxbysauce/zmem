@@ -678,5 +678,130 @@ class BeliefHeadTest(unittest.TestCase):
                     "content fields must be capped at 400 UTF-8 bytes")
 
 
+class NewestUpdateOrderingTest(unittest.TestCase):
+    """#248 AC2/AC3: `_newest_updates_dst` orders `updates` edges by their
+    parsed UTC INSTANT — offset and subsecond spellings order correctly,
+    and a malformed timestamp ranks strictly below every parseable value
+    (fail-closed: malformed can never win "newest" while a parseable edge
+    exists). Direct unit pins; the head-content consequence (the correction
+    quote) is covered by test_correction_uses_newest_update_quote."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.old_env = os.environ.copy()
+        for key in _ROUTE_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update({
+            "ZMEM_STORE": str(self.root / "store.sqlite"),
+            "ZMEM_DATA": str(self.root),
+            "ZMEM_MODELS_DIR": str(self.root / "missing-models"),
+            _ZMEM_MODEL_AUTO_DL: "0",
+        })
+        self.conn = sqlite3.connect(self.root / "store.sqlite")
+        self.conn.row_factory = sqlite3.Row
+        from storelib import beliefs, schema  # noqa: E402
+        self.beliefs = beliefs
+        schema.init_db(self.conn)
+        schema.migrate(self.conn)
+        self._seq = 0
+        self._members: list[dict] = []
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        os.environ.clear()
+        os.environ.update(self.old_env)
+        self.tmp.cleanup()
+
+    def _row(self, tag: str) -> dict:
+        self._seq += 1
+        mid = f"ord{self._seq:03d}-{tag}"
+        self.conn.execute(
+            """INSERT INTO memory
+               (id, namespace, type, content, tags, source_ref, source_hash,
+                confidence, signal, valid_from, superseded_at, ingestion_ts,
+                retrieval_count, taint, trust_score)
+               VALUES (?,?,?,?,?,'','',?,?,'',NULL,?,0,?,?)""",
+            (mid, "project:ordering", "fact", f"row {tag}", "",
+             0.9, "test", "", "trusted_internal", 0.5))
+        row = {"id": mid}
+        self._members.append(row)
+        return row
+
+    def _edge(self, src: dict, dst: dict, created_at: str) -> None:
+        self.conn.execute(
+            "INSERT INTO memory_link (src_id, dst_id, relation, score, "
+            "created_at) VALUES (?,?,?,?,?)",
+            (src["id"], dst["id"], "updates", 0.8, created_at))
+
+    def test_offset_misorder_returns_true_newest(self):
+        # "-05:00" edge is the LATER UTC instant (2026-01-02T01:00:00Z) but
+        # sorts lexically EARLIER than the Z-form 2026-01-01T23:00:00Z.
+        src, later, earlier = self._row("src"), self._row("later"), self._row("earlier")
+        self._edge(src, later, "2026-01-01T20:00:00-05:00")
+        self._edge(src, earlier, "2026-01-01T23:00:00Z")
+        self.conn.commit()
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            later["id"])
+
+    def test_offset_subsecond_returns_true_newest(self):
+        src, later, earlier = self._row("src"), self._row("later"), self._row("earlier")
+        self._edge(src, later, "2026-01-01T20:00:00.900-05:00")  # == 01:00:00.900Z
+        self._edge(src, earlier, "2026-01-02T01:00:00.250Z")
+        self.conn.commit()
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            later["id"])
+
+    def test_malformed_never_wins_over_parseable(self):
+        src, bad, good = self._row("src"), self._row("bad"), self._row("good")
+        self._edge(src, bad, "not-a-timestamp")
+        self._edge(src, good, "2026-01-05T00:00:00Z")
+        self.conn.commit()
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            good["id"],
+            "a malformed created_at must rank below every parseable value")
+
+    def test_malformed_only_topic_still_selects_deterministically(self):
+        # Fail-closed-to-oldest still returns SOME dst when nothing
+        # parseable exists — deterministic by (src, dst).
+        src, a, b = self._row("src"), self._row("a"), self._row("b")
+        self._edge(src, a, "garbage-one")
+        self._edge(src, b, "garbage-two")
+        self.conn.commit()
+        expect = max(a["id"], b["id"])
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            expect)
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            expect, "the malformed-only tiebreak must be deterministic")
+
+    def test_same_string_tiebreak_is_max_dst(self):
+        src, a, b = self._row("src"), self._row("a"), self._row("b")
+        self._edge(src, a, "2026-01-02T01:00:00Z")
+        self._edge(src, b, "2026-01-02T01:00:00Z")
+        self.conn.commit()
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            max(a["id"], b["id"]),
+            "equal instants resolve by the documented (src, dst) max "
+            "tiebreak")
+
+    def test_submicrosecond_precision_truncates_and_ties(self):
+        # Documented precision policy: beyond six fractional digits the
+        # parser truncates, so these two DISTINCT instants tie and resolve
+        # by (src, dst) — never silently misorder.
+        src, a, b = self._row("src"), self._row("a"), self._row("b")
+        self._edge(src, a, "2026-01-02T01:00:00.1234567Z")
+        self._edge(src, b, "2026-01-02T01:00:00.1234568Z")
+        self.conn.commit()
+        self.assertEqual(
+            self.beliefs._newest_updates_dst(self.conn, self._members),
+            max(a["id"], b["id"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,8 +8,10 @@ Classes (the issue's declared set):
                         endpoints clamp.
   OccurrenceWriteTest — atomic event occurrence writes, non-event rejection
                         (CLI exit 2, no row), the four update/fold transition
-                        tests, and the tombstone cleanup coverage across
-                        supersede / consolidate absorb / organize.
+                        tests, and the two-tier tombstone law (#389:
+                        supersede / consolidate absorb retain, organize
+                        cleans, purge's hard delete removes via the
+                        side-table registry).
   TemporalArmTest     — the in-window event ranks first under the seeded
                         as-of fixture, the default/env cap contract, and the
                         temporal arm is additive beside the graph arm.
@@ -43,18 +45,38 @@ os.environ["ZMEM_STORE"] = STORE_PATH
 os.environ["ZMEM_DATA"] = _TMP
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "missing-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-# The temporal-cap env is varied per test below; start from the default.
-os.environ.pop("ZMEM_ARM_CAP_TEMPORAL", None)
-# Writer time is always a fixed `now=` argument (never ZMEM_TEST_NOW — that
-# seam is recall-only per the issue); the recall tests set it around calls.
-os.environ.pop("ZMEM_TEST_NOW", None)
 # No auto entity links in the fixtures (the test_graph_seed_arm.py pin).
 os.environ["ZMEM_LINK_THRESHOLD"] = "1.01"
 os.environ.setdefault("ZMEM_EMBED_PROFILE", "minilm")  # model-absent shape
+# Issue #389 AC9 clock/cap hygiene: ZMEM_TEST_NOW and ZMEM_ARM_CAP_TEMPORAL
+# are NO LONGER module-level mutations (a module-level set/pop leaks the
+# ambient for every later-imported module in a one-process run); the
+# store-touching classes pin them per setUp with cleanup restores. Writer
+# time is always a fixed `now=` argument (never ZMEM_TEST_NOW — that seam is
+# recall-only per the issue); the recall helpers set ZMEM_TEST_NOW strictly
+# around calls. Every RETAINED module-level mutation above is paired with an
+# explicit unittest.addModuleCleanup restore below (AC9: no module-level
+# mutation lacking an addCleanup-family restore). Standalone runs execute
+# doModuleCleanups; one-process runs never depend on them — the isolation
+# canary's driver pins the import-frozen constants and per-class pins carry
+# the call-time ones.
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_LINK_THRESHOLD", "ZMEM_EMBED_PROFILE")}
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import contextlib  # noqa: E402
+import hashlib  # noqa: E402
 import io  # noqa: E402
 import json  # noqa: E402
 import re  # noqa: E402
@@ -63,7 +85,10 @@ import subprocess  # noqa: E402
 import unittest  # noqa: E402
 import uuid  # noqa: E402
 
+unittest.addModuleCleanup(_restore_module_env)
+
 from storelib import recall as recall_mod  # noqa: E402
+from storelib import schema as schema_mod  # noqa: E402
 from storelib.consolidate import _absorb_into_keeper  # noqa: E402
 from storelib.links import add_link_pair  # noqa: E402
 from storelib.organize import _supersede_stale_summaries  # noqa: E402
@@ -86,11 +111,15 @@ UUID_SHAPE = re.compile(
 
 
 def _reset_store_file():
-    """Per-test isolation on the frozen module path (the graph-arm pattern:
-    delete the file while no connection is open)."""
+    """Per-test isolation on the FROZEN module path (the graph-arm pattern:
+    delete the file while no connection is open). Issue #389 AC9 invariant:
+    the reset resolves storelib.schema.STORE_PATH — the path the FIRST
+    storelib import in this process froze — never os.environ at call time,
+    so the reset can never target a different file than connect() opens
+    (standalone the frozen path IS this module's own pin above)."""
     for suffix in ("", "-wal", "-shm"):
         try:
-            os.unlink(STORE_PATH + suffix)
+            os.unlink(str(schema_mod.STORE_PATH) + suffix)
         except OSError:
             pass
 
@@ -99,7 +128,7 @@ def _cli_env(store=None):
     env = {
         **{k: v for k, v in os.environ.items()
            if not k.startswith("ZMEM_")},
-        "ZMEM_STORE": store or STORE_PATH,
+        "ZMEM_STORE": store or str(schema_mod.STORE_PATH),
         "ZMEM_DATA": _TMP,
         "ZMEM_MODELS_DIR": os.path.join(_TMP, "missing-models"),
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
@@ -122,6 +151,42 @@ def _read_asof_fixture():
     return rows
 
 
+def _pin_env_values(**pins):
+    """Set each `pins` key (a None value POPS it) and return a restore
+    callable for addCleanup/addClassCleanup (issue #389 AC9: ambient env
+    writes are class/test-scoped and always restored)."""
+    prior = {k: os.environ.get(k) for k in pins}
+    for key, value in pins.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+    def _restore():
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return _restore
+
+
+def _pin_profile(name):
+    """Pin ZMEM_EMBED_PROFILE to `name` for the calling class/test and
+    return a restore callable. The profile resolves CALL-TIME
+    (embed_profiles.resolve_active_profile, never cached), so pinning at
+    the START of setUp/setUpClass covers every fixture built afterwards —
+    and this asserts the resolved value immediately (the plan's build-time
+    profile assertion: a co-run ambient must never flip the fixture shape)."""
+    import embed_profiles as _ep
+    restore = _pin_env_values(ZMEM_EMBED_PROFILE=name)
+    active = _ep.resolve_active_profile()
+    assert active == name, (
+        "build-time profile assertion failed: pinned %r but ambient "
+        "resolved %r" % (name, active))
+    return restore
+
+
 def _seed_asof_store(rows, store=None):
     """Seed the issue fixture rows exactly like the frozen check driver:
     CLI `add` per row (the event rows through the new occurrence flags),
@@ -129,7 +194,7 @@ def _seed_asof_store(rows, store=None):
     window (the row with a non-empty valid_until is the superseded one and
     also gets its tombstone), renaming the id in EVERY memory_id side table.
     """
-    store = store or STORE_PATH
+    store = store or str(schema_mod.STORE_PATH)
     env = _cli_env(store)
     env["ZMEM_TEST_NOW"] = PROMPT_TS
     env.pop("ZMEM_ARM_CAP_TEMPORAL", None)
@@ -320,12 +385,60 @@ class RelativePhraseTest(unittest.TestCase):
                                               "not-a-timestamp"), ("", ""))
 
 
+class FixtureDigestTest(unittest.TestCase):
+    """Issue #389 item 5: pin the GENERATED fixture's digest.
+
+    The correctness oracle for the temporal phrases is the HAND-AUTHORED
+    expected_start/expected_end literals in phrases.json (asserted
+    per-record in RelativePhraseTest above); the byte-compare against a
+    re-run of parse_relative_range only pins determinism. This digest pin
+    adds tamper evidence: an in-place edit to the committed
+    phrases.expected.json bytes is detectable without re-running the
+    generator. Regenerate the constant with:
+    python tests/fixtures/temporal/generate_expected.py (it prints the
+    sha256 of the bytes it writes).
+    """
+
+    EXPECTED_PHRASES_SHA256 = (
+        "5defc54f3835a511b183e33d6d3020adc53cd23bf5c03c0cee1f1048599b048c")
+
+    def test_expected_bytes_digest_is_pinned(self):
+        data = (FIXTURES_DIR / "temporal" /
+                "phrases.expected.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(data).hexdigest(), self.EXPECTED_PHRASES_SHA256,
+            "phrases.expected.json bytes changed — regenerate deliberately "
+            "via tests/fixtures/temporal/generate_expected.py and re-pin "
+            "the digest (the correctness oracle stays phrases.json)")
+
+    def test_in_place_edit_is_detectable(self):
+        data = bytearray((FIXTURES_DIR / "temporal" /
+                          "phrases.expected.json").read_bytes())
+        # Deterministic single-byte tamper in the first timestamp.
+        data[2] = ord("9") if data[2] != ord("9") else ord("8")
+        self.assertNotEqual(
+            hashlib.sha256(bytes(data)).hexdigest(),
+            self.EXPECTED_PHRASES_SHA256,
+            "a one-byte edit to the generated fixture must change the "
+            "digest — the pin is real tamper evidence")
+
+
 class OccurrenceWriteTest(unittest.TestCase):
     """Atomic occurrence writes + the update/fold transition matrix + the
-    tombstone cleanup sites. Writer time is ALWAYS a fixed `now=` argument
-    (never ZMEM_TEST_NOW)."""
+    two-tier tombstone law (#389: user-event tombstones retain, generated
+    rows clean, purge's hard delete removes via the side-table registry).
+    Writer time is ALWAYS a fixed `now=` argument (never ZMEM_TEST_NOW)."""
 
     def setUp(self):
+        # Issue #389 AC9 per-class pins, BEFORE any store fixture is built:
+        # model-absent 'minilm' (under a co-run's ambient 'fake' profile the
+        # write path's semantic dedup goes LIVE and folds fixture rows), no
+        # frozen clock (writer time is always a fixed `now=` argument — the
+        # ZMEM_TEST_NOW seam is recall-only), and the temporal cap at its
+        # default (varied per test below).
+        self.addCleanup(_pin_profile("minilm"))
+        self.addCleanup(_pin_env_values(ZMEM_TEST_NOW=None,
+                                        ZMEM_ARM_CAP_TEMPORAL=None))
         _reset_store_file()
         self.conn = connect()
         _prepare_store(self.conn)
@@ -441,18 +554,23 @@ class OccurrenceWriteTest(unittest.TestCase):
         new_id = str(upd)
         self.assertNotEqual(new_id, old_id)
         # The replacement row INHERITS the exact occurrence triple; the old
-        # id's side-table row is gone (an event never drops out of the arm).
+        # id RETAINS its occurrence row (issue #389: as-of recall inside
+        # the tombstoned row's validity window still reaches the event).
         self.assertEqual(
             self._occurrence(new_id),
             ("2026-09-01T08:00:00Z", "2026-09-03T08:00:00Z",
              "2026-09-03T09:00:00Z"))
-        self.assertIsNone(self._occurrence(old_id))
+        self.assertIsNotNone(self._occurrence(old_id))
+        self.assertEqual(
+            self._occurrence(old_id),
+            ("2026-09-01T08:00:00Z", "2026-09-03T08:00:00Z",
+             "2026-09-03T09:00:00Z"))
         old = self.conn.execute(
             "SELECT superseded_at FROM memory WHERE id=?",
             (old_id,)).fetchone()
         self.assertIsNotNone(old[0])
 
-    def test_update_event_to_non_event_cleans_occurrence(self):
+    def test_update_event_to_non_event_retains_occurrence(self):
         res = add_memory(
             self.conn, namespace=NS, type_="event",
             content="event becoming a fact",
@@ -464,11 +582,17 @@ class OccurrenceWriteTest(unittest.TestCase):
             self.conn, mid=old_id, content="event becoming a fact",
             type_="fact", now="2026-09-10T16:00:00Z")
         self.assertTrue(created_new)
-        self.assertIsNone(self._occurrence(old_id),
-                          "the old id's occurrence must be cleaned")
+        # Issue #389: the old id's occurrence row survives its soft
+        # tombstone; only the fact replacement carries none.
+        self.assertIsNotNone(
+            self._occurrence(old_id),
+            "the old id's occurrence must be retained on the soft tombstone")
+        self.assertEqual(
+            self._occurrence(old_id),
+            ("2026-09-01T08:00:00Z", "2026-09-02T08:00:00Z", FIXED_NOW))
         self.assertIsNone(self._occurrence(str(upd)),
                           "a fact replacement carries no occurrence")
-        self.assertEqual(self._count("memory_occurrence"), 0)
+        self.assertEqual(self._count("memory_occurrence"), 1)
 
     def test_update_non_event_to_event_refused(self):
         res = add_memory(
@@ -521,8 +645,14 @@ class OccurrenceWriteTest(unittest.TestCase):
         self.assertEqual(self._count("memory_occurrence"), 1,
                          "the fold must never insert a second occurrence row")
 
-    def test_supersede_and_consolidate_and_organize_clean_occurrence(self):
-        # --- supersede: the occurrence dies with the parent tombstone. ---
+    def test_tombstone_retention_and_organize_cleanup(self):
+        # Two-tier law (issue #389): USER-event tombstones (supersede,
+        # consolidate absorb) RETAIN the occurrence row so as-of recall
+        # surfaces the event inside the tombstoned row's validity window;
+        # generated rows (organize stale summaries) KEEP the
+        # same-transaction cleanup; purge's hard delete removes the row
+        # through the side-table registry.
+        # --- supersede: the occurrence SURVIVES the user tombstone. ---
         res = add_memory(
             self.conn, namespace=NS, type_="event",
             content="superseded event occurrence",
@@ -532,11 +662,12 @@ class OccurrenceWriteTest(unittest.TestCase):
         self.assertIsNotNone(self._occurrence(str(res)))
         self.assertTrue(
             supersede_memory(self.conn, str(res), "test reason"))
-        self.assertIsNone(self._occurrence(str(res)),
-                          "supersede must clean memory_occurrence in the "
-                          "same transaction")
+        self.assertEqual(
+            self._occurrence(str(res)),
+            ("2026-09-01T08:00:00Z", "2026-09-02T08:00:00Z", FIXED_NOW),
+            "supersede must RETAIN memory_occurrence (issue #389)")
 
-        # --- consolidate absorb: the ABSORBED row's occurrence is cleaned. ---
+        # --- consolidate absorb: the ABSORBED row's occurrence is RETAINED. ---
         keeper = add_memory(
             self.conn, namespace=NS, type_="fact",
             content="cluster keeper narrative about rotating credentials",
@@ -555,16 +686,18 @@ class OccurrenceWriteTest(unittest.TestCase):
         _absorb_into_keeper(
             self.conn, keeper_row, absorbed_row, now="2026-09-10T17:00:00Z")
         self.conn.commit()
-        self.assertIsNone(self._occurrence(str(absorbed)),
-                          "the consolidate absorb must clean the absorbed "
-                          "row's occurrence in the same transaction")
+        self.assertEqual(
+            self._occurrence(str(absorbed)),
+            ("2026-09-02T08:00:00Z", "2026-09-02T10:00:00Z", FIXED_NOW),
+            "the consolidate absorb must RETAIN the absorbed row's "
+            "occurrence (issue #389)")
         self.assertIsNotNone(self.conn.execute(
             "SELECT superseded_at FROM memory WHERE id=?",
             (str(absorbed),)).fetchone()[0])
 
         # --- organize stale-summary re-key: the tombstoned summary's
         # occurrence (here: an imported stray row keyed to a summary) is
-        # cleaned with the tombstone. ---
+        # cleaned with the tombstone — the generated tier KEEPS cleanup. ---
         summary = add_memory(
             self.conn, namespace=NS, type_="fact",
             content="organize summary row for the topic guard",
@@ -592,14 +725,168 @@ class OccurrenceWriteTest(unittest.TestCase):
             "SELECT superseded_at FROM memory WHERE id=?",
             (str(summary),)).fetchone()[0])
 
+        # --- purge hard delete: the side-table registry still removes a
+        # RETAINED occurrence row when the parent is hard-deleted. The
+        # content's only >=8-char token is the synthetic zebraquux needle
+        # (the tests/test_q01_purge.py convention) so purge's byte-level
+        # residue verify cannot false-positive on schema vocabulary. ---
+        hard = add_memory(
+            self.conn, namespace=NS, type_="event",
+            content="purge leg zebraquux marker",
+            signal="test", now=FIXED_NOW,
+            occurred_start="2026-09-01T08:00:00Z",
+            occurred_end="2026-09-02T08:00:00Z")
+        hard_id = str(hard)
+        self.assertTrue(supersede_memory(self.conn, hard_id, "purge leg"))
+        self.assertIsNotNone(self._occurrence(hard_id),
+                             "supersede must RETAIN the occurrence row")
+        self.conn.commit()
+        proc = subprocess.run(
+            [sys.executable, str(STORE_PY), "purge", "--id", hard_id],
+            cwd=str(REPO_ROOT), env=_cli_env(), capture_output=True, text=True,
+            timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
+        self.assertIsNone(self._occurrence(hard_id),
+                          "the purge hard delete must remove the occurrence "
+                          "row via the side-table registry")
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM memory WHERE id=?", (hard_id,)).fetchone(),
+            "the purged parent row must be gone")
+
+    def test_update_dedup_fold_retains_occurrence(self):
+        # Issue #389 (update-fold retention): an update whose content
+        # dedup-folds into an EXISTING keeper tombstones the old row — its
+        # occurrence row must SURVIVE that soft tombstone (the historical
+        # row stays temporal-arm-reachable), the keeper keeps its own
+        # occurrence, exactly two occurrence rows exist (old + keeper), and
+        # the reachability partitions: as-of between the old row's two
+        # writes returns it while live recall returns the keeper.
+        old = add_memory(
+            self.conn, namespace=NS, type_="event",
+            content=QUERY,
+            signal="test", now="2026-09-03T09:00:00Z",
+            occurred_start="2026-09-01T08:00:00Z",
+            occurred_end="2026-09-03T08:00:00Z",
+            mentioned_at="2026-09-03T09:00:00Z")
+        old_id = str(old)
+        keeper = add_memory(
+            self.conn, namespace=NS, type_="event",
+            content=QUERY + " at the fold cluster",
+            signal="test", now="2026-09-04T09:00:00Z",
+            occurred_start="2026-08-20T08:00:00Z",
+            occurred_end="2026-08-21T08:00:00Z",
+            mentioned_at="2026-08-21T09:00:00Z")
+        keeper_id = str(keeper)
+        # The update adopts the keeper's exact content -> exact-match dedup
+        # folds the old row into the keeper (embeddings are unavailable in
+        # this fixture shape, so the exact lane is the fold trigger).
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            upd, created_new = update_memory(
+                self.conn, mid=old_id, content=QUERY + " at the fold cluster",
+                now="2026-09-10T16:00:00Z")
+        self.assertFalse(created_new)
+        self.assertEqual(str(upd), keeper_id)
+        self.assertIn("merged into existing live memory", buf.getvalue(),
+                      "the update did not fold at all — pin is vacuous")
+        # Retention: the OLD row's occurrence survives its soft tombstone;
+        # the keeper keeps its OWN occurrence; nothing else exists.
+        self.assertEqual(
+            self._occurrence(old_id),
+            ("2026-09-01T08:00:00Z", "2026-09-03T08:00:00Z",
+             "2026-09-03T09:00:00Z"),
+            "the folded-away row's occurrence must be RETAINED (#389)")
+        self.assertEqual(
+            self._occurrence(keeper_id),
+            ("2026-08-20T08:00:00Z", "2026-08-21T08:00:00Z",
+             "2026-08-21T09:00:00Z"),
+            "the keeper keeps its own occurrence")
+        self.assertEqual(
+            self._count("memory_occurrence"), 2,
+            "exactly the old row's and the keeper's occurrence rows exist")
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT superseded_at FROM memory WHERE id=?",
+            (old_id,)).fetchone()[0])
+        # Reachability partition: as-of between the old row's add (09-03)
+        # and the fold (09-10) still returns the OLD row through the
+        # temporal arm (the retained occurrence is the only way the arm can
+        # reach it); live recall returns the keeper only.
+        between = _recall_envelope(self.conn, namespace=NS,
+                                   as_of="2026-09-05T00:00:00Z")
+        between_ids = [r["id"] for r in between["results"]]
+        self.assertIn(old_id, between_ids,
+                      "historical as-of recall lost the tombstoned event")
+        self.assertGreaterEqual(between["arms"]["temporal"]["post"], 1,
+                                "temporal arm empty at as-of: %r"
+                                % (between["arms"],))
+        live = _recall_envelope(self.conn, namespace=NS)
+        live_ids = [r["id"] for r in live["results"]]
+        self.assertIn(keeper_id, live_ids)
+        self.assertNotIn(old_id, live_ids)
+
+    def test_update_partition_between_asof_windows(self):
+        # Issue #389 partition safety: update_memory closes the old row's
+        # validity at the tombstone instant and the replacement starts at
+        # that same instant, so the as-of windows partition exactly — as-of
+        # between the two writes returns EXACTLY the old row (temporal arm
+        # pre>=1 post>=1), as-of after the update returns EXACTLY the
+        # replacement, and live recall returns EXACTLY the replacement.
+        res = add_memory(
+            self.conn, namespace=NS, type_="event",
+            content=QUERY,
+            signal="test", now="2026-09-03T09:00:00Z",
+            occurred_start="2026-09-01T08:00:00Z",
+            occurred_end="2026-09-03T08:00:00Z",
+            mentioned_at="2026-09-03T09:00:00Z")
+        old_id = str(res)
+        upd, created_new = update_memory(
+            self.conn, mid=old_id, content=QUERY + " (amended)",
+            now="2026-09-10T16:00:00Z")
+        self.assertTrue(created_new)
+        new_id = str(upd)
+        self.assertNotEqual(new_id, old_id)
+
+        # As-of between the add (09-03) and the update (09-10): EXACTLY the
+        # old row — the replacement is not yet valid, and the old row's
+        # retained occurrence keeps the temporal arm armed.
+        between = _recall_envelope(self.conn, namespace=NS,
+                                   as_of="2026-09-05T00:00:00Z")
+        self.assertEqual([r["id"] for r in between["results"]], [old_id],
+                         "as-of between the writes must return exactly the "
+                         "old row: %r" % (between["results"],))
+        self.assertGreaterEqual(between["arms"]["temporal"]["pre"], 1)
+        self.assertGreaterEqual(between["arms"]["temporal"]["post"], 1,
+                                "temporal arm empty at as-of: %r"
+                                % (between["arms"],))
+
+        # As-of after the update: EXACTLY the replacement — the old row's
+        # validity closed at the tombstone instant.
+        after = _recall_envelope(self.conn, namespace=NS,
+                                 as_of="2026-09-12T00:00:00Z")
+        self.assertEqual([r["id"] for r in after["results"]], [new_id],
+                         "as-of after the update must return exactly the "
+                         "replacement: %r" % (after["results"],))
+
+        # Live (no as-of): EXACTLY the replacement.
+        live = _recall_envelope(self.conn, namespace=NS)
+        self.assertEqual([r["id"] for r in live["results"]], [new_id],
+                         "live recall must return exactly the replacement: "
+                         "%r" % (live["results"],))
+
 
 class TemporalArmTest(unittest.TestCase):
     """The capped temporal candidate arm over the seeded as-of fixture."""
 
     def setUp(self):
+        # Issue #389 AC9 per-class pins, BEFORE _seed_asof_store builds the
+        # fixture (its CLI children pin their own env; the in-process adds in
+        # the additive test resolve the profile call-time): model-absent
+        # 'minilm', no ambient frozen clock, temporal cap at default.
+        self.addCleanup(_pin_profile("minilm"))
+        self.addCleanup(_pin_env_values(ZMEM_TEST_NOW=None,
+                                        ZMEM_ARM_CAP_TEMPORAL=None))
         rows = _read_asof_fixture()
         _seed_asof_store(rows)
-        self.addCleanup(os.environ.pop, "ZMEM_ARM_CAP_TEMPORAL", None)
         self.conn = connect()
         self.addCleanup(self.conn.close)
 
@@ -732,6 +1019,9 @@ class ScopedPromptTimestampTest(unittest.TestCase):
             "ZMEM_STORE": os.path.join(scratch, "store.sqlite"),
             "ZMEM_MODELS_DIR": os.path.join(scratch, "missing-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            # Standalone parity (#389 AC9): a co-run ambient (e.g. a sibling
+            # module's 'fake') must not ride dict(os.environ) into the child.
+            "ZMEM_EMBED_PROFILE": "minilm",
             # Divergent clock: "last week" from THIS instant does NOT
             # overlap the seeded 2026-09-01..03 window.
             "ZMEM_TEST_NOW": "2026-10-18T12:00:00Z",
@@ -786,12 +1076,17 @@ class GraphTemporalOverlapTest(unittest.TestCase):
         from storelib.schema import connect, _prepare_store
         from storelib.write import add_memory
         import storelib.recall as recall_mod
+        self.addCleanup(_pin_profile("minilm"))
         scratch = tempfile.mkdtemp(prefix="zmem-178-overlap-")
         self.addCleanup(shutil.rmtree, scratch, True)
-        os.environ["ZMEM_STORE"] = os.path.join(scratch, "store.sqlite")
-        os.environ["ZMEM_DATA"] = scratch
-        for key in ("ZMEM_TEST_NOW",):
-            os.environ.pop(key, None)
+        # Issue #389 AC9: these ambient writes are test-scoped and RESTORED
+        # (the original left the dead scratch path in os.environ for every
+        # later module in a one-process run). connect() resolves the frozen
+        # storelib.schema.STORE_PATH either way; the pins keep the child-env
+        # contract shape and clear the recall clock seam.
+        self.addCleanup(_pin_env_values(
+            ZMEM_STORE=os.path.join(scratch, "store.sqlite"),
+            ZMEM_DATA=scratch, ZMEM_TEST_NOW=None))
         conn = connect()
         _prepare_store(conn)
         # Seed a seed row + an overlapping event row sharing its entity so
@@ -956,6 +1251,9 @@ class TemporalReviewRegressionTest(unittest.TestCase):
             "ZMEM_STORE": os.path.join(scratch, "store.sqlite"),
             "ZMEM_MODELS_DIR": os.path.join(scratch, "missing-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            # Standalone parity (#389 AC9): pin the model-absent profile so
+            # the fold-dedup lane is the exact-match one the pin documents.
+            "ZMEM_EMBED_PROFILE": "minilm",
         })
 
         def run_cli(args):

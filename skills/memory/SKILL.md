@@ -337,10 +337,15 @@ table (occurred_start / occurred_end / mentioned_at beside the memory id).
 Event rows require BOTH occurrence endpoints (clamped to the temporal
 window: the future clamps to the prompt timestamp, older than 3650 days
 clamps to the floor); non-event rows refuse any occurrence field (exit 2,
-no partial row). Occurrence rows live and die with their parent: every
-tombstone path deletes them in the same transaction, and event->event
-updates inherit the occurrence onto the replacement row (non-event->event
-via update is refused; dedup folds keep the keeper's occurrence).
+no partial row). Occurrence rows live with their parent and SURVIVE soft
+tombstones of USER event rows (update / supersede / consolidate-absorb) —
+historical as-of recall surfaces them inside the tombstoned row's validity
+window; generated-row writers (organize summaries, entity reconcile) keep
+same-transaction cleanup; hard deletes (purge, import-store) remove
+occurrence rows through the side-table registry; event->event updates
+additionally inherit the occurrence onto the replacement row
+(non-event->event via update is refused; dedup folds keep the keeper's
+occurrence).
 
 The temporal recall arm resolves relative phrases in the query (the fixed
 20-phrase vocabulary: today/yesterday/tomorrow, this/last/next week,
@@ -352,6 +357,11 @@ selects occurrence-overlapping rows under the unchanged `--as-of`
 validity predicate, and fuses them as the capped fifth RRF arm
 (`ZMEM_ARM_CAP_TEMPORAL`, default 4). Knowledge validity (valid_from
 inclusive / valid_until exclusive) is SEPARATE from occurrence time.
+Recall rows reached via the temporal arm carry additive occurred_start /
+occurred_end / mentioned_at envelope fields (the time the event HAPPENED),
+distinct from valid_from (the time it was WRITTEN). The three keys ride
+only temporal-arm rows (never non-temporal rows, never overwriting an
+existing key), so projections that select known fields are unaffected.
 A phrase-free query or an occurrence-empty store fuses byte-identically.
 The Hermes/MCP `add` surfaces do not advertise `event` (they take no
 occurrence endpoints — the #173 `state` precedent).

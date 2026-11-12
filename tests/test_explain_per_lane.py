@@ -44,12 +44,30 @@ os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "nonexistent-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 os.environ["ZMEM_EMBED_PROFILE"] = "fake"
-os.environ["ZMEM_TEST_NOW"] = "2026-06-01T00:00:00Z"
+# Issue #389 AC9: ZMEM_TEST_NOW used to be set HERE at module import (the
+# scoring clock) — a cross-module ambient leak in a one-process run. The
+# clock now rides the class pin in setUpClass below; every RETAINED
+# module-level mutation above is paired with an explicit
+# unittest.addModuleCleanup restore (registered after the unittest import).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_DATA", "ZMEM_BACKUP_DIR",
+    "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS", "ZMEM_INJECT_FLOOR_ENT",
+    "ZMEM_INJECT_FLOOR_GRAPH", "ZMEM_INJECT_FLOOR_TRUST")}
 for _k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR",
            "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
            "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_GRAPH",
            "ZMEM_INJECT_FLOOR_TRUST"):
     os.environ.pop(_k, None)
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -61,8 +79,30 @@ import contextlib  # noqa: E402
 
 import embed_profiles  # noqa: E402  (env pinned above)
 import storelib.recall as recall_mod  # noqa: E402
+from storelib import schema as schema_mod  # noqa: E402
 from storelib.links import add_link  # noqa: E402
 from storelib.schema import _prepare_store, connect  # noqa: E402
+
+unittest.addModuleCleanup(_restore_module_env)
+
+
+def _pin_env_values(**pins):
+    """Set each `pins` key (a None value POPS it) and return a restore
+    callable for addCleanup/addClassCleanup (issue #389 AC9)."""
+    prior = {k: os.environ.get(k) for k in pins}
+    for key, value in pins.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+    def _restore():
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return _restore
 
 NS = "project:explainlane"
 # Hex/uuid-shaped fixture ids: _resolve_explain_targets resolves UUID-shaped
@@ -84,7 +124,31 @@ class ExplainPerLaneTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.store = os.environ["ZMEM_STORE"]
+        # Issue #389 AC9 per-class pins, BEFORE the fixture is built: the
+        # 'fake' profile (call-time resolved; the build-time assertion is
+        # the immediate resolve check), the frozen scoring clock (formerly a
+        # module-level ambient write), and the inject floors at defaults (a
+        # co-run sibling's module-level floor override must not flip the
+        # lane_floors pin). The reset clears the SHARED frozen store
+        # (storelib.schema.STORE_PATH) so the P vector insert lands in a
+        # fresh 16-dim memory_vec — standalone the reset is a no-op on the
+        # module's own fresh scratch.
+        cls.addClassCleanup(_pin_env_values(
+            ZMEM_TEST_NOW="2026-06-01T00:00:00Z",
+            ZMEM_INJECT_FLOOR_LEX=None, ZMEM_INJECT_FLOOR_COS=None,
+            ZMEM_INJECT_FLOOR_ENT=None, ZMEM_INJECT_FLOOR_GRAPH=None,
+            ZMEM_INJECT_FLOOR_TRUST=None))
+        cls.addClassCleanup(_pin_env_values(
+            ZMEM_EMBED_PROFILE="fake"))
+        assert embed_profiles.resolve_active_profile() == "fake", (
+            "build-time profile assertion failed: ambient resolved %r"
+            % embed_profiles.resolve_active_profile())
+        cls.store = str(schema_mod.STORE_PATH)
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(cls.store + suffix)
+            except OSError:
+                pass
         conn = connect()
         _prepare_store(conn)
         rows = [

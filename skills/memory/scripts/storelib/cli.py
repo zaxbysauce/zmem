@@ -2831,6 +2831,13 @@ def main():
              "--consume-tasktext consume (see recall --consume-agent-id). "
              "Local stores only: remote mode refuses it (the fleet lane "
              "never parks, so a remote id would have nothing to match).")
+    p_prefetch.add_argument("--prompt-timestamp", dest="prompt_timestamp",
+                            action="store", type=_iso8601, default=None,
+                            required=False,
+                            help="timestamp used to resolve relative temporal "
+                                 "phrases; default is the injected test seam "
+                                 "(issue #389 AC8: the hook/broker thread "
+                                 "the payload's prompt clock here)")
     p_prefetch.add_argument("--ops-token", dest="ops_tokens", type=str,
                             action="append", default=[],
                             help="Operation token from the pretool ring "
@@ -6426,6 +6433,11 @@ def main():
                         getattr(args, "consume_tasktext", False)),
                     consume_agent_id=getattr(
                         args, "consume_agent_id", "") or "",
+                    # Issue #389 (AC8): the prompt's own clock, threaded from
+                    # the hook payload / broker / MCP prefetch surface; None
+                    # keeps the ZMEM_TEST_NOW/now seam.
+                    prompt_timestamp=getattr(
+                        args, "prompt_timestamp", None),
                 )
             except ValueError as exc:
                 print(f"[zmem] {exc}", file=sys.stderr)

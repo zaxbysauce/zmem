@@ -1667,6 +1667,7 @@ def reconcile_entity_aliases(
                 # with it in the same transaction (cards carry neither
                 # expiry nor occurrence rows in practice; the clears are
                 # the same no-op guard every supersede path runs).
+                # Two-tier law (#389): generated rows KEEP this cleanup.
                 from storelib.write import _clear_expiry, _clear_occurrence
                 _clear_expiry(conn, orphan_card["id"])
                 _clear_occurrence(conn, orphan_card["id"])

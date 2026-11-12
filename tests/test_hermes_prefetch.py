@@ -36,11 +36,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 _SCRATCH = Path(tempfile.mkdtemp(prefix="zmem-162-prefetch-"))
 atexit.register(shutil.rmtree, str(_SCRATCH), ignore_errors=True)
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (standalone runs execute doModuleCleanups; one-process runs never
+# depend on it).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_NAMESPACE")}
 os.environ["ZMEM_STORE"] = str(_SCRATCH / "store.sqlite")
 os.environ["ZMEM_DATA"] = str(_SCRATCH)
 os.environ["ZMEM_MODELS_DIR"] = str(_SCRATCH / "missing-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 os.environ["ZMEM_NAMESPACE"] = "project:fixture"
+
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+unittest.addModuleCleanup(_restore_module_env)
 
 _FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "hermes"
 _SUPPORT_DIR = REPO_ROOT / "tests" / "support"
