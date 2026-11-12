@@ -41,6 +41,13 @@ STORE_PY = SCRIPTS_DIR / "store.py"
 
 _TMP = tempfile.mkdtemp(prefix="zmem-178-temporal-")
 STORE_PATH = os.path.join(_TMP, "store.sqlite")
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (registered after the unittest import; standalone runs execute
+# doModuleCleanups, one-process runs never depend on it).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_LINK_THRESHOLD", "ZMEM_EMBED_PROFILE")}
 os.environ["ZMEM_STORE"] = STORE_PATH
 os.environ["ZMEM_DATA"] = _TMP
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "missing-models")
@@ -60,9 +67,6 @@ os.environ.setdefault("ZMEM_EMBED_PROFILE", "minilm")  # model-absent shape
 # doModuleCleanups; one-process runs never depend on them — the isolation
 # canary's driver pins the import-frozen constants and per-class pins carry
 # the call-time ones.
-_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
-    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
-    "ZMEM_LINK_THRESHOLD", "ZMEM_EMBED_PROFILE")}
 
 
 def _restore_module_env():

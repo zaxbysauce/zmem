@@ -397,12 +397,15 @@ def _forward_prefetch(args: Any, http: Any, remaining_ms: int) -> Any:
         ops_tokens=list(getattr(args, "ops_tokens", []) or []),
         lane=args.lane, reserve=bool(args.reserve),
         deadline_ms=max(1, remaining_ms),
-        consume_tasktext=bool(getattr(args, "consume_tasktext", False)))
+        consume_tasktext=bool(getattr(args, "consume_tasktext", False)),
+        prompt_timestamp=getattr(args, "prompt_timestamp", None))
 
 
 def _route_prefetch(args: Any) -> None:
     """Remote prefetch (issue #374): forwarded = query, namespace,
-    session-id, moment, lane, reserve, ops-token; REFUSED = --exclude (the
+    session-id, moment, lane, reserve, ops-token, prompt-timestamp (#389
+    AC8 — the hub prefetch tool and the offline snapshot serve both carry
+    it); REFUSED = --exclude (the
     hub prefetch tool accepts no exclusion parameter) and client-asserted
     --principal/--harness (remote identity is the AUTHENTICATED token); the
     refusal names the flag. Offline (hub unreachable) serves the FULL
@@ -478,10 +481,15 @@ def _offline_prefetch(args: Any):
     except Exception:  # noqa: BLE001
         return None, None
     try:
+        # Issue #389 (AC8): the prompt's own clock rides the offline serve
+        # too (_serve_offline_read threads it into the selector — the serve
+        # must not fall back to this process's wall clock when the caller
+        # supplied one).
         envelope, state = fleet_snapshot._serve_offline_read(
             dict(os.environ), query=args.query, namespace=args.namespace,
             moment=args.moment or "user_prompt",
-            session_id=args.session_id or "", lane=args.lane or "deepseek")
+            session_id=args.session_id or "", lane=args.lane or "deepseek",
+            prompt_timestamp=getattr(args, "prompt_timestamp", None))
         envelope = dict(envelope)
         envelope.pop("reservation", None)
         return envelope, state

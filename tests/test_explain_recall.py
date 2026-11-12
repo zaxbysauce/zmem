@@ -48,18 +48,19 @@ NS = "project:explaintest"
 # ---------------------------------------------------------------------------
 _INPROC_TMP = tempfile.mkdtemp(prefix="zmem-explain-inproc")
 INPROC_STORE = os.path.join(_INPROC_TMP, "inproc.sqlite")
-os.environ["ZMEM_STORE"] = INPROC_STORE
-os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
-os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
-os.environ["ZMEM_EMBED_PROFILE"] = "fake"
-os.environ.pop("ZMEM_INJECT_FLOOR_TRUST", None)  # PRR: floor default must hold
-# Issue #389 AC9: every module-level mutation above is paired with an
-# explicit unittest.addModuleCleanup restore. Standalone runs execute
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each is paired with an explicit
+# unittest.addModuleCleanup restore. Standalone runs execute
 # doModuleCleanups; one-process runs never depend on them (per-class pins
 # and the shared frozen path below carry isolation there).
 _MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
     "ZMEM_STORE", "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
     "ZMEM_EMBED_PROFILE", "ZMEM_INJECT_FLOOR_TRUST")}
+os.environ["ZMEM_STORE"] = INPROC_STORE
+os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
+os.environ["ZMEM_MODELS_DIR"] = "/nonexistent-zmem-models-dir"
+os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+os.environ.pop("ZMEM_INJECT_FLOOR_TRUST", None)  # PRR: floor default must hold
 
 
 def _restore_module_env():

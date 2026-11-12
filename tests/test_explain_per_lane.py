@@ -40,20 +40,21 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 
 _TMP_KEEPALIVE = tempfile.TemporaryDirectory(prefix="zmem-explain-lanes-")
 _TMP = _TMP_KEEPALIVE.name  # TemporaryDirectory cleans up at exit
-os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
-os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "nonexistent-models")
-os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
-os.environ["ZMEM_EMBED_PROFILE"] = "fake"
-# Issue #389 AC9: ZMEM_TEST_NOW used to be set HERE at module import (the
-# scoring clock) — a cross-module ambient leak in a one-process run. The
-# clock now rides the class pin in setUpClass below; every RETAINED
-# module-level mutation above is paired with an explicit
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each is paired with an explicit
 # unittest.addModuleCleanup restore (registered after the unittest import).
+# ZMEM_TEST_NOW used to be set at module import (the scoring clock) — a
+# cross-module ambient leak in a one-process run; the clock now rides the
+# class pin in setUpClass below.
 _MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
     "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
     "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "ZMEM_DATA", "ZMEM_BACKUP_DIR",
     "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS", "ZMEM_INJECT_FLOOR_ENT",
     "ZMEM_INJECT_FLOOR_GRAPH", "ZMEM_INJECT_FLOOR_TRUST")}
+os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
+os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "nonexistent-models")
+os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+os.environ["ZMEM_EMBED_PROFILE"] = "fake"
 for _k in ("ZMEM_DATA", "ZMEM_BACKUP_DIR",
            "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
            "ZMEM_INJECT_FLOOR_ENT", "ZMEM_INJECT_FLOOR_GRAPH",

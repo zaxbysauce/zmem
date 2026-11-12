@@ -559,8 +559,9 @@ class RemoteBehaviorPinTest(unittest.TestCase):
 
     def test_forward_prefetch_forwards_real_kwargs(self):
         """The prefetch route's forwarded surface (query, namespace,
-        session_id, moment, lane, reserve, ops_tokens, consume_tasktext)
-        must reach the hub call verbatim (PR #453 review round 3: the
+        session_id, moment, lane, reserve, ops_tokens, consume_tasktext,
+        prompt_timestamp) must reach the hub call verbatim (PR #453 review
+        round 3: the
         forward half of the prefetch route was unpinned; the consume-grant
         verbatim pin lives in tests/test_tasktext_fleet_grant.py)."""
         seen = {}
@@ -587,7 +588,8 @@ class RemoteBehaviorPinTest(unittest.TestCase):
             moment="subagent", lane=None, reserve=True,
             ops_tokens=["tok"], consume_tasktext=True, consume_agent_id="",
             exclude_ids=None, principal=None, harness=None, state_hint=None,
-            for_injection=False, authorized_namespace=None)
+            for_injection=False, authorized_namespace=None,
+            prompt_timestamp="2026-09-10T15:30:00Z")
         env = dict(os.environ)
         env.pop("ZMEM_STORE", None)
         env.pop("ZMEM_DATA", None)
@@ -605,6 +607,7 @@ class RemoteBehaviorPinTest(unittest.TestCase):
             "query": "probe-q", "namespace": "project:pin",
             "session_id": "supp-sid", "moment": "subagent", "lane": None,
             "reserve": True, "ops_tokens": ["tok"], "consume_tasktext": True,
+            "prompt_timestamp": "2026-09-10T15:30:00Z",
             "deadline_ms": 1000,
         })
 
@@ -668,8 +671,8 @@ class RemoteReadFlagCompletenessTest(unittest.TestCase):
     }
     # Pinned prefetch dest set (remote_gate._route_prefetch forwards
     # query/namespace/session_id/moment/lane/reserve/ops_tokens/
-    # consume_tasktext and refuses the rest by name). Update ONLY together
-    # with a remote disposition for the new flag.
+    # consume_tasktext/prompt_timestamp and refuses the rest by name).
+    # Update ONLY together with a remote disposition for the new flag.
     PREFETCH_PINNED = None  # filled from the live parser in setUpClass
 
     @classmethod
@@ -719,7 +722,8 @@ class RemoteReadFlagCompletenessTest(unittest.TestCase):
             # it remotely changes nothing, so it needs no hub parameter.
             "no_bump",
             # --prompt-timestamp (issue #389 AC8/F5): forwarded — the
-            # e2e forward-capture leg lives in RemoteBehaviorPinTest.
+            # forward-capture leg is
+            # RemoteBehaviorPinTest.test_forward_prefetch_forwards_real_kwargs.
             "prompt_timestamp",
         }
         actual = _dests(self.subs["prefetch"])

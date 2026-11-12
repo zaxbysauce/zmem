@@ -150,6 +150,14 @@ class TemporalProjectionTest(unittest.TestCase):
             set(stripped), BASE_ROW_KEYS,
             "stripping the three occurrence keys must leave EXACTLY the "
             "pre-change key set — purely additive projection")
+        # Byte-additivity for the JSON dump: the triple is a CONTIGUOUS
+        # block in OCC_KEYS order sitting after every base key except the
+        # post-projection `entities` attachment (v10, issue #60 — attached
+        # to every row AFTER the temporal projection, so it trails here
+        # exactly as it trailed pre-change).  Stripping the triple then
+        # reproduces the pre-change key order, not just the key set.
+        self.assertEqual(list(row)[-1], "entities")
+        self.assertEqual(list(row)[-4:-1], list(OCC_KEYS))
 
     def test_non_temporal_rows_carry_no_occurrence_keys(self):
         env = _recall(self.conn, query="harbor cranes")

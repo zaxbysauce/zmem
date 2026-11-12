@@ -225,6 +225,34 @@ class StubTransport:
         return {"ok": True, "results": []}
 
 
+class _OldShapeTransport:
+    """A transport predating ``prompt_timestamp`` (mixed-version pin): the
+    kwarg is an unexpected keyword argument (TypeError, exactly like a real
+    older signature); the historical call shape serves normally."""
+
+    def __init__(self, envelope):
+        import copy
+        self._copy = copy.deepcopy
+        self.envelope = envelope
+        self.prefetch_calls = []
+        self.search_calls = []
+
+    def prefetch(self, query, *, namespace, session_id, moment, ops_tokens,
+                 lane, **unexpected):
+        self.prefetch_calls.append(dict(unexpected))
+        if "prompt_timestamp" in unexpected:
+            raise TypeError("prefetch() got an unexpected keyword "
+                            "argument 'prompt_timestamp'")
+        return self._copy(self.envelope)
+
+    def search(self, query, *, namespace=None, limit=None, **unexpected):
+        self.search_calls.append(dict(unexpected))
+        if "prompt_timestamp" in unexpected:
+            raise TypeError("search() got an unexpected keyword "
+                            "argument 'prompt_timestamp'")
+        return {"ok": True, "results": []}
+
+
 class HookLegTest(unittest.TestCase):
     """The recall body forwards the payload's prompt clock (probe legs)."""
 
@@ -491,6 +519,60 @@ class HermesProviderTest(unittest.TestCase):
                               user_message="project alpha notes")
         self.assertEqual(len(transport.calls), 2)
         self.assertIsNone(transport.calls[1]["prompt_timestamp"])
+
+    def test_pre_llm_call_offline_serves_snapshot_once_with_timestamp(self):
+        # IR-1 pin: the hub-unreachable fallback serves the offline snapshot
+        # EXACTLY ONCE and with the prompt timestamp threaded (the
+        # double-serve first-without-then-with shape is dead).
+        transport = StubTransport(
+            envelope={"ok": False, "reason": "hub-unreachable"})
+        mod, provider, _ = self._provider(transport=transport)
+        serves = []
+
+        def _counting_serve(query, namespace, session_id,
+                            prompt_timestamp=None):
+            serves.append({"query": query, "namespace": namespace,
+                           "session_id": session_id,
+                           "prompt_timestamp": prompt_timestamp})
+            return None  # no snapshot: the degrade path, the serve counted
+
+        with mock.patch.object(mod, "_offline_snapshot_envelope",
+                               _counting_serve):
+            provider.pre_llm_call(session_id=SESSION_ID,
+                                  user_message="project alpha notes",
+                                  prompt_timestamp=PROMPT_TS)
+        self.assertEqual(len(serves), 1)
+        self.assertEqual(serves[0]["prompt_timestamp"], PROMPT_TS)
+
+    def test_mixed_version_transport_typeerror_retries_once_warned(self):
+        # Mixed-version guard: a transport predating prompt_timestamp raises
+        # TypeError on the kwarg; the guarded call sites retry once WITHOUT
+        # it (the lane still serves) and warn exactly once per process.
+        transport = _OldShapeTransport(_fixture_envelope())
+        mod, provider, _ = self._provider(transport=transport)
+        with mock.patch.object(mod, "_PROMPT_TS_TRANSPORT_WARNED", False), \
+                mock.patch.object(mod.logger, "warning") as warned:
+            provider.prefetch("project alpha", session_id=SESSION_ID,
+                              prompt_timestamp=PROMPT_TS)
+            # The retry served the envelope: kwarg attempt, then the
+            # historical call shape.
+            self.assertEqual(
+                transport.prefetch_calls, [{"prompt_timestamp": PROMPT_TS},
+                                           {}])
+            # One-shot: a second guarded failure never re-warns.
+            provider.prefetch("project alpha two", session_id=SESSION_ID,
+                              prompt_timestamp=ALT_TS)
+            self.assertEqual(len(transport.prefetch_calls), 4)
+            # The remote search lane degrades the same way.
+            provider._mode = mod._transport.TransportMode.mcp
+            provider._tool_search({"query": "alpha lessons",
+                                   "prompt_timestamp": PROMPT_TS})
+        self.assertEqual(transport.search_calls, [{"prompt_timestamp":
+                                                   PROMPT_TS}, {}])
+        ts_warnings = [c for c in warned.call_args_list
+                       if "prompt_timestamp" in str(c.args[0] if c.args
+                                                    else c)]
+        self.assertEqual(len(ts_warnings), 1)
 
 
 class FleetTransportTest(unittest.TestCase):

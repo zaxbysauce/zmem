@@ -46,6 +46,20 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 HOOK_BODY = REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
 
 _TMP = tempfile.mkdtemp(prefix="zmem-graph-seed-")
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (registered right after the unittest import below; standalone
+# runs execute doModuleCleanups, one-process runs never depend on them).
+# ZMEM_TEST_NOW used to be set at module import — the exact cross-module
+# ambient leak the one-process canary pins; the frozen clock now rides the
+# _StoreClassPins mixin below (class-scoped set + addClassCleanup restore),
+# applied BEFORE any fixture is built, so the prior capture covers it too.
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_THRESHOLD", "ZMEM_DATA",
+    "ZMEM_GRAPH_SEED", "ZMEM_ARM_CAP_FTS", "ZMEM_ARM_CAP_VEC",
+    "ZMEM_ARM_CAP_ENTITY", "ZMEM_ARM_CAP_GRAPH", "ZMEM_INJECT_FLOOR_GRAPH",
+    "ZMEM_TEST_NOW")}
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "nonexistent-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
@@ -76,20 +90,6 @@ from storelib.write import add_memory  # noqa: E402
 
 PIN_TS = "2026-06-01T00:00:00Z"
 FIXED_NOW = float(calendar.timegm((2026, 6, 1, 0, 0, 0)))
-# Issue #389 AC9: ZMEM_TEST_NOW used to be set HERE at module import — the
-# exact cross-module ambient leak the one-process canary pins. The frozen
-# clock now rides the _StoreClassPins mixin below (class-scoped set +
-# addClassCleanup restore), applied BEFORE any fixture is built; every
-# RETAINED module-level mutation above is paired with an explicit
-# unittest.addModuleCleanup restore (registered right after the unittest
-# import below). Standalone runs execute doModuleCleanups; one-process runs
-# never depend on them.
-_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
-    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
-    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_THRESHOLD", "ZMEM_DATA",
-    "ZMEM_GRAPH_SEED", "ZMEM_ARM_CAP_FTS", "ZMEM_ARM_CAP_VEC",
-    "ZMEM_ARM_CAP_ENTITY", "ZMEM_ARM_CAP_GRAPH", "ZMEM_INJECT_FLOOR_GRAPH",
-    "ZMEM_TEST_NOW")}
 
 
 def _restore_module_env():

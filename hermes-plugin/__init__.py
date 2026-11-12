@@ -905,6 +905,44 @@ def _valid_prompt_timestamp(value: object) -> Optional[str]:
     return value
 
 
+# Mixed-version guard for the #389 kwarg: a transport predating the
+# ``prompt_timestamp`` parameter rejects it with TypeError; warn once per
+# process (the _ENVELOPE_KEYS_WARNED one-shot pattern) and retry without it.
+_PROMPT_TS_TRANSPORT_WARNED = False
+
+
+def _transport_call_with_prompt_ts(method: Any, query: str,
+                                   kwargs: Dict[str, Any],
+                                   prompt_timestamp: Optional[str]) -> Any:
+    """Invoke one transport method threading the prompt clock (#389 AC8).
+
+    ``prompt_timestamp`` joins the kwargs ONLY when present, so a
+    no-timestamp call keeps the exact historical call shape.  A transport
+    predating the parameter raises TypeError on the kwarg — catch it, warn
+    exactly once, and retry once WITHOUT the kwarg: the older transport
+    then serves its wall clock instead of blacking out the lane (the call
+    still raises when the retry fails, so genuine TypeErrors are never
+    masked).
+    """
+    global _PROMPT_TS_TRANSPORT_WARNED
+    call_kwargs = dict(kwargs)
+    if prompt_timestamp:
+        call_kwargs["prompt_timestamp"] = prompt_timestamp
+    try:
+        return method(query, **call_kwargs)
+    except TypeError:
+        if "prompt_timestamp" not in call_kwargs:
+            raise
+        if not _PROMPT_TS_TRANSPORT_WARNED:
+            _PROMPT_TS_TRANSPORT_WARNED = True
+            logger.warning(
+                "zmem: transport rejected prompt_timestamp (older "
+                "transport?); retrying without it — the lane serves wall "
+                "clock")
+        call_kwargs.pop("prompt_timestamp", None)
+        return method(query, **call_kwargs)
+
+
 def _passive_store_args(
     command: str,
     *,
@@ -933,6 +971,11 @@ def _passive_store_args(
         args.extend(["--query=" + query] if query.startswith("-")
                     else ["--query", query])
     prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+    if command == "recall" and isinstance(prompt_timestamp, str) \
+            and not prompt_ts:
+        # Issue #389 AC8 (the MCP server convention): a supplied-but-invalid
+        # value is dropped with one debug line, never an error.
+        logger.debug("recall: dropping invalid prompt_timestamp")
     if command == "recall" and prompt_ts:
         args.extend(["--prompt-timestamp", prompt_ts])
     args.extend([
@@ -3332,15 +3375,12 @@ class ZmemMemoryProvider(MemoryProvider):
             ops_tokens=[],
             lane="hermes-provider",
         )
-        # Issue #389 (AC8): thread the prompt clock ONLY when present — a
-        # transport predating the parameter keeps the exact historical call
-        # shape on the no-timestamp path (provider mixed-version safety).
-        if prompt_timestamp:
-            prefetch_kwargs["prompt_timestamp"] = prompt_timestamp
-        envelope = transport.prefetch(
-            query,
-            **prefetch_kwargs,
-        )
+        # Issue #389 (AC8): thread the prompt clock ONLY when present, and
+        # through the mixed-version guard — a transport predating the
+        # parameter keeps the exact historical call shape on the
+        # no-timestamp path and is retried without the kwarg on TypeError.
+        envelope = _transport_call_with_prompt_ts(
+            transport.prefetch, query, prefetch_kwargs, prompt_timestamp)
         if isinstance(envelope, dict) and "context" in envelope:
             # The #159 MCP server adds an additive `context` alias that
             # duplicates `rendered` (mcp_server.py).  Strip it before the
@@ -3733,13 +3773,10 @@ class ZmemMemoryProvider(MemoryProvider):
                 ops_tokens=list(ops_snapshot),
                 lane="hermes-provider",
             )
-            # Threaded only when present (mixed-version transport shape).
-            if prompt_ts:
-                prefetch_kwargs["prompt_timestamp"] = prompt_ts
-            return transport.prefetch(
-                query,
-                **prefetch_kwargs,
-            )
+            # Threaded only when present, behind the mixed-version guard
+            # (#389 AC8): an older transport is retried without the kwarg.
+            return _transport_call_with_prompt_ts(
+                transport.prefetch, query, prefetch_kwargs, prompt_ts)
 
         try:
             if deadline is not None and hasattr(deadline, "run"):
@@ -3766,9 +3803,7 @@ class ZmemMemoryProvider(MemoryProvider):
             # suppresses subsequent recall.  Expired or absent keeps the
             # degrade below ({} — the matrix's "if none" row).  No stamp,
             # no refresh on this lane (a broker-bearing machine owns both).
-            offline = _offline_snapshot_envelope(query, namespace, session_id)
-            if offline is not None:
-                offline = _offline_snapshot_envelope(query, namespace, session_id,
+            offline = _offline_snapshot_envelope(query, namespace, session_id,
                                                  prompt_timestamp=prompt_ts)
             if offline is not None:
                 envelope = offline
@@ -3934,8 +3969,12 @@ class ZmemMemoryProvider(MemoryProvider):
             return _tool_error("Missing required parameter: query")
         limit = _clamp_limit(args.get("limit"))
         # Issue #389 (AC8): the tool schema's optional prompt clock —
-        # validated at this boundary, dropped (never an error) when invalid.
-        prompt_ts = _valid_prompt_timestamp(args.get("prompt_timestamp"))
+        # validated at this boundary, dropped (never an error) when invalid
+        # with one debug line (the MCP server convention).
+        raw_prompt_ts = args.get("prompt_timestamp")
+        prompt_ts = _valid_prompt_timestamp(raw_prompt_ts)
+        if isinstance(raw_prompt_ts, str) and not prompt_ts:
+            logger.debug("search: dropping invalid prompt_timestamp")
         # Namespace: explicit arg wins; '*' means "search everything"; default
         # is the session namespace (per-user isolation on shared gateway boxes).
         ns_arg = (args.get("namespace") or "").strip()
@@ -3991,12 +4030,11 @@ class ZmemMemoryProvider(MemoryProvider):
             search_kwargs: Dict[str, Any] = {
                 "namespace": remote_ns, "limit": limit}
             # Issue #389 (AC8): thread the prompt clock to the hub search —
-            # only when present, so a transport predating the parameter keeps
-            # the exact historical call shape.
-            if prompt_ts:
-                search_kwargs["prompt_timestamp"] = prompt_ts
-            resp = self._transport.search(query[:_MAX_QUERY_CHARS],
-                                          **search_kwargs)
+            # only when present, and behind the mixed-version guard (an
+            # older transport keeps the exact historical call shape).
+            resp = _transport_call_with_prompt_ts(
+                self._transport.search, query[:_MAX_QUERY_CHARS],
+                search_kwargs, prompt_ts)
             if not isinstance(resp, dict) or resp.get("ok") is False \
                     or resp.get("error"):
                 detail = (resp.get("error") or resp.get("reason")

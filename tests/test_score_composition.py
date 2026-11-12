@@ -41,6 +41,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 
 _TMP = tempfile.mkdtemp(prefix="zmem-score-comp-")
+# Issue #389 AC9: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each is paired with an explicit unittest.addModuleCleanup
+# restore (registered after the unittest import below). Standalone runs
+# execute doModuleCleanups; one-process runs never depend on them — there
+# the per-class pins below carry isolation (the profile resolves CALL-TIME,
+# so a co-run's ambient must never decide which embedder builds a fixture).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_THRESHOLD", "ZMEM_DATA",
+    "ZMEM_BACKUP_DIR", "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
+    "ZMEM_INJECT_FLOOR_ENT")}
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "nonexistent-models")
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
@@ -56,18 +67,6 @@ for _k in (
     "ZMEM_INJECT_FLOOR_ENT",
 ):
     os.environ.pop(_k, None)
-
-# Issue #389 AC9: every RETAINED module-level mutation above is paired with
-# an explicit unittest.addModuleCleanup restore (registered after the
-# unittest import below). Standalone runs execute doModuleCleanups;
-# one-process runs never depend on them — there the per-class pins below
-# carry isolation (the profile resolves CALL-TIME, so a co-run's ambient
-# must never decide which embedder builds a fixture).
-_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
-    "ZMEM_STORE", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
-    "ZMEM_EMBED_PROFILE", "ZMEM_LINK_THRESHOLD", "ZMEM_DATA",
-    "ZMEM_BACKUP_DIR", "ZMEM_INJECT_FLOOR_LEX", "ZMEM_INJECT_FLOOR_COS",
-    "ZMEM_INJECT_FLOOR_ENT")}
 
 
 def _restore_module_env():
