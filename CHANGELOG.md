@@ -65,6 +65,41 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `phrases.expected.json` so in-place edits are detectable; the
   hand-authored `phrases.json` literals remain the correctness oracle.
 
+## [0.150.0] - 2026-11-11
+### Security
+- Entity report surfaces now mask credential-shaped names at display time
+  (issues #455, #366): `entity-list` (names and alias lists), `entity-merge`
+  dry-run (both name sites and the alias-collision join),
+  `reclassify-entities` dry-run/apply envelopes, and
+  `reconcile-entity-aliases` dry-run/apply envelopes (orphan names, suffixes,
+  `merged_rows` names, owner names) render `[REDACTED_SECRET]` instead of the
+  raw value. Detection = exact secret-head tokens (password/passwd/secret/
+  token/api-key/api_key/apikey/credential/auth as whitespace-trimmed
+  `[:_=-]`-delimited segments or adjacent pairs — attribute-assignment
+  shapes like `DB_PASSWORD=12345`, `DB_PASSWORD = 12345`, and dot-joined
+  keys like `db.password=12345` — including behind an earlier separator
+  (`redis:db.password=12345`, `--config=db.password=12345`) and the
+  dot-joined head spelling `api.key=12345` — mask too, while bare
+  whitespace without punctuation, bare dotted hostnames, and non-head env
+  suffixes (`db.password-prod=1`) do not) plus the shared redaction
+  registry; legal `label:port`
+  names (`localhost:8080`, `server:8080`) render unmasked, and
+  prefix-shaped words (`tokenized-service`, `authentication-service`,
+  `author`) are not masked. Masking is display-only — stored entity/alias
+  rows, the classifier, resolve/write paths, and entity-card construction
+  are untouched — and fail-closed: the reports never fall back to raw
+  output (a registry that becomes unavailable after startup makes the
+  renderer refuse — dry-run exits 2 with empty stdout, apply reports from
+  the committed state; a registry missing at process start fails the CLI at
+  import before any report runs).
+### Documentation
+- `skills/memory/SKILL.md` carries the dated, owner-confirmed #366
+  entity-kind classifier decision record (five precision rows keep
+  spec-literal with no guards; the 30-row `classify.json` fixture stays
+  frozen; the linear host regex + ASCII-strict IPv4 hardening landed via
+  #365), plus the PRR-013 recall `--json`/`--explain` no-LF-contract record
+  and the #455 masking contract.
+
 ## [0.149.0] - 2026-11-10
 ### Added
 - `store.py reconcile-entity-aliases --dry-run|--apply [--json]` (issue #358):
