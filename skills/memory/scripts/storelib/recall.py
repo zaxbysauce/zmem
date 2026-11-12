@@ -4281,7 +4281,7 @@ def _explain_nearest_neighbors(
         scope_clause = f"AND namespace IN ({ph})"
         params = list(scope)
     rows = conn.execute(
-        f"""SELECT id, content, content_norm, taint, tags, source_ref
+        f"""SELECT id, type, content, content_norm, taint, tags, source_ref
             FROM memory
             WHERE superseded_at IS NULL {scope_clause}""",
         params,
@@ -4291,8 +4291,8 @@ def _explain_nearest_neighbors(
         sim = _explain_jaccard(
             tokens, _explain_token_set(r["content_norm"] or r["content"]))
         if sim > 0.0:
-            scored.append((sim, r["id"], r["content"], r["taint"], r["tags"],
-                           r["source_ref"]))
+            scored.append((sim, r["id"], r["type"], r["content"], r["taint"],
+                           r["tags"], r["source_ref"]))
     scored.sort(key=lambda x: (-x[0], x[1]))
     # PRR-005: neighbors carry the row's trust surface explicitly — the same
     # rows the fenced render would mark, so a not_in_db verdict never shows
@@ -4303,8 +4303,21 @@ def _explain_nearest_neighbors(
     # Review round (maintainer F-06 / PRR-003): the classify blob matches the
     # canonical input set — source_ref is classified too, so a credential
     # shape living only in source_ref withholds here like every other lane.
+    # Issue #459 (implementation review): the slice is a render exit too —
+    # an entity_card row's slice passes through the same read-time identity
+    # guard before the 80-char cut, so a legacy/foreign raw card never
+    # discloses its identity in the not_in_db neighbors.
     out: list[dict] = []
-    for sim, mid, content, taint, tags, source_ref in scored[:k]:
+    for sim, mid, row_type, content, taint, tags, source_ref in scored[:k]:
+        if row_type == "entity_card":
+            guarded = {
+                "id": mid,
+                "type": "entity_card",
+                "content": content or "",
+                "source_ref": source_ref or "",
+            }
+            _mask_legacy_card_row(guarded, conn)
+            content = guarded["content"]
         entry = {
             "id": mid,
             "content": (content or "")[:80],
