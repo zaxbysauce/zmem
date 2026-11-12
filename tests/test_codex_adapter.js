@@ -511,23 +511,12 @@ console.log("\n[6] Codex envelope clamp (issues #95 + #154: upstream spills abov
         claudePlain.encoded > launch.CODEX_ENVELOPE_CAP_BYTES,
         "encoded=" + claudePlain.encoded);
 
-    // #154: with giant content, a modest systemMessage is DROPPED (content
-    // wins) and the content is retained within the cap. (The pre-#154 code
-    // handled THIS exact parameterization without loss — marginal 219
-    // reserved, both channels at exactly 8000 — but degenerated when the
-    // message's marginal size approached the budget: content squeezed to
-    // fitEnvelope's {} fallback and the message riding on it. Section [8]'s
-    // 7990-marginal and 8001-byte cases pin those failure modes; this case
-    // pins the new contract at a parameterization where the old code
-    // happened to survive.)
-    const codexSmallSys = runClampCase("codex", 200);
-    ok("clamp: codex envelope with systemMessage stays <= cap",
-        codexSmallSys.encoded >= 0 && codexSmallSys.encoded <= launch.CODEX_ENVELOPE_CAP_BYTES,
-        "encoded=" + codexSmallSys.encoded);
-    ok("clamp: systemMessage dropped when content fills the cap (content wins, #154)",
-        !codexSmallSys.sysMsgPresent, "systemMessage was retained");
-    ok("clamp: content retained when the message is dropped (#154)",
-        codexSmallSys.ctxPresent, "additionalContext was lost");
+    // #213 supersession: the guarded co-fit retry removed the
+    // drop-under-saturation contract this case pinned (30000-char content +
+    // 200-char message at the 8000 cap: content re-fits at budget - the
+    // message's encoded marginal and the message rides, provided the re-fit
+    // stays above the usefulness floor). The co-fit retry and its floor
+    // boundary are pinned in tests/test_launcher_cofit.js.
 
     // #154 co-fit leg: when content and message fit together, both survive.
     const codexCoFit = runClampCase("codex", 200, 200);
