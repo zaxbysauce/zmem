@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f62ae8bef9813dff05ea1a408f790c5975a649b885c8daa779f6e579949e1863",
+  "digest": "ea83d73b007cf763e54c1a43309ccb0d82621ef419ef96c176b9a84d5ee2f488",
   "files": {
     ".agents/plugins/marketplace.json": "0d61d432c7a08c5df9511627d8164a258ce29a4742a34786c305d6af86578339",
     ".claude-plugin/marketplace.json": "091f641e3c3c4080938597e9e76b9944b103b86aac8500cf957959f9edada345",
@@ -18,7 +18,7 @@
     "deepseek-plugin/package.json": "784546ed2a1ae5dca1e3b3bb445915aa4f171d4566ddecb67612527d0e70194b",
     "deepseek-plugin/plugin.json": "f127a1c2d31e69d1f371b85928d7c96bbbed9fa40e91ea91d2953291353fcc72",
     "deepseek-plugin/tools.mjs": "c51a4e02d4473e44b110294a554c093843d6d1bad39c62f10489ccaec7d56a95",
-    "hermes-plugin/__init__.py": "d1c78ca7e95894037bce3e676cfa02cc2cfbca77b8cc0d96dfcca4f331ec0030",
+    "hermes-plugin/__init__.py": "204a5fbe86015371b776d550dd8c895d99b3669cf414879369cb3a3cef920f09",
     "hermes-plugin/hooks/_zmem_hook_common.py": "98a15c57335dfa2a330fd07dfb5a0c87b21eaf1761c679b998234f53127f6b78",
     "hermes-plugin/hooks/zmem-hermes-convention.py": "ef1a7b1fd8a3630dd8ee5c993a786b344b93d28784bb8bf64c07218a71b3d30e",
     "hermes-plugin/hooks/zmem-hermes-reflect.py": "fdec448c8b40d7a0a5c32b98e80e9a1aedcd1df15d806c3c93b059183814b1eb",

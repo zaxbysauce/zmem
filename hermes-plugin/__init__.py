@@ -3228,6 +3228,8 @@ class ZmemMemoryProvider(MemoryProvider):
         # entry — every downstream seam (cache key, live transport call,
         # background job closure) carries the SAME validated value.
         prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if isinstance(prompt_timestamp, str) and not prompt_ts:
+            logger.debug("prefetch: dropping invalid prompt_timestamp")
         prompt_digest = _hermes_prompt_digest(q)
         explicit_session = str(session_id or "").strip()
         with self._turn_ticket_lock:
@@ -3482,6 +3484,8 @@ class ZmemMemoryProvider(MemoryProvider):
         # key and the background closure (a divergent job-time clock can
         # never win).
         prompt_ts = _valid_prompt_timestamp(prompt_timestamp)
+        if isinstance(prompt_timestamp, str) and not prompt_ts:
+            logger.debug("queue_prefetch: dropping invalid prompt_timestamp")
         explicit_session = str(session_id or "").strip()
         with self._turn_ticket_lock:
             transport = self._transport
@@ -3759,6 +3763,8 @@ class ZmemMemoryProvider(MemoryProvider):
         # is validated here and rides the live transport call and the
         # offline-snapshot fallback alike (absent/invalid → wall clock).
         prompt_ts = _valid_prompt_timestamp(kwargs.get("prompt_timestamp"))
+        if isinstance(kwargs.get("prompt_timestamp"), str) and not prompt_ts:
+            logger.debug("pre_llm_call: dropping invalid prompt_timestamp")
 
         transport = self._transport
         if transport is None or not hasattr(transport, "prefetch"):
