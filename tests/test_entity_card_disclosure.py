@@ -915,5 +915,95 @@ class EntityCardDisclosureTest(unittest.TestCase):
             f"raw identity values ({MARKER} absent)")
 
 
+    # A uuid-shaped id matching no row: drives the explain --target
+    # not_in_db verdict (whose neighbors rank against the QUERY tokens — a
+    # missed UUID carries no semantic content; recall.py explain_recall).
+    MISSING_TARGET = "00000000-0000-0000-0000-00000000dead"
+
+    def test_explain_target_neighbors_mask_card_identity(self):
+        """Explain --target neighbor exit (implementation-review blocker,
+        fixed by commit 12410ffc): the not_in_db verdict's neighbors carry
+        80-char content slices, and an entity_card neighbor's slice passes
+        the read-time identity guard BEFORE the cut — the planted raw card
+        must surface as a neighbor with its slice MASKED (marker inside the
+        slice, raw identities absent) in BOTH the JSON verdict detail and
+        the human blameline. GREEN at the current tree (the fix is in); the
+        leg pins the just-fixed exit. Note the query token must be a
+        STANDALONE whitespace token of the card — the neighbor scorer
+        tokenizes whitespace-split over content_norm, where the card's
+        'text=meridian' glues but 'rotation' stands alone (probe-verified:
+        overlap 0.038, masked slice, not withheld)."""
+        eid = f"e-cred-tgt-{self.suffix}"
+        card_id = f"m-tgtcard-{self.suffix}"
+        card_content = (
+            f"Entity: {RAW_CANONICAL}\n"
+            "Kind: other\n"
+            f"Aliases: {RAW_ALIAS}\n"
+            "Mentions:\n"
+            f"- score=0.900000 last_seen=2026-11-11T00:00:04Z id=m-legacy-1 "
+            f"source_ref=probe text=meridian rotation notes ({RAW_CANONICAL}) "
+            f"and [{RAW_ALIAS}] for the quarter\n"
+            "Last seen: 2026-11-11T00:00:04Z\n"
+            "Sources:\n"
+            "- m-legacy-1\n")
+        self.insert_entity_mentions(
+            eid, "other", RAW_CANONICAL, (RAW_ALIAS,), mentions=[])
+        self.plant_raw_card(eid, card_id, card_content)
+
+        # JSON leg: no raw identity anywhere on stdout, marker present, and
+        # the not_in_db verdict's neighbors carry the card with a MASKED
+        # content slice (marker inside the slice itself).
+        pj = self.run_store("recall", "--query", "rotation",
+                            "--namespace", self.ns, "--explain", "--target",
+                            self.MISSING_TARGET, "--json")
+        for raw in (RAW_CANONICAL, RAW_ALIAS):
+            self.assertNotIn(
+                raw, pj.stdout,
+                f"explain-target-json: RAW-LEAK credential-shaped value "
+                f"{raw!r} reached stdout through the not_in_db neighbor "
+                f"slice; expected {MARKER}")
+        self.assertIn(
+            MARKER, pj.stdout,
+            "explain-target-json: masked form absent from the explain "
+            "output")
+        d = json.loads(pj.stdout)
+        neighbors = []
+        for v in (d.get("explain") or {}).get("verdicts", []):
+            if v.get("reason") == "not_in_db":
+                neighbors.extend(
+                    (v.get("detail") or {}).get("neighbors") or [])
+        card_neighbors = [n for n in neighbors if n.get("id") == card_id]
+        self.assertTrue(
+            card_neighbors,
+            "the planted card did not surface as a not_in_db neighbor for "
+            f"the query token (neighbor ids={[n.get('id') for n in neighbors]})")
+        slice_text = card_neighbors[0].get("content") or ""
+        self.assertIn(
+            MARKER, slice_text,
+            f"the card neighbor's content slice carries no masked marker "
+            f"(slice={slice_text!r} — withheld-empty or raw?)")
+
+        # Human leg: the blameline renders the nearest neighbors inline —
+        # same no-leak + marker contract, with the card's id proving it
+        # surfaced (vacuous-pass guard).
+        ph = self.run_store("recall", "--query", "rotation",
+                            "--namespace", self.ns, "--explain", "--target",
+                            self.MISSING_TARGET)
+        for raw in (RAW_CANONICAL, RAW_ALIAS):
+            self.assertNotIn(
+                raw, ph.stdout,
+                f"explain-target-human: RAW-LEAK credential-shaped value "
+                f"{raw!r} reached stdout through the not_in_db blameline "
+                f"slice; expected {MARKER}")
+        self.assertIn(
+            MARKER, ph.stdout,
+            "explain-target-human: masked form absent from the blameline "
+            "output")
+        self.assertIn(
+            card_id, ph.stdout,
+            "explain-target-human: the planted card did not surface in the "
+            "blameline (vacuous-pass guard)")
+
+
 if __name__ == "__main__":
     unittest.main()
