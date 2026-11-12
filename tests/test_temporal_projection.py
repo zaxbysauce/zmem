@@ -30,6 +30,14 @@ SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 _TMP = tempfile.mkdtemp(prefix="zmem-389-projection-")
+# Issue #389 AC9 / FC-5: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (the tests/test_temporal.py pattern; standalone runs execute
+# doModuleCleanups, one-process runs never depend on it).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_LINK_THRESHOLD", "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW",
+    "ZMEM_ARM_CAP_TEMPORAL")}
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ["ZMEM_DATA"] = _TMP
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "missing-models")
@@ -39,6 +47,15 @@ os.environ.setdefault("ZMEM_EMBED_PROFILE", "minilm")
 for _k in ("ZMEM_TEST_NOW", "ZMEM_ARM_CAP_TEMPORAL"):
     os.environ.pop(_k, None)
 
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -46,6 +63,8 @@ import contextlib  # noqa: E402
 import io  # noqa: E402
 import json  # noqa: E402
 import unittest  # noqa: E402
+
+unittest.addModuleCleanup(_restore_module_env)
 
 import storelib.recall as recall_mod  # noqa: E402
 from storelib.schema import _prepare_store, connect  # noqa: E402

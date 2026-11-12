@@ -6228,6 +6228,11 @@ def main():
                             getattr(args, "consume_tasktext", False)),
                         consume_agent_id=getattr(
                             args, "consume_agent_id", "") or "",
+                        # Issue #389 AC8: the hook lane threads the prompt's
+                        # own clock through this exact argv shape — a divergent
+                        # ZMEM_TEST_NOW must not override it.
+                        prompt_timestamp=getattr(
+                            args, "prompt_timestamp", None),
                     )
                 except ValueError as exc:
                     print(f"[zmem] {exc}", file=sys.stderr)

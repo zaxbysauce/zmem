@@ -53,16 +53,21 @@ _SNAPSHOT_COLUMNS = (
 
 def _data_dir(env: dict[str, str]) -> Path:
     import host  # noqa: PLC0415 - lazy: reads env at call time
-    sync = {k: env.get(k) for k in (
-        "ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA",
-        "ZCODE_PLUGIN_DATA") if env.get(k)}
-    saved = {k: os.environ.get(k) for k in sync}
+    _keys = ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA",
+             "ZCODE_PLUGIN_DATA")
+    sync = {k: env.get(k) for k in _keys if env.get(k)}
+    # Issue #389 AC9 exposure (one-process isolation canary): save EVERY
+    # key this dance may mutate (the opqueue.queue_dir discipline) — the
+    # clear step below pops keys the caller's env leaves unset (e.g. an
+    # ambient ZMEM_STORE under a broker env that pins only ZMEM_DATA), so
+    # a save limited to ``sync``'s keys leaked that pop past the finally
+    # and deleted the caller's ZMEM_STORE for the rest of the process.
+    saved = {k: os.environ.get(k) for k in _keys}
     try:
         for k, v in sync.items():
             os.environ[k] = v
         for k in set(os.environ) - set(sync):
-            if k in ("ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA",
-                     "ZCODE_PLUGIN_DATA") and k not in sync:
+            if k in _keys and k not in sync:
                 os.environ.pop(k, None)
         return Path(host.resolve_store_path()).expanduser().parent
     finally:

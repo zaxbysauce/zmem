@@ -56,6 +56,13 @@ HERMES_INIT = REPO_ROOT / "hermes-plugin" / "__init__.py"
 
 _TMP = tempfile.mkdtemp(prefix="zmem-389-promptts-test-")
 atexit.register(shutil.rmtree, _TMP, True)
+# Issue #389 AC9 / FC-5: capture the pre-pin ambient BEFORE the module-level
+# mutations below so each carries an explicit unittest.addModuleCleanup
+# restore (the tests/test_temporal.py pattern; standalone runs execute
+# doModuleCleanups, one-process runs never depend on it).
+_MODULE_ENV_PRIOR = {key: os.environ.get(key) for key in (
+    "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
+    "ZMEM_LINK_THRESHOLD", "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW")}
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "store.sqlite")
 os.environ["ZMEM_DATA"] = _TMP
 os.environ["ZMEM_MODELS_DIR"] = os.path.join(_TMP, "missing-models")
@@ -64,6 +71,17 @@ os.environ["ZMEM_LINK_THRESHOLD"] = "1.01"
 os.environ["ZMEM_EMBED_PROFILE"] = "minilm"  # model-absent shape
 os.environ.pop("ZMEM_TEST_NOW", None)
 
+
+def _restore_module_env():
+    for key, value in _MODULE_ENV_PRIOR.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+unittest.addModuleCleanup(_restore_module_env)
+
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 NAMESPACE = "project:pts389"
@@ -71,6 +89,7 @@ SESSION_ID = "pts389-session"
 PROMPT_TS = "2026-09-10T15:30:00Z"        # the payload's prompt timestamp
 ALT_TS = "2026-10-01T08:00:00Z"           # a second valid, divergent clock
 DIVERGENT_NOW = "2027-03-01T00:00:00Z"    # a divergent ZMEM_TEST_NOW
+E2E_DIVERGENT_NOW = "2030-01-01T00:00:00Z"  # e2e leg: years away from TS
 TEMPORAL_PROMPT = "outage during last week in the alpha service"
 
 # The stub store child (probe_389 mechanism): records argv to the capture
@@ -780,6 +799,75 @@ class InjectSeamTest(unittest.TestCase):
             self.assertIsNone(captured.get("prompt_timestamp"))
         finally:
             conn.close()
+
+
+class StoreChildEndToEndTest(unittest.TestCase):
+    """FC-1 part 2 — the committed end-to-end pin: the REAL store child,
+    driven with the hook's exact for-injection argv shape, resolves the
+    temporal window from the threaded ``--prompt-timestamp`` even while the
+    child's own ZMEM_TEST_NOW points years away."""
+
+    def _child_env(self, scratch):
+        # The StoreCliTest._run_cli subprocess-env pattern (ambient minus
+        # ZMEM_TEST_*), plus the model-absent pins and the divergent child
+        # clock the threaded timestamp must beat.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_TEST_")}
+        env.update({
+            "ZMEM_STORE": os.path.join(scratch, "store.sqlite"),
+            "ZMEM_DATA": scratch,
+            "ZMEM_MODELS_DIR": os.path.join(_TMP, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_EMBED_PROFILE": "minilm",
+            "ZMEM_LINK_THRESHOLD": "1.01",
+            "ZMEM_TEST_NOW": E2E_DIVERGENT_NOW,
+            "PYTHONUTF8": "1",
+        })
+        return env
+
+    def test_threaded_timestamp_beats_divergent_child_now(self):
+        scratch = tempfile.mkdtemp(prefix="zmem-389-promptts-e2e-", dir=_TMP)
+        env = self._child_env(scratch)
+        # Seed one event whose occurrence window (2026-09-01..03) overlaps
+        # "last week" ONLY relative to PROMPT_TS (2026-09-10) — never
+        # relative to the divergent 2030 child clock.
+        seed = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "add",
+             "--namespace", NAMESPACE, "--type", "event",
+             "--content", TEMPORAL_PROMPT, "--signal", "test",
+             "--occurred-start", "2026-09-01T08:00:00Z",
+             "--occurred-end", "2026-09-03T08:00:00Z"],
+            capture_output=True, text=True, env=env, timeout=180)
+        self.assertEqual(seed.returncode, 0, seed.stderr[-800:])
+        base_argv = [
+            sys.executable, "-X", "utf8", str(STORE_PY),
+            "recall",
+            "--query", TEMPORAL_PROMPT,
+            "--namespace", NAMESPACE,
+            "--no-bump", "--for-injection", "--json",
+            "--session-id", SESSION_ID,
+            "--moment", "user_prompt",
+            "--lane", "claude",
+            "--limit", "5",
+        ]
+        # Threaded leg: the payload's prompt clock wins over the child's
+        # divergent ZMEM_TEST_NOW — the temporal arm finds the event.
+        threaded = subprocess.run(
+            base_argv + ["--prompt-timestamp", PROMPT_TS],
+            capture_output=True, text=True, env=env, timeout=180)
+        self.assertEqual(threaded.returncode, 0, threaded.stderr[-800:])
+        envelope = json.loads(threaded.stdout)
+        temporal_arm = envelope["arms"]["temporal"]
+        self.assertGreaterEqual(temporal_arm["pre"], 1)
+        self.assertGreaterEqual(temporal_arm["post"], 1)
+        # Control leg: the SAME divergent now WITHOUT --prompt-timestamp
+        # resolves "last week" to Dec 2029 — the event is out of window and
+        # the temporal arm stays empty.
+        control = subprocess.run(
+            base_argv, capture_output=True, text=True, env=env, timeout=180)
+        self.assertEqual(control.returncode, 0, control.stderr[-800:])
+        control_envelope = json.loads(control.stdout)
+        self.assertEqual(control_envelope["arms"]["temporal"]["pre"], 0)
 
 
 if __name__ == "__main__":

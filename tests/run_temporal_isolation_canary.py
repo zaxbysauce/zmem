@@ -59,6 +59,10 @@ ENV_WRITING_MODULES = [
     "tests/test_tasktext_correlation_supp.py",
     "tests/test_tasktext_fleet_grant.py",
     "tests/test_tasktext_hub_argv.py",
+    # FC-5 (issue #389): the two NEW #389 test files also carry module-level
+    # os.environ writes (each now paired with an addModuleCleanup restore).
+    "tests/test_prompt_timestamp_threading.py",
+    "tests/test_temporal_projection.py",
 ]
 
 PYTEST_MODULES = TEMPORAL_MODULES + ENV_WRITING_MODULES

@@ -953,6 +953,9 @@ def _passive_store_args(
     session_id: str,
     moment: str,
     lane: str,
+    # Production caller is the recent lane (no timestamp today); the recall
+    # branch exists for the schema/tool seam + tests (_tool_search keeps its
+    # inline search-contract argv — byte-identical to the shipped shape).
     prompt_timestamp: Optional[str] = None,
 ) -> List[str]:
     """Build one store-owned passive-injection subprocess invocation.

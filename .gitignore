@@ -74,3 +74,4 @@ self-corpus-results.json
 # local rebuildable caches — never commit
 .zaxbygraph/
 .covtmp/
+zmem-guard-scratch/
