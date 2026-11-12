@@ -48,9 +48,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   recall/search/prefetch tools, the fleet transports, and the remote
   broker accept and forward it, so a divergent `ZMEM_TEST_NOW` never
   overrides an explicitly supplied prompt time on any lane that has one.
-  The wall clock remains the fallback where no prompt time exists
-  (disclosed exception: the CLI prefetch flag is forwarded on both the
-  live remote lane and the offline snapshot serve).
+  The wall clock remains the fallback where no prompt time exists; the
+  CLI `prefetch --prompt-timestamp` flag is forwarded on both the live
+  remote lane and the offline snapshot serve.
 ### Added
 - One-process test isolation for the temporal/env-writing suites (issue
   #389 item 4): the affected modules run green in ONE pytest invocation
