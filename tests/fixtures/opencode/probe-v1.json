@@ -1,0 +1,1 @@
+{"probe_date": "2026-09-10", "version": "1.0.0", "callbacks": ["system.transform", "session.compacting", "event"], "event_name": "session.compacting", "session_fields": ["id", "worktree"], "transcript_shape": {"info": {}, "parts": []}, "selected": true}
