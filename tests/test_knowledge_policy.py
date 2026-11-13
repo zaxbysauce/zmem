@@ -315,7 +315,7 @@ class RenderPolicyTest(ScratchDirTest):
                                              allow_capture=True).split())
         for needle in ("knowledge read --target", "knowledge check",
                        "knowledge status", "knowledge capture",
-                       "--namespace", "flush",
+                       "--namespace",
                        "configured Python interpreter",
                        "Obsidian is optional",
                        "author", "curate", "evidence", "secrets",
@@ -323,8 +323,10 @@ class RenderPolicyTest(ScratchDirTest):
             self.assertIn(needle, flat)
         # zmem compact memory vs external targets distinction is taught.
         self.assertIn("zmem memory", flat)
-        # Exit-3 recovery guidance is the pending state, not a blind flush.
-        self.assertIn("drains only queued entries", flat)
+        # Exit-3 recovery guidance names the ACTUAL subcommand — a bare
+        # `flush` was ambiguous (feedback FB-005): the CLI is `knowledge
+        # flush`, and it drains the pending queue, not a blind flush.
+        self.assertIn("knowledge flush` drains only queued entries", flat)
         # The workflow pointer names the portable skill.
         self.assertIn('"knowledge" skill', flat)
         # Closeout capture is scoped to a USER-requested closeout in this

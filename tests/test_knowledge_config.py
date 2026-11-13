@@ -289,9 +289,13 @@ class EnvCaptureTests(unittest.TestCase):
     def test_env_recorded_not_consulted(self):
         path = knowledge_cfg(self.tmp, {"enabled": True,
                                         "targets": {"kb": dict(GOOD_KB)}})
-        with_env = load_knowledge_config(path, env={"ZMEM_KB_TOKEN": "x"})
+        caller_env = {"ZMEM_KB_TOKEN": "x"}
+        with_env = load_knowledge_config(path, env=caller_env)
         without_env = load_knowledge_config(path, env={})
-        self.assertIs(with_env.env, with_env.env)
+        # The config captures the ACTUAL caller's mapping object (identity,
+        # not a copy) so later credential lookups see the caller's view of
+        # the environment; loading itself never reads the token value.
+        self.assertIs(with_env.env, caller_env)
         self.assertEqual(with_env.targets["kb"].credential_env,
                          "ZMEM_KB_TOKEN")
         self.assertEqual(with_env.enabled, without_env.enabled)

@@ -154,7 +154,7 @@ def build_link_op(entry: Mapping[str, Any]) -> dict[str, Any]:
             "locator": str(entry["locator"]),
             "fullhash": list(entry["fullhash"]),
             "summary": str(entry["summary"]),
-            "date": str(entry["date"]),
+            "date": entry["date"],
             "expected_row_id": entry.get("expected_row_id"),
         },
     }

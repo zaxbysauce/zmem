@@ -117,8 +117,8 @@ _CAPTURE_PARA = (
     "--namespace <ns> --content <text|->`; at a closeout the user\n"
     "requested in this session, store relevant explicit notes\n"
     "(agent/reminder-initiated closeouts draft only, no capture). Exit 3\n"
-    "= pending: inspect `knowledge status`; `flush` drains only queued\n"
-    "entries, else re-run the same capture input (idempotent)."
+    "= pending: inspect `knowledge status`; `knowledge flush` drains only\n"
+    "queued entries, else re-run the same capture input (idempotent)."
 )
 
 _READONLY_PARA = (

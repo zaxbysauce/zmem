@@ -34,6 +34,12 @@ PAYLOAD = REPO_ROOT / "hooks" / "lib" / "zmem-session-start-payload.py"
 POLICY = (REPO_ROOT / "skills" / "memory" / "scripts" / "knowledge"
           / "policy.py")
 BASE_REF = "5bee7e69:hooks/lib/zmem-session-start-payload.py"
+BASE_BLOB_SHA = "6b25881037a49f3d82e690343043dd22affc739c"
+# Byte-for-byte frozen copy of the BASE_REF blob (the pre-PR2 payload
+# builder).  Test-only static baseline: never imported, only executed as
+# a subprocess with mocked argv, exactly like the current builder.
+BASE_PAYLOAD_FIXTURE = (REPO_ROOT / "tests" / "fixtures"
+                        / "zmem_session_start_payload_5bee7e69.py")
 
 sys.path.insert(0, str(REPO_ROOT / "tests" / "fixtures"))
 from eval_store import BASE_ENV  # noqa: E402
@@ -103,15 +109,18 @@ class KnowledgePolicyHookTest(unittest.TestCase):
         self._helper_runs = 0
 
     def _extract_base_payload(self):
-        """The pre-PR2 payload builder at the base commit, as an oracle."""
-        try:
-            proc = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "show", BASE_REF],
-                capture_output=True, timeout=30, check=True)
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.skipTest("git show unavailable: %r" % (exc,))
+        """The pre-PR2 payload builder, frozen as a checked-in fixture.
+
+        The baseline used to be extracted with `git show BASE_REF`, which
+        made every test in this class SKIP wherever that commit object is
+        unreachable (CI's fetch-depth checkout) — a silent loss of the
+        whole default-off oracle.  The fixture is a byte-for-byte copy of
+        the BASE_REF blob (provenance pinned by
+        test_frozen_baseline_fixture_provenance whenever the object is
+        available); the comparison tests below run hermetically, with no
+        git dependency at test time."""
         out = self.base / "base-payload.py"
-        out.write_bytes(proc.stdout)
+        shutil.copyfile(BASE_PAYLOAD_FIXTURE, out)
         return out
 
     def _env(self, **extra):
@@ -179,6 +188,42 @@ class KnowledgePolicyHookTest(unittest.TestCase):
 
     def test_default_off_no_config_byte_identical(self):
         self._assert_default_off_identical()
+
+    def test_frozen_baseline_fixture_provenance(self):
+        """The frozen baseline is the REAL base-commit builder, not a
+        hand-approximation: wherever the git object exists (full clones,
+        this worktree), the fixture bytes must equal the BASE_REF blob.
+        Only THIS provenance check may skip on shallow checkouts — the
+        baseline comparisons above never depend on git."""
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "show", BASE_REF],
+                capture_output=True, timeout=30, check=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.skipTest(
+                "shallow clone: BASE_REF object unreachable (%r); the "
+                "frozen fixture is still enforced by the comparisons" % exc)
+        self.assertEqual(
+            proc.stdout, BASE_PAYLOAD_FIXTURE.read_bytes(),
+            "the frozen baseline drifted from %s" % BASE_REF)
+        self.assertEqual(
+            __import__("hashlib").sha1(
+                b"blob %d\0" % len(proc.stdout) + proc.stdout).hexdigest(),
+            BASE_BLOB_SHA, "recorded blob SHA no longer matches BASE_REF")
+
+    def test_baseline_comparison_has_teeth(self):
+        """Counter-mutant for the frozen oracle: run the current builder
+        and the frozen baseline on INPUTS that differ (core.md mutated
+        between the runs) and the outputs must differ — proving the
+        byte-identity assertions above can actually reject drift, not
+        just rubber-stamp two equal strings (test theater)."""
+        ours = self._stdout(self._run(PAYLOAD, self._env()))
+        (self.base / "core.md").write_text("SS-TIER0-MUTATED",
+                                           encoding="utf-8")
+        baseline = self._stdout(self._run(self.base_payload, self._env()))
+        self.assertNotEqual(ours, baseline,
+                            "differing inputs must break byte-identity — "
+                            "the frozen-oracle comparison has no teeth")
 
     def test_disabled_config_byte_identical(self):
         self._write_config({"knowledge": {

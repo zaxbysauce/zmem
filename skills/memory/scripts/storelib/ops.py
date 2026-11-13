@@ -322,7 +322,7 @@ def _knowledge_link_fields(args: Mapping[str, Any]) -> dict[str, Any]:
             return True
         if "\\" in value:
             return True
-        if value == ".." or "/../" in value:
+        if any(part == ".." for part in value.split("/")):
             return True
         return False
 

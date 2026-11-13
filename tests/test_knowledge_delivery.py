@@ -256,6 +256,25 @@ class SidecarContractTests(unittest.TestCase):
                           "no >=32-hex run may exist in the sidecar")
         self.assertEqual(entry["status"], "queued")
 
+    def test_build_link_op_preserves_null_date(self):
+        """A null date placeholder stays null in the typed-op envelope —
+        never str(None) ("None" is not a valid date literal; the ops
+        engine treats a null date as server-date-optional)."""
+        base = {
+            "op_id": "kl-null-date", "namespace": "user:global",
+            "target": "notes", "key": "run/a",
+            "version": 1, "locator": "run/a/x.md",
+            "fullhash": ["aaaaaaaa"] * 8, "summary": "s",
+            "date": None, "expected_row_id": None}
+        op = build_link_op(base)
+        self.assertIsNone(op["args"]["date"])
+        self.assertNotIn('"None"', json.dumps(op),
+                         "str(None) leaked a malformed date literal")
+        # Non-string junk passes through UNCHANGED for the ops-side field
+        # validator to refuse — build_link_op never stringifies it.
+        self.assertEqual(
+            build_link_op(dict(base, date=123))["args"]["date"], 123)
+
     def test_enqueue_idempotent_and_bounded(self):
         env = _Env()
         base = {
@@ -668,6 +687,8 @@ class EngineAdmissionTests(unittest.TestCase):
         for mutate in (
             lambda a: a.update({"fullhash": ["aaaaaaaa"] * 7}),
             lambda a: a.update({"locator": r"C:\vault\note.md"}),
+            lambda a: a.update({"locator": "../x"}),
+            lambda a: a.update({"locator": "x/.."}),
             lambda a: a.update({"version": 0}),
             lambda a: a.update({"expected_row_id": ""}),
             lambda a: a.update({"summary": ""}),
