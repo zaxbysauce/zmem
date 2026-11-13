@@ -48,8 +48,16 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
 - host install-skew: duplicate enabled zmem installs (fail), installed-cache
   vs marketplace version skew (warn), project pins behind the user-scope
   install (warn) (issue #185)
+- plugin-registry hygiene (issue #127): every Claude/ZCode registry entry is
+  validated for name, version, and install path — a DANGLING install path
+  (the registry names an install directory that no longer exists) warns with
+  the exact registry path, plugin name, version, and missing path; the
+  warning never fails the report
 - Codex manifest hook trust: registered manifest events (SessionStart,
-  PreToolUse) missing from the config's trusted hook state warn
+  UserPromptSubmit, PreToolUse `Bash|apply_patch`, PostToolUse
+  `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`, Stop, SubagentStart,
+  SubagentStop, PreCompact, SessionEnd) missing from the config's trusted
+  hook state warn
   `untrusted-hook <ids>`; when no entry names this repo the box-wide
   trusted union is used as inventory, so reapprove hooks manually anyway
   (issue #185)
@@ -57,7 +65,9 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
   counts; merge with `promote-store --from <path>`, never auto-deleted
   (issue #185)
 - canonical namespace derivation for the target project
-- required host surfaces and optional Codex adapter files
+- required host surfaces: the Claude, Codex, and ZCode plugin surfaces plus
+  the memory skill are ALL required (a missing Codex plugin file fails
+  `host-surfaces`; the repo never shipped repo-local Codex adapter files)
 
 Do not proceed on a failing doctor run until the blockers are understood.
 
@@ -145,11 +155,19 @@ store.
 
 Required surfaces in this repo today:
 - Claude Code plugin surface
+- Codex plugin surface (`.codex-plugin/plugin.json` +
+  `hooks/hooks.codex.json` — SHIPPED, and required since 0.18.0; doctor
+  fails `host-surfaces` when either is missing)
 - ZCode plugin surface
 - Memory skill surface
 
-Optional surface:
-- Repo-local Codex adapter files, if and when that lane lands
+The repo never shipped repo-local Codex adapter files (`.codex/hooks.json`,
+`.codex/AGENTS.md`); the optional-Codex framing is retired (issue #127).
+
+Envelope budgets after cutover: `ZMEM_CTX_BUDGET` defaults to 25000 on the
+ZCode launcher path and 9000 on the Claude Code path and the ZCode
+non-launcher path; Codex envelopes are capped at 8000 encoded bytes by the
+launcher regardless.
 
 After any hook-surface change:
 - trust the project again if your host requires it

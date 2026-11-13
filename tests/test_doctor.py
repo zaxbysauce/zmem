@@ -195,10 +195,37 @@ class DoctorCliTest(unittest.TestCase):
             self.assertEqual(statuses["windows-bash"], "pass")
 
         surfaces = next(c for c in report["checks"] if c["id"] == "host-surfaces")
+        # Issue #127: the optional-Codex era is over — assert the shipped
+        # plugin is the required surface, the checkout registry detail is
+        # present, and the codex_adapter_optional detail is GONE.
+        self.assertNotIn(
+            "codex_adapter_optional",
+            surfaces["details"]["surfaces"],
+            "the optional-Codex detail must not survive issue #127",
+        )
+        codex_group = surfaces["details"]["surfaces"]["codex_plugin"]
+        repo_prefix = str(self.repo) + os.sep
+
+        def _rel(paths):
+            return [p.replace(repo_prefix, "").replace("\\", "/") for p in paths]
+
         self.assertEqual(
-            surfaces["details"]["surfaces"]["codex_adapter_optional"]["present"],
-            [],
-            "optional Codex adapter files missing must not fail the doctor",
+            _rel(codex_group["required"]),
+            [".codex-plugin/plugin.json", "hooks/hooks.codex.json"],
+            "codex_plugin must require exactly the two shipped paths",
+        )
+        self.assertEqual(_rel(codex_group["present"]), _rel(codex_group["required"]))
+        plugin_registries = next(
+            c for c in report["checks"] if c["id"] == "plugin-registries"
+        )
+        self.assertEqual(
+            plugin_registries["details"]["codex"]["registry"],
+            "checkout",
+            "Codex installs from the checkout; the registry detail must say so",
+        )
+        self.assertEqual(
+            plugin_registries["details"]["hermes"]["registry"],
+            "provider-or-compatibility-config",
         )
 
     def test_missing_required_host_surface_fails_per_group(self):
@@ -235,6 +262,256 @@ class DoctorCliTest(unittest.TestCase):
                 check = next(c for c in report["checks"] if c["id"] == "host-surfaces")
                 self.assertEqual(check["status"], "fail", group)
                 self.assertIn(group, check["summary"])
+
+    def test_missing_codex_plugin_surface_fails(self):
+        """Issue #127 AC2: each shipped Codex plugin path is REQUIRED —
+        removing either one from the repository fixture must fail the CLI
+        doctor run (nonzero exit, ok=false, host-surfaces fail), one
+        subtest per path."""
+        required = [".codex-plugin/plugin.json", "hooks/hooks.codex.json"]
+        for rel in required:
+            with self.subTest(missing=rel):
+                (self.repo / rel).unlink()
+                try:
+                    result = self._run(
+                        "--format",
+                        "json",
+                        "--repo-root",
+                        str(self.repo),
+                        "--project",
+                        str(self.project),
+                    )
+                finally:
+                    self._write_repo_surfaces()
+                self.assertNotEqual(
+                    result.returncode,
+                    0,
+                    f"missing {rel} must fail doctor (issue #127 AC2)",
+                )
+                report = json.loads(result.stdout)
+                self.assertFalse(report["ok"], rel)
+                check = next(
+                    c for c in report["checks"] if c["id"] == "host-surfaces"
+                )
+                self.assertEqual(check["status"], "fail", rel)
+                self.assertIn("codex_plugin", check["summary"], rel)
+
+    def _issue127_registry_projection(self, home: Path, detail) -> dict:
+        """Normalize the plugin-registries ``registries`` detail for the
+        byte-compare against the committed expected fixture: rewrite the
+        temp-home prefix to ``<scratch>`` and force forward slashes so the
+        fixture is platform-neutral."""
+
+        def rewrite(value):
+            if isinstance(value, str):
+                text = value.replace(str(home), "<scratch>")
+                return text.replace("\\", "/")
+            if isinstance(value, list):
+                return [rewrite(v) for v in value]
+            if isinstance(value, dict):
+                return {k: rewrite(v) for k, v in value.items()}
+            return value
+
+        return rewrite(detail)
+
+    def test_dangling_plugin_registry_warns(self):
+        """Issue #127 AC4: a registry entry whose install path does not exist
+        warns under plugin-registries (exact registry path, name, version,
+        install path), the projection byte-matches the committed fixture,
+        and the warning never fails the report (no duplicate-install, host
+        surfaces still pass)."""
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        # Clean-pass baseline (same shape as test_json_report_clean_pass):
+        # a healthy store/settings/config so ONLY the registry fixtures can
+        # produce findings.
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "\n".join(
+                [
+                    "[features]",
+                    "memories = false",
+                    "",
+                    "[memories]",
+                    "use_memories = false",
+                    "generate_memories = false",
+                    "",
+                    f"[projects.'{str(self.project).lower()}']",
+                    'trust_level = "trusted"',
+                ]
+            ),
+        )
+        claude_reg = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        zcode_reg = self.home / ".zcode" / "cli" / "plugins" / "installed_plugins.json"
+        claude_reg.parent.mkdir(parents=True)
+        zcode_reg.parent.mkdir(parents=True)
+        for src, dst in (
+            (fixtures / "installed_plugins.claude.json", claude_reg),
+            (fixtures / "installed_plugins.zcode.json", zcode_reg),
+        ):
+            data = json.loads(src.read_text(encoding="utf-8"))
+
+            def _sub(value):
+                if isinstance(value, str):
+                    return value.replace("<scratch>", str(self.home))
+                if isinstance(value, list):
+                    return [_sub(v) for v in value]
+                if isinstance(value, dict):
+                    return {k: _sub(v) for k, v in value.items()}
+                return value
+
+            dst.write_text(
+                json.dumps(_sub(data), sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+                newline="\n",
+            )
+        # Only the valid install directory exists; zmem-dangling stays absent.
+        valid_dir = self.home / "plugins" / "valid"
+        valid_dir.mkdir(parents=True)
+
+        result = self._run(
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        # The dangling warning must NEVER flip report.ok (#127 contract).
+        self.assertTrue(report["ok"], report["checks"])
+        host_surfaces = next(
+            c for c in report["checks"] if c["id"] == "host-surfaces"
+        )
+        self.assertEqual(host_surfaces["status"], "pass")
+        self.assertNotIn(
+            "duplicate-install",
+            {c["id"] for c in report["checks"]},
+            "the enabled:false dangling records must not trip #185",
+        )
+        check = next(
+            c for c in report["checks"] if c["id"] == "plugin-registries"
+        )
+        self.assertEqual(check["status"], "warn")
+        registries = check["details"]["registries"]
+        self.assertEqual(registries["claude"]["status"], "warn")
+        self.assertEqual(registries["zcode"]["status"], "warn")
+
+        def norm_reg_path(p):
+            return (
+                str(p)
+                .replace(str(self.home), "<scratch>")
+                .replace("\\", "/")
+            )
+
+        for host_key, reg_path in (
+            ("claude", claude_reg),
+            ("zcode", zcode_reg),
+        ):
+            warnings = registries[host_key]["warnings"]
+            dangling = [
+                w for w in warnings if w["kind"] == "dangling-install-path"
+            ]
+            self.assertEqual(
+                len(dangling), 1, f"{host_key}: exactly one dangling warning"
+            )
+            w = dangling[0]
+            self.assertEqual(
+                norm_reg_path(reg_path), norm_reg_path(w["registry_path"])
+            )
+            self.assertEqual(w["name"], "zmem-dangling")
+            self.assertEqual(w["version"], "0.28.0")
+            self.assertEqual(
+                norm_reg_path(w["install_path"]),
+                norm_reg_path(self.home / "plugins" / "gone"),
+            )
+
+        expected = (
+            fixtures / "expected" / "issue127-plugin-registries.json"
+        ).read_text(encoding="utf-8")
+        projection = self._issue127_registry_projection(
+            self.home, registries
+        )
+        actual = json.dumps(projection, sort_keys=True, separators=(",", ":"))
+        self.assertEqual(
+            actual,
+            expected.strip(),
+            "normalized plugin-registries projection must byte-match the "
+            "committed fixture",
+        )
+
+        # Negative legs (plan round-2 finding 1): field validation on the
+        # normalized projection — missing/non-string name, missing version,
+        # and a Claude v2 dangling installPath (live schema) each warn.
+        zcode_bad = self.home / ".zcode" / "cli" / "plugins" / "installed_plugins.json"
+        zcode_bad.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "plugins": [
+                        {
+                            "name": "no-version",
+                            "installPath": str(valid_dir),
+                            "enabled": False,
+                            "scope": "user",
+                        },
+                        {
+                            "name": 7,
+                            "installPath": str(valid_dir),
+                            "enabled": False,
+                            "scope": "user",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        claude_live = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        claude_live.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "other-tool": [
+                            {
+                                "installPath": str(self.home / "plugins" / "also-gone"),
+                                "version": "1.0.0",
+                                "enabled": False,
+                                "scope": "user",
+                            }
+                        ]
+                    },
+                }
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        result2 = self._run(
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+        )
+        self.assertEqual(result2.returncode, 0, result2.stderr)
+        report2 = json.loads(result2.stdout)
+        self.assertTrue(report2["ok"], "field warnings never fail the report")
+        check2 = next(
+            c for c in report2["checks"] if c["id"] == "plugin-registries"
+        )
+        self.assertEqual(check2["status"], "warn")
+        blob = json.dumps(check2["details"])
+        self.assertIn('"field": "version"', blob)
+        self.assertIn('"field": "name"', blob)
+        self.assertIn("also-gone", blob)
 
     def test_human_report_returns_nonzero_on_native_memory_blockers(self):
         store_dir = self.home / ".zmem"
