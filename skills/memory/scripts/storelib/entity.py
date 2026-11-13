@@ -613,6 +613,149 @@ def _masked_display_rows(rows, *name_keys):
     return out
 
 
+# --- Issue #459: entity-card identity masking --------------------------------
+#
+# A credential-shaped canonical name or alias renders VERBATIM into the
+# entity card's structural header (``Entity:``/``Aliases:``), its mention
+# text= lines, and its source_ref= line — the card row is STORED content, so
+# the #457 display mask (a rendering concern) never sees it. The two-layer
+# pass below runs at card COMPOSITION (build_entity_card_text, before the
+# bytes reach add_memory) and again at every read render exit for
+# pre-existing raw cards (recall.py's _mask_legacy_card_row guard).
+
+# The identity-substring fold map's whitespace handling (plan-critic rounds
+# 6+7): unlike _display_fold, this map NEVER strips or deletes a whitespace
+# CHARACTER — each original whitespace char survives as a boundary in the
+# mapped form, so token boundaries cannot be manufactured away
+# (``pass word:12345`` never matches identity ``password:12345``). Only
+# whitespace RUNS collapse (to single spaces, like every fold here), so
+# ``(password  db=12345)`` folds onto the whitespace-containing identity
+# ``password db=12345`` as a whole.
+
+
+def _fold_map(text: str) -> tuple[str, list[int]]:
+    """Map text onto its fold-equivalent form, keeping origin indices.
+
+    Per character: NFKC + casefold, with Unicode-Cf characters removed —
+    the same vocabulary as _display_fold but WITHOUT its ``.strip()`` and
+    without deleting interior whitespace. Whitespace runs then collapse to
+    single spaces. Returns ``(mapped, origins)`` where ``origins[k]`` is
+    the index in the ORIGINAL text of the character that produced mapped
+    character ``k`` (an NFKC expansion shares one origin; a collapsed
+    whitespace run's space carries the run's FIRST character index), so a
+    mapped match [i, j) maps back to the original span
+    ``[origins[i], origins[j-1] + 1)``. ``origins`` is non-decreasing."""
+    mapped: list[str] = []
+    origins: list[int] = []
+    for idx, ch in enumerate(text or ""):
+        if unicodedata.category(ch) == "Cf":
+            continue
+        for fch in unicodedata.normalize("NFKC", ch).casefold():
+            mapped.append(fch)
+            origins.append(idx)
+    out_chars: list[str] = []
+    out_origins: list[int] = []
+    i = 0
+    n = len(mapped)
+    while i < n:
+        ch = mapped[i]
+        if ch.isspace():
+            out_chars.append(" ")
+            out_origins.append(origins[i])
+            i += 1
+            while i < n and mapped[i].isspace():
+                i += 1
+        else:
+            out_chars.append(ch)
+            out_origins.append(origins[i])
+            i += 1
+    return "".join(out_chars), out_origins
+
+
+_CARD_TOKEN_SPLIT_RE = re.compile(r"(\s+)")
+
+
+def _mask_card_identity_text(text: str, identity_values) -> str:
+    """Two-layer identity/token mask over entity-card text (issue #459).
+
+    Layer 1 (identity substrings): every occurrence of a
+    credential-shaped identity value V (canonical name or alias — callers
+    judge the values with the unchanged #457 predicate BEFORE passing
+    them) is removed in FOLD-EQUIVALENT form: the text is mapped through
+    _fold_map, every _display_fold(V) occurrence is located in the mapped
+    form, and each match maps back to its ORIGINAL span, which is replaced
+    with _DISPLAY_MASK (unrelated surrounding text preserved). This
+    catches ``(V)``, ``[V]``, ``/V``, ``x=V``, every ASCII casing, every
+    fullwidth/Cf variant in EITHER direction, and whitespace-containing
+    identities folded as a whole — while a lone boundary space never
+    manufactures a match (``pass word:12345`` stays verbatim). A mapped
+    match whose original span re-folds differently (pathological NFKC
+    divergence) resolves toward REPLACING — fail toward masking, never
+    toward leaking. Non-overlapping matches are collected left-to-right
+    from one fold-map snapshot and applied from the right end so earlier
+    spans' original indices stay valid (the snapshot means inserted marker
+    text is never rescanned).
+
+    Layer 2 (token pass, defense in depth): the remaining text is split
+    on whitespace runs (separators preserved) and each non-space part
+    passes through _mask_entity_display — standalone credential shapes in
+    mention content/source_refs (``DB_PASSWORD=x``, a bare head token)
+    that are not identity occurrences still mask.
+
+    Raises _DisplayRedactionUnavailable out (fail closed) — callers
+    composing or rendering cards must refuse rather than store or emit
+    raw identity bytes."""
+    if not text:
+        return text
+    out = text
+    for value in identity_values or ():
+        if not value:
+            continue
+        needle = _display_fold(value)
+        if not needle:
+            continue
+        mapped, origins = _fold_map(out)
+        pos = 0
+        spans: list[tuple[int, int]] = []
+        while True:
+            start = mapped.find(needle, pos)
+            if start < 0:
+                break
+            end = start + len(needle)
+            spans.append((origins[start], origins[end - 1] + 1))
+            pos = end
+        for orig_start, orig_end in reversed(spans):
+            out = out[:orig_start] + _DISPLAY_MASK + out[orig_end:]
+    rebuilt: list[str] = []
+    for part in _CARD_TOKEN_SPLIT_RE.split(out):
+        if part and not part.isspace():
+            part = _mask_entity_display(part)
+        rebuilt.append(part)
+    return "".join(rebuilt)
+
+
+def _card_header_identities(content: str) -> list[str]:
+    """The card's OWN structural header identity candidates (issue #459).
+
+    Parses the ``Entity: <name>`` line (rest of line) and the
+    ``Aliases: <a>, <b>`` line (comma-separated, each stripped) out of a
+    card's content, returning the raw candidate values (empty entries
+    dropped). Callers judge each value with the unchanged #457 predicate
+    before it becomes a layer-1 replacement target. Header recovery lets
+    the read-time guard mask cards whose source entity was deleted,
+    renamed, or lost aliases since composition; already-masked headers
+    carry ``[REDACTED_SECRET]`` (not credential-shaped) and no-op."""
+    values: list[str] = []
+    for line in (content or "").splitlines():
+        if line.startswith("Entity: "):
+            values.append(line[len("Entity: "):].strip())
+        elif line.startswith("Aliases: "):
+            values.extend(
+                piece.strip()
+                for piece in line[len("Aliases: "):].split(","))
+    return [v for v in values if v]
+
+
 def _default_entity_kind_weights() -> dict[str, float]:
     weights = {k: 1.0 for k in ENTITY_KINDS}
     weights["other"] = 0.6
@@ -967,6 +1110,13 @@ def entities_for_memories(
 
     Ordered by canonical_name so recall JSON and `get --json` are
     deterministic across platforms.
+
+    Issue #459: the ``name`` field passes through _mask_entity_display —
+    a credential-shaped canonical name must never reach the recall/get
+    render's entities metadata (or anything deriving from it, like the
+    delivery-ledger matcher fuel). id/kind unchanged; the mask raises
+    _DisplayRedactionUnavailable (fail closed) when the shared registry
+    breaks.
     """
     if not memory_ids:
         return {}
@@ -981,7 +1131,8 @@ def entities_for_memories(
     out: dict[str, list[dict]] = {}
     for r in rows:
         out.setdefault(r["mid"], []).append(
-            {"id": r["eid"], "kind": r["kind"], "name": r["name"]}
+            {"id": r["eid"], "kind": r["kind"],
+             "name": _mask_entity_display(r["name"])}
         )
     return out
 
@@ -1947,7 +2098,21 @@ def build_entity_card_text(
     lines.append("Last seen: " + max(r["ts"] for r in rows))
     lines.append("Sources:")
     lines.extend(f"- {r['mid']}" for r in selected)
-    return "\n".join(lines) + "\n", [r["mid"] for r in selected], taint
+    # Issue #459: the card's STORED content must never carry a raw
+    # credential-shaped identity value. Layer 1 replaces every
+    # fold-equivalent occurrence of a credential-shaped canonical name or
+    # alias (the header renders them verbatim today, and mention
+    # text=/source_ref= lines can repeat them in any casing or
+    # fullwidth/Cf variant); layer 2 runs the shared token pass over the
+    # remaining text for non-identity credential shapes. Benign cards are
+    # byte-identical (no identity value is credential-shaped and no token
+    # masks, so both layers no-op). Raises _DisplayRedactionUnavailable
+    # out (fail closed) — the card CLI and the organize planner refuse
+    # rather than compose raw identity bytes.
+    identities = [ent["canonical_name"]] + aliases
+    mask_values = [v for v in identities if v and _is_credential_shaped(v)]
+    text = _mask_card_identity_text("\n".join(lines) + "\n", mask_values)
+    return text, [r["mid"] for r in selected], taint
 
 
 # Issue #179: the card row's explicit confidence. A signal=none row inherits

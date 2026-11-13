@@ -5,6 +5,58 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.153.0] - 2026-11-13
+### Security
+- Entity-identity disclosure boundary (issues #459): a credential-shaped
+  canonical name or alias can no longer leak through an entity card's STORED
+  row or any rendered card surface. At composition
+  (`build_entity_card_text`) the whole card text passes a two-layer mask —
+  layer 1 removes every fold-equivalent occurrence of a credential-shaped
+  identity value (the `Entity:`/`Aliases:` header, mention `text=` lines,
+  and `source_ref=` lines; every ASCII casing and fullwidth/Cf variant in
+  either direction; punctuation-wrapped `(v)`/`[v]`/`/v` forms), with the
+  fold map preserving whitespace boundaries (`pass word:12345` never
+  matches identity `password:12345` while whitespace-containing identities
+  fold and match as a whole); layer 2 runs the shared token mask
+  (`_mask_entity_display`) over the remaining text for non-identity
+  credential shapes in mention content/source_refs. Benign `label:port`
+  cards are byte-identical. The `entities` metadata on recall/get/explain
+  renders masks its `name` field at the source helpers
+  (`entities_for_memories`/`entities_for_memory`), which also covers the
+  delivery-ledger matcher fuel.
+- Read-time guard for pre-existing raw cards (issues #459): every render
+  exit for `entity_card`-typed rows — recall (plain/JSON/fence, incl.
+  as-of history and the passive injection lane), injection details,
+  `explain` (results build and the `--for-injection` replay), `list`
+  (human and JSON, superseded rows included), and `get` — masks `content`
+  AND re-derives `content_norm` from the masked content via the write
+  path's own normalizer. Layer-1 identity candidates resolve WITHOUT a
+  live entity row: the current DB identities for `source_ref=card:<eid>`
+  UNION the card's OWN structural header (`Entity:`/`Aliases:` lines), so
+  dead-entity cards (merge deletes the source entity while the card keeps
+  rendering), renamed entities, and removed aliases still mask
+  (already-masked headers carry `[REDACTED_SECRET]` and no-op). Read-path
+  masking failures refuse (a broken shared registry never falls back to
+  raw output). The card CLI (`entity-card build|refresh`) exits 2 with a
+  bounded stderr diagnostic and empty stdout when the registry breaks, and
+  the organize planner classifies the failing entity as `skipped` with one
+  bounded stderr warning per planner evaluation while the sweep (and every
+  later organize stage) continues — the five-key report contract
+  (`created/refreshed/unchanged/removed/skipped`) is unchanged.
+### Fixed
+- Guarded co-fit retry in the launcher's `translate()` (issue #213): when
+  translated content and the operator `systemMessage` cannot co-fit at the
+  full budget, the message's encoded marginal size is given back to the
+  content — the content is re-fitted at (budget − marginal) and the notice
+  attached when the re-fitted content is still useful (at least 256 bytes
+  of payload, never the bare truncation marker) and the completed envelope
+  provably fits the budget. This supersedes the 0.48.0 (issue #154)
+  content-wins trade-off FORWARD: above the 256-byte floor the notice now
+  survives budget saturation; below it (and on every degenerate retry
+  budget) the content-wins floor still drops the notice and keeps the
+  full-budget content fit. The no-message and message-only branches are
+  byte-identical, and the #154 completed-envelope budget invariant holds
+  on every branch.
 ## [0.152.0] - 2026-11-13
 ### Fixed
 - `--content -` stdin reads now decode UTF-8 explicitly regardless of the

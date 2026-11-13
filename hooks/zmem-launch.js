@@ -1684,6 +1684,16 @@ function fitEnvelope(host, hookName, content, budget) {
     return encodedSize(minimal) <= budget ? minimal : {};
 }
 
+// Issue #213: the co-fit retry's usefulness floor. A re-fitted content below
+// this many UTF-8 payload bytes (or the bare truncation marker, which is far
+// shorter) is not worth the message's bytes — the retry is rejected and the
+// full-budget content fit keeps the space (content-wins, the 0.48.0/issue
+// #154 trade-off preserved below the floor; the notice now survives budget
+// saturation ABOVE it). 256 bytes keeps a meaningful recall fence (a couple
+// of sourced lines) while guaranteeing operator notices never cost the
+// content its substance.
+const COFIT_MIN_CONTENT_BYTES = 256;
+
 // Translate the buffered child stdout into the final envelope for a
 // sentinel-emitting hook. Never throws — returns {} on any failure.
 // Issue #107: the operator-facing systemMessage is read BEFORE the
@@ -1733,6 +1743,31 @@ function translate(raw, host, hookName, budget) {
     // contentOnly envelope.
     const candidate = _withSystemMessage(Object.assign({}, contentOnly), sysMsg);
     if (encodedSize(candidate) <= budget) return candidate;
+    // Issue #213: guarded co-fit retry. The message cannot co-fit with the
+    // FULL-budget content fit, so give the message's encoded marginal size
+    // back to the content: re-fit the content alone at (budget - marginal)
+    // and attach the message to THAT envelope — but only when the re-fitted
+    // content is still useful (at least COFIT_MIN_CONTENT_BYTES of payload
+    // bytes, never the bare truncation marker) and the completed retry
+    // envelope provably fits the budget. Every other path keeps the
+    // content-wins floor from 0.48.0/issue #154: the full-budget content fit
+    // is returned and the message dropped.
+    const marginal = encodedSize(candidate) - encodedSize(contentOnly);
+    const retryBudget = budget - marginal;
+    if (retryBudget > 0) {
+        const refit = fitEnvelope(host, hookName, String(content), retryBudget);
+        const inner = refit && refit.hookSpecificOutput
+            ? refit.hookSpecificOutput.additionalContext
+            : (refit ? refit.additionalContext : undefined);
+        const innerBytes = typeof inner === "string"
+            ? Buffer.byteLength(inner, "utf8")
+            : 0;
+        if (innerBytes >= COFIT_MIN_CONTENT_BYTES) {
+            const retryCandidate = _withSystemMessage(
+                Object.assign({}, refit), sysMsg);
+            if (encodedSize(retryCandidate) <= budget) return retryCandidate;
+        }
+    }
     return contentOnly;
 }
 

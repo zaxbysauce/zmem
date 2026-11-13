@@ -98,6 +98,7 @@ from storelib.consolidate import (
 import importlib
 _consolidate_mod = importlib.import_module("storelib.consolidate")
 from storelib.entity import (
+    _DisplayRedactionUnavailable,
     build_entity_card_text,
     card_config_from_env,
     card_matches_content,
@@ -663,8 +664,22 @@ def _plan_entity_card_pass(
     eids = [r[0] for r in conn.execute(
         "SELECT id FROM entity ORDER BY id").fetchall()]
     for eid in eids:
-        built = build_entity_card_text(
-            conn, entity_id=eid, min_mentions=min_mentions, top_n=top_n)
+        try:
+            built = build_entity_card_text(
+                conn, entity_id=eid, min_mentions=min_mentions, top_n=top_n)
+        except _DisplayRedactionUnavailable as exc:
+            # Issue #459 fail-closed wiring: the shared redaction registry
+            # broke while composing THIS entity's card. The entity is planned
+            # as ``skipped`` (an existing five-key counter) with ONE bounded
+            # stderr warning naming it PER PLANNER EVALUATION — no
+            # process-global dedup, so a repeat failure in a later legitimate
+            # pass still warns. The sweep continues with the remaining
+            # entities; the apply loop and the dry-run twin share this
+            # planner, so parity holds by construction.
+            print(f"[zmem] entity cards: skipped entity {eid}: shared "
+                  f"redaction registry unavailable ({exc})", file=sys.stderr)
+            plan.append((eid, "skipped", None, None, None))
+            continue
         live = live_card_row(conn, eid)
         if built is None:
             if live is not None:

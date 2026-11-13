@@ -19,6 +19,9 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import (
+    _card_header_identities,
+    _is_credential_shaped,
+    _mask_card_identity_text,
     entities_for_memory,
     entities_for_memories,
     entity_match_ids,
@@ -41,7 +44,8 @@ from schema_meta import (ALLOWED_TYPES, CROSS_PROJECT_ENV,
                          CROSS_PROJECT_HAZARD_VERBS_ENV, CROSS_PROJECT_MAX,
                          CROSS_PROJECT_SIGNALS, INJECT_LANES, INJECT_MOMENTS,
                          PROTECTED_INJECT_TYPES,
-                         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV)
+                         ZMEM_VEC_NS_OVERFETCH_DEFAULT, ZMEM_VEC_NS_OVERFETCH_ENV,
+                         normalize_content)
 from storelib.ops_tokens import _HAZARDOUS_SUBS as _DEFAULT_HAZARD_VERBS
 import embed_profiles as _profiles
 from storelib.cross_encoder import (maybe_rerank as _cross_maybe_rerank,
@@ -2667,6 +2671,66 @@ def _withhold_credential_rows(rows: list) -> list:
         for r in rows]
 
 
+def _mask_legacy_card_row(row: dict, conn: sqlite3.Connection) -> None:
+    """Read-time identity guard for one rendered memory row (issue #459).
+
+    A pre-fix (or foreign-written) ``entity_card`` row stores its raw
+    credential-shaped identity values verbatim; every render exit runs its
+    rows through this guard BEFORE serializing. Non-entity_card rows and
+    rows with no content are untouched. For an entity_card row the guard
+    masks ``content`` with the same two-layer pass the composition path
+    uses (storelib.entity._mask_card_identity_text): layer-1 identity
+    candidates are (a) the CURRENT DB identities for
+    ``source_ref='card:<entity_id>'`` when the entity still exists,
+    UNION (b) the card's OWN structural header (``Entity:`` /
+    ``Aliases:`` lines) — header recovery covers deleted entities (a card
+    can outlive its entity; merge deletes the source row while the card
+    keeps rendering), renamed entities, and aliases removed since
+    composition. Every candidate is judged by the unchanged #457
+    predicate before it becomes a replacement value; already-masked
+    headers carry ``[REDACTED_SECRET]`` and no-op. When masking modified
+    the content and the row carries ``content_norm``, the norm is
+    re-derived from the fully masked content via the write path's own
+    normalizer (schema_meta.normalize_content).
+
+    Fail-closed: a broken shared redaction registry raises
+    _DisplayRedactionUnavailable out — the read refuses rather than
+    emitting raw identity bytes."""
+    if not isinstance(row, dict) or (row.get("type") or "") != "entity_card":
+        return
+    content = row.get("content")
+    if not content:
+        return
+    identities: list[str] = []
+    src = row.get("source_ref") or ""
+    if src.startswith("card:"):
+        eid = src[len("card:"):]
+        ent = conn.execute(
+            "SELECT canonical_name FROM entity WHERE id=?", (eid,)
+        ).fetchone()
+        if ent is not None and ent["canonical_name"]:
+            identities.append(ent["canonical_name"])
+        for ar in conn.execute(
+                "SELECT alias_norm FROM entity_alias WHERE entity_id=?",
+                (eid,)).fetchall():
+            if ar["alias_norm"]:
+                identities.append(ar["alias_norm"])
+    identities.extend(_card_header_identities(content))
+    mask_values = [v for v in identities if _is_credential_shaped(v)]
+    masked = _mask_card_identity_text(content, mask_values)
+    if masked != content:
+        row["content"] = masked
+        if "content_norm" in row:
+            row["content_norm"] = normalize_content(masked)
+
+
+def _mask_legacy_card_rows(rows: list, conn: sqlite3.Connection) -> None:
+    """In-place _mask_legacy_card_row over a rendered row list (issue
+    #459). Kept separate so each render exit cites one obvious call."""
+    for r in rows or ():
+        _mask_legacy_card_row(r, conn)
+
+
 def _classify_injection(item: dict) -> bool:
     """Classify a recall item as injection-risk (issue #58, 3.4).
 
@@ -3040,6 +3104,7 @@ def _recall_injection_details(
     cross_rerank: bool = False,
     global_withheld: int = 0,
     expiry_acc: dict | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[dict, list[dict]]:
     """Apply the one passive post-retrieval decision pipeline.
 
@@ -3067,6 +3132,13 @@ def _recall_injection_details(
     effective_budget = (inject_token_budget() if budget_tokens is None
                         else budget_tokens)
     candidate_rows = list(rows)
+    # Issue #459: the read-time identity guard runs at row construction —
+    # BEFORE the credential withhold and the token budget below — so a
+    # legacy raw entity_card row renders present-masked on the passive
+    # lane too. ``conn`` is optional so direct test seams driving empty
+    # row lists keep working unchanged.
+    if conn is not None:
+        _mask_legacy_card_rows(candidate_rows, conn)
     candidate_ids = [r["id"] for r in candidate_rows]
     excluded_count = 0
     selected_rows = candidate_rows
@@ -3788,6 +3860,11 @@ def _recall_memory_impl(
         cards = entities_for_memories(conn, [r["id"] for r in results])
         for r in results:
             r["entities"] = cards.get(r["id"], [])
+        # Issue #459: read-time identity guard over every entity_card row —
+        # BEFORE the credential withhold and the budget stages below (the
+        # for_injection path reuses these same row dicts), so a pre-fix raw
+        # card renders present-masked on every downstream exit.
+        _mask_legacy_card_rows(results, conn)
 
     # Issue #98: splice the held-aside cross rows into the delivered stream
     # here — after every expansion pass, before the risk count and the
@@ -3956,6 +4033,7 @@ def _recall_memory_impl(
             query=query, cross_rerank=cross_rerank,
             global_withheld=global_floor_withheld,
             expiry_acc=expiry_acc,
+            conn=conn,
         )
         results = injection_details["results"]
         for _r in results:
@@ -4203,7 +4281,7 @@ def _explain_nearest_neighbors(
         scope_clause = f"AND namespace IN ({ph})"
         params = list(scope)
     rows = conn.execute(
-        f"""SELECT id, content, content_norm, taint, tags, source_ref
+        f"""SELECT id, type, content, content_norm, taint, tags, source_ref
             FROM memory
             WHERE superseded_at IS NULL {scope_clause}""",
         params,
@@ -4213,8 +4291,8 @@ def _explain_nearest_neighbors(
         sim = _explain_jaccard(
             tokens, _explain_token_set(r["content_norm"] or r["content"]))
         if sim > 0.0:
-            scored.append((sim, r["id"], r["content"], r["taint"], r["tags"],
-                           r["source_ref"]))
+            scored.append((sim, r["id"], r["type"], r["content"], r["taint"],
+                           r["tags"], r["source_ref"]))
     scored.sort(key=lambda x: (-x[0], x[1]))
     # PRR-005: neighbors carry the row's trust surface explicitly — the same
     # rows the fenced render would mark, so a not_in_db verdict never shows
@@ -4225,8 +4303,21 @@ def _explain_nearest_neighbors(
     # Review round (maintainer F-06 / PRR-003): the classify blob matches the
     # canonical input set — source_ref is classified too, so a credential
     # shape living only in source_ref withholds here like every other lane.
+    # Issue #459 (implementation review): the slice is a render exit too —
+    # an entity_card row's slice passes through the same read-time identity
+    # guard before the 80-char cut, so a legacy/foreign raw card never
+    # discloses its identity in the not_in_db neighbors.
     out: list[dict] = []
-    for sim, mid, content, taint, tags, source_ref in scored[:k]:
+    for sim, mid, row_type, content, taint, tags, source_ref in scored[:k]:
+        if row_type == "entity_card":
+            guarded = {
+                "id": mid,
+                "type": "entity_card",
+                "content": content or "",
+                "source_ref": source_ref or "",
+            }
+            _mask_legacy_card_row(guarded, conn)
+            content = guarded["content"]
         entry = {
             "id": mid,
             "content": (content or "")[:80],
@@ -4694,6 +4785,11 @@ def explain_recall(
              _pipeline_slots) = pipeline_result
         if no_bump:
             presented, omitted = _explain_omit_filter(presented)
+        # Issue #459: read-time identity guard over the presented rows BEFORE
+        # the results build and (in place, via the shared dicts) the injection
+        # replay below — a legacy raw entity_card row explains present-masked.
+        if presented:
+            _mask_legacy_card_rows(presented, conn)
         link_verdict_seeds = list(presented)
         if for_injection:
             # Keep this replay in the same order as recall_memory: omission,
@@ -4711,6 +4807,10 @@ def explain_recall(
                     conn, [r["id"] for r in injection_candidate_rows])
                 for r in injection_candidate_rows:
                     r["entities"] = cards.get(r["id"], [])
+                # Issue #459: the replay's link-expansion arrivals are NEW row
+                # dicts the presented-pass above never saw — guard them too
+                # (already-masked base rows no-op).
+                _mask_legacy_card_rows(injection_candidate_rows, conn)
 
             # Retain the pre-gate rows and its aggregate stats. The maps below
             # let target verdicts explain a rejection instead of falling
@@ -5447,6 +5547,7 @@ def _recent_memory_impl(
             budget_tokens=_injection_budget_tokens,
             namespace=namespace, fence_id=_fence_id or "",
             expiry_acc=expiry_acc,
+            conn=conn,
         )
         results = injection_details["results"]
         for _r in results:
@@ -5904,6 +6005,11 @@ def list_memory(conn, *, namespace=None, limit=50, include_superseded=False,
         f"ORDER BY ingestion_ts DESC LIMIT ?",
         params,
     ).fetchall()]
+    # Issue #459: read-time identity guard over every entity_card row
+    # (superseded rows included) BEFORE the credential withhold and the
+    # preview rendering — an operator listing never sees a legacy card's
+    # raw identity values.
+    _mask_legacy_card_rows(rows, conn)
     # The #352/#256 credential-withhold law, extended to this operator
     # surface (issue #443): every row runs through the shared builder -- a
     # scrub-bypassing row (manual surgery, pre-pattern legacy store, foreign
@@ -6077,6 +6183,10 @@ def get_memory(conn, mid) -> bool:
         return False
     d = {k: (f"<{len(v)}-byte blob>" if isinstance(v, bytes) else v)
          for k, v in dict(r).items()}
+    # Issue #459: read-time identity guard — a legacy raw entity_card row
+    # serializes with BOTH content and content_norm masked (the norm is
+    # re-derived from the masked content via the write path's normalizer).
+    _mask_legacy_card_row(d, conn)
     # v10 (issue #60): the memory's entity links ride along on the get
     # surface — [{id, kind, name}] from memory_entity, canonical-name order.
     d["entities"] = entities_for_memory(conn, mid)

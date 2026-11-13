@@ -28,6 +28,7 @@ from storelib import readonly as _readonly_store
 from storelib.organize import organize
 from storelib.entity import (
     ENTITY_KINDS,
+    _DisplayRedactionUnavailable,
     cmd_entity_card,
     cmd_entity_list,
     cmd_entity_merge,
@@ -6973,6 +6974,17 @@ def main():
                 # unresolvable/ambiguous entity, or a duplicate build. Exit
                 # 2 with the store bytes unchanged.
                 print(f"[zmem] entity-card: {exc}", file=sys.stderr)
+                sys.exit(2)
+            except _DisplayRedactionUnavailable as exc:
+                # Issue #459: the shared redaction registry broke while
+                # composing the card's masked content. Refuse with EMPTY
+                # stdout (the --json swap above is already undone) and ONE
+                # bounded stderr diagnostic naming the registry failure —
+                # never raw identity bytes on either stream, never a stored
+                # row (the refusal precedes the write).
+                print(f"[zmem] entity-card: shared redaction registry "
+                      f"unavailable ({exc}); refusing to build or store "
+                      f"the card", file=sys.stderr)
                 sys.exit(2)
             finally:
                 _release_lock("consolidate", _card_token)

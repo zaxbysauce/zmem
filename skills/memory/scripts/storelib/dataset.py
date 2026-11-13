@@ -309,11 +309,20 @@ def export_dataset(conn: sqlite3.Connection, *, out_dir: str,
     if namespace is not None:
         where = " WHERE namespace = ?"
         params = (namespace,)
+    # Issue #459 final-critic round 1: cards never travel (the sync-export
+    # F-3 law). A pre-fix raw entity_card row is store-local derived state;
+    # the destination re-derives cards via its own cadence sweep, and the
+    # dataset is a governed egress artifact whose publish-time secret scan
+    # does not catch #457 head-vocabulary names — so the export omits
+    # entity_card rows unconditionally, live AND tombstoned.
     if where:
+        where += " AND type != 'entity_card'"
         if not include_tombstones:
             where += " AND superseded_at IS NULL"
-    elif not include_tombstones:
-        where = " WHERE superseded_at IS NULL"
+    else:
+        where = " WHERE type != 'entity_card'"
+        if not include_tombstones:
+            where += " AND superseded_at IS NULL"
     rows = conn.execute(
         "SELECT " + ", ".join(MEMORY_COLUMNS) + " FROM memory"
         + where + " ORDER BY ingestion_ts, id",
