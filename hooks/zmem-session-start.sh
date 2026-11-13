@@ -368,13 +368,20 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # runs). The host canary sets 0 for its driven hooks: it validates recall,
   # not background maintenance, and its tier-2 read races this worker on the
   # SAME store — the 15s delay above is a partial guard; the knob removes the
-  # collision source entirely. NOTE: the gate is a `[ ... ] &&` short-circuit,
-  # not an if/fi block, ON PURPOSE: test_low_findings.py's L22 behavioral
-  # test extracts the sink block (up to the first python-interpreter
-  # invocation below) and runs it standalone — an `if ... then` opener here
-  # would leave that extraction syntactically unterminated.
-  [ "${ZMEM_SESSION_CADENCE:-1}" != "0" ] && \
-  "$PYTHON_BIN" -c 'import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))' \
+  # collision source entirely. NOTE: the gate lives INSIDE the python wrapper
+  # string, not in a shell `[ ... ] &&` guard, ON PURPOSE for two reasons:
+  # (a) test_low_findings.py's L22 behavioral test extracts the sink block
+  # (up to the first python-interpreter invocation below) and runs it
+  # standalone — any shell-level opener (`if`, `[`, `{`) before the python
+  # line would leave that extraction syntactically unterminated; (b) a
+  # shell-level `gate && cmd &` backgrounds the WHOLE AND-list, so the
+  # gate-evaluating subshell keeps holding the launcher's stdout/stderr
+  # pipes until the 15s-delayed worker exits — the launcher then rides its
+  # 12s outer watchdog on every session start (observed: launcher 12.7s vs
+  # 3.0s at base). Embedding the check in the wrapper keeps this line a
+  # single redirected background command, which releases the parent pipes
+  # immediately exactly as before this knob existed.
+  "$PYTHON_BIN" -c 'import os, time, subprocess, sys; (sys.exit(0) if os.environ.get("ZMEM_SESSION_CADENCE") == "0" else None); time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))' \
     "$STORE_PY_PY" session-cadence \
     --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
 fi
