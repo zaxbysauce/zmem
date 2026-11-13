@@ -539,9 +539,17 @@ added to the store's `config.json` — and it never injects, never rides the
 core op queue, and never publishes raw session transcripts. In remote mode
 (`ZMEM_REMOTE_URL`) the pointer op goes to the hub through a separate
 capability-gated delivery queue (`knowledge_link_v1`); an old hub leaves
-the pointer explicitly pending without affecting core memory. The
-conditional instruction/skill/closeout discovery wiring (PR2) is not
-shipped. Config schema, CLI contract, security posture, and limits:
+the pointer explicitly pending without affecting core memory. PR2 adds
+the knowledge routing policy — a concise, display-only block that names
+the lane and its configured target ids, surfaced once per session on
+natively wired hosts (Hermes once per provider instance per capture
+mode, dsh once per session per adapter process, hooks once per
+SessionStart — no latch survives a restart); it is gated by
+`ZMEM_INJECT` (and `ZMEM_CAPTURE=0`
+still renders read-routing), empty by default with byte-identical output,
+and it never captures anything — capture stays explicit-command-only
+([docs/KNOWLEDGE-ROUTING.md](docs/KNOWLEDGE-ROUTING.md)). Config schema,
+CLI contract, security posture, and limits:
 [docs/KNOWLEDGE-COMPANION.md](docs/KNOWLEDGE-COMPANION.md).
 
 ## Requirements

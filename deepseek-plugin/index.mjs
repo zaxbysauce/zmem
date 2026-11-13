@@ -17,6 +17,13 @@ const STATE_SCHEMA = "zmem-deepseek-state-v1";
 const COMPACTION_EVENTS = new Set(["compaction/start", "compaction/end",
   "compaction/prune", "compaction/summary"]);
 const SOURCE_KIND = "zmem";
+// Knowledge routing policy (PR2) rides its OWN source kind, deliberately
+// NOT SOURCE_KIND: the session/event admission matcher commits a pending
+// recall reservation on any user/message admitted with kind "zmem", so a
+// policy message sharing that kind could false-ack a recall that was never
+// admitted. A distinct kind also keeps the frozen t13/t14 zmem-message
+// assertions (sourceKind === "zmem") untouched under default-off.
+const POLICY_SOURCE_KIND = "zmem-policy";
 const CAPTURE_OFF = () =>
   (process.env.ZMEM_CAPTURE || "") === "0" ||
   (process.env.ZMEM_INJECT || "") === "0";
@@ -65,6 +72,10 @@ export function plugin(ctx, config = {}) {
     bounded: false, guidance: "next-request-gap", reason: "",
     nudgeCount: 0, nudgeBound: 1, selfTriggeredContinuation: false,
     ledgerKey: "", ledgerKeyDistinct: true,
+    // Knowledge routing policy (PR2) top-level preview (observers'
+    // accessors; per-session policyResolved/policyDelivered entries are
+    // authoritative). Empty string + "none" = no policy lane engaged.
+    policyDeliveredText: "", policyReason: "none",
   };
   const writeState = () => {
     if (!statePath()) return;
@@ -104,6 +115,14 @@ export function plugin(ctx, config = {}) {
         namespace: ident.namespace, lane: "deepseek",
         ledgerKey: ledgerKey(ident), acked: false, deliveredText: "",
         reserved: false, reservationId: null, ledgerKeyDistinct: true,
+        // PR2 knowledge policy: attempted-once latch + delivered flag.
+        // policyResolved bounds cost (at most ONE helper spawn per session
+        // within THIS adapter process — the plugin does not rehydrate the
+        // persisted state file at boot, so a fresh process re-primes the
+        // session and may deliver exactly once more, mirroring the recall
+        // delivery epoch at agent/created); policyDelivered records that
+        // the text actually rode a message.
+        policyResolved: false, policyDelivered: false,
       };
     }
     return { ident, entry: state.sessions[ident.session] };
@@ -192,6 +211,38 @@ export function plugin(ctx, config = {}) {
       ({ ident, entry } = sessionOf(agent));
     } catch { return decision; }
     if (INJECT_OFF()) return decision;
+    // Knowledge routing policy (PR2): once per session, AFTER the inject
+    // gate — INJECT=0 appends nothing (and never spawns the helper);
+    // CAPTURE=0 does NOT suppress it (the launcher then passes --no-capture
+    // so the helper renders read-routing without a capture invitation).
+    // The policy is a HOST-authored instruction, so it rides BEFORE the
+    // fenced untrusted recall text and carries its own source kind
+    // (POLICY_SOURCE_KIND — never SOURCE_KIND, see the const note).
+    // One bounded helper spawn per session (policyResolved latches even on
+    // empty/absent results so the default-off path never respawns), and
+    // the append is independent of recall: a missing envelope below still
+    // delivers the policy.
+    let policyMsg = null;
+    try {
+      if (!entry.policyResolved) {
+        entry.policyResolved = true;
+        const pol = await backend.runPolicy();
+        state.policyReason = (pol && pol.reason) ? pol.reason : "none";
+        if (pol && pol.text) {
+          policyMsg = createUserMessage({
+            content: [{ type: "text", text: pol.text }],
+            source: { kind: POLICY_SOURCE_KIND, form: "knowledge-policy" },
+          });
+          entry.policyDelivered = true;
+          state.policyDeliveredText = pol.text;
+        }
+        project(ident, entry);
+        writeState();
+      }
+    } catch { /* fail-open: no policy append */ }
+    const withPolicy = policyMsg
+      ? { ...decision, messages: [...decision.messages, policyMsg] }
+      : decision;
     try {
       const query = (messages || [])
         .filter((m) => m?.source?.kind === "user")
@@ -214,7 +265,7 @@ export function plugin(ctx, config = {}) {
       if (!rendered) {
         if (envelope) state.reason = envelope.reason || "empty";
         project(ident, entry); writeState();
-        return decision;
+        return withPolicy;
       }
       state.reserved = Boolean(envelope.reservation);
       state.reservationId = envelope.reservation || null;
@@ -238,13 +289,14 @@ export function plugin(ctx, config = {}) {
       state.pendingIdent = ident.session;
       project(ident, entry);
       writeState();
-      // Spread the original decision — startsRequestSeries and every other
-      // field survive the append (README contract; frozen series probe).
-      return { ...decision, messages: [...decision.messages, msg] };
+      // Spread the decision carrying any policy append — startsRequestSeries
+      // and every other field survive the appends (README contract; frozen
+      // series probe).
+      return { ...withPolicy, messages: [...withPolicy.messages, msg] };
     } catch {
       state.reason = "fail-open";
       writeState();
-      return decision;
+      return withPolicy;
     }
   });
 

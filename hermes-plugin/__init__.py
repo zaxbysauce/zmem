@@ -110,6 +110,22 @@ _STORE_TIMEOUT_S = 20
 # hooks/lib/zmem-retain-process.py::RETAIN_SUBPROCESS_TIMEOUT_S so every
 # retain child on every surface shares one deadline contract.
 _RETAIN_SUBPROCESS_TIMEOUT_S = 10.0
+# Knowledge routing policy (PR2): the standalone display-only helper
+# knowledge/policy.py (introduced with PR2 by the helper owner — see
+# docs/KNOWLEDGE-ROUTING.md), relative to the zmem checkout root. It renders
+# the canonical concise routing policy from the LOCAL store-side config
+# (enabled + target IDs only — never values, credentials, network, or a root
+# stat) and owns config resolution itself (``resolve_config_path``, the
+# common authority mirroring the host store chain). This provider invokes it
+# ONLY as a bounded subprocess — no ``--config`` (the helper resolves from
+# the inherited user flags), no imports of storelib or the knowledge package.
+_POLICY_PY_REL = Path("skills") / "memory" / "scripts" / "knowledge" / "policy.py"
+# The helper is a tiny stdlib render (no model, no store, no network); a
+# short hard cap keeps a wedged helper from stalling agent startup.
+_POLICY_TIMEOUT_S = 5.0
+# Defensive display bound (the canonical policy is <200 words; this cap only
+# truncates a misbehaving helper's output, it never grows the block).
+_POLICY_MAX_CHARS = 8192
 
 
 def _now_iso_utc() -> str:
@@ -877,6 +893,63 @@ def _inject_disabled() -> bool:
     literal ``0`` (whitespace-tolerated) disables — the ZMEM_QUERY_CONTEXT
     kill-switch convention; ``false``/``no``/empty keep injection enabled."""
     return os.environ.get("ZMEM_INJECT", "1").strip() == "0"
+
+
+def _knowledge_policy_text(allow_capture: bool = True) -> str:
+    """Render the knowledge routing policy through the standalone helper.
+
+    PR2 seam against the FROZEN helper contract (docs/KNOWLEDGE-ROUTING.md):
+    ``render_policy(config_path=None, environ=None, allow_capture=True)``,
+    CLI ``--text``/``--json`` with an OPTIONAL ``--config`` and
+    ``--no-capture``. The helper is the ONLY interpreter of the
+    ``knowledge`` config object AND the only resolver of the canonical
+    store config (``resolve_config_path`` — the common authority mirroring
+    the host store chain, file-shaped refusals included); this provider
+    passes NO config path, never parses ``enabled``/target values, and
+    never imports storelib or the knowledge package. The inherited child
+    environment carries the user's own flags — no server or hub config and
+    no credential is ever forwarded; the argv is flags only.
+
+    Gates per the coordinated contract: the CALLER owns the ZMEM_INJECT=0
+    gate (no spawn at all); ZMEM_CAPTURE=0 maps to ``--no-capture`` so the
+    helper renders read-routing WITHOUT a capture invitation.
+
+    Fail-open by contract: a missing helper (the helper is a separate PR2
+    deliverable and may not be present in this checkout yet), a non-zero
+    exit, a timeout, or empty output all render "" and the system prompt
+    block stays byte-identical to the pre-knowledge output. The companion
+    is off by default; a disabled companion renders empty.
+    """
+    home = _resolve_zmem_home()
+    if home is None:
+        return ""
+    policy_py = home / _POLICY_PY_REL
+    try:
+        if not policy_py.is_file():
+            # Helper not shipped in this checkout — no policy lane here.
+            return ""
+    except OSError:  # pragma: no cover — defensive stat failure
+        return ""
+    argv = [_python_bin(), "-X", "utf8", str(policy_py), "--text"]
+    if not allow_capture:
+        argv.append("--no-capture")
+    try:
+        proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_POLICY_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — spawn failure/timeout fail open
+        return ""
+    if proc.returncode != 0:
+        return ""
+    text = (proc.stdout or "").strip()
+    if not text:
+        return ""
+    return text[:_POLICY_MAX_CHARS]
 
 
 def _decode_rendered_envelope(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2632,6 +2705,13 @@ class ZmemMemoryProvider(MemoryProvider):
             else 6.0)
         self._prefetch_cache = _PrefetchCache(
             ttl_s=PREFETCH_CACHE_TTL_S, clock=self._clock)
+        # Knowledge routing policy (PR2): rendered once per capture mode
+        # per provider instance — the helper is cheap, but the system
+        # prompt is assembled per session and must not respawn per turn.
+        # Empty results cache too (default-off stays spawn-free after the
+        # first probe; a provider built before an operator opts in picks
+        # the policy up on the next provider construction).
+        self._knowledge_policy_cache: Dict[bool, str] = {}
         # Key -> ownership token.  A job's finally may only remove the
         # marker it owns, so a switch-back re-registration (review
         # PRR-003) can never have its marker discarded by a stale job.
@@ -3201,8 +3281,52 @@ class ZmemMemoryProvider(MemoryProvider):
 
     # -- recall -------------------------------------------------------------
 
+    def _knowledge_policy_block(self) -> str:
+        """The knowledge routing policy for this provider's store config.
+
+        PR2 conditional append (docs/KNOWLEDGE-ROUTING.md): the policy text
+        is rendered by the standalone helper, which owns config resolution
+        (``resolve_config_path`` — the common authority; this provider
+        passes no path and resolves nothing itself). Cached per capture
+        mode for the provider's lifetime — the system prompt is assembled
+        per session and must not respawn per turn.
+
+        Gates: ``ZMEM_INJECT=0`` silences the policy together with all
+        passive context (the caller enforces it first; re-checked here so
+        a direct call cannot bypass it). ``ZMEM_CAPTURE=0`` does NOT
+        silence it — the helper still teaches reading knowledge, rendered
+        WITHOUT any capture invitation via ``--no-capture``. With the
+        companion disabled (the default) the helper renders empty and this
+        returns "", leaving the system prompt byte-identical.
+        """
+        if _inject_disabled():
+            return ""
+        allow_capture = not _capture_disabled()
+        cached = self._knowledge_policy_cache.get(allow_capture)
+        if cached is not None:
+            return cached
+        text = _knowledge_policy_text(allow_capture=allow_capture)
+        self._knowledge_policy_cache[allow_capture] = text
+        if text:
+            logger.info(
+                "zmem system prompt: knowledge routing policy appended "
+                "(allow_capture=%s)", allow_capture)
+        return text
+
     def system_prompt_block(self) -> str:
-        """Inject Tier-0 ``core.md`` (stable rules) into the system prompt."""
+        """Inject Tier-0 ``core.md`` plus the optional knowledge policy.
+
+        PR2 appends the knowledge routing policy AFTER the Tier-0 text
+        (client-side, conditional, empty-by-default — see
+        ``_knowledge_policy_block``). When the companion is disabled the
+        appended section is empty and the returned block is byte-identical
+        to the pre-knowledge output. Compatibility mode (Hindsight kept as
+        ``memory.provider``, zmem running beside it via the shell-hook
+        path) never calls this method, so no new per-turn policy path
+        exists there — the explicit portable knowledge/closeout skills are
+        the documented fallback, and they are NOT equivalent to this
+        native per-session append (docs/KNOWLEDGE-ROUTING.md).
+        """
         # Issue #110 (P0-5): the kill switch silences ALL passive context on
         # every surface — the bash SessionStart hook likewise suppresses its
         # Tier 0 under ZMEM_INJECT=0 — so the Hermes system-prompt Tier 0
@@ -3212,15 +3336,18 @@ class ZmemMemoryProvider(MemoryProvider):
                 "zmem system prompt tier0: status=silent "
                 "reason=disabled (ZMEM_INJECT=0)")
             return ""
+        text = ""
         try:
             core = _resolve_core_md()
             if core.is_file():
-                text = core.read_text(encoding="utf-8", errors="replace").strip()
-                if text:
-                    return text
+                text = core.read_text(
+                    encoding="utf-8", errors="replace").strip()
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("zmem: core.md read failed: %s", exc)
-        return ""
+        policy = self._knowledge_policy_block()
+        if text and policy:
+            return text + "\n\n" + policy
+        return text or policy
 
     def prefetch(self, query: str, *, session_id: str = "",
                  prompt_timestamp: Optional[str] = None) -> str:

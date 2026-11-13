@@ -362,6 +362,66 @@ never fires and the promotion was wasted. Always write it yourself:
 
 `--confirm` is required to actually write; `--dry-run` alone changes nothing.
 
+## Step 5.5 — Optional knowledge-companion closeout (enabled-gated)
+
+The knowledge companion (PR1) is a separate, optional explicit-note
+workflow with its own `store.py knowledge ...` subcommands and its own
+pointer lane — it never rides the memory steps above. This step is
+**conditional**: run ONE bounded status check, and when the companion is
+not enabled say NOTHING about knowledge in the report — silence is the
+off state, not a finding.
+
+```bash
+"$P" "$S" knowledge status --json
+```
+
+- Exit 2 with the disabled hint (or `enabled=false`): skip this step
+  silently. Do not mention knowledge in the report.
+- Unavailable/error (status cannot say whether the companion is enabled):
+  never abort the closeout over it, but do NOT go silent either — say
+  "knowledge closeout unavailable, no capture performed" in the report,
+  and if the user asked for knowledge in this closeout, report it as not
+  performed/pending rather than dropped.
+- Enabled, and the ACTUAL USER asked for this closeout in THIS session
+  (their own request, any phrasing — "closeout", "wrap up", "capture what
+  we learned"): the standing opt-in authorizes evaluating this session's
+  knowledge candidates and capturing the worthwhile ones — no per-note
+  confirmation and no magic phrase needed. `ZMEM_CAPTURE=0` removes
+  capture from the table (report/verify only). Then do ONLY the
+  following, bounded to THIS session's own keys:
+  1. **Evaluate and capture worthwhile notes** through the `knowledge`
+     skill's workflow (`knowledge capture --target <target-id> --key <key>
+     --content - --namespace "<namespace>"`) — its capture bar (long-lived,
+     evidence-cited, curated, no transcripts/credentials) applies in full;
+     the bar decides, not a quota. Most closeouts capture nothing, and
+     that is a good outcome.
+  2. **Pending pointers — read the JSON, do not blind-flush.**
+     `knowledge flush` (and capture's own inner flush) drains the WHOLE
+     knowledge queue; there is no own-key filter. Re-run `knowledge
+     status --json`: flush ONLY if this session's entries are the queued
+     ones AND no unrelated pending/queued entries exist — otherwise do
+     NOT flush; report this session's keys as pending. A pointer that is
+     `pending` without being enqueued is resolved by re-running the SAME
+     capture (idempotent), not by a flush.
+  3. **Verify this session's notes** with
+     `"$P" "$S" knowledge read --target <target-id> --key <key>
+     --namespace "<namespace>" --json` (readback) for keys captured this
+     session only — never a sweep of the target. A digest question mark
+     goes to `knowledge check --target <target-id> --key <key>
+     --namespace "<namespace>"`.
+- Enabled, but this closeout was NOT user-requested — the agent initiated
+  it itself (the description's after-a-substantial-task path) or a session
+  hook reminder surfaced it: knowledge work is **DRAFT-ONLY**. Evaluate
+  candidates under the same bar and draft the worthwhile note texts in
+  your reply for the user to review; run NO `knowledge capture`, no
+  pointer writes, no flush against the target. Say the drafts await a
+  user-requested closeout (or an explicit save/publish request) before
+  anything is published.
+
+No editor (Obsidian or otherwise) is required or implied by any target
+kind, and targets are the operator-configured local vault or private
+fleet endpoint only — never a channel to external public publishing.
+
 ## Step 6 — Report
 
 State plainly:
@@ -376,6 +436,13 @@ State plainly:
   contradict (issue #261); name each id and what you did (invalidated, kept
   with the correction rejected, or deferred with why)
 - Skills promoted (and why those, not the others)
+- Knowledge companion (ONLY when Step 5.5's status check reported it
+  enabled — otherwise say nothing about knowledge): notes captured and
+  verified (key/target/namespace, readback matched), pendings flushed or
+  still pending (pending is not success), anything deliberately not
+  captured — or, for a closeout that was NOT user-requested, the
+  draft-only outcome: drafts delivered, nothing captured, awaiting the
+  user's explicit request
 - Subagent reflection filter count (issue #439): how many trivial read-only
   search misses the subagent hand-off filter suppressed this session. Read
   it from the per-session counter — resolve the ring EXACTLY as the

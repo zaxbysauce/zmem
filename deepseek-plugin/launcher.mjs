@@ -35,6 +35,16 @@ function resolveRoot() {
 export const ROOT = resolveRoot();
 export const STORE_PY = path.join(ROOT, "skills", "memory", "scripts", "store.py");
 const CAPTURE_PY = path.join(ROOT, "hooks", "lib", "zmem-capture-entry.py");
+// Knowledge routing policy helper (PR2; docs/KNOWLEDGE-ROUTING.md): the
+// standalone display-only renderer at knowledge/policy.py (introduced with
+// PR2 by the helper owner). Invoked ONLY as a bounded subprocess with NO
+// config path — the helper's resolve_config_path(environ, home) is the
+// single common authority for the canonical store config (mirroring the
+// host store chain, file-shaped refusals included), resolved from the
+// inherited user flags. Never imported, never given credentials, never a
+// model call, and this adapter never duplicates the resolution chain.
+const POLICY_PY = path.join(
+  ROOT, "skills", "memory", "scripts", "knowledge", "policy.py");
 
 export function childEnv(extra = {}) {
   const env = { ...process.env, ...extra };
@@ -143,6 +153,38 @@ export async function runReflect(session, namespace) {
   const r = await run(["bash", path.join(ROOT, "hooks", "zmem-reflect.sh")],
     { timeoutMs: 12000, env, stdin: JSON.stringify({ session_id: session || "" }) });
   return { ok: r.code === 0, out: r.out, raw: r };
+}
+
+// Knowledge routing policy (PR2): render the canonical concise policy via
+// the standalone helper, FROZEN seam: CLI --text|--json with an OPTIONAL
+// --config and a --no-capture flag (render_policy(config_path=None,
+// environ=None, allow_capture=True) on the API side). This adapter passes
+// NO config path — the helper resolves the canonical store config from the
+// inherited user flags — and maps ZMEM_CAPTURE=0 to --no-capture so the
+// helper renders read-routing WITHOUT a capture invitation. The CALLER
+// owns the ZMEM_INJECT=0 gate (no spawn at all under it). Cheap by
+// contract — no model, no store, no network, no root stat — and hard-
+// bounded so a wedged helper can never stall a pre-step. Fail-open
+// everywhere: absent helper (the helper ships as a separate PR2
+// deliverable), non-zero exit, timeout, or empty output (the companion's
+// default-off state) all yield { text: "" } and the caller appends
+// nothing.
+export async function runPolicy({ timeoutMs = 5000 } = {}) {
+  try {
+    if (!fs.existsSync(POLICY_PY)) {
+      return { text: "", reason: "helper-absent" };
+    }
+  } catch {
+    return { text: "", reason: "helper-absent" };
+  }
+  const captureOff = (process.env.ZMEM_CAPTURE || "").trim() === "0";
+  const argv = ["python", "-X", "utf8", POLICY_PY, "--text"];
+  if (captureOff) argv.push("--no-capture");
+  const r = await run(argv, { timeoutMs });
+  if (r.code !== 0) return { text: "", reason: "exit-" + r.code };
+  const text = (r.out || "").trim();
+  if (!text) return { text: "", reason: "disabled" };
+  return { text: text.slice(0, 8192), reason: "ok" };
 }
 
 export { run, lastJson };

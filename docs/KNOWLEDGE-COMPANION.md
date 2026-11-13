@@ -20,10 +20,11 @@ Scope of this guide (PR1, approved plan 2026-11-13):
   local Markdown and KB HTTP targets, immutable content-addressed versions,
   readback verification, crash-recovery journal, reserved store pointers,
   and the separate capability-gated fleet delivery lane.
-- What does NOT ship here: the conditional instruction/skill/closeout
-  discovery wiring (PR2 — not shipped; nothing in this feature injects
-  knowledge content into sessions), any passive remote fetch, vault sync,
-  or an OpenCode native adapter.
+- What does NOT ship here: any passive remote fetch, vault sync, or an
+  OpenCode native adapter. The PR2 routing policy ships separately
+  ([KNOWLEDGE-ROUTING.md](KNOWLEDGE-ROUTING.md)): it is display-only —
+  it names the lane and its target ids and never injects knowledge
+  content into sessions; capture stays explicit-command-only.
 - All commands and example outputs below are **illustrative** — they
   document the contract, they are not transcripts of live runs. Substitute
   your own hosts, paths, and token locations; never commit production
@@ -566,8 +567,10 @@ are content-free: `committed`/`duplicate` with `link_status` (`created`/
 ## Not in this feature
 
 - No passive injection: knowledge documents are never injected into
-  sessions by anything in PR1. The conditional instruction/skill/closeout
-  discovery wiring is PR2 and **not shipped**.
+  sessions. The PR2 routing policy
+  ([KNOWLEDGE-ROUTING.md](KNOWLEDGE-ROUTING.md)) is display-only — it
+  names the lane and its target ids, never note content, and capture
+  stays explicit-command-only.
 - No passive remote fetch, no vault sync, no vendor API (Obsidian or
   otherwise), no OpenCode native adapter or autonomous writes.
 - No new schema surface: pointer rows are ordinary fact rows; no new
