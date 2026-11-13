@@ -61,6 +61,7 @@ def _pack_query(conn: sqlite3.Connection, namespace: str, limit: int, min_confid
     rows = conn.execute(
         """SELECT type, signal, content, source_ref, tags FROM memory
            WHERE namespace=? AND superseded_at IS NULL AND confidence >= ?
+           AND type != 'entity_card'
            ORDER BY confidence DESC, (retrieval_count + surfaced_count) DESC,
                     ingestion_ts DESC
            LIMIT ?""",

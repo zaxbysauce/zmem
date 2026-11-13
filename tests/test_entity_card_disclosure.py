@@ -1004,6 +1004,151 @@ class EntityCardDisclosureTest(unittest.TestCase):
             "explain-target-human: the planted card did not surface in the "
             "blameline (vacuous-pass guard)")
 
+    def test_export_pack_and_dataset_exclude_raw_cards(self):
+        """Bulk-export exclusion leg (final-critic wave 9): the planted
+        pre-fix raw entity_card row must ship through NEITHER bulk export
+        surface — export-pack (the markdown pack; sync.py _pack_query now
+        excludes type='entity_card' at the SQL boundary) nor export-dataset
+        (the governed dataset; dataset.py export_dataset excludes the type
+        unconditionally, live AND tombstoned). The exclusion is pinned as
+        EXCLUSION, not masking: the string 'entity_card' appears nowhere in
+        the pack output or the exported dataset's memory files, and the raw
+        identity values appear nowhere in either surface (the dataset leg
+        reads the memory rows DECODED — parquet when pyarrow is importable,
+        jsonl otherwise — plus a whole-export-dir byte scan; the pack bullet
+        label would render the type pre-fix, so the pin catches a masked
+        card too). Non-vacuous guards: a benign fact row in the same
+        namespace DOES appear in both exports — and export-pack exits 2 when
+        the namespace and user:global are BOTH empty (tests/test_export_pack.
+        py EmptyPackTest), so post-exclusion content is load-bearing for the
+        runs themselves, not just the assertions. GREEN at the current tree:
+        the production fix precedes the pin (like wave 8); the final critic's
+        probe at 0155a15d is the pre-fix RED evidence of record."""
+        eid = f"e-cred-exp-{self.suffix}"
+        card_id = f"m-expcard-{self.suffix}"
+        benign_token = "aurora"
+        benign_content = (
+            f"{benign_token} benign rotation checklist for the quarterly "
+            "review")
+        card_content = (
+            f"Entity: {RAW_CANONICAL}\n"
+            "Kind: other\n"
+            f"Aliases: {RAW_ALIAS}\n"
+            "Mentions:\n"
+            f"- score=0.900000 last_seen=2026-11-11T00:00:04Z id=m-legacy-1 "
+            f"source_ref=probe text={self.PLANTED_CARD_TOKEN} rotation notes "
+            f"({RAW_CANONICAL}) and [{RAW_ALIAS}] for the quarter\n"
+            "Last seen: 2026-11-11T00:00:04Z\n"
+            "Sources:\n"
+            "- m-legacy-1\n")
+        self.insert_entity_mentions(
+            eid, "other", RAW_CANONICAL, (RAW_ALIAS,), mentions=[])
+        self.plant_raw_card(eid, card_id, card_content)
+        # Benign row in the SAME namespace (direct INSERT, confidence 0.9
+        # above the pack's 0.6 default floor): without it the namespace is
+        # empty after the exclusion and export-pack refuses with exit 2.
+        conn = sqlite3.connect(self.store_path)
+        try:
+            now = "2026-11-11T00:00:00Z"
+            conn.execute(
+                "INSERT INTO memory(id, namespace, type, content, tags, "
+                "source_ref, signal, confidence, valid_from, ingestion_ts)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (f"m-benign-{self.suffix}", self.ns, "fact",
+                 benign_content, "", "probe", "user", 0.9, now, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # export-pack (argv shape from tests/test_export_pack.py: the
+        # subcommand with a required --namespace; stdout carries the pack).
+        pack = self.run_store("export-pack", "--namespace", self.ns)
+        self.assertIn(
+            benign_token, pack.stdout,
+            "export-pack: the benign row did not render — the pack had no "
+            "content (vacuous-pass guard)")
+        for stream_name, stream in (("stdout", pack.stdout),
+                                    ("stderr", pack.stderr)):
+            for raw in (RAW_CANONICAL, RAW_ALIAS):
+                self.assertNotIn(
+                    raw, stream,
+                    f"export-pack {stream_name}: RAW-LEAK credential-shaped "
+                    f"value {raw!r} from the planted raw entity_card reached "
+                    f"the pack {stream_name}; the card must be EXCLUDED "
+                    f"(type != 'entity_card' at the _pack_query boundary)")
+        self.assertNotIn(
+            "entity_card", pack.stdout,
+            "export-pack: the string 'entity_card' reached the pack output "
+            "— the card row was masked/rendered rather than EXCLUDED (the "
+            "bullet label renders the row type pre-exclusion)")
+
+        # export-dataset (argv shape from tests/test_dataset.py: positional
+        # output dir, then --namespace; the dir must not pre-exist). The
+        # export lives under this test's scratch dir, so tearDown cleans it.
+        export_dir = Path(self._td.name) / "dataset-export"
+        dset = self.run_store("export-dataset", str(export_dir),
+                              "--namespace", self.ns, timeout=300)
+        manifest_path = export_dir / "manifest.json"
+        self.assertTrue(
+            manifest_path.is_file(), "export-dataset wrote no manifest.json")
+        mem_files = sorted((export_dir / "data").glob("memories-*.*"))
+        self.assertTrue(
+            mem_files, "export-dataset wrote no memories family files")
+        # Decode the memory rows (jsonl lines verbatim; parquet rows via
+        # pyarrow — same interpreter as the export subprocess, so pyarrow is
+        # importable here exactly when the export chose the parquet format).
+        row_blobs = []
+        for mf in mem_files:
+            if mf.suffix == ".jsonl":
+                row_blobs.extend(
+                    line for line in
+                    mf.read_text(encoding="utf-8").splitlines()
+                    if line.strip())
+            else:
+                import pyarrow.parquet as pq
+                row_blobs.extend(
+                    json.dumps(row, default=str)
+                    for row in pq.read_table(str(mf)).to_pylist())
+        self.assertTrue(row_blobs, "memories family files decoded to no rows")
+        self.assertTrue(
+            any(benign_token in blob for blob in row_blobs),
+            "export-dataset: the benign row is absent from the exported "
+            "memory files — the export had no content (vacuous-pass guard)")
+        for blob in row_blobs:
+            for raw in (RAW_CANONICAL, RAW_ALIAS):
+                self.assertNotIn(
+                    raw, blob,
+                    f"export-dataset: RAW-LEAK credential-shaped value "
+                    f"{raw!r} from the planted raw entity_card reached an "
+                    f"exported memory row; the card must be EXCLUDED "
+                    f"(type != 'entity_card' in export_dataset)")
+            self.assertNotIn(
+                "entity_card", blob,
+                "export-dataset: an exported memory row carries the string "
+                "'entity_card' — the card row was shipped (masked or raw) "
+                "rather than EXCLUDED")
+        # Belt-and-braces over the whole export dir (manifest, README, every
+        # family file) plus the CLI's own summary output: no plaintext
+        # channel carries the raw identities. (For parquet the decoded row
+        # scan above is authoritative — columnar encoding can hide bytes.)
+        for f in sorted(export_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            data = f.read_bytes()
+            for raw in (RAW_CANONICAL, RAW_ALIAS):
+                self.assertNotIn(
+                    raw.encode("utf-8"), data,
+                    f"export-dataset: RAW-LEAK credential-shaped value "
+                    f"{raw!r} found in the export file {f.name}")
+        for stream_name, stream in (("stdout", dset.stdout),
+                                    ("stderr", dset.stderr)):
+            for raw in (RAW_CANONICAL, RAW_ALIAS):
+                self.assertNotIn(
+                    raw, stream,
+                    f"export-dataset {stream_name}: RAW-LEAK "
+                    f"credential-shaped value {raw!r} from the planted raw "
+                    f"entity_card reached the CLI {stream_name}")
+
 
 if __name__ == "__main__":
     unittest.main()
