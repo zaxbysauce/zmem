@@ -1537,7 +1537,12 @@ class CanaryHermeticityTest(unittest.TestCase):
             ["remote", "add", "origin",
              "https://example.com/hostile/canary-decoy.git"],
         ):
-            subprocess.run(git + argv, check=True, capture_output=True)
+            # GIT_TERMINAL_PROMPT='0' as the EFFECTIVE env value per the
+            # git-hygiene ratchet (the remote-add carries an https:// URL,
+            # so this invocation is network-capable even though it never
+            # contacts the network).
+            subprocess.run(git + argv, check=True, capture_output=True,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
         home = self._data_dir("hostile-home")
         d = self._data_dir("hostile-run")
