@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "84cb9d4fd6a029b51d82a832e92ae6239ddee6c314143fb03606e0355fab88f9",
+  "digest": "8c47c9d682861c965b60c28b0b9c725568e864ee5b3864669d55a881848f0a39",
   "files": {
     ".agents/plugins/marketplace.json": "bf3d585650027b2bc01f13f8c4813ff89949c35b6c253b73d2eaa7d0c592b94a",
     ".claude-plugin/marketplace.json": "1f415c698cc1e1b9bd9f5eb10904d34bca81895130460d35ead6c08bc85b944c",
@@ -114,7 +114,7 @@
     "skills/memory/scripts/storelib/config.py": "36448a1f80cdfc60b5ddd101a679a166f1522ad1e2eb3555139bac351ec7fc38",
     "skills/memory/scripts/storelib/consolidate.py": "f4f30c9d7dcf69cdc17a01235af56f87918000f630c53cc377d28979f72fae82",
     "skills/memory/scripts/storelib/cross_encoder.py": "175a3cc3cb7241ecc317f1d138863e437ae0585b5112062caf97c94125ba8ed4",
-    "skills/memory/scripts/storelib/dataset.py": "ba6e70a3e3adbd75bbfd6af761c22e27c43d75562231a4003ef303b23f9c0128",
+    "skills/memory/scripts/storelib/dataset.py": "037e5fcd2f92c49ec748f8c1e425f52a8a1ac76cd78b9169fe645d8b32842e4e",
     "skills/memory/scripts/storelib/decision_report.py": "453107144d11e8a41f68e0cdb2db9bd9cf78a231fb001ded42d62d562af9c2e1",
     "skills/memory/scripts/storelib/delivery_ledger.py": "3c87501aaf729cc35df64e030b0ea879af0368e6ae1d4d1a774644db59e84e78",
     "skills/memory/scripts/storelib/entity.py": "fc6710251d2223a95866128a023eec2e0e95a7ed7438166a9fd3e997feff00bc",
@@ -148,7 +148,7 @@
     "skills/memory/scripts/storelib/state.py": "f2236393c1b7a8f344a93b8ff1b89b6642db69d4aeb438b3000666f5c9595642",
     "skills/memory/scripts/storelib/state_expiry.py": "fb3f2286aa5d503cce9288e6f9382e177f22750079d311f1faa985084e43f9bf",
     "skills/memory/scripts/storelib/subject.py": "bf6e3bcf8b85834d682f9d3b473b8655f177e633b6b8470ba07dff4605648c36",
-    "skills/memory/scripts/storelib/sync.py": "19cd99370140ca87f78428c6912550e12cc6d49792e4add5dadbb269ec4bfd48",
+    "skills/memory/scripts/storelib/sync.py": "d9b6707f65793eb3237cbddbf4f27ba6495908f9d8414ac88d0cc3e4b68f90c5",
     "skills/memory/scripts/storelib/temporal.py": "d687472bdc4d11b83f8ca248b0fecd3f21316397ac706d6b6cb82fcbedeab70c",
     "skills/memory/scripts/storelib/training.py": "a308dcc6289e4c16efb0286a14c65dc8de0b400334d99cda80e24ae101cea4d6",
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
