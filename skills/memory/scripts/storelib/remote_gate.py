@@ -27,6 +27,7 @@ caller continues on the unchanged local path.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -286,7 +287,20 @@ def _refuse_read_flags(cmd: str, args: Any) -> None:
 def _resolve_content(args: Any) -> str:
     content = args.content
     if content == "-":
-        content = sys.stdin.read()
+        # Read the raw buffer and decode UTF-8 explicitly (issue #460, PR
+        # #461 review F-003): a bare sys.stdin.read() decodes with the
+        # process locale codec — cp1252 on a default Windows install —
+        # mojibake-ing non-ASCII content and, for cp1252's undefined bytes,
+        # producing lone surrogates that cannot be re-encoded for the hub
+        # transport. Same policy as the local dispatch site in cli.py,
+        # including its default universal newlines (newline=None): the \r\n
+        # a text-mode parent emits on Windows is normalized back to \n (on
+        # Windows the base text-layer read did the same; on POSIX it did not
+        # translate), so remote and local writes of the same piped content
+        # queue identical text.
+        content = io.TextIOWrapper(
+            sys.stdin.buffer, encoding="utf-8", errors="replace"
+        ).read()
     return content
 
 

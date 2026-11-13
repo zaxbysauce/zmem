@@ -766,6 +766,42 @@ def test_remote_add_content_dash_reads_stdin_into_queued_op():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_remote_add_content_dash_stdin_decodes_utf8_on_cp1252_stdio():
+    """PR #461 review F-003: remote-mode `--content -` must decode the
+    piped bytes as UTF-8 regardless of the stdio codec. With the child's
+    stdio codec pinned to cp1252 (the default Windows ANSI codepage), a
+    bare sys.stdin.read() queued mojibake ("café — naïve" ->
+    cafÃ© â€” naÃ¯ve) and cp1252's undefined bytes even produced lone
+    surrogates that cannot be re-encoded for the hub transport; the raw
+    buffer read + explicit UTF-8 decode queues the exact codepoints.
+    The piped bytes carry a CRLF break: the reader keeps base's universal
+    newlines (TextIOWrapper, newline=None), so the queued text is LF — the
+    same text the local dispatch site stores."""
+    tmp = _pinned_scratch("p7b")
+    try:
+        piped = "café —\r\nnaïve"
+        expected = "café —\nnaïve"
+        env = _remote_subproc_env(tmp, _dead_port_url())
+        env["PYTHONIOENCODING"] = "cp1252"  # the defect-host stdio codec
+        proc = subprocess.run(
+            [sys.executable, str(STORE_PY), "add", "--namespace",
+             "user:global", "--type", "fact", "--content", "-", "--json"],
+            capture_output=True, env=env, input=piped.encode("utf-8"),
+            cwd=str(REPO_ROOT), timeout=_SUBPROC_TIMEOUT_S)
+        assert proc.returncode == 0, (
+            f"remote add --content - must exit 0 (stdin resolved before "
+            f"enqueue); rc={proc.returncode} stderr={_tail(proc.stderr)!r}")
+        entries = _queue_entries(tmp)
+        assert len(entries) == 1, (
+            f"exactly one queued op expected, got {len(entries)}")
+        assert entries[0].get("args", {}).get("content") == expected, (
+            f"the queued op's content must be the exact UTF-8 codepoints "
+            f"independent of the stdio codec, with CRLF normalized to LF; got "
+            f"{entries[0].get('args', {}).get('content')!r}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_remote_update_content_dash_reads_stdin_into_queued_op():
     """PRR-001 (PR #400 review): `update --content -` under remote mode
     queues the piped stdin text verbatim — `_resolve_content` must run
@@ -1695,6 +1731,7 @@ _ALL_TESTS = (
     test_read_flag_refusals_and_positive_remote_search,
     test_remote_add_content_dash_reads_stdin_into_queued_op,
     test_remote_update_content_dash_reads_stdin_into_queued_op,
+    test_remote_add_content_dash_stdin_decodes_utf8_on_cp1252_stdio,
     test_remote_capture_mode_resolved_from_env_intent,
     test_overlay_ordering_pending_then_flushed_recall,
     test_unreachable_hub_error_contract,

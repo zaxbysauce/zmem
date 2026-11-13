@@ -1669,7 +1669,13 @@ Legacy rows already stranded under a near-miss namespace
 - **Large content**: `--content -` (the literal dash) reads the content from
   stdin on both `add` and `update`. Windows caps command-line argv far below the
   65536-char content limit, so pipe near-limit payloads instead of passing them
-  as an argument (the Hermes/MCP surfaces do this automatically).
+  as an argument (the Hermes/MCP surfaces do this automatically). Piped bytes
+  are always decoded as UTF-8, whatever the process stdio codec (cp1252 on a
+  default Windows install), locally and in remote mode; invalid UTF-8 bytes
+  store as U+FFFD. Line endings are normalized: `\r\n` (and a lone `\r`) store
+  as `\n`, so a text-mode parent's piped LF text is stored as LF (issue #460).
+  The argv path performs no translation: an argument containing `\r\n` is
+  stored verbatim.
 
 ### Provenance trust (`--taint`) — v9 (issue #59, 4.7)
 Every memory carries a **taint** rank marking the trust of its ORIGIN:

@@ -5,6 +5,7 @@ import calendar
 import contextlib
 from collections.abc import Mapping
 import hashlib
+import io
 import json
 import math
 import os
@@ -2466,7 +2467,8 @@ def main():
     p_add.add_argument("--type", required=True, choices=list(_ADD_TYPE_CHOICES))
     p_add.add_argument("--content", required=True,
                        help="the memory text; the literal '-' reads content from "
-                            "stdin (use for payloads near the content cap — "
+                            "stdin, decoded as UTF-8 with CRLF normalized to LF "
+                            "(use for payloads near the content cap — "
                             "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_add.add_argument("--tags", default="")
     p_add.add_argument("--source-ref", default="")
@@ -3020,7 +3022,8 @@ def main():
     p_upd.add_argument("--id", required=True, help="id of the live memory to update")
     p_upd.add_argument("--content", required=True,
                        help="the new content; the literal '-' reads content from "
-                            "stdin (use for payloads near the content cap — "
+                            "stdin, decoded as UTF-8 with CRLF normalized to LF "
+                            "(use for payloads near the content cap — "
                             "Windows argv caps far below MAX_CONTENT_CHARS)")
     p_upd.add_argument("--namespace", default=None)
     p_upd.add_argument("--expected-old-namespace", default=None,
@@ -5519,9 +5522,22 @@ def main():
     # from stdin. Windows argv caps near 32k chars while the content cap is
     # MAX_CONTENT_CHARS (65536), so large-but-valid content cannot always be
     # delivered as an argv element; the Hermes/MCP surfaces pipe oversize
-    # payloads through this path instead.
+    # payloads through this path instead. Read the raw buffer and decode
+    # UTF-8 explicitly: a bare sys.stdin.read() decodes with the process
+    # locale codec — cp1252 on a default Windows install — mojibake-ing
+    # non-ASCII content (issue #460). Same rationale as _cmd_apply_ops and
+    # the retain readers. Wrap the buffer in a TextIOWrapper (default
+    # newline=None) rather than reading the text layer: the UTF-8 decode
+    # stays independent of the stdio codec, while universal newlines still
+    # translate the \r\n a text-mode parent (Hermes/MCP on Windows) emits
+    # back to \n (the LF text the parent sent; on Windows this matches the
+    # base text layer, on POSIX the base read did not translate), so near-cap
+    # multi-line writes are measured on the logical length. The argv path
+    # does no newline translation; this is stdin-only.
     if getattr(args, "content", None) == "-":
-        args.content = sys.stdin.read()
+        args.content = io.TextIOWrapper(
+            sys.stdin.buffer, encoding="utf-8", errors="replace"
+        ).read()
 
     if args.cmd in {"add", "update"}:
         try:

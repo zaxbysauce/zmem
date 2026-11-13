@@ -59,9 +59,11 @@ jobs:
       # Pin UTF-8 mode for the python lanes. The repo's cp1252-pinned child
       # fixtures are unaffected by the pin either way: storelib's CLI
       # reconfigures its own stdout to UTF-8 before dispatch (verified by
-      # execution on the add path), so no shipped test depends on a cp1252
-      # child — there is deliberately no in-repo leg that still exercises
-      # cp1252 mode.
+      # execution on the add path). The stdin-decode legs
+      # (tests/test_cli_stdin_encoding.py and the remote-mode leg in
+      # tests/test_t10_cli_remote_supp.py, issue #460) DO exercise a cp1252
+      # child: they set PYTHONIOENCODING=cp1252 explicitly in the child env,
+      # which takes precedence over this inherited PYTHONUTF8 pin.
       PYTHONUTF8: "1"
     steps:
       # Actions are tag-pinned. This workflow uses no secrets and no

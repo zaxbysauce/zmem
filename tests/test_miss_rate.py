@@ -261,7 +261,7 @@ def _enriched_bg_line(ts: int, ids, *, lane=None,
 _WRITER_TAIL_LINE = (
     "[1780000000] zmem-hook status=injected reason=injected"
     " ids=['m1'] all=['m1', 'm2'] sid=sess-a moment=recall"
-    " lane=zcode ver=0.151.0 t_ms=4 arms=fts:1/15,temporal:1/5"
+    " lane=zcode ver=0.152.0 t_ms=4 arms=fts:1/15,temporal:1/5"
     " state=clean pts=2026-09-10T15:30:00Z")
 
 
