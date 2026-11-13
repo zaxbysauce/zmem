@@ -317,9 +317,9 @@ async function main() {
     const compactionOut = { context: ["prior context"] };
     await hooks["experimental.session.compacting"](
       { sessionID: "00000000-0000-4000-8000-000000000660" }, compactionOut);
-    ok("compaction writes context only",
+    ok("testCompactionWritesContextOnly: compaction appends rendered to context",
       compactionOut.context.length === 2);
-    ok("compaction never writes a user prompt",
+    ok("testCompactionWritesContextOnly: never writes a user prompt",
       !("system" in compactionOut) || compactionOut.system === undefined
       || compactionOut.system.length === 0);
   }
