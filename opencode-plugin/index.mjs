@@ -225,15 +225,26 @@ export function normalizeOpenCodeMessage(message, sourcePath, seq) {
   };
 }
 
-function transcriptPath() {
+// ZMEM_OPENCODE_TRANSCRIPTS (and the <ZMEM_DATA>/transcripts/opencode
+// default) is a DIRECTORY of *.jsonl transcripts per the mining contract
+// (store.py mine-history --source opencode globs <dir>/*.jsonl); a path
+// ending in .jsonl is honored as a direct FILE override for test callers.
+function transcriptRoot() {
   return process.env.ZMEM_OPENCODE_TRANSCRIPTS
     || path.join(process.env.ZMEM_DATA || path.join(homeDir(), ".zmem"),
                  "transcripts", "opencode");
 }
 
+function transcriptFileFor(sessionId) {
+  const root = transcriptRoot();
+  if (root.endsWith(".jsonl")) return root; // explicit file override
+  const safe = String(sessionId || "session").replace(/[^A-Za-z0-9._-]/g, "_");
+  return path.join(root, safe + ".jsonl");
+}
+
 function readMaxSeq(target) {
   // Persisted sequence state across reloads: the seq counter is recovered
-  // from the transcript's own tail (the transcript IS the seq state).
+  // from the transcript file's own tail (the transcript IS the seq state).
   try {
     const raw = fs.readFileSync(target, "utf-8");
     const lines = raw.split("\n").filter((l) => l.trim());
@@ -248,21 +259,23 @@ function readMaxSeq(target) {
 }
 
 const finalizedTurns = new Set(); // turn_uuid idempotency (in-process)
-let seqCounter = null;
+const seqCounters = new Map();    // per-FILE seq state (per session file)
 
 export function appendTurn(message, sourcePath) {
-  const target = transcriptPath();
   try {
     const info = (message && message.info) || {};
     const turnUuid = info.id || "";
     if (!turnUuid || finalizedTurns.has(turnUuid)) return false; // exactly once
-    if (seqCounter === null) seqCounter = readMaxSeq(target);
-    const seq = seqCounter + 1;
+    const target = transcriptFileFor(info.sessionID || info.session_id);
+    if (!seqCounters.has(target)) {
+      seqCounters.set(target, readMaxSeq(target));
+    }
+    const seq = seqCounters.get(target) + 1;
     const turn = normalizeOpenCodeMessage(message, sourcePath, seq);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.appendFileSync(target,
       JSON.stringify(turn) + "\n", "utf-8");
-    seqCounter = seq;
+    seqCounters.set(target, seq);
     finalizedTurns.add(turnUuid);
     return true;
   } catch (exc) {
@@ -279,7 +292,7 @@ export function appendTurn(message, sourcePath) {
 
 export function _resetCaptureStateForTests() {
   finalizedTurns.clear();
-  seqCounter = null;
+  seqCounters.clear();
   openMessages.clear();
 }
 
@@ -327,7 +340,8 @@ function finalizeMessage(messageID) {
   const entry = openMessages.get(messageID);
   if (!entry) return;
   openMessages.delete(messageID);
-  appendTurn(entry.message, path.basename(transcriptPath()));
+  appendTurn(entry.message, path.basename(transcriptFileFor(
+    entry.sessionID)));
 }
 
 function finalizePendingMessages() {
@@ -371,6 +385,7 @@ export default async function zmemPlugin(input, options = {}) {
         query: "",
         moment: "user_prompt",
         session_id: sessionId,
+        worktree: input && input.worktree,
         budget_tokens: 1500,
       });
       if (envelope && envelope.rendered
@@ -384,6 +399,7 @@ export default async function zmemPlugin(input, options = {}) {
         query: "",
         moment: "precompact",
         session_id: sessionId,
+        worktree: input && input.worktree,
         budget_tokens: 1500,
       });
       if (envelope && envelope.rendered
@@ -421,6 +437,7 @@ export default async function zmemPlugin(input, options = {}) {
             moment: "user_prompt",
             session_id: args.session_id || (ctx && ctx.sessionID) || "",
             namespace: args.namespace,
+            worktree: (ctx && ctx.worktree) || (input && input.worktree),
             limit: args.limit,
             global_limit: args.global_limit,
             budget_tokens: args.budget_tokens || 1500,
@@ -445,6 +462,7 @@ export default async function zmemPlugin(input, options = {}) {
             moment: "session_start",
             session_id: args.session_id || (ctx && ctx.sessionID) || "",
             namespace: args.namespace,
+            worktree: (ctx && ctx.worktree) || (input && input.worktree),
             limit: args.limit,
             global_limit: args.global_limit,
             budget_tokens: args.budget_tokens || 1500,

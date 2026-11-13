@@ -1433,7 +1433,19 @@ def _mine_opencode_candidates(transcript_dir: str) -> list[dict]:
                 continue
             if not isinstance(obj, dict):
                 continue
-            turn = normalize_opencode_message(obj, path.name, seq)
+            # Two accepted record shapes: RAW {info, parts} messages (the
+            # fixture family) and CANONICAL Turn records already emitted
+            # by the plugin's capture engine (harness == "opencode" with a
+            # blocks list) — the canonical form passes through unchanged.
+            is_canonical_turn = (
+                obj.get("harness") == "opencode"
+                and isinstance(obj.get("blocks"), list)
+                and "session_id" in obj)
+            if is_canonical_turn:
+                turn = dict(obj)
+                turn.setdefault("seq", seq)
+            else:
+                turn = normalize_opencode_message(obj, path.name, seq)
             user_text = " ".join(
                 b.get("text", "") for b in turn["blocks"]
                 if isinstance(b, dict) and b.get("type") == "text").strip()

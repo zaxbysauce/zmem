@@ -61,15 +61,17 @@ def empty_envelope(reason: str, budget: int) -> dict:
 
 def _resolve_namespace(request: dict) -> str:
     """Request namespace wins; else ZMEM_NAMESPACE; else the canonical
-    git-remote resolver over the probed worktree (the same key the launcher
-    derives); else user:global."""
+    git-remote resolver over the probed worktree (request worktree, or the
+    ZMEM_PROJECT the plugin exports — the same value the launcher derives
+    its namespace from); else user:global."""
     requested = str(request.get("namespace") or "").strip()
     if requested:
         return requested
     explicit = os.environ.get("ZMEM_NAMESPACE", "").strip()
     if explicit:
         return explicit
-    worktree = str(request.get("worktree") or "").strip()
+    worktree = str(request.get("worktree")
+                   or os.environ.get("ZMEM_PROJECT", "")).strip()
     if worktree:
         try:
             sys.path.insert(0, _BRIDGE_PATH)

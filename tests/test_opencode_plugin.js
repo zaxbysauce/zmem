@@ -215,17 +215,26 @@ async function main() {
     // below-bar `none` signal omitted: a conf-0.3 none-signal row never
     // renders (seed one and confirm it stays out of candidate_ids).
     const low = spawnSync(PYTHON, ["-c", [
-      "import sys, os",
+      "import sys, os, json",
       "sys.path.insert(0, r'" + path.join(REPO, "skills", "memory",
         "scripts").replace(/\\/g, "\\\\") + "')",
       "import storelib",
       "conn = storelib.connect()",
-      "storelib.add_memory(conn, namespace='project:opencode', type_='fact',",
+      "storelib.schema.init_db(conn)",
+      "storelib.schema.migrate(conn)",
+      "res = storelib.add_memory(conn, namespace='project:opencode',"
+      + " type_='fact',",
       "  content='stash pop related none-signal row', signal='none',",
-      "  confidence=0.3, now='2026-09-10T00:00:00Z', skip_dedup=True)",
+      "  now='2026-09-10T00:00:00Z', skip_dedup=True)",
+      "print(json.dumps({'id': str(res)}))",
       "conn.close()",
     ].join("\n")], { encoding: "utf-8", timeout: 120000 });
-    ok("below-bar seed landed", low.status === 0,
+    let lowRowId = "";
+    try {
+      lowRowId = JSON.parse(String(low.stdout || "")
+        .trim().split("\n").pop()).id;
+    } catch { lowRowId = ""; }
+    ok("below-bar seed landed", low.status === 0 && lowRowId.length > 0,
       (low.stderr || "").slice(-200));
     if (low.status === 0) {
       const second = await mod.runInjection({
@@ -235,8 +244,11 @@ async function main() {
         session_id: "00000000-0000-4000-8000-000000000660",
         budget_tokens: 1500,
       });
-      ok("below-bar none@0.3 signal absent from candidate ids",
-        !second.candidate_ids.some((id) => true) || true); // structure pin
+      ok("below-bar none@0.3 row id absent from candidate ids",
+        !second.candidate_ids.includes(lowRowId));
+      ok("below-bar fixture row id still present (discriminating leg)",
+        second.candidate_ids.includes(
+          "00000000-0000-4000-8000-000000000666"));
       ok("below-bar row content absent from rendered fence",
         second.rendered.indexOf("none-signal row") === -1);
     }
@@ -455,6 +467,114 @@ async function main() {
     const dTurn = finalTurns.find((t) => t.turn_uuid === "msg-d");
     ok("testPersistedSequenceAcrossReload: seq continues from transcript",
       typeof dTurn.seq === "number" && dTurn.seq === seqBefore + 1);
+  }
+
+  // --- reviewer finding 1: the DIRECTORY contract end to end --------------
+  // ZMEM_OPENCODE_TRANSCRIPTS names a DIRECTORY of *.jsonl files (the mining
+  // contract); appendTurn must write <dir>/<session>.jsonl and mine-history
+  // --source opencode must harvest those CANONICAL Turn records.
+  {
+    const dir = scratchDir("dircontract");
+    pinStore(dir);
+    const tdir = path.join(dir, "transcripts", "opencode");
+    process.env.ZMEM_OPENCODE_TRANSCRIPTS = tdir; // directory, NOT a file
+    mod._resetCaptureStateForTests();
+    const captureHooks = await mod.default(
+      { worktree: "/tmp/oc-wt" }, {});
+    const mkEvt = (id, text) => ({
+      type: "message.updated",
+      sessionID: "sess-dir-contract",
+      info: { id, sessionID: "sess-dir-contract", role: "user",
+        time: { created: 1767225600000 }, worktree: "C:/oc", status:
+        "completed",
+        parts: [{ type: "text", text }] },
+    });
+    await captureHooks.event({ event: mkEvt("msg-dir-1",
+      "no, use uv not pip") });
+    const oneFile = fs.readdirSync(tdir).filter((f) => f.endsWith(".jsonl"));
+    ok("transcript root is a DIRECTORY with one <session>.jsonl",
+      fs.statSync(tdir).isDirectory() && oneFile.length === 1
+      && oneFile[0] === "sess-dir-contract.jsonl");
+    const harvested = spawnSync(PYTHON, [
+      path.join(REPO, "skills", "memory", "scripts", "store.py"),
+      "mine-history", "--source", "opencode",
+      "--transcript-dir", tdir, "--json",
+    ], { encoding: "utf-8", timeout: 180000,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+    let mined = null;
+    try {
+      const line = String(harvested.stdout || "").trim()
+        .split("\n").filter((l) => l.startsWith("{")).pop();
+      mined = line ? JSON.parse(line) : null;
+    } catch { mined = null; }
+    ok("mine-history harvests plugin-captured canonical Turns",
+      harvested.status === 0 && mined !== null
+      && Array.isArray(mined.candidates)
+      && mined.candidates.length >= 1
+      && typeof mined.candidates[0].message === "string"
+      && mined.candidates[0].message.indexOf("uv") !== -1,
+      (harvested.stderr || "").slice(-200));
+    delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
+  }
+
+  // --- reviewer finding 2: worktree -> namespace propagation --------------
+  // With ZMEM_NAMESPACE UNSET and no explicit namespace arg, a plugin drive
+  // carrying input.worktree must resolve the PROJECT namespace (not
+  // user:global) and recall the project-seeded row.
+  {
+    const dir = scratchDir("worktreens");
+    pinStore(dir);
+    // Build a real git worktree so host.resolve_namespace derives the
+    // project key from its origin remote.
+    const proj = path.join(dir, "proj");
+    fs.mkdirSync(proj, { recursive: true });
+    fs.writeFileSync(path.join(proj, "seed.txt"), "x", "utf-8");
+    const g = (args) => spawnSync("git", args, { cwd: proj,
+      encoding: "utf-8", timeout: 30000 });
+    g(["init", "-q"]);
+    g(["add", "."]);
+    g(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+       "-m", "seed"]);
+    g(["remote", "add", "origin",
+       "https://example.com/oc-probe/ws-probe.git"]);
+    // Seed a row in the namespace the resolver will derive.
+    const seedNs = spawnSync(PYTHON, ["-c", [
+      "import sys, os, json",
+      "sys.path.insert(0, r'" + path.join(REPO, "skills", "memory",
+        "scripts").replace(/\\/g, "\\\\") + "')",
+      "import host, storelib",
+      "ns = host.resolve_namespace(r'" + proj.replace(/\\/g, "\\\\")
+        + "')",
+      "conn = storelib.connect()",
+      "storelib.schema.init_db(conn)",
+      "storelib.schema.migrate(conn)",
+      "r = storelib.add_memory(conn, namespace=ns, type_='fact',",
+      "  content='worktree namespace probe row uv cache', signal='test',",
+      "  confidence=0.9, now='2026-09-10T00:00:00Z', skip_dedup=True)",
+      "print(json.dumps({'ns': ns, 'id': str(r)}))",
+      "conn.close()",
+    ].join("\n")], { encoding: "utf-8", timeout: 120000,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+    let nsInfo = null;
+    try {
+      nsInfo = JSON.parse(String(seedNs.stdout || "").trim()
+        .split("\n").filter((l) => l.startsWith("{")).pop());
+    } catch { nsInfo = null; }
+    ok("worktree-namespace seed landed", seedNs.status === 0
+      && nsInfo !== null && nsInfo.ns.startsWith("project:"),
+      (seedNs.stderr || "").slice(-200));
+    if (nsInfo) {
+      delete process.env.ZMEM_NAMESPACE;
+      const wsHooks = await mod.default(
+        { worktree: proj, directory: proj }, {});
+      const out = await wsHooks.tool.zmem_recall.execute(
+        { query: "uv cache" }, { sessionID: "sess-ws-probe" });
+      let env2 = null;
+      try { env2 = JSON.parse(out); } catch { env2 = null; }
+      ok("worktree recall resolves the PROJECT namespace (reviewer F2)",
+        env2 !== null && env2.candidate_ids.includes(nsInfo.id),
+        "ns=" + nsInfo.ns + " reason=" + (env2 && env2.reason));
+    }
   }
 
   console.log("");
