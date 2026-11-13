@@ -1313,9 +1313,174 @@ def _mine_deepseek_candidates(root):
     return candidates
 
 
+_OPENCODE_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _utc_rfc3339(epoch_ms: int) -> str:
+    dt = datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_opencode_ts(value):
+    """OpenCode Turn timestamp normalization (issue #66 design step 5).
+
+    Epoch milliseconds (int/float) become UTC RFC3339; RFC3339 strings are
+    normalized to UTC; the live SDK's ``time`` object shape recurses into
+    ``created``; invalid or missing values become None (a null Turn ts never
+    receives newest ordering downstream). Ported byte-faithfully from
+    tests/fixtures/opencode/generate_expected_turns.py — that generator is
+    the byte-spec of the committed expected-turns fixtures this module must
+    reproduce."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return _utc_rfc3339(int(value))
+    if isinstance(value, dict):
+        created = value.get("created")
+        return _normalize_opencode_ts(created)
+    if isinstance(value, str):
+        try:
+            iso = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
+
+
+def _normalize_opencode_blocks(parts):
+    """OpenCode message parts -> canonical Turn blocks.
+
+    Accepts BOTH raw shapes (issue #66 / plan R2 F1): the fixture shape
+    (``{type:"text",text}`` / ``{type:"tool",name,text}``) and the live SDK
+    shape (``{type:"tool",tool,state:{status,output,error}}``)."""
+    blocks = []
+    for part in parts or []:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            blocks.append({"type": "text", "text": part.get("text", "")})
+        elif ptype == "tool":
+            name = part.get("name") or part.get("tool") or ""
+            state = part.get("state")
+            if isinstance(state, dict):
+                text = state.get("output") or state.get("error") or ""
+            else:
+                text = part.get("text") or ""
+            blocks.append({"type": "tool", "name": name, "text": text})
+    return blocks
+
+
+def normalize_opencode_message(message: dict, source_path: str,
+                               seq: int) -> dict:
+    """Canonical OpenCode Turn normalization (issue #66 design step 5).
+
+    A raw ``{info, parts}`` OpenCode message becomes the canonical Turn dict
+    with keys in order: session_id, workdir, turn_uuid, parent_uuid, seq, ts,
+    role, blocks, source_path, harness="opencode". Byte-faithful port of the
+    reference implementation in tests/fixtures/opencode/
+    generate_expected_turns.py (do not import the fixture file from here —
+    production code never depends on test fixtures)."""
+    info = message.get("info") or {}
+    return {
+        "session_id": info.get("sessionID") or info.get("session_id") or "",
+        "workdir": info.get("worktree") or info.get("workdir") or "",
+        "turn_uuid": info.get("id") or "",
+        "parent_uuid": info.get("parentID") or info.get("parent_id"),
+        "seq": seq,
+        "ts": _normalize_opencode_ts(info.get("time")),
+        "role": info.get("role") or "",
+        "blocks": _normalize_opencode_blocks(message.get("parts")),
+        "source_path": source_path,
+        "harness": "opencode",
+    }
+
+
+def _mine_opencode_candidates(transcript_dir: str) -> list[dict]:
+    """Mine canonical OpenCode Turn JSONL transcripts (issue #66 design
+    step 5) into review candidates.
+
+    READ-ONLY, mirroring _mine_hermes_candidates' contract: user-role Turn
+    text blocks feed the SAME corrections.detect_patterns rules the live
+    hook uses; tool blocks whose output classifies as an error feed the
+    error-pattern lane (classify_error_type's tuple — (None, None) is not a
+    candidate). Candidates are REVIEWED before any store write; --queue is
+    owned by the dispatch wrapper (cmd_mine_history_adapters), never this
+    adapter. Transcript JSONL shape is upstream-owned: an unparseable line
+    is skipped, never fatal."""
+    import corrections as _corr
+    root = Path(transcript_dir).expanduser()
+    if not root.is_dir():
+        raise FileNotFoundError(str(root))
+    candidates: list[dict] = []
+    for path in sorted(root.glob("*.jsonl")):
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = [ln for ln in raw[:_OPENCODE_MAX_FILE_BYTES].splitlines()
+                 if ln.strip()]
+        source_name = "opencode-session:" + path.name
+        for seq, line in enumerate(lines):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            turn = normalize_opencode_message(obj, path.name, seq)
+            user_text = " ".join(
+                b.get("text", "") for b in turn["blocks"]
+                if isinstance(b, dict) and b.get("type") == "text").strip()
+            if turn["role"] == "user" and len(user_text) >= 5 \
+                    and _corr.should_include_message(user_text):
+                item_type, patterns, confidence, sentiment, decay = \
+                    _corr.detect_patterns(user_text)
+                if item_type:
+                    candidates.append({
+                        "message": user_text,
+                        "type": item_type,
+                        "patterns": patterns,
+                        # PRR-013: keep the detector's per-pattern calibration
+                        # (same as the hermes lane).
+                        "confidence": confidence,
+                        "decay_days": decay,
+                        "source": source_name,
+                        "dedup_key": hashlib.sha1(
+                            (item_type + "\x00" + user_text)
+                            .encode("utf-8", "replace")).hexdigest(),
+                    })
+            for block in turn["blocks"]:
+                if not (isinstance(block, dict)
+                        and block.get("type") == "tool"):
+                    continue
+                err_text = str(block.get("text") or "")
+                if not err_text:
+                    continue
+                # classify_error_type returns a TUPLE — test the first
+                # element (the type), or unfiltered tool output becomes a
+                # hub memory row (same guard as the deepseek lane).
+                _etype = _corr.classify_error_type(err_text)
+                if not (_etype and _etype[0]):
+                    continue
+                candidates.append({
+                    "type": "error_pattern",
+                    "source": source_name,
+                    "message": err_text[:2000],
+                    "dedup_key": "err|%s|%s" % (
+                        path.stem, " ".join(err_text.split())[:120]),
+                })
+    return candidates
+
+
 def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
                               queue: bool, as_json: bool, limit=None) -> int:
-    """Dispatch for `mine-history --source codex|hermes` (issue #71 I).
+    """Dispatch for `mine-history --source codex|hermes|deepseek|opencode`.
 
     Same contract as the Claude lane: read-only on inputs, candidates are
     REVIEWED before any store write, --queue appends to the #47 sidecar with
@@ -1328,6 +1493,16 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
             root = transcript_dir or os.environ.get("ZMEM_CODEX_MEMORY") \
                 or str(Path.home() / ".codex" / "MEMORY.md")
             candidates = _mine_codex_candidates(root)
+        elif source == "opencode":
+            # Issue #66 design step 5 precedence: --transcript-dir, then
+            # ZMEM_OPENCODE_TRANSCRIPTS, then <ZMEM_DATA>/transcripts/opencode
+            # (~/.zmem when ZMEM_DATA is unset). A non-directory or unreadable
+            # override raises FileNotFoundError below (clean exit 1, no write).
+            root = transcript_dir or os.environ.get(
+                "ZMEM_OPENCODE_TRANSCRIPTS") or os.path.join(
+                os.environ.get("ZMEM_DATA") or str(Path.home() / ".zmem"),
+                "transcripts", "opencode")
+            candidates = _mine_opencode_candidates(root)
         else:
             root = transcript_dir or os.environ.get("ZMEM_HERMES_SESSIONS") \
                 or str(Path.home() / ".hermes" / "sessions")
@@ -1394,8 +1569,12 @@ def cmd_mine_history_adapters(*, source: str, transcript_dir: str,
                 sentiment="correction",
                 decay_days=c.get("decay_days", 90), session="",
                 namespace=namespace,
+                # Issue #66 / plan R2 F8: explicit per-source host so no
+                # opencode queue item is ever labeled hermes by the
+                # fall-through below.
                 host=("codex" if source == "codex"
-                     else "deepseek" if source == "deepseek" else "hermes"),
+                     else "deepseek" if source == "deepseek"
+                     else "opencode" if source == "opencode" else "hermes"),
             )
             item["dedup_key"] = c["dedup_key"]
             item["source"] = "history-mine"

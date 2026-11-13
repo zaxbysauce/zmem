@@ -94,7 +94,8 @@
     "backups/",
     ".capture-prompted-",
     "core.md",
-    "embedding-degraded.notice"
+    "embedding-degraded.notice",
+    "home/"
   ],
   "rules": [
     "lane must be one of lanes; host must equal lane_host[lane]",

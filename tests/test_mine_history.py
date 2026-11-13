@@ -57,6 +57,9 @@ import correction_queue as cq  # noqa: E402
 import corrections as cmod  # noqa: E402
 import history_mining as hm  # noqa: E402
 import capture_quality as capture_quality  # noqa: E402
+import storelib.mine as mine_mod  # noqa: E402
+
+OPENCODE_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "opencode"
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1033,200 @@ class HistorySuffixTest(unittest.TestCase):
         saved = hm.read_suffix_checkpoint(
             self.root, self.transcript, self.session)
         self.assertEqual(saved["offset"], complete["offset"])
+
+
+class OpenCodeMineHistoryTest(unittest.TestCase):
+    """Issue #66 (design step 5, plan R2 F1/F8): the canonical OpenCode Turn
+    normalizer, the read-only mining adapter, dispatch precedence, and queue
+    idempotence/provenance.
+
+    The committed fixtures (session.jsonl / expected-turns.json and
+    live-session.jsonl / expected-live-turns.json) are the byte-spec: the
+    normalizer ported into storelib.mine must reproduce them exactly.
+    Every store-facing arm pins the scratch env inside the test (never the
+    operator store)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-mine-opencode-")
+        self._patcher = mock.patch.dict(os.environ, {
+            "ZMEM_STORE": os.path.join(self.tmp, "store.sqlite"),
+            "ZMEM_DATA": self.tmp,
+            "ZMEM_MODELS_DIR": os.path.join(self.tmp, "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        }, clear=False)
+        self._patcher.start()
+        os.environ.pop("ZMEM_OPENCODE_TRANSCRIPTS", None)
+
+    def tearDown(self):
+        self._patcher.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- helpers ------------------------------------------------------------
+
+    def _fixture_records(self, name="session.jsonl"):
+        text = (OPENCODE_FIXTURES / name).read_text(encoding="utf-8")
+        return [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+
+    def _copy_fixture(self, dest_dir, name="session.jsonl"):
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / name
+        shutil.copy2(OPENCODE_FIXTURES / name, target)
+        return str(target)
+
+    def _run_adapter(self, **kwargs):
+        """Drive cmd_mine_history_adapters in-process, capturing both
+        streams so the JSON arm's stdout stays parseable."""
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        kwargs.setdefault("source", "opencode")
+        kwargs.setdefault("queue", False)
+        kwargs.setdefault("as_json", True)
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = mine_mod.cmd_mine_history_adapters(**kwargs)
+        return rc, out.getvalue(), err.getvalue()
+
+    # -- the seven contract tests -------------------------------------------
+
+    def test_source_dispatch_opencode(self):
+        # (a) --transcript-dir drives the adapter directly.
+        tdir = os.path.join(self.tmp, "direct")
+        self._copy_fixture(tdir)
+        rc, out, err = self._run_adapter(transcript_dir=tdir)
+        self.assertEqual(rc, 0, err)
+        rep = json.loads(out)
+        self.assertEqual(rep["source"], "opencode")
+        self.assertEqual(rep["count"], 1)
+        cand = rep["candidates"][0]
+        self.assertEqual(cand["type"], "explicit")
+        self.assertEqual(cand["source"], "opencode-session:session.jsonl")
+        self.assertIn("dedup_key", cand)
+
+        # (b) precedence: ZMEM_OPENCODE_TRANSCRIPTS wins with no flag.
+        os.environ["ZMEM_OPENCODE_TRANSCRIPTS"] = os.path.join(
+            self.tmp, "envknob")
+        self._copy_fixture(os.environ["ZMEM_OPENCODE_TRANSCRIPTS"])
+        rc, out, err = self._run_adapter(transcript_dir="")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["count"], 1)
+
+        # (c) default: <ZMEM_DATA>/transcripts/opencode.
+        os.environ.pop("ZMEM_OPENCODE_TRANSCRIPTS", None)
+        self._copy_fixture(os.path.join(self.tmp, "transcripts", "opencode"))
+        rc, out, err = self._run_adapter(transcript_dir="")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["count"], 1)
+
+        # (d) a non-directory override is a clean exit 1 with a stderr
+        # diagnostic, never a traceback (issue #66 design step 5).
+        os.environ["ZMEM_OPENCODE_TRANSCRIPTS"] = os.path.join(
+            self.tmp, "not-a-dir")
+        rc, out, err = self._run_adapter(transcript_dir="")
+        self.assertEqual(rc, 1)
+        self.assertIn("no opencode input found", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_normalize_v1_message(self):
+        record = self._fixture_records()[0]
+        turn = mine_mod.normalize_opencode_message(record, "session.jsonl", 0)
+        self.assertEqual(turn["session_id"],
+                         "00000000-0000-4000-8000-000000000660")
+        self.assertEqual(turn["workdir"], "C:/oc-project")
+        self.assertEqual(turn["turn_uuid"],
+                         "00000000-0000-4000-8000-000000000661")
+        self.assertIsNone(turn["parent_uuid"])
+        self.assertEqual(turn["seq"], 0)
+        self.assertEqual(turn["ts"], "2026-09-10T17:00:00Z")
+        self.assertEqual(turn["role"], "user")
+        self.assertEqual(
+            turn["blocks"],
+            [{"type": "text", "text": "remember: store the test command"}])
+        self.assertEqual(turn["source_path"], "session.jsonl")
+        self.assertEqual(turn["harness"], "opencode")
+        # Canonical key ORDER is part of the byte contract.
+        self.assertEqual(list(turn.keys()), [
+            "session_id", "workdir", "turn_uuid", "parent_uuid", "seq",
+            "ts", "role", "blocks", "source_path", "harness"])
+
+    def test_epoch_millisecond_to_utc(self):
+        # Fixture record 2's time is the epoch-millisecond case.
+        record = self._fixture_records()[1]
+        self.assertEqual(record["info"]["time"], 1767225600000)
+        turn = mine_mod.normalize_opencode_message(record, "session.jsonl", 1)
+        self.assertEqual(turn["ts"], "2026-01-01T00:00:00Z")
+
+    def test_invalid_timestamp_is_null_and_neutral(self):
+        records = self._fixture_records()
+        turn = mine_mod.normalize_opencode_message(records[2],
+                                                   "session.jsonl", 2)
+        self.assertEqual(records[2]["info"]["time"], "not-a-time")
+        self.assertIsNone(turn["ts"])
+        # Neutral in newest ordering: a null ts never outranks a dated turn
+        # (it sorts oldest under every None-safe ordering the consumers use).
+        dated = mine_mod.normalize_opencode_message(records[3],
+                                                    "session.jsonl", 3)
+        self.assertEqual(dated["ts"], "2026-09-10T18:00:00Z")
+        newest = max((turn, dated), key=lambda t: t["ts"] or "")
+        self.assertIs(newest, dated)
+
+    def test_turn_fields_are_deterministic(self):
+        # BYTE parity with the committed expected fixtures (the generator in
+        # tests/fixtures/opencode/ is the spec; this pins the production
+        # port). Covers both raw shapes: fixture {info,parts} and the live
+        # SDK records (time.created object + state.output tool parts).
+        for src_name, expected_name in (
+                ("session.jsonl", "expected-turns.json"),
+                ("live-session.jsonl", "expected-live-turns.json")):
+            with self.subTest(family=src_name):
+                records = self._fixture_records(src_name)
+                turns = [mine_mod.normalize_opencode_message(
+                    r, src_name, seq) for seq, r in enumerate(records)]
+                produced = "".join(
+                    json.dumps(t, ensure_ascii=False,
+                               separators=(",", ":")) + "\n"
+                    for t in turns).encode("utf-8")
+                expected = (OPENCODE_FIXTURES / expected_name).read_bytes()
+                self.assertEqual(produced, expected)
+
+    def test_adapter_is_read_only_without_queue(self):
+        tdir = os.path.join(self.tmp, "ro")
+        self._copy_fixture(tdir)
+        before = {p.name: p.read_bytes()
+                  for p in Path(tdir).iterdir() if p.is_file()}
+        candidates = mine_mod._mine_opencode_candidates(tdir)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["type"], "explicit")
+        # No writes anywhere in the scratch tree, and no store/queue
+        # side-effect: without --queue the opencode lane writes nothing.
+        after = {p.name: p.read_bytes()
+                 for p in Path(tdir).iterdir() if p.is_file()}
+        self.assertEqual(after, before)
+        self.assertNotIn("queue", os.listdir(self.tmp))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp, "store.sqlite")))
+
+    def test_queue_is_idempotent(self):
+        tdir = os.path.join(self.tmp, "q")
+        self._copy_fixture(tdir)
+        rc, out, err = self._run_adapter(transcript_dir=tdir, queue=True)
+        self.assertEqual(rc, 0, err)
+        queue_dir = Path(self.tmp) / "queue"
+        qfiles = list(queue_dir.glob("*.json"))
+        self.assertEqual(len(qfiles), 1, qfiles)
+        items = json.loads(qfiles[0].read_text(encoding="utf-8"))
+        self.assertEqual(len(items), 1)
+        # Plan R2 F8 (queue host provenance): the sidecar item is labeled
+        # opencode — the hermes fall-through must never claim it.
+        self.assertEqual(items[0]["host"], "opencode")
+        self.assertEqual(items[0]["source"], "history-mine")
+        self.assertIn("dedup_key", items[0])
+        # Second queue run is idempotent: dedup_key suppresses the append.
+        rc2, out2, err2 = self._run_adapter(transcript_dir=tdir, queue=True)
+        self.assertEqual(rc2, 0, err2)
+        self.assertIn("already present", err2)
+        items2 = json.loads(qfiles[0].read_text(encoding="utf-8"))
+        self.assertEqual(len(items2), 1)
 
 
 if __name__ == "__main__":

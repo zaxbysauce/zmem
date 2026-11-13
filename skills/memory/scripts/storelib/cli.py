@@ -3418,8 +3418,10 @@ def main():
     p_promote.add_argument("--confirm", action="store_true",
                            help="REQUIRED to write. Promotion creates a SKILL.md in every dir "
                                 "in the review-candidate area; add --install-approved for the "
-                                "explicit live install into ZMEM_SKILLS_DIRS (default: both "
-                                "~/.claude/skills and ~/.zcode/skills). --id alone refuses "
+                                "explicit live install into ZMEM_SKILLS_DIRS (default: the "
+                                "four promotion dirs ~/.codex/skills, ~/.claude/skills, "
+                                "~/.zcode/skills, and ~/.config/opencode/skills, per issue "
+                                "#66). --id alone refuses "
                                 "with exit 2. --dry-run needs no confirmation (and lists ALL "
                                 "candidates — it ignores --id).")
     p_promote.add_argument("--install-approved", action="store_true",
@@ -4035,15 +4037,21 @@ def main():
                              "(source=history-mine; resolves the store namespace "
                              "from the current project's git origin, so it may "
                              "spawn one short `git` subprocess)")
-    p_mine.add_argument("--source", choices=["claude", "codex", "hermes", "deepseek"],
+    p_mine.add_argument("--source",
+                        choices=["claude", "codex", "hermes", "deepseek",
+                                 "opencode"],
                         default="claude",
                         help="input surface (issue #71 I): claude = Claude Code "
                              "transcripts (default, full report); codex = a "
                              "curated Codex MEMORY.md (ZMEM_CODEX_MEMORY or "
                              "~/.codex/MEMORY.md; raw_memories.md is refused); "
                              "hermes = Hermes session JSONL under "
-                             "ZMEM_HERMES_SESSIONS or ~/.hermes/sessions. "
-                             "codex/hermes emit review-queue candidates only.")
+                             "ZMEM_HERMES_SESSIONS or ~/.hermes/sessions; "
+                             "opencode = canonical OpenCode Turn JSONL "
+                             "(ZMEM_OPENCODE_TRANSCRIPTS or --transcript-dir; "
+                             "defaults to <data>/transcripts/opencode). "
+                             "codex/hermes/deepseek/opencode emit review-queue "
+                             "candidates only.")
     p_mine.add_argument("--json", action="store_true",
                         help="emit the full merged candidate report as JSON")
 

@@ -117,6 +117,35 @@ class DoctorCliTest(unittest.TestCase):
         _write_text(self.repo / ".zcode-plugin" / "plugin.json", "{}\n")
         _write_text(self.repo / "hooks" / "hooks.zcode.json", "{}\n")
         _write_text(self.repo / "skills" / "memory" / "SKILL.md", "# memory\n")
+        # Issue #66: the OpenCode adapter surface is part of the complete
+        # scratch repo (a complete package + no opencode shim on PATH makes
+        # the check not_applicable — a NON-failing status — so every
+        # clean-pass fixture in this class keeps its green verdict).
+        self._write_opencode_surfaces()
+
+    def _write_opencode_surfaces(self):
+        _write_text(
+            self.repo / "opencode-plugin" / "package.json",
+            json.dumps({"name": "zmem-opencode", "version": "0.0.0",
+                        "type": "module"}) + "\n",
+        )
+        _write_text(
+            self.repo / "opencode-plugin" / "index.mjs",
+            "export default async function zmemPlugin() { return {}; }\n",
+        )
+        _write_text(
+            self.repo / "skills" / "memory" / "scripts" / "opencode_bridge.py",
+            "def run_request(request: dict) -> dict:\n    return {}\n",
+        )
+
+    def _write_opencode_shim(self):
+        """A fake opencode executable on PATH: a .cmd shim for Windows
+        (shutil.which resolves it through PATHEXT) plus a shebang script
+        with the exec bit for POSIX — deterministic on both platforms."""
+        _write_text(self.bin / "opencode.cmd", _cmd_script("echo 1.0.0"))
+        shim = self.bin / "opencode"
+        _write_text(shim, "#!/bin/sh\necho 1.0.0\n")
+        os.chmod(shim, 0o755)
 
     def _base_env(self) -> dict:
         env = {**os.environ}
@@ -924,6 +953,122 @@ class DoctorCliTest(unittest.TestCase):
             "alongside the miss rate",
         )
         self.assertIn("min_overlap 3", check["summary"])
+
+    # --- issue #66: OpenCode adapter surface (pass/fail/not_applicable) ----
+
+    def _run_json_report(self, env=None):
+        result = self._run(
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+            env=env,
+        )
+        return result, json.loads(result.stdout)
+
+    def _opencode_check(self, report):
+        return next(c for c in report["checks"] if c["id"] == "opencode-adapter")
+
+    def test_opencode_present(self):
+        """Complete package + a fake opencode executable on PATH -> pass."""
+        _make_store(self.home / ".zmem" / "store.sqlite",
+                    schema_version=CURRENT_SCHEMA_VERSION)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "[features]\nmemories = false\n\n[memories]\n"
+            "use_memories = false\ngenerate_memories = false\n",
+        )
+        self._write_opencode_shim()
+        result, report = self._run_json_report()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = self._opencode_check(report)
+        self.assertEqual(check["status"], "pass", check)
+        self.assertIn("executable", check["details"]["opencode"])
+        # The new check changes no existing verdict (at least the surfaces
+        # group and the host-native checks stay exactly as they were).
+        statuses = {c["id"]: c["status"] for c in report["checks"]}
+        self.assertEqual(statuses["host-surfaces"], "pass")
+        self.assertEqual(statuses["claude-native-memory"], "pass")
+        self.assertEqual(statuses["codex-native-memory"], "pass")
+
+    def test_opencode_missing_package_fails(self):
+        """One missing package file in an otherwise complete scratch repo
+        -> the check fails (a tree predating #66 reports this by design)."""
+        _make_store(self.home / ".zmem" / "store.sqlite",
+                    schema_version=CURRENT_SCHEMA_VERSION)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "[features]\nmemories = false\n\n[memories]\n"
+            "use_memories = false\ngenerate_memories = false\n",
+        )
+        (self.repo / "opencode-plugin" / "package.json").unlink()
+        result, report = self._run_json_report()
+        check = self._opencode_check(report)
+        self.assertEqual(check["status"], "fail", check)
+        self.assertIn("opencode-plugin/package.json", check["summary"])
+        # The failure is scoped: the host-surfaces group is untouched.
+        statuses = {c["id"]: c["status"] for c in report["checks"]}
+        self.assertEqual(statuses["host-surfaces"], "pass")
+        self.assertFalse(report["ok"])
+
+    def test_opencode_binary_absent_is_not_applicable(self):
+        """Complete package + no resolvable opencode executable ->
+        not_applicable (never fail: opencode is simply not installed), and
+        the FULL report renders without KeyError — plan R2 finding F4's
+        regression: the aggregation counters must count not_applicable."""
+        _make_store(self.home / ".zmem" / "store.sqlite",
+                    schema_version=CURRENT_SCHEMA_VERSION)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "[features]\nmemories = false\n\n[memories]\n"
+            "use_memories = false\ngenerate_memories = false\n",
+        )
+        # Deterministic unit arm: a host_binary name nothing on PATH can
+        # resolve -> exactly "not_applicable".
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "memory" / "scripts"))
+        import doctor  # noqa: E402
+
+        res = doctor._check_opencode_adapter(
+            self.repo, host_binary="zmem-opencode-not-on-path-xyz")
+        self.assertEqual(res["status"], "not_applicable", res)
+        self.assertEqual(res["id"], "opencode-adapter")
+
+        # CLI arm: the whole report (every aggregation + the human render)
+        # survives the not_applicable status without KeyError. The CLI
+        # resolves the default binary name, so on a box where a real
+        # opencode IS on PATH the status is legitimately "pass" — both
+        # outcomes must render; neither may crash.
+        result, report = self._run_json_report()
+        self.assertNotIn("Traceback", result.stderr, result.stderr)
+        self.assertIn("not_applicable", report["summary"])
+        check = self._opencode_check(report)
+        self.assertIn(check["status"], ("pass", "not_applicable"), check)
+        if check["status"] == "not_applicable":
+            self.assertEqual(report["summary"]["not_applicable"] >= 1, True)
+        human = self._run(
+            "--format",
+            "human",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+        )
+        self.assertNotIn("Traceback", human.stderr, human.stderr)
+        self.assertIn("not_applicable=", human.stdout)
 
 
 class DoctorIssue49ChecksTest(unittest.TestCase):

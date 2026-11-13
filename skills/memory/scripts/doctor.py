@@ -3485,6 +3485,70 @@ def _check_hermes_plugin(repo_root: Path) -> dict:
     )
 
 
+def _check_opencode_adapter(repo_root: Path,
+                            host_binary: str | None = None) -> dict:
+    """Issue #66 (design step 6): the OpenCode host-adapter surface check.
+
+    Three states, no fixture or store writes (read-only file presence +
+    shutil.which only):
+    - ``fail`` — any of opencode-plugin/package.json, opencode-plugin/
+      index.mjs, or skills/memory/scripts/opencode_bridge.py is missing from
+      the repo checkout (a tree predating #66 reports this by design);
+    - ``not_applicable`` — the package is complete but no executable is
+      resolved by ``shutil.which(host_binary or "opencode")`` (opencode is
+      simply not installed on this machine — nothing to integrate);
+    - ``pass`` — complete package AND a resolved executable.
+
+    Wired as its OWN top-level check beside _check_hermes_plugin, NOT inside
+    _check_surfaces: the report aggregation would KeyError on the new
+    not_applicable status (plan R2 finding F4), which the counters and the
+    human render now count alongside pass/warn/fail/skip/info without
+    changing any existing status's semantics (not_applicable never flips
+    report ok)."""
+    required = {
+        "opencode-plugin/package.json":
+            repo_root / "opencode-plugin" / "package.json",
+        "opencode-plugin/index.mjs":
+            repo_root / "opencode-plugin" / "index.mjs",
+        "skills/memory/scripts/opencode_bridge.py":
+            repo_root / "skills" / "memory" / "scripts" / "opencode_bridge.py",
+    }
+    details = {
+        "files": {
+            rel: _display_path(path) for rel, path in required.items()
+        }
+    }
+    missing = [rel for rel, path in required.items() if not path.is_file()]
+    if missing:
+        return _check(
+            "opencode-adapter",
+            "fail",
+            "OpenCode adapter package incomplete: missing "
+            + ", ".join(sorted(missing))
+            + ". A tree predating issue #66 reports this by design — refresh"
+              " the tree to the current release.",
+            opencode=details,
+        )
+    executable = shutil.which(host_binary or "opencode")
+    if not executable:
+        return _check(
+            "opencode-adapter",
+            "not_applicable",
+            "OpenCode adapter package is complete, but the opencode "
+            "executable is not on PATH — opencode is not installed on this "
+            "machine, so there is nothing to integrate yet.",
+            opencode=details,
+        )
+    details["executable"] = executable
+    return _check(
+        "opencode-adapter",
+        "pass",
+        "OpenCode adapter package is complete and the opencode executable "
+        "is on PATH.",
+        opencode=details,
+    )
+
+
 # The three v9 (issue #59, 4.1) append-only lineage columns. A healthy store
 # post-migration carries all three; their ABSENCE means the store is pre-v9 and
 # waiting for a writable migration run (the schema-version check already flags
@@ -4263,7 +4327,7 @@ def _render_human(report: dict) -> str:
     lines.append(
         "zmem doctor: "
         f"{'OK' if report['ok'] else 'BLOCKED'} "
-        f"(pass={summary['pass']} warn={summary['warn']} fail={summary['fail']} skip={summary['skip']})"
+        f"(pass={summary['pass']} warn={summary['warn']} fail={summary['fail']} skip={summary['skip']} not_applicable={summary['not_applicable']})"
     )
     lines.append(f"Resolved store: {report['resolved_store']}")
     lines.append(f"Project namespace: {report.get('namespace') or '(not resolved)'}")
@@ -6088,6 +6152,10 @@ def build_report(
     # Issue #71 B: Hermes plugin surface — manifest parity, provider/hooks
     # files, MCP server importability, and remote-mode config when set.
     checks.append(_check_hermes_plugin(repo_root))
+    # Issue #66 (design step 6): the OpenCode host-adapter surface — its OWN
+    # top-level check (never inside _check_surfaces: the not_applicable
+    # status would KeyError the aggregation counters — plan R2 finding F4).
+    checks.append(_check_opencode_adapter(repo_root))
     # Issue #287 (Workstream T PR 8): the per-machine broker surface when
     # fleet remote mode is configured.
     checks.append(_check_fleet_remote(repo_root, resolved_store))
@@ -6145,7 +6213,11 @@ def _finish_report(
     # "info" is a supported non-ok-flipping status (hybrid-default's
     # embeddings-unavailable branch: lexical fallback works — PRR-001R fix;
     # previously the missing key raised KeyError in the aggregation below).
-    counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0, "info": 0}
+    # "not_applicable" is the same class (issue #66's opencode-adapter: the
+    # host is simply not installed on this box — plan R2 finding F4 made the
+    # counters count it instead of KeyErroring).
+    counts = {"pass": 0, "warn": 0, "fail": 0, "skip": 0, "info": 0,
+              "not_applicable": 0}
     for check in checks:
         counts[check["status"]] += 1
 

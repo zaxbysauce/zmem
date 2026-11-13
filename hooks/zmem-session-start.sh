@@ -361,6 +361,19 @@ if [ -n "$STORE_PY_PY" ] && [ -f "$STORE_PY_PY" ]; then
   # BG_SINK, would silently kill maintenance on every box (reviewer gate
   # caught this pre-merge; CI was green because no test inspected the
   # worker's output — the test below now does).
+  #
+  # ZMEM_SESSION_CADENCE=0 (issue #351, B8): documented kill switch for the
+  # detached session-cadence worker — same idiom as ZMEM_CAPTURE/ZMEM_INJECT.
+  # Production default is UNCHANGED (unset or any other value => the worker
+  # runs). The host canary sets 0 for its driven hooks: it validates recall,
+  # not background maintenance, and its tier-2 read races this worker on the
+  # SAME store — the 15s delay above is a partial guard; the knob removes the
+  # collision source entirely. NOTE: the gate is a `[ ... ] &&` short-circuit,
+  # not an if/fi block, ON PURPOSE: test_low_findings.py's L22 behavioral
+  # test extracts the sink block (up to the first python-interpreter
+  # invocation below) and runs it standalone — an `if ... then` opener here
+  # would leave that extraction syntactically unterminated.
+  [ "${ZMEM_SESSION_CADENCE:-1}" != "0" ] && \
   "$PYTHON_BIN" -c 'import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))' \
     "$STORE_PY_PY" session-cadence \
     --backup-retention "${ZMEM_BACKUP_RETENTION:-7}" >>"$BG_SINK" 2>&1 &
