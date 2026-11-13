@@ -614,7 +614,13 @@ class ScoreMarginIntegrationTest(unittest.TestCase):
         conn = self._memory_conn()
         mid = "entity-budget"
         self._seed_memory_rows(conn, [mid])
-        names = ["entity-name-" + (letter * 200)
+        # Issue #459 fixture note: the former names ("entity-name-" + a
+        # 200-char single-letter run) are shared-registry secret-like (the
+        # same class as the #457 oversized filler) and the entities-name
+        # display mask legitimately rewrites them to [REDACTED_SECRET],
+        # shrinking the fence cost. Benign whitespace-separated words keep
+        # the names long (the budget premise) without tripping the mask.
+        names = ["load balancer tier three " * 8 + letter
                  for letter in ("a", "b", "c")]
         for index, name in enumerate(names):
             eid = f"entity-budget-{index}"
