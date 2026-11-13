@@ -717,6 +717,289 @@ def _cmd_apply_ops(conn, args) -> int:
 
 
 
+def _cmd_knowledge(args) -> int:
+    """The explicit knowledge-companion surface (PR1, 2026-11-13).
+
+    Dispatches EARLY (before the shared connect() lifecycle): the command
+    owns its store handling. LOCAL mode opens the existing store itself —
+    capture takes the writer lease and the schema gates exactly like the
+    other early-dispatch write arms; read/check/status open strictly
+    read-only. REMOTE mode (ZMEM_REMOTE_URL) NEVER opens or creates a
+    local store: pointer ops go to the capability-gated knowledge
+    delivery queue (a separate bounded metadata queue — never the core
+    op queue), and journal/delivery sidecars live in the data dir.
+    """
+    import json as _json
+
+    from storelib import remote_gate
+    from knowledge import workflow as _workflow
+    from knowledge.config import KnowledgeConfigError, load_knowledge_config
+    from knowledge.delivery import (
+        DeliveryError, KnowledgeDelivery, default_delivery_path)
+    from knowledge.journal import JournalError
+
+    mode = "remote" if remote_gate.is_remote_mode() else "local"
+    sub = args.knowledge_cmd
+
+    def _require_known_target() -> int | None:
+        """Fail fast on a usage error BEFORE the lease/store lifecycle (a
+        missing store must not mask it) — the same two refusals the
+        workflow's target check raises, hoisted above any connect."""
+        if not config.enabled:
+            return _fail(
+                "knowledge companion is disabled: no enabled 'knowledge' "
+                "object in the store config (config.json); see the "
+                "operator guide")
+        if args.target not in config.targets:
+            return _fail(
+                "unknown knowledge target %r (configured: %s)"
+                % (args.target, ", ".join(sorted(config.targets)) or "none"))
+        return None
+
+    def _emit(payload: dict, *, exit_code: int = 0) -> int:
+        if args.json:
+            sys.stdout.write(_json.dumps(payload, ensure_ascii=False) + "\n")
+        return exit_code
+
+    def _fail(message: str, *, payload: dict | None = None) -> int:
+        # Under --json the error IS the stdout contract: always one JSON
+        # object ({"ok": false, "error": ...}), never an empty stdout.
+        if args.json:
+            body = {"ok": False, "error": message}
+            if payload is not None:
+                body.update(payload)
+            sys.stdout.write(_json.dumps(body, ensure_ascii=False) + "\n")
+        else:
+            print(f"[zmem] knowledge: {message}", file=sys.stderr)
+        return 2
+
+    def _capture_exit(result: dict) -> int:
+        """0 only when the pointer landed.  A pending/queued pointer (the
+        immutable version IS published — doc_published) gets the DISTINCT
+        exit 3; any other pointer failure exits 1."""
+        if result.get("ok"):
+            return 0
+        status = (result.get("pointer") or {}).get("status")
+        return 3 if status in ("pending", "queued") else 1
+
+    try:
+        config = load_knowledge_config(env=dict(os.environ))
+    except KnowledgeConfigError as exc:
+        return _fail(str(exc))
+
+    # default_journal pre-creates the sidecar dir (journal lock order)
+    journal = _workflow.default_journal()
+    delivery = KnowledgeDelivery(default_delivery_path())
+    conn = None
+    ro_handle = None
+    try:
+        if sub == "flush":
+            if mode == "local":
+                pending = delivery.pending()
+                out = {"ok": not pending, "mode": mode, "applied": [],
+                       "rejected": [], "pending": len(pending),
+                       "note": ("local mode applies pointers directly at "
+                                "capture; nothing to flush" if not pending
+                                else "%d queued entries (remote-mode "
+                                "leftovers); flush requires remote mode"
+                                % len(pending))}
+                if not args.json:
+                    print(f"[zmem] knowledge flush: {out['note']}")
+                # Undrained entries are pending, not failure: distinct 3.
+                return _emit(out, exit_code=0 if not pending else 3)
+            result = _workflow.flush(journal=journal, delivery=delivery)
+            if not args.json:
+                print(f"[zmem] knowledge flush: applied="
+                      f"{len(result.get('applied') or [])} rejected="
+                      f"{len(result.get('rejected') or [])} pending="
+                      f"{result.get('pending', 0)}"
+                      + (f" reason={result.get('reason')}"
+                         if result.get("reason") else ""))
+                for row in result.get("rejected") or []:
+                    print(f"[zmem] knowledge flush rejected: "
+                          f"{row.get('op_id')} error={row.get('error')}",
+                          file=sys.stderr)
+            # Distinct exit 3 while entries remain pending (the queue is
+            # not the hub's verdict — flushed entries may still be
+            # rejected, which is the honest exit 1 path via ok=false and
+            # pending=0).
+            pending = int(result.get("pending", 0) or 0)
+            exit_code = (0 if result.get("ok")
+                         else 3 if pending > 0 else 1)
+            return _emit(result, exit_code=exit_code)
+
+        if sub == "capture":
+            refused = _require_known_target()
+            if refused is not None:
+                return refused
+            text = args.content
+            if text == "-":
+                text = io.TextIOWrapper(
+                    sys.stdin.buffer, encoding="utf-8", errors="replace"
+                ).read()
+            # Under --json the writer's human progress lines ([zmem]
+            # added ...) go to STDERR so stdout stays pure JSON (the same
+            # contract as add --json).
+            _stdout = sys.stdout
+            if args.json:
+                sys.stdout = sys.stderr
+            try:
+                if mode == "local":
+                    lease = None
+                    try:
+                        _wait_for_maintenance_clear("knowledge")
+                        if _schema_host is not None:
+                            _schema_host.assert_local_fs(
+                                STORE_PATH.resolve().parent)
+                        lease = _acquire_writer_lease("knowledge-capture")
+                        _require_supported_schema_stamp()
+                        conn = _connect_existing_store()
+                        assert_store_schema_compatible(conn, STORE_PATH)
+                        result = _workflow.capture(
+                            target_id=args.target, logical_key=args.key,
+                            text=text, summary=args.summary,
+                            namespace=args.namespace, mode="local",
+                            conn=conn, config=config, journal=journal,
+                            delivery=delivery)
+                    except (FileNotFoundError, RuntimeError, sqlite3.Error,
+                            OSError) as exc:
+                        # Restore stdout FIRST: under --json the error
+                        # object belongs on the real stdout (the swap was
+                        # only for the writer's human progress lines).
+                        sys.stdout = _stdout
+                        return _fail(str(exc))
+                    finally:
+                        if conn is not None:
+                            conn.close()
+                        _release_writer_lease(lease)
+                else:
+                    try:
+                        result = _workflow.capture(
+                            target_id=args.target, logical_key=args.key,
+                            text=text, summary=args.summary,
+                            namespace=args.namespace, mode="remote",
+                            config=config, journal=journal,
+                            delivery=delivery)
+                    except _workflow.WorkflowError as exc:
+                        sys.stdout = _stdout
+                        return _fail(str(exc))
+            finally:
+                if args.json:
+                    sys.stdout = _stdout
+            pointer = result.get("pointer", {})
+            if args.json:
+                return _emit(result, exit_code=_capture_exit(result))
+            status = pointer.get("status")
+            print(f"[zmem] knowledge: {status} version {result['version']} "
+                  f"at {result['locator']}")
+            if status == "pending":
+                # Nothing was enqueued (capability BEFORE queue): flush
+                # has nothing to drain — the advice is to RE-CAPTURE with
+                # the same screened input once the hub is capable (the
+                # create is idempotent; the pointer attempt resumes).
+                print(f"[zmem] knowledge: pointer pending "
+                      f"({pointer.get('reason')}: {pointer.get('detail')}); "
+                      f"the document IS published and nothing is queued — "
+                      f"re-run capture with the same screened input once "
+                      f"the hub advertises knowledge_link_v1",
+                      file=sys.stderr)
+            elif status == "queued":
+                print("[zmem] knowledge: pointer queued for the hub "
+                      "(run 'knowledge flush')", file=sys.stderr)
+            elif not result.get("ok"):
+                print(f"[zmem] knowledge: pointer {status}: "
+                      f"{pointer.get('detail', '')}", file=sys.stderr)
+            return _capture_exit(result)
+
+        # read / check / status: read-only surfaces.
+        if sub in ("read", "check"):
+            refused = _require_known_target()
+            if refused is not None:
+                return refused
+        if mode == "local":
+            try:
+                ro_handle = _connect_existing_store_readonly()
+                conn = ro_handle.conn
+            except (FileNotFoundError, RuntimeError, sqlite3.Error,
+                    OSError) as exc:
+                return _fail(f"store unavailable: {exc}")
+
+        if sub == "read":
+            try:
+                result = _workflow.read(
+                    target_id=args.target, logical_key=args.key,
+                    locator=args.locator, namespace=args.namespace,
+                    mode=mode, conn=conn, config=config, journal=journal,
+                    delivery=delivery)
+            except _workflow.WorkflowError as exc:
+                return _fail(str(exc))
+            if args.json:
+                return _emit(result)
+            sys.stdout.write(result["content"])
+            if not result["content"].endswith("\n"):
+                sys.stdout.write("\n")
+            return 0
+
+        if sub == "check":
+            try:
+                result = _workflow.check(
+                    target_id=args.target, logical_key=args.key,
+                    locator=args.locator, namespace=args.namespace,
+                    mode=mode, conn=conn, config=config, journal=journal,
+                    delivery=delivery)
+            except _workflow.WorkflowError as exc:
+                return _fail(str(exc))
+            if args.json:
+                return _emit(result,
+                             exit_code=0 if result["ok"] else 1)
+            verdict = "OK" if result["ok"] else "MISMATCH"
+            print(f"[zmem] knowledge check {verdict}: {result['locator']} "
+                  f"(source: {result['provenance']})")
+            return 0 if result["ok"] else 1
+
+        # status
+        result = _workflow.status(
+            target_id=args.target, logical_key=args.key,
+            namespace=args.namespace, mode=mode, conn=conn,
+            config=config, journal=journal, delivery=delivery)
+        if args.json:
+            return _emit(result)
+        print(f"knowledge companion: enabled={result['enabled']} "
+              f"mode={result['mode']} "
+              f"targets={','.join(sorted(result['targets'])) or 'none'}")
+        for row in result["journal"]:
+            print(f"  journal: {row['ref']} state={row['state']} "
+                  f"version-locator={row['locator']}")
+        for row in result["delivery"]["queue"]:
+            print(f"  delivery: {row.get('target')}:{row.get('key')} "
+                  f"op={row.get('op_id')} status={row.get('status')} "
+                  f"attempts={row.get('attempts', 0)}")
+        for row in result["delivery"]["receipts"]:
+            print(f"  receipt: {row.get('target')}:{row.get('key')} "
+                  f"op={row.get('op_id')} -> {row.get('status')} "
+                  f"link={row.get('link_status')}")
+        for row in result["pointers"] or []:
+            pointer = row["pointer"]
+            if pointer is None:
+                print(f"  pointer: {row['target']}:{row['key']} "
+                      f"(no verified pointer)")
+            else:
+                print(f"  pointer: {row['target']}:{row['key']} "
+                      f"v{pointer['version']} row={pointer['row_id']} "
+                      f"{pointer['locator']}")
+        return 0
+    except (_workflow.WorkflowError, JournalError, DeliveryError) as exc:
+        # A corrupt/unreadable journal or delivery sidecar is an honest
+        # operator-facing failure (exit 2, one JSON object under --json) —
+        # never a traceback.
+        return _fail(str(exc))
+    finally:
+        if ro_handle is not None:
+            ro_handle.close()
+        elif conn is not None:
+            conn.close()
+
+
 def _cmd_ops_enqueue(args) -> int:
     """Enqueue one typed operation on the durable op queue (issue #374).
 
@@ -3877,6 +4160,63 @@ def main():
                              help="apply against the LOCAL store "
                                   "(refused in remote mode)")
     p_ops_flush.add_argument("--json", action="store_true")
+
+    # PR1 (knowledge companion, 2026-11-13): the explicit external-knowledge
+    # surface. Off by default (no 'knowledge' object in the store
+    # config.json -> every subcommand refuses with the operator hint). The
+    # command dispatches EARLY, owns its own store handling, and never
+    # rides the core op queue.
+    p_knowledge = _add_parser(
+        "knowledge",
+        help="explicit external knowledge companion (config-gated, off by "
+             "default; PR1)")
+    knowledge_sub = p_knowledge.add_subparsers(
+        dest="knowledge_cmd", required=True)
+    k_cap = knowledge_sub.add_parser(
+        "capture",
+        help="publish one immutable version to a configured target and "
+             "link/advance the reserved knowledge pointer")
+    k_cap.add_argument("--target", required=True,
+                       help="configured knowledge target id")
+    k_cap.add_argument("--key", required=True,
+                       help="logical key of the knowledge document "
+                            "('/'-separated slug or uuid segments)")
+    k_cap.add_argument("--content", required=True,
+                       help="the note text; the literal '-' reads UTF-8 "
+                            "content from stdin (screened: any secret-like "
+                            "pattern rejects the publication)")
+    k_cap.add_argument("--summary", default=None,
+                       help="pointer summary (default: first non-empty "
+                            "line, bounded)")
+    k_cap.add_argument("--namespace", default="user:global")
+    k_cap.add_argument("--json", action="store_true")
+    k_read = knowledge_sub.add_parser(
+        "read", help="read one immutable version from its target")
+    k_read.add_argument("--target", required=True)
+    k_read.add_argument("--key", required=True)
+    k_read.add_argument("--locator", default=None,
+                        help="explicit immutable locator (remote mode: "
+                             "pointer state lives on the hub)")
+    k_read.add_argument("--namespace", default="user:global")
+    k_read.add_argument("--json", action="store_true")
+    k_check = knowledge_sub.add_parser(
+        "check", help="verify a recorded version's readback digest")
+    k_check.add_argument("--target", required=True)
+    k_check.add_argument("--key", required=True)
+    k_check.add_argument("--locator", default=None)
+    k_check.add_argument("--namespace", default="user:global")
+    k_check.add_argument("--json", action="store_true")
+    k_status = knowledge_sub.add_parser(
+        "status", help="config, journal, delivery queue and pointer state")
+    k_status.add_argument("--target", default=None)
+    k_status.add_argument("--key", default=None)
+    k_status.add_argument("--namespace", default="user:global")
+    k_status.add_argument("--json", action="store_true")
+    k_flush = knowledge_sub.add_parser(
+        "flush",
+        help="remote mode: deliver queued knowledge pointer ops to a "
+             "knowledge_link_v1-capable hub (never the core op queue)")
+    k_flush.add_argument("--json", action="store_true")
     p_queue_add = _add_parser(
         "queue-add",
         help="append a cheap closeout note to a namespace's correction "
@@ -4399,6 +4739,15 @@ def main():
     from storelib import remote_gate  # noqa: PLC0415 - lazy: local path free
     if remote_gate.is_remote_mode():
         remote_gate.handle_remote(args)
+
+    # PR1 (knowledge companion): dispatches EARLY — the command owns its
+    # complete store handling (local: existing-store rw under the writer
+    # lease for capture, strict ro for read/check/status; remote: NEVER a
+    # local store — pointer ops ride the separate knowledge delivery
+    # queue). Reaching here in remote mode means remote_gate ALLOW-LOCAL'd
+    # it as a helper sidecar; the workflow enforces the mode itself.
+    if args.cmd == "knowledge":
+        sys.exit(_cmd_knowledge(args))
 
     # `None` is an explicit parser sentinel: --check rejects an operator's
     # supplied --batch but ordinary reembed retains its historical default.

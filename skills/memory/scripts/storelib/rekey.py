@@ -290,6 +290,82 @@ def _selected_rows_are_at_targets(conn: sqlite3.Connection,
         prior.append(prefix)
 
 
+def _refuse_pointer_collisions(conn: sqlite3.Connection,
+                               post_namespace_for) -> None:
+    """SINGLE shared authority (PR1): refuse a set of namespace moves that
+    would place two LIVE VERIFIED knowledge pointer rows for the same exact
+    reserved source_ref into one namespace.
+
+    ``post_namespace_for(row)`` returns the row's post-move namespace (its
+    CURRENT namespace when the plan leaves it alone). Every namespace-move
+    surface routes through this one implementation — rekey-namespace's map
+    (entries), write.rekey_namespace (--from/--near-miss, incl. its
+    automatic CLI route), and schema._rekey_namespaces (v5 migration +
+    retry) — so the exact-ref verified-pointer uniqueness law cannot drift
+    between them.
+
+    Two verified rows for one ref may legitimately coexist while they sit
+    in DIFFERENT namespaces (each namespace holds its own authoritative
+    pointer); a move that concentrates them into one namespace manufactures
+    exactly the duplicate get_pointer/link_pointer treat as unrecoverable
+    store corruption (KnowledgePointerConflict on every later read or
+    advance). Detected per (post-move namespace, source_ref) BEFORE the
+    caller mutates anything, inside the caller's transaction, so a refusal
+    leaves the store untouched. A collision that already exists statically
+    (no row actually moves into it) is pre-existing corruption get_pointer
+    already reports loudly — it is not introduced by this move. Unverified
+    imported copies never count: they are inert by design and the handler's
+    relink folds them.
+    """
+    # Lazy imports: rekey stays importable on stdlib-only hosts
+    # (embeddings/sqlite-vec optional); only a move that actually touches
+    # knowledge rows pays for the storelib.knowledge import chain.
+    from storelib.write import KNOWLEDGE_SOURCE_REF_PREFIX
+    from storelib.knowledge import parse_payload
+
+    rows = conn.execute(
+        "SELECT id, namespace, source_ref, content FROM memory "
+        "WHERE superseded_at IS NULL AND source_ref LIKE ?",
+        (KNOWLEDGE_SOURCE_REF_PREFIX + "%",),
+    ).fetchall()
+    # (post-move namespace, ref) -> [(row, moves_under_this_plan), ...] for
+    # VERIFIED rows only.
+    verified_groups: dict[tuple[str, str], list[tuple[sqlite3.Row, bool]]] = {}
+    for row in rows:
+        ref = row["source_ref"] or ""
+        post_namespace = post_namespace_for(row)
+        parsed = parse_payload(row["content"])
+        if (parsed is None or not parsed["verified"]
+                or parsed["logical_id"] != ref):
+            continue  # inert/unverified copy — never authoritative
+        verified_groups.setdefault((post_namespace, ref), []).append(
+            (row, post_namespace != row["namespace"]))
+    for (post_namespace, ref), members in verified_groups.items():
+        if len(members) < 2 or not any(m for _, m in members):
+            continue
+        ids = ", ".join(sorted(r["id"] for r, _ in members))
+        raise RuntimeError(
+            "namespace rekey would place "
+            f"{len(members)} live verified knowledge pointer rows for "
+            f"source_ref {ref!r} into namespace {post_namespace!r} "
+            f"(rows {ids}); get_pointer treats that as store corruption — "
+            "move one of them elsewhere or relink the pointer first")
+
+
+def _refuse_introduced_pointer_conflicts(conn: sqlite3.Connection,
+                                         entries: list[tuple[str, str]]) -> None:
+    """Map-form wrapper over :func:`_refuse_pointer_collisions`: the
+    post-move namespace is the FIRST map entry whose prefix matches the
+    row's source_ref (mirroring _classify_rows / the apply loop order)."""
+    def post_namespace_for(row) -> str:
+        ref = row["source_ref"] or ""
+        for prefix, target in entries:
+            if ref.startswith(prefix):
+                return target
+        return row["namespace"]
+    _refuse_pointer_collisions(conn, post_namespace_for)
+
+
 def _decision_lines(entries: list[tuple[str, str]],
                     mapped_counts: list[dict[str, int]], unmapped_count: int,
                     snapshot_sha256: str) -> list[str]:
@@ -322,6 +398,11 @@ def apply_namespace_map(conn: sqlite3.Connection, *, store_path: Path,
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # PR1 guard, BEFORE any census or move: a map that would concentrate
+        # two live verified knowledge pointer rows for one exact ref into a
+        # single namespace refuses here — nothing moves, the transaction
+        # rolls back atomically, and the exit is the standard 1.
+        _refuse_introduced_pointer_conflicts(conn, entries)
         identity_before = _derived_identity_digest(conn)
         mapped_counts = [{"total": 0, "live": 0, "moved": 0}
                          for _ in entries]

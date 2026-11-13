@@ -3872,6 +3872,51 @@ Always clamped to [0.0, 1.0]; visible in `get --json`, `export-jsonl`,
 and `doctor`. `confidence`/`signal` are never changed by linking — they
 are provenance inputs; trust_score is the contradiction ledger.
 
+### knowledge — explicit external knowledge companion (PR1)
+
+```
+<interpreter> <store.py> knowledge capture --target <id> --key <key> \
+  --content <text|-> [--summary "<one line>"] [--namespace <ns>] [--json]
+<interpreter> <store.py> knowledge read --target <id> --key <key> \
+  [--locator <locator>] [--namespace <ns>] [--json]
+<interpreter> <store.py> knowledge check --target <id> --key <key> \
+  [--locator <locator>] [--namespace <ns>] [--json]
+<interpreter> <store.py> knowledge status [--target <id>] [--key <key>] \
+  [--namespace <ns>] [--json]
+<interpreter> <store.py> knowledge flush [--json]
+```
+
+OFF BY DEFAULT and purely explicit: nothing runs, captures, publishes, or
+injects unless an operator adds a strict `knowledge` object to the store's
+`config.json` AND you type one of the commands above. There is no
+automation in PR1 — the conditional instruction/skill/closeout discovery
+wiring is PR2 and NOT shipped; nothing in this feature injects knowledge
+content into sessions. The workflow publishes a note you explicitly author
+as an immutable, content-addressed version to a configured target (a local
+Markdown vault directory, or a fleet KB HTTP endpoint — provider-neutral,
+no Obsidian dependency, never mandatory) and records a reserved
+`knowledge:<target>:<key>` pointer row so it stays findable, re-readable,
+and digest-checkable. Curated notes only — never raw session transcripts.
+
+Exit codes: `0` completed; `3` pending (the version is published but the
+pointer is `pending`/`queued`, or a `flush` left entries pending — a
+state, not success or failure); `2` refusal (usage, invalid or disabled
+config, unknown target, secret-screening of the note body or summary,
+unavailable store); `1` failure/conflict (pointer `cas_stale`/`conflict`,
+rejected delivery, `check` digest mismatch). `--content -` reads the note
+body from stdin as UTF-8. Bodies are screened for secret-like patterns
+BEFORE anything is written, and a supplied `--summary` is screened with
+the same pattern source in the same admission step; re-running `capture`
+with the same screened input is
+idempotent (a checked reconciliation against the live pointer row, never a
+blind noop). In remote mode (`ZMEM_REMOTE_URL`) the command never opens a
+local store — pointer ops ride a separate capability-gated delivery queue
+(`knowledge_link_v1`); `flush` drains it. The `knowledge:` `source_ref`
+prefix is reserved: ordinary `add`/`update` refuse it.
+
+Config schema, the capture pipeline and crash recovery, security posture,
+and limits: [docs/KNOWLEDGE-COMPANION.md](../../docs/KNOWLEDGE-COMPANION.md).
+
 ## Operation feedback counters (issue #124)
 
 `applied_count`/`violated_count` have ONE writer

@@ -454,23 +454,76 @@ def _normalize_capture_mode(mode: str | None) -> str:
 # hard refusal for card: lives in add_memory/update_memory below (an
 # ordinary write claiming a card: ref raises ValueError before any
 # mutation).
-RESERVED_SOURCE_REF_PREFIX = ("organize:", "card:")
+RESERVED_SOURCE_REF_PREFIX = ("organize:", "card:", "knowledge:")
 RESERVED_SOURCE_REF_WARNING = (
     "[zmem] WARNING: source_ref prefix organize: is reserved for organize summaries"
 )
 CARD_SOURCE_REF_WARNING = (
     "[zmem] WARNING: source_ref prefix card: is reserved for entity cards"
 )
+# PR1 (knowledge companion, 2026-11-13): `knowledge:` joins the reserved
+# set. Knowledge pointers key their authoritative state on the exact
+# `knowledge:<target>:<key>` source_ref; a manually written row claiming
+# that prefix would masquerade as a verified pointer. Unlike organize:/
+# card: (warn-only at this printer) the hard refusal for knowledge: lives
+# in add_memory/update_memory AND the import paths DEMOTE rather than
+# refuse (a synced ref is preserved but never newly verified). The single
+# grammar authority is storelib.knowledge; this module owns only the raw
+# prefix literal (every guard site needs it cheaply, without importing the
+# knowledge module — which imports THIS one).
+KNOWLEDGE_SOURCE_REF_PREFIX = "knowledge:"
+KNOWLEDGE_SOURCE_REF_WARNING = (
+    "[zmem] WARNING: source_ref prefix knowledge: is reserved for knowledge "
+    "pointers (storelib.knowledge)"
+)
+
+
+class KnowledgePointerRefusal(ValueError):
+    """A write targeted a knowledge pointer row through an ordinary writer
+    surface. Pointer state mutates only inside the knowledge handler's CAS
+    transaction (storelib.knowledge.link_pointer)."""
+
+
+# The private capability add_memory identity-compares against (PR1): a
+# module-private OBJECT registered once by storelib.knowledge at import.
+# An object, not a string/flag: no CLI argument, ops payload, or JSONL row
+# can carry it, so the reserved knowledge: prefix is unforgeable from any
+# serialized writer surface — only knowledge.link_pointer's code path
+# passes it. None means NOT REGISTERED (never "registered as None"): the
+# guard fails closed on that state, so a module reload that resets this
+# global cannot re-open the reserved prefix to ordinary None-default
+# writers (review round: `None is not None` used to pass the identity
+# check when both sides were None — fail-open).
+_KNOWLEDGE_CAPABILITY: object | None = None
+
+
+def _register_knowledge_capability(capability: object) -> None:
+    """Called once by storelib.knowledge at import (it imports this module;
+    the reverse import would cycle). Identity-based from then on. Rejects
+    None: registering "no capability" would arm the exact fail-open state
+    the guard refuses (None is the UNREGISTERED sentinel, and add_memory's
+    own default for the private argument is None)."""
+    if capability is None:
+        raise ValueError(
+            "_register_knowledge_capability: the knowledge capability is a "
+            "private object, never None (None is the not-registered state "
+            "the write guard fails closed on)"
+        )
+    global _KNOWLEDGE_CAPABILITY
+    _KNOWLEDGE_CAPABILITY = capability
 
 
 def warn_reserved_source_ref(source_ref: str | None) -> None:
-    """Emit the reserved-prefix warning for `organize:`/`card:` source_refs."""
+    """Emit the reserved-prefix warning for `organize:`/`card:`/
+    `knowledge:` source_refs."""
     if not source_ref:
         return
     if source_ref.startswith("organize:"):
         print(RESERVED_SOURCE_REF_WARNING, file=sys.stderr)
     elif source_ref.startswith("card:"):
         print(CARD_SOURCE_REF_WARNING, file=sys.stderr)
+    elif source_ref.startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+        print(KNOWLEDGE_SOURCE_REF_WARNING, file=sys.stderr)
 
 def _redact_secret_like_text(text: str) -> tuple[str, int]:
     return _shared_redact_secret_like_text(text)
@@ -1080,7 +1133,11 @@ def _detect_duplicate(
                 rows = conn.execute(
                     "SELECT id, content, tags, type FROM memory "
                     f"WHERE id IN ({','.join('?' * len(ids))}) "
-                    "AND superseded_at IS NULL",
+                    "AND superseded_at IS NULL "
+                    # PR1: pointer rows are excluded from every dedup lane
+                    # (a normal fact must never fold into a pointer; the
+                    # prefix test is structural, payload-independent).
+                    "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')",
                     tuple(ids),
                 ).fetchall() if ids else []
                 by_id = {r["id"]: r for r in rows}
@@ -1106,6 +1163,9 @@ def _detect_duplicate(
                 rows = conn.execute(
                     "SELECT id, content, tags, type FROM memory "
                     "WHERE namespace=? AND content_norm=? AND superseded_at IS NULL "
+                    # PR1: pointer rows never serve as dedup keepers (see the
+                    # cache-hit fetch above for the lane-wide rule).
+                    "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%') "
                     "ORDER BY rowid LIMIT ?",
                     (namespace, norm, SUBJECT_MAX_EXACT_CANDIDATES + 1),
                 ).fetchall()
@@ -1121,7 +1181,11 @@ def _detect_duplicate(
                 # rowid order instead of stopping at the first match.
                 candidates = conn.execute(
                     "SELECT id, content FROM memory "
-                    "WHERE namespace=? AND superseded_at IS NULL ORDER BY rowid",
+                    "WHERE namespace=? AND superseded_at IS NULL "
+                    # PR1: pointer rows never serve as dedup keepers (see the
+                    # cache-hit fetch above for the lane-wide rule).
+                    "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%') "
+                    "ORDER BY rowid",
                     (namespace,),
                 )
                 eq: list[tuple[sqlite3.Row, float]] = []
@@ -1490,6 +1554,18 @@ def rekey_namespace(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+        # PR1 guard (shared authority, single implementation): refuse this
+        # bulk move BEFORE any mutation when it would concentrate two live
+        # VERIFIED knowledge pointer rows for one exact reserved ref into
+        # the destination namespace — get_pointer treats that as store
+        # corruption. Lazy import: rekey imports this module's siblings
+        # (schema/backup/entity) and its own knowledge imports are lazy, so
+        # a top-level import would cycle.
+        from storelib.rekey import _refuse_pointer_collisions
+        _refuse_pointer_collisions(
+            conn,
+            lambda row: (to_namespace if row["namespace"] in sources
+                         else row["namespace"]))
         conn.execute(
             f"UPDATE memory SET namespace=? "
             f"WHERE superseded_at IS NULL AND namespace IN ({placeholders})",
@@ -1592,6 +1668,11 @@ def add_memory(
     occurred_start: str = "",
     occurred_end: str = "",
     mentioned_at: str = "",
+    # PR1 (knowledge companion): the internal capability object registered
+    # by storelib.knowledge. Appended LAST (the #177/#178 signature lesson)
+    # and underscore-private: no CLI/ops/JSONL surface can supply it, so an
+    # ordinary writer can never claim a reserved knowledge: ref.
+    _knowledge_cap: object | None = None,
 ) -> WriteResult:
     # #179 (issue #179, Workstream K PR 8): the two append-only card controls.
     # Both are appended AFTER the live keyword set (the #177/#178 signature
@@ -1629,6 +1710,26 @@ def add_memory(
                 "rows are born only through the entity-card refresh path, "
                 "and an ordinary row cannot claim a card identity"
             )
+    # PR1 (knowledge companion): an ordinary write cannot CLAIM a knowledge
+    # ref either — pointer rows key their authoritative state on the exact
+    # reserved `knowledge:` source_ref, so a forged ref would masquerade as
+    # a verified pointer (the same F-2/PRR-001 masquerade class card: fixed).
+    # Refused BEFORE any mutation; the ONLY exempt writer is
+    # storelib.knowledge.link_pointer, which passes the private capability
+    # object registered at its import (identity check — not a flag any
+    # serialized surface can carry). The registration STATE is checked too:
+    # an unregistered module (None — e.g. after a reload reset the global)
+    # fails CLOSED for every caller including the None default, never
+    # `None is not None`-open (review round).
+    if ((source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
+            and (_KNOWLEDGE_CAPABILITY is None
+                 or _knowledge_cap is not _KNOWLEDGE_CAPABILITY)):
+        raise ValueError(
+            "source_ref prefix knowledge: is reserved for knowledge "
+            "pointers: pointer rows are minted only by the knowledge "
+            "companion handler (storelib.knowledge.link_pointer), never an "
+            "ordinary add"
+        )
     # Capture the pre-policy length: value-span redaction GROWS text
     # ([REDACTED_SECRET] is longer than a short value), so an input that fit
     # the cap can overflow it after redaction. That row has no safe storable
@@ -2042,11 +2143,17 @@ def _find_semantic_duplicate(
     for mid, distance in knn:
         # sqlite-vec distance is cosine distance (0 = identical, 2 = opposite).
         # Convert to cosine similarity: sim = 1 - distance.
-        similarity = 1.0 - distance
+        similarity = 1 - distance
         if similarity >= threshold:
             row = conn.execute(
                 "SELECT id, confidence, signal, tags, type FROM memory "
-                "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+                "WHERE id=? AND superseded_at IS NULL AND namespace=? "
+                # PR1 (knowledge companion): pointer rows are excluded from
+                # the SEMANTIC dedup lane too — the vec0 KNN is namespace-
+                # filtered but prefix-blind, so the re-fetch carries the
+                # reserved-ref predicate (a normal fact must never fold into
+                # a pointer row, however similar its payload text).
+                "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')",
                 (mid, namespace),
             ).fetchone()
             if row:
@@ -2150,7 +2257,8 @@ def supersede_memory(
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
         row = conn.execute(
-            "SELECT id, superseded_at, namespace FROM memory WHERE id=?", (mid,)
+            "SELECT id, superseded_at, namespace, source_ref FROM memory WHERE id=?",
+            (mid,),
         ).fetchone()
         if not row:
             print(f"[zmem] no memory with id {mid}", file=sys.stderr)
@@ -2170,6 +2278,26 @@ def supersede_memory(
                 f"[zmem] namespace guard: memory {mid} lives in namespace "
                 f"{row['namespace']}, expected {expected_namespace} — "
                 "cross-namespace supersede/invalidate refused (issue #109)"
+            )
+        # PR1 (knowledge companion): a pointer row's tombstone IS a pointer
+        # state transition — an ordinary supersede/invalidate (CLI, ops,
+        # ingest's remote-tombstone lane) must never perform it. Tombstoning
+        # the authoritative row would read as "pointer gone" and move
+        # valid_until outside the handler's CAS, the exact broad-bypass
+        # class the plan's "supersede/invalidate need a deliberate supported
+        # path" correction closes: only link_pointer's advance/relink (and,
+        # later, an authenticated knowledge tombstone op) tombstones pointer
+        # rows. Raised as KnowledgePointerRefusal so sync's ingest lane can
+        # count it as tombstone_refused instead of a generic malformed row.
+        if (row["source_ref"] or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise KnowledgePointerRefusal(
+                f"[zmem] memory {mid} is a knowledge pointer row (reserved "
+                "knowledge: source_ref): pointer tombstones happen only "
+                "inside the knowledge handler's CAS transaction "
+                "(storelib.knowledge.link_pointer), never an ordinary "
+                "supersede/invalidate"
             )
         if row["superseded_at"] is not None:
             if started_tx and conn.in_transaction:
@@ -2379,6 +2507,24 @@ def update_memory(
         raise ValueError(
             "update refused: source_ref prefix card: is reserved for entity "
             "cards — an ordinary row cannot claim a card identity"
+        )
+    # PR1 (knowledge companion): update refuses knowledge: refs from BOTH
+    # directions, with no refresh-path exemption (unlike card:). (a) An
+    # ordinary row cannot CLAIM a knowledge ref — same masquerade class as
+    # the card guard. (b) A live POINTER row cannot be edited at all: its
+    # content IS the versioned pointer payload, so an in-place successor
+    # would advance/mutate authoritative pointer state outside the handler's
+    # compare-and-swap (storelib.knowledge.link_pointer is the only writer;
+    # it never routes through update_memory). The old-row check catches a
+    # content-only edit that passes source_ref=None (which would otherwise
+    # inherit the ref and slip past a source_ref_eff-only guard).
+    if ((source_ref_eff or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
+            or (old["source_ref"] or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)):
+        raise ValueError(
+            "update refused: source_ref prefix knowledge: is reserved for "
+            "knowledge pointers — an ordinary row cannot claim a knowledge "
+            "identity, and a pointer row's payload advances only through "
+            "the knowledge handler's CAS path (storelib.knowledge.link_pointer)"
         )
 
     # v15 (#173): one clock per transaction; the SAME `ts` stamps the old row's
@@ -2794,7 +2940,18 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
     make a candidate). A ``CapturePolicyRefusal`` propagates from the scan
     itself: an unredactable row (e.g. a ``sudo -S`` password on stdin) can
     never become a candidate, and the refusal fires before any transaction
-    opens, so store bytes never move on the failure path.
+    opens, so store bytes never move on the failure path — EXCEPT for
+    reserved knowledge pointer rows (PR1 review round): a pointer can never
+    be an update_memory candidate (the pointer-edit guard refuses it, and
+    routing it there would abort the whole maintenance batch), so a
+    secret-suspect pointer — policy-changed payload OR a scan refusal —
+    becomes a POINTER SUSPECT instead: quarantined and tombstoned
+    individually via the knowledge handler's dedicated maintenance helper
+    (storelib.knowledge.quarantine_pointer_row) with the capture reason
+    recorded, while ordinary rows continue through the normal batch. A
+    clean pointer row (screened at admission) is not a suspect and is left
+    untouched. Suspects are counted and listed — never a silent skip and
+    never a false-clean report.
 
     Dry-run performs the SELECT and the policy calls only — no BEGIN,
     INSERT, UPDATE, commit, checkpoint, FTS rebuild, or embedding work.
@@ -2812,7 +2969,11 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
     single machine-readable line.
 
     Returns exactly ``{"mode", "rows_scanned", "rows_needing_review",
-    "ids"}`` with ``ids`` ascending and candidate-only.
+    "ids"}`` with ``ids`` covering ordinary candidates and pointer
+    suspects alike (candidate-only). ``pointer_rows_quarantined`` (the
+    suspect count) is a CONDITIONAL key, present only when pointer
+    suspects exist — a pointer-free store keeps the legacy result bytes
+    unchanged.
     """
     import io as _io
 
@@ -2821,24 +2982,57 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
         "WHERE superseded_at IS NULL ORDER BY id ASC"
     ).fetchall()
     candidates: list[tuple[str, str, str, str]] = []
+    # PR1 review round: reserved pointer rows never route through
+    # update_memory (its guard correctly refuses pointer edits), so a
+    # secret-suspect pointer would abort the whole batch. They get their
+    # own remediation lane instead: quarantine + tombstone via the
+    # knowledge handler's dedicated maintenance helper, one row at a time,
+    # with the capture reason recorded — never a silent skip, never a
+    # false-clean report. A CLEAN pointer row (the screened-at-admission
+    # case) is not a candidate and stays untouched, exactly like a clean
+    # ordinary row.
+    pointer_suspects: list[tuple[str, str]] = []
     for row in rows:
         content = row["content"] or ""
         tags = row["tags"] or ""
         source_ref = row["source_ref"] or ""
-        new_content, new_source_ref, new_tags, _warnings = (
-            apply_capture_policy(content=content, source_ref=source_ref,
-                                 tags=tags, capture_mode="auto"))
+        is_pointer = source_ref.startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
+        try:
+            new_content, new_source_ref, new_tags, _warnings = (
+                apply_capture_policy(content=content, source_ref=source_ref,
+                                     tags=tags, capture_mode="auto"))
+        except CapturePolicyRefusal as exc:
+            if is_pointer:
+                # e.g. an unredactable shape (sudo -S) in a hand-crafted
+                # payload: the row can never be auto-remediated — quarantine
+                # it rather than aborting every other row's remediation.
+                pointer_suspects.append(
+                    (row["id"], f"capture refused: {exc.reason}"))
+                continue
+            raise
         if (new_content != content or new_tags != tags
                 or new_source_ref != source_ref):
+            if is_pointer:
+                pointer_suspects.append(
+                    (row["id"],
+                     "secret-like content under the current capture patterns"))
+                continue
             candidates.append((row["id"], new_content, new_tags,
                                new_source_ref))
 
     result = {
         "mode": "apply" if apply else "dry-run",
         "rows_scanned": len(rows),
-        "rows_needing_review": len(candidates),
-        "ids": [c[0] for c in candidates],
+        "rows_needing_review": len(candidates) + len(pointer_suspects),
+        "ids": sorted([c[0] for c in candidates]
+                      + [p[0] for p in pointer_suspects]),
     }
+    if pointer_suspects:
+        # CONDITIONAL key (review delta-4): a pointer-free store must keep
+        # the legacy result bytes EXACTLY — the #181 fixtures pin dry-run
+        # stdout byte-for-byte — so the quarantine count is emitted only
+        # when pointer suspects actually exist, never as a constant zero.
+        result["pointer_rows_quarantined"] = len(pointer_suspects)
     if not apply:
         return result
 
@@ -2864,6 +3058,16 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                         "(dedup) instead of creating its own replacement; "
                         "append-only lineage is impossible for this batch"
                     )
+            if pointer_suspects:
+                # Lazy import: storelib.knowledge imports THIS module.
+                from storelib.knowledge import quarantine_pointer_row
+                for mid, reason in pointer_suspects:
+                    if not quarantine_pointer_row(conn, mid, reason=reason):
+                        raise ValueError(
+                            f"pointer quarantine for {mid} found no live "
+                            "pointer row; the batch cannot land its "
+                            "remediation"
+                        )
         _commit(conn)
     except BaseException:
         if started_tx and conn.in_transaction:

@@ -5,6 +5,84 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.154.0] - 2026-11-13
+### Added
+- Knowledge companion, PR1 of the knowledge-companion workstream (explicit,
+  operator-driven, OFF BY DEFAULT): a new early-dispatch `store.py knowledge
+  capture|read|check|status|flush` command family publishes a note you
+  explicitly author as an immutable, content-addressed version to a
+  configured target and records a reserved `knowledge:<target>:<key>` pointer
+  row in the store so the note stays findable, re-readable, and
+  digest-checkable. Nothing activates without a strict `knowledge` object
+  (`enabled` + `targets`, riding the issue #177 config surface) in the
+  store's `config.json`: with no object, `capture`/`read`/`check` refuse with
+  the operator hint (exit 2) and `status` reports `enabled=false`; no journal
+  or queue entry is ever written. Nothing in PR1 injects knowledge content
+  into sessions — the conditional instruction/skill/closeout discovery
+  wiring is PR2 and is NOT shipped (no passive remote fetch, no vault sync).
+- Two target kinds, both provider-neutral and never Obsidian-mandatory:
+  `markdown` (a plain local directory of immutable versions addressed by
+  `<key>/<digest>.md`) and `kb-http` (a minimal custom JSON create/read API
+  implemented by a self-hosted fleet KB; it is deliberately NOT the official
+  Obsidian API or any vendor API). Bodies are secret-screened BEFORE
+  anything is written — any detection refuses the publication (exit 2, no
+  partial write, no journal stake), and a user-supplied `--summary` is
+  screened with the same single pattern source in the same admission step
+  (it rides the pointer row verbatim, so nothing downstream re-scans it);
+  re-running `capture` with the SAME
+  screened input is idempotent — the fixed journal stake is reused, the
+  target create answers `existed_match`, and the pointer CAS reconciles
+  explicitly against the live row (same version+digest is a `noop`; a
+  pointer another writer already advanced goes through the CAS/version
+  law, never a blind noop) — while a different digest under a live intent
+  is refused before the create.
+- Exit-code contract (frozen by tests): `0` completed; `3` pending — a
+  pointer left `pending` or merely `queued` (the immutable version IS
+  published; the pointer is not) and a `flush` that left entries pending,
+  including local-mode leftovers that require remote mode; `2` refusal —
+  usage errors, an invalid or disabled `knowledge` config, an unknown
+  target, a screening refusal, or an unavailable store; `1` failure/conflict
+  — a pointer `cas_stale`/`conflict`, a `rejected` delivery, or a `check`
+  digest mismatch (`check` verifies SHA-256 readback of the canonical bytes:
+  `0` match, `1` drift).
+- Remote mode (`ZMEM_REMOTE_URL`): the knowledge command runs as a helper
+  sidecar and NEVER opens or creates a local store. Pointer ops ride a
+  separate bounded, capability-gated delivery queue — never the core op
+  queue: capability is checked BEFORE enqueue, so an old hub that does not
+  advertise `knowledge_link_v1` leaves the pointer explicitly `pending`
+  with nothing queued and core memory unaffected. `knowledge flush` drains
+  the queue to a capable hub and re-checks the capability before every
+  apply (`pointer_cas_stale`/`pointer_conflict` are distinct receipt codes);
+  local capture applies pointers directly under the same writer lease and
+  schema gates as every other write, while `read`/`check`/`status` open
+  the STORE CONNECTION read-only (their journal/delivery sidecars may
+  still take their advisory locks and create their dirs — sidecar
+  bookkeeping, not a store write).
+- Reserved-source-ref boundary: `knowledge:` joins the reserved
+  `source_ref` prefixes (`organize:`, `card:`). Pointer state mutates only
+  inside the knowledge handler's CAS transaction
+  (`storelib.knowledge.link_pointer`); `add`/`update` hard-refuse a row
+  claiming the prefix (a manually written row could masquerade as a
+  verified pointer), and the sync/import paths DEMOTE such a ref rather
+  than refuse — a synced ref is preserved but never newly verified. The
+  hub's ops engine (and the Hermes MCP server's advertised capabilities)
+  implement the typed `knowledge_link` op as a CLOSED whitelist of pointer
+  metadata (digest as eight 8-hex chunks — never note content, and never
+  server-filesystem path access: the `locator` is relative metadata the
+  hub records but never resolves against its filesystem),
+  namespace-scoped before any pointer-existence lookup (no
+  cross-namespace oracle); the op bypasses the identical-content replay
+  lane, needs the `write` capability for the initial create only
+  (`expected_row_id: null`; the handler CAS refuses a null stake when a
+  verified pointer already exists) and `mutate` for any op supplying a
+  non-null `expected_row_id` stake — an advance or an idempotent noop —
+  and is additive to the protocol (an old hub simply omits it).
+- Documentation: `docs/KNOWLEDGE-COMPANION.md` (config schema, CLI
+  contract, capture pipeline and crash recovery, security posture, limits),
+  a README "Knowledge companion (optional, off by default)" section, and a
+  `SKILL.md` "knowledge — explicit external knowledge companion (PR1)"
+  command section pointing at it.
+
 ## [0.153.0] - 2026-11-13
 ### Security
 - Entity-identity disclosure boundary (issues #459): a credential-shaped

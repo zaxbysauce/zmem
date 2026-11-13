@@ -2272,6 +2272,13 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "apply-ops",
             # issue #290 (Workstream T PR 11): the offline snapshot.
             "snapshot",
+            # PR1 (knowledge companion, 2026-11-13): the typed
+            # knowledge_link pointer op is implemented by this hub's ops
+            # engine (storelib.ops -> storelib.knowledge.link_pointer).
+            # Advertised ONLY because it is implemented — an old hub
+            # simply omits it and knowledge clients stay pending (no
+            # protocol bump; the capability is additive).
+            "knowledge_link_v1",
         ]
         return {
             "protocol": _PROTOCOL_MAJOR,
@@ -3349,6 +3356,66 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             "unexpected get payload shape")
 
     @mcp.tool()
+    async def knowledge_pointer(
+        target: str,
+        key: str,
+        namespace: Optional[str] = None,
+        client_protocol: object = None,
+        deadline_ms: object = None,
+    ) -> dict[str, Any]:
+        """Read one authoritative knowledge pointer row (PR1, 2026-11-13).
+
+        The remote capture path's predecessor lookup: a SECOND host must
+        stake the pointer the hub actually holds, not its own local
+        sidecar.  Returns the CURRENT pointer (row_id, version, logical_id,
+        locator, full_sha256, summary) for (namespace, target, key), or
+        ``pointer: None`` when no verified pointer exists.  Read-only,
+        metadata-only and namespace-guarded like every read tool; callers
+        verify the hub's ``hello`` advertises ``knowledge_link_v1`` before
+        relying on this route (the pointer CAS at apply time remains the
+        safety net, so a stale read can only cost an honest cas_stale).
+        """
+        if not _protocol_allowed(client_protocol):
+            return _protocol_refusal(client_protocol)
+        deadline, _bad_deadline = _deadline_gate(deadline_ms)
+        if _bad_deadline is not None:
+            return _bad_deadline
+        if deadline is not None and deadline.expired():
+            return _deadline_response(deadline)
+        denied = _guard_namespace(namespace)
+        if denied:
+            return denied
+        tid = (target or "").strip()
+        lkey = (key or "").strip()
+        if not tid or not lkey:
+            return _error("target and key are required")
+        args = ["knowledge", "status", "--target", tid, "--key", lkey,
+                "--json"]
+        args += _namespace_flag(namespace)
+        r = await _run_store_async(args, deadline=deadline, pool="read")
+        if not r["ok"]:
+            return _store_failure(r)
+        stdout = (r["stdout"] or "").strip()
+        try:
+            parsed = json.loads(stdout) if stdout else None
+        except json.JSONDecodeError as exc:
+            return _error(f"non-JSON from store.py knowledge status: {exc}")
+        if not isinstance(parsed, dict) or not isinstance(
+                parsed.get("pointers"), list):
+            return _error("unexpected knowledge status payload shape")
+        for row in parsed["pointers"]:
+            if (isinstance(row, dict) and row.get("target") == tid
+                    and row.get("key") == lkey):
+                return {
+                    "ok": True,
+                    "namespace": (namespace or "").strip(),
+                    "target": tid,
+                    "key": lkey,
+                    "pointer": row.get("pointer"),
+                }
+        return _error("pointer row missing from knowledge status")
+
+    @mcp.tool()
     async def prefetch(
         query: str,
         namespace: str,
@@ -3622,6 +3689,18 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
         canonical id the hub actually assigned (a dedup fold is
         ``committed`` + ``deduped: true``; ``duplicate`` is only a replay).
 
+        PR1 (knowledge companion): the op set also includes
+        ``knowledge_link`` — a metadata-only pointer CAS whose args are a
+        closed whitelist (namespace, target, key, logical_id, version,
+        locator, fullhash as eight 8-hex chunks, summary, date,
+        expected_row_id); the engine reassembles the digest, never reads
+        a client path, and applies through the SAME handler as the local
+        CLI capture (storelib.knowledge.link_pointer, taint
+        untrusted_tool). The knowledge delivery lane reaches this tool
+        only after the client verified the hub's ``hello`` advertises
+        ``knowledge_link_v1``; core batches never carry knowledge ops and
+        vice versa.
+
         Capability enforcement (issue #281's deferred rule): the EFFECTIVE
         principal is the authenticated REQUEST context; the tool-level
         ``principal`` parameter is bound to it — naming a DIFFERENT
@@ -3744,9 +3823,16 @@ def build_server(host: str, port: int, use_tls: bool = False) -> "FastMCP":  # t
             # (user:global) here — the by-id half is enforced engine-side
             # via the --namespace-scope passthrough for scoped legacy
             # callers (issue #420).
+            # PR1 (knowledge companion): knowledge_link takes the SAME
+            # omitted-namespace default as add/capture — the namespace
+            # guard must answer BEFORE any pointer-existence or content
+            # logic runs engine-side (a capability verdict keyed on
+            # pointer existence must never become a cross-namespace
+            # oracle).
             effective_ns = str(ns) if ns else (
                 "user:global"
-                if kind in ("add", "capture") and principal_map is None
+                if kind in ("add", "capture", "knowledge_link")
+                and principal_map is None
                 else None)
             if effective_ns:
                 denied = _guard_namespace(effective_ns, caller=resolved)

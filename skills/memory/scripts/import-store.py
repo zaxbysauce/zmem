@@ -122,7 +122,12 @@ from storelib.write import (  # noqa: E402
     QUARANTINE_REASONS,
     apply_capture_policy,
     quarantine_import_rows,
+    KNOWLEDGE_SOURCE_REF_PREFIX,
 )
+# PR1 (knowledge companion): imported knowledge: refs are preserved but
+# never newly verified — the payload demotion helper is shared with the
+# sync ingest path so both import lanes apply byte-identical semantics.
+from storelib.knowledge import demote_imported_payload  # noqa: E402
 
 
 # Sidecars a sqlite database can leave beside its main file. Duplicated here
@@ -382,6 +387,20 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
             counters["quarantined"] += 1
             print(f"[import] quarantined {mid} ({reason})")
             continue
+        # PR1 (knowledge companion): a source store's pointer rows arrive
+        # with the reserved knowledge: ref PRESERVED but the payload's
+        # verified marker DEMOTED — an import can never mint verified
+        # pointer state (explicit relink/readback through
+        # storelib.knowledge.link_pointer is the only re-verification path).
+        # Applied BEFORE the keeper-rewrite comparison so the existing
+        # content_norm/vec/entity recomputation below covers the demoted
+        # bytes; unparseable payloads are left as-is (they can never be
+        # authoritative: get_pointer requires a parsed, verified payload).
+        if (new_source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+            demoted = demote_imported_payload(new_content)
+            if demoted is not None and demoted != new_content:
+                new_content = demoted
+                print(f"[import] knowledge ref preserved unverified for {mid}")
         if new_content != content or new_tags != tags:
             # Keeper rewrite mirroring storelib.purge: content AND every
             # derived carrier must be recomputed or dropped, or the secret

@@ -40,6 +40,13 @@ NLI_DEFAULT_MAX_SECONDS = 30.0
 # already excludes it from its own working set (organize.SUMMARY_SOURCE_REF_PREFIX);
 # the same exclusion applies to consolidate's candidate set here.
 SUMMARY_SOURCE_REF_PREFIX = "organize:"
+# PR1 (knowledge companion): knowledge pointer rows are AUTHORITATIVE state,
+# not consolidate INPUT — an absorb would append content to (or tombstone)
+# the very row that carries a verified pointer payload. The grammar
+# authority is storelib.knowledge (which cannot be imported here without a
+# cycle: knowledge imports write, write imports consolidate lazily); the
+# raw literal mirrors the SUMMARY_SOURCE_REF_PREFIX precedent above.
+POINTER_SOURCE_REF_PREFIX = "knowledge:"
 # Cadence gate knobs (env-overridable for parity with the thresholds above):
 # how much time must elapse and how much the live set must have grown since the
 # last automatic run before consolidate() proceeds.
@@ -620,7 +627,16 @@ def _gather_neighbors(
                     "SELECT id, confidence, signal, tags, type, rowid, retrieval_count, "
                     "surfaced_count, content, taint "
                     "FROM memory "
-                    "WHERE id=? AND superseded_at IS NULL AND namespace=?",
+                    "WHERE id=? AND superseded_at IS NULL AND namespace=? "
+                    # PR1 (knowledge companion): pointer rows are never
+                    # NEIGHBORS either — the working set excludes them as
+                    # seeds, but the vec0 KNN is prefix-blind and would
+                    # otherwise offer a pointer id for absorption (which
+                    # tombstones it). This re-fetch is shared by organize's
+                    # related-graph, so both callers are covered in one
+                    # predicate.
+                    "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                    f"'{POINTER_SOURCE_REF_PREFIX}%')",
                     (mid, seed["namespace"]),
                 ).fetchone()
                 if row:
@@ -1188,7 +1204,16 @@ def consolidate(
     # produced (the same F-003/PRR-008 rule organize applies to its own
     # working set). The predicate guards BOTH the eligible count and the
     # ranked candidate query below.
-    summary_clause = "AND (source_ref IS NULL OR source_ref NOT LIKE ?)"
+    # PR1 (knowledge companion): pointer rows join the exclusion — a
+    # pointer is never a seed/keeper, exactly the "consolidation protects
+    # refs" law (an absorb would rewrite or tombstone authoritative pointer
+    # state). The KNN neighbor re-fetch in _gather_neighbors carries the
+    # same predicate (seeds are filtered here, but the vec0 index is
+    # prefix-blind and offers ids globally).
+    summary_clause = (
+        "AND (source_ref IS NULL OR (source_ref NOT LIKE ? "
+        f"AND source_ref NOT LIKE '{POINTER_SOURCE_REF_PREFIX}%'))"
+    )
     summary_params = [SUMMARY_SOURCE_REF_PREFIX + "%"]
     total_eligible = conn.execute(
         f"""SELECT count(*) AS c FROM memory
@@ -1659,6 +1684,16 @@ def consolidate(
         # the explicit `feedback` CLI owns them and the promote ladder reads
         # them; feedback-aware pruning would need its own issue + tests.
         # signal!=none is never pruned.
+        # PR1 (knowledge companion): pointer rows are excluded from PRUNE as
+        # well — the same reserved-prefix predicate the seed/keeper query
+        # above applies. A pointer row is born signal='none' with the 0.2
+        # default confidence and zero retrieval/surfaced counts, so an
+        # older-than-the-window pointer ALWAYS matches the numeric predicate
+        # below; supersede_memory then refuses it (KnowledgePointerRefusal —
+        # a pointer tombstone is a pointer state transition owned by the
+        # handler's CAS), and that uncaught refusal would abort the whole
+        # consolidate routine mid-run. Excluding them up front keeps the
+        # prune pass a no-op on pointer rows instead of a crash.
         unrecalled_days = _prune_unrecalled_days()
         prune_rows = conn.execute(
             f"""SELECT id, content FROM memory
@@ -1671,6 +1706,8 @@ def consolidate(
                        last_surfaced IS NOT NULL AND
                        julianday(last_surfaced) < julianday('now', '-{int(unrecalled_days)} days')
                      ))
+                 AND (source_ref IS NULL
+                      OR source_ref NOT LIKE '{POINTER_SOURCE_REF_PREFIX}%')
                {ns_clause}""",
             ns_params,
         ).fetchall()

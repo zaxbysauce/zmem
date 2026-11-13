@@ -1317,6 +1317,30 @@ def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str
             new_ns = _host.resolve_namespace(checkout_path)
         mapping[old_ns] = new_ns
         if new_ns != old_ns:
+            # PR1 guard (shared authority, single implementation in
+            # storelib.rekey._refuse_pointer_collisions): never concentrate
+            # two live VERIFIED knowledge pointer rows for one exact
+            # reserved ref into the destination namespace. The migration's
+            # own refuse-and-retry contract applies: on collision the whole
+            # old namespace is left unchanged (not added to the moves, so
+            # the retry pass re-attempts it once the operator relinks or
+            # drops one pointer) instead of bricking every migrate().
+            # Lazy import: rekey imports this module at top level.
+            from storelib.rekey import _refuse_pointer_collisions
+            try:
+                _refuse_pointer_collisions(
+                    conn,
+                    lambda row, _old=old_ns, _new=new_ns:
+                        _new if row["namespace"] == _old
+                        else row["namespace"])
+            except RuntimeError as exc:
+                print(
+                    f"[zmem] ns migration WARNING: refusing to re-key "
+                    f"{old_ns} -> {new_ns}: {exc}",
+                    file=sys.stderr,
+                )
+                mapping.pop(old_ns, None)
+                continue
             conn.execute(
                 "UPDATE memory SET namespace=? WHERE namespace=?",
                 (new_ns, old_ns),
