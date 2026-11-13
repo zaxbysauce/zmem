@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "6e5161d93ff26029ee274a124e1ee73e9d5827a5295d651bc9c444efac27fa77",
+  "digest": "77e3952dee8604eac63fb95f8ecc5e60222ee18d5db88c7758145b5add460896",
   "files": {
     ".agents/plugins/marketplace.json": "973ccc2d26f032b06467c930efc89ab51fc5af263441e52cdf9d229294eda8a6",
     ".claude-plugin/marketplace.json": "07036905e1bdc3af90ecf27e85500b364abcd7321ab4a8f8d447be2ba625890d",
@@ -104,7 +104,7 @@
     "skills/memory/scripts/import-store.py": "b970b42afa369aa86b0cbbe02af6929235a8dfc56c1b694521e7fe69137f7a53",
     "skills/memory/scripts/knowledge/__init__.py": "c0a7b9a0ad9df5db2e342286b56f686fe762045c68544e8bcbce39ee7b3a33f6",
     "skills/memory/scripts/knowledge/config.py": "f708c48f68a4e4cd5b339f009c5369d72f34c1c0f33f639e219069f2b54951a6",
-    "skills/memory/scripts/knowledge/delivery.py": "a19cf52f1292d49eee4cd0efcd2b3f8e65a69856fb808820b0ebbc8af1cc04af",
+    "skills/memory/scripts/knowledge/delivery.py": "cf08681ab9d606973941a3ce6843ca4db2322c0910c1b1dfe37a34dfd93ebf63",
     "skills/memory/scripts/knowledge/documents.py": "90bb3b6bbb24511f102370ebf092c229a2b1ac3ed8bf1d24c76c6aa7eff05215",
     "skills/memory/scripts/knowledge/journal.py": "f8e6c5f47248f2a0adee858ad5f6e6e315464a124dd78903df0d6381f42b6ea7",
     "skills/memory/scripts/knowledge/locking.py": "88472d77c9bcbf124dbbb974a5e5cac3a1b7372bd68cb4671bb6eda1f7d0800c",
@@ -139,7 +139,7 @@
     "skills/memory/scripts/storelib/miss_rate.py": "2a68006edf989207b82888e2bf509600e2bd932f7aa651632e9b36c20489791d",
     "skills/memory/scripts/storelib/namespace_cache.py": "5b55e10bbc063b867cbe40a8f7280f89016734908e63505ca92ae6977bf202dc",
     "skills/memory/scripts/storelib/opcmds.py": "d34b7dc219e6aa95b1b85cce59d3ff525451df0051e1b36167255f8feacabbe0",
-    "skills/memory/scripts/storelib/ops.py": "23c4c229980fb10a025158636e4ba85936d5692861466e2485fb314b9912ed76",
+    "skills/memory/scripts/storelib/ops.py": "968b72750aa2f35a565013a921fef578bfba0dc2534ef2b042559cf640e6c4f1",
     "skills/memory/scripts/storelib/ops_tokens.py": "c70c23fbbad94c23a33d7d939a2765b30d2cd41844e33e89f927aeb15635a72a",
     "skills/memory/scripts/storelib/organize.py": "995e92d3c51d298c189fe7fa38e1b6d349bceab7ef0c692723b87ed963032734",
     "skills/memory/scripts/storelib/pages.py": "f656bbae3f68dfa9853c81fe78240df04de61817858c5d8c2f84efb2db45cf00",
