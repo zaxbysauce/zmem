@@ -60,6 +60,13 @@ def _pin_scratch_env(root: Path) -> None:
     os.environ["ZMEM_DATA"] = str(root)
     os.environ["ZMEM_MODELS_DIR"] = str(root / "missing-models")
     os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    # Pin the scoring clock: _score embeds a recency component computed
+    # from NOW against the rows' fixed valid_from — without this pin the
+    # fixture bytes drift as wall-clock time passes (observed 0.8997 ->
+    # 0.8994 over hours) and the committed-parity tests break. The same
+    # pin is exported by the bridge-parity leg of tests/test_opencode_
+    # plugin.js; the host canary strips it ambiently (D2).
+    os.environ["ZMEM_TEST_NOW"] = FIXED_TS
 
 
 def _import_storelib():

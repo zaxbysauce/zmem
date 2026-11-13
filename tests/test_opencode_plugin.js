@@ -53,6 +53,11 @@ function pinStore(dir) {
   process.env.ZMEM_DATA = dir;
   process.env.ZMEM_MODELS_DIR = path.join(dir, "missing-models");
   process.env.ZMEM_MODEL_AUTODOWNLOAD = "0";
+  // Pin the scoring clock to the fixture's fixed timestamp: _score embeds
+  // a recency component computed from NOW, so without this pin the parity
+  // legs drift against the committed fixture as wall-clock time passes
+  // (same pin as the envelope generator; the host canary strips it).
+  process.env.ZMEM_TEST_NOW = "2026-09-10T00:00:00Z";
 }
 
 function seedFixtureRows() {
