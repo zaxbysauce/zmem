@@ -7,6 +7,11 @@ directory holds only this helper in the PR2 worktree).  Pins:
   plugin vars > home probes) and the issue-#291 file-shaped refusal;
 - strict default-off semantics: missing / malformed / oversized / BOM /
   non-boolean enabled / no display-safe ids all render nothing;
+- fail-closed AS A WHOLE (FB-023): one invalid shape anywhere in an
+  existing config - bad kind, duplicate JSON key, unknown key, malformed
+  UTF-8, non-boolean enabled, non-object target - suppresses the ENTIRE
+  render, never a partial roster, with no id or value fragments in any
+  output;
 - ids-only rendering (target values never read or shown), display cap;
 - < 200 word deterministic text in both capture modes;
 - read-only CLI (--text/--json/--config/--no-capture, no config writes);
@@ -50,8 +55,22 @@ def _knowledge_config(enabled=True, targets=None):
 
 
 def _markdown_targets(*ids):
-    return {tid: {"kind": "markdown", "root": "D:/vault-%s" % tid}
+    # Portable absolute roots (tempdir-derived, valid-looking on Windows
+    # AND Linux).  The display loader never validates root VALUES (shape
+    # only), so the roots need not exist - but portable fixtures keep the
+    # configs plausible wherever the suite runs (CI-002 fixture family).
+    base = Path(tempfile.gettempdir()).resolve()
+    return {tid: {"kind": "markdown",
+                  "root": str(base / ("vault-%s" % tid))}
             for tid in ids}
+
+
+def _kbhttp_target(**overrides):
+    target = {"kind": "kb-http",
+              "endpoint": "https://kb.internal.example:8443/api/notes",
+              "credential_env": "ZMEM_KB_FLEET_TOKEN"}
+    target.update(overrides)
+    return target
 
 
 class ScratchDirTest(unittest.TestCase):
@@ -229,24 +248,30 @@ class LoadPolicyStateTest(ScratchDirTest):
         self.assertEqual(
             policy.render_policy(str(base / "config.json")), "")
 
-    def test_unsafe_ids_dropped_safe_ids_kept_in_order(self):
+    def test_unsafe_ids_refuse_whole_render_not_dropped(self):
+        # FB-023 fail-closed-as-a-whole: a non-slug id used to be silently
+        # DROPPED from the roster (and counted in targets_omitted); now ONE
+        # invalid id suppresses the ENTIRE render - the real validator
+        # (knowledge/config.py) refuses the same config, so no partial
+        # roster may advertise it.
         base = self._scratch()
-        raw_targets = {
-            "Bad Key": {"kind": "markdown", "root": "D:/x"},
-            "UPPER": {"kind": "markdown", "root": "D:/x"},
-            "-lead": {"kind": "markdown", "root": "D:/x"},
-            "trail-": {"kind": "markdown", "root": "D:/x"},
-            "under_score": {"kind": "markdown", "root": "D:/x"},
-            "a" * 25: {"kind": "markdown", "root": "D:/x"},
-            "notes": {"kind": "markdown", "root": "D:/vault"},
-            "fleet-2": {"kind": "markdown", "root": "D:/vault"},
-        }
+        raw_targets = dict(_markdown_targets("notes", "fleet-2"))
+        raw_targets["Bad Key"] = {"kind": "markdown", "root": "x"}
         path = _write_config(base, _knowledge_config(True, raw_targets))
         state = policy.load_policy_state(path)
-        self.assertEqual(state["targets"], ["notes", "fleet-2"])
-        self.assertEqual(state["targets_omitted"], 6)
+        self.assertFalse(state["enabled"])
+        self.assertEqual(state["reason"], "invalid-config")
+        self.assertEqual(state["targets"], [])
+        self.assertEqual(state["targets_omitted"], 0)
+        self.assertEqual(policy.render_policy(path), "")
+        status = json.dumps(policy.policy_status(path))
+        self.assertNotIn("notes", status)
+        self.assertNotIn("fleet-2", status)
 
     def test_display_cap_counts_omitted(self):
+        # All-VALID ids: the "(+N not shown)" note counts only ids beyond
+        # the display cap (invalid keys never reach this count - they
+        # refuse the whole render instead).
         base = self._scratch()
         ids = ["t-%02d" % i for i in range(12)]
         path = _write_config(base, _knowledge_config(
@@ -281,6 +306,208 @@ class LoadPolicyStateTest(ScratchDirTest):
         self.assertEqual(status["text"], "")
 
 
+class FailClosedWholeConfigTest(ScratchDirTest):
+    """FB-023: display fails closed AS A WHOLE.
+
+    One invalid shape anywhere in an EXISTING config suppresses the
+    ENTIRE render (bounded disabled-style output) - never a partial
+    roster of the valid-looking siblings, and never a target id or value
+    fragment in any output (ids-only per the existing contract; refusals
+    are content-free).
+    """
+
+    def _refused(self, payload=None, raw=None, fragments=()):
+        """Write the config, render it both ways, assert whole refusal."""
+        base = self._scratch()
+        # Portable scratch-derived root so the VALID sibling target is
+        # plausible on every OS (the loader never validates values).
+        valid = {"kind": "markdown", "root": str(base / "vault-notes")}
+        if payload is not None:
+            targets = payload.setdefault(
+                "knowledge", {}).setdefault("targets", {})
+            if "fleet" in targets and targets["fleet"] == "VALID":
+                targets["fleet"] = valid
+            if "notes" in targets and targets["notes"] == "VALID":
+                targets["notes"] = valid
+        path = _write_config(base, payload or {}, raw=raw)
+        for allow_capture in (True, False):
+            self.assertEqual(
+                policy.render_policy(path, allow_capture=allow_capture), "",
+                "an invalid config must render nothing in either mode")
+        status = policy.policy_status(path)
+        self.assertFalse(status["enabled"])
+        self.assertEqual(status["targets"], [])
+        self.assertEqual(status["targets_omitted"], 0)
+        self.assertEqual(status["text"], "")
+        self.assertIn(status["reason"],
+                      ("malformed", "invalid-config", "invalid-enabled",
+                       "invalid-targets"))
+        # No id or value fragments anywhere in the bounded output.
+        status_json = json.dumps(status)
+        for fragment in fragments:
+            self.assertNotIn(fragment, status_json,
+                             "refusal leaked %r" % (fragment,))
+        return status
+
+    def test_bad_kind_suppresses_whole_render(self):
+        status = self._refused(payload={"knowledge": {"enabled": True, "targets": {
+            "notes": {"kind": "bogus", "root": "/vault"},
+            "fleet": "VALID"}}},
+            fragments=("notes", "fleet", "bogus", "vault"))
+        self.assertEqual(status["reason"], "invalid-config")
+
+    def test_unknown_target_key_suppresses_whole_render(self):
+        self._refused(payload={"knowledge": {"enabled": True, "targets": {
+            "notes": {"kind": "markdown", "root": "/vault", "extra": 1},
+            "fleet": "VALID"}}},
+            fragments=("notes", "fleet"))
+
+    def test_unknown_knowledge_key_suppresses_whole_render(self):
+        self._refused(payload={"knowledge": {"enabled": True,
+                                             "typo": True,
+                                             "targets": {"notes": "VALID"}}},
+                      fragments=("notes", "typo"))
+
+    def test_non_object_target_suppresses_whole_render(self):
+        self._refused(payload={"knowledge": {"enabled": True, "targets": {
+            "notes": "markdown", "fleet": "VALID"}}},
+            fragments=("notes", "fleet"))
+
+    def test_missing_kind_suppresses_whole_render(self):
+        self._refused(payload={"knowledge": {"enabled": True, "targets": {
+            "notes": {"root": "/vault"}, "fleet": "VALID"}}},
+            fragments=("notes", "fleet"))
+
+    def test_non_string_root_suppresses_whole_render(self):
+        self._refused(payload={"knowledge": {"enabled": True, "targets": {
+            "notes": {"kind": "markdown", "root": 7},
+            "fleet": "VALID"}}},
+            fragments=("notes", "fleet"))
+
+    def test_kbhttp_field_shapes_suppress_whole_render(self):
+        bad_specs = (
+            {"kind": "kb-http"},  # no endpoint, no credential location
+            {"kind": "kb-http", "endpoint": 5, "credential_env": "T_OK"},
+            {"kind": "kb-http", "endpoint": "  ",
+             "credential_env": "T_OK"},
+            {"kind": "kb-http", "endpoint": "https://kb.example.invalid/n",
+             "allow_http": "yes", "credential_env": "T_OK"},
+            {"kind": "kb-http", "endpoint": "https://kb.example.invalid/n",
+             "credential_env": "T_OK", "token_file": "/both/creds"},
+            {"kind": "kb-http", "endpoint": "https://kb.example.invalid/n",
+             "credential_env": "T_OK", "timeout_s": "fast"},
+            {"kind": "kb-http", "endpoint": "https://kb.example.invalid/n",
+             "credential_env": "T_OK", "max_response_bytes": 1.5},
+            {"kind": "kb-http", "endpoint": "https://kb.example.invalid/n",
+             "credential_env": 42},
+        )
+        for spec in bad_specs:
+            status = self._refused(payload={"knowledge": {
+                "enabled": True,
+                "targets": {"fleet": spec, "notes": "VALID"}}},
+                fragments=("fleet", "notes", "kb.example.invalid"))
+            self.assertEqual(status["reason"], "invalid-config",
+                             "spec=%r" % (spec,))
+
+    def test_valid_kbhttp_still_renders(self):
+        # Counter-mutant: a VALID kb-http spec (exactly one credential
+        # location, optional knobs well-typed) must keep rendering - the
+        # shape mirror is validator-subset, not validator-superset.
+        base = self._scratch()
+        payload = {"knowledge": {"enabled": True, "targets": {
+            "fleet": _kbhttp_target(timeout_s=10, max_response_bytes=4096),
+            "notes": {"kind": "markdown", "root": str(base / "vault")}}}}
+        path = _write_config(base, payload)
+        state = policy.load_policy_state(path)
+        self.assertEqual(state["reason"], "enabled")
+        self.assertEqual(state["targets"], ["fleet", "notes"])
+        self.assertIn("fleet", policy.render_policy(path))
+
+    def test_malformed_utf8_suppresses_whole_render(self):
+        # Strict decode (no replace-decode): undecodable bytes anywhere
+        # refuse the whole file.
+        raw = (b'{"knowledge": {"enabled": true, "targets": {"notes": '
+               b'{"kind": "markdown", "root": "D:\xff\xfe"}}}}')
+        status = self._refused(raw=raw, fragments=("notes",))
+        self.assertEqual(status["reason"], "malformed")
+
+    def test_duplicate_keys_suppress_whole_render(self):
+        # Stdlib json keeps the LAST duplicate silently; the display lane
+        # refuses the whole file (object_pairs_hook detection) wherever
+        # the duplicate sits - top level, knowledge object, or a target
+        # spec.
+        raws = (
+            b'{"knowledge": {"enabled": true, "enabled": false, '
+            b'"targets": {"notes": {"kind": "markdown", "root": "x"}}}}',
+            b'{"auto_retain": false, "auto_retain": true, "knowledge": '
+            b'{"enabled": true, "targets": {}}}',
+            b'{"knowledge": {"enabled": true, "targets": {"notes": '
+            b'{"kind": "markdown", "kind": "kb-http", "root": "x"}}}}',
+        )
+        for raw in raws:
+            status = self._refused(raw=raw, fragments=("notes",))
+            self.assertEqual(status["reason"], "malformed", "raw=%r" % raw)
+
+
+# Byte pins for the VALID-config render (regression pin for the
+# fail-closed work: valid configs must keep rendering byte-for-byte;
+# only a deliberate wording fix - like the FB-030 whole-queue flush
+# truth - ever changes these, never incidentally).
+_GOLDEN_CAPTURE = (
+    "# ZMem knowledge companion (operator-enabled external notes)\n"
+    "\n"
+    "Configured target ids: notes, fleet.\n"
+    "\n"
+    "Targets hold durable reference notes you explicitly author, curate,\n"
+    "and attach evidence to - never raw transcripts, never secrets. Keep\n"
+    "routine session lessons in zmem memory (compact, private); targets\n"
+    "store long-lived notes outside zmem (Markdown vault or KB endpoint;\n"
+    "access follows the target's own permissions; Obsidian is optional,\n"
+    "never required).\n"
+    "\n"
+    "Invoke via the configured Python interpreter and memory store CLI.\n"
+    "Read: `knowledge read --target <id> --key <key> --namespace <ns>`,\n"
+    "verify with `knowledge check`; `knowledge status` shows pointers.\n"
+    "Derive the namespace per the memory skill; always pass `--namespace`\n"
+    "(the default puts project pointers in user:global).\n"
+    "\n"
+    "Publish explicitly, never automatically: screen for secrets (capture\n"
+    "rejects them), then `knowledge capture --target <id> --key <key>\n"
+    "--namespace <ns> --content <text|->`; at a closeout the user\n"
+    "requested in this session, store relevant explicit notes\n"
+    "(agent/reminder-initiated closeouts draft only, no capture). Exit 3\n"
+    "= pending: inspect `knowledge status`; `knowledge flush` drains the\n"
+    "whole pending queue (no session filter), else re-run the same capture\n"
+    "input (idempotent).\n"
+    "\n"
+    "Full workflow and limits: the \"knowledge\" skill (memory skill "
+    "knowledge section)."
+)
+
+_GOLDEN_READONLY = (
+    "# ZMem knowledge companion (operator-enabled external notes)\n"
+    "\n"
+    "Configured target ids: notes, fleet.\n"
+    "\n"
+    "Targets hold durable reference notes you explicitly author, curate,\n"
+    "and attach evidence to - never raw transcripts, never secrets. Keep\n"
+    "routine session lessons in zmem memory (compact, private); targets\n"
+    "store long-lived notes outside zmem (Markdown vault or KB endpoint;\n"
+    "access follows the target's own permissions; Obsidian is optional,\n"
+    "never required).\n"
+    "\n"
+    "This session is read-only for targets (publishing disabled): do not\n"
+    "write, create, or capture notes into targets. Read via the configured\n"
+    "Python interpreter: `knowledge read --target <id> --key <key>\n"
+    "--namespace <ns>`, verify with `knowledge check`; `knowledge status`\n"
+    "shows pointers. Derive the namespace per the memory skill and always\n"
+    "pass `--namespace`.\n"
+    "\n"
+    "Full workflow and limits: the \"knowledge\" skill (memory skill "
+    "knowledge section)."
+)
+
+
 class RenderPolicyTest(ScratchDirTest):
     def _config(self, targets=None):
         base = self._scratch()
@@ -295,6 +522,17 @@ class RenderPolicyTest(ScratchDirTest):
         self.assertEqual(capture, policy.render_policy(path,
                                                        allow_capture=True))
         self.assertNotEqual(capture, readonly)
+
+    def test_valid_config_render_regression_pin(self):
+        # (f) regression pin: a VALID config renders byte-for-byte the
+        # golden text in both modes - the fail-closed work must never
+        # perturb valid rendering (deliberate wording fixes update the
+        # golden, e.g. the FB-030 whole-queue flush truth).
+        path = self._config()
+        self.assertEqual(policy.render_policy(path, allow_capture=True),
+                         _GOLDEN_CAPTURE)
+        self.assertEqual(policy.render_policy(path, allow_capture=False),
+                         _GOLDEN_READONLY)
 
     def test_word_cap_both_modes_at_display_max(self):
         ids = ["t-%02d" % i for i in range(16)]  # 8 shown + 8 omitted
@@ -325,8 +563,10 @@ class RenderPolicyTest(ScratchDirTest):
         self.assertIn("zmem memory", flat)
         # Exit-3 recovery guidance names the ACTUAL subcommand — a bare
         # `flush` was ambiguous (feedback FB-005): the CLI is `knowledge
-        # flush`, and it drains the pending queue, not a blind flush.
-        self.assertIn("knowledge flush` drains only queued entries", flat)
+        # flush`, and it drains the WHOLE pending queue (no session
+        # filter exists — FB-030 truth pass).
+        self.assertIn("knowledge flush` drains the whole pending queue",
+                      flat)
         # The workflow pointer names the portable skill.
         self.assertIn('"knowledge" skill', flat)
         # Closeout capture is scoped to a USER-requested closeout in this
@@ -356,7 +596,8 @@ class RenderPolicyTest(ScratchDirTest):
     def test_target_values_never_rendered(self):
         base = self._scratch()
         targets = {
-            "notes": {"kind": "markdown", "root": "D:/super-secret-vault"},
+            "notes": {"kind": "markdown",
+                      "root": str(base / "super-secret-vault")},
             "fleet": {"kind": "kb-http",
                       "endpoint": "https://kb.internal.example:8443/api/notes",
                       "credential_env": "ZMEM_KB_FLEET_TOKEN"},
@@ -383,7 +624,8 @@ class RenderPolicyTest(ScratchDirTest):
                            "targets": _markdown_targets("notes")}},
             {"knowledge": {"enabled": True, "targets": {}}},
             {"knowledge": {"enabled": True, "targets": {
-                "not a slug": {"kind": "markdown", "root": "D:/x"}}}},
+                "not a slug": {"kind": "markdown",
+                               "root": str(base / "vault")}}}},
             {"something_else": True},
         ]
         for payload in cases:
@@ -519,6 +761,23 @@ class CliTest(ScratchDirTest):
                 self.assertEqual(status["targets"], [])
                 self.assertEqual(status["text"], "")
 
+    def test_missing_config_value_is_usage_error_no_fallback(self):
+        # FB-030: a missing --config value - end of argv, or the next
+        # flag swallowed as the path (`--config --json` used to consume
+        # --json and render rc 0) - exits 2 with empty stdout and NEVER
+        # falls back to default resolution.  ZMEM_DATA points at an
+        # ENABLED config, so a silent fallback would print a policy.
+        base = self._enabled_dir()
+        env = _cli_env(ZMEM_DATA=str(base))
+        for args in (["--config"], ["--text", "--config"],
+                     ["--config", "--json"], ["--config", "--text"],
+                     ["--config", "--no-capture"],
+                     ["--config", "--config", str(base / "config.json")]):
+            proc = self._run(*args, env=env)
+            self.assertEqual(proc.returncode, 2, "args=%r" % (args,))
+            self.assertEqual(proc.stdout, b"", "args=%r" % (args,))
+            self.assertNotEqual(proc.stderr, b"", "args=%r" % (args,))
+
     def test_usage_errors_exit_two(self):
         base = self._enabled_dir()
         env = _cli_env(ZMEM_DATA=str(base))
@@ -560,12 +819,23 @@ class HygieneTest(unittest.TestCase):
     def test_file_opens_are_read_only(self):
         tree = ast.parse(POLICY.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "open"):
-                mode = node.args[1].value if len(node.args) > 1 else None
-                self.assertEqual(mode, "rb",
-                                 "policy.py opens files read-only ('rb')")
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                is_open = node.func.id == "open"
+            elif isinstance(node.func, ast.Attribute):
+                # CI-003-R1: an attribute open — something.open(...),
+                # a.b.open(...) — is a file open too; the read-only gate
+                # must not be satisfiable by switching a bare open() to a
+                # bound/attribute call shape.
+                is_open = node.func.attr == "open"
+            else:
+                continue
+            if not is_open:
+                continue
+            mode = node.args[1].value if len(node.args) > 1 else None
+            self.assertEqual(mode, "rb",
+                             "policy.py opens files read-only ('rb')")
 
     def test_runtime_imports_nothing_heavy(self):
         # Import + render from an unrelated cwd with an empty PYTHONPATH:

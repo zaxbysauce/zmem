@@ -1459,6 +1459,7 @@ def rekey_namespace(
     to_namespace: str | None = None,
     near_miss_global: bool = False,
     dry_run: bool = False,
+    store_dir: str | Path | None = None,
 ) -> int:
     """Admin re-key: rewrite the ``namespace`` column of live rows.
 
@@ -1479,6 +1480,16 @@ def rekey_namespace(
 
     ``to_namespace`` is itself validated (must not itself be a near-miss) so the
     command cannot move rows FROM one dead-letter key TO another.
+
+    FB-031 local coordinated rekey guard: ``store_dir`` is the authoritative
+    store directory (whose ``knowledge/`` sidecars are coordinated). When
+    omitted it is derived from the EXISTING connection (``PRAGMA
+    database_list`` — never a second SQLite handle). While a knowledge
+    publication is durably in flight under a source or destination
+    namespace, the move is refused with
+    ``storelib.rekey.RekeyKnowledgeBusy`` before any SQLite or sidecar
+    mutation; both sidecar locks stay held through the namespace commit
+    (see ``storelib.rekey.knowledge_rekey_fence``).
 
     Returns the number of rows rekeyed. ``dry_run`` reports the count and the
     candidate namespaces without writing. The write is a single UPDATE under a
@@ -1551,37 +1562,50 @@ def rekey_namespace(
 
     started_tx = False
     try:
-        if not conn.in_transaction:
-            conn.execute("BEGIN IMMEDIATE")
-            started_tx = True
-        # PR1 guard (shared authority, single implementation): refuse this
-        # bulk move BEFORE any mutation when it would concentrate two live
-        # VERIFIED knowledge pointer rows for one exact reserved ref into
-        # the destination namespace — get_pointer treats that as store
-        # corruption. Lazy import: rekey imports this module's siblings
-        # (schema/backup/entity) and its own knowledge imports are lazy, so
-        # a top-level import would cycle.
-        from storelib.rekey import _refuse_pointer_collisions
-        _refuse_pointer_collisions(
-            conn,
-            lambda row: (to_namespace if row["namespace"] in sources
-                         else row["namespace"]))
-        conn.execute(
-            f"UPDATE memory SET namespace=? "
-            f"WHERE superseded_at IS NULL AND namespace IN ({placeholders})",
-            [to_namespace, *sources],
-        )
-        # v10 (issue #60): namespace is an extraction input (project:<suffix>
-        # mints a project entity). Re-derive the moved rows' entity links from
-        # their NEW namespace in the same transaction so the entity lane never
-        # surfaces a rekeyed row under its dead old project identity.
-        for rid in [r[0] for r in conn.execute(
-            f"SELECT id FROM memory WHERE superseded_at IS NULL "
-            f"AND namespace=?", (to_namespace,)
-        ).fetchall()]:
-            relink_memory(conn, rid)
-        if started_tx:
-            _commit(conn)
+        # FB-031 local coordinated rekey guard: the fence spans the whole
+        # BEGIN..UPDATE..COMMIT so both knowledge sidecar locks stay held
+        # through the namespace commit (a concurrent capture can never
+        # observe pre-move state between the UPDATE and the commit), and
+        # the refusal fires BEFORE any SQLite mutation. Lazy import for
+        # the same cycle reason as the PR1 guard below.
+        from storelib.rekey import (knowledge_rekey_fence,
+                                    store_dir_from_conn)
+        with knowledge_rekey_fence(
+                store_dir if store_dir is not None
+                else store_dir_from_conn(conn)) as coordination:
+            if coordination is not None:
+                coordination.refuse_if_active([*sources, to_namespace])
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+                started_tx = True
+            # PR1 guard (shared authority, single implementation): refuse this
+            # bulk move BEFORE any mutation when it would concentrate two live
+            # VERIFIED knowledge pointer rows for one exact reserved ref into
+            # the destination namespace — get_pointer treats that as store
+            # corruption. Lazy import: rekey imports this module's siblings
+            # (schema/backup/entity) and its own knowledge imports are lazy, so
+            # a top-level import would cycle.
+            from storelib.rekey import _refuse_pointer_collisions
+            _refuse_pointer_collisions(
+                conn,
+                lambda row: (to_namespace if row["namespace"] in sources
+                             else row["namespace"]))
+            conn.execute(
+                f"UPDATE memory SET namespace=? "
+                f"WHERE superseded_at IS NULL AND namespace IN ({placeholders})",
+                [to_namespace, *sources],
+            )
+            # v10 (issue #60): namespace is an extraction input (project:<suffix>
+            # mints a project entity). Re-derive the moved rows' entity links from
+            # their NEW namespace in the same transaction so the entity lane never
+            # surfaces a rekeyed row under its dead old project identity.
+            for rid in [r[0] for r in conn.execute(
+                f"SELECT id FROM memory WHERE superseded_at IS NULL "
+                f"AND namespace=?", (to_namespace,)
+            ).fetchall()]:
+                relink_memory(conn, rid)
+            if started_tx:
+                _commit(conn)
     except Exception:
         if started_tx and conn.in_transaction:
             conn.rollback()

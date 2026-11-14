@@ -40,7 +40,9 @@ an exception message.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -487,10 +489,17 @@ class MarkdownStore:
     def create(self, document: Document) -> "CreateResult":
         """Exclusive immutable create with readback verification.
 
-        An existing byte-identical version is SUCCESS
-        (``existed_match=True``); existing different content is
-        :class:`ConflictError`.  The file is never overwritten, renamed, or
-        deleted.
+        The content is written to a uniquely OWNED temporary file in the
+        SAME directory as the final locator (``O_EXCL``), fsynced and
+        closed, then published with ``os.link`` — an atomic no-replace.
+        The final locator therefore only ever appears COMPLETE: a partial
+        write (ENOSPC, a killed process) leaves no final path to wedge the
+        identity, and the owned temp is unlinked on ANY failure.  The
+        final path is NEVER unlinked, overwritten, or replaced
+        (``os.replace`` on it is forbidden).  A final that already exists
+        is resolved by digest comparison: byte-identical is SUCCESS
+        (``existed_match=True``), different content is
+        :class:`ConflictError`.
         """
         if document.target_id != self._target.id:
             raise ValueError(
@@ -504,24 +513,54 @@ class MarkdownStore:
         # before the exclusive create (narrows the TOCTOU window); only the
         # note file itself may still be absent.
         _assert_no_reparse_chain(final, self._root, missing="file")
+        temp = final.with_name(
+            "%s.tmp-%d-%s" % (final.name, os.getpid(), os.urandom(4).hex()))
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
         try:
-            fd = os.open(str(final), flags, 0o600)
-        except FileExistsError:
-            return self._existing_matches(document, final)
+            try:
+                fd = os.open(str(temp), flags, 0o600)
+            except OSError as exc:
+                raise TargetError(
+                    "markdown target %r: create failed at %r (%s)" %
+                    (self._target.id, str(final),
+                     exc.__class__.__name__)) from exc
+            try:
+                data = document.content
+                offset = 0
+                while offset < len(data):
+                    offset += os.write(fd, data[offset:])
+                os.fsync(fd)
+            except OSError as exc:
+                raise TargetError(
+                    "markdown target %r: create failed at %r (%s)" %
+                    (self._target.id, str(final),
+                     exc.__class__.__name__)) from exc
+            finally:
+                os.close(fd)
+            try:
+                os.link(str(temp), str(final))
+            except FileExistsError:
+                # Another writer published this locator first (or this is a
+                # retry): resolve by CONTENT, never by overwrite.
+                return self._existing_matches(document, final)
+            except OSError as exc:
+                raise TargetError(
+                    "markdown target %r: create failed at %r (%s)" %
+                    (self._target.id, str(final),
+                     exc.__class__.__name__)) from exc
+        finally:
+            # Only EVER the owned temp is removed — the final path is
+            # never unlinked or replaced, and no fallback rename exists.
+            with contextlib.suppress(OSError):
+                os.unlink(str(temp))
+        try:
+            verified = self._read_verified(final, document.digest)
         except OSError as exc:
             raise TargetError(
-                "markdown target %r: create failed at %r (%s)" %
-                (self._target.id, str(final), exc.__class__.__name__)) from exc
-        try:
-            data = document.content
-            offset = 0
-            while offset < len(data):
-                offset += os.write(fd, data[offset:])
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        if self._read_verified(final, document.digest) is None:
+                "markdown target %r: readback failed at %r (%s)" %
+                (self._target.id, str(final),
+                 exc.__class__.__name__)) from exc
+        if verified is None:
             raise IntegrityError(
                 "markdown target %r: readback digest mismatch for %r" %
                 (self._target.id, document.locator))
@@ -531,7 +570,18 @@ class MarkdownStore:
 
     def _existing_matches(self, document: Document,
                           final: Path) -> "CreateResult":
-        if self._read_verified(final, document.digest) is None:
+        try:
+            verified = self._read_verified(final, document.digest)
+        except OSError as exc:
+            # FB-021: an unreadable existing note is a TYPED, content-free
+            # TargetError (the create() readback conversion's style) — a
+            # raw OSError would escape the workflow/CLI error mapping as
+            # a traceback.
+            raise TargetError(
+                "markdown target %r: readback failed at %r (%s)" %
+                (self._target.id, str(final),
+                 exc.__class__.__name__)) from exc
+        if verified is None:
             raise ConflictError(
                 "markdown target %r: immutable version already exists with "
                 "different content at %r (never overwritten)" %
@@ -559,7 +609,17 @@ class MarkdownStore:
             raise TargetError(
                 "markdown target %r: %r is not a regular file" %
                 (self._target.id, locator))
-        return _read_bounded(final, MAX_CONTENT_BYTES, "note file")
+        try:
+            return _read_bounded(final, MAX_CONTENT_BYTES, "note file")
+        except OSError as exc:
+            # FB-021: an unreadable note (permissions, sharing violation,
+            # ...) is a TYPED, content-free TargetError — the raw OSError
+            # would escape workflow._read_current (which catches only
+            # TargetError/ValueError) and the CLI's WorkflowError mapping
+            # as a traceback.
+            raise TargetError(
+                "markdown target %r: read failed at %r (%s)" %
+                (self._target.id, locator, exc.__class__.__name__)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +686,14 @@ class KBClient:
             raise TargetError(
                 "kb target %r: token exceeds %d bytes" %
                 (self._target.id, MAX_TOKEN_BYTES))
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in token):
+            # A control character in the credential would reach the header
+            # layer, whose ValueError embeds the offending VALUE (the
+            # token bytes) in its message — refuse here, content-free.
+            raise TargetError(
+                "kb target %r: credential value contains control "
+                "characters (refused before any request)" %
+                self._target.id)
         return token
 
     # -- request plumbing
@@ -639,15 +707,18 @@ class KBClient:
         """One bounded, redirect-refusing request.  Returns
         ``(status, body_bytes)``; redirects and network failures become
         :class:`TransportError`; response bodies are capped at the
-        configured ``max_response_bytes``."""
-        request = urllib.request.Request(
-            self._url(locator), data=body, method=method)
-        request.add_header("Authorization", "Bearer " + self._token())
-        if body is not None:
-            request.add_header("Content-Type", "application/json")
-        request.add_header("Accept", "application/json")
+        configured ``max_response_bytes``.  Hostile input that makes the
+        header or URL layer raise ``ValueError`` becomes a content-free
+        :class:`TransportError` — the raw message (which quotes the
+        offending header VALUE, i.e. the token) never escapes."""
         limit = self._target.max_response_bytes
         try:
+            request = urllib.request.Request(
+                self._url(locator), data=body, method=method)
+            request.add_header("Authorization", "Bearer " + self._token())
+            if body is not None:
+                request.add_header("Content-Type", "application/json")
+            request.add_header("Accept", "application/json")
             with self._opener.open(request,
                                    timeout=self._target.timeout_s) as resp:
                 status = resp.status
@@ -657,10 +728,22 @@ class KBClient:
             try:
                 with exc:
                     payload = exc.read(limit + 1)
-            except OSError:
+            except (OSError, http.client.HTTPException):
                 payload = b""
+        except ValueError as exc:
+            # Invalid header value / URL from hostile input: suppressed
+            # cause (``from None``) because the chained exception's message
+            # carries the offending bytes — never part of a traceback.
+            raise TransportError(
+                "kb target %r: %s to endpoint refused (%s)" %
+                (self._target.id, method, exc.__class__.__name__)) from None
         except (urllib.error.URLError, socket.timeout, TimeoutError,
-                OSError) as exc:
+                OSError, http.client.HTTPException) as exc:
+            # HTTPException (e.g. IncompleteRead on a truncated chunked
+            # body) escapes ``resp.read`` OUTSIDE urllib's ``do_open``
+            # wrapper, which only converts header-stage failures — a
+            # hostile/truncating endpoint must still land in the typed,
+            # content-free error contract, never a raw traceback.
             raise TransportError(
                 "kb target %r: %s to endpoint failed (%s)" %
                 (self._target.id, method, exc.__class__.__name__)) from exc

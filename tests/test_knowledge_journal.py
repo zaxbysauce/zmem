@@ -329,13 +329,28 @@ class RobustnessTests(unittest.TestCase):
 
     def test_bounded_history(self):
         journal = KnowledgeJournal(self.path, max_entries=3)
-        for index in range(5):
+        for index in range(3):
             journal.record_intent(
                 **intent_args("notes", "run/doc-%d" % index, NOTE_BODY))
         entries = journal.entries()
         self.assertEqual(len(entries), 3)
         self.assertEqual([e.logical_key for e in entries],
-                         ["run/doc-2", "run/doc-3", "run/doc-4"])
+                         ["run/doc-0", "run/doc-1", "run/doc-2"])
+        # An all-ACTIVE overflow is refused atomically (state-aware
+        # retention never drops an in-flight entry): no mutation at all.
+        before = self.path.read_bytes()
+        with self.assertRaises(JournalError):
+            journal.record_intent(
+                **intent_args("notes", "run/doc-3", NOTE_BODY))
+        self.assertEqual(self.path.read_bytes(), before)
+        # Once an entry is terminal, the oldest TERMINAL history is the
+        # eviction candidate and the new intent records.
+        journal.mark(target_id="notes", logical_key="run/doc-0",
+                     state="quarantined")
+        journal.record_intent(
+            **intent_args("notes", "run/doc-3", NOTE_BODY))
+        self.assertEqual([e.logical_key for e in journal.entries()],
+                         ["run/doc-1", "run/doc-2", "run/doc-3"])
 
     def test_no_stray_temp_files(self):
         journal = KnowledgeJournal(self.path)
@@ -345,6 +360,77 @@ class RobustnessTests(unittest.TestCase):
         leftovers = [p.name for p in self.dir.iterdir()
                      if ".tmp-" in p.name]
         self.assertEqual(leftovers, [])
+
+
+class StateAwareRetentionTests(unittest.TestCase):
+    """Retention is state-aware: terminal history is evicted first (oldest
+    by seq), an ACTIVE (in-flight) entry is never evicted while any
+    terminal entry exists, and an all-active overflow refuses the write
+    atomically — the file stays byte-identical."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="zmem-knfjrn-"))
+        self.path = self.dir / "journal.json"
+
+    def _record(self, journal: KnowledgeJournal, key: str):
+        return journal.record_intent(
+            **intent_args("notes", key, NOTE_BODY + key))
+
+    def _apply(self, journal: KnowledgeJournal, key: str) -> None:
+        for state in ("doc_verified", "pointer_queued", "applied"):
+            journal.mark(target_id="notes", logical_key=key, state=state)
+
+    def test_active_entry_survives_while_terminal_history_evicted(self):
+        journal = KnowledgeJournal(self.path, max_entries=3)
+        self._record(journal, "run/active")           # seq 1, ACTIVE, oldest
+        self._record(journal, "run/t1")
+        self._apply(journal, "run/t1")                # seq 2, terminal
+        self._record(journal, "run/t2")
+        self._apply(journal, "run/t2")                # seq 3, terminal
+        self.assertEqual(len(journal.entries()), 3)
+        # seq 4 pushes over the bound: the OLDEST TERMINAL goes, not the
+        # older ACTIVE entry (the old seq-order slice dropped 'active').
+        self._record(journal, "run/new")
+        by_key = {e.logical_key: e for e in journal.entries()}
+        self.assertEqual(len(by_key), 3)
+        self.assertIn("run/active", by_key)
+        self.assertEqual(by_key["run/active"].state, "doc_pending")
+        self.assertNotIn("run/t1", by_key)
+        self.assertIn("run/t2", by_key)
+        self.assertIn("run/new", by_key)
+
+    def test_terminal_history_is_bounded(self):
+        journal = KnowledgeJournal(self.path, max_entries=2)
+        for version in range(3):
+            self._record(journal, "run/v%d" % version)
+            journal.mark(target_id="notes", logical_key="run/v%d" % version,
+                         state="quarantined")
+        states = [e.state for e in journal.entries()]
+        self.assertEqual(len(states), 2)
+        self.assertEqual(states, ["quarantined", "quarantined"])
+        self.assertEqual(journal.entry_for("notes", "run/v2").seq, 3)
+
+    def test_all_active_overflow_refuses_atomically(self):
+        journal = KnowledgeJournal(self.path, max_entries=3)
+        for index in range(3):
+            self._record(journal, "run/a%d" % index)
+        before = self.path.read_bytes()
+        with self.assertRaises(JournalError) as ctx:
+            self._record(journal, "run/overflow")
+        self.assertIn("ACTIVE", str(ctx.exception))
+        self.assertEqual(self.path.read_bytes(), before,
+                         "the atomic refuse leaves the file byte-identical")
+        self.assertEqual([p.name for p in self.dir.iterdir()
+                          if ".tmp-" in p.name], [],
+                         "no temp litter from the refused write")
+        # Driving one entry terminal frees exactly one slot (the terminal
+        # entry becomes the eviction candidate), and the same record then
+        # succeeds.
+        journal.mark(target_id="notes", logical_key="run/a0",
+                     state="quarantined")
+        entry = self._record(journal, "run/overflow")
+        self.assertEqual(entry.state, "doc_pending")
+        self.assertEqual(len(journal.entries()), 3)
 
 
 class LockTests(unittest.TestCase):

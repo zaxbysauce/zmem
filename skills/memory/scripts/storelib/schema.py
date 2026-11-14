@@ -1253,7 +1253,8 @@ def _load_ns_migration_checkouts() -> dict[str, str]:
         return dict(_NS_MIGRATION_CHECKOUTS)
     return mapping
 
-def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str]:
+def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces,
+                      guard=None) -> dict[str, str]:
     """Re-derive and rewrite the namespace key for each entry of
     `old_namespaces` (a subset of _NS_MIGRATION_CHECKOUTS's keys). Returns the
     {old: new} map of the ones actually resolved.
@@ -1263,6 +1264,18 @@ def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str
     _retry_pending_ns_migration). Rewrites ALL rows under the old key, tombstones
     included — a superseded row left behind under a dead key would be stranded
     from its own namespace's history. Does not commit; the caller does.
+
+    FB-031 local coordinated rekey guard: ``guard`` is an already-engaged
+    knowledge rekey coordination (from ``storelib.rekey.knowledge_rekey_fence``)
+    when the CALLER holds the fence — the v5 block and the retry pass do
+    this so both sidecar locks stay held through their own commit. When
+    ``guard`` is None (a direct call) the rewrites coordinate on a fence
+    acquired here for the duration of this function. The coordination
+    does path/lock/parse ONLY — it never initializes schema, never opens
+    a second store, never migrates — and follows this lane's
+    refuse-and-retry contract: a namespace whose move would strand an
+    in-flight knowledge publication is left unchanged (not added to the
+    moves, so the retry pass re-attempts it once the publication drains).
     """
     mapping: dict[str, str] = {}
     if _host is None:
@@ -1273,99 +1286,121 @@ def _rekey_namespaces(conn: sqlite3.Connection, old_namespaces) -> dict[str, str
         )
         return mapping
     checkouts = _load_ns_migration_checkouts()
-    for old_ns in old_namespaces:
-        checkout = checkouts.get(old_ns)
-        if not checkout:
-            print(
-                f"[zmem] ns migration WARNING: no configured checkout path for "
-                f"{old_ns} - namespace left unchanged",
-                file=sys.stderr,
-            )
-            continue
-        checkout_path = Path(checkout)
-        if not checkout_path.is_dir():
-            print(
-                f"[zmem] ns migration WARNING: checkout for {old_ns} "
-                f"not found at {checkout} — refusing to guess; "
-                f"namespace left unchanged (will be retried on a later run)",
-                file=sys.stderr,
-            )
-            continue
-        # A migration re-key is a PERMANENT bulk UPDATE (schema_version moves
-        # forward in the same batch, so it never re-runs). Only re-key when
-        # the checkout's origin is verifiably present RIGHT NOW: on a
-        # transient git error the resolver's capture-path fallback
-        # (cached key, then user:global) must never decide where a whole
-        # namespace's history lands — re-keying to user:global would merge
-        # unrelated projects' memories (PR #199 review, UR-1). Absent/unknown
-        # statuses follow the same refuse-and-retry contract as a missing
-        # checkout directory.
-        status_fn = getattr(_host, "_get_git_remote_status", None)
-        if status_fn is not None:
-            url, git_status = status_fn(checkout_path)
-            if git_status != "remote":
+    # Lazy import: rekey imports this module at top level.
+    from storelib.rekey import (RekeyKnowledgeBusy,
+                                knowledge_rekey_fence, store_dir_from_conn)
+    if guard is not None:
+        fence_ctx = contextlib.nullcontext(guard)
+    else:
+        fence_ctx = knowledge_rekey_fence(store_dir_from_conn(conn))
+    with fence_ctx as coordination:
+        for old_ns in old_namespaces:
+            checkout = checkouts.get(old_ns)
+            if not checkout:
+                print(
+                    f"[zmem] ns migration WARNING: no configured checkout path for "
+                    f"{old_ns} - namespace left unchanged",
+                    file=sys.stderr,
+                )
+                continue
+            checkout_path = Path(checkout)
+            if not checkout_path.is_dir():
                 print(
                     f"[zmem] ns migration WARNING: checkout for {old_ns} "
-                    f"git status is '{git_status}' (origin not verifiable) "
-                    f"— refusing to guess; namespace left unchanged "
-                    f"(will be retried on a later run)",
+                    f"not found at {checkout} — refusing to guess; "
+                    f"namespace left unchanged (will be retried on a later run)",
                     file=sys.stderr,
                 )
                 continue
-            new_ns = f"project:{_host._normalize_remote(url)}"
-        else:  # older host.py without the status probe — behave as before
-            new_ns = _host.resolve_namespace(checkout_path)
-        mapping[old_ns] = new_ns
-        if new_ns != old_ns:
-            # PR1 guard (shared authority, single implementation in
-            # storelib.rekey._refuse_pointer_collisions): never concentrate
-            # two live VERIFIED knowledge pointer rows for one exact
-            # reserved ref into the destination namespace. The migration's
-            # own refuse-and-retry contract applies: on collision the whole
-            # old namespace is left unchanged (not added to the moves, so
-            # the retry pass re-attempts it once the operator relinks or
-            # drops one pointer) instead of bricking every migrate().
-            # Lazy import: rekey imports this module at top level.
-            from storelib.rekey import _refuse_pointer_collisions
-            try:
-                _refuse_pointer_collisions(
-                    conn,
-                    lambda row, _old=old_ns, _new=new_ns:
-                        _new if row["namespace"] == _old
-                        else row["namespace"])
-            except RuntimeError as exc:
-                print(
-                    f"[zmem] ns migration WARNING: refusing to re-key "
-                    f"{old_ns} -> {new_ns}: {exc}",
-                    file=sys.stderr,
+            # A migration re-key is a PERMANENT bulk UPDATE (schema_version moves
+            # forward in the same batch, so it never re-runs). Only re-key when
+            # the checkout's origin is verifiably present RIGHT NOW: on a
+            # transient git error the resolver's capture-path fallback
+            # (cached key, then user:global) must never decide where a whole
+            # namespace's history lands — re-keying to user:global would merge
+            # unrelated projects' memories (PR #199 review, UR-1). Absent/unknown
+            # statuses follow the same refuse-and-retry contract as a missing
+            # checkout directory.
+            status_fn = getattr(_host, "_get_git_remote_status", None)
+            if status_fn is not None:
+                url, git_status = status_fn(checkout_path)
+                if git_status != "remote":
+                    print(
+                        f"[zmem] ns migration WARNING: checkout for {old_ns} "
+                        f"git status is '{git_status}' (origin not verifiable) "
+                        f"— refusing to guess; namespace left unchanged "
+                        f"(will be retried on a later run)",
+                        file=sys.stderr,
+                    )
+                    continue
+                new_ns = f"project:{_host._normalize_remote(url)}"
+            else:  # older host.py without the status probe — behave as before
+                new_ns = _host.resolve_namespace(checkout_path)
+            mapping[old_ns] = new_ns
+            if new_ns != old_ns:
+                # FB-031 guard (refuse-and-retry, same contract as the PR1
+                # collision guard below): never move a namespace that
+                # carries durably in-flight knowledge publication state —
+                # the namespaced sidecar identities would be stranded.
+                if coordination is not None:
+                    try:
+                        coordination.refuse_if_active((old_ns, new_ns))
+                    except RekeyKnowledgeBusy as exc:
+                        print(
+                            f"[zmem] ns migration WARNING: refusing to re-key "
+                            f"{old_ns} -> {new_ns}: {exc}",
+                            file=sys.stderr,
+                        )
+                        mapping.pop(old_ns, None)
+                        continue
+                # PR1 guard (shared authority, single implementation in
+                # storelib.rekey._refuse_pointer_collisions): never concentrate
+                # two live VERIFIED knowledge pointer rows for one exact
+                # reserved ref into the destination namespace. The migration's
+                # own refuse-and-retry contract applies: on collision the whole
+                # old namespace is left unchanged (not added to the moves, so
+                # the retry pass re-attempts it once the operator relinks or
+                # drops one pointer) instead of bricking every migrate().
+                from storelib.rekey import _refuse_pointer_collisions
+                try:
+                    _refuse_pointer_collisions(
+                        conn,
+                        lambda row, _old=old_ns, _new=new_ns:
+                            _new if row["namespace"] == _old
+                            else row["namespace"])
+                except RuntimeError as exc:
+                    print(
+                        f"[zmem] ns migration WARNING: refusing to re-key "
+                        f"{old_ns} -> {new_ns}: {exc}",
+                        file=sys.stderr,
+                    )
+                    mapping.pop(old_ns, None)
+                    continue
+                conn.execute(
+                    "UPDATE memory SET namespace=? WHERE namespace=?",
+                    (new_ns, old_ns),
                 )
-                mapping.pop(old_ns, None)
-                continue
-            conn.execute(
-                "UPDATE memory SET namespace=? WHERE namespace=?",
-                (new_ns, old_ns),
-            )
-            # v10 (issue #60): the namespace suffix is an entity-extraction
-            # input, so every moved row's links are re-derived from its NEW
-            # namespace in the same uncommitted batch. Covers both callers —
-            # the one-time v5 walk (whose rows the v10 backfill would also
-            # cover, but this keeps the invariant local) and the
-            # every-migrate() retry pass, which runs AFTER the v10 block and
-            # would otherwise strand stale links. GUARD: on a legacy pre-v10
-            # store walking the versions, this code runs BEFORE the v10 block
-            # creates the entity tables — skip then (the v10 backfill derives
-            # those rows' links with their final namespace). Local import:
-            # entity.py imports this module.
-            has_entities = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' "
-                "AND name='memory_entity'"
-            ).fetchone()
-            if has_entities:
-                from storelib.entity import relink_memory
-                for rid in [r[0] for r in conn.execute(
-                    "SELECT id FROM memory WHERE namespace=?", (new_ns,)
-                ).fetchall()]:
-                    relink_memory(conn, rid)
+                # v10 (issue #60): the namespace suffix is an entity-extraction
+                # input, so every moved row's links are re-derived from its NEW
+                # namespace in the same uncommitted batch. Covers both callers —
+                # the one-time v5 walk (whose rows the v10 backfill would also
+                # cover, but this keeps the invariant local) and the
+                # every-migrate() retry pass, which runs AFTER the v10 block and
+                # would otherwise strand stale links. GUARD: on a legacy pre-v10
+                # store walking the versions, this code runs BEFORE the v10 block
+                # creates the entity tables — skip then (the v10 backfill derives
+                # those rows' links with their final namespace). Local import:
+                # entity.py imports this module.
+                has_entities = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='memory_entity'"
+                ).fetchone()
+                if has_entities:
+                    from storelib.entity import relink_memory
+                    for rid in [r[0] for r in conn.execute(
+                        "SELECT id FROM memory WHERE namespace=?", (new_ns,)
+                    ).fetchall()]:
+                        relink_memory(conn, rid)
     return mapping
 
 def _record_ns_migration(
@@ -1427,12 +1462,29 @@ def _retry_pending_ns_migration(conn: sqlite3.Connection) -> None:
         return  # never let a retry probe break an otherwise-fine migrate()
     if not stranded:
         return  # nothing left under an old-style key — no-op
-    mapping = _rekey_namespaces(conn, stranded)
-    if mapping:
-        _record_ns_migration(conn, mapping)
-        print(f"[zmem] ns migration: re-keyed {len(mapping)} previously-skipped "
-              f"namespace(s): {', '.join(sorted(mapping))}", file=sys.stderr)
-    conn.commit()
+    # FB-031: the fence spans the rewrites AND this commit, so both
+    # knowledge sidecar locks stay held through the namespace commit. A
+    # fence-entry failure (corrupt sidecar, busy lock) follows the same
+    # refuse-and-retry contract as every other skip: nothing moves here,
+    # the next migrate() re-attempts it. Lazy import: rekey imports this
+    # module at top level.
+    from storelib.rekey import (RekeyKnowledgeBusy,
+                                knowledge_rekey_fence, store_dir_from_conn)
+    try:
+        with knowledge_rekey_fence(store_dir_from_conn(conn)) as guard:
+            mapping = _rekey_namespaces(conn, stranded, guard=guard)
+            if mapping:
+                _record_ns_migration(conn, mapping)
+                print(f"[zmem] ns migration: re-keyed {len(mapping)} previously-skipped "
+                      f"namespace(s): {', '.join(sorted(mapping))}", file=sys.stderr)
+            conn.commit()
+    except RekeyKnowledgeBusy as exc:
+        print(
+            "[zmem] ns migration WARNING: deferring re-key of "
+            f"{', '.join(sorted(stranded))} (knowledge coordination "
+            f"unavailable/busy; nothing moved, will be retried): {exc}",
+            file=sys.stderr,
+        )
 
 
 _EVIDENCE_SCHEMA_DDL = (
@@ -2382,13 +2434,35 @@ def migrate(conn: sqlite3.Connection) -> None:
         # pass has to skip (checkout absent) are NOT lost: the unconditional
         # _retry_pending_ns_migration() below picks them up on a later run,
         # which is why bumping schema_version here is safe.
-        migration_map = _rekey_namespaces(conn, list(_load_ns_migration_checkouts()))
-        # `user:global` and any unmapped namespace (e.g. `project:ZCode`,
-        # a spurious parent-dir capture with no git remote of its own) are
-        # deliberately left untouched.
-        _record_ns_migration(conn, migration_map, merge=False)
-        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
-        conn.commit()
+        #
+        # FB-031: the fence spans the rewrites AND this block's commit (the
+        # version bump rides the same commit), so both knowledge sidecar
+        # locks stay held through it. A fence-entry failure keeps the
+        # refuse-and-retry contract: namespaces left unchanged, version
+        # still advances, the retry pass re-attempts later. Lazy import:
+        # rekey imports this module at top level.
+        from storelib.rekey import (RekeyKnowledgeBusy,
+                                    knowledge_rekey_fence,
+                                    store_dir_from_conn)
+        try:
+            with knowledge_rekey_fence(store_dir_from_conn(conn)) as guard:
+                migration_map = _rekey_namespaces(
+                    conn, list(_load_ns_migration_checkouts()), guard=guard)
+                # `user:global` and any unmapped namespace (e.g. `project:ZCode`,
+                # a spurious parent-dir capture with no git remote of its own) are
+                # deliberately left untouched.
+                _record_ns_migration(conn, migration_map, merge=False)
+                conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+                conn.commit()
+        except RekeyKnowledgeBusy as exc:
+            print(
+                "[zmem] ns migration WARNING: deferring the v5 re-key "
+                "(knowledge coordination unavailable/busy; namespaces left "
+                f"unchanged, the retry pass re-attempts them): {exc}",
+                file=sys.stderr,
+            )
+            conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+            conn.commit()
 
     if ver < 6:
         # v6: consolidation content-provenance (issue #19).

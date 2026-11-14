@@ -540,6 +540,52 @@ class RealHubKnowledgeFlowTest(unittest.TestCase):
         self.assertEqual((answer.get("pointer") or {}).get("full_sha256"),
                          digest, answer)
 
+    def test_remote_digest_mismatch_refusal_matches_cli_contract(self):
+        """FB-011 through the REAL hub: the remote read resolves the
+        CURRENT version via the hub's authoritative pointer, so tampering
+        the shared vault under the pointer's locator must REFUSE — exit 1,
+        ok:false, reason digest-mismatch, and NO content bytes in any
+        stream.  check reports matches:false (exit 1) on the same drift."""
+        body = "Mismatch lane probe: original canonical body.\n"
+        rc, cap, err = _run_client(
+            self.dir_d, self.hub.url, self.token,
+            ["knowledge", "capture", "--target", "notes",
+             "--key", "guides/mismatch-lane", "--content", body.strip(),
+             "--namespace", self.ns, "--json"])
+        self.assertEqual(rc, 0, (cap, err))
+        locator = cap["locator"]
+        note = self.vault / locator
+        self.assertTrue(note.is_file(), locator)
+        tampered = b"mismatch lane: bytes replaced under the pointer\n"
+        note.write_bytes(tampered)
+
+        rc2, mis, err2 = _run_client(
+            self.dir_d, self.hub.url, self.token,
+            ["knowledge", "read", "--target", "notes",
+             "--key", "guides/mismatch-lane", "--namespace", self.ns,
+             "--json"])
+        self.assertEqual(rc2, 1, (rc2, mis, err2))
+        self.assertFalse(mis.get("ok"), mis)
+        self.assertEqual(mis.get("reason"), "digest-mismatch", mis)
+        self.assertNotIn("content", mis)
+        self.assertEqual(mis.get("provenance"), "hub-pointer", mis)
+        self.assertNotIn("bytes replaced", json.dumps(mis))
+        self.assertNotIn(body, json.dumps(mis))
+
+        rc3, check, err3 = _run_client(
+            self.dir_d, self.hub.url, self.token,
+            ["knowledge", "check", "--target", "notes",
+             "--key", "guides/mismatch-lane", "--namespace", self.ns,
+             "--json"])
+        self.assertEqual(rc3, 1, (rc3, check, err3))
+        self.assertFalse(check.get("ok"), check)
+        self.assertFalse(check.get("matches"), check)
+        self.assertNotIn("content", check)
+
+        # restore the canonical bytes so later/order-independent methods
+        # that rglob the vault see a clean state for THIS key only
+        note.write_bytes(body.strip().encode("utf-8") + b"\n")
+
     # -- core lane health (independent) --------------------------------------
 
     def test_core_add_and_apply_ops_survive_knowledge_attempts(self):
@@ -701,13 +747,18 @@ class ScopedHubNamespaceAuthzTest(unittest.TestCase):
             self.dir_client, self.hub.url, self.token,
             ["knowledge", "read", "--target", "notes", "--key", key,
              "--namespace", "project:other", "--json"])
-        # SECURE CONTRACT: refuse — never the seeded local bytes.
+        # SECURE CONTRACT: refuse — never the seeded local bytes.  The CLI
+        # contract for a DENIED hub read is the clean refusal exit 2 (one
+        # JSON error object), never success and never a traceback.
+        self.assertEqual(rc, 2, (rc, payload, err))
         self.assertFalse(
             payload and payload.get("ok"),
             "local-intent fallback disclosed content in a namespace the "
             "token cannot touch: %r" % (payload,))
         self.assertNotIn("Seeded local-intent probe bytes",
                          json.dumps(payload or {}))
+        self.assertIn("refused", str((payload or {}).get("error", "")),
+                      payload)
 
     def test_scoped_capture_foreign_ns_is_terminal_rejection(self):
         """A REAL network capture in a foreign namespace is a TERMINAL

@@ -7,12 +7,22 @@ recording a *pointer* to each published note inside the zmem store so it can
 be found, re-read, and integrity-checked later.
 
 It is OFF BY DEFAULT. With no `knowledge` object in the store's
-`config.json`, `capture`, `read`, and `check` refuse with the operator hint
-(exit 2), `status` reports `enabled=false`, and nothing is captured,
+`config.json`, `capture`, `flush`, `read`, and `check` refuse with the
+operator hint (exit 2; the flush refusal preserves any pending queue
+entries), `status` reports `enabled=false`, and nothing is captured,
 published, or sent — no journal entry or queue entry is ever written.
 Nothing happens unless a `store.py knowledge ...` command is invoked
 explicitly — by you, or by an agent acting on your explicit instruction;
 there is no automatic, conditional, or injected trigger anywhere in PR1.
+One code-level override exists: the operator kill switch. Setting the
+environment variable `ZMEM_CAPTURE=0` (the same switch the core capture
+and auto-retain lanes honor) makes `knowledge capture` and
+`knowledge flush` refuse immediately — before any sidecar, store, target,
+or network access — with exit `2`; pending queue state is never deleted by
+the refusal. `read`, `check`, and `status` are not gated: verification
+stays available with capture switched off. A disabled `knowledge` config
+object refuses capture AND flush the same way (before any store or hub
+access, preserving pending entries).
 
 Scope of this guide (PR1, approved plan 2026-11-13):
 
@@ -95,6 +105,14 @@ use your own):
 Rules (enforced at load; a present-but-invalid `knowledge` object is a hard
 config error, exit 2 — never silently half-enabled):
 
+- Loading rides the shared `storelib.config.load_config`, whose own
+  contract fails OPEN to `{}` when the WHOLE `config.json` is malformed
+  (invalid JSON, non-object top level, over its size bound). In that
+  whole-file-corruption case the knowledge companion therefore reads as
+  disabled — an availability/validation-masking behavior inherited from
+  the pre-existing shared loader (it can never ENABLE anything or bypass
+  target validation); only a well-formed file with an invalid
+  `knowledge` object fails closed with the error above.
 - `enabled` must be a JSON boolean (`true`/`false`) — anything else is an
   error, not silently-off.
 - Unknown keys anywhere in the `knowledge` object are errors: a typo'd field
@@ -113,7 +131,11 @@ config error, exit 2 — never silently half-enabled):
 The root must **already exist and be a real directory** — the companion
 never creates the vault root, only note files (and the locator's
 subdirectories) under it. Symlinks/junctions (reparse points) on the note
-path, any ancestor, or the root itself are refused.
+path, any ancestor, or the root itself are refused. Path validity is
+checked with the HOST's path rules (`Path.is_absolute`, host separators):
+an absolute root that is valid on one platform (e.g. `D:/notes` on
+Windows) is simply an invalid path on another — a config file is not
+portable across operating systems (CMP-011).
 
 ### `kb-http` target
 
@@ -121,10 +143,10 @@ path, any ancestor, or the root itself are refused.
 |-------|----------|---------|
 | `kind` | yes | the literal `kb-http` |
 | `endpoint` | yes | ONE exact URL: `http`/`https`, non-empty host, path starting `/` and not ending `/`, **no** query, fragment, or userinfo |
-| `allow_http` | no | plain `http://` endpoints require explicit `"allow_http": true` (a disclosed LAN-only carve-out; https is the default) |
+| `allow_http` | no | plain `http://` endpoints require explicit `"allow_http": true` — a disclosed opt-in, not an enforced restriction: the client does NOT verify the endpoint is on your LAN, so the operator is responsible for where they point it. `https` is the default |
 | `credential_env` | exactly one of `credential_env` / `token_file` | name of the environment variable holding the bearer token |
 | `token_file` | (see above) | absolute path to a file holding the bearer token (≤ 4096 bytes) |
-| `timeout_s` | no | request timeout, 0.1..120 s (default 10) |
+| `timeout_s` | no | timeout per individual socket operation, 0.1..120 s (default 10) — NOT an overall request deadline: one create or read is a multi-step exchange (connect, send, receive), so a single exchange can legitimately take longer than one `timeout_s` |
 | `max_response_bytes` | no | response body cap, 256..16777216 (default 1048576) |
 
 Credentials are explicit by design: exactly one named location per target,
@@ -202,8 +224,9 @@ Argument notes:
 - `--locator` on `read`/`check` addresses one explicit immutable version;
   in remote mode (where pointer state lives on the hub) it is how you read
   a version that was captured on another machine.
-- `--summary` defaults to the first non-empty line of the canonical
-  content, bounded to 512 chars. A summary you supply is authored text
+- `--summary` defaults to the FIXED placeholder `knowledge note <key>`
+  (the logical key, bounded to the 512-char pointer cap) — the default is
+  never derived from the note body. A summary you supply is authored text
   that rides the pointer row and the delivery sidecar verbatim (nothing
   downstream re-scans it), so it is screened with the SAME secret-like
   pattern source as the content in the admission step — any detection
@@ -222,12 +245,21 @@ Argument notes:
 ### Exit codes
 
 - `0` — completed: the operation's own outcome is ok (for `capture`, the
-  pointer landed).
+  pointer landed; for `status`, no pointer-store corruption was found).
 - `1` — a reported failure/conflict: pointer `cas_stale`/`conflict`, a
-  `rejected` delivery, or a `check` digest mismatch.
+  `rejected` delivery, a `check` digest mismatch, a `read` digest
+  mismatch (the refusal below), or a `status` that found pointer-store
+  corruption (duplicate live verified rows: the JSON envelope carries
+  `"ok": false` plus a per-identity, content-free `corruption` entry, and
+  no winner is silently picked).
 - `2` — a refusal: usage errors, an invalid `knowledge` config object, a
-  disabled companion, a screening refusal (secret-like content), an
-  unknown target, or an unavailable store.
+  disabled companion (this refuses `capture` AND `flush`, before any
+  store or hub access, preserving pending queue entries), the
+  `ZMEM_CAPTURE=0` kill switch (same scope), a screening refusal
+  (secret-like content), a malformed `--locator`, an unknown target, an
+  unavailable store (`read`/`check`/`status` open the store read-only and
+  a missing/unopenable store is this clean refusal, never a traceback),
+  or undecodable target bytes on a digest-matching `read`.
 - `3` — pending: a `capture` whose immutable version IS published but
   whose pointer is `pending` or merely `queued`, or a `flush` that left
   entries pending (including local-mode leftovers that need remote mode).
@@ -279,7 +311,7 @@ Journal states:
 | `doc_verified` | immutable version exists at the target, read back and digested |
 | `pointer_queued` | pointer op handed to the store / delivery queue |
 | `applied` | pointer landed (terminal) |
-| `quarantined` | operator escape hatch from any non-terminal state (terminal) |
+| `quarantined` | terminal rejection state; see the recovery note below |
 
 Recovery rules (from the code): after a crash at any point, re-running
 `capture` with the same screened input resumes idempotently from the
@@ -288,9 +320,16 @@ the live row (same version+digest is a `noop`; a pointer another writer
 already advanced goes through the CAS/version law, never a blind noop).
 While an identity's latest intent is still ACTIVE
 (non-terminal), a capture with a DIFFERENT digest is refused before the
-create (drive it to a terminal state or quarantine it first); once the
+create (drive it to a terminal state first); once the
 latest intent is terminal, a new digest records a fresh `doc_pending`
 entry — the next version of the same note.
+
+**Quarantine has no recovery command yet.** A quarantined entry is
+terminal: re-publishing the SAME digest under that identity is refused
+(there is no `clear`/`retry` command today — an explicit recovery
+surface is pending an owner decision), while publishing NEW content
+(different digest) records a fresh intent normally. The quarantined
+history is always retained for inspection via `knowledge status`.
 
 ## The pointer contract (namespace, payload, CAS)
 
@@ -375,8 +414,10 @@ bump). Consequences, all explicit:
   (`hub-unsupported`), nothing enqueued, no core-queue fallback.
 - **Unreachable hub:** pointer status `pending` (`hub-unreachable`),
   nothing enqueued.
-- **Rollback:** `flush` re-checks the capability before every apply; a hub
-  that lost it pauses every entry `queued` — nothing sent, nothing dropped.
+- **Rollback:** `flush` re-checks the capability before EVERY batch —
+  including between the batches of one flush (batches of 64), not before
+  every individual op; a hub that lost it pauses every entry `queued` —
+  nothing sent, nothing dropped.
 - In every case the immutable version was still published to its target;
   re-run `capture` (same content → idempotent) or `knowledge flush` once
   the hub advertises the capability. Core memory is unaffected throughout.
@@ -386,7 +427,9 @@ bump). Consequences, all explicit:
 The queue is a separate, bounded, metadata-only sidecar at
 `<store_dir>/knowledge/delivery.json` (remote mode: the data dir) — queue
 entries carry identity/locator/digest-chunks/summary, **never the note
-body**; bounded to 256 queued entries / 512 receipts / 1024 intents /
+body**; the summary they carry is either the fixed `knowledge note <key>`
+placeholder or text you explicitly passed to `--summary` (screened at
+admission). Bounded to 256 queued entries / 512 receipts / 1024 intents /
 2 MiB, atomic and locked like the journal. It is not the core op queue —
 the helper keeps the two lanes separate and its knowledge transport
 refuses a mixed batch (see "Memory fails independently" above).
@@ -395,7 +438,7 @@ refuses a mixed batch (see "Memory fails independently" above).
   a fresh `kl-<uuid>` op id), then one best-effort immediate delivery; the
   result reports `applied`, `rejected`, or still-`queued`.
 - `knowledge flush` (remote profile): drains the queue to the hub in
-  batches of 64, re-checking the capability first. Applied entries
+  batches of 64, re-checking the capability before each batch. Applied entries
   (`committed` / `duplicate` receipts) leave the queue; rejected entries
   leave the queue with their receipt KEPT — the hub recorded the rejection
   against that op id, so a resend would replay it forever; the operator
@@ -414,10 +457,19 @@ the hub actually applied (`pointer_queued` → `applied`).
 
 - Every create is verified by reading the version back and comparing the
   digest (`IntegrityError` on mismatch — the publication is not claimed).
+- `knowledge read` VERIFIES: the actual digest of the bytes just read is
+  compared with the expected digest BEFORE any decode or output. A
+  mismatch is a refusal — `ok: false`, `reason: "digest-mismatch"`, both
+  digests, and NO content field; the CLI exits `1` without writing note
+  bytes to any stream. Only a matching digest returns content (and a
+  digest-matching read whose bytes are not valid UTF-8 is a typed,
+  content-free error, never a traceback).
 - `knowledge check` re-reads the recorded version and compares the full
   SHA-256: exit `0` / `"matches": true` when the target still holds the
-  exact canonical bytes, exit `1` on drift. Readback ≠ semantic truth: a
-  matching digest proves the bytes, not that the note is correct.
+  exact canonical bytes, exit `1` on drift — where `check` REPORTS the
+  drift (both digests, `matches: false`), `read` refuses to emit it.
+  Readback ≠ semantic truth: a matching digest proves the bytes, not that
+  the note is correct.
 - `knowledge read` resolves the version in this order: an explicit
   `--locator` (`provenance` `locator-arg`), then the AUTHORITATIVE pointer
   — the local store's in local profile (`pointer`), or the hub's
@@ -442,8 +494,14 @@ the hub actually applied (`pointer_queued` → `applied`).
   heuristic. Do not treat a passed scan as proof of no secrets.
 - Normalization: CRLF and lone CR become LF; the canonical form ends with
   exactly one terminal newline; UTF-8; note content ≤ 4 MiB.
-- No module logs, and no error message ever embeds note content or a token
-  value — errors name target ids, keys, statuses, and paths only.
+- Every failure surface is a TYPED, content-free error with a nonzero
+  exit — a malformed `--locator`, a non-UTF-8 or hostile target read, a
+  corrupt sidecar, a corrupt pointer store, a capture against corrupt
+  duplicate verified rows (one clean `{"ok": false, "error": …}` JSON
+  object under `--json`, never a raw exception traceback). No module
+  logs, and no error message or traceback embeds note content or a token
+  value — errors name target ids, keys, digests, statuses, and paths
+  only.
 
 ## Security posture (truths, not promises)
 
@@ -452,13 +510,22 @@ the hub actually applied (`pointer_queued` → `applied`).
   silently altered — that is the whole of the claim.
 - The journal, delivery sidecar, receipts, queue entries, and pointer
   payloads carry metadata only — never note bodies, never token values.
+  The one human-authored field is an explicit `--summary` (screened at
+  admission); without it even the summary is the fixed
+  `knowledge note <key>` placeholder.
 - The companion publishes curated documents you author; it has no
   transcript-harvesting path and never publishes raw session logs.
 - KB credentials live in a named env var or token file, read only at
   request time, sent only as a bearer header to the exact configured
   endpoint (no redirects, no proxies, response bodies capped).
 - Imported pointer rows are preserved but demoted (below); trust is never
-  minted by transport, only by the handler's verified readback/relink.
+  minted by transport — but note the write-principal caveat (SEC-004):
+  `verified: true` means THE HANDLER'S admission ran (grammar, CAS,
+  secret-screened summary), not that a human authored the note. On a hub,
+  any principal the operator grants `write`/`mutate` capability to can
+  drive the handler and thereby mint or advance verified pointers; the
+  marker is an integrity boundary over serialized writer surfaces, not an
+  authentication of authorship.
 - Pointer rows are `untrusted_tool`-tainted on arrival at recall surfaces,
   local and remote alike.
 
@@ -475,12 +542,53 @@ the hub actually applied (`pointer_queued` → `applied`).
 - **No remote tombstones of pointers.** A sync file asking to tombstone a
   pointer row is refused (`tombstone_refused`) — pointer state advances
   only through the handler's CAS.
-- **Consolidation protects refs.** Pointer rows are excluded from every
-  near-duplicate selection surface in both directions: write-time exact and
-  semantic dedup, consolidate seeds/keepers/neighbors, organize working
+- **Consolidation protects refs — in this client only.** Pointer rows are
+  excluded from every near-duplicate selection surface in both directions:
+  write-time exact and semantic dedup, the ops-lane identical-content
+  replay fold, consolidate seeds/keepers/neighbors, organize working
   sets, and write-time link neighbors. A normal fact never folds into a
   pointer; a pointer never absorbs or gets absorbed; its tags never
   propagate onto neighbors.
+- **Mixed-version writer rule (FB-009).** The prune exclusion above (and
+  the other pointer predicates) exist only in post-feature clients. A
+  PRE-feature client running `consolidate --prune` against the same
+  shared store has no pointer predicate and will supersede live pointer
+  rows. Do not mix client versions on one store once the knowledge
+  companion is in use; drain old clients first.
+- **Namespace rekey refuses pointer collisions (documented refusal).**
+  Every namespace-move surface (`rekey-namespace` map or `--from`/
+  `--near-miss`, and the schema migration's namespace pass) refuses —
+  before mutating anything — a plan that would place two LIVE VERIFIED
+  pointer rows for the same reserved ref into one namespace (the state
+  `get_pointer` treats as unrecoverable corruption). Two verified rows
+  may legitimately coexist in DIFFERENT namespaces; a move that would
+  concentrate them is rejected with nothing written, and nothing is
+  auto-remapped or auto-tombstoned around it.
+- **Namespace rekey coordination (FB-031).** Every namespace-move
+  surface — `rekey-namespace --from/--near-miss-global`
+  (`storelib.write.rekey_namespace`), `rekey-namespace --map --confirm`
+  (`storelib.rekey.apply_namespace_map`), and the automatic v5
+  namespace-migration/retry lane (`storelib.schema._rekey_namespaces`) —
+  coordinates with the knowledge sidecars before moving rows. The guard
+  takes the journal lock and then the delivery lock (the sidecars' own
+  persistent OS byte-lock files, created on first use when knowledge is
+  enabled so a first-ever capture cannot interleave), reads both sidecars
+  under those locks, and REFUSES the move — before any SQLite or sidecar
+  mutation — while a source or destination namespace carries a durably
+  in-flight publication (a non-terminal journal entry, a queued delivery
+  op, or a not-yet-settled delivery intent). Corrupt or unreadable
+  sidecars, a busy coordination lock, and an invalid knowledge config all
+  refuse (fail closed); terminal-only history and unrelated namespaces
+  never block; sidecars are never auto-remapped and orphaned pointers are
+  never auto-tombstoned. With knowledge disabled and no existing sidecars
+  or lock files, a rekey creates nothing (`<store_dir>/knowledge/` stays
+  absent). This is LOCAL coordination only: the hub cannot see remote
+  clients' `journal.json`/`delivery.json`, so before any namespace rekey
+  a FLEET-WIDE CLIENT DRAIN is mandatory — every client must flush or
+  quiesce its in-flight knowledge publications first; already-stranded
+  FB-031 states (a quarantined old-namespace identity, an orphaned
+  first-create pointer, an eternal pending entry) require separately
+  designed remediation pending an explicit owner decision — not a rekey.
 
 ## Concurrency and known limitations
 

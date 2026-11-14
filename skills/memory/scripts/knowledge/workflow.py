@@ -144,14 +144,18 @@ def _now_iso() -> str:
 
 
 def _default_summary(document) -> str:
-    """First non-empty line of the canonical content, bounded to the
-    pointer summary cap (the store module owns the exact bound)."""
+    """The FIXED default pointer summary: ``knowledge note <logical_key>``.
+
+    Privacy law (FB-012, 2026-11-14): the default NEVER derives from the
+    note body — no first line, no body excerpt.  The pointer row, the
+    delivery queue entry and every other pointer-bound surface therefore
+    carry note-derived text ONLY when the operator explicitly passes
+    ``--summary`` (which is secret-screened at admission).  The logical
+    key is identity metadata (grammar-validated, scanner-safe by
+    construction), not content; the store-side cap slice stays as a
+    belt-and-braces bound."""
     cap = getattr(_storelib_knowledge(), "MAX_SUMMARY_CHARS", 512)
-    for line in document.content.decode("utf-8", "replace").splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped[:cap]
-    return "knowledge note %s" % document.logical_key
+    return ("knowledge note %s" % document.logical_key)[:cap]
 
 
 def _digest_from_chunks(chunks: Any) -> str | None:
@@ -303,9 +307,10 @@ def _journal_record(journal: KnowledgeJournal | None, *, target_id: str,
                 and entry.state == "quarantined"):
             raise WorkflowError(
                 "journal entry for knowledge:%s:%s (namespace %r) is "
-                "quarantined; the operator must clear it before this "
-                "content is re-published" % (target_id, logical_key,
-                                             namespace))
+                "quarantined: no recovery command exists yet (an explicit "
+                "recovery surface is pending an owner decision); publish "
+                "NEW content under this identity to record a fresh intent"
+                % (target_id, logical_key, namespace))
         return journal
     except JournalError as exc:
         entry = journal.entry_for(target_id, logical_key, namespace)
@@ -482,8 +487,18 @@ def capture(*, target_id: str, logical_key: str, text: str,
         if mode == "local":
             if conn is None:
                 raise WorkflowError("local capture requires an open store")
-            current_pointer = store_knowledge.get_pointer(
-                conn, namespace, target_id, logical_key)
+            try:
+                current_pointer = store_knowledge.get_pointer(
+                    conn, namespace, target_id, logical_key)
+            except store_knowledge.KnowledgeError as exc:
+                # Store corruption seen at the predecessor read (e.g. two
+                # live verified rows for one ref): a TYPED, content-free
+                # refusal BEFORE the create (FB-016) — the raw
+                # KnowledgeError (a ValueError) would escape the CLI's
+                # error mapping as a traceback.  The journal entry stays
+                # doc_pending; a retry resumes after the corruption is
+                # resolved deliberately.
+                raise WorkflowError(str(exc)) from exc
             if current_pointer is not None:
                 expected_row_id = current_pointer.row_id
                 version = (current_pointer.version
@@ -533,8 +548,13 @@ def capture(*, target_id: str, logical_key: str, text: str,
     try:
         create_result: CreateResult = client.create(document)
     except (_TargetError, _DocConflictError) as exc:
-        # The intent stays recorded (doc_pending) — a retry with the same
-        # screened content resumes from here.
+        # A create failure arrives TYPED (every I/O failure inside
+        # documents.create is converted to a TargetError subclass — a raw
+        # OSError never reaches here), so this one handler covers the
+        # whole failure surface: the intent stays recorded at
+        # doc_pending (no advance to doc_verified, no pointer queue
+        # transition) and a retry with the same screened content resumes
+        # from here with a clean, content-free error.
         raise WorkflowError(str(exc)) from exc
     _journal_mark(tracked_journal, target_id=target_id,
                   logical_key=logical_key, state="doc_verified",
@@ -960,14 +980,23 @@ def _resolve_current(*, mode: str, conn, namespace: str, delivery,
     return None
 
 
-def read(*, target_id: str, logical_key: str, locator: str | None = None,
-         namespace: str = _DEFAULT_NAMESPACE, mode: str = "local",
-         conn=None, config=None, journal=None, delivery=None, http=None,
-         env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Read one immutable version's canonical bytes from the target.
+def _read_current(*, target_id: str, logical_key: str,
+                  locator: str | None = None,
+                  namespace: str = _DEFAULT_NAMESPACE, mode: str = "local",
+                  conn=None, config=None, journal=None, delivery=None,
+                  http=None,
+                  env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The PRIVATE byte-read engine shared by ``read`` and ``check``.
 
-    In remote mode the CURRENT version is the hub's authoritative pointer
-    (``http`` defaults to the configured hub transport)."""
+    Resolves the addressed version, reads the target's bytes, computes the
+    actual digest — and STOPS there.  It never decodes and never emits:
+    callers decide what a mismatch means (``read`` refuses before any
+    decode/output, FB-011; ``check`` reports ``matches: false``).  Malformed
+    locators and hostile target answers surface as TYPED, content-free
+    :class:`WorkflowError` — a raw ValueError/UnicodeDecodeError never
+    escapes this module."""
+    from knowledge.documents import content_digest, parse_locator  # noqa: PLC0415
+
     if config is None:
         from knowledge.config import load_knowledge_config  # noqa: PLC0415
 
@@ -980,6 +1009,14 @@ def read(*, target_id: str, logical_key: str, locator: str | None = None,
             KnowledgeDelivery, default_delivery_path)
 
         delivery = KnowledgeDelivery(default_delivery_path())
+    if locator is not None:
+        try:
+            parse_locator(locator)
+        except ValueError as exc:
+            raise WorkflowError(
+                "locator %r is malformed: expected "
+                "'<logical-key>/<4x16hex>.md' addressing key %r"
+                % (locator, logical_key)) from exc
     resolved = _resolve_current(
         mode=mode, conn=conn, namespace=namespace, delivery=delivery,
         journal=journal, target_id=target_id, logical_key=logical_key,
@@ -994,17 +1031,71 @@ def read(*, target_id: str, logical_key: str, locator: str | None = None,
         content = client.read(use_locator)
     except _TargetError as exc:
         raise WorkflowError(str(exc)) from exc
-    from knowledge.documents import content_digest  # noqa: PLC0415
-
+    except ValueError as exc:
+        # A malformed locator surviving to the target client (its own
+        # parse) — typed, content-free, never a raw traceback.
+        raise WorkflowError(
+            "locator %r is malformed for target %r"
+            % (use_locator, target_id)) from exc
     return {
-        "ok": True,
         "target": target_id,
         "key": logical_key,
         "locator": use_locator,
         "expected_digest": expected_digest,
         "actual_digest": content_digest(content),
         "provenance": provenance,
-        "content": content.decode("utf-8"),
+        "content_bytes": content,
+    }
+
+
+def read(*, target_id: str, logical_key: str, locator: str | None = None,
+         namespace: str = _DEFAULT_NAMESPACE, mode: str = "local",
+         conn=None, config=None, journal=None, delivery=None, http=None,
+         env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Read one immutable version's canonical bytes from the target —
+    VERIFIED (FB-011, 2026-11-14).
+
+    The actual digest of the bytes just read is compared with the expected
+    digest BEFORE any decode or output.  A mismatch is a REFUSAL: the
+    envelope answers ``ok: false`` with ``reason: "digest-mismatch"`` and
+    BOTH digests, carries NO content field, and the CLI maps it to a
+    nonzero exit without writing note bytes to any stream.  Only a
+    matching digest returns ``content``.  In remote mode the CURRENT
+    version is the hub's authoritative pointer (``http`` defaults to the
+    configured hub transport)."""
+    result = _read_current(
+        target_id=target_id, logical_key=logical_key, locator=locator,
+        namespace=namespace, mode=mode, conn=conn, config=config,
+        journal=journal, delivery=delivery, http=http, env=env)
+    if result["actual_digest"] != result["expected_digest"]:
+        return {
+            "ok": False,
+            "reason": "digest-mismatch",
+            "target": result["target"],
+            "key": result["key"],
+            "locator": result["locator"],
+            "expected_digest": result["expected_digest"],
+            "actual_digest": result["actual_digest"],
+            "provenance": result["provenance"],
+        }
+    try:
+        text = result["content_bytes"].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The digest matched what was asked for, but the bytes are not
+        # decodable (a hand-crafted locator against foreign bytes): a
+        # typed, content-free read error, never a traceback.
+        raise WorkflowError(
+            "knowledge read: target %r bytes at %r are not valid UTF-8"
+            % (result["target"], result["locator"])) from exc
+    return {
+        "ok": True,
+        "target": result["target"],
+        "key": result["key"],
+        "locator": result["locator"],
+        "expected_digest": result["expected_digest"],
+        "actual_digest": result["actual_digest"],
+        "provenance": result["provenance"],
+        "content": text,
     }
 
 
@@ -1012,16 +1103,20 @@ def check(*, target_id: str, logical_key: str, locator: str | None = None,
           namespace: str = _DEFAULT_NAMESPACE, mode: str = "local",
           conn=None, config=None, journal=None, delivery=None, http=None,
           env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Integrity check: re-read the recorded version and compare digests."""
-    result = read(target_id=target_id, logical_key=logical_key,
-                  locator=locator, namespace=namespace, mode=mode,
-                  conn=conn, config=config, journal=journal,
-                  delivery=delivery, http=http, env=env)
+    """Integrity check: re-read the recorded version and compare digests.
+
+    Contract unchanged by FB-011: a mismatch answers ``ok: false`` /
+    ``matches: false`` (CLI exit 1) with BOTH digests and NO content —
+    the check REPORTS drift, it does not refuse to look."""
+    result = _read_current(
+        target_id=target_id, logical_key=logical_key, locator=locator,
+        namespace=namespace, mode=mode, conn=conn, config=config,
+        journal=journal, delivery=delivery, http=http, env=env)
     matches = result["actual_digest"] == result["expected_digest"]
     return {
         "ok": matches,
-        "target": target_id,
-        "key": logical_key,
+        "target": result["target"],
+        "key": result["key"],
         "locator": result["locator"],
         "expected_digest": result["expected_digest"],
         "actual_digest": result["actual_digest"],
@@ -1213,13 +1308,16 @@ def flush(*, journal=None, delivery=None, http=None,
     # Restart recovery: receipts persisted by a flush that crashed before
     # this reconciliation.  The queue replay cannot cover these (the
     # entry left the queue WITH its receipt) — the still-queued intent
-    # naming the op is the recovery key.
+    # naming the op is the recovery key.  ONE sidecar snapshot serves the
+    # whole pass (a per-receipt re-read made flush cost quadratic in
+    # persisted receipts and re-locked the file per receipt).
     recovered = 0
+    snapshot_intents = delivery.snapshot()["intents"]
     for op_id, receipt in receipts.items():
         if op_id in before or not isinstance(receipt, dict):
             continue
         intent = next(
-            (r for r in delivery.snapshot()["intents"].values()
+            (r for r in snapshot_intents.values()
              if isinstance(r, dict) and r.get("op_id") == op_id
              and r.get("state") not in _STAKE_SPENT_STATES
              and r.get("state") not in ("rejected", "cas_stale",
@@ -1260,7 +1358,12 @@ def status(*, target_id: str | None = None, logical_key: str | None = None,
            conn=None, config=None, journal=None, delivery=None,
            env: Mapping[str, str] | None = None) -> dict[str, Any]:
     """The operator's one-stop view: config, journal, delivery queue,
-    receipts, and (local mode) the authoritative pointers."""
+    receipts, and (local mode) the authoritative pointers.
+
+    Pointer-store corruption (duplicate live verified rows for one ref)
+    is REPORTED, not swallowed: the envelope answers ``ok: false`` with a
+    per-identity ``corruption`` entry carrying a content-free code
+    (FB-016)."""
     if config is None:
         from knowledge.config import load_knowledge_config  # noqa: PLC0415
 
@@ -1330,6 +1433,7 @@ def status(*, target_id: str | None = None, logical_key: str | None = None,
     if target_id is not None and logical_key is not None:
         identities.add((target_id, logical_key))
     pointers = []
+    corruption: list[dict[str, str]] = []
     if conn is not None:
         for tid, key in sorted(identities):
             try:
@@ -1337,7 +1441,19 @@ def status(*, target_id: str | None = None, logical_key: str | None = None,
                     conn, namespace, tid, key)
                 rows = store_knowledge.get_pointer_rows(
                     conn, namespace, tid, key)
-            except ValueError:
+            except store_knowledge.KnowledgePointerConflict as exc:
+                # Duplicate live verified rows = store corruption: REPORT
+                # it (typed, content-free) instead of swallowing it — the
+                # old blanket ``except ValueError: continue`` hid exactly
+                # this class (FB-016).  A winner is never silently picked.
+                corruption.append({
+                    "target": tid,
+                    "key": key,
+                    "code": "duplicate-verified-rows",
+                    "error": str(exc),
+                })
+                continue
+            except store_knowledge.KnowledgeRefError:
                 continue  # grammar-refused identity: shown via journal rows
             pointers.append({
                 "target": tid,
@@ -1355,4 +1471,11 @@ def status(*, target_id: str | None = None, logical_key: str | None = None,
                           "verified": r["verified"]} for r in rows],
             })
     out["pointers"] = pointers
+    if corruption:
+        # Structured corruption report (FB-016): the surface answers
+        # ok:false with a per-identity, content-free corruption code —
+        # the CLI maps it to a nonzero exit instead of a silently
+        # incomplete pointer list.
+        out["ok"] = False
+        out["corruption"] = corruption
     return out

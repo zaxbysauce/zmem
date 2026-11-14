@@ -46,6 +46,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -62,8 +63,8 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from knowledge import workflow  # noqa: E402
 from knowledge.config import load_knowledge_config  # noqa: E402
 from knowledge.delivery import (  # noqa: E402
-    CAPABILITY, KnowledgeDelivery, build_link_op, flush_to_hub,
-    hub_capability_status)
+    CAPABILITY, DeliveryError, KnowledgeDelivery, build_link_op,
+    flush_to_hub, hub_capability_status)
 from knowledge.documents import prepare_document  # noqa: E402
 from knowledge.journal import KnowledgeJournal  # noqa: E402
 from storelib import ops as opslib  # noqa: E402
@@ -516,6 +517,204 @@ class WholeCallDenialTests(unittest.TestCase):
         self.assertEqual([len(batch) for batch in hub.ops_seen], [2, 1, 1])
 
 
+class _SelectiveReceiptHub:
+    """A capable hub whose ``ok: true`` answer OMITS the receipt for every
+    op id in ``omit`` — the receipt-omission shape that used to loop a
+    flush forever (one apply attempt per op per flush is the law now)."""
+
+    def __init__(self, omit=()):
+        self.omit = set(omit)
+        self.ops_seen: list[list[dict]] = []
+        self.hello_calls = 0
+
+    def hello(self):
+        self.hello_calls += 1
+        return {"protocol": 1, "capabilities": ["apply-ops", CAPABILITY],
+                "zmem_version": "test-hub"}
+
+    def apply_knowledge_ops(self, ops, principal: str = "", **_kw):
+        self.ops_seen.append(copy.deepcopy(list(ops)))
+        return {"ok": True, "receipts": [
+            {"op_id": op["op_id"], "status": "committed",
+             "link_status": "created", "canonical_id": "row-x"}
+            for op in ops if op["op_id"] not in self.omit]}
+
+
+class _SplitOmitHub(_DenyingHub):
+    """Whole-batch calls are DENIED; the split single for an omitted op
+    answers ``ok: true`` with NO receipt for it."""
+
+    def __init__(self, omit=()):
+        super().__init__(batch_reason="capability_denied")
+        self.omit = set(omit)
+
+    def apply_knowledge_ops(self, ops, principal: str = "", **_kw):
+        import copy as _copy
+
+        self.ops_seen.append(_copy.deepcopy(list(ops)))
+        if len(ops) > 1:
+            return {"ok": False, "reason": self.batch_reason}
+        op = ops[0]
+        if op["op_id"] in self.omit:
+            return {"ok": True, "receipts": []}
+        return {"ok": True, "receipts": [
+            {"op_id": op["op_id"], "status": "committed",
+             "link_status": "created", "canonical_id": "row-x"}]}
+
+
+class _FlakyCapabilityHub(_DenyingHub):
+    """Capable for the first ``capable_hellos`` hello calls, then rolled
+    back (mid-flush capability loss)."""
+
+    def __init__(self, capable_hellos=1):
+        super().__init__()
+        self.capable_hellos = capable_hellos
+        self.hello_calls = 0
+
+    def hello(self):
+        self.hello_calls += 1
+        capabilities = ["apply-ops"]
+        if self.hello_calls <= self.capable_hellos:
+            capabilities.append(CAPABILITY)
+        return {"protocol": 1, "capabilities": capabilities,
+                "zmem_version": "test-hub"}
+
+
+class BoundedFlushTests(unittest.TestCase):
+    """FB-006: a flush hands every queued op to the hub AT MOST ONCE per
+    invocation (split-denial path included); a missing receipt ends the
+    flush with an explicit no-receipt verdict and the entry stays queued
+    for the NEXT flush — a receipt-omitting hub can never loop the caller.
+    """
+
+    def test_missing_receipt_one_attempt_then_next_flush_recovers(self):
+        env = _Env()
+        hub = _SelectiveReceiptHub(omit={"kl-nr-2"})
+        env.delivery.enqueue(_queue_entry("kl-nr-1", key="run/ok"))
+        env.delivery.enqueue(_queue_entry("kl-nr-2", key="run/miss"))
+        flush = flush_to_hub(env.delivery, hub)
+        self.assertFalse(flush["ok"], flush)
+        self.assertEqual(flush["reason"], "no-receipt", flush)
+        self.assertEqual(flush["applied"], ["kl-nr-1"], flush)
+        self.assertEqual(flush["pending"], 1, flush)
+        # Exactly ONE apply attempt for the omitted op this flush: one
+        # batch carried both ops, and nothing was resent.
+        self.assertEqual([len(batch) for batch in hub.ops_seen], [2],
+                         hub.ops_seen)
+        singles = [b for b in hub.ops_seen
+                   if len(b) == 1 and b[0]["op_id"] == "kl-nr-2"]
+        self.assertEqual(singles, [])
+        # The receiptless entry stays queued with its attempt noted.
+        queued = env.delivery.pending()
+        self.assertEqual([e["op_id"] for e in queued], ["kl-nr-2"])
+        self.assertGreaterEqual(queued[0]["attempts"], 1)
+        self.assertEqual(queued[0]["last_error"], "no-receipt")
+        # A LATER explicit flush against a good hub retries ONCE and
+        # succeeds — this is the infinite-loop kill.
+        good = _DenyingHub()
+        second = flush_to_hub(env.delivery, good)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["applied"], ["kl-nr-2"], second)
+        self.assertEqual(env.delivery.pending(), [])
+
+    def test_split_denial_missing_receipt_also_single_attempt(self):
+        env = _Env()
+        hub = _SplitOmitHub(omit={"kl-sp-2"})
+        env.delivery.enqueue(_queue_entry("kl-sp-1", key="run/ok"))
+        env.delivery.enqueue(_queue_entry("kl-sp-2", key="run/miss"))
+        flush = flush_to_hub(env.delivery, hub)
+        self.assertFalse(flush["ok"], flush)
+        self.assertEqual(flush["reason"], "no-receipt", flush)
+        self.assertEqual(flush["applied"], ["kl-sp-1"], flush)
+        self.assertEqual(flush["pending"], 1, flush)
+        # Batch (denied) + one single each; the omitted op's single call
+        # happened exactly once and the flush RETURNED instead of looping.
+        self.assertEqual([len(batch) for batch in hub.ops_seen], [2, 1, 1],
+                         hub.ops_seen)
+        self.assertEqual([e["op_id"] for e in env.delivery.pending()],
+                         ["kl-sp-2"])
+        entry = env.delivery.pending()[0]
+        self.assertEqual(entry["last_error"], "no-receipt")
+
+    def test_capability_lost_midflush_prevents_next_batch(self):
+        env = _Env()
+        # Capable for the initial check + first batch only; with a
+        # one-op batch size the second entry needs a SECOND batch, which
+        # the between-batches capability re-check must never send.
+        hub = _FlakyCapabilityHub(capable_hellos=1)
+        env.delivery.enqueue(_queue_entry("kl-cap-1", key="run/one"))
+        env.delivery.enqueue(_queue_entry("kl-cap-2", key="run/two"))
+        with mock.patch("knowledge.delivery._FLUSH_BATCH", 1):
+            flush = flush_to_hub(env.delivery, hub)
+        self.assertFalse(flush["ok"], flush)
+        self.assertEqual(flush["reason"], "hub-unsupported", flush)
+        self.assertTrue(flush["paused"], flush)
+        self.assertEqual(flush["applied"], ["kl-cap-1"], flush)
+        self.assertEqual(flush["pending"], 1, flush)
+        # The rolled-back entry was NEVER sent.
+        sent = [op["op_id"] for batch in hub.ops_seen for op in batch]
+        self.assertEqual(sent, ["kl-cap-1"])
+        self.assertEqual(
+            [e["op_id"] for e in env.delivery.pending()], ["kl-cap-2"])
+        self.assertEqual(env.delivery.pending()[0]["last_error"],
+                         "hub-unsupported")
+
+
+class SidecarBoundWriteTests(unittest.TestCase):
+    """The sidecar refuses instead of truncating an over-bound queue, and
+    hub-controlled receipt fields are validated/bounded at the write."""
+
+    def test_overbound_queue_refuses_without_truncation(self):
+        env = _Env()
+        sidecar = Path(env.tmp) / "knowledge" / "delivery.json"
+        for index in range(3):
+            env.delivery.enqueue(_queue_entry(
+                "kl-full-%d" % index, key="run/full-%d" % index))
+        self.assertEqual(len(env.delivery.pending()), 3)
+        before = sidecar.read_bytes()
+        # A narrowed bound (or an edited file) must REFUSE every later
+        # write — the old code silently sliced the queue at _write.
+        narrow = KnowledgeDelivery(sidecar, max_queue=2)
+        with self.assertRaises(DeliveryError) as ctx:
+            narrow.note_attempt(["kl-full-2"], error="probe")
+        self.assertIn("refusing to write", str(ctx.exception))
+        self.assertEqual(sidecar.read_bytes(), before,
+                         "no mutation on the atomic refuse")
+        # And enqueue still refuses new entries at the bound (never a
+        # silent drop, never truncation).
+        with self.assertRaises(DeliveryError):
+            narrow.enqueue(_queue_entry("kl-full-3", key="run/full-3"))
+        self.assertEqual(len(narrow.pending()), 3)
+        self.assertEqual(sidecar.read_bytes(), before)
+
+    def test_oversize_receipt_field_rejected_typed(self):
+        env = _Env()
+        sidecar = Path(env.tmp) / "knowledge" / "delivery.json"
+        env.delivery.enqueue(_queue_entry("kl-rb", key="run/rb"))
+        before = sidecar.read_bytes()
+        for bad in (
+            {"op_id": "kl-big", "status": "committed",
+             "error": "x" * 5000},
+            {"op_id": "kl-obj" * 40, "status": "committed"},
+            {"op_id": "kl-nest", "status": "committed",
+             "link_status": {"deep": "object"}},
+            {"op_id": "", "status": "committed"},
+        ):
+            with self.subTest(op=bad["op_id"][:16]):
+                with self.assertRaises(DeliveryError):
+                    env.delivery.record_receipt(bad)
+        self.assertEqual(env.delivery.receipts(), {})
+        self.assertEqual(sidecar.read_bytes(), before,
+                         "a rejected receipt must not mutate the sidecar")
+        # A well-formed receipt still lands (correlation by op_id).
+        env.delivery.record_receipt(
+            {"op_id": "kl-good", "target": "notes", "key": "run/rb",
+             "status": "committed", "link_status": "created",
+             "version": 1, "row_id": "row-x", "error": None})
+        self.assertEqual(env.delivery.receipts()["kl-good"]["status"],
+                         "committed")
+
+
 class TransportMethodTests(unittest.TestCase):
     """McpHttp.apply_knowledge_ops: the separate lane's client contract
     (exercised with a stub call_fn — NOT a live hub)."""
@@ -655,6 +854,91 @@ class TransportMethodTests(unittest.TestCase):
                                   "reason": "capability_denied"})
 
 
+class IntentRetentionTests(unittest.TestCase):
+    """FB-014: the intent map's bound is state-aware (the journal's
+    _retained law, mirrored).  Settled intents are evicted oldest-first;
+    an in-flight stake is NEVER evicted while a settled intent remains,
+    and an all-in-flight overflow refuses atomically (byte-identical
+    file) instead of silently dropping an active stake."""
+
+    @staticmethod
+    def _fields(state: str) -> dict:
+        return {"target": "notes", "key": "run/x", "namespace": "user:global",
+                "digest": "d" * 64, "locator": "run/x/" + "a" * 64 + ".md",
+                "version": 1, "expected_row_id": None, "row_id": None,
+                "state": state, "op_id": None, "staked": True}
+
+    def test_overflow_evicts_settled_not_the_new_stake(self):
+        sidecar = Path(tempfile.mkdtemp(prefix="zmem-kndl-intent-")) \
+            / "knowledge" / "delivery.json"
+        delivery = KnowledgeDelivery(sidecar, max_intents=3)
+        for key in ("run/old", "run/mid", "run/new"):
+            delivery.set_intent(ref="knowledge:notes:%s" % key,
+                                fields=self._fields("applied"))
+        # At capacity: one more IN-FLIGHT stake evicts the OLDEST settled
+        # intent, never the fresh stake.
+        stake = delivery.set_intent(ref="knowledge:notes:run/stake",
+                                    fields=self._fields("staked"))
+        self.assertEqual(stake["state"], "staked")
+        intents = delivery.snapshot()["intents"]
+        self.assertIn("|knowledge:notes:run/stake", intents)
+        self.assertNotIn("|knowledge:notes:run/old", intents,
+                         "the OLDEST settled intent is the eviction "
+                         "candidate, not the in-flight stake")
+        self.assertEqual(len(intents), 3)
+
+    def test_all_inflight_overflow_refuses_atomically(self):
+        sidecar = Path(tempfile.mkdtemp(prefix="zmem-kndl-intent-")) \
+            / "knowledge" / "delivery.json"
+        delivery = KnowledgeDelivery(sidecar, max_intents=2)
+        delivery.set_intent(ref="knowledge:notes:run/a",
+                            fields=self._fields("staked"))
+        # An UNRECOGNIZED state is in flight too (fail-closed retention).
+        delivery.set_intent(ref="knowledge:notes:run/b",
+                            fields=self._fields("unknown-state"))
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        before = sidecar.read_bytes()
+        with self.assertRaises(DeliveryError) as ctx:
+            delivery.set_intent(ref="knowledge:notes:run/c",
+                                fields=self._fields("staked"))
+        self.assertIn("IN-FLIGHT", str(ctx.exception))
+        self.assertEqual(sidecar.read_bytes(), before,
+                         "the atomic refusal must not mutate the sidecar")
+
+    def test_updated_settled_key_keeps_slot_but_not_at_stakes_expense(self):
+        """The reviewer's exact scenario: dict update preserves insertion
+        order, so updating an old settled intent keeps its ORIGINAL slot.
+        A later new identity overflowing the bound must still evict a
+        SETTLED intent (by insertion order among settled only) — the old
+        pop-first eviction dropped the fresh in-flight stake at slot 0."""
+        sidecar = Path(tempfile.mkdtemp(prefix="zmem-kndl-intent-")) \
+            / "knowledge" / "delivery.json"
+        delivery = KnowledgeDelivery(sidecar, max_intents=3)
+        # Insertion order: an in-flight stake FIRST, then settled intents.
+        delivery.set_intent(ref="knowledge:notes:run/stake",
+                            fields=self._fields("staked"))
+        delivery.set_intent(ref="knowledge:notes:run/settled-1",
+                            fields=self._fields("applied"))
+        delivery.set_intent(ref="knowledge:notes:run/settled-2",
+                            fields=self._fields("applied"))
+        # Update the OLD settled intent (kept its original insertion slot).
+        delivery.set_intent(ref="knowledge:notes:run/settled-1",
+                            fields=self._fields("applied"))
+        # A new identity overflows the bound: the stake survives.
+        delivery.set_intent(ref="knowledge:notes:run/new",
+                            fields=self._fields("staked"))
+        intents = delivery.snapshot()["intents"]
+        self.assertIn("|knowledge:notes:run/stake", intents,
+                      "the pre-existing in-flight stake must survive")
+        self.assertIn("|knowledge:notes:run/new", intents,
+                      "the fresh stake must survive")
+        self.assertNotIn("|knowledge:notes:run/settled-1",
+                         intents,
+                         "the oldest settled intent (by insertion order "
+                         "among settled) is evicted instead")
+        self.assertEqual(len(intents), 3)
+
+
 class EngineAdmissionTests(unittest.TestCase):
     """The ops engine's knowledge_link admission (the SAME engine the hub
     runs): namespace first, closed whitelist, capability split."""
@@ -698,6 +982,34 @@ class EngineAdmissionTests(unittest.TestCase):
             result = self._apply(env, [op])
             self.assertEqual(result["receipts"][0]["error"], "bad_op",
                              "args after mutate: %r" % op["args"])
+        # MIC-PLAT-004: Windows reserved device names are path-shaped —
+        # bare, with an extension, as a path segment, in any field the
+        # shape check covers, case-insensitive.
+        for mutate in (
+            lambda a: a.update({"locator": "CON"}),
+            lambda a: a.update({"locator": "con.md"}),
+            lambda a: a.update({"locator": "run/con/x.md"}),
+            lambda a: a.update({"locator": "notes/NUL.txt"}),
+            lambda a: a.update({"locator": "com3"}),
+            lambda a: a.update({"key": "aux"}),
+            lambda a: a.update({"target": "LPT9"}),
+            lambda a: a.update({"expected_row_id": "prn"}),
+        ):
+            op = _link_op("kl-res")
+            mutate(op["args"])
+            result = self._apply(env, [op])
+            self.assertEqual(result["receipts"][0]["error"], "bad_op",
+                             "reserved-name args after mutate: %r"
+                             % op["args"])
+        # Near misses stay ADMITTED (the stem is not a reserved name):
+        # "console", "com10" (beyond COM9) and dotted non-reserved stems.
+        for locator in ("run/console/notes.md", "com10.md", "notes.txt.md"):
+            op = _link_op("kl-nr", key="run/near-%s" % locator.replace(
+                "/", "-").replace(".", "-"))
+            op["args"]["locator"] = locator
+            result = self._apply(env, [op])
+            self.assertNotEqual(result["receipts"][0]["error"], "bad_op",
+                                "non-reserved locator refused: %r" % locator)
 
     def test_capability_split_write_vs_mutate(self):
         env = _Env()

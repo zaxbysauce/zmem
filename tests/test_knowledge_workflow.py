@@ -44,7 +44,9 @@ import sqlite3
 import subprocess
 import sys
 import unittest
+import uuid
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -1717,6 +1719,123 @@ class FlushRestartRecoveryTests(unittest.TestCase):
         self.assertEqual(intent["state"], "rejected")
 
 
+class CreateFailureTests(unittest.TestCase):
+    """FB-007 (workflow side): a typed create failure leaves the journal
+    intent at doc_pending — no advance to doc_verified, no pointer queue
+    transition — and surfaces a clean, content-free WorkflowError.
+    FB-021: an unreadable note at the READ surface is likewise typed —
+    the workflow never lets a raw OSError escape as a traceback."""
+
+    def test_unreadable_note_read_surfaces_typed_workflow_error(self):
+        """The CLI's read path catches only WorkflowError (cli.py) and
+        _read_current catches only (TargetError, ValueError): the
+        MarkdownStore read must convert an OSError itself (FB-021), so
+        the workflow surface stays a clean, content-free error."""
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            workflow.capture(
+                target_id="notes", logical_key="run-notes", text=NOTE_V1,
+                mode="local", conn=conn, config=env.config(),
+                journal=env.journal, delivery=env.delivery)
+            with mock.patch("knowledge.documents._read_bounded",
+                            side_effect=PermissionError("denied")):
+                with self.assertRaises(workflow.WorkflowError) as ctx:
+                    workflow.read(
+                        target_id="notes", logical_key="run-notes",
+                        mode="local", conn=conn, config=env.config(),
+                        journal=env.journal, delivery=env.delivery)
+            self.assertIn("PermissionError", str(ctx.exception))
+            self.assertNotIsInstance(ctx.exception, OSError)
+        finally:
+            conn.close()
+
+    def test_create_failure_keeps_doc_pending_and_recovers(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            def broken_link(src, dst, **_kw):
+                raise OSError("simulated publish failure")
+
+            with mock.patch("os.link", broken_link):
+                with self.assertRaises(workflow.WorkflowError) as ctx:
+                    workflow.capture(
+                        target_id="notes", logical_key="run-notes",
+                        text=NOTE_V1, mode="local", conn=conn,
+                        config=env.config(), journal=env.journal,
+                        delivery=env.delivery)
+            self.assertNotIn("Pipefail", str(ctx.exception),
+                             "the error must stay content-free")
+            # The intent stays doc_pending: no doc_verified advance, no
+            # pointer_queued transition, nothing enqueued.
+            entry = env.journal.entry_for(
+                "notes", "run-notes", namespace="user:global")
+            self.assertEqual(entry.state, "doc_pending")
+            self.assertEqual(env.delivery.pending(), [])
+            intent = env.delivery.get_intent(
+                "knowledge:notes:run-notes", namespace="user:global")
+            self.assertEqual(intent["state"], "staked")
+            self.assertIsNone(store_knowledge.get_pointer(
+                conn, "user:global", "notes", "run-notes"))
+            self.assertEqual(list(env.vault.rglob("*.md")), [],
+                             "no partial final was published")
+            # The retry with a healthy link completes end to end.
+            result = workflow.capture(
+                target_id="notes", logical_key="run-notes", text=NOTE_V1,
+                mode="local", conn=conn, config=env.config(),
+                journal=env.journal, delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["journal_state"], "applied")
+        finally:
+            conn.close()
+
+
+class FlushSnapshotCostTests(unittest.TestCase):
+    """FB-013: one workflow flush takes exactly ONE delivery sidecar
+    snapshot for the whole restart-recovery pass (the per-receipt re-read
+    made flush cost quadratic in persisted receipts)."""
+
+    def test_exactly_one_snapshot_per_flush(self):
+        env = _Env()
+        delivery = env.delivery
+        # Two orphan receipts (entries long gone from the queue, intents
+        # still naming the ops) drive the recovery pass.
+        for index in (1, 2):
+            key = "run/orphan-%d" % index
+            doc = prepare_document("notes", key, "orphan body %d\n" % index)
+            delivery.set_intent(
+                ref="knowledge:notes:%s" % key, namespace="user:global",
+                fields={"target": "notes", "key": key,
+                        "namespace": "user:global", "digest": doc.digest,
+                        "locator": doc.locator, "version": 1,
+                        "expected_row_id": None, "row_id": None,
+                        "state": "queued", "op_id": "kl-orphan-%d" % index,
+                        "staked": True})
+            delivery.record_receipt({
+                "op_id": "kl-orphan-%d" % index, "target": "notes",
+                "key": key, "status": "committed",
+                "link_status": "created", "version": 1,
+                "row_id": "row-%d" % index, "error": None})
+        calls = {"snapshot": 0}
+        real_snapshot = delivery.snapshot
+
+        def counting_snapshot():
+            calls["snapshot"] += 1
+            return real_snapshot()
+
+        with mock.patch.object(delivery, "snapshot", counting_snapshot):
+            result = workflow.flush(journal=env.journal,
+                                    delivery=delivery, http=None)
+        self.assertEqual(result["recovered_from_receipts"], 2, result)
+        self.assertEqual(calls["snapshot"], 1,
+                         "exactly one sidecar snapshot per flush")
+        for index in (1, 2):
+            intent = delivery.get_intent(
+                "knowledge:notes:run/orphan-%d" % index,
+                namespace="user:global")
+            self.assertEqual(intent["state"], "applied")
+
+
 class JournalFreshParentTests(unittest.TestCase):
     """A DIRECT constructor against a fresh nested path works: the lock
     file's parent is created before the lock is opened (no caller-side
@@ -2089,6 +2208,588 @@ class DeliveryLockTests(unittest.TestCase):
         stored = KnowledgeDelivery(sidecar, lock_timeout_s=2.0).enqueue(
             dict(entry))
         self.assertEqual(stored["status"], "queued")
+
+
+class ReadIntegrityTests(unittest.TestCase):
+    """FB-011 (2026-11-14): `read` VERIFIES — the actual digest of the
+    bytes just read is compared with the expected digest BEFORE any
+    decode or output.  A mismatch is a refusal with NO content bytes in
+    the result envelope or any CLI stream; `check`'s contract (ok:false /
+    matches:false / exit 1 / no content) is unchanged."""
+
+    DISTINCT = "ZIRCONIUM-HAMMOCK-CRUCIBLE distinctive first line\n"
+
+    def _captured_env(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.capture(
+                target_id="notes", logical_key="run-notes",
+                text=NOTE_V1, mode="local", conn=conn,
+                config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+        finally:
+            conn.close()
+        return env
+
+    @staticmethod
+    def _tamper(env):
+        note_files = list(env.vault.rglob("*.md"))
+        assert len(note_files) == 1
+        note_files[0].write_bytes(b"tampered bytes replacing the note\n")
+
+    def test_local_mismatch_refusal_zero_content_anywhere(self):
+        env = self._captured_env()
+        self._tamper(env)
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.read(
+                target_id="notes", logical_key="run-notes", mode="local",
+                conn=conn, config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["reason"], "digest-mismatch")
+            self.assertNotIn("content", result)
+            self.assertEqual(len(result["expected_digest"]), 64)
+            self.assertEqual(len(result["actual_digest"]), 64)
+            self.assertNotEqual(result["expected_digest"],
+                                result["actual_digest"])
+            # check contract unchanged: REPORTS the drift, no content.
+            check = workflow.check(
+                target_id="notes", logical_key="run-notes", mode="local",
+                conn=conn, config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertFalse(check["ok"])
+            self.assertFalse(check["matches"])
+            self.assertNotIn("content", check)
+        finally:
+            conn.close()
+
+    def test_matching_digest_still_returns_content(self):
+        env = self._captured_env()
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.read(
+                target_id="notes", logical_key="run-notes", mode="local",
+                conn=conn, config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["content"],
+                             NOTE_V1.rstrip("\n") + "\n")
+            self.assertEqual(result["expected_digest"],
+                             result["actual_digest"])
+        finally:
+            conn.close()
+
+    def test_remote_mismatch_refusal_no_content(self):
+        host_b = _Env()
+        doc = prepare_document("notes", "run-notes", NOTE_V1)
+        # The hub authoritatively points at doc's locator, but this host's
+        # vault holds DIFFERENT bytes at that path.
+        rel = doc.locator.split("/")
+        note_dir = host_b.vault.joinpath(*rel[:-1])
+        note_dir.mkdir(parents=True, exist_ok=True)
+        note_dir.joinpath(rel[-1]).write_bytes(b"not the published bytes\n")
+        hub = _PointerHub(pointer={
+            "row_id": "row-11", "version": 1, "locator": doc.locator,
+            "full_sha256": doc.digest, "summary": "s"})
+        result = workflow.read(
+            target_id="notes", logical_key="run-notes", mode="remote",
+            config=host_b.config(), journal=host_b.journal,
+            delivery=host_b.delivery, http=hub)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason"], "digest-mismatch")
+        self.assertNotIn("content", result)
+        self.assertEqual(result["provenance"], "hub-pointer")
+        check = workflow.check(
+            target_id="notes", logical_key="run-notes", mode="remote",
+            config=host_b.config(), journal=host_b.journal,
+            delivery=host_b.delivery, http=hub)
+        self.assertFalse(check["ok"])
+        self.assertFalse(check["matches"])
+        self.assertNotIn("content", check)
+
+    def test_malformed_locator_is_typed_content_free_error(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            for bad in ("not-a-locator", "run-notes/nothex.md",
+                        "run-notes/" + "a" * 64 + ".md", ""):
+                with self.subTest(locator=bad):
+                    with self.assertRaises(workflow.WorkflowError) as ctx:
+                        workflow.read(
+                            target_id="notes", logical_key="run-notes",
+                            locator=bad, mode="local", conn=conn,
+                            config=env.config(), journal=env.journal,
+                            delivery=env.delivery)
+                    self.assertIn("malformed", str(ctx.exception))
+        finally:
+            conn.close()
+
+    def test_non_utf8_digest_matching_read_is_typed_error(self):
+        """A hand-crafted locator whose digest MATCHES non-UTF-8 bytes: the
+        digest comparison passes and the decode failure must surface as a
+        typed, content-free WorkflowError (COR-013), never a raw
+        UnicodeDecodeError traceback."""
+        import hashlib
+
+        from knowledge.documents import version_locator
+
+        env = _Env()
+        raw = b"\xff\xfe broken utf8 payload \x81\n"
+        digest = hashlib.sha256(raw).hexdigest()
+        locator = version_locator("run-notes", digest)
+        rel = locator.split("/")
+        note_dir = env.vault.joinpath(*rel[:-1])
+        note_dir.mkdir(parents=True, exist_ok=True)
+        note_dir.joinpath(rel[-1]).write_bytes(raw)
+        conn = _open_rw(env.store_path)
+        try:
+            with self.assertRaises(workflow.WorkflowError) as ctx:
+                workflow.read(
+                    target_id="notes", logical_key="run-notes",
+                    locator=locator, mode="local", conn=conn,
+                    config=env.config(), journal=env.journal,
+                    delivery=env.delivery)
+            self.assertIn("not valid UTF-8", str(ctx.exception))
+        finally:
+            conn.close()
+
+    def test_cli_mismatch_refusal_no_content_any_stream(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-knwf-rdmis-")
+        vault = Path(tmp) / "vault"
+        vault.mkdir()
+        (Path(tmp) / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "notes": {"kind": "markdown", "root": str(vault)},
+            }},
+        }), encoding="utf-8")
+        init = subprocess.run(
+            [sys.executable, str(STORE_PY), "init"], capture_output=True,
+            text=True,
+            env={**{k: v for k, v in os.environ.items()
+                    if not k.startswith("ZMEM_")},
+                 "ZMEM_HOME": str(REPO_ROOT),
+                 "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+                 "ZMEM_DATA": tmp, "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                 "PYTHONIOENCODING": "utf-8"},
+            cwd=str(REPO_ROOT), timeout=180)
+        self.assertEqual(init.returncode, 0, init.stderr[-400:])
+
+        def run(*argv):
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("ZMEM_")}
+            env.update({
+                "ZMEM_HOME": str(REPO_ROOT),
+                "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+                "ZMEM_DATA": tmp, "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "PYTHONIOENCODING": "utf-8",
+            })
+            return subprocess.run(
+                [sys.executable, str(STORE_PY), "knowledge", *argv],
+                capture_output=True, text=True, env=env,
+                cwd=str(REPO_ROOT), timeout=180)
+
+        secret_body = "TAMPERMARKER-UNIQUE-BODY-7f3a"
+        cap = run("capture", "--target", "notes", "--key", "run-notes",
+                  "--content", secret_body, "--json")
+        self.assertEqual(cap.returncode, 0, cap.stderr[-300:])
+        tampered = list(vault.rglob("*.md"))
+        self.assertEqual(len(tampered), 1)
+        tampered[0].write_text("replaced content\n", encoding="utf-8")
+
+        mis = run("read", "--target", "notes", "--key", "run-notes",
+                  "--json")
+        self.assertEqual(mis.returncode, 1,
+                         "%r %r" % (mis.stdout[-200:], mis.stderr[-200:]))
+        payload = json.loads(mis.stdout.splitlines()[0])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["reason"], "digest-mismatch")
+        self.assertNotIn("content", payload)
+        self.assertNotIn("replaced content", mis.stdout)
+        self.assertNotIn(secret_body, mis.stdout + mis.stderr)
+
+        plain = run("read", "--target", "notes", "--key", "run-notes")
+        self.assertEqual(plain.returncode, 1)
+        self.assertNotIn("replaced content", plain.stdout)
+        self.assertEqual(plain.stdout, "")
+        self.assertIn("digest-mismatch", plain.stderr)
+
+        check = run("check", "--target", "notes", "--key", "run-notes",
+                    "--json")
+        self.assertEqual(check.returncode, 1)
+        check_payload = json.loads(check.stdout.splitlines()[0])
+        self.assertFalse(check_payload["ok"])
+        self.assertFalse(check_payload["matches"])
+        self.assertNotIn("content", check_payload)
+
+        bad_locator = run("read", "--target", "notes", "--key",
+                          "run-notes", "--locator", "nope", "--json")
+        self.assertEqual(bad_locator.returncode, 2)
+        err = json.loads(bad_locator.stdout.splitlines()[0])
+        self.assertFalse(err["ok"])
+        self.assertIn("malformed", err["error"])
+        self.assertNotIn("Traceback", bad_locator.stderr)
+
+
+class DefaultSummaryPlaceholderTests(unittest.TestCase):
+    """FB-012 (2026-11-14): the default pointer summary is the FIXED
+    placeholder `knowledge note <key>` — never derived from the note body.
+    An explicit --summary still rides verbatim (and is still screened —
+    SummaryScreenTests above)."""
+
+    DISTINCT = "ZIRCONIUM-HAMMOCK-CRUCIBLE distinctive first line"
+
+    def test_default_summary_is_placeholder_never_body(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.capture(
+                target_id="notes", logical_key="run-notes",
+                text=self.DISTINCT + "\nsecond line\n", mode="local",
+                conn=conn, config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+            pointer = store_knowledge.get_pointer(
+                conn, "user:global", "notes", "run-notes")
+            self.assertEqual(pointer.summary, "knowledge note run-notes")
+            self.assertNotIn("ZIRCONIUM", pointer.summary)
+            self.assertNotIn("first line", pointer.summary)
+        finally:
+            conn.close()
+        # Remote lane: the enqueued op's summary is the same placeholder
+        # (the queue entry carries pointer metadata only). _PointerHub
+        # records the ops the apply lane received.
+        hub = _PointerHub(pointer=None)
+        remote = workflow.capture(
+            target_id="notes", logical_key="run-notes2",
+            text=self.DISTINCT + " two\n", mode="remote",
+            config=env.config(), journal=env.journal,
+            delivery=env.delivery, http=hub)
+        self.assertTrue(remote["ok"], remote)
+        seen = [op for batch in hub.ops_seen for op in batch]
+        self.assertTrue(seen, "the capable hub saw the enqueued op")
+        summaries = {str(op["args"].get("summary")) for op in seen}
+        self.assertIn("knowledge note run-notes2", summaries)
+        for summary in summaries:
+            self.assertNotIn("ZIRCONIUM", summary)
+
+    def test_explicit_summary_still_flows_verbatim(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.capture(
+                target_id="notes", logical_key="run-notes",
+                text=NOTE_V1, summary="operator authored deploy note",
+                mode="local", conn=conn, config=env.config(),
+                journal=env.journal, delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+            pointer = store_knowledge.get_pointer(
+                conn, "user:global", "notes", "run-notes")
+            self.assertEqual(pointer.summary, "operator authored deploy note")
+        finally:
+            conn.close()
+
+
+class StatusCorruptionTests(unittest.TestCase):
+    """FB-016 (2026-11-14): duplicate live verified pointer rows are
+    REPORTED, not swallowed — status answers ok:false with a structured,
+    content-free corruption entry and a nonzero exit; capture against the
+    corruption is one clean typed JSON error (never a KnowledgeError
+    traceback), leaving the journal at doc_pending."""
+
+    def _corrupted_env(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.capture(
+                target_id="notes", logical_key="run-notes",
+                text=NOTE_V1, mode="local", conn=conn,
+                config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+            # Store surgery: a SECOND live verified row for the same ref —
+            # exactly the corruption get_pointer treats as unrecoverable.
+            other = prepare_document("notes", "run-notes",
+                                     "other body entirely\n")
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, source_hash, confidence, signal, valid_from, "
+                "superseded_at, ingestion_ts, retrieval_count, "
+                "last_retrieved, taint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), "user:global", "fact",
+                 store_knowledge.build_payload(
+                     target="notes", key="run-notes", version=5,
+                     full_sha256=other.digest,
+                     summary="corrupt duplicate"),
+                 "knowledge", "knowledge:notes:run-notes", "", 0.5, "none",
+                 "2026-11-14T00:00:00Z", None, "2026-11-14T00:00:00Z",
+                 0, None, "untrusted_tool"))
+            conn.commit()
+        finally:
+            conn.close()
+        return env
+
+    def test_status_reports_corruption_structured(self):
+        env = self._corrupted_env()
+        conn = _open_rw(env.store_path)
+        try:
+            result = workflow.status(
+                target_id="notes", logical_key="run-notes", mode="local",
+                conn=conn, config=env.config(), journal=env.journal,
+                delivery=env.delivery)
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(len(result["corruption"]), 1)
+            entry = result["corruption"][0]
+            self.assertEqual((entry["target"], entry["key"]),
+                             ("notes", "run-notes"))
+            self.assertEqual(entry["code"], "duplicate-verified-rows")
+            self.assertIn("verified", entry["error"])
+            # the legitimate journal/queue rows still render
+            self.assertTrue(result["journal"])
+        finally:
+            conn.close()
+
+    def test_status_clean_store_stays_ok(self):
+        env = _Env()
+        conn = _open_rw(env.store_path)
+        try:
+            workflow.capture(
+                target_id="notes", logical_key="run-notes", text=NOTE_V1,
+                mode="local", conn=conn, config=env.config(),
+                journal=env.journal, delivery=env.delivery)
+            result = workflow.status(
+                mode="local", conn=conn, config=env.config(),
+                journal=env.journal, delivery=env.delivery)
+            self.assertTrue(result["ok"], result)
+            self.assertNotIn("corruption", result)
+        finally:
+            conn.close()
+
+    def test_cli_status_and_capture_under_corruption(self):
+        env = self._corrupted_env()
+
+        def run(*argv):
+            run_env = {k: v for k, v in os.environ.items()
+                       if not k.startswith("ZMEM_")}
+            run_env.update({
+                "ZMEM_HOME": str(REPO_ROOT),
+                "ZMEM_STORE": env.store_path,
+                "ZMEM_DATA": env.tmp, "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "PYTHONIOENCODING": "utf-8",
+            })
+            return subprocess.run(
+                [sys.executable, str(STORE_PY), "knowledge", *argv],
+                capture_output=True, text=True, env=run_env,
+                cwd=str(REPO_ROOT), timeout=180)
+
+        status = run("status", "--target", "notes", "--key", "run-notes",
+                     "--json")
+        self.assertEqual(status.returncode, 1,
+                         "%r %r" % (status.stdout[-300:],
+                                    status.stderr[-300:]))
+        payload = json.loads(status.stdout.splitlines()[0])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["corruption"][0]["code"],
+                         "duplicate-verified-rows")
+        self.assertNotIn("Traceback", status.stderr)
+
+        plain = run("status", "--target", "notes", "--key", "run-notes")
+        self.assertEqual(plain.returncode, 1)
+        self.assertIn("corruption", plain.stderr)
+
+        cap = run("capture", "--target", "notes", "--key", "run-notes",
+                  "--content", "changed body under corruption",
+                  "--json")
+        self.assertEqual(cap.returncode, 2,
+                         "%r %r" % (cap.stdout[-300:], cap.stderr[-300:]))
+        lines = [ln for ln in cap.stdout.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1,
+                         "the JSON error contract is one stdout line: %r"
+                         % cap.stdout)
+        err = json.loads(lines[0])
+        self.assertFalse(err["ok"])
+        self.assertIn("verified pointer rows", err["error"])
+        self.assertNotIn("Traceback", cap.stderr)
+        # the attempt's journal entry stays honestly doc_pending
+        entry = env.journal.entry_for("notes", "run-notes",
+                                      namespace="user:global")
+        self.assertEqual(entry.state, "doc_pending")
+
+
+class CaptureKillSwitchTests(unittest.TestCase):
+    """FB-022 code half (2026-11-14): ZMEM_CAPTURE=0 refuses knowledge
+    capture AND flush immediately — before sidecar creation, store
+    opening, target writes, or network. read/check/status stay available;
+    pending queue state is never deleted. Unset or 1 behaves normally."""
+
+    def _run(self, tmp: str, *argv: str, capture_env: str | None = None):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")}
+        env.update({
+            "ZMEM_HOME": str(REPO_ROOT),
+            "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+            "ZMEM_DATA": tmp,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "PYTHONIOENCODING": "utf-8",
+        })
+        if capture_env is not None:
+            env["ZMEM_CAPTURE"] = capture_env
+        return subprocess.run(
+            [sys.executable, str(STORE_PY), "knowledge", *argv],
+            capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
+            timeout=180)
+
+    @staticmethod
+    def _enabled_config(tmp: str, vault: Path):
+        (Path(tmp) / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "notes": {"kind": "markdown", "root": str(vault)},
+            }},
+        }), encoding="utf-8")
+
+    def test_capture_refused_before_any_side_effect(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-knwf-kill-")
+        vault = Path(tmp) / "vault"
+        vault.mkdir()
+        self._enabled_config(tmp, vault)
+        proc = self._run(tmp, "capture", "--target", "notes",
+                         "--key", "run-notes", "--content", NOTE_V1.strip(),
+                         "--json", capture_env="0")
+        self.assertEqual(proc.returncode, 2,
+                         "%r %r" % (proc.stdout[-300:], proc.stderr[-300:]))
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1, proc.stdout)
+        payload = json.loads(lines[0])
+        self.assertFalse(payload["ok"])
+        self.assertIn("ZMEM_CAPTURE=0", payload["error"])
+        # NOTHING was created or opened: no sidecar dir/journal, no store
+        # file, no target write.
+        self.assertFalse((Path(tmp) / "knowledge").exists(),
+                         "the kill switch fires before default_journal() "
+                         "pre-creates the sidecar dir")
+        self.assertFalse((Path(tmp) / "store.sqlite").exists(),
+                         "the kill switch fires before any store open")
+        self.assertEqual(list(vault.rglob("*.md")), [],
+                         "no target write happened")
+
+    def test_flush_refused_and_pending_state_preserved(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-knwf-killf-")
+        (Path(tmp) / "knowledge").mkdir()
+        queued_entry = {
+            "op_id": "kl-keepme", "namespace": "user:global",
+            "target": "notes", "key": "run-notes", "version": 1,
+            "locator": "run-notes/x.md",
+            "fullhash": ["aaaaaaaa"] * 8, "summary": "s",
+            "date": "2026-11-14T00:00:00Z", "expected_row_id": None,
+            "enqueued_at": "2026-11-14T00:00:00Z", "attempts": 0,
+            "last_error": None, "status": "queued"}
+        sidecar = Path(tmp) / "knowledge" / "delivery.json"
+        sidecar.write_text(json.dumps({
+            "version": 1, "queue": [queued_entry],
+            "receipts": {}, "intents": {}}), encoding="utf-8")
+        proc = self._run(tmp, "flush", "--json", capture_env="0")
+        self.assertEqual(proc.returncode, 2,
+                         "%r %r" % (proc.stdout[-300:], proc.stderr[-300:]))
+        payload = json.loads(proc.stdout.splitlines()[0])
+        self.assertFalse(payload["ok"])
+        self.assertIn("ZMEM_CAPTURE=0", payload["error"])
+        # pending state preserved verbatim
+        after = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(after["queue"], [queued_entry])
+
+    def test_unset_and_one_capture_normally(self):
+        for value in (None, "1"):
+            with self.subTest(zmem_capture=value):
+                tmp = tempfile.mkdtemp(
+                    prefix="zmem-knwf-killn%s" % (value or "unset"))
+                vault = Path(tmp) / "vault"
+                vault.mkdir()
+                self._enabled_config(tmp, vault)
+                init = subprocess.run(
+                    [sys.executable, str(STORE_PY), "init"],
+                    capture_output=True, text=True,
+                    env={**{k: v for k, v in os.environ.items()
+                            if not k.startswith("ZMEM_")},
+                         "ZMEM_HOME": str(REPO_ROOT),
+                         "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+                         "ZMEM_DATA": tmp,
+                         "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                         "PYTHONIOENCODING": "utf-8"},
+                    cwd=str(REPO_ROOT), timeout=180)
+                self.assertEqual(init.returncode, 0, init.stderr[-400:])
+                proc = self._run(tmp, "capture", "--target", "notes",
+                                 "--key", "run-notes",
+                                 "--content", NOTE_V1.strip(), "--json",
+                                 capture_env=value)
+                self.assertEqual(proc.returncode, 0,
+                                 "%r %r" % (proc.stdout[-300:],
+                                            proc.stderr[-300:]))
+                self.assertTrue(json.loads(
+                    proc.stdout.splitlines()[0])["ok"])
+
+    def test_reads_and_status_available_under_kill_switch(self):
+        tmp = tempfile.mkdtemp(prefix="zmem-knwf-killr-")
+        vault = Path(tmp) / "vault"
+        vault.mkdir()
+        self._enabled_config(tmp, vault)
+        init = subprocess.run(
+            [sys.executable, str(STORE_PY), "init"], capture_output=True,
+            text=True,
+            env={**{k: v for k, v in os.environ.items()
+                    if not k.startswith("ZMEM_")},
+                 "ZMEM_HOME": str(REPO_ROOT),
+                 "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+                 "ZMEM_DATA": tmp, "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                 "PYTHONIOENCODING": "utf-8"},
+            cwd=str(REPO_ROOT), timeout=180)
+        self.assertEqual(init.returncode, 0, init.stderr[-400:])
+        cap = self._run(tmp, "capture", "--target", "notes",
+                        "--key", "run-notes", "--content", NOTE_V1.strip(),
+                        "--json")
+        self.assertEqual(cap.returncode, 0, cap.stderr[-300:])
+        for argv, want_rc in (
+                (("read", "--target", "notes", "--key", "run-notes"), 0),
+                (("check", "--target", "notes", "--key", "run-notes",
+                  "--json"), 0),
+                (("status", "--json"), 0)):
+            with self.subTest(cmd=argv[0]):
+                proc = self._run(tmp, *argv, capture_env="0")
+                self.assertEqual(proc.returncode, want_rc,
+                                 "%r %r" % (proc.stdout[-300:],
+                                            proc.stderr[-300:]))
+        read = self._run(tmp, "read", "--target", "notes",
+                         "--key", "run-notes", capture_env="0")
+        self.assertEqual(read.stdout, NOTE_V1.rstrip("\n") + "\n")
+
+    def test_disabled_config_flush_refuses_and_preserves(self):
+        """A disabled knowledge config refuses flush BEFORE any store or
+        hub access (INT-004/FB-022 family) and deletes nothing."""
+        tmp = tempfile.mkdtemp(prefix="zmem-knwf-killd-")
+        (Path(tmp) / "knowledge").mkdir()
+        queued_entry = {
+            "op_id": "kl-keepme2", "namespace": "user:global",
+            "target": "notes", "key": "run-notes", "version": 1,
+            "locator": "run-notes/x.md",
+            "fullhash": ["bbbbbbbb"] * 8, "summary": "s",
+            "date": "2026-11-14T00:00:00Z", "expected_row_id": None,
+            "enqueued_at": "2026-11-14T00:00:00Z", "attempts": 0,
+            "last_error": None, "status": "queued"}
+        sidecar = Path(tmp) / "knowledge" / "delivery.json"
+        sidecar.write_text(json.dumps({
+            "version": 1, "queue": [queued_entry],
+            "receipts": {}, "intents": {}}), encoding="utf-8")
+        # config.json WITHOUT a knowledge object (default off)
+        (Path(tmp) / "config.json").write_text("{}", encoding="utf-8")
+        proc = self._run(tmp, "flush", "--json")
+        self.assertEqual(proc.returncode, 2,
+                         "%r %r" % (proc.stdout[-300:], proc.stderr[-300:]))
+        payload = json.loads(proc.stdout.splitlines()[0])
+        self.assertFalse(payload["ok"])
+        self.assertIn("disabled", payload["error"])
+        after = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(after["queue"], [queued_entry])
 
 
 def _all_tests():

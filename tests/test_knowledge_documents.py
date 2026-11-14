@@ -36,9 +36,11 @@ import os
 import sys
 import tempfile
 import threading
+import traceback
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -402,6 +404,117 @@ class MarkdownStoreTests(unittest.TestCase):
         with self.assertRaises(TargetError):
             self.store.read(doc.locator)
 
+    def test_unreadable_note_read_is_typed_not_traceback(self):
+        """FB-021: an OSError at the bounded read (permissions, sharing
+        violation, ...) surfaces as a TYPED, content-free TargetError —
+        never a raw OSError the workflow/CLI error mapping would let
+        escape as a traceback."""
+        doc = make_doc("notes", "run/deploy", "genuine body\n")
+        self.store.create(doc)
+        with mock.patch("knowledge.documents._read_bounded",
+                        side_effect=PermissionError("denied")):
+            with self.assertRaises(TargetError) as ctx:
+                self.store.read(doc.locator)
+        self.assertIn("PermissionError", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, OSError)
+
+    def test_unreadable_existing_note_create_is_typed_not_traceback(self):
+        """FB-021, the create-side leg: the existed-match readback goes
+        through _existing_matches, whose bounded read must convert an
+        OSError the same way create()'s own readback already does."""
+        doc = make_doc("notes", "run/deploy", "genuine body\n")
+        self.store.create(doc)
+        before = (self.root / doc.locator).read_bytes()
+        with mock.patch("knowledge.documents._read_bounded",
+                        side_effect=PermissionError("denied")):
+            with self.assertRaises(TargetError) as ctx:
+                self.store.create(doc)
+        self.assertIn("PermissionError", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, OSError)
+        self.assertEqual((self.root / doc.locator).read_bytes(), before,
+                         "the refused create must not touch the final")
+
+
+class ExclusivePublishTests(unittest.TestCase):
+    """FB-007: the markdown create publishes through a uniquely OWNED
+    temp in the final's directory plus ``os.link`` (atomic no-replace), so
+    a partial write can never wedge the immutable locator and the final
+    path is never deleted or replaced."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="zmem-knfpub-"))
+        self.store = MarkdownStore(MarkdownTarget(id="notes", root=self.root))
+
+    def _temps(self) -> list[Path]:
+        return [p for p in self.root.rglob("*") if ".tmp-" in p.name]
+
+    def test_partial_write_failure_leaves_no_final_and_retry_succeeds(self):
+        doc = make_doc("notes", "run/deploy", "partial write body\n")
+        final = self.root / doc.locator
+        real_fsync = os.fsync
+        armed = {"fail": True}
+
+        def flaky_fsync(fd):
+            if armed["fail"]:
+                armed["fail"] = False
+                raise OSError("simulated ENOSPC")
+            return real_fsync(fd)
+
+        with mock.patch("os.fsync", flaky_fsync):
+            with self.assertRaises(TargetError) as ctx:
+                self.store.create(doc)
+        self.assertNotIn("partial write body", str(ctx.exception))
+        self.assertFalse(final.exists(),
+                         "a failed create must leave NO final path")
+        self.assertEqual(self._temps(), [],
+                         "the owned temp is removed on failure")
+        # The retry (healthy fsync) publishes and the content is complete.
+        result = self.store.create(doc)
+        self.assertFalse(result.existed_match)
+        self.assertEqual(final.read_bytes(), b"partial write body\n")
+        self.assertEqual(self._temps(), [])
+
+    def test_link_failure_leaves_no_partial_final(self):
+        doc = make_doc("notes", "run/deploy", "link failure body\n")
+        final = self.root / doc.locator
+
+        def broken_link(src, dst, **_kw):
+            raise OSError("simulated link failure")
+
+        with mock.patch("os.link", broken_link):
+            with self.assertRaises(TargetError) as ctx:
+                self.store.create(doc)
+        self.assertNotIn("link failure body", str(ctx.exception))
+        self.assertFalse(final.exists())
+        self.assertEqual(self._temps(), [])
+
+    def test_preexisting_final_identical_resumes_foreign_never_replaced(self):
+        # Identical pre-existing final at the same locator: resume success.
+        doc = make_doc("notes", "run/deploy", "identical body\n")
+        final = self.root / doc.locator
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(doc.content)
+        stat_before = final.stat()
+        result = self.store.create(doc)
+        self.assertTrue(result.existed_match)
+        self.assertEqual(final.read_bytes(), doc.content)
+        self.assertEqual(final.stat().st_mtime_ns, stat_before.st_mtime_ns,
+                         "an identical resume never rewrites the final")
+
+        # Foreign content at the same locator: ConflictError, and the
+        # foreign final is never deleted or replaced (content + mtime
+        # stability).
+        other = make_doc("notes", "run/deploy", "a different body\n")
+        final2 = self.root / other.locator
+        final2.parent.mkdir(parents=True, exist_ok=True)
+        final2.write_bytes(b"foreign tampered bytes\n")
+        stat2 = final2.stat()
+        with self.assertRaises(ConflictError):
+            self.store.create(other)
+        self.assertEqual(final2.read_bytes(), b"foreign tampered bytes\n")
+        self.assertEqual(final2.stat().st_mtime_ns, stat2.st_mtime_ns)
+        self.assertEqual(self._temps(), [])
+
 
 class _MockKB(http.server.BaseHTTPRequestHandler):
     """Minimal KB: POST create (409 on existing), GET, strict bearer auth.
@@ -646,6 +759,39 @@ class KBClientTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_truncated_chunked_response_is_typed_not_traceback(self):
+        # Round-3 closeout FB-020 residual: a chunked body that dies
+        # mid-chunk raises http.client.IncompleteRead from resp.read —
+        # OUTSIDE urllib's do_open wrapper — and must land in the typed,
+        # content-free TransportError contract, never a raw traceback.
+        class TruncatedChunked(_MockKB):
+            def do_GET(self):  # noqa: N802
+                self._record("GET")
+                if not self._authorized():
+                    self._reply(401)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                # Announce a chunk larger than what we send, then close —
+                # the client's read() hits IncompleteRead.
+                self.wfile.write(b"1a\r\n{\"content\": \"trunc")
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = MockKBServer(TruncatedChunked)
+        try:
+            client = kb_client(server.endpoint)
+            doc = make_doc("fleet", "guides/trunc", "body\n")
+            with self.assertRaises(TransportError) as ctx:
+                client.create(doc)  # POST lands; readback GET truncates
+            self.assertIn("IncompleteRead",
+                          type(ctx.exception.__cause__).__name__)
+            self.assertNotIn("trunc", str(ctx.exception))
+        finally:
+            server.close()
+
     def test_oversized_response_refused(self):
         class Big(_MockKB):
             def do_GET(self):  # noqa: N802
@@ -719,6 +865,44 @@ class KBClientTests(unittest.TestCase):
         with self.assertRaises(TargetError):
             client.read("a/" + "1" * 16 + "-" + "2" * 16 + "-" + "3" * 16
                         + "-" + "4" * 16 + ".md")
+
+    def test_control_char_token_refused_content_free(self):
+        """FB-010: a credential carrying control characters (a newline
+        injection) is refused BEFORE any request, content-free — the
+        token bytes appear in no message and no traceback."""
+        token = "tok\nwith-newline\x01ctl"
+        client = kb_client(self.server.endpoint, token=token)
+        doc = make_doc("fleet", "guides/ctrl", "x\n")
+        with self.assertRaises(TargetError) as ctx:
+            client.create(doc)
+        self.assertNotIn(token, str(ctx.exception))
+        formatted = "".join(traceback.format_exception(
+            type(ctx.exception), ctx.exception, ctx.exception.__traceback__))
+        self.assertNotIn(token, formatted)
+        self.assertNotIn("with-newline", formatted)
+        self.assertEqual(_MockKB.requests, [],
+                         "the refusal happens before any request leaves")
+
+    def test_invalid_header_value_is_typed_and_token_free(self):
+        """Defense in depth: even if a hostile token BYPASSES _token's
+        control-character gate, the header layer's ValueError (whose
+        message quotes the header VALUE) is converted to a content-free
+        TransportError with a suppressed cause — no traceback carries the
+        token bytes."""
+        token = "hdr\ntoken-value-carrier"
+        client = kb_client(self.server.endpoint)
+        locator = ("a/" + "1" * 16 + "-" + "2" * 16 + "-" + "3" * 16
+                   + "-" + "4" * 16 + ".md")
+        with mock.patch.object(client, "_token", return_value=token):
+            with self.assertRaises(TransportError) as ctx:
+                client.read(locator)
+        self.assertNotIn(token, str(ctx.exception))
+        formatted = "".join(traceback.format_exception(
+            type(ctx.exception), ctx.exception, ctx.exception.__traceback__))
+        self.assertNotIn(token, formatted)
+        self.assertNotIn("token-value-carrier", formatted)
+        self.assertIsNone(ctx.exception.__cause__,
+                          "the ValueError cause is suppressed (from None)")
 
 
 class OpenTargetTests(unittest.TestCase):

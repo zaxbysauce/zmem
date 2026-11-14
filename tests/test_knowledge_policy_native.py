@@ -4,27 +4,37 @@ Covers ONLY this PR's owned surfaces (docs/KNOWLEDGE-ROUTING.md):
 
 * the Hermes provider's conditional client-side append in
   ``system_prompt_block`` (after the inject gate, cached, byte-identical
-  when the companion is off),
+  when the companion is off), plus ONE real-helper Hermes leg driving
+  the actual system-prompt block against the real policy helper from
+  this checkout (skips only when that helper file is absent),
 * the dsh adapter's ``runPolicy`` launcher seam (bounded, fail-open,
   frozen helper CLI contract, no config-path duplication),
 * the dsh ``agent/pre-step`` once-per-session policy append (runtime legs
-  — skipped honestly when the pinned dsh runtime is absent),
+  — skipped honestly when the pinned dsh runtime is absent), and the dsh
+  ``agent/disposed`` pending-capture drain (a direct plugin-import leg
+  that runs wherever node+python exist — only the pinned dsh-llm bare
+  import is stubbed through a node module-register hook, disclosed in the
+  class docstring),
 * the portable skills' and the routing doc's load-bearing truths.
 
-FROZEN helper contract (coordinated with the helper worker — the real
-``skills/memory/scripts/knowledge/policy.py`` is a separate PR2
-deliverable and is NOT exercised here):
+FROZEN helper contract (the real
+``skills/memory/scripts/knowledge/policy.py`` has landed; the launcher
+legs below exercise it directly, the adapter legs drive a STUB):
 
     render_policy(config_path=None, environ=None, allow_capture=True) -> str
-    CLI: --config PATH (optional) | --no-capture | --text | --json, exit 0
-    resolve_config_path(environ, home)  # the single config authority
+    CLI: --config PATH (optional) | --no-capture | --text | --json,
+         exit 0 rendered-or-disabled, exit 2 usage (incl. a missing
+         --config value)
+    resolve_config_path(environ=None, *, home=None)  # the single config
+        # authority (home is keyword-only — test isolation)
 
 Adapters spawn the helper with NO ``--config`` (the helper resolves the
-canonical store config from the inherited user flags) and map
-``ZMEM_CAPTURE=0`` to ``--no-capture``; ``ZMEM_INJECT=0`` is the adapter's
-own no-spawn gate. These tests drive a STUB helper implementing exactly
-that CLI so the ADAPTER behavior is pinned without depending on the other
-worker's file. Tests against the real helper land with the helper.
+canonical store config from the resolver variables the adapter passes)
+and map ``ZMEM_CAPTURE=0`` to ``--no-capture``; ``ZMEM_INJECT=0`` is the
+adapter's own no-spawn gate. The adapter legs drive a STUB helper
+implementing exactly that CLI so the ADAPTER behavior is pinned without
+depending on the helper's renderer; the launcher seam and real-helper
+legs exercise the delivered renderer end to end.
 
 Default-off byte-identity is asserted by comparing outputs against the
 pre-change shapes (core.md alone for Hermes; no non-user messages for dsh
@@ -97,6 +107,21 @@ else:
     print(%r)
 ''' % (POLICY_TEXT_NO_CAPTURE, POLICY_TEXT)
 
+# Env-probe helper: records its FULL child environment to the marker (a
+# sentinel-LEAK probe, FB-028) and prints the enabled stub text.
+ENV_PROBE_POLICY_PY = '''\
+import json, os, sys
+marker = os.environ.get("ZMEM_TEST_POLICY_MARKER", "")
+if marker:
+    with open(marker, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"flags": [a for a in sys.argv[1:]],
+                             "env": dict(os.environ)}) + "\\n")
+print(%r)
+''' % (POLICY_TEXT,)
+
+REAL_POLICY_PY = (REPO_ROOT / "skills" / "memory" / "scripts"
+                  / "knowledge" / "policy.py")
+
 # Environment keys the hermes tests pin or strip (the t13/hermes discipline:
 # ambient plugin-data vars silently change path resolution).
 _PIN_KEYS = ("ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_INJECT",
@@ -142,6 +167,44 @@ def _read_marker(path: Path) -> list:
     return rows
 
 
+# CI-003-R1 test-integrity repair (round-3 cluster 5): the hermes execs
+# below install agent-module stubs (and, as an exec side effect, the
+# plugin registers zmem_hermes_transport) that previously leaked for the
+# rest of the session — tearDownClass only rmtree'd. Exact-restore
+# discipline, the tests/test_knowledge_hub_integration.py pattern:
+# snapshot the managed names BEFORE stubbing, then in teardown delete
+# EVERY current match and put the exact previous objects back (names
+# that were previously absent stay removed).
+def _managed_module(key: str) -> bool:
+    return (key == "agent" or key.startswith("agent.")
+            or key.startswith("zmem_hermes"))
+
+
+def _install_agent_stubs() -> dict:
+    """Install the minimal agent.memory_provider ABC stubs the hermes
+    plugin needs at import time; return the exact-restore snapshot."""
+    saved = {key: value for key, value in list(sys.modules.items())
+             if _managed_module(key)}
+    agent = types.ModuleType("agent")
+    mp = types.ModuleType("agent.memory_provider")
+
+    class MemoryProvider:  # noqa: D401 — minimal ABC stub
+        pass
+
+    mp.MemoryProvider = MemoryProvider
+    agent.memory_provider = mp
+    sys.modules["agent"] = agent
+    sys.modules["agent.memory_provider"] = mp
+    return saved
+
+
+def _restore_stub_modules(saved: dict) -> None:
+    for key in [key for key in list(sys.modules)
+                if _managed_module(key)]:
+        del sys.modules[key]
+    sys.modules.update(saved)
+
+
 class HermesPolicyAppendTest(unittest.TestCase):
     """system_prompt_block: conditional append, gates, byte-identity."""
 
@@ -163,16 +226,10 @@ class HermesPolicyAppendTest(unittest.TestCase):
         (cls.data / "core.md").write_text(CORE_TEXT + "\n", encoding="utf-8")
         (cls.data / "config.json").write_text(
             json.dumps({"auto_retain": False}), encoding="utf-8")
-        agent = types.ModuleType("agent")
-        mp = types.ModuleType("agent.memory_provider")
-
-        class MemoryProvider:  # noqa: D401 — minimal ABC stub
-            pass
-
-        mp.MemoryProvider = MemoryProvider
-        agent.memory_provider = mp
-        sys.modules.setdefault("agent", agent)
-        sys.modules.setdefault("agent.memory_provider", mp)
+        # Exact-restore stubs (CI-003-R1): _install_agent_stubs snapshots
+        # the managed sys.modules names BEFORE stubbing; tearDownClass
+        # restores the exact previous state via _restore_stub_modules.
+        cls._saved_modules = _install_agent_stubs()
         with _Env(ZMEM_HOME=str(cls._tmp / "home"),
                   ZMEM_STORE=str(cls.data / "store.sqlite"),
                   ZMEM_DATA=str(cls.data),
@@ -185,6 +242,7 @@ class HermesPolicyAppendTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        _restore_stub_modules(cls._saved_modules)
         shutil.rmtree(cls._tmp, ignore_errors=True)
 
     def _env(self, marker: Path, mode: str = "enabled", **extra):
@@ -304,6 +362,91 @@ class HermesPolicyAppendTest(unittest.TestCase):
                   ZMEM_TEST_POLICY_MODE="enabled"):
             provider = self.mod.ZmemMemoryProvider()
             self.assertEqual(provider.system_prompt_block(), POLICY_TEXT)
+
+
+class HermesRealHelperPolicyTest(unittest.TestCase):
+    """CI-003-R1 real-helper Hermes leg: the stub legs above pin the
+    ADAPTER's behavior with a stub helper; this leg invokes the ACTUAL
+    hermes-plugin system_prompt_block against the REAL
+    skills/memory/scripts/knowledge/policy.py from THIS checkout (copied
+    into a scratch home so the provider's store.py probe stays on the
+    SystemExit marker — no real checkout side effects). Self-skips ONLY
+    when the real helper file is absent from the checkout; CI has the
+    repo, so the leg runs there (no unconditional skip)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not REAL_POLICY_PY.is_file():
+            raise unittest.SkipTest(
+                "real policy helper not landed in this checkout")
+        cls._tmp = Path(tempfile.mkdtemp(prefix="zmem-pr2-hermes-real-"))
+        scripts = cls._tmp / "home" / "skills" / "memory" / "scripts"
+        (scripts / "knowledge").mkdir(parents=True)
+        (scripts / "store.py").write_text("raise SystemExit(0)\n",
+                                          encoding="utf-8")
+        cls.policy_py = scripts / "knowledge" / "policy.py"
+        shutil.copyfile(REAL_POLICY_PY, cls.policy_py)
+        cls.data = cls._tmp / "data"
+        cls.data.mkdir()
+        (cls.data / "core.md").write_text(CORE_TEXT + "\n", encoding="utf-8")
+        # An ENABLED knowledge config beside the scratch store: the real
+        # helper resolves it from the resolver env the provider's child
+        # inherits (no --config — the frozen adapter spawn shape), so the
+        # renderer has a real target roster to render.
+        vault = cls._tmp / "vault"
+        vault.mkdir()
+        (cls.data / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "notes": {"kind": "markdown", "root": str(vault)}}}}),
+            encoding="utf-8")
+        cls._saved_modules = _install_agent_stubs()
+        with _Env(ZMEM_HOME=str(cls._tmp / "home"),
+                  ZMEM_STORE=str(cls.data / "store.sqlite"),
+                  ZMEM_DATA=str(cls.data),
+                  ZMEM_MODEL_AUTODOWNLOAD="0",
+                  ZMEM_MODELS_DIR=str(cls._tmp / "no-models")):
+            spec = importlib.util.spec_from_file_location(
+                "zmem_hermes_pr2_policy_real", HERMES_INIT)
+            cls.mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cls.mod)
+
+    @classmethod
+    def tearDownClass(cls):
+        _restore_stub_modules(cls._saved_modules)
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def _pins(self) -> dict:
+        return dict(ZMEM_HOME=str(self._tmp / "home"),
+                    ZMEM_STORE=str(self.data / "store.sqlite"),
+                    ZMEM_DATA=str(self.data),
+                    ZMEM_MODEL_AUTODOWNLOAD="0",
+                    ZMEM_MODELS_DIR=str(self._tmp / "no-models"))
+
+    def test_system_prompt_block_appends_real_helper_policy(self):
+        """Byte parity: the delivered block is EXACTLY core.md plus the
+        REAL helper's own --text rendering under the same resolver env —
+        the adapter appends what the delivered renderer prints, nothing
+        else (the provider spawns sys.executable, so the comparison leg
+        runs the same interpreter against the same copied helper)."""
+        with _Env(**self._pins()):
+            provider = self.mod.ZmemMemoryProvider()
+            block = provider.system_prompt_block()
+            helper = subprocess.run(
+                [sys.executable, "-X", "utf8", str(self.policy_py),
+                 "--text"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30)
+        self.assertEqual(helper.returncode, 0,
+                         f"real helper CLI failed: {helper.stderr!r}")
+        rendered = (helper.stdout or "").strip()
+        self.assertTrue(rendered,
+                        "the real helper must render the enabled "
+                        "companion's policy")
+        self.assertIn("notes", rendered,
+                      "the real rendering names the configured target id")
+        self.assertEqual(block, CORE_TEXT + "\n\n" + rendered,
+                         "the hermes block must be core.md plus exactly "
+                         "the real helper's rendered policy")
 
 
 class _NodeLeg:
@@ -442,6 +585,75 @@ class DshLauncherPolicyTest(_NodeLeg, unittest.TestCase):
         self.assertLess(elapsed, 20.0,
                         f"runPolicy must kill a wedged helper "
                         f"({elapsed:.1f}s)")
+
+    def test_remote_mode_child_resolves_zmem_store_config(self):
+        """FB-028: the store-lane normalization deletes ZMEM_STORE under
+        ZMEM_REMOTE_URL — the POLICY child must keep it (its config
+        resolution ranks ZMEM_STORE first; the delete exists for store
+        access, not config resolution). Sentinel configs beside each
+        candidate store prove the precedence: the store-side target id
+        renders, the data-side one never appears."""
+        root = self.stub_tree(self._tmp)
+        shutil.copyfile(
+            REAL_POLICY_PY,
+            root / "skills" / "memory" / "scripts" / "knowledge"
+            / "policy.py")
+        store_side = self._tmp / "store-side"
+        data_side = self._tmp / "data-side"
+        for directory in (store_side, data_side):
+            directory.mkdir()
+        vault = str(self._tmp)  # never stat'ed by the display loader
+        (store_side / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "store-side-wins": {"kind": "markdown", "root": vault}}}}),
+            encoding="utf-8")
+        (data_side / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "data-side-loses": {"kind": "markdown", "root": vault}}}}),
+            encoding="utf-8")
+        marker = self._tmp / "m.jsonl"
+        out = self.run_node(_RUNPOLICY_PROBE, self._env(
+            root, marker, "enabled",
+            ZMEM_REMOTE_URL="https://hub.invalid.example/sentinel",
+            ZMEM_STORE=str(store_side / "store.sqlite"),
+            ZMEM_DATA=str(data_side)))
+        self.assertEqual(out.get("reason"), "ok", f"leg: {out!r}")
+        text = out.get("text") or ""
+        self.assertIn("store-side-wins", text,
+                      "remote mode must NOT strip ZMEM_STORE from the "
+                      "policy child (config resolution, not store access)")
+        self.assertNotIn("data-side-loses", text)
+
+    def test_policy_child_env_is_minimal_no_sentinel_leak(self):
+        """FB-028: only the documented resolver/system variables reach the
+        spawned policy child — sentinel credential vars set in the parent
+        env are absent from the child, while the resolver variables ride."""
+        root = self.stub_tree(self._tmp)
+        (root / "skills" / "memory" / "scripts" / "knowledge"
+         / "policy.py").write_text(ENV_PROBE_POLICY_PY, encoding="utf-8")
+        marker = self._tmp / "m.jsonl"
+        out = self.run_node(_RUNPOLICY_PROBE, self._env(
+            root, marker, "enabled",
+            ZMEM_MCP_TOKEN="sentinel-mcp-token-not-a-secret",
+            ZMEM_KB_FLEET_TOKEN="sentinel-kb-token-not-a-secret",
+            ZMEM_PRINCIPAL="sentinel-principal",
+            ZMEM_NAMESPACE="sentinel-namespace"))
+        self.assertEqual(out.get("reason"), "ok", f"leg: {out!r}")
+        rows = _read_marker(marker)
+        self.assertEqual(len(rows), 1, "exactly one policy spawn")
+        child_env = rows[0].get("env") or {}
+        for leak in ("ZMEM_MCP_TOKEN", "ZMEM_KB_FLEET_TOKEN",
+                     "ZMEM_PRINCIPAL", "ZMEM_NAMESPACE"):
+            self.assertNotIn(leak, child_env,
+                             f"credential/sentinel var {leak} leaked to "
+                             f"the policy child")
+        self.assertNotIn("sentinel-mcp-token-not-a-secret",
+                         json.dumps(child_env))
+        # Resolver variables DO ride the minimal child env.
+        self.assertEqual(child_env.get("ZMEM_STORE"),
+                         str(root / "store.sqlite"))
+        self.assertTrue(child_env.get("PATH"),
+                        "interpreter resolution needs PATH")
 
 
 class DshPreStepPolicyTest(_NodeLeg, unittest.TestCase):
@@ -610,12 +822,152 @@ class DshPreStepPolicyTest(_NodeLeg, unittest.TestCase):
             # The REJECTED agent's pre-step decision never entered the
             # gate: its session must not consume the once-per-session
             # latch through a delivered message it never had.
+            # CI-003-R1 test-integrity repair: assert the rejected
+            # session's native entry EXISTS unconditionally, then inspect
+            # it — the old `if sid == "ds-rejected-input":` guard inside
+            # the iteration was vacuously green whenever the producer
+            # dropped the key. agent/created keeps the per-session latch
+            # bookkeeping even when the pre-step decision is rejected.
             state = obs.get("pluginState") or {}
-            for sid, entry in (state.get("sessions") or {}).items():
-                if sid == "ds-rejected-input" and isinstance(entry, dict):
-                    self.assertNotEqual(entry.get("policyDelivered"), True,
-                                        "a rejected decision must not "
-                                        "count as a policy delivery")
+            sessions = state.get("sessions") or {}
+            entry = sessions.get("ds-rejected-input")
+            self.assertIsInstance(
+                entry, dict,
+                "the rejected session must keep a native state entry "
+                f"(sessions={sessions!r}) — a dropped entry would hide "
+                "whether the once-per-session latch was consumed")
+            self.assertNotEqual(entry.get("policyDelivered"), True,
+                                "a rejected decision must not count as a "
+                                "policy delivery")
+            self.assertNotEqual(entry.get("policyResolved"), True,
+                                "a rejected pre-step never resolves the "
+                                "policy — the once-per-session latch is "
+                                "not consumed")
+
+
+# -- agent/disposed capture drain (the PR2 plugin's own pending-capture
+# guard): the probe imports the REAL deepseek-plugin/index.mjs with ONLY
+# the pinned dsh-llm import stubbed through a node module-register hook
+# (the dispose lane never touches dsh message APIs), so the pin RUNS on
+# every host with node+python instead of skipping with the runtime.  The
+# stub capture entry SLEEPS, holding the capture in flight at dispose.
+_STUB_CAPTURE_ENTRY_PY = '''\
+import json, time
+# Hold the capture in flight long enough to still be pending at dispose.
+time.sleep(0.6)
+print(json.dumps({"ok": True, "deduped": False, "text": "dispose-drain-probe"}))
+'''
+
+_STUB_DSH_LLM_MJS = '''\
+export function createUserMessage(init) { return { id: "stub-msg", ...init }; }
+'''
+
+_RESOLVE_HOOK_MJS = '''\
+export async function resolve(specifier, context, next) {
+  if (specifier === "@deepseek-ai/dsh-llm") {
+    return { url: process.env.DSH_LLM_STUB_URL, shortCircuit: true };
+  }
+  return next(specifier, context);
+}
+'''
+
+_REGISTER_HOOK_MJS = '''\
+import { register } from "node:module";
+register(new URL("./stub-resolve.mjs", import.meta.url), import.meta.url);
+'''
+
+_DISPOSE_DRAIN_PROBE = """
+import fs from "node:fs";
+const handlers = {};
+const ctx = { on: (name, fn) => { (handlers[name] ??= []).push(fn); } };
+const mod = await import(process.env.PLUGIN_URL);
+await mod.plugin(ctx);
+// An eligible FINAL tool failure starts an in-flight capture against the
+// SLEEPING stub capture entry (still pending at dispose time).
+handlers["tools/result"][0](
+  { agent: { id: "ds-dispose-drain" } },
+  { isError: true, error: { message: "dispose drain probe: flange tool failed" } });
+await handlers["agent/disposed"][0]();
+const state = JSON.parse(
+  fs.readFileSync(process.env.ZMEM_DEEPSEEK_STATE, "utf8"));
+console.log(JSON.stringify({
+  captureQueue: state.captureQueue || [],
+  disposeDrained: state.disposeDrained ?? null,
+  persistsAcrossDispose: state.persistsAcrossDispose === true,
+}));
+"""
+
+
+class DshDisposeDrainTest(_NodeLeg, unittest.TestCase):
+    """agent/disposed drains this process's PENDING captures (the same
+    bounded Promise.allSettled drain agent/turn-stopping already uses)
+    and discloses the drain in state: a pending in-flight capture is
+    never silently dropped on dispose, and the pending state file is
+    preserved. RED at base: the old dispose handler wrote state with an
+    empty captureQueue while the capture was still in flight."""
+
+    def setUp(self):
+        if not (self.node_on_path() and self.python_on_path()):
+            self.skipTest("node/python not on PATH for the dispose leg")
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-dispose-drain-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _file_url(self, path: Path) -> str:
+        proc = subprocess.run(
+            ["node", "-e",
+             "console.log(require('url').pathToFileURL(%r).href)"
+             % str(path)],
+            capture_output=True, text=True, timeout=30, check=True)
+        return proc.stdout.strip()
+
+    def test_pending_capture_is_drained_and_disclosed_at_dispose(self):
+        root = self.tmp / "root"
+        for rel, text in (
+            ("dshstub/index.mjs", _STUB_DSH_LLM_MJS),
+            ("reg/stub-resolve.mjs", _RESOLVE_HOOK_MJS),
+            ("reg/reghook.mjs", _REGISTER_HOOK_MJS),
+            ("root/hooks/lib/zmem-capture-entry.py",
+             _STUB_CAPTURE_ENTRY_PY),
+        ):
+            target = self.tmp / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        (root / "skills" / "memory" / "scripts").mkdir(parents=True,
+                                                       exist_ok=True)
+        (root / "skills" / "memory" / "scripts" / "store.py").write_text(
+            "raise SystemExit(0)\n", encoding="utf-8")
+        state_path = self.tmp / "state.json"
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+                             "NODE_OPTIONS")}
+        env.update({
+            "ZMEM_DEEPSEEK_STATE": str(state_path),
+            "ZMEM_ROOT": str(root),
+            "DSH_LLM_STUB_URL": self._file_url(
+                self.tmp / "dshstub" / "index.mjs"),
+            "PLUGIN_URL": self._file_url(
+                REPO_ROOT / "deepseek-plugin" / "index.mjs"),
+            "PYTHONIOENCODING": "utf-8",
+            # The register hook redirects the pinned dsh-llm bare import
+            # to the stub above (disclosed: the dispose lane under test
+            # never calls its exports).
+            "NODE_OPTIONS": "--import=" + self._file_url(
+                self.tmp / "reg" / "reghook.mjs"),
+        })
+        observed = self.run_node(_DISPOSE_DRAIN_PROBE, env, timeout_s=60.0)
+        self.assertTrue(state_path.is_file(),
+                        "the pending state file is preserved on dispose")
+        queue = observed.get("captureQueue") or []
+        self.assertTrue(
+            any(e.get("kind") == "failure"
+                and "dispose drain probe" in str(e.get("text") or "")
+                for e in queue),
+            f"the in-flight capture must be DRAINED into captureQueue "
+            f"before dispose finishes: {observed!r}")
+        self.assertEqual(observed.get("disposeDrained"), 1,
+                         "the drain is disclosed in state (disposeDrained)")
+        self.assertIs(observed.get("persistsAcrossDispose"), True)
 
 
 class DocsAndSkillsTruthTest(unittest.TestCase):
@@ -815,8 +1167,10 @@ class RealHelperSeamTest(_NodeLeg, unittest.TestCase):
 def main(argv=None) -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for cls in (HermesPolicyAppendTest, DshLauncherPolicyTest,
-                DshPreStepPolicyTest, RealHelperSeamTest,
+    for cls in (HermesPolicyAppendTest, HermesRealHelperPolicyTest,
+                DshLauncherPolicyTest,
+                DshPreStepPolicyTest, DshDisposeDrainTest,
+                RealHelperSeamTest,
                 DocsAndSkillsTruthTest):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)

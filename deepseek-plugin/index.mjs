@@ -443,11 +443,24 @@ export function plugin(ctx, config = {}) {
   });
 
   ctx.on("agent/disposed", async () => {
-    // Bounded drain of owned pending work (the delivery-ledger ack): the
-    // durable write lands before the runtime finishes disposing. Ordinary
-    // disposal is NOT persisted-session termination: per-session entries
-    // persist.
+    // Bounded drain of owned pending work (the delivery-ledger ack AND
+    // this process's in-flight captures — the same bounded
+    // Promise.allSettled drain agent/turn-stopping already uses, no new
+    // machinery): the durable writes land before the runtime finishes
+    // disposing. A capture still pending at dispose is DISCLOSED in
+    // state (disposeDrained) and its outcome preserved in
+    // captureQueue/state — never silently dropped; the pending state
+    // file itself is always preserved. Ordinary disposal is NOT
+    // persisted-session termination: per-session entries persist.
     state.persistsAcrossDispose = true;
+    const pendingCount = pendingCaptures.size;
+    if (pendingCount > 0) {
+      state.disposeDrained =
+        (state.disposeDrained || 0) + pendingCount;
+      try {
+        await Promise.allSettled([...pendingCaptures]);
+      } catch { /* fail-open */ }
+    }
     writeState();
   });
 

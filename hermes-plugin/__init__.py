@@ -906,17 +906,19 @@ def _knowledge_policy_text(allow_capture: bool = True) -> str:
     store config (``resolve_config_path`` — the common authority mirroring
     the host store chain, file-shaped refusals included); this provider
     passes NO config path, never parses ``enabled``/target values, and
-    never imports storelib or the knowledge package. The inherited child
-    environment carries the user's own flags — no server or hub config and
-    no credential is ever forwarded; the argv is flags only.
+    never imports storelib or the knowledge package. The child subprocess
+    inherits this provider's process environment verbatim (the embedding
+    host pins it to the user's own resolver flags); from it the helper
+    reads only the resolver variables — ZMEM_STORE/ZMEM_DATA/plugin-data
+    and home — and never token material. No credential value appears in
+    the spawn: the argv is flags only.
 
     Gates per the coordinated contract: the CALLER owns the ZMEM_INJECT=0
     gate (no spawn at all); ZMEM_CAPTURE=0 maps to ``--no-capture`` so the
     helper renders read-routing WITHOUT a capture invitation.
 
-    Fail-open by contract: a missing helper (the helper is a separate PR2
-    deliverable and may not be present in this checkout yet), a non-zero
-    exit, a timeout, or empty output all render "" and the system prompt
+    Fail-open by contract: a missing helper (checkouts without it), a
+    non-zero exit, a timeout, or empty output all render "" and the system prompt
     block stays byte-identical to the pre-knowledge output. The companion
     is off by default; a disabled companion renders empty.
     """

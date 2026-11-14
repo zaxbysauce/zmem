@@ -236,6 +236,20 @@ def _kbhttp_target(tid: str, obj: object) -> KBHTTPTarget:
         raise KnowledgeConfigError(
             "%s: endpoint path must not end with '/' (the client appends "
             "'/<encoded locator>')" % where)
+    # An explicit port must be a valid one: ``urlsplit``'s ``.port``
+    # property itself raises ValueError for a non-numeric or out-of-range
+    # port (e.g. ':99999'), so the access is guarded and the range is
+    # checked explicitly — an invalid port is refused AT LOAD, never
+    # carried to request time.
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise KnowledgeConfigError(
+            "%s: endpoint port must be an integer in 1..65535" %
+            where) from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise KnowledgeConfigError(
+            "%s: endpoint port must be in 1..65535" % where)
 
     allow_http = obj.get("allow_http", False)
     if not isinstance(allow_http, bool):

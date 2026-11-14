@@ -48,10 +48,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `skills/closeout/SKILL.md` only when a bounded `knowledge status` check
   reports the companion enabled (silent otherwise) — documented
   NON-equivalence: manual, explicit-only, no per-session injection.
-  OpenCode keeps its capability gap (issue #66): the supported path is
-  the manual operator shim `python skills/memory/scripts/knowledge/policy.py
-  --text` pasted into OpenCode's own instructions config — no automatic
-  sync, no native adapter claim.
+  `skills/closeout-remote/SKILL.md` carries the remote-mode half: when
+  local capture/flush cannot run, the closeout surfaces a draft-only
+  knowledge handoff (no pointer write, no flush) for the operator to
+  capture from a capable host. OpenCode keeps its capability gap
+  (issue #66): the supported path is the manual operator shim `python
+  skills/memory/scripts/knowledge/policy.py --text` pasted into
+  OpenCode's own instructions config — no automatic sync, no native
+  adapter claim.
 - Documentation: `docs/KNOWLEDGE-ROUTING.md` (the routing truth table —
   helper contract, per-host gates and cadence, default-off byte-identity,
   compat fallback, OpenCode gap); README, `docs/KNOWLEDGE-COMPANION.md`,

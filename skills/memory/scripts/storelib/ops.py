@@ -83,14 +83,23 @@ def _identical_content_row(conn, namespace: str, content: str):
 
     Issue #363: the at-most-once replay key for queued adds. Scoped to the
     effective namespace and LIVE rows only (write.py dedup scoping parity);
-    superseded rows never satisfy a replay.
+    superseded rows never satisfy a replay.  Knowledge POINTER rows are
+    excluded (FB-017/SEC-005, 2026-11-14): a pointer row's content is the
+    closed pointer payload, and an ordinary ``add`` whose content happens
+    to equal it must never fold onto the pointer (the fold receipt would
+    name the pointer row as the add's canonical id — a silent supersede
+    candidate and an authority leak).  Ordinary-to-ordinary identical adds
+    still fold; the pointer keeps its own replay lane (the engine's
+    applied_ops key on the knowledge_link op id).
     """
     if not content:
         return None
     try:
         row = conn.execute(
             "SELECT id FROM memory WHERE namespace = ? AND content = ? "
-            "AND superseded_at IS NULL LIMIT 1",
+            "AND superseded_at IS NULL "
+            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
+            " LIMIT 1",
             (namespace, content)).fetchone()
     except Exception:
         return None
@@ -317,12 +326,30 @@ def _knowledge_link_fields(args: Mapping[str, Any]) -> dict[str, Any]:
     _drive_root = _re.compile(r"^[A-Za-z]:[\\/]")
     _abs_root = _re.compile(r"^[\\/]")
 
+    # MIC-PLAT-004: Windows reserved device names (case-insensitive; the
+    # basename stem before the FIRST dot — so "CON", "con" and "CON.txt"
+    # all match, while "console" does not) would resolve to a DEVICE,
+    # not a file, on a Windows host even inside an otherwise relative
+    # path.  Refused conservatively: any whole value or "/"-separated
+    # segment whose stem is reserved (values with backslashes are
+    # already refused above).
+    _reserved_names = frozenset(
+        ("CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+         "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+         "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"))
+
+    def _reserved_stem(segment: str) -> bool:
+        return segment.split(".", 1)[0].upper() in _reserved_names
+
     def _path_shaped(value: str) -> bool:
         if _drive_root.match(value) or _abs_root.match(value):
             return True
         if "\\" in value:
             return True
         if any(part == ".." for part in value.split("/")):
+            return True
+        if _reserved_stem(value) or any(
+                _reserved_stem(part) for part in value.split("/")):
             return True
         return False
 
