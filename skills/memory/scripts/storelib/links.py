@@ -284,6 +284,13 @@ def _link_neighbors_lexical(
         "SELECT id, content, tags, type, namespace, confidence, signal "
         "FROM memory "
         "WHERE namespace=? AND superseded_at IS NULL AND id != ? "
+        # PR1 (knowledge companion): pointer rows are never link NEIGHBORS —
+        # an edge from an ordinary fact plus the attribute-evolution tag
+        # union would mutate an authoritative pointer row's metadata
+        # outside the handler. (A pointer row's OWN write passes
+        # link_attr_propagate=False, but that flag only stops its tags
+        # flowing OUT; this predicate stops ordinary writes reaching IN.)
+        "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%') "
         "ORDER BY ingestion_ts DESC LIMIT ?",
         (namespace, mid, CONSOLIDATE_MAX_ROWS_PER_NAMESPACE),
     ).fetchall()
@@ -316,7 +323,10 @@ def _link_neighbors_vec(
             continue
         row = conn.execute(
             "SELECT id, content, tags, type, namespace, confidence, signal "
-            "FROM memory WHERE id=? AND superseded_at IS NULL AND namespace=?",
+            "FROM memory WHERE id=? AND superseded_at IS NULL AND namespace=? "
+            # PR1 (knowledge companion): same reserved-ref exclusion as the
+            # lexical lane above — the vec0 KNN window is prefix-blind.
+            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')",
             (nid, namespace),
         ).fetchone()
         if row:

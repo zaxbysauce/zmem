@@ -48,6 +48,29 @@ _SELECTOR_ENVELOPE_KEYS = (
     "budget_truncated", "budget_dropped_protected", "arms", "rendered",
 )
 
+# Tool-refusal values proven content-free (stable machine codes the server
+# actually mints for whole-call authorization decisions — namespace guard,
+# revoked/uncapable token, impersonation; never prose, never a secret).
+# Only these may cross the wire boundary as a structured code.
+TOOL_REFUSAL_CODES = ("namespace_not_allowed", "capability_denied",
+                      "principal_mismatch")
+
+
+class ToolRefusalError(RuntimeError):
+    """A tool's structured refusal carrying one SAFE machine code.
+
+    Still a :class:`RuntimeError`, so every legacy ``except RuntimeError``
+    caller keeps its exact behavior; ``safe_code`` is always one of
+    :data:`TOOL_REFUSAL_CODES` — arbitrary tool error text is never
+    reflected into it (the knowledge transport reads only this attribute).
+    """
+
+    def __init__(self, code: str) -> None:
+        if code not in TOOL_REFUSAL_CODES:
+            raise ValueError("not a safe refusal code: %r" % (code,))
+        super().__init__(code)
+        self.safe_code = code
+
 
 def _resolve_token(args: argparse.Namespace) -> str:
     if args.token:
@@ -113,7 +136,13 @@ async def _call(url: str, token: str, tool: str, arguments: dict) -> dict:
             raise ValueError("prefetch response is not valid JSON")
         if isinstance(obj, dict):
             if obj.get("error"):
-                raise RuntimeError(str(obj["error"])[:200])
+                err_text = str(obj["error"])[:200]
+                # A whitelisted refusal code becomes the typed error (the
+                # knowledge transport classifies it without string-guessing);
+                # every other error keeps the legacy RuntimeError.
+                if err_text in TOOL_REFUSAL_CODES:
+                    raise ToolRefusalError(err_text)
+                raise RuntimeError(err_text)
             return obj
     raise ValueError("prefetch response was not a JSON object")
 

@@ -471,6 +471,45 @@ def _failure_reason(exc: BaseException) -> str:
             else REASON_EMPTY_POOL)
 
 
+# The SAFE machine codes a hub-side refusal of a KNOWLEDGE call can carry:
+# the server's whole-call denial codes (mirroring mcp_client's
+# TOOL_REFUSAL_CODES) plus ``authorization_denied``, synthesized here for
+# HTTP 401/403 found in the exception chain.  Stable enum values —
+# classified exactly, never by substring.
+KNOWLEDGE_REFUSAL_CODES = ("namespace_not_allowed", "authorization_denied",
+                           "capability_denied", "principal_mismatch")
+
+
+def _knowledge_refusal_code(exc: BaseException, _depth: int = 0) \
+        -> str | None:
+    """The safe refusal code for a KNOWLEDGE call failure, or None.
+
+    Knowledge calls only (core wrappers unchanged): reads only the
+    whitelisted ``safe_code`` attribute minted by mcp_client's
+    ToolRefusalError — never arbitrary tool error text — and walks the
+    cause/context/ExceptionGroup chain for an HTTP 401/403 status error
+    (the async stack surfaces those wrapped)."""
+    if _depth > 8:
+        return None
+    code = str(getattr(exc, "safe_code", "") or "")
+    if code in KNOWLEDGE_REFUSAL_CODES:
+        return code
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status in (401, 403):
+        return "authorization_denied"
+    if hasattr(exc, "exceptions"):
+        for sub in exc.exceptions:  # type: ignore[attr-defined]
+            found = _knowledge_refusal_code(sub, _depth + 1)
+            if found is not None:
+                return found
+    for linked in (exc.__cause__, exc.__context__):
+        if linked is not None and linked is not exc:
+            found = _knowledge_refusal_code(linked, _depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
 class McpHttp:
     """The zmem MCP tools over HTTP; no network before the operation.
 
@@ -680,6 +719,103 @@ class McpHttp:
             return {"ok": False, "reason": "empty-pool"}
         return payload if isinstance(payload, dict) else {
             "ok": False, "reason": REASON_HUB_UNREACHABLE}
+
+    def apply_knowledge_ops(
+            self, ops: list, principal: str = "",
+            client_protocol: int = CLIENT_PROTOCOL_MAJOR,
+            deadline_ms: int | None = None) -> dict[str, Any]:
+        """PR1 (knowledge companion): apply ``knowledge_link`` ops ONLY.
+
+        A deliberately SEPARATE method from :meth:`apply_ops` so the
+        knowledge delivery lane (knowledge/delivery.py) can never leak a
+        knowledge op into — or be mistaken for — the core operation queue.
+        The caller MUST have verified the hub's ``hello`` capabilities
+        advertise ``knowledge_link_v1`` first; this method performs no
+        fallback of any kind (an old hub gets the structured refusal, the
+        entries stay queued). Every op in ``ops`` must be a
+        ``knowledge_link`` envelope; anything else is refused client-side
+        (a mixed core/knowledge batch is exactly the poisoning this split
+        exists to prevent). Fails closed: connect errors and deadline hits
+        return ``{"ok": False, "reason": ...}`` envelopes, never raise.
+        """
+        for op in ops:
+            if not isinstance(op, dict) or op.get("op") != "knowledge_link":
+                return {
+                    "ok": False,
+                    "reason": "knowledge-batch-refused",
+                    "detail": "apply_knowledge_ops carries only "
+                              "knowledge_link ops (never a mixed core "
+                              "batch)",
+                }
+        arguments: dict[str, Any] = {
+            "ops": list(ops),
+            "principal": principal,
+            "client_protocol": client_protocol,
+            "deadline_ms": deadline_ms,
+        }
+        try:
+            payload = self._run_tool("apply_ops", arguments)
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+            refusal = _knowledge_refusal_code(exc)
+            if refusal is not None:
+                # The hub DENIED the call (scoped token / authorization):
+                # a stable nonretryable reason, never collapsed into
+                # empty-pool (which would requeue the denial forever).
+                logger.debug(
+                    "zmem transport: apply_knowledge_ops refused: %s",
+                    refusal)
+                return {"ok": False, "reason": refusal}
+            logger.debug(
+                "zmem transport: apply_knowledge_ops failed closed: %s",
+                exc)
+            if _is_unreachable_exception(exc):
+                return {"ok": False, "reason": REASON_HUB_UNREACHABLE}
+            return {"ok": False, "reason": REASON_EMPTY_POOL}
+        return payload if isinstance(payload, dict) else {
+            "ok": False, "reason": REASON_HUB_UNREACHABLE}
+
+    def knowledge_pointer(
+            self, target: str, key: str, *, namespace: str | None = None,
+            deadline_ms: int | None = None) -> dict[str, Any]:
+        """PR1 (knowledge companion): read ONE authoritative knowledge
+        pointer row from the hub's ``knowledge_pointer`` tool.
+
+        This is the remote capture path's predecessor lookup — the way a
+        SECOND host stakes the pointer the hub actually holds instead of
+        its own local sidecar.  Read-only and metadata-only (row id,
+        version, logical id, locator, digest, summary — never a token,
+        never a note body).  The caller MUST have verified the hub's
+        ``hello`` capabilities advertise ``knowledge_link_v1`` first; this
+        wrapper performs no fallback of any kind (no core queue, no raw-DB
+        route) and fails open with ``{"ok": False, "reason": ...}`` like
+        every read wrapper — EXCEPT a hub-side refusal (scoped-token
+        namespace denial, HTTP 401/403), which returns its stable code
+        (``namespace_not_allowed``/``authorization_denied``) so the caller
+        can refuse to fall back past the hub's access decision.  The
+        pointer CAS at apply time remains the safety net, so a merely
+        failed read can only cost an honest cas_stale.
+        """
+        arguments: dict[str, Any] = {
+            "target": target,
+            "key": key,
+            "deadline_ms": deadline_ms,
+        }
+        if namespace is not None:
+            arguments["namespace"] = namespace
+        try:
+            payload = self._run_tool("knowledge_pointer", arguments)
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001
+            refusal = _knowledge_refusal_code(exc)
+            if refusal is not None:
+                logger.debug(
+                    "zmem transport: knowledge_pointer refused: %s",
+                    refusal)
+                return {"ok": False, "reason": refusal}
+            logger.debug(
+                "zmem transport: knowledge_pointer failed open: %s", exc)
+            return {"ok": False, "reason": _failure_reason(exc)}
+        return payload if isinstance(payload, dict) else {
+            "ok": False, "reason": "hub-response-invalid"}
 
     def tier0_get(self, client_protocol: int = CLIENT_PROTOCOL_MAJOR,
                   deadline_ms: int | None = None) -> dict[str, Any]:

@@ -916,7 +916,12 @@ def organize(
         # column) — summaries are the pipeline's OUTPUT, and letting them into
         # the working set would let consolidate ingest/absorb the very rows it
         # produced (summary-as-keeper, summary-tombstoned-into-summary).
-        "AND (source_ref IS NULL OR source_ref NOT LIKE ?) "
+        # PR1 (knowledge companion): knowledge pointer rows join the
+        # exclusion — a pointer is authoritative state, not episode input,
+        # and the related-graph/topic stages share consolidate's neighbor
+        # predicate, which carries the same reserved-ref filter.
+        "AND (source_ref IS NULL OR (source_ref NOT LIKE ? "
+        "AND source_ref NOT LIKE 'knowledge:%')) "
         "ORDER BY ingestion_ts DESC, id DESC LIMIT ?",
         (SUMMARY_SOURCE_REF_PREFIX + "%", bound),
     ).fetchall()

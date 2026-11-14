@@ -26,6 +26,18 @@ revision 2 in the trace):
   unredacted original anywhere on the hub.
 - Error codes are content-free (``capability_denied``, ``target_missing``,
   ``store_refused``, ``capture_refused``, ``bad_op``) — never op content.
+- PR1 (knowledge companion, 2026-11-13): ``knowledge_link`` is a typed op
+  whose args are a CLOSED whitelist of pointer metadata (digest as eight
+  8-hex chunks, reconstructed and validated here — never a raw 64-hex
+  run, never note content, never a path). Namespace scope is checked
+  BEFORE the pointer-existence lookup (no cross-namespace oracle) and the
+  op bypasses the #363 identical-content replay lane (add/capture only).
+  A first create or idempotent noop needs the ``write`` capability; a
+  replacement — an advance, or ANY supplied ``expected_row_id`` — needs
+  ``mutate``. Application goes through ``storelib.knowledge.link_pointer``
+  (the same handler and untrusted_tool taint as the local CLI capture),
+  with ``pointer_cas_stale`` / ``pointer_conflict`` as distinct receipt
+  codes.
 """
 
 from __future__ import annotations
@@ -38,11 +50,32 @@ from typing import Any, Callable, Mapping, Optional
 
 from storelib import write as writelib
 from storelib.write import CapturePolicyRefusal
+# PR1: the knowledge pointer CAS handler's exception taxonomy — imported
+# eagerly so the per-op savepoint handler can distinguish a retryable
+# stale CAS from an immutability conflict (storelib.knowledge imports
+# storelib.write, which this module already imports; no cycle).
+from storelib.knowledge import (
+    KnowledgePointerCasError as _KnowledgeCasError,
+    KnowledgePointerConflict as _KnowledgeConflictError,
+)
 
 _OP_KINDS = ("add", "update", "supersede", "invalidate",
-             "capture")  # capture = add-with-auto (hook captures)
+             "capture",  # capture = add-with-auto (hook captures)
+             "knowledge_link")  # PR1: the knowledge-pointer CAS op
 _MUTATING_KINDS = ("update", "supersede", "invalidate")
 _MAX_OPS_PER_BATCH = 256
+
+# PR1 (knowledge companion, 2026-11-13): the CLOSED args whitelist for a
+# knowledge_link op.  The op carries POINTER METADATA ONLY — no note
+# content, no paths, no caller-controlled writer flags — and the digest
+# travels as eight 8-hex chunks (``fullhash``), exactly the pointer
+# payload's storage form, so no >=32-hex run exists in an op line.
+_KNOWLEDGE_LINK_ARG_FIELDS = frozenset({
+    "namespace", "target", "key", "version", "locator", "fullhash",
+    "summary", "date", "expected_row_id",
+})
+_KNOWLEDGE_HASH_CHUNKS = 8
+_KNOWLEDGE_HASH_CHUNK_LEN = 8
 
 
 def _identical_content_row(conn, namespace: str, content: str):
@@ -50,14 +83,23 @@ def _identical_content_row(conn, namespace: str, content: str):
 
     Issue #363: the at-most-once replay key for queued adds. Scoped to the
     effective namespace and LIVE rows only (write.py dedup scoping parity);
-    superseded rows never satisfy a replay.
+    superseded rows never satisfy a replay.  Knowledge POINTER rows are
+    excluded (FB-017/SEC-005, 2026-11-14): a pointer row's content is the
+    closed pointer payload, and an ordinary ``add`` whose content happens
+    to equal it must never fold onto the pointer (the fold receipt would
+    name the pointer row as the add's canonical id — a silent supersede
+    candidate and an authority leak).  Ordinary-to-ordinary identical adds
+    still fold; the pointer keeps its own replay lane (the engine's
+    applied_ops key on the knowledge_link op id).
     """
     if not content:
         return None
     try:
         row = conn.execute(
             "SELECT id FROM memory WHERE namespace = ? AND content = ? "
-            "AND superseded_at IS NULL LIMIT 1",
+            "AND superseded_at IS NULL "
+            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
+            " LIMIT 1",
             (namespace, content)).fetchone()
     except Exception:
         return None
@@ -212,6 +254,124 @@ def mutate_allowed(principal_obj: Any) -> bool:
     return "mutate" in capabilities or "admin" in capabilities
 
 
+def write_allowed(principal_obj: Any) -> bool:
+    """The PR1 knowledge_link first-create/noop capability rule.
+
+    Same fail-closed shape as :func:`mutate_allowed`; the accepted set is
+    ``write`` (the plain creation capability) plus the stronger
+    ``mutate``/``admin``.  A pointer REPLACEMENT (an advance, or any op
+    supplying ``expected_row_id``) requires :func:`mutate_allowed`
+    instead — see the knowledge_link admission block in
+    :func:`apply_ops`.
+    """
+    if principal_obj is None:
+        return False
+    if getattr(principal_obj, "revoked", False):
+        return False
+    capabilities = getattr(principal_obj, "capabilities", None)
+    if capabilities is None:
+        return True
+    if not capabilities:
+        return False
+    return bool({"write", "mutate", "admin"} & set(capabilities))
+
+
+def _knowledge_link_fields(args: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a knowledge_link op's args against the CLOSED whitelist and
+    return the handler fields.
+
+    Raises ``ValueError`` (content-free) for any violation: unknown keys,
+    wrong types, a malformed chunked digest, or a PATH-SHAPED ROUTING
+    value — the hub never reads a client-supplied path, and the whitelist
+    guarantees no path field exists at all (defense in depth on top of
+    it: any backslash, drive root, absolute root, or ``..`` segment in a
+    routing string refuses the op).  ``summary`` is prose, not routing:
+    it stays a required non-empty string but is exempt from the
+    path-shape refusal — a summary may legitimately mention a path and
+    no file is ever opened from it.
+    """
+    extra = sorted(set(args) - _KNOWLEDGE_LINK_ARG_FIELDS)
+    if extra:
+        raise ValueError(
+            "knowledge_link: unknown args %s" % ",".join(extra))
+    for field in ("namespace", "target", "key", "locator",
+                  "summary"):
+        if not isinstance(args.get(field), str) or not args[field]:
+            raise ValueError(
+                "knowledge_link: %s must be a non-empty string" % field)
+    version = args.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError("knowledge_link: version must be an integer >= 1")
+    chunks = args.get("fullhash")
+    if (not isinstance(chunks, list)
+            or len(chunks) != _KNOWLEDGE_HASH_CHUNKS
+            or not all(isinstance(c, str)
+                       and len(c) == _KNOWLEDGE_HASH_CHUNK_LEN
+                       and all(ch in "0123456789abcdef" for ch in c)
+                       for c in chunks)):
+        raise ValueError(
+            "knowledge_link: fullhash must be %d 8-hex chunks"
+            % _KNOWLEDGE_HASH_CHUNKS)
+    date = args.get("date")
+    if date is not None and not isinstance(date, str):
+        raise ValueError("knowledge_link: date must be a string or null")
+    expected = args.get("expected_row_id")
+    if expected is not None and (not isinstance(expected, str)
+                                 or not expected):
+        raise ValueError(
+            "knowledge_link: expected_row_id must be a row id or null")
+
+    import re as _re
+
+    _drive_root = _re.compile(r"^[A-Za-z]:[\\/]")
+    _abs_root = _re.compile(r"^[\\/]")
+
+    # MIC-PLAT-004: Windows reserved device names (case-insensitive; the
+    # basename stem before the FIRST dot — so "CON", "con" and "CON.txt"
+    # all match, while "console" does not) would resolve to a DEVICE,
+    # not a file, on a Windows host even inside an otherwise relative
+    # path.  Refused conservatively: any whole value or "/"-separated
+    # segment whose stem is reserved (values with backslashes are
+    # already refused above).
+    _reserved_names = frozenset(
+        ("CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+         "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+         "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"))
+
+    def _reserved_stem(segment: str) -> bool:
+        return segment.split(".", 1)[0].upper() in _reserved_names
+
+    def _path_shaped(value: str) -> bool:
+        if _drive_root.match(value) or _abs_root.match(value):
+            return True
+        if "\\" in value:
+            return True
+        if any(part == ".." for part in value.split("/")):
+            return True
+        if _reserved_stem(value) or any(
+                _reserved_stem(part) for part in value.split("/")):
+            return True
+        return False
+
+    for field in ("target", "key", "locator", "expected_row_id"):
+        value = args.get(field)
+        if isinstance(value, str) and _path_shaped(value):
+            raise ValueError(
+                "knowledge_link: %s must not be path-shaped" % field)
+
+    return {
+        "namespace": args["namespace"],
+        "target": args["target"],
+        "key": args["key"],
+        "version": version,
+        "locator": args["locator"],
+        "full_sha256": "".join(chunks),
+        "summary": args["summary"],
+        "date": date,
+        "expected_row_id": expected,
+    }
+
+
 def parse_ops_line(line: str) -> dict[str, Any]:
     """Parse ONE input line. Raises ValueError with a line-level (content-free)
     message when the line is not a valid op envelope."""
@@ -319,6 +479,24 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
             args = raw.get("args") or {}
             depends_on = raw.get("depends_on") or None
 
+            # Knowledge receipts are scoped evidence: authorize before even
+            # consulting the replay ledger. A caller must not reuse a prior
+            # op id to reveal a canonical row outside its current scope.
+            if kind == "knowledge_link":
+                if principal and effective is None:
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected", error="unknown_principal"))
+                    continue
+                if not _namespace_allowed(effective,
+                                          _effective_namespace(args)):
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected", error="namespace_not_allowed"))
+                    continue
+                if not write_allowed(effective):
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected", error="capability_denied"))
+                    continue
+
             # 1. PK FIRST — a replay writes nothing at all. Idempotency is
             # scoped PER PRINCIPAL: one caller's op_id cannot pre-claim or
             # disclose another caller's canonical id (review PRR-016).
@@ -375,6 +553,63 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                 receipts.append(_receipt(op_id, kind, "rejected",
                                          error="unknown_principal"))
                 continue
+
+            # 3a-prime. PR1 knowledge_link admission. NAMESPACE AUTH FIRST —
+            # the pointer-existence lookup below must never run for a
+            # namespace the principal cannot touch (a capability verdict
+            # keyed on pointer existence would be a cross-namespace
+            # oracle). The #363 identical-content replay lane is an
+            # add/capture-only rule and is structurally bypassed here: a
+            # knowledge_link op's "content" is the server-minted pointer
+            # payload, never caller content. Capability split: a FIRST
+            # create or an idempotent noop needs `write`; a REPLACEMENT
+            # (an advance, or ANY op supplying expected_row_id — the
+            # conservative reading of an explicit CAS stake) needs
+            # `mutate`. The same storelib.knowledge handler (and its
+            # untrusted_tool taint) runs for local and remote callers.
+            if kind == "knowledge_link":
+                if not _namespace_allowed(effective,
+                                          _effective_namespace(args)):
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected",
+                        error="namespace_not_allowed"))
+                    continue
+                try:
+                    link_fields = _knowledge_link_fields(args)
+                except ValueError:
+                    receipts.append(_receipt(op_id, kind, "rejected",
+                                             error="bad_op"))
+                    continue
+                requires_mutate = link_fields["expected_row_id"] is not None
+                if not requires_mutate:
+                    from storelib import knowledge as _store_knowledge
+
+                    try:
+                        current = _store_knowledge.get_pointer(
+                            conn, link_fields["namespace"],
+                            link_fields["target"], link_fields["key"])
+                    except ValueError:
+                        receipts.append(_receipt(
+                            op_id, kind, "rejected", error="bad_op"))
+                        continue
+                    if current is not None:
+                        # Replacement unless it is the idempotent noop
+                        # (same version AND same digest).
+                        requires_mutate = not (
+                            current.version == link_fields["version"]
+                            and current.full_sha256
+                            == link_fields["full_sha256"])
+                if requires_mutate:
+                    if not mutate_allowed(effective):
+                        receipts.append(_receipt(
+                            op_id, kind, "rejected",
+                            error="capability_denied"))
+                        continue
+                elif not write_allowed(effective):
+                    receipts.append(_receipt(
+                        op_id, kind, "rejected",
+                        error="capability_denied"))
+                    continue
 
             # 3b. Namespace scope for EVERY kind: the declared namespace
             # (add/capture) and the TARGET row's namespace (the mutation
@@ -482,6 +717,11 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                     canonical[op_id] = _replay
                     committed_ids.add(op_id)
                     continue
+            elif kind == "knowledge_link":
+                # Admission finished in 3a-prime (namespace auth, whitelist,
+                # capability); no by-id target resolution applies — the op
+                # addresses a reserved source_ref, not a store row id.
+                pass
             else:
                 target_probe = _resolve_target(args, canonical)
                 target_ns = (_target_namespace(conn, target_probe)
@@ -526,6 +766,20 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 receipt = _receipt(op_id, kind, "rejected",
                                    error="capture_refused")
+            except _KnowledgeCasError:
+                # PR1: a stale/lost CAS stake is a RETRYABLE rejection with
+                # its own content-free code — mapping it into
+                # store_refused/target_missing would hide the one outcome
+                # the caller can act on (re-read the pointer, relink).
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                receipt = _receipt(op_id, kind, "rejected",
+                                   error="pointer_cas_stale")
+            except _KnowledgeConflictError:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                receipt = _receipt(op_id, kind, "rejected",
+                                   error="pointer_conflict")
             except ValueError as exc:
                 conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -586,6 +840,38 @@ def _capture_mode(args: Mapping[str, Any]) -> str:
 def _apply_one(conn: sqlite3.Connection, op_id: str, kind: str,
                args: Mapping[str, Any],
                canonical: Mapping[str, str]) -> dict[str, Any]:
+    if kind == "knowledge_link":
+        # PR1: the authoritative pointer CAS. The fields are revalidated
+        # here (the admission block's check is the gate; this is the single
+        # source of truth for the handler call). link_pointer owns the
+        # transaction discipline (BEGIN IMMEDIATE / nested SAVEPOINT), the
+        # reserved-ref mint capability, the untrusted_tool taint, and the
+        # immutability/CAS laws — the SAME handler serves local CLI
+        # captures and hub-applied remote ops (taint parity).
+        from storelib import knowledge as _store_knowledge
+
+        fields = _knowledge_link_fields(args)
+        result = _store_knowledge.link_pointer(
+            conn,
+            namespace=fields["namespace"],
+            target=fields["target"],
+            key=fields["key"],
+            version=fields["version"],
+            locator=fields["locator"],
+            full_sha256=fields["full_sha256"],
+            summary=fields["summary"],
+            date=fields["date"],
+            expected_row_id=fields["expected_row_id"],
+        )
+        noop = result["status"] == "noop"
+        receipt = _receipt(
+            op_id, kind, "committed", canonical_id=result["row_id"],
+            deduped=noop, created_new=(not noop))
+        receipt["link_status"] = result["status"]
+        receipt["version"] = result["version"]
+        receipt["replaced_unverified"] = result.get("replaced_unverified", 0)
+        return receipt
+
     if kind in ("add", "capture"):
         result = writelib.add_memory(
             conn,

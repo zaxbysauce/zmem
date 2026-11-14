@@ -33,3 +33,22 @@ claims; zmem publishes only what its own harness measures on its own fixture.
 | LongMemEval / LoCoMo numbers, third-party benchmark scores | — | **not a claim**: adapters (`scripts/eval_adapters.py`) convert public corpora into zmem gold format only; no score is published and CI downloads nothing |
 | Vector recall quality on real corpora at scale | — | **aspirational** (self-corpus harness above measures it per-store; no published number) |
 | Cross-machine store sync / conflict-free multi-writer | `storelib/sync.py` export/import; `storelib/schema.py` writer leases | partial — leases serialize writers on one box; sync is offline file exchange, not live replication |
+| Knowledge companion (PR1): explicit `knowledge capture/read/check/status/flush`, off by default, immutable content-addressed versions to a Markdown vault or `kb-http` target, reserved `knowledge:` pointer rows, separate capability-gated remote delivery lane, never injects | `skills/memory/scripts/storelib/cli.py` `_cmd_knowledge`; `skills/memory/scripts/knowledge/` (`workflow.py`, `documents.py`, `journal.py`, `delivery.py`, `config.py`, `locking.py`); `storelib/knowledge.py` `link_pointer`; `storelib/ops.py` `knowledge_link` op; `hermes-plugin/server/mcp_server.py` `knowledge_pointer` + `knowledge_link_v1`; pinned by `tests/test_knowledge_{config,delivery,documents,guards,journal,links,workflow}.py` and `tests/test_knowledge_hub_integration.py` (real-hub subprocess: cross-host pointer resolution, exit-3 pending lane, direct-tool namespace denial without oracle, workflow-level denied-read no-local-fallback — `test_scoped_read_no_local_intent_fallback_in_denied_namespace` green on a real hub, suite 21/21 PASS, run log `call_UUsMEhLtHvCE7vXXiiUCPie6`; scope: that executed suite, not a whole-fleet claim) | implemented — **scoped to PR1**: purely explicit (no automatic, conditional, or injected trigger; an agent may run it only on explicit user instruction); the conditional instruction/skill/closeout discovery wiring is PR2 and NOT shipped; `kb-http` is a minimal custom JSON API, not the official Obsidian API (no Obsidian dependency, never mandatory) |
+
+## Resolved docs-callback items (2026-11-13)
+
+All three previously ledgered knowledge-companion gaps are closed —
+each verified against the landed source AND a pinning test before this
+note was written (no mock-intent labeling):
+
+- Pre-create `--summary` length validation: admission now refuses an
+  oversized summary (≤ 512, `MAX_SUMMARY_CHARS`) before the journal
+  intent/create (`knowledge/workflow.py`), pinned by
+  `tests/test_knowledge_workflow.py::test_cli_oversized_summary_is_clean_exit_2`.
+- Corrupt-sidecar `--json` envelopes: a corrupt journal/delivery sidecar
+  is an exit-2 refusal with one `{"ok": false, "error": …}` object under
+  `--json` (`storelib/cli.py` `_cmd_knowledge` top-level guard), pinned by
+  `tests/test_knowledge_workflow.py::test_cli_corrupt_delivery_sidecar_is_clean_json`
+  and `tests/test_knowledge_journal.py::test_corrupt_file_refuses`.
+- Workflow-level denied-read no-fallback (wire2): green on the real-hub
+  wire, per the executed-suite citation in the table above.
