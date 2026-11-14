@@ -417,6 +417,35 @@ def store_dir_from_conn(conn: sqlite3.Connection) -> Path | None:
     return None
 
 
+def _ensure_knowledge_package() -> None:
+    """Anchor the real ``knowledge`` package by path (FB-031 CI fix).
+
+    Import-path-order hazard: legacy suites (pages/as-of/recall families)
+    put ``skills/memory/scripts/storelib`` ITSELF on ``sys.path`` ahead of
+    the scripts dir, so ``storelib/knowledge.py`` — the pointer MODULE —
+    shadows the ``knowledge`` PACKAGE for absolute imports. The fence's
+    ``from knowledge...`` imports then die with ``'knowledge' is not a
+    package`` inside ``schema.migrate`` autoload. Anchoring
+    ``sys.modules['knowledge']`` to the package directory next to this
+    module makes every absolute ``knowledge.*`` import resolve
+    deterministically, in any ``sys.path`` order. Idempotent and cheap:
+    a properly-anchored package short-circuits before any I/O.
+    """
+    import importlib.util
+    import sys
+
+    pkg_dir = Path(__file__).resolve().parent.parent / "knowledge"
+    mod = sys.modules.get("knowledge")
+    if mod is not None and getattr(mod, "__path__", None) == [str(pkg_dir)]:
+        return
+    spec = importlib.util.spec_from_file_location(
+        "knowledge", pkg_dir / "__init__.py",
+        submodule_search_locations=[str(pkg_dir)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["knowledge"] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+
+
 def _open_sidecar_lock(path: Path, timeout_s: float) -> int:
     """Open and non-blockingly lock ONE persistent sidecar lock file —
     the ``knowledge.locking`` byte-lock discipline (the parent directory
@@ -424,6 +453,7 @@ def _open_sidecar_lock(path: Path, timeout_s: float) -> int:
     releases it when the holder exits). Raises
     :class:`RekeyKnowledgeBusy` when another writer (a capture, flush or
     status in flight) holds the OS lock past the deadline."""
+    _ensure_knowledge_package()
     from knowledge.locking import try_lock_nb
 
     try:
@@ -576,19 +606,23 @@ def knowledge_rekey_fence(store_dir, *, lock_timeout_s: float = 5.0):
     fence wraps the namespace-move entry points, it is never called from
     the ``post_namespace_for`` lane.
     """
+    _ensure_knowledge_package()
     from knowledge.config import KnowledgeConfigError, load_knowledge_config
-    from knowledge.delivery import (
-        DeliveryError, KnowledgeDelivery, delivery_path_for_store)
-    from knowledge.journal import (
-        JournalError, KnowledgeJournal, journal_path_for_store)
 
     if store_dir is None:
         # No file-backed store (in-memory/URI): no sidecars can exist.
         yield None
         return
     store = Path(store_dir)
-    journal_path = journal_path_for_store(store)
-    delivery_path = delivery_path_for_store(store)
+    # Sidecar/lock paths are derived inline (no knowledge.journal import
+    # yet): the disabled-with-no-state fast path must stay CHEAP — it runs
+    # inside schema.migrate() on EVERY store open in non-knowledge hosts,
+    # and the heavy sibling imports (journal/delivery, which pull the
+    # knowledge package's larger dependency cone) are deferred until the
+    # fence actually has knowledge state to coordinate.
+    knowledge_dir = store / "knowledge"
+    journal_path = knowledge_dir / "journal.json"
+    delivery_path = knowledge_dir / "delivery.json"
     lock_paths = (journal_path.with_name(journal_path.name + ".lock"),
                   delivery_path.with_name(delivery_path.name + ".lock"))
     sidecars_present = any(path.exists() for path in
@@ -606,6 +640,16 @@ def knowledge_rekey_fence(store_dir, *, lock_timeout_s: float = 5.0):
         # without creating the knowledge directory or any lock file.
         yield None
         return
+    from knowledge.delivery import (
+        DeliveryError, KnowledgeDelivery, delivery_path_for_store)
+    from knowledge.journal import (
+        JournalError, KnowledgeJournal, journal_path_for_store)
+    # Re-derive the authoritative paths via the exported helpers (they
+    # mirror the inline derivation above; kept single-sourced by tests).
+    journal_path = journal_path_for_store(store)
+    delivery_path = delivery_path_for_store(store)
+    lock_paths = (journal_path.with_name(journal_path.name + ".lock"),
+                  delivery_path.with_name(delivery_path.name + ".lock"))
     # Journal THEN delivery, one fixed order. The normal persistent lock
     # files are created here (enabled first use included, rule 3).
     journal_fd = _open_sidecar_lock(lock_paths[0], lock_timeout_s)

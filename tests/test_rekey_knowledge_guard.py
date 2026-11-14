@@ -1009,5 +1009,51 @@ class CrossProcessOrderingTest(unittest.TestCase):
         self.assertTrue((env.knowledge_dir() / "journal.json").exists())
 
 
+class ShadowedKnowledgeImportTest(unittest.TestCase):
+    """CI-005 (post-retarget CI red): legacy suites (pages / as-of /
+    recall families) put ``skills/memory/scripts/storelib`` ITSELF on
+    ``sys.path`` ahead of the scripts dir, so ``storelib/knowledge.py``
+    (the pointer MODULE) shadows the ``knowledge`` PACKAGE. The fence's
+    absolute ``from knowledge...`` imports must still resolve —
+    ``_ensure_knowledge_package`` anchors the real package by path.
+    Reproduces the exact CI shape in a SUBPROCESS with the shadowing
+    sys.path order, then drives ``schema.migrate`` (the autoload lane
+    that enters the fence)."""
+
+    def test_migrate_survives_storelib_dir_shadowing_the_package(self):
+        import subprocess
+        import sys as _sys
+        import tempfile
+
+        repo_root = Path(__file__).resolve().parent.parent
+        scripts = repo_root / "skills" / "memory" / "scripts"
+        with tempfile.TemporaryDirectory(prefix="zmem-shadow-") as tmp:
+            # storelib FIRST — the shadow order the legacy suites use.
+            script = (
+                "import sys; "
+                "sys.path.insert(0, r'%s'); "
+                "sys.path.insert(0, r'%s'); "
+                "import storelib.schema as schema; "
+                "conn = schema.connect(); "
+                "schema.init_db(conn); "
+                "schema.migrate(conn); "
+                "conn.close(); print('MIGRATE-OK')"
+                % (scripts, scripts / "storelib"))
+            env = dict(os.environ, CI="true",
+                       ZMEM_MODEL_AUTODOWNLOAD="0",
+                       ZMEM_STORE=str(Path(tmp) / "store.sqlite"),
+                       ZMEM_DATA=tmp)
+            proc = subprocess.run(
+                [_sys.executable, "-I", "-c", script],
+                capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0,
+                             "migrate must survive the shadowing sys.path "
+                             "order:\n%s\n%s" % (proc.stdout, proc.stderr))
+            self.assertIn("MIGRATE-OK", proc.stdout)
+            # The shadow really was in play: without the anchor this exact
+            # script dies with "'knowledge' is not a package".
+            self.assertNotIn("is not a package", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
