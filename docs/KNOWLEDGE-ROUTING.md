@@ -130,8 +130,10 @@ operator action:
 
 There is no app-config install tool, no automatic sync, and no claim
 that the OpenCode adapter renders the policy. The pasted policy is
-static until the operator re-runs the helper; wiring the policy into
-the native adapter is future work, disclosed as a remaining gap.
+static until the operator re-runs the helper; the knowledge-policy row
+of the fleet capability matrix stays `capability_gap` — that gap
+remains until the policy is wired into the native adapter as future
+work.
 
 ## Non-goals
 
