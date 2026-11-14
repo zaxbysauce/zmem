@@ -453,6 +453,119 @@ class SkillDocDriftTest(unittest.TestCase):
                           f"SKILL.md must document {needle} (tune-weights)")
 
 
+    # -- issue #127 (documentation truth pass) -------------------------------
+
+    def test_codex_and_hermes_matrix_documented(self):
+        """Issue #127 AC5: the shipped Codex plugin surface (all nine live
+        events, both matchers, 8000/9000/25000 budgets, native flags, /hooks
+        + hooks.state) is documented per OWNING document section, and the
+        Hermes provider/compatibility matrix (with ZMEM_MCP_TIMEOUT 8.0
+        clamped 1.0..30.0) exists. Needles are asserted inside the section
+        that owns them so the Claude matcher substring can never satisfy a
+        Codex assertion."""
+
+        def md_section(text, start_pattern, count=400):
+            lines = text.splitlines()
+            start = None
+            for i, line in enumerate(lines):
+                if re.search(start_pattern, line):
+                    start = i
+                    break
+            self.assertIsNotNone(
+                start, f"section {start_pattern!r} not found"
+            )
+            # Heading-bounded window: from the anchor line to the NEXT
+            # markdown heading of ANY level (a fixed 400-line window, or a
+            # same-or-higher-level bound, swallowed sibling subsections and
+            # re-satisfied needles from text that does not own them — the
+            # desktop quick-reference table duplicates every budget needle;
+            # PR #468 review findings B1 + delta r1). `count` remains a
+            # hard cap.
+            end = min(len(lines), start + count)
+            for j in range(start + 1, min(len(lines), start + count)):
+                if lines[j].startswith("#") and lines[j].strip() != lines[start].strip():
+                    end = j
+                    break
+            return "\n".join(lines[start:end])
+
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        cutover = (REPO_ROOT / "CUTOVER.md").read_text(encoding="utf-8")
+
+        readme_codex = md_section(readme, r"^### Codex ")
+        for needle in (
+            "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+            "Stop", "SubagentStart", "SubagentStop", "PreCompact",
+            "SessionEnd",
+            "Bash|apply_patch",
+            "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch",
+            "8000", "25000", "9000",
+            "features.memories", "memories.use_memories",
+            "memories.generate_memories",
+            "/hooks", "hooks.state",
+        ):
+            self.assertIn(
+                needle, readme_codex,
+                f"README Codex section missing {needle!r} (issue #127 AC5)",
+            )
+
+        skill_codex = md_section(skill, r"Codex registers SessionStart")
+        for needle in (
+            "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+            "Stop", "SubagentStart", "SubagentStop", "PreCompact",
+            "SessionEnd",
+            "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch",
+        ):
+            self.assertIn(
+                needle, skill_codex,
+                f"SKILL.md Codex block missing {needle!r} (issue #127 AC5)",
+            )
+        skill_budget = md_section(
+            skill, r"capped at 8000 encoded bytes", count=20
+        )
+        for needle in ("8000", "25000", "9000"):
+            self.assertIn(
+                needle, skill_budget,
+                f"SKILL.md budget block missing {needle!r} (issue #127 AC5)",
+            )
+
+        cutover_hooks = md_section(cutover, r"Codex manifest hook trust", count=12)
+        for needle in (
+            "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+            "Stop", "SubagentStart", "SubagentStop", "PreCompact",
+            "SessionEnd",
+            "Bash|apply_patch",
+            "Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch",
+        ):
+            self.assertIn(
+                needle, cutover_hooks,
+                f"CUTOVER.md Codex hook-trust bullet missing {needle!r} "
+                "(issue #127 AC5)",
+            )
+        cutover_budget = md_section(
+            cutover, r"^## 5\. Install and trust", count=20
+        )
+        for needle in ("25000", "9000", "8000"):
+            self.assertIn(
+                needle, cutover_budget,
+                f"CUTOVER.md host-surface section missing {needle!r} "
+                "(issue #127 AC5)",
+            )
+
+        readme_matrix = md_section(
+            readme, r"^#### Hermes deployment modes"
+        )
+        for needle in (
+            "provider", "compatibility", "ZMEM_MCP_TIMEOUT",
+            "1.0", "30.0",
+        ):
+            self.assertIn(
+                needle, readme_matrix,
+                f"README Hermes matrix section missing {needle!r} "
+                "(issue #127 AC5)",
+            )
+
+
 class CloseoutDocDriftTest(unittest.TestCase):
     """Issue #58, 3.7: closeout must reflect that the vec0 KNN footgun
     is mitigated (still over-fetch), not unmitigated."""
@@ -470,6 +583,59 @@ class CloseoutDocDriftTest(unittest.TestCase):
                 "is mitigated, not unmitigated (issue #58 3.7).",
             )
 
+
+
+    def test_residue_corrections_documented(self):
+        """Issue #127: the residue corrections are documented in their owning
+        documents (a/b/c/g/h; d/e were already documented by #93 and stay)."""
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        cutover = (REPO_ROOT / "CUTOVER.md").read_text(encoding="utf-8")
+        recall_body = (
+            REPO_ROOT / "hooks" / "lib" / "zmem-recall-body.py"
+        ).read_text(encoding="utf-8")
+
+        # (a) _data_dir() resolves the decision-log data directory.
+        self.assertIn(
+            "Resolve the decision-log data directory", recall_body,
+            "zmem-recall-body.py _data_dir docstring must say it resolves "
+            "the decision-log data directory (issue #127 residue a)",
+        )
+        # (b) the ring reads from the unified data-dir chain (the issue's
+        # "skips plugin-data directories" wording was disproved at the
+        # current tree: read_ops_ring reads exactly the directory it is
+        # given, including plugin-data dirs, by #88 design).
+        self.assertIn(
+            "including plugin-data directories by #88 design", skill,
+            "SKILL.md must document the ring's data-dir resolution "
+            "(issue #127 residue b, corrected)",
+        )
+        # (c) bare ZMEM_STORE is a relative store path.
+        self.assertIn(
+            "a relative path resolved against the process working "
+            "directory",
+            readme,
+            "README must document bare ZMEM_STORE behavior (issue #127 "
+            "residue c)",
+        )
+        # (g) zmem never emits permissionDecision.
+        self.assertIn(
+            "never emits `permissionDecision`", readme,
+            "README must state zmem never emits permissionDecision "
+            "(issue #127 residue g)",
+        )
+        # (h) dangling registry warning documented.
+        self.assertIn("dangling install path", readme)
+        self.assertIn("DANGLING install path", cutover)
+        # (d)/(e) remain covered by the pre-existing SKILL text (#93); the
+        # needles are the full sentences so unrelated substrings ("task-")
+        # can never satisfy them (PR #468 review finding B2).
+        self.assertIn(
+            "credential-prefix-shaped tokens (`sk-`, `npm_`, `AKIA`", skill,
+        )
+        self.assertIn(
+            "eval composer ignores `ZMEM_QUERY_CONTEXT` by design", skill
+        )
 
 class DoctorChecksTest(unittest.TestCase):
     """Issue #58, 3.7: doctor must include the new hybrid-default and
@@ -791,6 +957,44 @@ class Issue87DocDriftTest(unittest.TestCase):
                 "the session-start writer's `status=injected` lines",
         ):
             self.assertIn(needle, text, f"SKILL.md missing {needle!r}")
+
+class ClaimsAuditPathTest(unittest.TestCase):
+    """Issue #127: every backticked local path cited in
+    docs/CLAIMS-AUDIT.md must resolve below the repository root."""
+
+    PATH_RE = re.compile(
+        r"`([^`\n]+?\.(?:py|js|json|md|sh|toml|yaml|yml|txt))`"
+    )
+
+    def test_every_cited_local_path_exists(self):
+        claims = (REPO_ROOT / "docs" / "CLAIMS-AUDIT.md").read_text(
+            encoding="utf-8"
+        )
+        missing = []
+        for match in self.PATH_RE.finditer(claims):
+            token = match.group(1)
+            # Strip an optional :N or :N-M suffix; ignore URLs and
+            # placeholder/symbol-only references (they are not repo-relative
+            # citations).
+            token = re.sub(r":[0-9]+(-[0-9]+)?$", "", token)
+            # Ignore URLs, placeholder-shaped tokens, home-relative paths
+            # (~/...), and bare filenames with no directory component (host
+            #-native files referenced by name, not repo citations).
+            if (
+                "://" in token
+                or "<" in token
+                or ">" in token
+                or token.startswith("~")
+                or ("/" not in token and chr(92) not in token)
+            ):
+                continue
+            if not (REPO_ROOT / token).exists():
+                missing.append(token)
+        self.assertEqual(
+            missing,
+            [],
+            "missing local path: " + (missing[0] if missing else ""),
+        )
 
 
 if __name__ == "__main__":

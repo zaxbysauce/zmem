@@ -708,7 +708,36 @@ the one-copy run (`single-copy-pass`) in the same artifact.
 3. Restart your session. `<repo>/CLAUDE.md` (CC's own always-on project memory)
    is untouched by ZMem — it keeps working exactly as it always has.
 
-### Codex — shared-store skill / broker mode
+### Codex — shipped plugin, shared-store skill / broker mode
+
+The Codex plugin is **shipped**: the repo's `.codex-plugin/plugin.json` manifest
+points at `./hooks/hooks.codex.json` and `./skills/`, and both files are
+required `doctor.py` surfaces (`host-surfaces` fails if either is missing).
+The shipped manifest registers `PreToolUse` with the matcher
+`Bash|apply_patch` and `PostToolUse` with the matcher
+`Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch` (shown unescaped here;
+the table below renders the same matchers markdown-escaped), over these hook
+events:
+
+| Event | Matcher |
+|---|---|
+| `SessionStart` | — |
+| `UserPromptSubmit` | — |
+| `PreToolUse` | `Bash\|apply_patch` |
+| `PostToolUse` | `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|apply_patch` |
+| `Stop` | — |
+| `SubagentStart` | — |
+| `SubagentStop` | — |
+| `PreCompact` | — |
+| `SessionEnd` | — |
+
+PreToolUse context is **advisory** (it lands as `additionalContext`, never as
+a tool refusal — zmem never emits `permissionDecision`), and compaction is the
+separate `PreCompact` moment. On Codex the recall envelope is additionally
+capped at **8000 encoded bytes** by the launcher; `ZMEM_CTX_BUDGET` is
+host-dependent when unset — `25000` on the ZCode launcher path and `9000` on
+the Claude Code path and the ZCode non-launcher path (an operator-set value on
+Codex is clamped to the 8000 cap with a stderr warning).
 
 Codex does not need a second physical store. Point it at the same canonical
 store directory the plugin hosts use.
@@ -723,16 +752,20 @@ store directory the plugin hosts use.
    use_memories = false
    generate_memories = false
    ```
-   Do this yourself; zmem should never auto-edit Codex config.
+   Those three native flags (`features.memories`, `memories.use_memories`,
+   `memories.generate_memories`) are reported by the `codex-native-memory`
+   check separately from project trust (`codex-hook-trust`) and from shipped
+   plugin hook trust (`untrusted-hook`). Do this yourself; zmem should never
+   auto-edit Codex config.
 2. Make the canonical shared store path writable from Codex. If Codex cannot
    write that path directly, add it as a writable root or use a small local
    broker that owns the store.
 3. Use `ZMEM_TIER0=native` for Codex cutover: keep Codex project instructions
    as the host's native Tier 0 and let zmem own the shared Tier 2 store.
-4. If you add a repo-local Codex hook surface later, trust the project and
-   reapprove hooks after the cutover change. The current repo's Claude/ZCode
-   plugin surfaces are first-class now; repo-local Codex adapter files may lag
-   behind and are treated as optional by `doctor.py`.
+4. After an upgrade, re-approve the shipped hooks in the Codex TUI (`/hooks`)
+   when the manifest changes, and refresh the `hooks.state` hash so
+   `untrusted-hook` stops warning: trust the project, then reapprove the
+   events the manifest registers.
 
 #### Doctor install-skew and orphan-store checks (issue #185)
 
@@ -749,17 +782,64 @@ store directory the plugin hosts use.
   `memoryEnabled`: explicit `true` fails cutover, explicit `false` passes,
   anything unreadable warns. Disable it yourself; zmem never auto-edits it.
 - **`untrusted-hook`** — compares the pre-approval events the repo's
-  Codex manifest registers (SessionStart, PreToolUse) with the hook-trust
-  state recorded for your repo; missing events warn
+  Codex manifest registers (SessionStart, UserPromptSubmit, PreToolUse
+  `Bash|apply_patch`, PostToolUse `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`,
+  Stop, SubagentStart, SubagentStop, PreCompact, SessionEnd) with the
+  hook-trust state recorded for your repo; missing events warn
   `untrusted-hook <ids>`. When no config entry names this repo, the
   box-wide union of trusted events is used as a read-only inventory
   fallback — on a multi-repo box another repo's approval can stand in, so
   treat a pass as inventory rather than proof. Reapproval is always manual.
+- **`plugin-registries`** (issue #127) — read-only plugin-registry
+  diagnostics: every Claude/ZCode registry entry is validated for `name`,
+  `version`, and `install_path`, and a **dangling install path** (the
+  registry names an install directory that no longer exists — the residue
+  of an uninstall or cache purge) warns with the exact registry path,
+  plugin name, version, and missing install path. Codex has no host
+  registry: it installs from the checkout
+  (`registry="checkout"`, validating `.codex-plugin/plugin.json`); Hermes
+  is deployed by provider or compatibility configuration
+  (`registry="provider-or-compatibility-config"`) and makes no cache-path
+  claim. A registry warning never fails the report.
 - **`orphan-store`** — warns with `schema=`/`rows=` for each non-canonical
   SQLite store on the known host paths (plugin-data env dirs,
   `~/.zcode/memory/store.sqlite`). Inspect, then merge with
   `promote-store --from <path>` and retire it manually; doctor never
   deletes or migrates anything.
+
+#### Hermes deployment modes — provider vs compatibility
+
+Hermes has exactly two deployment modes for zmem memory (issue #127 matrix;
+native integration landed with #165):
+
+| | `provider` | `compatibility` |
+|---|---|---|
+| Path | Native `MemoryManager` / `ZmemMemoryProvider` plugin | Shell hooks (`zmem-hermes-reflect.py`, `zmem-hermes-convention.py`) |
+| Providers | ONE provider (`memory.provider = zmem`) | none (`memory.provider = hindsight` or unset — hooks carry the surface) |
+| Context placement | Tier 0 / system placement; the MemoryManager wrapper emits one `<memory-context>` block | `pre_llm_call` injects context; the native callback returns its result directly as `{"context": ...}` rather than the manager's `<memory-context>` wrapper |
+| Recall timing | current-turn prefetch (joins the manager's 8.0-second join contract) | passive delivery on `pre_llm_call`, with ops-ring context |
+| Corrections | provider tools | correction capture before delivery (issue #71 D) |
+| Compatibility-hook scripts | the native provider callback itself spawns ZERO compatibility-hook scripts; operator-installed shell hooks MAY still run beside it | the shell-hook path IS the surface; optional MCP passive prefetch when remote |
+| Non-hooks | `pre_tool_call` is not a zmem hook and performs no zmem I/O in either mode | same |
+
+`ZMEM_MCP_TIMEOUT` is a float, default `8.0` seconds, clamped to `1.0`–`30.0`
+(garbage parses to the 8.0 default; the hook's own shell-side timeout is 15 s,
+so anything above it would never be honored anyway). A timeout or provider
+error yields EMPTY context and exit success — remote delivery always fails
+open. To move between modes, change `memory.provider`; a running Hermes
+gateway loads MCP servers at startup, so restart the gateway once after a
+config change (Hermes runtime behavior, not zmem's).
+
+#### Desktop host quick reference
+
+Per-host facts at a glance (details in each host section above):
+
+| Host | Hook events (manifest) | Context limit | Trust | Native memory flags | Refresh |
+|---|---|---|---|---|---|
+| Claude Code | SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolBatch, PostToolUseFailure, Stop, SubagentStart, SubagentStop, PreCompact, PostCompact, SessionEnd | `ZMEM_CTX_BUDGET` default 9000 | plugin install (marketplace) | `autoMemoryEnabled=false` (`~/.claude/settings.json`) | `scripts/refresh_hosts.py` |
+| Codex | SessionStart, UserPromptSubmit, PreToolUse (`Bash\|apply_patch`), PostToolUse (`Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|apply_patch`), Stop, SubagentStart, SubagentStop, PreCompact, SessionEnd | 8000 encoded bytes (launcher cap; `ZMEM_CTX_BUDGET` clamped to it) | `/hooks` TUI approval + `hooks.state` refresh after upgrades | `features.memories`, `memories.use_memories`, `memories.generate_memories` all false (`~/.codex/config.toml`) | checkout install (`registry="checkout"`) |
+| ZCode | SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop | `ZMEM_CTX_BUDGET` default 25000 (launcher path); 9000 non-launcher | plugin cache install (`~/.zcode/cli/plugins/`) | `memoryEnabled` false (`~/.zcode/v2/setting.json`) | `scripts/refresh_hosts.py` |
+| Hermes | provider mode has no shell hooks; compatibility mode uses `pre_llm_call` + observational `post_tool_call` | `ZMEM_MCP_TIMEOUT` float, default 8.0 s, clamp 1.0–30.0 | provider plugin dir or compat hooks config | `memory.provider` (`zmem` = provider mode) | gateway restart after config change |
 
 ### Hermes Agent — local (memory provider + reflection hooks)
 
@@ -1015,7 +1095,7 @@ Paths / store resolution:
 |-----|---------|---------|
 | `ZMEM_HOME` | Path to the zmem checkout (where `store.py` lives). **Required for copy installs;** optional for symlink/junction. | — |
 | `ZMEM_DATA` | Override the store data directory (holds `store.sqlite` + `core.md`). | `~/.zmem` |
-| `ZMEM_STORE` | Override the store SQLite path directly (wins over `ZMEM_DATA`). | — |
+| `ZMEM_STORE` | Override the store SQLite path directly (wins over `ZMEM_DATA`). A **bare filename** (`ZMEM_STORE=store.sqlite`) is kept verbatim by `host.resolve_store_path` — a relative path resolved against the process working directory, with no directory qualification of its own (the store lands wherever the process runs) — so operators must provide a directory-qualified path (e.g. `<dir>/store.sqlite`). | — |
 | `ZMEM_BACKUP_DIR` | Override the directory snapshots are written to (`store.py backup`). Off-volume recommended for drive-loss protection. | `<store dir>/backups` |
 | `ZMEM_CORE_MD` | Override the Tier-0 `core.md` path directly (wins over the store-dir default). | `<data dir>/core.md` |
 | `ZMEM_SKILLS_DIRS` | Extra directories searched for skill-promotion scanning (`;`-delimited on Windows, `:` elsewhere). | derived |
@@ -1645,10 +1725,13 @@ Notes:
   acknowledgment; `ZMEM_CAPTURE_MODE=auto` redacts secrets at capture time
   (default `manual` keeps the original wording and flags `secret_warning`). The
   queue is capped at 100 items (oldest first) and stale items are flagged, never
-  auto-deleted. **Hermes is intentionally NOT wired for live capture** — its hook
-  surface is `post_tool_call` (observational, results discarded) + `pre_llm_call`
-  (context injected), so a Hermes correction-capture would use that flag pattern
-  and is a separate follow-up.
+  auto-deleted. **Hermes captures corrections live** (issue #71 D): the compat
+  hook runs one store-owned capture/prepare call before passive delivery on
+  `pre_llm_call`, and remote corrections land in that box's own sidecar queue
+  (`~/.zmem/queue/`) for review by the closeout skill there. `ZMEM_HERMES_CORRECTIONS=0`
+  disables it (default ON, for parity with the other hosts). Hermes'
+  `post_tool_call` surface stays observational (results discarded); `pre_tool_call`
+  is not a zmem hook and performs no zmem I/O.
 - **Capture recurrence + history progress:**
   `<store-data-dir>/ops/<session-hash>.capture-failure.json` and
   `<store-data-dir>/history-checkpoints/<session-hash>-<path-hash>.json` are

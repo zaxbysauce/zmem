@@ -2143,15 +2143,13 @@ def _check_codex_memory_and_trust(
         )
 
     trust_level = _lookup_project_trust(cfg, project)
-    repo_has_codex_hooks = (repo_root / ".codex" / "hooks.json").exists()
+    # Issue #127: the stale repo-local <repo>/.codex/hooks.json probe is gone.
+    # The repo never shipped a repo-local Codex adapter; the shipped plugin's
+    # manifest trust is reported by _check_codex_manifest_trust.
     hook_state_hits = _hook_state_for_repo(cfg, repo_root)
     if trust_level == "trusted":
-        if repo_has_codex_hooks and not hook_state_hits:
-            status = "warn"
-            summary = "Project is trusted in Codex, but repo-local hooks are not yet approved; reapprove them after cutover."
-        else:
-            status = "pass"
-            summary = "Codex project trust is present."
+        status = "pass"
+        summary = "Codex project trust is present."
     elif trust_level:
         status = "warn"
         summary = f"Codex project trust is {trust_level!r}; trusted is recommended before hook-based cutover."
@@ -2167,7 +2165,6 @@ def _check_codex_memory_and_trust(
             config_path=_display_path(config_path),
             project=_display_path(project),
             trust_level=trust_level,
-            repo_has_codex_hooks=repo_has_codex_hooks,
             approved_hook_entries=len(hook_state_hits),
         )
     )
@@ -2222,10 +2219,10 @@ def _check_surfaces(repo_root: Path) -> dict:
             repo_root / "skills" / "memory" / "SKILL.md",
         ],
     }
-    optional_codex = [
-        repo_root / ".codex" / "hooks.json",
-        repo_root / ".codex" / "AGENTS.md",
-    ]
+    # Issue #127: the optional-Codex era is over — the repo-local .codex/
+    # adapter files were never shipped and the Codex plugin surfaces above
+    # are required. No optional group, no codex_adapter_optional detail, and
+    # no summary text that says Codex adapter files are absent from the repo.
     details = {}
     missing_required = []
     for key, files in required.items():
@@ -2237,12 +2234,6 @@ def _check_surfaces(repo_root: Path) -> dict:
         if len(present) != len(files):
             missing_required.append(key)
 
-    optional_present = [_display_path(p) for p in optional_codex if p.exists()]
-    details["codex_adapter_optional"] = {
-        "expected_examples": [_display_path(p) for p in optional_codex],
-        "present": optional_present,
-    }
-
     if missing_required:
         status = "fail"
         summary = (
@@ -2250,20 +2241,253 @@ def _check_surfaces(repo_root: Path) -> dict:
             "A tree predating the 0.18.0 codex_plugin surface reports this by "
             "design — refresh the tree to the current release."
         )
-    elif optional_present:
-        status = "pass"
-        summary = (
-            "Claude, Codex, and ZCode plugin surfaces plus the memory skill "
-            "are present; optional Codex adapter files are also present."
-        )
     else:
         status = "pass"
         summary = (
             "Claude, Codex, and ZCode plugin surfaces plus the memory skill "
-            "are present; optional Codex adapter files are not in this repo yet."
+            "are present."
         )
 
     return _check("host-surfaces", status, summary, surfaces=details)
+
+
+# Per-registry warning cap for _check_plugin_registries (PR #468 review
+# finding A2): a registry full of purged caches must not balloon the JSON
+# report — the first N warnings are recorded, the remainder are counted.
+_REGISTRY_WARNING_CAP = 20
+
+
+def _normalize_registry_entries(host_name: str, document) -> list[dict]:
+    """Issue #127: project a codec-validated host registry onto the common
+    ``{key, name, version, install_path}`` entry shape. Claude v2 keys
+    ``plugins`` by plugin name (records carry ``installPath``); ZCode v1
+    lists records that carry ``name`` + ``installPath``."""
+    entries: list[dict] = []
+    plugins = document.get("plugins") if isinstance(document, dict) else None
+    if host_name == "claude" and isinstance(plugins, dict):
+        for plugin_name, records in plugins.items():
+            if not isinstance(records, list):
+                continue
+            for index, record in enumerate(records):
+                if isinstance(record, dict):
+                    entries.append(
+                        {
+                            "key": f"{plugin_name}[{index}]",
+                            "name": plugin_name,
+                            "version": record.get("version"),
+                            "install_path": record.get("installPath"),
+                        }
+                    )
+    elif host_name == "zcode" and isinstance(plugins, list):
+        for index, record in enumerate(plugins):
+            if isinstance(record, dict):
+                # PR #468 review finding A4: the #185 lane accepts
+                # entry.get("id") or entry.get("name"); the projection must
+                # not be stricter than its sibling for the same records.
+                entries.append(
+                    {
+                        "key": f"plugins[{index}]",
+                        "name": record.get("id") or record.get("name"),
+                        "version": record.get("version"),
+                        "install_path": record.get("installPath"),
+                    }
+                )
+    return entries
+
+
+def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
+    """Issue #127: read-only plugin-registry diagnostics.
+
+    Reads the Claude and ZCode installed-plugin registries through the same
+    #184 strict codecs as the install-skew checks, then validates every
+    projected entry's ``name``, ``version``, and ``install_path`` — a
+    dangling install path (an uninstall or cache purge that left the registry
+    entry behind) warns here. Missing registries skip; a warning NEVER flips
+    ``host-surfaces`` to fail and NEVER flips ``report.ok``. Codex installs
+    from the checkout (``registry="checkout"``, validating
+    ``.codex-plugin/plugin.json``); Hermes is deployed by provider or
+    compatibility configuration (``registry="provider-or-compatibility-config"``)
+    and makes no cache-path claim.
+    """
+    targets = (
+        ("claude", home / ".claude" / "plugins" / "installed_plugins.json"),
+        ("zcode", home / ".zcode" / "cli" / "plugins" / "installed_plugins.json"),
+    )
+    registries: dict[str, dict] = {}
+    any_present = False
+    for host_name, path in targets:
+        record: dict = {
+            "path": _display_path(path),
+            "status": "skip",
+            "warnings": [],
+        }
+        if path.exists():
+            any_present = True
+            if host_registry is None:
+                record["status"] = "warn"
+                record["warnings"].append(
+                    {
+                        "kind": "registry-unreadable",
+                        "registry_path": _display_path(path),
+                        "reason": "host_registry module unavailable",
+                    }
+                )
+            else:
+                try:
+                    _schema, document = host_registry.load_host_registry(
+                        path, host_name
+                    )
+                except Exception as exc:  # never let host state crash doctor
+                    record["status"] = "warn"
+                    record["warnings"].append(
+                        {
+                            "kind": "registry-unreadable",
+                            "registry_path": _display_path(path),
+                            "reason": _display_path(f"{exc}"),
+                        }
+                    )
+                else:
+                    # Review finding A1/A2 (PR #468 swarm review): the
+                    # per-entry loop is the same semi-trusted-input class as
+                    # the #185 lane, so it runs under the same
+                    # never-let-host-state-crash-doctor backstop, and the
+                    # recorded warnings are capped (a registry full of
+                    # purged caches must not balloon the JSON report; the
+                    # overflow is counted, not enumerated).
+                    overflow = 0
+                    for entry in _normalize_registry_entries(host_name, document):
+                        try:
+                            name = entry["name"]
+                            version = entry["version"]
+                            install_path = entry["install_path"]
+                            base = {
+                                "registry_path": _display_path(path),
+                                "name": (name if isinstance(name, str) else None),
+                                "version": (
+                                    version if isinstance(version, str) else None
+                                ),
+                            }
+                            if not isinstance(name, str) or not name:
+                                warning = dict(
+                                    base,
+                                    kind="invalid-entry-field",
+                                    field="name",
+                                    entry=entry["key"],
+                                )
+                            elif not isinstance(version, str) or not version:
+                                warning = dict(
+                                    base,
+                                    kind="invalid-entry-field",
+                                    field="version",
+                                    entry=entry["key"],
+                                )
+                            elif (
+                                not isinstance(install_path, str)
+                                or not install_path
+                            ):
+                                warning = dict(
+                                    base,
+                                    kind="invalid-entry-field",
+                                    field="install_path",
+                                    entry=entry["key"],
+                                )
+                            else:
+                                resolved = Path(install_path)
+                                if not resolved.is_absolute():
+                                    resolved = home / resolved
+                                if resolved.exists():
+                                    warning = None
+                                else:
+                                    warning = dict(
+                                        base,
+                                        kind="dangling-install-path",
+                                        install_path=_display_path(install_path),
+                                    )
+                        except Exception:  # A1: EACCES etc. must not crash
+                            warning = dict(
+                                {
+                                    "registry_path": _display_path(path),
+                                    "name": None,
+                                    "version": None,
+                                },
+                                kind="entry-uninspectable",
+                                entry=entry.get("key", "?"),
+                            )
+                        if warning is None:
+                            continue
+                        if len(record["warnings"]) < _REGISTRY_WARNING_CAP:
+                            record["warnings"].append(warning)
+                        else:
+                            overflow += 1
+                    if overflow:
+                        record["overflow_warnings"] = overflow
+                    record["status"] = "warn" if record["warnings"] else "pass"
+        registries[host_name] = record
+
+    # Codex installs from the checkout: validate the shipped manifest parse
+    # (a MISSING manifest is host-surfaces' failure domain, not this check's).
+    checkout_warnings: list[dict] = []
+    codex_manifest = repo_root / ".codex-plugin" / "plugin.json"
+    codex_valid = False
+    if codex_manifest.exists():
+        try:
+            parsed = json.loads(codex_manifest.read_text(encoding="utf-8"))
+            codex_valid = isinstance(parsed, dict)
+        except (OSError, UnicodeError, ValueError):
+            codex_valid = False
+        if not codex_valid:
+            checkout_warnings.append(
+                {
+                    "kind": "invalid-checkout-manifest",
+                    "registry_path": _display_path(codex_manifest),
+                    "name": "zmem",
+                }
+            )
+    codex_detail = {
+        "registry": "checkout",
+        "manifest": _display_path(codex_manifest),
+        "present": codex_manifest.exists(),
+        "valid": codex_valid,
+    }
+
+    warning_count = sum(len(r["warnings"]) for r in registries.values())
+    warning_count += sum(
+        r.get("overflow_warnings", 0) for r in registries.values()
+    )
+    warning_count += len(checkout_warnings)
+    if not any_present and not checkout_warnings:
+        # PR #468 review finding A3: an invalid checkout manifest must not be
+        # buried by the no-registries skip (skip requires no registries AND
+        # no checkout findings).
+        status = "skip"
+        summary = (
+            "No Claude or ZCode plugin registry is present for inspection."
+        )
+    elif warning_count:
+        status = "warn"
+        summary = (
+            f"Plugin registries carry {warning_count} warning(s): dangling "
+            "install paths or invalid entries (see details)."
+        )
+    else:
+        status = "pass"
+        summary = (
+            "Plugin registries are readable and every recorded install path "
+            "exists."
+        )
+
+    return _check(
+        "plugin-registries",
+        status,
+        summary,
+        registries=registries,
+        checkout_warnings=checkout_warnings,
+        codex=codex_detail,
+        hermes={
+            "registry": "provider-or-compatibility-config",
+            "cache_path": None,
+        },
+    )
 
 
 def _check_served_drift(repo_root: Path) -> dict:
@@ -6082,6 +6306,9 @@ def build_report(
     namespace_check = _check_namespace(project)
     checks.append(namespace_check)
     checks.append(_check_surfaces(repo_root))
+    # Issue #127: read-only plugin-registry diagnostics (dangling install
+    # paths, invalid entries; warn/skip only — never flips report.ok).
+    checks.append(_check_plugin_registries(Path.home(), repo_root))
     # Issue #107 (Workstream A PR 2): served tree vs release manifest —
     # content-hash identity (warn/skip only; see _check_served_drift).
     checks.append(_check_served_drift(repo_root))

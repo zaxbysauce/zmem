@@ -1,0 +1,1 @@
+{"plugins":[{"enabled":true,"installPath":"<scratch>/plugins/valid","name":"zmem-valid","scope":"user","version":"0.28.0"},{"enabled":false,"installPath":"<scratch>/plugins/gone","name":"zmem-dangling","scope":"user","version":"0.28.0"}],"version":1}

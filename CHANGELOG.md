@@ -5,6 +5,41 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.154.0] - 2026-11-13
+### Fixed
+- Documentation truth pass for the shipped Codex plugin and Hermes capture
+  (issue #127): README, SKILL.md, and CUTOVER.md now document the Codex
+  plugin as SHIPPED with its live nine-event manifest (PreToolUse
+  `Bash|apply_patch`, PostToolUse
+  `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`), the 8000-byte Codex
+  envelope cap, and the `ZMEM_CTX_BUDGET` defaults (25000 ZCode launcher
+  path; 9000 Claude Code path and ZCode non-launcher path). The stale
+  "Hermes is intentionally NOT wired for live capture" claim is replaced by
+  the shipped correction-capture truth (`ZMEM_HERMES_CORRECTIONS`, default
+  ON, issue #71 D); a Hermes provider-vs-compatibility deployment-mode
+  matrix (with `ZMEM_MCP_TIMEOUT` float, default 8.0 s, clamped 1.0–30.0)
+  and per-host desktop quick-reference sections were added. zmem never
+  emits `permissionDecision` (pretool context is advisory); a bare
+  `ZMEM_STORE` filename is documented as a relative path. The stale
+  repo-local `.codex/hooks.json` doctor probe is retired.
+- Doctor plugin-registry diagnostics (issue #127): new read-only
+  `plugin-registries` check validates every Claude/ZCode registry entry's
+  `name`, `version`, and `install_path` through the #184 strict codecs and
+  warns on DANGLING install paths (registry entries whose install directory
+  no longer exists) with the exact registry path, plugin name, version, and
+  missing path — never failing the report. Codex is identified as
+  `registry="checkout"` (validating `.codex-plugin/plugin.json`); Hermes as
+  `registry="provider-or-compatibility-config"` with no cache-path claim.
+  The optional-Codex `codex_adapter_optional` detail is removed from
+  `host-surfaces` (the Codex plugin surfaces are required, not optional).
+- `docs/CLAIMS-AUDIT.md` rewritten to the four-column shape
+  (claim/source/status/checked_on) with full repository-relative citations,
+  rows for the Codex plugin/trust, remote Hermes passive prefetch, automatic
+  near-miss rekey, and the Codex/Hermes history adapters, and the PR #104
+  Codex-parity claim set; `tests/test_doc_drift.py` gained
+  `ClaimsAuditPathTest` plus Codex/matrix and residue-correction needle
+  tests bound to their owning document sections.
+
 ## [0.153.0] - 2026-11-13
 ### Security
 - Entity-identity disclosure boundary (issues #459): a credential-shaped
