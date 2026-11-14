@@ -507,6 +507,10 @@ async function main() {
     });
     await captureHooks.event({ event: mkEvt("msg-dir-1",
       "no, use uv not pip") });
+    // Round-3 G1: user turns finalize at the next message boundary —
+    // send the session's second message to flush the first.
+    await captureHooks.event({ event: mkEvt("msg-dir-2",
+      "second message boundary") });
     const oneFile = fs.readdirSync(tdir).filter((f) => f.endsWith(".jsonl"));
     ok("transcript root is a DIRECTORY with one <session>.jsonl",
       fs.statSync(tdir).isDirectory() && oneFile.length === 1
@@ -620,17 +624,24 @@ async function main() {
     const sdkTurns = () => fs.existsSync(sdkFile)
       ? readJsonLines(sdkFile) : [];
 
-    // user message arrives complete -> finalized on first sight
+    // Round-3 G1 boundary semantics: a user snapshot NEVER finalizes on
+    // arrival or on a part event — the turn finalizes at the session's
+    // NEXT message boundary (transform / next message.updated / dispose).
     await hooks.event({ event: sdkMsg("u1", "user",
       { parts: [{ type: "text", text: "sdk user turn" }] }) });
     let turns = sdkTurns();
-    ok("SDK envelope: user message finalized on arrival",
-      turns.length === 1 && turns[0].turn_uuid === "u1"
-      && turns[0].role === "user");
+    ok("SDK envelope: user snapshot stays open (no premature finalize)",
+      turns.length === 0);
 
-    // assistant opens, streams parts keyed by part.id, completes only on
-    // time.completed (no `status` field exists on the SDK Message).
+    // assistant opens -> boundary flush writes u1; assistant streams
+    // parts keyed by part.id, completes only on time.completed (the SDK
+    // Message carries NO `status`).
     await hooks.event({ event: sdkMsg("a1", "assistant", {}) });
+    turns = sdkTurns();
+    ok("SDK envelope: user turn written at the message boundary",
+      turns.length === 1 && turns[0].turn_uuid === "u1"
+      && turns[0].role === "user"
+      && turns[0].blocks[0].text === "sdk user turn");
     await hooks.event({ event: sdkPart("p1", "a1", "hello ") });
     await hooks.event({ event: sdkPart("p2", "a1", "world") });
     // a repeated part id REPLACES its snapshot (no accumulation — R12)
@@ -650,32 +661,69 @@ async function main() {
       && aTurn.blocks[1].text === "world!");
 
     // ZMEM_CAPTURE=0 kill switch (R6/FB-009): production default ON; "0"
-    // suppresses the transcript write entirely and clears on unset.
+    // suppresses the transcript write entirely. The switch stays ON
+    // through the NEXT message's arrival so the boundary flush itself is
+    // gated (the round-3 semantics), then clears.
     process.env.ZMEM_CAPTURE = "0";
     await hooks.event({ event: sdkMsg("u2", "user",
       { parts: [{ type: "text", text: "must not be captured" }] }) });
-    ok("ZMEM_CAPTURE=0 suppresses capture",
+    ok("ZMEM_CAPTURE=0 suppresses capture (turn stays unwritten)",
       sdkTurns().length === 2);
-    delete process.env.ZMEM_CAPTURE;
+    // u3's arrival flushes u2 — still under the switch, nothing lands.
+    const u3Secret = "remember: my api_key=sk-ant-ABCDEFGHIJ1234567890x99";
     await hooks.event({ event: sdkMsg("u3", "user",
-      { parts: [{ type: "text", text: "capture resumes" }] }) });
-    ok("capture resumes after the kill switch clears",
-      sdkTurns().length === 3
-      && sdkTurns().some((t) => t.turn_uuid === "u3"));
+      { parts: [{ type: "text", text: u3Secret }] }) });
+    ok("kill-switched turn never lands even at the next boundary",
+      sdkTurns().length === 2
+      && !sdkTurns().some((t) => t.turn_uuid === "u2"));
+    // u5's arrival flushes u3 -> capture resumed; the credential is
+    // REDACTED at the write boundary (round-3 G3, deepseek always-auto
+    // precedent) and the turn carries secret_warning.
+    delete process.env.ZMEM_CAPTURE;
+    await hooks.event({ event: sdkMsg("u5", "user",
+      { parts: [{ type: "text", text: "plain follow-up" }] }) });
+    turns = sdkTurns();
+    const u3Turn = turns.find((t) => t.turn_uuid === "u3");
+    ok("capture resumes at the boundary",
+      turns.length === 3 && u3Turn !== undefined);
+    ok("secret-like capture text is redacted before persistence",
+      u3Turn !== undefined
+      && u3Turn.blocks[0].text.indexOf("sk-ant-ABCDEFGHIJ") === -1
+      && u3Turn.blocks[0].text.indexOf("[REDACTED_SECRET]") !== -1
+      && u3Turn.secret_warning === true);
+    ok("clean turns are untouched by the redactor",
+      turns.find((t) => t.turn_uuid === "u1").secret_warning === undefined);
 
-    // Round-2 review F1: the LIVE user-turn shape — the snapshot carries
-    // NO info.parts (SDK UserMessage has no parts field in
-    // EventMessageUpdated); text arrives via message.part.updated. The
-    // deferred-finalize arm must keep the aggregate open until the part
-    // lands, then emit the turn WITH its text.
+    // Round-3 G1 multi-part user turn: several part events accumulate —
+    // the aggregate does NOT finalize on the first part (the round-2
+    // arm did, silently dropping parts 2..N; critic probe reproduced).
     await hooks.event({ event: sdkMsg("u4", "user", {}) });
-    await hooks.event({ event: sdkPart("p4", "u4", "user text via part") });
+    await hooks.event({ event: sdkPart("p4", "u4", "First instruction") });
+    await hooks.event({ event: sdkPart("p5", "u4",
+      "Actually use 12 Nm, not 8 Nm") });
+    ok("SDK envelope: multi-part user turn not finalized on its first part",
+      sdkTurns().length === 4 // u5 flushed by u4's boundary; u4 still open
+      && !sdkTurns().some((t) => t.turn_uuid === "u4"));
+
+    // Round-3 G2: a part event for an ALREADY-FINALIZED message is a
+    // straggler — dropped, never resurrecting a skeleton aggregate.
+    await hooks.event({ event: sdkPart("p1", "a1", "late straggler") });
+    ok("post-finalize part straggler is dropped (no resurrection)",
+      sdkTurns().length === 4
+      && !sdkTurns().some((t) => t.blocks.some(
+        (b) => b.text === "late straggler")));
+
+    // the session transform flushes the open multi-part user turn WITH
+    // all of its parts
+    await hooks["experimental.chat.system.transform"](
+      { sessionID: "sess-sdk", model: {} }, { system: [] });
     turns = sdkTurns();
     const u4Turn = turns.find((t) => t.turn_uuid === "u4");
-    ok("SDK envelope: part-streamed user turn finalized WITH its text",
-      u4Turn !== undefined && u4Turn.blocks.length === 1
-      && u4Turn.blocks[0].text === "user text via part");
-    ok("SDK envelope: exactly one turn for the part-streamed user message",
+    ok("SDK envelope: multi-part user turn finalized WITH all parts",
+      u4Turn !== undefined && u4Turn.blocks.length === 2
+      && u4Turn.blocks[0].text === "First instruction"
+      && u4Turn.blocks[1].text === "Actually use 12 Nm, not 8 Nm");
+    ok("SDK envelope: exactly one turn for the multi-part user message",
       turns.filter((t) => t.turn_uuid === "u4").length === 1);
     delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
   }

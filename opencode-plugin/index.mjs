@@ -318,6 +318,56 @@ function readMaxSeq(target) {
 const finalizedTurns = new Set(); // turn_uuid idempotency (durable via transcript)
 const seqCounters = new Map();    // per-FILE seq state (per session file)
 
+// Capture-path secret redaction (review R6/FB-009, round-3 G3; the
+// deepseek adapter's always-auto precedent): the canonical transcript is
+// a PERSISTED ARCHIVE, so secret-like content is redacted at the write
+// boundary — never stored raw. This is the high-precision credential core
+// of skills/memory/scripts/redaction.py SECRET_CREDENTIAL_PATTERNS with
+// the same [REDACTED_SECRET] marker; the python miner still runs the full
+// redact_text pipeline downstream (defense in depth). The generic entropy
+// patterns (base64-40+/hex-32+) are intentionally NOT ported — too
+// false-positive-prone for a capture path; the python lane still owns them.
+const REDACTED_SECRET = "[REDACTED_SECRET]";
+const CAPTURE_KEYVALUE_SECRET = /(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)(\s*[:=]\s*)(\S{8,})/gi;
+const CAPTURE_SECRET_SIMPLE = [
+  /\bBearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])/g,
+  /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bxox[abprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/g,
+  /\bsk-(?:ant|proj)-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
+  /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/g,
+  /\beyJ[A-Za-z0-9_-]{40,}\.[A-Za-z0-9_-]{10,}(?![0-9A-Za-z_-])/g,
+  /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/g,
+  /-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----/g,
+];
+
+function redactCaptureText(text) {
+  let out = String(text == null ? "" : text);
+  let count = 0;
+  // key=value span semantics (issue #180 parity): keep key + separator,
+  // mask only the value; a value already equal to the marker is detected
+  // (counted) but not rewritten.
+  out = out.replace(CAPTURE_KEYVALUE_SECRET,
+    (match, key, sep, value) => {
+      count += 1;
+      if (value === REDACTED_SECRET) return match;
+      return key + sep + REDACTED_SECRET;
+    });
+  for (const re of CAPTURE_SECRET_SIMPLE) {
+    out = out.replace(re, (match) => {
+      count += 1;
+      return match === REDACTED_SECRET ? match : REDACTED_SECRET;
+    });
+  }
+  return { text: out, count };
+}
+
+export function _redactCaptureTextForTests(text) {
+  return redactCaptureText(text);
+}
+
 export function appendTurn(message, sourcePath) {
   try {
     // Capture kill switch (review R6/UR-3 — deepseek ZMEM_CAPTURE parity):
@@ -335,6 +385,18 @@ export function appendTurn(message, sourcePath) {
     if (!turnUuid || finalizedTurns.has(turnUuid)) return false; // exactly once
     const seq = seqCounters.get(target) + 1;
     const turn = normalizeOpenCodeMessage(message, sourcePath, seq);
+    // Redact BEFORE persistence (round-3 G3): the archive never stores
+    // raw secret-like block text; a redaction flags the turn.
+    let redactions = 0;
+    turn.blocks = (turn.blocks || []).map((b) => {
+      if (b && typeof b === "object" && typeof b.text === "string") {
+        const r = redactCaptureText(b.text);
+        redactions += r.count;
+        return r.count ? { ...b, text: r.text } : b;
+      }
+      return b;
+    });
+    if (redactions) turn.secret_warning = true;
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.appendFileSync(target,
       JSON.stringify(turn) + "\n", "utf-8");
@@ -405,11 +467,16 @@ export function _ingestMessageEvent(event) {
 
   // Part-delta event (SDK: message.part.updated carries properties.part
   // with .messageID + .id): upsert by part id into the open aggregate.
+  // Parts NEVER finalize: a user turn can carry several part events (and
+  // delta updates to the same part id), so the aggregate accumulates until
+  // a turn boundary (the session's NEXT message.updated, the session's
+  // own system transform, or dispose) — round-3 G1.
   if (part && !info) {
     const messageID = part.messageID || "";
     if (!messageID) return;
     let existing = openMessages.get(messageID);
     if (!existing) {
+      if (finalizedTurns.has(messageID)) return; // post-finalize straggler
       // Part BEFORE its message snapshot (robust ordering): open a
       // skeleton so early parts are not dropped; the snapshot's info
       // merges in when it arrives.
@@ -422,13 +489,6 @@ export function _ingestMessageEvent(event) {
     } else {
       existing.partsById.set(String(existing.partsById.size), part);
     }
-    // Deferred finalize (review round-2 F1): a terminal message whose
-    // parts stream AFTER the snapshot (live-SDK user snapshots carry no
-    // info.parts) finalizes HERE, with its parts attached.
-    if (existing.terminal && existing.partsById.size > 0
-        && !Array.isArray(existing.info.parts)) {
-      finalizeMessage(messageID);
-    }
     return;
   }
 
@@ -439,8 +499,14 @@ export function _ingestMessageEvent(event) {
 
   let existing = openMessages.get(messageID);
   if (!existing) {
+    // Turn boundary (round-3 G1): a NEW message id in a session implies
+    // every EARLIER message of that session is complete — flush its open
+    // aggregates first (user turns accumulate HERE until this boundary;
+    // the session's own transform and dispose also flush).
+    const boundarySession = info.sessionID || info.session_id || sessionID;
+    if (boundarySession) finalizeUserTurns(boundarySession);
     existing = {
-      sessionID: info.sessionID || info.session_id || sessionID,
+      sessionID: boundarySession,
       info: {},
       partsById: new Map(),
       terminal: false,
@@ -464,15 +530,12 @@ export function _ingestMessageEvent(event) {
     }
   }
   openMessages.set(messageID, existing);
-  if (existing.terminal
-      && (existing.info.role !== "user"
-          || existing.partsById.size > 0)) {
-    // Finalize on terminality, EXCEPT user snapshots with no parts yet:
-    // the live-SDK UserMessage carries no info.parts (text rides part
-    // events), so an empty user aggregate stays open and finalizes when
-    // its first part lands (deferred arm above), or on transform /
-    // dispose (review round-2 F1). Assistant terminality is authoritative
-    // — SDK part events precede the completed snapshot.
+  if (existing.terminal && existing.info.role !== "user") {
+    // Assistant terminality is authoritative — SDK part events precede
+    // the completed snapshot. User snapshots are NEVER finalized here:
+    // their parts stream independently and may continue after this
+    // event (round-3 G1; finalize at the next turn boundary / transform /
+    // dispose).
     finalizeMessage(messageID);
   }
 }
@@ -500,6 +563,21 @@ function finalizePendingMessages(sessionId) {
   if (!sessionId) return;
   for (const [messageID, entry] of Array.from(openMessages)) {
     if (entry.sessionID !== sessionId) continue;
+    finalizeMessage(messageID);
+  }
+}
+
+function finalizeUserTurns(sessionId) {
+  // The turn-boundary flush (round-3 G1): only USER turns (and empty
+  // skeletons, which appendTurn drops for lack of a uuid) finalize here —
+  // a still-streaming ASSISTANT message owns its lifecycle via its
+  // upcoming completed snapshot and must not be cut by a sibling
+  // message's arrival.
+  if (!sessionId) return;
+  for (const [messageID, entry] of Array.from(openMessages)) {
+    if (entry.sessionID !== sessionId) continue;
+    if (entry.info && entry.info.role === "assistant"
+        && !entry.terminal) continue;
     finalizeMessage(messageID);
   }
 }
