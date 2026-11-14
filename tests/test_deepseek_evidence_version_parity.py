@@ -162,5 +162,80 @@ class DeepseekEvidenceVersionParityTest(unittest.TestCase):
             f"expected version {agreement!r}: {kwarg_problems}")
 
 
+# --- Issue #469 AC2 (appended): evidence stamp ordering guardrail ---------
+
+from datetime import datetime  # noqa: E402
+
+
+def _stamp_ordering_problem(canary_report, support_report):
+    """Return None when the support report's generated_at lands strictly
+    after the canary report's (the PR #451 convention), else a non-empty
+    problem string. Reads ONLY generated_at from either report; fails
+    closed on a missing, empty, or unparseable stamp (never skips)."""
+    canary_raw = (canary_report or {}).get("generated_at")
+    support_raw = (support_report or {}).get("generated_at")
+    if not canary_raw or not support_raw:
+        return (f"generated_at missing or empty: canary={canary_raw!r} "
+                f"support={support_raw!r} (fail closed)")
+    try:
+        canary_stamp = datetime.fromisoformat(
+            str(canary_raw).replace("Z", "+00:00"))
+        support_stamp = datetime.fromisoformat(
+            str(support_raw).replace("Z", "+00:00"))
+    except ValueError as exc:
+        return (f"generated_at unparseable: canary={canary_raw!r} "
+                f"support={support_raw!r} ({exc})")
+    if not support_stamp > canary_stamp:
+        return (f"support generated_at {support_raw} is not strictly after "
+                f"canary generated_at {canary_raw} (PR #451 convention: the "
+                f"support report's stamp must land strictly AFTER the "
+                f"canary write)")
+    return None
+
+
+class EvidenceStampOrderingTest(unittest.TestCase):
+    """The parity suite mechanically enforces the support-strictly-after-
+    canary generated_at ordering (PR #451), which was previously policed
+    only by operator memory. The class does not exist at base (loader
+    error), GREEN after the fix lands."""
+
+    def test_support_stamp_strictly_after_canary(self):
+        # LIVE leg: the committed artifacts must satisfy the convention
+        # (canary carries millisecond precision, support seconds).
+        canary = _load(_EVIDENCE / "canary-report.json")
+        support = _load(_EVIDENCE / "support-report.json")
+        canary_stamp = datetime.fromisoformat(
+            str(canary["generated_at"]).replace("Z", "+00:00"))
+        support_stamp = datetime.fromisoformat(
+            str(support["generated_at"]).replace("Z", "+00:00"))
+        self.assertGreater(
+            support_stamp, canary_stamp,
+            f"support generated_at {support['generated_at']} must land "
+            f"strictly AFTER canary generated_at "
+            f"{canary['generated_at']} (PR #451 convention: the support "
+            f"report's stamp must land strictly after the canary write)")
+        # SYNTHETIC fail-closed legs: the check bites.
+        self.assertTrue(_stamp_ordering_problem(
+            {"generated_at": "2026-11-14T04:05:32.358Z"},
+            {"generated_at": "2026-11-14T04:05:32.358Z"}),
+            "equal stamps are a problem (strictly-after, not >=)")
+        self.assertTrue(_stamp_ordering_problem(
+            {"generated_at": "2026-11-14T04:06:02Z"},
+            {"generated_at": "2026-11-14T04:05:32.358Z"}),
+            "a support stamp BEFORE the canary stamp is a problem")
+        self.assertTrue(_stamp_ordering_problem(
+            {"generated_at": "2026-11-14T04:05:32.358Z"}, {}),
+            "a missing support generated_at fails closed")
+        self.assertTrue(_stamp_ordering_problem(
+            {}, {"generated_at": "2026-11-14T04:06:02Z"}),
+            "a missing canary generated_at fails closed")
+        self.assertTrue(_stamp_ordering_problem(
+            {"generated_at": "not-a-stamp"},
+            {"generated_at": "2026-11-14T04:06:02Z"}),
+            "an unparseable stamp fails closed (never skips)")
+        self.assertIsNone(_stamp_ordering_problem(canary, support),
+                          "the live evidence pair is correctly ordered")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

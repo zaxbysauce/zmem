@@ -1799,6 +1799,16 @@ def add_memory(
                     "own occurrence data; the supplied occurred_start/"
                     "occurred_end were not applied"
                 )
+            # #469 AC1: a fold discards the INCOMING content entirely (the
+            # keeper's content is untouched; only confidence/signal/tags/
+            # taint/trust merge). Disclose that disposition explicitly — the
+            # refresh notice below names the keeper and similarity but never
+            # says the caller's content was dropped, which read as "merged".
+            print(f"[zmem] dedup: existing memory {existing['id']} folded the "
+                  f"incoming add — its content was NOT stored (only metadata "
+                  f"merged); the incoming content is not stored anywhere "
+                  f"(similarity={dedup_sim:.3f}). Re-phrase it, or pass "
+                  "--no-dedup to store it as its own row")
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
             return WriteResult(existing["id"], warnings=warns, deduped=True)
