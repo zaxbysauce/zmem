@@ -330,7 +330,7 @@ const seqCounters = new Map();    // per-FILE seq state (per session file)
 const REDACTED_SECRET = "[REDACTED_SECRET]";
 const CAPTURE_KEYVALUE_SECRET = /(api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)(\s*[:=]\s*)(\S{8,})/gi;
 const CAPTURE_SECRET_SIMPLE = [
-  /\bBearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])/g,
+  /\bBearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])/gi,
   /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/g,
@@ -499,6 +499,11 @@ export function _ingestMessageEvent(event) {
 
   let existing = openMessages.get(messageID);
   if (!existing) {
+    // Round-4 H2: a replayed snapshot of an ALREADY-FINALIZED message is
+    // inert — it must not manufacture a new-message boundary (the round-3
+    // flush would otherwise cut the CURRENT open user turn, whose later
+    // parts the finalized guard then drops).
+    if (finalizedTurns.has(messageID)) return;
     // Turn boundary (round-3 G1): a NEW message id in a session implies
     // every EARLIER message of that session is complete — flush its open
     // aggregates first (user turns accumulate HERE until this boundary;
@@ -568,16 +573,20 @@ function finalizePendingMessages(sessionId) {
 }
 
 function finalizeUserTurns(sessionId) {
-  // The turn-boundary flush (round-3 G1): only USER turns (and empty
-  // skeletons, which appendTurn drops for lack of a uuid) finalize here —
-  // a still-streaming ASSISTANT message owns its lifecycle via its
-  // upcoming completed snapshot and must not be cut by a sibling
-  // message's arrival.
+  // The turn-boundary flush (round-3 G1): USER turns finalize here; a
+  // still-streaming ASSISTANT message owns its lifecycle via its upcoming
+  // completed snapshot and must not be cut. Round-4 H1: uuid-LESS
+  // skeletons (part-before-snapshot) are NOT finalizable — finalizing
+  // would delete the aggregate and lose its accumulated parts before
+  // their snapshot merges; they stay open until it does (transform and
+  // dispose flush them as the last resort, where appendTurn no-ops on
+  // the missing uuid).
   if (!sessionId) return;
   for (const [messageID, entry] of Array.from(openMessages)) {
     if (entry.sessionID !== sessionId) continue;
     if (entry.info && entry.info.role === "assistant"
         && !entry.terminal) continue;
+    if (!entry.info || !entry.info.id) continue; // H1: keep skeletons
     finalizeMessage(messageID);
   }
 }

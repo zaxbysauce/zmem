@@ -725,6 +725,51 @@ async function main() {
       && u4Turn.blocks[1].text === "Actually use 12 Nm, not 8 Nm");
     ok("SDK envelope: exactly one turn for the multi-part user message",
       turns.filter((t) => t.turn_uuid === "u4").length === 1);
+
+    // Round-4 H1: a part BEFORE its snapshot opens a skeleton; a sibling
+    // message's boundary must NOT delete it (the round-3 flush destroyed
+    // the accumulated early part) — the skeleton survives until its
+    // snapshot merges, and the final assistant turn carries BOTH texts.
+    mod._resetCaptureStateForTests();
+    fs.rmSync(tdir, { recursive: true, force: true });
+    await hooks.event({ event: sdkPart("p9", "a9", "early assistant text") });
+    await hooks.event({ event: sdkMsg("u9", "user",
+      { parts: [{ type: "text", text: "u9 boundary" }] }) });
+    await hooks.event({ event: sdkMsg("a9", "assistant", {}) });
+    await hooks.event({ event: sdkPart("p10", "a9", "late assistant text") });
+    await hooks.event({ event: sdkMsg("a9", "assistant",
+      { time: { created: 1767225600000, completed: 1767225603000 } }) });
+    turns = sdkTurns();
+    const a9Turn = turns.find((t) => t.turn_uuid === "a9");
+    ok("H1: skeleton parts survive a sibling boundary until their snapshot",
+      a9Turn !== undefined && a9Turn.blocks.length === 2
+      && a9Turn.blocks[0].text === "early assistant text"
+      && a9Turn.blocks[1].text === "late assistant text");
+
+    // Round-4 H2: a REPLAYED finalized snapshot is inert — it must not
+    // flush the session's current open user turn (whose later parts the
+    // finalized guard would then drop).
+    await hooks.event({ event: sdkPart("p11", "u10", "first new instruction") });
+    await hooks.event({ event: sdkMsg("u10", "user", {}) });
+    await hooks.event({ event: sdkMsg("a9", "assistant",
+      { time: { created: 1767225600000, completed: 1767225603000 } }) }); // replay
+    await hooks.event({ event: sdkPart("p12", "u10", "second new instruction") });
+    await hooks["experimental.chat.system.transform"](
+      { sessionID: "sess-sdk", model: {} }, { system: [] });
+    turns = sdkTurns();
+    const u10Turn = turns.find((t) => t.turn_uuid === "u10");
+    ok("H2: replayed snapshot does not cut the open user turn",
+      u10Turn !== undefined && u10Turn.blocks.length === 2
+      && u10Turn.blocks[0].text === "first new instruction"
+      && u10Turn.blocks[1].text === "second new instruction");
+
+    // Round-4 H3: the authorization scheme is case-insensitive (the
+    // python precedent pattern is (?i)) — lowercase "bearer" is redacted.
+    const r = mod._redactCaptureTextForTests(
+      "Authorization: bearer ABCDEFGHIJKLMNOPQRSTUVWXYZ123456");
+    ok("H3: lowercase bearer credentials are redacted",
+      r.count === 1 && r.text.indexOf("ABCDEFGHIJKLMNOP") === -1
+      && r.text.indexOf("[REDACTED_SECRET]") !== -1);
     delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
   }
 
