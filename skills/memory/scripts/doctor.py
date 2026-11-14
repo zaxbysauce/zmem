@@ -2405,7 +2405,7 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
                                     )
                         except Exception:  # A1: EACCES etc. must not crash
                             warning = dict(
-                                base={
+                                {
                                     "registry_path": _display_path(path),
                                     "name": None,
                                     "version": None,
