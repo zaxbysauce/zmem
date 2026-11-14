@@ -216,6 +216,13 @@ def _expected_moments():
         "reflect": "agent/turn-stopping",
         "precompact": "compaction/start",
     })
+    # Native OpenCode plugin wiring parity (issue #66): the adapter registers
+    # the LIVE SDK hooks in opencode-plugin/index.mjs — no shell-hook
+    # manifest exists. Keep in sync with _NATIVE_WIRING in the generator.
+    wiring.setdefault("opencode", {
+        "recall": "experimental.chat.system.transform",
+        "precompact": "experimental.session.compacting",
+    })
     moments = set()
     for verbs in wiring.values():
         moments.update(verbs)
@@ -306,8 +313,9 @@ def test_matrix_pins_supported_versions():
     hermes callback surface plus the explicit-tool lane (no missing,
     duplicate, or phantom rows), status and hub_ops come from closed
     vocabularies, the launcher column matches what the manifests wire,
-    and every opencode row stays capability_gap until #66 lands. RED at
-    base, GREEN after the fix."""
+    and OpenCode carries exactly the issue-#66 split registration (three
+    registered surfaces, every other row a declared capability_gap). RED
+    at base, GREEN after the fix."""
     wiring = _manifest_wiring()
     # Native dsh/Cordis wiring parity (issue #374): the deepseek adapter
     # registers these events in deepseek-plugin/index.mjs — no shell-hook
@@ -319,6 +327,13 @@ def test_matrix_pins_supported_versions():
         "capture-failure": "tools/result",
         "reflect": "agent/turn-stopping",
         "precompact": "compaction/start",
+    })
+    # Native OpenCode plugin wiring parity (issue #66): the adapter registers
+    # the LIVE SDK hooks in opencode-plugin/index.mjs — no shell-hook
+    # manifest exists. Keep in sync with _NATIVE_WIRING in the generator.
+    wiring.setdefault("opencode", {
+        "recall": "experimental.chat.system.transform",
+        "precompact": "experimental.session.compacting",
     })
     rows = _rows(_load_matrix())
 
@@ -406,7 +421,13 @@ def test_matrix_pins_supported_versions():
             where = (f"row ({harness}/{moment}/"
                      f"{row.get('hook_event')})")
             if moment in EXPLICIT_MOMENTS:
-                registered = harness != "opencode"
+                # Issue #66 split: OpenCode registers explicit recall through
+                # the plugin's zmem_* tools only — no write tool ships, so
+                # explicit-write stays a declared gap.
+                if harness == "opencode":
+                    registered = moment == "explicit-recall"
+                else:
+                    registered = True
             elif moment in callbacks:
                 registered = harness == "hermes"
             else:
@@ -419,10 +440,18 @@ def test_matrix_pins_supported_versions():
             launcher = row.get("launcher")
             if registered:
                 if moment in EXPLICIT_MOMENTS:
-                    assert launcher in ("store.py recall", "store.py add"), (
-                        f"{where} launcher {launcher!r} is not an explicit "
-                        f"tool invocation"
-                    )
+                    if harness == "opencode":
+                        assert launcher == (
+                            "zmem_recall/zmem_session_start tools"), (
+                            f"{where} launcher {launcher!r} must honestly "
+                            f"name the zmem_* tool surface (issue #66)"
+                        )
+                    else:
+                        assert launcher in ("store.py recall",
+                                            "store.py add"), (
+                            f"{where} launcher {launcher!r} is not an "
+                            f"explicit tool invocation"
+                        )
                 elif moment in callbacks:
                     assert launcher == row.get("hook_event"), (
                         f"{where} launcher {launcher!r} must name the "
@@ -451,14 +480,28 @@ def test_matrix_pins_supported_versions():
                 f"gating); got {note!r}"
             )
 
-    # -- opencode stays a declared gap until #66 lands ------------------
-    for i, row in enumerate(rows):
-        if row.get("harness") == "opencode":
-            assert row.get("status") == "capability_gap", (
-                f"row {i} (opencode/{row.get('moment')}) claims "
-                f"{row.get('status')!r}; OpenCode ships no adapter (issue "
-                f"#66) so every row must stay capability_gap"
-            )
+    # -- opencode carries exactly the issue-#66 split registration ------
+    # Three registered surfaces (the two passive moments the plugin's live
+    # SDK hooks deliver plus the zmem_* explicit-recall tool lane); every
+    # other row — session-start, capture/retention moments, explicit-write —
+    # stays a declared capability_gap (no SessionStart-equivalent hook and
+    # no write tool ship).
+    oc_registered = sorted(
+        f"{row.get('moment')}/{row.get('hook_event')}"
+        for row in rows
+        if row.get("harness") == "opencode"
+        and row.get("status") == "registered"
+    )
+    assert oc_registered == [
+        "explicit-recall/None",
+        "precompact/experimental.session.compacting",
+        "recall/experimental.chat.system.transform",
+    ], (
+        f"opencode registered rows must be exactly the issue-#66 split "
+        f"(recall via experimental.chat.system.transform, precompact via "
+        f"experimental.session.compacting, explicit-recall via the zmem_* "
+        f"tools); got {oc_registered}"
+    )
 
 
 def test_fleet_fixtures_match_the_matrix():

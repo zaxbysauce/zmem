@@ -1059,6 +1059,7 @@ Maintenance cadence (the session-start hook runs `backup --if-due`, `consolidate
 | `ZMEM_CONSOLIDATE_GROWTH_THRESHOLD` | Consolidate runs early if live rows grew by at least this fraction since the last run. | `0.20` |
 | `ZMEM_SENTINEL_SWEEP_DAYS` | `sweep` prunes per-session cooldown markers older than this many days. | `7` |
 | `ZMEM_BG_LOG` | Set `0` to send session-start maintenance output (consolidate/backup/sweep) to `/dev/null` instead of `<data dir>/zmem-bg.log`. | `1` |
+| `ZMEM_SESSION_CADENCE` | Set `0` to skip the session-start hook's 15s background-maintenance sleep entirely (issue #351: tests, canaries, and CI set this so a hook run cannot stall a bounded runner). Only the trimmed literal `0` is honored; any other value keeps the sleep. | — |
 
 Consolidate / recall / dedup tuning:
 

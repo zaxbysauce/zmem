@@ -59,6 +59,10 @@ function envWith(overrides) {
         "ZMEM_AGENT_ID", "ZMEM_NAMESPACE", "ZMEM_SKILLS_DIRS",
         "ZMEM_TIER0", "ZMEM_CTX_BUDGET", "ZMEM_SESSION_SOURCE", "ZMEM_CAPTURE",
         "PLUGIN_ROOT", "PLUGIN_DATA", "CODEX_PROJECT_DIR",
+        // issue #66: OPENCODE_PLUGIN_ROOT now drives host detection ahead of
+        // PLUGIN_ROOT — an ambient OpenCode session must not flip the host of
+        // every sandboxed subprocess leg below (finding F10).
+        "OPENCODE_PLUGIN_ROOT",
         "CLAUDE_PLUGIN_ROOT", "ZCODE_PLUGIN_ROOT", "CLAUDE_PROJECT_DIR",
         "ZCODE_PROJECT_DIR", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
         "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_OPTION_STOREDIRECTORY",
@@ -1752,6 +1756,29 @@ console.log("\n[13] storeDirectory plugin userConfig feeds ZMEM_DATA (claude hos
         launch.buildCanonicalEnv("claude", { cwd: PROJ }, "recall").ZMEM_DATA,
         path.join(os.homedir(), ".zmem"));
 
+    // Review R23/FB-021 NEGATIVE CONTROL: the opencode storeDirectory arm
+    // (zmem-launch.js:1453) is gated host === "opencode". Delete that gate
+    // and THIS assertion is the one that fails — a non-opencode host must
+    // never adopt adapter meta.storeDirectory (that value is ONLY legal via
+    // its own host's plugin option, tested above).
+    {
+        const savedData = process.env.ZMEM_DATA;
+        const savedOpt = process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        delete process.env.ZMEM_DATA;
+        delete process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        for (const host of ["claude", "zcode", "codex"]) {
+            eq("storeDirectory: " + host + " ignores adapter meta.storeDirectory",
+                launch.buildCanonicalEnv(host, { cwd: PROJ,
+                    storeDirectory: "/tmp/oc-misrouted-store" }, "recall")
+                    .ZMEM_DATA,
+                path.join(os.homedir(), ".zmem"));
+        }
+        if (savedData === undefined) delete process.env.ZMEM_DATA;
+        else process.env.ZMEM_DATA = savedData;
+        if (savedOpt === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        else process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY = savedOpt;
+    }
+
     restore();
 }
 
@@ -2684,6 +2711,145 @@ function testZcodeProcessEntriesRunFixtureContract() {
 }
 
 testZcodeProcessEntriesRunFixtureContract();
+
+// --- issue #66: OpenCode host detection, root precedence, canonical env -----
+// detectHost()/getPluginRoot() read process.env directly, so these unit legs
+// pin and restore the detection vars the same way test_codex_adapter.js's
+// withProcessEnv does (the helper is local: test_launcher.js never had one).
+function withProcessEnv(overrides, fn) {
+    const saved = new Map();
+    for (const key of Object.keys(overrides)) {
+        saved.set(key, Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : undefined);
+        if (overrides[key] === undefined) delete process.env[key];
+        else process.env[key] = overrides[key];
+    }
+    try {
+        return fn();
+    } finally {
+        for (const [key, value] of saved.entries()) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    }
+}
+
+function testDetectHostOpenCode() {
+    const OCROOT = path.join(TMP, "oc-plugin-root");
+    // ONLY OPENCODE_PLUGIN_ROOT set (every other detection var cleared) —
+    // the ambient box env must never leak a competing marker in.
+    eq("detectHost(opencode): OPENCODE_PLUGIN_ROOT alone → opencode",
+        withProcessEnv({
+            ZMEM_HOST: undefined, OPENCODE_PLUGIN_ROOT: OCROOT,
+            PLUGIN_ROOT: undefined, PLUGIN_DATA: undefined,
+            CLAUDE_PLUGIN_ROOT: undefined, ZCODE_PLUGIN_ROOT: undefined,
+        }, () => launch.detectHost()),
+        "opencode");
+    // Explicit ZMEM_HOST stays the top precedence, as on every host.
+    eq("detectHost(opencode): explicit ZMEM_HOST wins over OPENCODE_PLUGIN_ROOT",
+        withProcessEnv({ ZMEM_HOST: "claude", OPENCODE_PLUGIN_ROOT: OCROOT },
+            () => launch.detectHost()),
+        "claude");
+    // OPENCODE_PLUGIN_ROOT is FIRST in getPluginRoot()'s resolution list.
+    eq("getPluginRoot(opencode): OPENCODE_PLUGIN_ROOT resolved ahead of every other root",
+        withProcessEnv({
+            OPENCODE_PLUGIN_ROOT: OCROOT,
+            PLUGIN_ROOT: path.join(TMP, "codex-root"),
+            CLAUDE_PLUGIN_ROOT: path.join(TMP, "claude-root"),
+            ZCODE_PLUGIN_ROOT: path.join(TMP, "zcode-root"),
+        }, () => launch.getPluginRoot()),
+        OCROOT);
+}
+
+function testDetectHostRegression() {
+    // The pre-#66 branches, unchanged, plus the new precedence slot.
+    const base = {
+        ZMEM_HOST: undefined, OPENCODE_PLUGIN_ROOT: undefined,
+        PLUGIN_ROOT: undefined, PLUGIN_DATA: undefined,
+        CLAUDE_PLUGIN_ROOT: undefined, ZCODE_PLUGIN_ROOT: undefined,
+    };
+    eq("detectHost regression: PLUGIN_ROOT → codex",
+        withProcessEnv({ ...base, PLUGIN_ROOT: REPO }, () => launch.detectHost()), "codex");
+    eq("detectHost regression: PLUGIN_DATA → codex",
+        withProcessEnv({ ...base, PLUGIN_DATA: path.join(TMP, "codex-data") },
+            () => launch.detectHost()),
+        "codex");
+    eq("detectHost regression: CLAUDE_PLUGIN_ROOT → claude",
+        withProcessEnv({ ...base, CLAUDE_PLUGIN_ROOT: REPO }, () => launch.detectHost()), "claude");
+    eq("detectHost regression: ZCODE_PLUGIN_ROOT → zcode",
+        withProcessEnv({ ...base, ZCODE_PLUGIN_ROOT: REPO }, () => launch.detectHost()), "zcode");
+    eq("detectHost regression: bare env → zcode fallback",
+        withProcessEnv(base, () => launch.detectHost()), "zcode");
+    // The #66 precedence: OpenCode's marker outranks Codex's when both are set
+    // (an OpenCode session embedding a Codex-style PLUGIN_ROOT must not be
+    // misattributed).
+    eq("detectHost regression: OPENCODE_PLUGIN_ROOT beats PLUGIN_ROOT",
+        withProcessEnv({
+            ...base,
+            OPENCODE_PLUGIN_ROOT: path.join(TMP, "oc-root"), PLUGIN_ROOT: REPO,
+        }, () => launch.detectHost()),
+        "opencode");
+}
+
+function testBuildCanonicalEnvOpenCode() {
+    // "envdump" is the file's perf-skip hookName (see [11]) so no python
+    // namespace subprocess runs here. Every process.env input
+    // buildCanonicalEnv copies is cleared so the meta object is the sole
+    // source under test.
+    withProcessEnv({
+        ZMEM_DATA: undefined, ZMEM_SKILLS_DIRS: undefined,
+        CLAUDE_SESSION_ID: undefined, CLAUDE_PLUGIN_OPTION_STOREDIRECTORY: undefined,
+    }, () => {
+        const meta = {
+            storeDirectory: "/tmp/oc-store",
+            worktree: "/tmp/oc-wt",
+            session_id: "sess-oc-1",
+        };
+        const env = launch.buildCanonicalEnv("opencode", meta, "envdump");
+        eq("buildCanonicalEnv(opencode): ZMEM_HOST", env.ZMEM_HOST, "opencode");
+        eq("buildCanonicalEnv(opencode): ZMEM_TIER0 is native", env.ZMEM_TIER0, "native");
+        eq("buildCanonicalEnv(opencode): meta.storeDirectory feeds ZMEM_DATA",
+            env.ZMEM_DATA, "/tmp/oc-store");
+        eq("buildCanonicalEnv(opencode): meta.session_id feeds ZMEM_SESSION",
+            env.ZMEM_SESSION, "sess-oc-1");
+
+        // Explicit env still beats the adapter-supplied storeDirectory.
+        const explicit = path.join(TMP, "oc-explicit-store");
+        process.env.ZMEM_DATA = explicit;
+        eq("buildCanonicalEnv(opencode): explicit ZMEM_DATA overrides meta.storeDirectory",
+            launch.buildCanonicalEnv("opencode", meta, "envdump").ZMEM_DATA, explicit);
+        delete process.env.ZMEM_DATA;
+
+        // The adapter may send "~/..." — expanded, never passed literally.
+        eq("buildCanonicalEnv(opencode): leading ~ in storeDirectory is expanded",
+            launch.buildCanonicalEnv("opencode", { storeDirectory: "~/oc" }, "envdump").ZMEM_DATA,
+            path.join(os.homedir(), "oc"));
+
+        // No storeDirectory → the box-wide ~/.zmem default.
+        eq("buildCanonicalEnv(opencode): no storeDirectory → ~/.zmem default",
+            launch.buildCanonicalEnv("opencode", { worktree: "/tmp/oc-wt" }, "envdump").ZMEM_DATA,
+            path.join(os.homedir(), ".zmem"));
+
+        // Issue #66 four-directory skills default, box-wide for ALL hosts,
+        // ~/.config/opencode/skills LAST (the ordered contract shared with
+        // host.py's resolve_skills_dirs).
+        const dirs = launch.buildCanonicalEnv("opencode", {}, "envdump")
+            .ZMEM_SKILLS_DIRS.split(path.delimiter);
+        eq("buildCanonicalEnv(opencode): default skills dirs list all four", dirs.length, 4);
+        eq("buildCanonicalEnv(opencode): ~/.codex/skills first",
+            dirs[0], path.join(os.homedir(), ".codex", "skills"));
+        eq("buildCanonicalEnv(opencode): ~/.claude/skills second",
+            dirs[1], path.join(os.homedir(), ".claude", "skills"));
+        eq("buildCanonicalEnv(opencode): ~/.zcode/skills third",
+            dirs[2], path.join(os.homedir(), ".zcode", "skills"));
+        eq("buildCanonicalEnv(opencode): ~/.config/opencode/skills last",
+            dirs[3], path.join(os.homedir(), ".config", "opencode", "skills"));
+    });
+}
+
+console.log("\n[#66] OpenCode host detection, root precedence, and canonical env");
+testDetectHostOpenCode();
+testDetectHostRegression();
+testBuildCanonicalEnvOpenCode();
 
 // --- cleanup + report ------------------------------------------------------
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) { /* */ }

@@ -377,6 +377,57 @@ class TestPromoteQuality(PromoteTestBase):
         for f in after:
             self.assertEqual(f.read_text(encoding="utf-8"), before[f])
 
+    def test_four_directory_promotion(self):
+        """Issue #66: an approved install writes a byte-identical SKILL.md
+        into ALL FOUR resolved promotion dirs (the box-wide four-host
+        default, pinned here through ZMEM_SKILLS_DIRS to four scratch
+        dirs)."""
+        dirs = [os.path.join(self.tmp, f"skills_{n}") for n in "abcd"]
+        self.env["ZMEM_SKILLS_DIRS"] = os.pathsep.join(dirs)
+        r = self._run(
+            "promote", "--id", self.memory_id, "--confirm",
+            "--install-approved")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        files = sorted(Path(self.tmp).glob("skills_*/*/SKILL.md"))
+        self.assertEqual(len(files), 4, files)
+        # Byte equality across all four targets.
+        contents = {f.read_bytes() for f in files}
+        self.assertEqual(
+            len(contents), 1, "all four SKILL.md files must be byte-identical")
+        # And each pinned dir owns exactly one of them.
+        self.assertEqual(
+            sorted(str(f.parent.parent) for f in files), sorted(dirs))
+
+    def test_collision_refusal(self):
+        """Issue #66: a PRE-WRITE collision — an existing different file at
+        one of the four targets refuses the whole promote BEFORE writing
+        anything: no review candidate, no partial install into the other
+        three dirs, the colliding file untouched."""
+        dirs = [os.path.join(self.tmp, f"skills_{n}") for n in "abcd"]
+        self.env["ZMEM_SKILLS_DIRS"] = os.pathsep.join(dirs)
+        # Resolve the skill dir name the promoter will use via --dry-run
+        # (the slug is derived from tags + memory id; never hand-computed).
+        dry = self._run("promote", "--id", self.memory_id, "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        match = re.search(r"install target: (.+)$", dry.stdout, re.MULTILINE)
+        self.assertIsNotNone(match, dry.stdout)
+        skill_dir = Path(match.group(1)).parent
+        sentinel = b"--- pre-existing different skill ---\n"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_bytes(sentinel)
+
+        r = self._run(
+            "promote", "--id", self.memory_id, "--confirm",
+            "--install-approved")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("ERROR", r.stderr)
+        # Refused BEFORE any write: the sentinel is untouched and it is the
+        # ONLY SKILL.md anywhere in the four target trees (no partial
+        # promotion, no review candidate either).
+        self.assertEqual((skill_dir / "SKILL.md").read_bytes(), sentinel)
+        self.assertEqual(self._skill_files(), [skill_dir / "SKILL.md"])
+        self.assertEqual(self._review_files(), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

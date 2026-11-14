@@ -75,3 +75,8 @@ self-corpus-results.json
 .zaxbygraph/
 .covtmp/
 zmem-guard-scratch/
+
+# Issue #66: OpenCode plugin SDK installed by CI's fail-closed
+# `npm ci --prefix opencode-plugin` (and locally by the same command);
+# the committed lockfile pins the versions, node_modules never commits.
+opencode-plugin/node_modules/

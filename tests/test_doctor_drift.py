@@ -172,6 +172,16 @@ class DoctorServedDriftCliTest(unittest.TestCase):
         _write_text(self.repo / ".zcode-plugin" / "plugin.json", "{}\n")
         _write_text(self.repo / "hooks" / "hooks.zcode.json", "{}\n")
         _write_text(self.repo / "skills" / "memory" / "SKILL.md", "# memory\n")
+        # Issue #66: the opencode adapter package is part of the repo
+        # surface set now — minimal stubs so the opencode-adapter check sees
+        # a complete package (then not_applicable/pass on the binary probe)
+        # and the exit-code contract of THIS suite (warn/skip never flip ok)
+        # keeps testing served-drift alone.
+        _write_text(self.repo / "opencode-plugin" / "package.json", "{}\n")
+        _write_text(self.repo / "opencode-plugin" / "index.mjs", "\n")
+        _write_text(
+            self.repo / "skills" / "memory" / "scripts"
+            / "opencode_bridge.py", "\n")
 
     def _base_env(self) -> dict:
         env = {**os.environ}

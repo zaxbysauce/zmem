@@ -32,8 +32,10 @@ Scope of this guide (PR1, approved plan 2026-11-13):
   and the separate capability-gated fleet delivery lane.
 - What does NOT ship here: the conditional instruction/skill/closeout
   discovery wiring (PR2 — not shipped; nothing in this feature injects
-  knowledge content into sessions), any passive remote fetch, vault sync,
-  or an OpenCode native adapter.
+  knowledge content into sessions), any passive remote fetch, or vault
+  sync. (A native OpenCode HOST adapter now ships on main from #66/#351;
+  this feature adds no knowledge surface to it — the knowledge
+  companion is explicit-command-only on every host.)
 - All commands and example outputs below are **illustrative** — they
   document the contract, they are not transcripts of live runs. Substitute
   your own hosts, paths, and token locations; never commit production
@@ -677,6 +679,8 @@ are content-free: `committed`/`duplicate` with `link_status` (`created`/
   sessions by anything in PR1. The conditional instruction/skill/closeout
   discovery wiring is PR2 and **not shipped**.
 - No passive remote fetch, no vault sync, no vendor API (Obsidian or
-  otherwise), no OpenCode native adapter or autonomous writes.
+  otherwise), no autonomous writes, and no knowledge wiring into the
+  OpenCode adapter (the host adapter itself ships separately from
+  #66/#351; this feature adds no knowledge surface to it).
 - No new schema surface: pointer rows are ordinary fact rows; no new
   table, metadata column, type, or schema version.
