@@ -53,11 +53,12 @@ python skills/memory/scripts/doctor.py --project <repo> --format human
   (the registry names an install directory that no longer exists) warns with
   the exact registry path, plugin name, version, and missing path; the
   warning never fails the report
-- Codex manifest hook trust: registered manifest events (SessionStart,
+- Codex manifest hook trust: the manifest registers nine events (SessionStart,
   UserPromptSubmit, PreToolUse `Bash|apply_patch`, PostToolUse
   `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`, Stop, SubagentStart,
-  SubagentStop, PreCompact, SessionEnd) missing from the config's trusted
-  hook state warn
+  SubagentStop, PreCompact, SessionEnd); doctor compares the PRE-APPROVAL
+  subset (SessionStart, PreToolUse) against the config's trusted hook state —
+  missing pre-approval events warn
   `untrusted-hook <ids>`; when no entry names this repo the box-wide
   trusted union is used as inventory, so reapprove hooks manually anyway
   (issue #185)

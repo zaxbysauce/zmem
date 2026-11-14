@@ -781,11 +781,13 @@ store directory the plugin hosts use.
 - **`zcode-native-memory`** — reads `~/.zcode/v2/setting.json`
   `memoryEnabled`: explicit `true` fails cutover, explicit `false` passes,
   anything unreadable warns. Disable it yourself; zmem never auto-edits it.
-- **`untrusted-hook`** — compares the pre-approval events the repo's
-  Codex manifest registers (SessionStart, UserPromptSubmit, PreToolUse
-  `Bash|apply_patch`, PostToolUse `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`,
-  Stop, SubagentStart, SubagentStop, PreCompact, SessionEnd) with the
-  hook-trust state recorded for your repo; missing events warn
+- **`untrusted-hook`** — the repo's Codex manifest registers nine events
+  (SessionStart, UserPromptSubmit, PreToolUse `Bash|apply_patch`, PostToolUse
+  `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`, Stop, SubagentStart,
+  SubagentStop, PreCompact, SessionEnd); doctor compares the PRE-APPROVAL
+  subset of those (SessionStart, PreToolUse — the events that can execute
+  code before you approve) with the hook-trust state recorded for your
+  repo; missing pre-approval events warn
   `untrusted-hook <ids>`. When no config entry names this repo, the
   box-wide union of trusted events is used as a read-only inventory
   fallback — on a multi-repo box another repo's approval can stand in, so
