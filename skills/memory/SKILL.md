@@ -3889,9 +3889,10 @@ are provenance inputs; trust_score is the contradiction ledger.
 OFF BY DEFAULT and purely explicit: nothing runs, captures, publishes, or
 injects unless an operator adds a strict `knowledge` object to the store's
 `config.json` AND you type one of the commands above. There is no
-automation in PR1 — the conditional instruction/skill/closeout discovery
-wiring is PR2 and NOT shipped; nothing in this feature injects knowledge
-content into sessions. The workflow publishes a note you explicitly author
+automatic capture: the PR2 routing policy
+(`docs/KNOWLEDGE-ROUTING.md`) is display-only — it names the lane and its
+target ids, never note content — so nothing in this feature injects
+knowledge content into sessions. The workflow publishes a note you explicitly author
 as an immutable, content-addressed version to a configured target (a local
 Markdown vault directory, or a fleet KB HTTP endpoint — provider-neutral,
 no Obsidian dependency, never mandatory) and records a reserved

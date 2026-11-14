@@ -5,6 +5,69 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.156.0] - 2026-11-14
+### Added
+- Knowledge routing policy, PR2 of the knowledge-companion workstream
+  (display-only, OFF BY DEFAULT, no auto-capture): one stdlib-only helper
+  (`skills/memory/scripts/knowledge/policy.py`, `render_policy` /
+  `resolve_config_path`, CLI `--config` / `--no-capture` / `--text` /
+  `--json`) renders the canonical concise policy — it names the knowledge
+  lane, the enabled state, and the configured target IDS ONLY (never
+  target values, endpoints, credential locations, or note content), stays
+  under 200 words, is identical on every host, and performs no network
+  I/O, vault-root stat, or model call while rendering. `ZMEM_INJECT=0` is
+  enforced by each adapter BEFORE any spawn (no output, no subprocess);
+  `ZMEM_CAPTURE=0` does not silence the policy — the adapter passes
+  `--no-capture` and the helper renders read-routing with no capture
+  invitation. With no `knowledge` object, or `enabled: false`, the helper
+  renders empty text, adapters append nothing, and every surface's output
+  is byte-identical to the pre-knowledge output. Capture itself stays
+  explicit-command-only — the PR1 `knowledge
+  capture|read|check|status|flush` law is unchanged and nothing injects
+  note content into sessions.
+- Native surfaces, one bounded delivery each: Hermes provider mode appends
+  the policy after the Tier-0 block in `system_prompt_block`
+  (`hermes-plugin/__init__.py` `_knowledge_policy_block`, cached per
+  capture mode; compat mode never calls it, so no new per-turn path
+  exists there); the DeepSeek (dsh/Cordis) plugin appends one
+  `agent/pre-step` message of source kind `zmem-policy` before the fenced
+  recall text with a per-session `policyResolved`/`policyDelivered` latch
+  (at most ONE helper spawn per session per adapter process, independent
+  of recall delivery, top-level preview `policyDeliveredText` /
+  `policyReason`); hook hosts (ZCode / Claude Code / Codex) append to the
+  SessionStart final context via `hooks/lib/zmem-session-start-payload.py`
+  `_knowledge_policy_note` (2.0 s bounded spawn). A missing helper, a
+  non-zero exit, a timeout, or empty output all fail open to
+  append-nothing; adapters never import storelib. The dsh message
+  deliberately uses its own `zmem-policy` source kind — never `zmem` — so
+  the admission matcher cannot false-ack a recall reservation. No
+  server/hub canonical recall envelope is modified and no new hook events
+  are introduced.
+- Fallback and gap honesty: hosts without native wiring get the explicit
+  portable `skills/knowledge/SKILL.md`, surfaced at closeout by
+  `skills/closeout/SKILL.md` only when a bounded `knowledge status` check
+  reports the companion enabled (silent otherwise) — documented
+  NON-equivalence: manual, explicit-only, no per-session injection.
+  `skills/closeout-remote/SKILL.md` carries the remote-mode half: when
+  local capture/flush cannot run, the closeout surfaces a draft-only
+  knowledge handoff (no pointer write, no flush) for the operator to
+  capture from a capable host. The native OpenCode HOST adapter shipped
+  separately on main (0.154.0, #66/#351); PR2 does not wire the routing
+  policy into it — the supported knowledge-policy path on OpenCode is
+  still the manual operator shim `python
+  skills/memory/scripts/knowledge/policy.py --text` pasted into
+  OpenCode's own instructions config — no automatic sync, no
+  adapter-rendered policy claim.
+- Documentation: `docs/KNOWLEDGE-ROUTING.md` (the routing truth table —
+  helper contract, per-host gates and cadence, default-off byte-identity,
+  compat fallback, OpenCode policy-note gap); README, `docs/KNOWLEDGE-COMPANION.md`,
+  `skills/memory/SKILL.md`, and `docs/CLAIMS-AUDIT.md` now state PR2 as
+  implemented instead of "not shipped" (PR1's explicit-only, no-injection
+  law unchanged). Pinned by `tests/test_knowledge_policy.py` and
+  `tests/test_knowledge_policy_hooks.py` (helper config resolution,
+  rendering, gates) and `tests/test_knowledge_policy_native.py` (Hermes
+  block, hook payload, dsh pre-step latch/kind/default-off byte-identity).
+
 ## [0.155.0] - 2026-11-14
 ### Added
 - Knowledge companion, PR1 of the knowledge-companion workstream (explicit,
