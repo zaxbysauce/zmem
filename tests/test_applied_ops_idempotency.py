@@ -42,15 +42,20 @@ Runs under pytest and standalone (CI convention):
 from __future__ import annotations
 import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
+import importlib
 import importlib.util
 import io
+import json
 import os
+import shutil
 import sys
 import tempfile
+import types
 import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skills" / "memory" / "scripts"
@@ -432,6 +437,109 @@ class AppliedOpsReplayIdempotencyTest(unittest.TestCase):
                              "never add a second row")
         finally:
             conn.close()
+
+
+class ApplyOpsInputCapTest(unittest.TestCase):
+    """The apply-ops CLI route bounds its RAW input read (stdin or file)
+    at storelib.cli.APPLY_OPS_MAX_INPUT_BYTES before any parsing: the
+    256-op count check only runs after the whole batch is in memory, so
+    an unbounded stream allocated freely first.  Over-cap input is a
+    clean typed refusal naming the cap (no partial processing); input at
+    exactly the cap is accepted through the cap gate."""
+
+    OP_LINE = json.dumps({
+        "op_id": "cap-probe-1", "op": "add",
+        "args": {"type": "fact", "content": "apply-ops cap probe row",
+                 "tags": "cap", "source": "cap"},
+    }) + "\n"
+
+    def _cli(self):
+        return importlib.import_module("storelib.cli")
+
+    def _fresh_conn(self):
+        """A per-test isolated store (the scoped-principal-parity fixture
+        discipline: env re-pinned and re-derived through _refresh_env_state
+        so this test never sees the module-shared applied_ops rows)."""
+        tmp = tempfile.mkdtemp(prefix="zmem-applyops-cap-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        saved_store = os.environ.get("ZMEM_STORE")
+        os.environ["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
+        if saved_store is None:
+            self.addCleanup(os.environ.pop, "ZMEM_STORE", None)
+        else:
+            self.addCleanup(os.environ.__setitem__, "ZMEM_STORE",
+                            saved_store)
+        storelib._refresh_env_state()
+        conn = storelib.connect()
+        storelib.init_db(conn)
+        storelib.migrate(conn)  # applied_ops is a v19 table
+        self.addCleanup(conn.close)
+        return conn
+
+    def _args(self, in_path):
+        return types.SimpleNamespace(in_path=in_path, json=False,
+                                     principal=None, namespace_scope=None)
+
+    def _run(self, conn, in_path, payload: bytes):
+        cli = self._cli()
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(payload))
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            with mock.patch("sys.stdin", stdin):
+                rc = cli._cmd_apply_ops(conn, self._args(in_path))
+        return rc, buf_out.getvalue(), buf_err.getvalue()
+
+    def _applied_count(self, conn):
+        return conn.execute("SELECT COUNT(*) c FROM applied_ops") \
+            .fetchone()["c"]
+
+    def test_oversized_stdin_refused_cleanly_without_partial_processing(self):
+        conn = self._fresh_conn()
+        cap = self._cli().APPLY_OPS_MAX_INPUT_BYTES
+        rc, _out, err = self._run(conn, "-", b"x" * (cap + 1))
+        self.assertEqual(rc, 2)
+        self.assertIn(str(cap), err)
+        self.assertIn("byte limit", err)
+        self.assertEqual(self._applied_count(conn), 0,
+                         "an over-cap input must never be parsed or "
+                         "applied at all")
+
+    def test_oversized_file_refused_cleanly(self):
+        conn = self._fresh_conn()
+        cap = self._cli().APPLY_OPS_MAX_INPUT_BYTES
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-applyops-cap-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        big = tmp / "batch.jsonl"
+        big.write_bytes(b"x" * (cap + 1))
+        rc, _out, err = self._run(conn, str(big), b"")
+        self.assertEqual(rc, 2)
+        self.assertIn(str(cap), err)
+        self.assertIn("byte limit", err)
+        self.assertEqual(self._applied_count(conn), 0)
+
+    def test_at_cap_input_is_accepted_and_applies(self):
+        conn = self._fresh_conn()
+        cap = self._cli().APPLY_OPS_MAX_INPUT_BYTES
+        # One valid op padded with whitespace-only lines to EXACTLY the
+        # cap (blank/whitespace lines are skipped by the parser).
+        payload = self.OP_LINE.encode("utf-8")
+        payload += b" " * (cap - len(payload))
+        self.assertEqual(len(payload), cap)
+        for in_path, feed in (("-", payload),
+                              (self._tmp_file(payload), b"")):
+            with self.subTest(in_path=in_path):
+                rc, _out, _err = self._run(conn, in_path, feed)
+                self.assertEqual(rc, 0)
+        # The SAME op id applies once and replays duplicate: exactly one
+        # applied_ops row regardless of the input route.
+        self.assertEqual(self._applied_count(conn), 1)
+
+    def _tmp_file(self, payload: bytes) -> str:
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-applyops-atcap-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / "batch.jsonl"
+        path.write_bytes(payload)
+        return str(path)
 
 
 if __name__ == "__main__":

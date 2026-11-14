@@ -246,6 +246,26 @@ class KBHTTPTargetTests(unittest.TestCase):
             with self.assertRaises(KnowledgeConfigError, msg=bad):
                 self.load(dict(GOOD_KB, endpoint=bad))
 
+    def test_endpoint_port_validated_at_load(self):
+        """An explicit port must be a valid 1..65535 integer: urlsplit's
+        ``.port`` itself raises ValueError for non-numeric/out-of-range
+        ports, so the access is guarded and the range checked explicitly —
+        refused AT LOAD, never carried to request time."""
+        for bad in (
+            "https://hub.lan:99999/api/notes",
+            "https://hub.lan:65536/api/notes",
+            "https://hub.lan:0/api/notes",
+            "https://hub.lan:-1/api/notes",
+            "https://hub.lan:abc/api/notes",
+        ):
+            with self.assertRaises(KnowledgeConfigError, msg=bad):
+                self.load(dict(GOOD_KB, endpoint=bad))
+        for good in ("https://hub.lan:1/api/notes",
+                     "https://hub.lan:65535/api/notes",
+                     GOOD_KB["endpoint"]):
+            target = self.load(dict(GOOD_KB, endpoint=good))
+            self.assertIsInstance(target, KBHTTPTarget)
+
     def test_credential_exactly_one(self):
         with self.assertRaisesRegex(KnowledgeConfigError, "exactly one"):
             self.load(dict(GOOD_KB, token_file=str(self.tmp / "tok")))

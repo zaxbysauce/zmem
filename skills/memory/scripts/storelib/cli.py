@@ -604,6 +604,15 @@ def _intent_capture_mode() -> str:
     return raw if raw in CAPTURE_MODES else "manual"
 
 
+# The apply-ops raw input bound (stdin or file), read capped BEFORE any
+# parsing: the 256-op count check only runs after the whole batch is in
+# memory, so an unbounded stream allocated freely first.  4 MiB is far
+# above any legitimate 256-op JSONL batch (the engine's own per-op
+# content bound is 4 MiB); an over-cap input is a clean typed refusal
+# naming the cap — never a partial parse.
+APPLY_OPS_MAX_INPUT_BYTES = 4 * 1024 * 1024
+
+
 def _cmd_apply_ops(conn, args) -> int:
     """Issue #288: apply a typed-op batch; per-op receipts; idempotent."""
     import json as _json
@@ -616,19 +625,45 @@ def _cmd_apply_ops(conn, args) -> int:
         # decodes with the process locale codec — cp1252 on a default
         # Windows install — mojibake-ing non-ASCII ops and discarding the
         # whole batch on a cp1252-undefined byte. Same rationale as
-        # _retain_read_stdin (the retain readers).
-        raw = _sys.stdin.buffer.read().decode("utf-8", errors="replace")
+        # _retain_read_stdin (the retain readers).  The read is BOUNDED
+        # (cap + 1 probe byte): over-cap input is refused before any
+        # decoding or parsing begins.
+        raw_bytes = _sys.stdin.buffer.read(
+            APPLY_OPS_MAX_INPUT_BYTES + 1)
+        if len(raw_bytes) > APPLY_OPS_MAX_INPUT_BYTES:
+            print(f"[zmem] apply-ops: input exceeds the "
+                  f"{APPLY_OPS_MAX_INPUT_BYTES} byte limit",
+                  file=_sys.stderr)
+            return 2
+        raw = raw_bytes.decode("utf-8", errors="replace")
         # A UTF-8 BOM (Windows-authored JSONL) would kill line 1's parse.
         raw = raw.lstrip("﻿")
     else:
         try:
-            raw = Path(args.in_path).read_text(encoding="utf-8-sig",
-                                               errors="replace")
+            with open(args.in_path, "rb") as handle:
+                raw_bytes = handle.read(APPLY_OPS_MAX_INPUT_BYTES + 1)
         except OSError as exc:
             print(f"[zmem] apply-ops: unreadable input: {exc}", file=_sys.stderr)
             return 2
+        if len(raw_bytes) > APPLY_OPS_MAX_INPUT_BYTES:
+            print(f"[zmem] apply-ops: input exceeds the "
+                  f"{APPLY_OPS_MAX_INPUT_BYTES} byte limit",
+                  file=_sys.stderr)
+            return 2
+        raw = raw_bytes.decode("utf-8-sig", errors="replace")
     parsed = []
-    for lineno, line in enumerate(raw.splitlines(), start=1):
+    # JSONL framing law (typed-op lane): records are delimited by LITERAL
+    # LF only.  ``str.splitlines()`` also splits on U+2028/U+2029/U+0085
+    # (and VT/FF/CR) — characters that are LEGAL unescaped inside JSON
+    # strings, so a payload carrying one (e.g. a knowledge pointer
+    # ``summary``) was torn into two unparseable halves.  Every in-repo
+    # writer emits ``json.dumps`` with the default ``ensure_ascii=True``
+    # (non-ASCII always escaped), which can never produce the raw forms —
+    # this split keeps a worst-case raw-U+2028 batch (an external writer)
+    # intact too.  A trailing CR is stripped per line so a CRLF-authored
+    # file parses identically.
+    for lineno, line in enumerate(raw.split("\n"), start=1):
+        line = line.rstrip("\r")
         if not line.strip():
             continue
         try:
@@ -782,6 +817,22 @@ def _cmd_knowledge(args) -> int:
         status = (result.get("pointer") or {}).get("status")
         return 3 if status in ("pending", "queued") else 1
 
+    # ZMEM_CAPTURE=0 kill switch (FB-022 code half, 2026-11-14): the same
+    # operator switch the core capture/auto_retain lanes honor (the
+    # retain-adapt and retain early-dispatch arms).  capture and flush
+    # refuse IMMEDIATELY — before the config load below, before
+    # default_journal() pre-creates the sidecar dir, before any store
+    # open, target write, or hub call.  The read-only surfaces
+    # (read/check/status) are NOT gated: verification stays available with
+    # capture switched off.
+    if sub in ("capture", "flush") and \
+            (os.environ.get("ZMEM_CAPTURE", "1") or "").strip() == "0":
+        return _fail(
+            "knowledge %s is disabled: ZMEM_CAPTURE=0 (the operator kill "
+            "switch); refused before any sidecar, store, target, or "
+            "network access — read/check/status remain available; pending "
+            "queue state is preserved" % sub)
+
     try:
         config = load_knowledge_config(env=dict(os.environ))
     except KnowledgeConfigError as exc:
@@ -794,6 +845,16 @@ def _cmd_knowledge(args) -> int:
     ro_handle = None
     try:
         if sub == "flush":
+            if not config.enabled:
+                # INT-004/FB-022 family: a disabled companion refuses the
+                # flush BEFORE the store is opened or the hub is touched,
+                # and NEVER deletes pending queue state — the operator
+                # re-enables or clears deliberately.
+                return _fail(
+                    "knowledge companion is disabled: no enabled "
+                    "'knowledge' object in the store config (config.json); "
+                    "knowledge flush is refused before any store or hub "
+                    "access and pending queue entries are preserved")
             if mode == "local":
                 pending = delivery.pending()
                 out = {"ok": not pending, "mode": mode, "applied": [],
@@ -933,6 +994,21 @@ def _cmd_knowledge(args) -> int:
                     delivery=delivery)
             except _workflow.WorkflowError as exc:
                 return _fail(str(exc))
+            if not result.get("ok"):
+                # FB-011: read-now-verifies — a digest mismatch is a
+                # REFUSAL with NO content bytes in any stream (stdout,
+                # stderr, or the JSON envelope).  Exit 1 (a reported
+                # integrity failure), never a silent unverified dump.
+                if args.json:
+                    return _emit(result, exit_code=1)
+                print(f"[zmem] knowledge: read refused "
+                      f"({result.get('reason')}): expected "
+                      f"{result.get('expected_digest')} at "
+                      f"{result.get('locator')}, found "
+                      f"{result.get('actual_digest')} — the version is "
+                      f"NOT the recorded canonical bytes; nothing was "
+                      f"printed", file=sys.stderr)
+                return 1
             if args.json:
                 return _emit(result)
             sys.stdout.write(result["content"])
@@ -963,7 +1039,8 @@ def _cmd_knowledge(args) -> int:
             namespace=args.namespace, mode=mode, conn=conn,
             config=config, journal=journal, delivery=delivery)
         if args.json:
-            return _emit(result)
+            return _emit(result,
+                         exit_code=0 if result.get("ok", True) else 1)
         print(f"knowledge companion: enabled={result['enabled']} "
               f"mode={result['mode']} "
               f"targets={','.join(sorted(result['targets'])) or 'none'}")
@@ -978,6 +1055,14 @@ def _cmd_knowledge(args) -> int:
             print(f"  receipt: {row.get('target')}:{row.get('key')} "
                   f"op={row.get('op_id')} -> {row.get('status')} "
                   f"link={row.get('link_status')}")
+        for row in result.get("corruption") or []:
+            # FB-016: a corrupt pointer store is REPORTED (typed,
+            # content-free) with a nonzero exit — never swallowed into an
+            # incomplete pointer list.
+            print(f"  corruption: {row.get('target')}:{row.get('key')} "
+                  f"{row.get('code')} — resolve the store corruption "
+                  f"deliberately; no winner is picked",
+                  file=sys.stderr)
         for row in result["pointers"] or []:
             pointer = row["pointer"]
             if pointer is None:
@@ -987,7 +1072,7 @@ def _cmd_knowledge(args) -> int:
                 print(f"  pointer: {row['target']}:{row['key']} "
                       f"v{pointer['version']} row={pointer['row_id']} "
                       f"{pointer['locator']}")
-        return 0
+        return 0 if result.get("ok", True) else 1
     except (_workflow.WorkflowError, JournalError, DeliveryError) as exc:
         # A corrupt/unreadable journal or delivery sidecar is an honest
         # operator-facing failure (exit 2, one JSON object under --json) —
@@ -4186,8 +4271,10 @@ def main():
                             "content from stdin (screened: any secret-like "
                             "pattern rejects the publication)")
     k_cap.add_argument("--summary", default=None,
-                       help="pointer summary (default: first non-empty "
-                            "line, bounded)")
+                       help="pointer summary (default: the fixed "
+                            "placeholder 'knowledge note <key>' — never "
+                            "note content; an explicit summary is "
+                            "secret-screened)")
     k_cap.add_argument("--namespace", default="user:global")
     k_cap.add_argument("--json", action="store_true")
     k_read = knowledge_sub.add_parser(

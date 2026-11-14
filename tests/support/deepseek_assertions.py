@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 ZMEM_KIND = "zmem"
 SNAPSHOT_LABEL = "[OFFLINE SNAPSHOT r"
 CANARY_LANES = ("delivered", "acked", "offline", "tools", "capture",
-                "compaction")
+                "compaction", "policy")
 SUPPORT_SCHEMA = "zmem-deepseek-support-v1"
 SUPPORT_GAP_DISCLOSURES = ("compaction-synthetic", "real-compactor-absent",
                            "desktop-carrier-not-tested")
@@ -172,8 +172,9 @@ def canary_problems(report, expected_version: str,
                     expected_packages: "dict | None" = None) -> list:
     """Claim-gate validation for the committed native canary report
     (interface-freeze: schema zmem-deepseek-canary-v1, zmem_version bound
-    to release-manifest.json, the frozen headless claimed set, six lanes
-    all pass). Returns the violation list (empty = valid).
+    to release-manifest.json, the frozen headless claimed set, seven lanes
+    all pass — the round-3 policy lane included). Returns the violation
+    list (empty = valid).
 
     ``expected_claimed`` (frozen callers pass it): the EXACT DECLARED
     PROJECTION each claimed entry must match — exact list equality, same

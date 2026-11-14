@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -639,6 +640,210 @@ class DistinctIdentityTest(_StoreTestCase):
             (ctl_ns,),
         ).fetchone()["c"]
         self.assertGreater(ctl_edges, 0)
+
+
+class OpsReplayPointerIsolationTest(_StoreTestCase):
+    """FB-017/SEC-005: the ops-lane identical-content replay fold
+    (_identical_content_row, issue #363) must never fold an ordinary
+    add/capture onto a knowledge POINTER row — the fold receipt would name
+    the pointer row as the add's canonical id. Ordinary-to-ordinary
+    identical adds still fold (the control)."""
+
+    def setUp(self):
+        self.ns = _ns()
+        self.ptr_digest = _digest(self.ns + "-replay-isolation")
+
+    def _pointer_payload(self) -> str:
+        return self.conn.execute(
+            "SELECT content FROM memory WHERE id=?",
+            (self.ptr_row_id,),
+        ).fetchone()["content"]
+
+    def test_ordinary_add_op_never_folds_onto_pointer_row(self):
+        from storelib import ops as opslib
+        from storelib.ops import LegacyPrincipal
+
+        created = link_pointer(
+            self.conn, namespace=self.ns, target=TARGET, key=KEY,
+            version=1, full_sha256=self.ptr_digest,
+            summary="replay isolation probe", expected_row_id=None)
+        self.ptr_row_id = created["row_id"]
+        payload = self._pointer_payload()
+
+        # An ordinary add op whose content is byte-identical to the
+        # pointer payload: with the pre-fix plain WHERE namespace/content
+        # lookup this folded (committed, deduped, canonical_id = the
+        # POINTER row). The exclusion makes it a normal fresh add.
+        batch = opslib.apply_ops(self.conn, [
+            {"op_id": "probe-add-1-" + uuid.uuid4().hex[:8], "op": "add",
+             "args": {"namespace": self.ns, "type": "fact",
+                      "content": payload}},
+        ], principal="", default_principal=LegacyPrincipal())
+        receipt = batch["receipts"][0]
+        self.assertEqual(receipt["status"], "committed", receipt)
+        self.assertNotEqual(receipt["canonical_id"], self.ptr_row_id,
+                            "the replay fold must never name the pointer "
+                            "row as an ordinary add's canonical id")
+        self.assertFalse(receipt.get("deduped"), receipt)
+        # A distinct live fact row exists alongside the untouched pointer.
+        live = self.conn.execute(
+            "SELECT id, source_ref FROM memory WHERE namespace=? AND "
+            "content=? AND superseded_at IS NULL",
+            (self.ns, payload)).fetchall()
+        self.assertEqual(len(live), 2, live)  # pointer + one ordinary fact
+        facts = [r for r in live if r["id"] != self.ptr_row_id]
+        self.assertEqual(facts[0]["id"], receipt["canonical_id"])
+        self.assertEqual(facts[0]["source_ref"], "")
+        ptr = get_pointer(self.conn, self.ns, TARGET, KEY)
+        self.assertEqual(ptr.row_id, self.ptr_row_id)
+        self.assertEqual(ptr.version, 1)
+        self.assertEqual(ptr.full_sha256, self.ptr_digest)
+
+        # CONTROL: a second byte-identical ordinary add op still folds —
+        # onto the FIRST FACT row, never onto the pointer.
+        batch2 = opslib.apply_ops(self.conn, [
+            {"op_id": "probe-add-2-" + uuid.uuid4().hex[:8], "op": "add",
+             "args": {"namespace": self.ns, "type": "fact",
+                      "content": payload}},
+        ], principal="", default_principal=LegacyPrincipal())
+        receipt2 = batch2["receipts"][0]
+        self.assertEqual(receipt2["status"], "committed", receipt2)
+        self.assertTrue(receipt2.get("deduped"), receipt2)
+        self.assertEqual(receipt2["canonical_id"], receipt["canonical_id"],
+                         "ordinary-to-ordinary identical adds still fold")
+        self.assertNotEqual(receipt2["canonical_id"], self.ptr_row_id)
+        # and the pointer is still exactly one authoritative row
+        self.assertEqual(len(_live_rows(
+            self.conn, self.ns, make_source_ref(TARGET, KEY))), 1)
+
+
+class TypedOpJsonlFramingTest(unittest.TestCase):
+    """The typed-op JSONL framing law: records are delimited by LITERAL LF
+    only.  U+2028/U+2029/U+0085 are legal unescaped inside JSON strings,
+    and ``str.splitlines()`` tears on them — a knowledge_link
+    ``summary`` (or any payload string) carrying one must round-trip whole
+    through the real ``apply-ops`` CLI reader (MIC-INPUT-003 pin,
+    2026-11-14)."""
+
+    SEP_LINE = "\u2028"  # LINE SEPARATOR
+    SEP_PARA = "\u2029"  # PARAGRAPH SEPARATOR
+    SEP_NEL = "\u0085"   # NEXT LINE
+
+    def _apply_ops_env(self, tmp: str) -> dict:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")}
+        env.update({
+            "ZMEM_HOME": str(REPO_ROOT),
+            "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
+            "ZMEM_DATA": tmp,
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_MODELS_DIR": os.path.join(tmp, "no-models"),
+            "PYTHONIOENCODING": "utf-8",
+        })
+        return env
+
+    def test_line_separators_never_tear_typed_op_records(self):
+        import hashlib as _hashlib
+
+        tmp = tempfile.mkdtemp(prefix="zmem-knjsonl-")
+        store = os.path.join(tmp, "store.sqlite")
+        env = self._apply_ops_env(tmp)
+        init = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "store.py"), "init"],
+            capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
+            timeout=180)
+        self.assertEqual(init.returncode, 0, init.stderr[-400:])
+
+        separators = (self.SEP_LINE + self.SEP_PARA + self.SEP_NEL)
+        summary_with_seps = ("unicode" + self.SEP_LINE + "separators"
+                             + self.SEP_PARA + "stay" + self.SEP_NEL
+                             + "intact")
+        body_with_seps = ("body with" + self.SEP_LINE + "line"
+                          + self.SEP_PARA + "para" + self.SEP_NEL + "nel")
+        # One add op whose CONTENT and one knowledge_link op whose SUMMARY
+        # carry the separators — written with ensure_ascii=False so
+        # they are RAW in the JSONL line (the worst-case writer; the
+        # in-repo writers use the default ensure_ascii=True, which escapes
+        # them).
+        digest = _hashlib.sha256(b"framing-pin").hexdigest()
+        chunks = [digest[i * 8:(i + 1) * 8] for i in range(8)]
+        locator = "%s/%s.md" % (KEY, "-".join(
+            digest[i:i + 16] for i in range(0, 64, 16)))
+        ops = [
+            {"op_id": "kl-frame-add", "op": "add",
+             "args": {"namespace": "user:global", "type": "fact",
+                      "content": body_with_seps}},
+            {"op_id": "kl-frame-link", "op": "knowledge_link",
+             "args": {"namespace": "user:global", "target": TARGET,
+                      "key": KEY, "version": 1, "locator": locator,
+                      "fullhash": chunks,
+                      "summary": summary_with_seps,
+                      "date": "2026-11-14T00:00:00Z",
+                      "expected_row_id": None}},
+        ]
+        ops_path = Path(tmp) / "ops.jsonl"
+        ops_path.write_text(
+            "".join(json.dumps(op, ensure_ascii=False) + "\n"
+                    for op in ops),
+            encoding="utf-8", newline="")
+        # the file really carries the raw separators (the tear precondition)
+        raw = ops_path.read_text(encoding="utf-8")
+        for sep in (self.SEP_LINE, self.SEP_PARA, self.SEP_NEL):
+            self.assertIn(sep, raw)
+            self.assertNotIn(sep.encode("unicode_escape").decode(), raw)
+
+        run = subprocess.run(
+            [sys.executable, str(SCRIPTS_DIR / "store.py"),
+             "apply-ops", "--in", str(ops_path), "--json"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=env, cwd=str(REPO_ROOT), timeout=180)
+        self.assertEqual(run.returncode, 0,
+                         "a U+2028/U+2029/U+0085 payload must not tear "
+                         "the JSONL record: %r %r"
+                         % (run.stdout[-300:], run.stderr[-300:]))
+        result = json.loads(run.stdout.splitlines()[-1])
+        statuses = {r["op_id"]: r["status"] for r in result["receipts"]}
+        self.assertEqual(statuses["kl-frame-add"], "committed", result)
+        self.assertEqual(statuses["kl-frame-link"], "committed", result)
+        # Round-trip: the stored pointer summary kept the separators.
+        conn = sqlite3.connect(store)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT content FROM memory WHERE source_ref=? AND "
+                "superseded_at IS NULL", (make_source_ref(TARGET, KEY),)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            parsed = parse_payload(row["content"])
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed["summary"], summary_with_seps)
+            fact = conn.execute(
+                "SELECT content FROM memory WHERE id=?",
+                ([r for r in result["receipts"]
+                  if r["op_id"] == "kl-frame-add"][0]["canonical_id"],)
+            ).fetchone()
+            self.assertEqual(fact["content"], body_with_seps)
+        finally:
+            conn.close()
+
+    def test_writer_ascii_escaping_needs_no_raw_separators(self):
+        r"""Pin the writer half of the law: the in-repo batch writer
+        (ops-flush's producer) uses json.dumps' default ensure_ascii=True,
+        which escapes U+2028/U+2029/U+0085 as \uXXXX — it can never
+        emit a raw separator into a JSONL line, and the escaped form
+        round-trips through the literal-LF reader unchanged."""
+        body = ("kept" + self.SEP_LINE + "escaped" + self.SEP_PARA
+                + "as" + self.SEP_NEL + "text")
+        op = {"op_id": "x", "op": "add",
+              "args": {"content": body}}
+        line = json.dumps(op)  # the writer's exact call shape
+        for sep in (self.SEP_LINE, self.SEP_PARA, self.SEP_NEL):
+            self.assertNotIn(sep, line)
+        # the six-character ESCAPED forms are what the line carries
+        self.assertIn("\\u2028", line)
+        self.assertIn("\\u2029", line)
+        self.assertIn("\\u0085", line)
+        self.assertEqual(json.loads(line)["args"]["content"], body)
 
 
 if __name__ == "__main__":

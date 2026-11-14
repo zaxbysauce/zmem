@@ -1694,6 +1694,13 @@ def consolidate(
         # handler's CAS), and that uncaught refusal would abort the whole
         # consolidate routine mid-run. Excluding them up front keeps the
         # prune pass a no-op on pointer rows instead of a crash.
+        # MIXED-VERSION WRITER RULE (FB-009, 2026-11-14): this exclusion
+        # exists only in THIS (post-feature) client. A pre-feature client
+        # running consolidate --prune against the same shared store has no
+        # pointer predicate and WILL supersede live pointer rows —
+        # operators must not mix client versions on one store once the
+        # knowledge companion is in use (see docs/KNOWLEDGE-COMPANION.md,
+        # "Imports, exports, and consolidation").
         unrecalled_days = _prune_unrecalled_days()
         prune_rows = conn.execute(
             f"""SELECT id, content FROM memory

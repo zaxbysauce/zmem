@@ -935,6 +935,177 @@ class WriteRekeyCollisionTest(unittest.TestCase):
             pb["row_id"])
 
 
+class KnowledgeRekeyCoordinationTest(unittest.TestCase):
+    """FB-031 local coordinated rekey guard on the write.rekey_namespace
+    lane: a namespace move is refused while a knowledge publication is
+    durably in flight under a source or destination namespace (journal
+    entry, queued delivery op, or not-yet-settled delivery intent),
+    BEFORE any SQLite or sidecar mutation — and the sidecar locks stay
+    held through the namespace commit. Terminal-only history does not
+    block; the near-miss-global auto-rekey route coordinates too."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-knfb031-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store_path = self.tmp / "store.sqlite"
+        self.conn = _fresh_store_conn(self.store_path)
+        self.addCleanup(self._close)
+        self.kb = self.tmp / "knowledge"
+        (self.tmp / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {}},
+        }), encoding="utf-8")
+
+    def _close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def _journal(self):
+        from knowledge.journal import KnowledgeJournal
+
+        return KnowledgeJournal(self.kb / "journal.json")
+
+    def _delivery(self):
+        from knowledge.delivery import KnowledgeDelivery
+
+        return KnowledgeDelivery(self.kb / "delivery.json")
+
+    def _active_intent(self, namespace, key="run/fb031"):
+        from knowledge.documents import prepare_document
+
+        doc = prepare_document(TARGET, key, "fb-031 coordination body\n")
+        self._journal().record_intent(
+            target_id=TARGET, logical_key=key, locator=doc.locator,
+            digest=doc.digest, namespace=namespace)
+
+    def _row_under(self, namespace, body="ordinary fb-031 row"):
+        with capture():
+            return str(_write.add_memory(
+                self.conn, namespace=namespace, type_="fact",
+                content=body, signal="test"))
+
+    def test_in_flight_delivery_intent_refuses_before_mutation(self):
+        from knowledge.delivery import KnowledgeDelivery
+
+        ns = _ns()
+        self._row_under(ns)
+        self.conn.commit()
+        # the workflow's pre-create stake: an intent with state "staked"
+        # and no journal entry yet written by this process — still a
+        # durably in-flight publication the move must not strand.
+        self._delivery().set_intent(
+            ref="knowledge:%s:run/fb031-stake" % TARGET, namespace=ns,
+            fields={"target": TARGET, "key": "run/fb031-stake",
+                    "digest": "0" * 64, "state": "staked",
+                    "staked": True})
+        rows = self.conn.execute(
+            "SELECT id, namespace FROM memory ORDER BY id").fetchall()
+        delivery_before = (self.kb / "delivery.json").read_bytes()
+        with capture():
+            with self.assertRaises(RuntimeError) as ctx:
+                _write.rekey_namespace(
+                    self.conn, from_namespace=ns,
+                    to_namespace="project:fb031-dest")
+        self.assertIn("in flight", str(ctx.exception))
+        self.assertFalse(self.conn.in_transaction)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT id, namespace FROM memory ORDER BY id").fetchall(),
+            rows)
+        self.assertEqual((self.kb / "delivery.json").read_bytes(),
+                         delivery_before)
+
+    def test_queued_delivery_op_refuses(self):
+        ns = _ns()
+        self._row_under(ns)
+        self.conn.commit()
+        self._delivery().enqueue({
+            "namespace": ns, "target": TARGET, "key": "run/fb031-q",
+            "version": 1, "locator": "run/fb031-q/x.md",
+            "fullhash": ["aaaaaaaa"] * 8, "summary": "s",
+            "date": "2026-11-14T00:00:00Z", "expected_row_id": None})
+        with capture():
+            with self.assertRaises(RuntimeError) as ctx:
+                _write.rekey_namespace(
+                    self.conn, from_namespace=ns,
+                    to_namespace="project:fb031-dest")
+        self.assertIn("queued delivery op", str(ctx.exception))
+
+    def test_destination_namespace_in_flight_refuses(self):
+        # a move INTO a namespace that carries an active publication is
+        # refused exactly like a move OUT of one
+        dest = _ns()
+        source = _ns()
+        self._row_under(source)
+        self._active_intent(dest, key="run/fb031-dest")
+        self.conn.commit()
+        with capture():
+            with self.assertRaises(RuntimeError) as ctx:
+                _write.rekey_namespace(
+                    self.conn, from_namespace=source, to_namespace=dest)
+        self.assertIn(dest, str(ctx.exception))
+        self.assertFalse(self.conn.in_transaction)
+
+    def test_near_miss_global_route_coordinated(self):
+        # the automatic CLI route (rekey_namespace(near_miss_global=True))
+        # strands a stranded near-miss row via the same guard: an active
+        # journal entry under the near-miss key refuses the bulk move
+        stranded = "userglobal"
+        self._row_under(_ns())
+        self.conn.execute(
+            "UPDATE memory SET namespace=? WHERE superseded_at IS NULL",
+            (stranded,))
+        self.conn.commit()
+        self._active_intent(stranded, key="run/fb031-nm")
+        with capture():
+            with self.assertRaises(RuntimeError):
+                _write.rekey_namespace(self.conn, near_miss_global=True)
+        kept = self.conn.execute(
+            "SELECT namespace FROM memory WHERE superseded_at IS NULL"
+        ).fetchall()
+        self.assertEqual({r["namespace"] for r in kept}, {stranded})
+
+    def test_sidecar_locks_held_through_the_namespace_commit(self):
+        import os as _os
+
+        from knowledge.locking import try_lock_nb
+
+        ns = _ns()
+        self._row_under(ns)
+        self.conn.commit()
+        real_commit = _write._commit
+        probes: list[bool] = []
+
+        def _probe_commit(conn):
+            # While the fence is up this process owns both sidecar byte
+            # locks; a second handle cannot re-lock either file.
+            for name in ("journal.json.lock", "delivery.json.lock"):
+                fd = _os.open(str(self.kb / name), _os.O_RDWR)
+                try:
+                    probes.append(try_lock_nb(fd))
+                finally:
+                    _os.close(fd)
+            return real_commit(conn)
+
+        with capture(), mock.patch.object(_write, "_commit",
+                                          side_effect=_probe_commit):
+            moved = _write.rekey_namespace(
+                self.conn, from_namespace=ns,
+                to_namespace="project:fb031-commit")
+        self.assertGreaterEqual(moved, 1)
+        self.assertEqual(probes, [False, False],
+                         "at commit time both sidecar locks must still "
+                         "be held by the rekey process")
+        # and released afterwards
+        for name in ("journal.json.lock", "delivery.json.lock"):
+            fd = _os.open(str(self.kb / name), _os.O_RDWR)
+            try:
+                self.assertTrue(try_lock_nb(fd))
+            finally:
+                _os.close(fd)
+
+
 class RescanPointerLaneTest(_StoreTestCase):
     """rescan-secrets must never route a reserved pointer row through
     update_memory (its guard refuses pointer edits, which pre-fix aborted

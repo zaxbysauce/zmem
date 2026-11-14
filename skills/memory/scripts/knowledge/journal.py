@@ -25,8 +25,11 @@ owns that journal and nothing else:
   the same digest is an idempotent return.  :meth:`mark` and
   :meth:`entry_for` coordinate on the LATEST entry; ``mark`` refuses when
   the latest entry is terminal (record a new intent first).
-- Bounded: at most ``max_entries`` entries are retained (oldest dropped by
-  sequence).
+- Bounded: at most ``max_entries`` entries are retained.  Eviction is
+  state-aware: terminal history goes first (oldest by sequence), an
+  in-flight (non-terminal) entry is never evicted while any terminal
+  entry exists, and a bound that could only be met by dropping an
+  in-flight entry refuses the write atomically (no file mutation).
 - Private + atomic + durable: entries live in one JSON file written to a
   same-directory temporary, flushed with ``fsync``, then moved onto the
   path with ``os.replace`` (atomic on POSIX and Windows).  The file is
@@ -65,6 +68,7 @@ __all__ = [
     "TERMINAL_STATES",
     "TRANSITIONS",
     "default_journal_path",
+    "journal_path_for_store",
 ]
 
 STATES = (
@@ -159,15 +163,20 @@ class KnowledgeJournal:
                 "journal lock file unavailable (%s)" %
                 exc.__class__.__name__) from exc
         deadline = time.monotonic() + self._lock_timeout_s
-        while not _try_lock_nb(fd):
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                raise JournalError(
-                    "journal lock busy after %.1fs (another writer holds "
-                    "the OS lock; it is released automatically when that "
-                    "writer exits): %r" %
-                    (self._lock_timeout_s, str(lock)))
-            time.sleep(0.03)
+        try:
+            while not _try_lock_nb(fd):
+                if time.monotonic() >= deadline:
+                    raise JournalError(
+                        "journal lock busy after %.1fs (another writer "
+                        "holds the OS lock; it is released automatically "
+                        "when that writer exits): %r" %
+                        (self._lock_timeout_s, str(lock)))
+                time.sleep(0.03)
+        except BaseException:
+            # The descriptor is owned by THIS attempt: the busy timeout
+            # and a FATAL locking.LockError (REL-015) both release it.
+            os.close(fd)
+            raise
         try:
             yield
         finally:
@@ -227,8 +236,38 @@ class KnowledgeJournal:
             raise JournalError("journal entry state/seq invalid")
         return entry
 
+    def _retained(self, entries: list[JournalEntry]) -> list[JournalEntry]:
+        """State-aware retention for one bounded write.
+
+        At or under ``max_entries`` every entry is kept (seq order).  Over
+        the bound, TERMINAL entries (``applied``/``quarantined``) are
+        evicted first — oldest by seq — and an ACTIVE (in-flight) entry is
+        NEVER evicted while any terminal entry remains: dropping a
+        ``doc_pending``/``doc_verified``/``pointer_queued`` intent would
+        orphan a publication mid-flight.  If the bound cannot be met
+        without dropping an in-flight entry (the active entries alone
+        exceed it), the write is refused BEFORE any file mutation — the
+        caller's operation fails atomically and the file stays
+        byte-identical."""
+        if len(entries) <= self._max_entries:
+            return sorted(entries, key=lambda e: e.seq)
+        active = [e for e in entries if e.state not in TERMINAL_STATES]
+        terminal = sorted((e for e in entries
+                           if e.state in TERMINAL_STATES),
+                          key=lambda e: e.seq)
+        if len(active) > self._max_entries:
+            raise JournalError(
+                "journal bound %d would drop an ACTIVE (in-flight) entry; "
+                "refusing to write — drive entries to a terminal state "
+                "first" % self._max_entries)
+        keep = self._max_entries - len(active)
+        # keep <= len(terminal) holds here (len(active) <= max and the
+        # total was over max); the NEWEST terminals survive.
+        retained = active + terminal[len(terminal) - keep:]
+        return sorted(retained, key=lambda e: e.seq)
+
     def _write_entries(self, entries: list[JournalEntry]) -> None:
-        entries = sorted(entries, key=lambda e: e.seq)[-self._max_entries:]
+        entries = self._retained(entries)
         payload = json.dumps({
             "version": _JOURNAL_VERSION,
             "entries": [entry.__dict__ for entry in entries],
@@ -443,3 +482,17 @@ def default_journal_path() -> Path:
     from storelib.config import config_path
 
     return config_path().parent / "knowledge" / "journal.json"
+
+
+def journal_path_for_store(store_dir: Path | str) -> Path:
+    """``<store_dir>/knowledge/journal.json`` constructed DIRECTLY from
+    the authoritative store directory (FB-031 rekey coordination).
+
+    Unlike :func:`default_journal_path` this never consults the
+    store-dir resolver chain (``storelib.config.config_path`` /
+    ``ZMEM_STORE``): the rekey coordination guard already owns the exact
+    store directory (caller-supplied, or derived from the existing
+    SQLite connection) and must address the exact sidecar the workflow
+    uses regardless of what the ambient environment points at.
+    """
+    return Path(store_dir) / "knowledge" / "journal.json"
