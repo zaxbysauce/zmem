@@ -475,18 +475,17 @@ class SkillDocDriftTest(unittest.TestCase):
                 start, f"section {start_pattern!r} not found"
             )
             # Heading-bounded window: from the anchor line to the NEXT
-            # markdown heading of the same-or-higher level (a fixed
-            # 400-line window would swallow sibling sections and
-            # re-satisfy needles from text that does not own them -
-            # PR #468 review finding B1). `count` remains a hard cap.
-            level = len(lines[start]) - len(lines[start].lstrip("#"))
+            # markdown heading of ANY level (a fixed 400-line window, or a
+            # same-or-higher-level bound, swallowed sibling subsections and
+            # re-satisfied needles from text that does not own them — the
+            # desktop quick-reference table duplicates every budget needle;
+            # PR #468 review findings B1 + delta r1). `count` remains a
+            # hard cap.
             end = min(len(lines), start + count)
             for j in range(start + 1, min(len(lines), start + count)):
-                if lines[j].startswith("#"):
-                    j_level = len(lines[j]) - len(lines[j].lstrip("#"))
-                    if j_level <= level and lines[j].strip() != lines[start].strip():
-                        end = j
-                        break
+                if lines[j].startswith("#") and lines[j].strip() != lines[start].strip():
+                    end = j
+                    break
             return "\n".join(lines[start:end])
 
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")

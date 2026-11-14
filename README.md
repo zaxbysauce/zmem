@@ -713,7 +713,11 @@ the one-copy run (`single-copy-pass`) in the same artifact.
 The Codex plugin is **shipped**: the repo's `.codex-plugin/plugin.json` manifest
 points at `./hooks/hooks.codex.json` and `./skills/`, and both files are
 required `doctor.py` surfaces (`host-surfaces` fails if either is missing).
-The shipped manifest registers these hook events:
+The shipped manifest registers `PreToolUse` with the matcher
+`Bash|apply_patch` and `PostToolUse` with the matcher
+`Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch` (shown unescaped here;
+the table below renders the same matchers markdown-escaped), over these hook
+events:
 
 | Event | Matcher |
 |---|---|
