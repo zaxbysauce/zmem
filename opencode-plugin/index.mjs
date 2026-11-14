@@ -44,10 +44,10 @@ const ENVELOPE_REQUIRED_KEYS = ["results", "count", "omitted", "reason",
   "budget_dropped", "budget_admission", "budget_truncated",
   "budget_dropped_protected", "arms", "rendered"];
 
-// Stream-aware UTF-8 decoder for pipe chunks: per-chunk toString("utf-8")
-// corrupts a multibyte codepoint split across chunk boundaries (review
-// R4/F-00x empirical).
-const decoder = new TextDecoder("utf-8");
+// (The stream-aware UTF-8 decoder for pipe chunks lives INSIDE callBridge
+// since the round-2 review: per-chunk toString("utf-8") corrupts a multibyte
+// codepoint split across chunk boundaries, and a module-level singleton
+// would share stream state across concurrent bridge calls.)
 
 const EMPTY_ENVELOPE_REASON = "bridge-error";
 
@@ -124,6 +124,12 @@ async function callBridge(request, spawnEnv) {
       stdio: ["pipe", "pipe", "pipe"],
       env: spawnEnv,
     });
+    // Per-call decoder (review round-2 F3): concurrent callBridge calls
+    // must not share TextDecoder stream state; a module-level singleton
+    // would corrupt interleaved multi-byte output. TextDecoder(stream)
+    // instead of per-chunk toString: a multibyte codepoint split across
+    // pipe chunks would decode as U+FFFD pairs.
+    const decoder = new TextDecoder("utf-8");
     let out = "";
     let errTail = "";
     let settled = false;
@@ -135,8 +141,6 @@ async function callBridge(request, spawnEnv) {
       finish(emptyEnvelope(request.budget_tokens || 1500));
     }, BRIDGE_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => {
-      // TextDecoder(stream) instead of per-chunk toString: a multibyte
-      // codepoint split across pipe chunks would decode as U+FFFD pairs.
       out += decoder.decode(chunk, { stream: true });
     });
     child.stderr.on("data", (chunk) => {
@@ -154,7 +158,10 @@ async function callBridge(request, spawnEnv) {
       finish(emptyEnvelope(request.budget_tokens || 1500));
     });
     child.on("close", (code) => {
-      out += decoder.decode(new Uint8Array(), { stream: true });
+      // decode() with NO options flushes the trailing partial codepoint
+      // (a {stream:true} empty decode would wedge stale bytes in the
+      // decoder for the next call — review round-2 F3).
+      out += decoder.decode();
       try {
         const parsed = JSON.parse(out);
         if (isEnvelope(parsed)) {
@@ -318,11 +325,14 @@ export function appendTurn(message, sourcePath) {
     if ((process.env.ZMEM_CAPTURE || "") === "0") return false;
     const info = (message && message.info) || {};
     const turnUuid = info.id || "";
-    if (!turnUuid || finalizedTurns.has(turnUuid)) return false; // exactly once
+    // Hydrate FIRST (review round-2 F2): on reload the first appendTurn
+    // for a file may itself be a REPLAYED turn — the id check must run
+    // after readMaxSeq has recovered the seen-uuid set from the transcript.
     const target = transcriptFileFor(info.sessionID || info.session_id);
     if (!seqCounters.has(target)) {
       seqCounters.set(target, readMaxSeq(target));
     }
+    if (!turnUuid || finalizedTurns.has(turnUuid)) return false; // exactly once
     const seq = seqCounters.get(target) + 1;
     const turn = normalizeOpenCodeMessage(message, sourcePath, seq);
     fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -381,8 +391,10 @@ function messageFinished(info) {
   if (!info || typeof info !== "object") return false;
   if (info.role === "user") return true; // user messages arrive complete
   const time = info.time;
+  // SDK AssistantMessage carries errors at the TOP level (info.error);
+  // time.error covers the flat fixture vocabulary.
   return !!(time && typeof time === "object"
-    && (time.completed || time.error));
+    && (time.completed || time.error)) || info.error != null;
 }
 
 export function _ingestMessageEvent(event) {
@@ -396,13 +408,26 @@ export function _ingestMessageEvent(event) {
   if (part && !info) {
     const messageID = part.messageID || "";
     if (!messageID) return;
-    const existing = openMessages.get(messageID);
-    if (!existing) return; // part before its message snapshot: wait for it
-    existing.terminal = false;
+    let existing = openMessages.get(messageID);
+    if (!existing) {
+      // Part BEFORE its message snapshot (robust ordering): open a
+      // skeleton so early parts are not dropped; the snapshot's info
+      // merges in when it arrives.
+      existing = { sessionID: part.sessionID || "", info: {},
+        partsById: new Map(), terminal: false };
+      openMessages.set(messageID, existing);
+    }
     if (part.id != null) {
       existing.partsById.set(String(part.id), part);
     } else {
       existing.partsById.set(String(existing.partsById.size), part);
+    }
+    // Deferred finalize (review round-2 F1): a terminal message whose
+    // parts stream AFTER the snapshot (live-SDK user snapshots carry no
+    // info.parts) finalizes HERE, with its parts attached.
+    if (existing.terminal && existing.partsById.size > 0
+        && !Array.isArray(existing.info.parts)) {
+      finalizeMessage(messageID);
     }
     return;
   }
@@ -426,19 +451,28 @@ export function _ingestMessageEvent(event) {
   existing.sessionID = existing.info.sessionID
     || existing.info.session_id || existing.sessionID || sessionID;
   existing.terminal = finished || existing.terminal;
-  // A full parts array on the info snapshot replaces the map (authoritative
-  // ordering); individual part events have already been upserted above.
-  const snapshotParts = existing.info.parts;
-  if (Array.isArray(snapshotParts)) {
+  // A parts array ON THE INCOMING snapshot replaces the map (authoritative
+  // ordering); an update WITHOUT parts leaves the accumulated part deltas
+  // intact (a rebuild from the stale merged array would clobber them —
+  // review round-2 nit).
+  if (Array.isArray(info.parts)) {
     existing.partsById = new Map();
     let i = 0;
-    for (const p of snapshotParts) {
+    for (const p of info.parts) {
       existing.partsById.set(String((p && p.id != null) ? p.id : i), p);
       i += 1;
     }
   }
   openMessages.set(messageID, existing);
-  if (existing.terminal) {
+  if (existing.terminal
+      && (existing.info.role !== "user"
+          || existing.partsById.size > 0)) {
+    // Finalize on terminality, EXCEPT user snapshots with no parts yet:
+    // the live-SDK UserMessage carries no info.parts (text rides part
+    // events), so an empty user aggregate stays open and finalizes when
+    // its first part lands (deferred arm above), or on transform /
+    // dispose (review round-2 F1). Assistant terminality is authoritative
+    // — SDK part events precede the completed snapshot.
     finalizeMessage(messageID);
   }
 }

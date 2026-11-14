@@ -1281,18 +1281,27 @@ class OpenCodeMineHistoryTest(unittest.TestCase):
     def test_oversize_file_skipped_whole(self):
         # Review F-003 (FB-012): an oversize file is skipped ENTIRELY (the
         # hermes shape) — the old head-biased byte slice mined the file's
-        # oldest turns and silently dropped the newest.
+        # oldest turns and silently dropped the newest. The candidate line
+        # sits at the file HEAD, so the old slice shape would harvest it;
+        # asserting its absence is the discriminating leg. Round-2 review:
+        # the file must actually EXCEED the 8 MiB cap (the first draft was
+        # ~415 KB and tautological) — precondition asserted.
         tdir = os.path.join(self.tmp, "oversize")
         os.makedirs(tdir, exist_ok=True)
+        big_path = os.path.join(tdir, "big.jsonl")
+        cap = 8 * 1024 * 1024
+        candidate_line = json.dumps(self._fixture_records()[0]) + "\n"
         filler = json.dumps({"info": {"id": "f", "role": "user",
                                       "time": "2026-01-01T00:00:00Z"},
                              "parts": []}) + "\n"
-        with open(os.path.join(tdir, "big.jsonl"), "w",
-                  encoding="utf-8", newline="\n") as fh:
-            fh.write(filler * 5000)  # ~10.5MB > the 8MB per-file cap
+        with open(big_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(candidate_line)
+            while fh.tell() <= cap:
+                fh.write(filler * 2000)  # ~160KB per write, ~52 writes
+        self.assertGreater(os.path.getsize(big_path), cap)  # precondition
         small = os.path.join(tdir, "small.jsonl")
-        with open(small, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(self._fixture_records()[0]) + "\n")
+        with open(small, "w", encoding="utf-8", newline="\n") as fill:
+            fill.write(json.dumps(self._fixture_records()[0]) + "\n")
         candidates = mine_mod._mine_opencode_candidates(tdir)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["source"],

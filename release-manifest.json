@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f163856e868d170c152e1f9b89436fc0e80a9a8b3cdec4b535ed84c6d96bc63e",
+  "digest": "9edee5d8d7c4be8272dad08662675b64ad58fe2105343a681574081aa55f377d",
   "files": {
     ".agents/plugins/marketplace.json": "973ccc2d26f032b06467c930efc89ab51fc5af263441e52cdf9d229294eda8a6",
     ".claude-plugin/marketplace.json": "07036905e1bdc3af90ecf27e85500b364abcd7321ab4a8f8d447be2ba625890d",
@@ -57,9 +57,9 @@
     "hooks/zmem-subagent-recall.sh": "6583c49f292b03b943e7501d7a000921fa8e99dce9a6958cfd2feae65fcb0474",
     "hooks/zmem-subagent-reflect.sh": "26f698c5269dea8b25737fde48b339f04311904e37dc332e48475c9ab1b2f9d3",
     "marketplace.json": "9a2f754e74814d08f1a22740c2dd1bb51bc5a758905d15d360b2359a1383bd6b",
-    "opencode-plugin/index.mjs": "cf56c8107c384120a6e5a7834af26a904715ca82d86ae228316659129d65b38d",
-    "opencode-plugin/package-lock.json": "60a2c4a881d2308493fc9cf3c349717a0a110d49115fb463555e88285125d7b0",
-    "opencode-plugin/package.json": "2cabf02912ce0c276ee1797b3b86db1da2a2ee0f138b9e4fbf1e2d3ea8da01b9",
+    "opencode-plugin/index.mjs": "edd8ad30c505ee2739dcf7aeaf0e82f005c52d382125cedc7d928d3f245381b9",
+    "opencode-plugin/package-lock.json": "9a738b1921611fbedb9f642cec3d598356f928c59d056821deb1cff9a29ee04f",
+    "opencode-plugin/package.json": "2dff9efa04d6488d9edd11baa1ce1509a40d349b21a5077100cc9c3302f1e988",
     "scripts/bench_hook_latency.py": "ed77a76b54b97faab045c90a04acb3673651b3243967f1ebb6833c631e1b16be",
     "scripts/canary-schema.json": "8b634ff86023a94847be4c595623b03d23588140286f14c3c1933158a9d29fcd",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",

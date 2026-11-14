@@ -456,15 +456,26 @@ async function main() {
       readJsonLines(tPath).length === 3);
 
     // persisted sequence across reload: a FRESH module instance (new
-    // dynamic import with a cache-busting query) continues the seq.
+    // dynamic import with a cache-busting query) continues the seq, and —
+    // round-2 review F2 — a REPLAYED uuid as the fresh instance's FIRST
+    // append is suppressed (the id check runs after transcript hydration).
     const seqBefore = readJsonLines(tPath).slice(-1)[0].seq;
+    const replayMsg = { info: { id: "msg-c", sessionID: "sess-cap-engine",
+      role: "assistant", time: { created: 1767225600000 }, worktree:
+      "C:/oc", parts: [{ type: "text", text: "c part 1" }] },
+      parts: [{ type: "text", text: "c part 1" }] };
     const freshUrl = PLUGIN_URL + "?reload=" + Date.now();
     const fresh = await import(freshUrl);
     fresh._resetCaptureStateForTests();
+    const replayed = fresh.appendTurn(replayMsg, "t.jsonl");
+    const countAfterReplay = readJsonLines(tPath).length;
+    ok("testPersistedSequenceAcrossReload: replayed uuid suppressed on reload",
+      replayed === false && countAfterReplay === 3);
     const wrote = fresh.appendTurn(
       { info: { id: "msg-d", sessionID: "sess-cap-engine", role: "user",
-        time: { created: 1767225600000 }, worktree: "C:/oc",
-        parts: [{ type: "text", text: "d" }] } },
+        time: { created: 1767205600000 }, worktree: "C:/oc",
+        parts: [{ type: "text", text: "d" }] },
+        parts: [{ type: "text", text: "d" }] },
       "t.jsonl");
     ok("testPersistedSequenceAcrossReload: fresh instance appended",
       wrote === true);
@@ -651,6 +662,21 @@ async function main() {
     ok("capture resumes after the kill switch clears",
       sdkTurns().length === 3
       && sdkTurns().some((t) => t.turn_uuid === "u3"));
+
+    // Round-2 review F1: the LIVE user-turn shape — the snapshot carries
+    // NO info.parts (SDK UserMessage has no parts field in
+    // EventMessageUpdated); text arrives via message.part.updated. The
+    // deferred-finalize arm must keep the aggregate open until the part
+    // lands, then emit the turn WITH its text.
+    await hooks.event({ event: sdkMsg("u4", "user", {}) });
+    await hooks.event({ event: sdkPart("p4", "u4", "user text via part") });
+    turns = sdkTurns();
+    const u4Turn = turns.find((t) => t.turn_uuid === "u4");
+    ok("SDK envelope: part-streamed user turn finalized WITH its text",
+      u4Turn !== undefined && u4Turn.blocks.length === 1
+      && u4Turn.blocks[0].text === "user text via part");
+    ok("SDK envelope: exactly one turn for the part-streamed user message",
+      turns.filter((t) => t.turn_uuid === "u4").length === 1);
     delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
   }
 
