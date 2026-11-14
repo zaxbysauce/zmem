@@ -1,0 +1,17 @@
+{
+  "name": "zmem-opencode",
+  "version": "0.154.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "description": "ZMem native OpenCode adapter: passive recall on the system transform, precompact re-injection, canonical Turn transcript capture, and the zmem_recall / zmem_session_start tools (zmem issue #66).",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "1.18.3"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.3"
+  }
+}

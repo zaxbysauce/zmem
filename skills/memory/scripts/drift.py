@@ -70,13 +70,19 @@ MANIFEST_NAME = "release-manifest.json"
 ALGORITHM = "sha256-crlf-norm"
 
 # Repo-relative (POSIX-separator) directory prefixes of the runtime surface.
-# scripts/ joined in 0.18.0 (issue #108 review round): the per-host injection
+# scripts/ joined in 0.18.0 (issue #108 review): the per-host injection
 # canary and the release gate live there — a served tree whose canary was
 # modified or dropped must be drift-detectable, not invisible. Keep in sync
 # with release_gate's runtime-surface description (this tuple is the single
 # source of truth both hash through).
+# opencode-plugin/ joined for issue #66 (plan R2 F12): the OpenCode runtime
+# surface (index.mjs + package.json) is served code and must be
+# drift-detectable the same way; VERSION_MANIFEST_RE and release_gate's
+# manifest discovery are deliberately untouched (the release workstream
+# re-emits the manifest).
 _SURFACE_DIRS = ("hooks/", "skills/memory/scripts/",
-                 "hermes-plugin/", "scripts/", "deepseek-plugin/")
+                 "hermes-plugin/", "scripts/", "deepseek-plugin/",
+                 "opencode-plugin/")
 # skills/**/SKILL.md — any depth under skills/, but only there (an unrelated
 # docs/SKILL.md is not runtime surface).
 _SKILL_MD_SELF = "skills/SKILL.md"

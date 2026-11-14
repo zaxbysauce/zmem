@@ -130,8 +130,47 @@ class TestResolveSkillsDirs(unittest.TestCase):
                 home / ".codex" / "skills",
                 home / ".claude" / "skills",
                 home / ".zcode" / "skills",
+                # Issue #66: the box-wide default gained the OpenCode dir —
+                # promotion targets all four hosts, not just three.
+                home / ".config" / "opencode" / "skills",
             ],
         )
+
+    def test_default_skills_dirs_includes_opencode(self):
+        """Issue #66: the exact ORDERED four-path default — ~/.codex/skills,
+        ~/.claude/skills, ~/.zcode/skills, ~/.config/opencode/skills."""
+        home = Path(os.path.expanduser("~"))
+        self.assertEqual(
+            host.resolve_skills_dirs(),
+            [
+                home / ".codex" / "skills",
+                home / ".claude" / "skills",
+                home / ".zcode" / "skills",
+                home / ".config" / "opencode" / "skills",
+            ],
+        )
+
+    def test_skills_dirs_override_is_authoritative(self):
+        """An explicit ZMEM_SKILLS_DIRS wins wholesale: exactly those dirs,
+        in the given order — the default list never leaks in."""
+        base = Path(tempfile.gettempdir())
+        dir_a = base / "oc-a" / "skills"
+        dir_b = base / "oc-b" / "skills"
+        dir_c = base / "oc-c" / "skills"
+        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join(
+            [str(dir_a), str(dir_b), str(dir_c)])
+        self.assertEqual(
+            host.resolve_skills_dirs(), [dir_a, dir_b, dir_c])
+
+    def test_skills_dirs_deduplicates(self):
+        """Duplicate entries collapse to the FIRST occurrence, order
+        otherwise preserved."""
+        base = Path(tempfile.gettempdir())
+        dir_a = base / "oc-dedup" / "skills"
+        dir_b = base / "oc-other" / "skills"
+        os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join(
+            [str(dir_a), str(dir_b), str(dir_a)])
+        self.assertEqual(host.resolve_skills_dirs(), [dir_a, dir_b])
 
     def test_override_via_pathsep_delimited_env(self):
         # NOTE: must not use literal Windows drive-letter paths (e.g. r"C:\a\skills")
@@ -155,6 +194,43 @@ class TestResolveSkillsDirs(unittest.TestCase):
         os.environ["ZMEM_SKILLS_DIRS"] = "~/customskills"
         dirs = host.resolve_skills_dirs()
         self.assertEqual(dirs, [Path(os.path.expanduser("~/customskills"))])
+
+    def test_schema_fallback_matches_four_dir_default_and_override(self):
+        """Plan R2 F10: the schema.py fallback (host.py unimportable) is
+        directly tested. Simulates host.py being absent by nulling
+        storelib.schema._host (saved/restored) and asserts the inline
+        four-dir default and the authoritative override arm. NOTE: the
+        fallback's override arm does not itself dedup resolved duplicates
+        (host.resolve_skills_dirs owns that; see
+        test_skills_dirs_deduplicates) — pinning non-dedup here would bless
+        a gap, so only the arms the fallback implements are asserted."""
+        import storelib.schema as schema_mod
+
+        os.environ["ZMEM_STORE"] = str(
+            Path(tempfile.gettempdir())
+            / "zmem-hosttest-fallback-store.sqlite")
+        saved = schema_mod._host
+        schema_mod._host = None
+        try:
+            home = Path(os.path.expanduser("~"))
+            self.assertEqual(
+                schema_mod._resolve_skills_dirs(),
+                [
+                    home / ".codex" / "skills",
+                    home / ".claude" / "skills",
+                    home / ".zcode" / "skills",
+                    home / ".config" / "opencode" / "skills",
+                ],
+            )
+            base = Path(tempfile.gettempdir())
+            dir_a = base / "oc-fallback-a"
+            dir_b = base / "oc-fallback-b"
+            os.environ["ZMEM_SKILLS_DIRS"] = os.pathsep.join(
+                [str(dir_a), str(dir_b)])
+            self.assertEqual(
+                schema_mod._resolve_skills_dirs(), [dir_a, dir_b])
+        finally:
+            schema_mod._host = saved
 
 
 class TestLocalFsGuard(unittest.TestCase):

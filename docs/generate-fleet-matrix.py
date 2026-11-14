@@ -65,8 +65,9 @@ EXPLICIT_RECALL = (
     "return no rows with reason: \"hub-unreachable\"."
 )
 OPENCUE_GAP = (
-    "Degrade, never block: no OpenCode adapter ships yet (issue #66), so "
-    "this moment has no delivery path and must not block the host."
+    "Degrade, never block: the OpenCode plugin (issue #66) wires only the "
+    "system-transform, session-compacting, and zmem_* tool surfaces; this "
+    "row has no delivery path on OpenCode and must not block the host."
 )
 
 CL, HU = "client_local", "hub_authoritative"
@@ -158,9 +159,32 @@ _NATIVE_WIRING = {
         # delivered, so the matrix records a capability_gap row instead of
         # an overclaimed registered row for compaction/start.
     },
+    # Native OpenCode plugin wiring (issue #66): the adapter registers the
+    # LIVE SDK hooks in opencode-plugin/index.mjs — no hooks.opencode.json
+    # exists or may be fabricated. The verb->event map below mirrors the
+    # plugin's actual registrations. The split records EXACTLY what #66
+    # ships: passive recall (the chat system transform), precompact recall
+    # (the session-compacting callback), and the zmem_* tools (the
+    # explicit-recall lane, registered in build_rows). session-start,
+    # capture, retention, and write surfaces are deliberately ABSENT — no
+    # SessionStart-equivalent hook and no write tool ship — so those rows
+    # stay capability_gap.
+    "opencode": {
+        "recall": "experimental.chat.system.transform",
+        "precompact": "experimental.session.compacting",
+    },
 }
-_NATIVE_NOTE = ("Native dsh/Cordis plugin event "
-                "(deepseek-plugin/index.mjs); no shell-hook manifest (#374).")
+_NATIVE_NOTES = {
+    "deepseek": ("Native dsh/Cordis plugin event "
+                 "(deepseek-plugin/index.mjs); no shell-hook manifest "
+                 "(#374)."),
+    "opencode": ("Native OpenCode plugin surface "
+                 "(opencode-plugin/index.mjs, issue #66); no shell-hook "
+                 "manifest."),
+}
+# The honest launcher label for OpenCode's explicit-recall lane: the tools
+# the plugin registers, not the store.py CLI other harnesses share.
+OPENCODE_TOOL_SURFACE = "zmem_recall/zmem_session_start tools"
 
 WIRING = _manifest_wiring()
 WIRING.update(_NATIVE_WIRING)
@@ -324,10 +348,16 @@ def _row(harness, moment, hook_event, status, launcher, notes=None):
         "degraded": spec["degraded"],
     }
     note = notes if notes is not None else spec.get("notes")
+    # Native-plugin harnesses: every deepseek row cites the plugin wiring.
+    # OpenCode (#66) splits — registered rows cite the plugin; gap rows keep
+    # the explicit OPENCUE_GAP note (or the moment's own note, e.g. the
+    # hermes-callback explanation), so an unwired surface is never papered
+    # over by the plugin note.
     if harness in _NATIVE_WIRING:
-        note = _NATIVE_NOTE
-    if harness == "opencode" and status == "capability_gap":
-        note = OPENCUE_GAP if note is None else note
+        if harness != "opencode" or status != "capability_gap":
+            note = _NATIVE_NOTES[harness]
+    if harness == "opencode" and status == "capability_gap" and note is None:
+        note = OPENCUE_GAP
     if note:
         row["notes"] = note
     return row
@@ -384,12 +414,19 @@ def build_rows():
                 rows.append(_row(harness, moment, MOMENT_SPEC[moment]["event"],
                                  "capability_gap", None))
         # 4. Explicit-tool moments (the CLI/skill surface every harness
-        #    shares; OpenCode has no adapter yet).
+        #    shares). OpenCode (#66 split) registers explicit recall through
+        #    the plugin's zmem_recall/zmem_session_start tools only — no
+        #    write tool ships, so explicit-write stays a declared gap.
         for moment in EXPLICIT_MOMENTS:
-            status = "capability_gap" if harness == "opencode" else "registered"
-            launcher = None if status == "capability_gap" else (
-                "store.py recall" if moment == "explicit-recall"
-                else "store.py add")
+            if harness == "opencode":
+                status = ("registered" if moment == "explicit-recall"
+                          else "capability_gap")
+                launcher = (OPENCODE_TOOL_SURFACE
+                            if status == "registered" else None)
+            else:
+                status = "registered"
+                launcher = ("store.py recall" if moment == "explicit-recall"
+                            else "store.py add")
             rows.append(_row(harness, moment, None, status, launcher))
     return rows
 

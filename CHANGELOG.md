@@ -5,6 +5,61 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.154.0] - 2026-11-13
+
+### Added
+
+- **OpenCode host support** (issue #66): launcher detection via
+  `OPENCODE_PLUGIN_ROOT` (ahead of the Codex branch) with `ZMEM_HOST=opencode`
+  and `ZMEM_TIER0=native`; the OpenCode adapter's `storeDirectory` occupies
+  the second `ZMEM_DATA` precedence slot; the new `opencode-plugin/` package
+  (`zmem-opencode`, peer-pinned `@opencode-ai/plugin` 1.18.3) wires the live
+  SDK hooks (`experimental.chat.system.transform`, `experimental.session.compacting`,
+  `event`) plus the `zmem_recall` / `zmem_session_start` tools through
+  `skills/memory/scripts/opencode_bridge.py` — one python subprocess per
+  injection over the #158 selector, no lane, fail-open everywhere, and
+  unknown-session drives never inject under a shared identity; canonical
+  OpenCode Turn transcript capture over the live SDK event envelope
+  (`properties`-nested payloads, `time.completed` terminality, part-id-keyed
+  streaming, own-session finalize; fixture and flattened shapes still read);
+  `ZMEM_CAPTURE=0` disables capture entirely and the mining lane applies
+  capture-mode redaction + hermes-parity bounds; `mine-history
+  --source opencode`; a doctor OpenCode-adapter check (`pass` / `fail` /
+  `not_applicable`) with report aggregation for the new status; drift
+  coverage for `opencode-plugin/` via `_SURFACE_DIRS`.
+- Deterministic OpenCode fixtures + generators under
+  `tests/fixtures/opencode/` (probe pair, transcript family, and the #158
+  envelope built through the real selector).
+
+### Changed
+
+- **Promotion skills default is now the four-directory box-wide list**
+  (`~/.codex/skills`, `~/.claude/skills`, `~/.zcode/skills`,
+  `~/.config/opencode/skills`) in the launcher, `host.py`, and the
+  `schema.py` fallback — claude/zcode-originated promotions now also write
+  the codex and opencode skill dirs (issue #66 contract; help text and
+  closeout docs updated to match).
+- Fleet capability matrix: OpenCode `recall`, `precompact`, and
+  `explicit-recall` flip to registered (system transform / compaction hook /
+  the zmem tool surface); `session-start`, `explicit-write`, and capture /
+  retention rows remain explicit capability gaps.
+
+### Fixed
+
+- **Host-canary hermeticity** (issue #351): the canary's driven-child
+  environment now strips the ambient project/session marker families
+  (incl. `OPENCODE_PLUGIN_ROOT`), remote-routing and log-rotation knobs,
+  and the store-selection knobs; pins the launcher watchdog (60 s), the
+  namespace-resolve budget (30 s), and the context budget; sandboxes child
+  `HOME`/`USERPROFILE` into the canary data dir (schema allowlist: `home/`);
+  retries the seed spawn on transient failures only (3 attempts, monotonic
+  cap); and a documented `ZMEM_SESSION_CADENCE=0` kill switch (default on)
+  lets the canary suppress the background session-cadence worker that races
+  the tier-2 read. `tests/test_host_canary.py` gained fault-injection and
+  hostile-ambient regression coverage.
+- The `_store_guard` import in `tests/test_host_canary.py` now follows the
+  decoy pins, so bare developer runs are not guard-aborted.
+
 ## [0.153.0] - 2026-11-13
 ### Security
 - Entity-identity disclosure boundary (issues #459): a credential-shaped
