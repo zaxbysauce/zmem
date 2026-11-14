@@ -848,8 +848,11 @@ class EngineKnowledgeGateOrderingTest(unittest.TestCase):
         os.environ["ZMEM_STORE"] = str(cls._tmp / "store.sqlite")
         os.environ.pop("ZMEM_DATA", None)
         os.environ.pop("ZMEM_REMOTE_URL", None)
-        for key in [k for k in sys.modules
-                    if k == "storelib" or k.startswith("storelib.")]:
+        cls._saved_modules = {
+            key: value for key, value in list(sys.modules.items())
+            if key == "storelib" or key.startswith("storelib.")
+        }
+        for key in cls._saved_modules:
             del sys.modules[key]
         pkg = SCRIPTS_DIR / "storelib"
         spec = importlib.util.spec_from_file_location(
@@ -866,9 +869,10 @@ class EngineKnowledgeGateOrderingTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for key in [k for k in sys.modules
+        for key in [k for k in list(sys.modules)
                     if k == "storelib" or k.startswith("storelib.")]:
             del sys.modules[key]
+        sys.modules.update(cls._saved_modules)
         for k, v in cls._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
