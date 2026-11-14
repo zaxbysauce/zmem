@@ -474,7 +474,20 @@ class SkillDocDriftTest(unittest.TestCase):
             self.assertIsNotNone(
                 start, f"section {start_pattern!r} not found"
             )
-            return "\n".join(lines[start : start + count])
+            # Heading-bounded window: from the anchor line to the NEXT
+            # markdown heading of the same-or-higher level (a fixed
+            # 400-line window would swallow sibling sections and
+            # re-satisfy needles from text that does not own them -
+            # PR #468 review finding B1). `count` remains a hard cap.
+            level = len(lines[start]) - len(lines[start].lstrip("#"))
+            end = min(len(lines), start + count)
+            for j in range(start + 1, min(len(lines), start + count)):
+                if lines[j].startswith("#"):
+                    j_level = len(lines[j]) - len(lines[j].lstrip("#"))
+                    if j_level <= level and lines[j].strip() != lines[start].strip():
+                        end = j
+                        break
+            return "\n".join(lines[start:end])
 
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         skill = SKILL_MD.read_text(encoding="utf-8")
@@ -615,9 +628,15 @@ class CloseoutDocDriftTest(unittest.TestCase):
         # (h) dangling registry warning documented.
         self.assertIn("dangling install path", readme)
         self.assertIn("DANGLING install path", cutover)
-        # (d)/(e) remain covered by the pre-existing SKILL text (#93).
-        self.assertIn("sk-", skill)
-        self.assertIn("ZMEM_QUERY_CONTEXT", skill)
+        # (d)/(e) remain covered by the pre-existing SKILL text (#93); the
+        # needles are the full sentences so unrelated substrings ("task-")
+        # can never satisfy them (PR #468 review finding B2).
+        self.assertIn(
+            "credential-prefix-shaped tokens (`sk-`, `npm_`, `AKIA`", skill,
+        )
+        self.assertIn(
+            "eval composer ignores `ZMEM_QUERY_CONTEXT` by design", skill
+        )
 
 class DoctorChecksTest(unittest.TestCase):
     """Issue #58, 3.7: doctor must include the new hybrid-default and

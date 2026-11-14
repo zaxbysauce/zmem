@@ -2251,6 +2251,12 @@ def _check_surfaces(repo_root: Path) -> dict:
     return _check("host-surfaces", status, summary, surfaces=details)
 
 
+# Per-registry warning cap for _check_plugin_registries (PR #468 review
+# finding A2): a registry full of purged caches must not balloon the JSON
+# report — the first N warnings are recorded, the remainder are counted.
+_REGISTRY_WARNING_CAP = 20
+
+
 def _normalize_registry_entries(host_name: str, document) -> list[dict]:
     """Issue #127: project a codec-validated host registry onto the common
     ``{key, name, version, install_path}`` entry shape. Claude v2 keys
@@ -2275,10 +2281,13 @@ def _normalize_registry_entries(host_name: str, document) -> list[dict]:
     elif host_name == "zcode" and isinstance(plugins, list):
         for index, record in enumerate(plugins):
             if isinstance(record, dict):
+                # PR #468 review finding A4: the #185 lane accepts
+                # entry.get("id") or entry.get("name"); the projection must
+                # not be stricter than its sibling for the same records.
                 entries.append(
                     {
                         "key": f"plugins[{index}]",
-                        "name": record.get("name"),
+                        "name": record.get("id") or record.get("name"),
                         "version": record.get("version"),
                         "install_path": record.get("installPath"),
                     }
@@ -2338,54 +2347,80 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
                         }
                     )
                 else:
+                    # Review finding A1/A2 (PR #468 swarm review): the
+                    # per-entry loop is the same semi-trusted-input class as
+                    # the #185 lane, so it runs under the same
+                    # never-let-host-state-crash-doctor backstop, and the
+                    # recorded warnings are capped (a registry full of
+                    # purged caches must not balloon the JSON report; the
+                    # overflow is counted, not enumerated).
+                    overflow = 0
                     for entry in _normalize_registry_entries(host_name, document):
-                        name = entry["name"]
-                        version = entry["version"]
-                        install_path = entry["install_path"]
-                        base = {
-                            "registry_path": _display_path(path),
-                            "name": name if isinstance(name, str) else None,
-                            "version": version if isinstance(version, str) else None,
-                        }
-                        if not isinstance(name, str) or not name:
-                            record["warnings"].append(
-                                dict(
+                        try:
+                            name = entry["name"]
+                            version = entry["version"]
+                            install_path = entry["install_path"]
+                            base = {
+                                "registry_path": _display_path(path),
+                                "name": (name if isinstance(name, str) else None),
+                                "version": (
+                                    version if isinstance(version, str) else None
+                                ),
+                            }
+                            if not isinstance(name, str) or not name:
+                                warning = dict(
                                     base,
                                     kind="invalid-entry-field",
                                     field="name",
                                     entry=entry["key"],
                                 )
-                            )
-                        if not isinstance(version, str) or not version:
-                            record["warnings"].append(
-                                dict(
+                            elif not isinstance(version, str) or not version:
+                                warning = dict(
                                     base,
                                     kind="invalid-entry-field",
                                     field="version",
                                     entry=entry["key"],
                                 )
-                            )
-                        if not isinstance(install_path, str) or not install_path:
-                            record["warnings"].append(
-                                dict(
+                            elif (
+                                not isinstance(install_path, str)
+                                or not install_path
+                            ):
+                                warning = dict(
                                     base,
                                     kind="invalid-entry-field",
                                     field="install_path",
                                     entry=entry["key"],
                                 )
-                            )
-                        else:
-                            resolved = Path(install_path)
-                            if not resolved.is_absolute():
-                                resolved = home / resolved
-                            if not resolved.exists():
-                                record["warnings"].append(
-                                    dict(
+                            else:
+                                resolved = Path(install_path)
+                                if not resolved.is_absolute():
+                                    resolved = home / resolved
+                                if resolved.exists():
+                                    warning = None
+                                else:
+                                    warning = dict(
                                         base,
                                         kind="dangling-install-path",
                                         install_path=_display_path(install_path),
                                     )
-                                )
+                        except Exception:  # A1: EACCES etc. must not crash
+                            warning = dict(
+                                base={
+                                    "registry_path": _display_path(path),
+                                    "name": None,
+                                    "version": None,
+                                },
+                                kind="entry-uninspectable",
+                                entry=entry.get("key", "?"),
+                            )
+                        if warning is None:
+                            continue
+                        if len(record["warnings"]) < _REGISTRY_WARNING_CAP:
+                            record["warnings"].append(warning)
+                        else:
+                            overflow += 1
+                    if overflow:
+                        record["overflow_warnings"] = overflow
                     record["status"] = "warn" if record["warnings"] else "pass"
         registries[host_name] = record
 
@@ -2416,8 +2451,14 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
     }
 
     warning_count = sum(len(r["warnings"]) for r in registries.values())
+    warning_count += sum(
+        r.get("overflow_warnings", 0) for r in registries.values()
+    )
     warning_count += len(checkout_warnings)
-    if not any_present:
+    if not any_present and not checkout_warnings:
+        # PR #468 review finding A3: an invalid checkout manifest must not be
+        # buried by the no-registries skip (skip requires no registries AND
+        # no checkout findings).
         status = "skip"
         summary = (
             "No Claude or ZCode plugin registry is present for inspection."

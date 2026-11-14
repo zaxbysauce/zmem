@@ -513,6 +513,37 @@ class DoctorCliTest(unittest.TestCase):
         self.assertIn('"field": "name"', blob)
         self.assertIn("also-gone", blob)
 
+        # PR #468 review finding B3: an invalid CHECKOUT manifest warns and
+        # is not buried by the no-registries skip (finding A3), and never
+        # fails the report.
+        claude_live.unlink()
+        zcode_bad.unlink()
+        (self.repo / ".codex-plugin" / "plugin.json").write_text(
+            "{not json", encoding="utf-8", newline="\n"
+        )
+        try:
+            result3 = self._run(
+                "--format",
+                "json",
+                "--repo-root",
+                str(self.repo),
+                "--project",
+                str(self.project),
+            )
+        finally:
+            self._write_repo_surfaces()
+        self.assertEqual(result3.returncode, 0, result3.stderr)
+        report3 = json.loads(result3.stdout)
+        check3 = next(
+            c for c in report3["checks"] if c["id"] == "plugin-registries"
+        )
+        self.assertEqual(check3["status"], "warn")
+        self.assertIn(
+            "invalid-checkout-manifest",
+            json.dumps(check3["details"]),
+        )
+        self.assertTrue(report3["ok"], "checkout warnings never fail")
+
     def test_human_report_returns_nonzero_on_native_memory_blockers(self):
         store_dir = self.home / ".zmem"
         _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
