@@ -127,16 +127,23 @@ def _resolve_core_md_path() -> Path:
 
 def _resolve_skills_dirs() -> list[Path]:
     """Resolve the skills dirs promotion writes into. Delegates to host.py's
-    box-wide default (both ~/.claude/skills and ~/.zcode/skills, overridable
-    via ZMEM_SKILLS_DIRS). Falls back to the old single ~/.zcode/skills dir
-    if host.py could not be imported at all."""
+    box-wide default (issue #66: ~/.codex/skills, ~/.claude/skills,
+    ~/.zcode/skills, and ~/.config/opencode/skills, overridable via
+    ZMEM_SKILLS_DIRS). Falls back to the same four-dir list inline if
+    host.py could not be imported at all."""
     if _host is not None:
         return _host.resolve_skills_dirs()
     # --- inline fallback (host.py absent) ---
     explicit = os.environ.get("ZMEM_SKILLS_DIRS")
     if explicit:
         return [Path(p).expanduser() for p in explicit.split(os.pathsep) if p.strip()]
-    return [Path(os.path.expanduser("~/.zcode/skills"))]
+    home = Path(os.path.expanduser("~"))
+    return [
+        home / ".codex" / "skills",
+        home / ".claude" / "skills",
+        home / ".zcode" / "skills",
+        home / ".config" / "opencode" / "skills",
+    ]
 
 STORE_PATH = _resolve_store_path()
 

@@ -115,21 +115,23 @@ otherwise). That fallback is documented **non-equivalence**: manual and
 explicit-only, with no per-session policy injection — a session that
 never invokes it never sees the knowledge lane.
 
-## OpenCode — manual instruction shim; the gap remains
+## OpenCode — host adapter shipped, knowledge policy still manual
 
-OpenCode has no zmem adapter (issue #66; every OpenCode row of the fleet
-capability matrix is `capability_gap`). PR2 does not change that. The
-supported path is a manual operator action:
+A native OpenCode HOST adapter now ships on main (release 0.154.0,
+issues #66/#351): launcher detection, recall/precompact, and OpenCode
+Turn transcript capture. PR2 does not wire the knowledge routing policy
+into that adapter — the policy surface on OpenCode remains a manual
+operator action:
 
 1. `python skills/memory/scripts/knowledge/policy.py --text` (add
    `--config <path>` when the store is not resolvable from the
    environment).
 2. Paste the rendered text into OpenCode's own instructions array config.
 
-There is no app-config install tool, no automatic sync, and no native
-OpenCode adapter claim. The pasted policy is static until the operator
-re-runs the helper; the fleet matrix gap remains until a native adapter
-ships.
+There is no app-config install tool, no automatic sync, and no claim
+that the OpenCode adapter renders the policy. The pasted policy is
+static until the operator re-runs the helper; wiring the policy into
+the native adapter is future work, disclosed as a remaining gap.
 
 ## Non-goals
 

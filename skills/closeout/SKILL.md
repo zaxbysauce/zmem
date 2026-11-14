@@ -344,9 +344,10 @@ not read `retrieval_count = 0` as "dead weight".
 "$P" "$S" promote --dry-run
 ```
 
-Promotion turns a lesson into a `SKILL.md` in **both** `~/.claude/skills` and
-`~/.zcode/skills`. Be selective — every promoted skill costs trigger-matching
-attention in every future session.
+Promotion turns a lesson into a `SKILL.md` in **all four** skills directories:
+`~/.codex/skills`, `~/.claude/skills`, `~/.zcode/skills`, and
+`~/.config/opencode/skills`. Be selective — every promoted skill costs
+trigger-matching attention in every future session.
 
 Promote only when the lesson is (a) grounded (`test`/`compile`/`lint`),
 (b) repeatedly retrieved, and (c) genuinely a *reusable procedure* rather than a

@@ -2,10 +2,10 @@
 
 All notable changes to the **zmem** plugin are recorded here.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.155.0] - 2026-11-13
+## [0.156.0] - 2026-11-14
 ### Added
 - Knowledge routing policy, PR2 of the knowledge-companion workstream
   (display-only, OFF BY DEFAULT, no auto-capture): one stdlib-only helper
@@ -51,14 +51,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `skills/closeout-remote/SKILL.md` carries the remote-mode half: when
   local capture/flush cannot run, the closeout surfaces a draft-only
   knowledge handoff (no pointer write, no flush) for the operator to
-  capture from a capable host. OpenCode keeps its capability gap
-  (issue #66): the supported path is the manual operator shim `python
+  capture from a capable host. The native OpenCode HOST adapter shipped
+  separately on main (0.154.0, #66/#351); PR2 does not wire the routing
+  policy into it — the supported knowledge-policy path on OpenCode is
+  still the manual operator shim `python
   skills/memory/scripts/knowledge/policy.py --text` pasted into
-  OpenCode's own instructions config — no automatic sync, no native
-  adapter claim.
+  OpenCode's own instructions config — no automatic sync, no
+  adapter-rendered policy claim.
 - Documentation: `docs/KNOWLEDGE-ROUTING.md` (the routing truth table —
   helper contract, per-host gates and cadence, default-off byte-identity,
-  compat fallback, OpenCode gap); README, `docs/KNOWLEDGE-COMPANION.md`,
+  compat fallback, OpenCode policy-note gap); README, `docs/KNOWLEDGE-COMPANION.md`,
   `skills/memory/SKILL.md`, and `docs/CLAIMS-AUDIT.md` now state PR2 as
   implemented instead of "not shipped" (PR1's explicit-only, no-injection
   law unchanged). Pinned by `tests/test_knowledge_policy.py` and
@@ -66,7 +68,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   rendering, gates) and `tests/test_knowledge_policy_native.py` (Hermes
   block, hook payload, dsh pre-step latch/kind/default-off byte-identity).
 
-## [0.154.0] - 2026-11-13
+## [0.155.0] - 2026-11-14
 ### Added
 - Knowledge companion, PR1 of the knowledge-companion workstream (explicit,
   operator-driven, OFF BY DEFAULT): a new early-dispatch `store.py knowledge
@@ -143,6 +145,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   a README "Knowledge companion (optional, off by default)" section, and a
   `SKILL.md` "knowledge — explicit external knowledge companion (PR1)"
   command section pointing at it.
+
+## [0.154.0] - 2026-11-13
+
+### Added
+
+- **OpenCode host support** (issue #66): launcher detection via
+  `OPENCODE_PLUGIN_ROOT` (ahead of the Codex branch) with `ZMEM_HOST=opencode`
+  and `ZMEM_TIER0=native`; the OpenCode adapter's `storeDirectory` occupies
+  the second `ZMEM_DATA` precedence slot; the new `opencode-plugin/` package
+  (`zmem-opencode`, peer-pinned `@opencode-ai/plugin` 1.18.3) wires the live
+  SDK hooks (`experimental.chat.system.transform`, `experimental.session.compacting`,
+  `event`) plus the `zmem_recall` / `zmem_session_start` tools through
+  `skills/memory/scripts/opencode_bridge.py` — one python subprocess per
+  injection over the #158 selector, no lane, fail-open everywhere, and
+  unknown-session drives never inject under a shared identity; canonical
+  OpenCode Turn transcript capture over the live SDK event envelope
+  (`properties`-nested payloads, `time.completed` terminality, part-id-keyed
+  streaming, own-session finalize; fixture and flattened shapes still read);
+  `ZMEM_CAPTURE=0` disables capture entirely and the mining lane applies
+  capture-mode redaction + hermes-parity bounds; `mine-history
+  --source opencode`; a doctor OpenCode-adapter check (`pass` / `fail` /
+  `not_applicable`) with report aggregation for the new status; drift
+  coverage for `opencode-plugin/` via `_SURFACE_DIRS`.
+- Deterministic OpenCode fixtures + generators under
+  `tests/fixtures/opencode/` (probe pair, transcript family, and the #158
+  envelope built through the real selector).
+
+### Changed
+
+- **Promotion skills default is now the four-directory box-wide list**
+  (`~/.codex/skills`, `~/.claude/skills`, `~/.zcode/skills`,
+  `~/.config/opencode/skills`) in the launcher, `host.py`, and the
+  `schema.py` fallback — claude/zcode-originated promotions now also write
+  the codex and opencode skill dirs (issue #66 contract; help text and
+  closeout docs updated to match).
+- Fleet capability matrix: OpenCode `recall`, `precompact`, and
+  `explicit-recall` flip to registered (system transform / compaction hook /
+  the zmem tool surface); `session-start`, `explicit-write`, and capture /
+  retention rows remain explicit capability gaps.
+
+### Fixed
+
+- **Host-canary hermeticity** (issue #351): the canary's driven-child
+  environment now strips the ambient project/session marker families
+  (incl. `OPENCODE_PLUGIN_ROOT`), remote-routing and log-rotation knobs,
+  and the store-selection knobs; pins the launcher watchdog (60 s), the
+  namespace-resolve budget (30 s), and the context budget; sandboxes child
+  `HOME`/`USERPROFILE` into the canary data dir (schema allowlist: `home/`);
+  retries the seed spawn on transient failures only (3 attempts, monotonic
+  cap); and a documented `ZMEM_SESSION_CADENCE=0` kill switch (default on)
+  lets the canary suppress the background session-cadence worker that races
+  the tier-2 read. `tests/test_host_canary.py` gained fault-injection and
+  hostile-ambient regression coverage.
+- The `_store_guard` import in `tests/test_host_canary.py` now follows the
+  decoy pins, so bare developer runs are not guard-aborted.
 
 ## [0.153.0] - 2026-11-13
 ### Security

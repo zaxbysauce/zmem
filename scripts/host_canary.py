@@ -124,6 +124,46 @@ STRIP_VARS = (
     "ZMEM_MODEL_AUTODOWNLOAD",
     "ZMEM_EMBED_PROFILE",
     "ZMEM_EMBEDDING_HEALTH_SHALLOW",
+    # Issue #351 (B1): ambient project-dir markers override the payload cwd in
+    # the launcher's buildCanonicalEnv (CODEX_PROJECT_DIR || CLAUDE_PROJECT_DIR
+    # || ZCODE_PROJECT_DIR || meta.cwd) and ZMEM_PROJECT feeds the shell hook
+    # directly — a decoy marker diverts the recall namespace away from the
+    # seeded row (verdict=fail reason=no-row-id).
+    "ZMEM_PROJECT",
+    "ZCODE_PROJECT_DIR",
+    "CLAUDE_PROJECT_DIR",
+    "CODEX_PROJECT_DIR",
+    # Issue #351 (B2): ambient session identity aliases the delivery ledger —
+    # every canary lane would share one ambient sid and cross-suppress
+    # (no-row-id).
+    "ZMEM_SESSION",
+    "CLAUDE_SESSION_ID",
+    "ZCODE_SESSION_ID",
+    # Issue #351 (B4): ambient remote routing sends the hook to a remote
+    # broker instead of the local plugin tree (hook-not-fired).
+    "ZMEM_REMOTE_URL",
+    "ZMEM_MCP_URL",
+    # Issue #351 (B5): ambient log-rotation knobs can rotate the decision log
+    # between the drive and the freshness read (the fresh line goes missing).
+    "ZMEM_BG_LOG_MAX_BYTES",
+    "ZMEM_LOG_ROTATIONS",
+    # Issue #351 (D2): ambient store-selection knobs — recall timeout, inject
+    # budget/floor/margin, the temporal-window clock, the cross-encoder and
+    # query/cross-project switches, and the repo-state/state-probe timing —
+    # can filter the seeded row out of the recall before the fence renders.
+    "ZMEM_STORE_RECALL_TIMEOUT_S",
+    "ZMEM_INJECT_TOKEN_BUDGET",
+    "ZMEM_INJECT_FLOOR_RECENT",
+    "ZMEM_INJECT_MARGIN",
+    "ZMEM_TEST_NOW",
+    "ZMEM_CROSS_ENCODER",
+    "ZMEM_QUERY_CONTEXT",
+    "ZMEM_CROSS_PROJECT",
+    "ZMEM_TEST_REPO_STATE",
+    "ZMEM_STATE_PROBE_TIMEOUT_S",
+    # Issue #66/#351: OPENCODE_PLUGIN_ROOT is a launcher host-detection
+    # marker — an ambient OpenCode session would hijack every host leg.
+    "OPENCODE_PLUGIN_ROOT",
 )
 
 HOSTS = ("claude", "codex", "zcode", "hermes")
@@ -169,6 +209,32 @@ def build_child_env(host, plugin_root, data_dir):
     env["ZMEM_MODELS_DIR"] = str(Path(data_dir) / "models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
     env["ZMEM_EMBED_PROFILE"] = "minilm"
+    # Issue #351: pin the load-coupled launcher knobs for EVERY driven child
+    # (the DIRECT canary path gets the same seams the unittest wrapper at
+    # tests/test_host_canary.py:115 already pinned for itself):
+    #  - ZMEM_LAUNCHER_WATCHDOG_MS=60000 (B6): the 12s launcher default kills
+    #    the tier-2 emit under self-load between the decision line and the
+    #    fence — the "marker missing" symptom.
+    #  - ZMEM_NAMESPACE_RESOLVE_MS=30000 (B7): the 2s default falls back to
+    #    user:global under load and the seeded row goes missing (no-row-id).
+    #  - ZMEM_CTX_BUDGET=9000 (B3): the canary's expected budget — an ambient
+    #    tiny budget trims tier-2 out of the rendered fence.
+    #  - ZMEM_SESSION_CADENCE=0 (B8): kill switch for the detached
+    #    session-cadence worker (hooks/zmem-session-start.sh) — the canary
+    #    validates recall, not background maintenance, and the worker races
+    #    the tier-2 read on the same store.
+    env["ZMEM_LAUNCHER_WATCHDOG_MS"] = "60000"
+    env["ZMEM_NAMESPACE_RESOLVE_MS"] = "30000"
+    env["ZMEM_CTX_BUDGET"] = "9000"
+    env["ZMEM_SESSION_CADENCE"] = "0"
+    # Issue #351 (E4): sandbox HOME/USERPROFILE for the driven CHILDREN only
+    # — an ambient ~/.claude/settings.json (the native-memory nudge) and
+    # ~/.zmem state must not leak into the probe. <data_dir>/home is created
+    # here; the canary process's own environment stays untouched.
+    child_home = Path(data_dir) / "home"
+    child_home.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(child_home)
+    env["USERPROFILE"] = str(child_home)
     detect = HOST_DETECT_ENV.get(host)
     if detect:
         env[detect] = str(plugin_root)
@@ -411,49 +477,70 @@ def run_drift_check(plugin_root):
     return "unknown"
 
 
+# Issue #351 (D1): the seed spawn is retried on TRANSIENT failures only.
+# Under load the observed live failures were "cannot spawn store.py (locked)"
+# and 120s timeouts — both transient. Permanent failures (rc!=0, unparseable
+# output) fail immediately exactly as before: a deterministic store error
+# will not heal by re-running, and burning attempts would only delay the
+# documented seed-failed verdict (exit 4).
+SEED_MAX_ATTEMPTS = 3
+SEED_TOTAL_BUDGET_S = 200.0
+
+
 def seed_row(env, plugin_root, namespace, data_dir):
     store_py = Path(plugin_root) / "skills" / "memory" / "scripts" / "store.py"
-    try:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                str(store_py),
-                "add",
-                "--namespace",
-                namespace,
-                "--type",
-                "fact",
-                "--content",
-                "%s host canary marker" % MARKER,
-                "--signal",
-                "test",
-                "--source-ref",
-                "issue-108-canary",
-                "--json",
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(data_dir),
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        # Locked store / slow disk: degrade to the documented seed-failed
-        # contract (verdict line + exit 4), never a bare traceback.
-        print("zmem-canary: seed failed — timed out after 120s", file=sys.stderr)
-        return None
-    except OSError as exc:
-        print("zmem-canary: seed failed — cannot spawn store.py (%s)" % exc, file=sys.stderr)
-        return None
-    if proc.returncode != 0:
-        print("zmem-canary: seed failed rc=%d" % proc.returncode, file=sys.stderr)
-        print((proc.stderr or "")[-800:], file=sys.stderr)
-        return None
-    try:
-        return json.loads(proc.stdout.strip().splitlines()[-1])["id"]
-    except (ValueError, KeyError, IndexError):
-        print("zmem-canary: seed output not parseable", file=sys.stderr)
-        return None
+    started = time.monotonic()
+    for attempt in range(1, SEED_MAX_ATTEMPTS + 1):
+        transient = None
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(store_py),
+                    "add",
+                    "--namespace",
+                    namespace,
+                    "--type",
+                    "fact",
+                    "--content",
+                    "%s host canary marker" % MARKER,
+                    "--signal",
+                    "test",
+                    "--source-ref",
+                    "issue-108-canary",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(data_dir),
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            # Locked store / slow disk: transient — retry while attempts and
+            # the monotonic budget allow, else degrade to the documented
+            # seed-failed contract (verdict line + exit 4), never a traceback.
+            transient = "zmem-canary: seed failed — timed out after 120s"
+        except OSError as exc:
+            transient = "zmem-canary: seed failed — cannot spawn store.py (%s)" % exc
+        if transient is not None:
+            if (attempt < SEED_MAX_ATTEMPTS
+                    and time.monotonic() - started < SEED_TOTAL_BUDGET_S):
+                print("%s (attempt=%d, retrying)" % (transient, attempt),
+                      file=sys.stderr)
+                continue
+            print(transient, file=sys.stderr)
+            return None
+        if proc.returncode != 0:
+            print("zmem-canary: seed failed rc=%d" % proc.returncode, file=sys.stderr)
+            print((proc.stderr or "")[-800:], file=sys.stderr)
+            return None
+        try:
+            return json.loads(proc.stdout.strip().splitlines()[-1])["id"]
+        except (ValueError, KeyError, IndexError):
+            print("zmem-canary: seed output not parseable", file=sys.stderr)
+            return None
+    return None
 
 
 def fresh_decision_line(bg_log, pre_size, must_contain=""):

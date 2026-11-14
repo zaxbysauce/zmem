@@ -149,13 +149,16 @@ const EVENT_MAP = {
 };
 
 // --- Detect host ------------------------------------------------------------
-// Explicit ZMEM_HOST wins; else Codex's PLUGIN_ROOT/PLUGIN_DATA, then
-// Claude/ZCode compatibility vars. Default 'zcode' when neither is present
-// (back-compat: the original tool, and the bare-env manual-install / test
-// case — a bare additionalContext envelope, no host-specific rewrap).
+// Explicit ZMEM_HOST wins; else OpenCode's OPENCODE_PLUGIN_ROOT (issue #66,
+// ahead of Codex so an OpenCode session can never be misattributed), then
+// Codex's PLUGIN_ROOT/PLUGIN_DATA, then Claude/ZCode compatibility vars.
+// Default 'zcode' when neither is present (back-compat: the original tool,
+// and the bare-env manual-install / test case — a bare additionalContext
+// envelope, no host-specific rewrap).
 function detectHost() {
     const explicit = process.env.ZMEM_HOST;
     if (explicit) return explicit;
+    if (process.env.OPENCODE_PLUGIN_ROOT) return "opencode";
     if (process.env.PLUGIN_ROOT || process.env.PLUGIN_DATA) return "codex";
     if (process.env.CLAUDE_PLUGIN_ROOT) return "claude";
     if (process.env.ZCODE_PLUGIN_ROOT) return "zcode";
@@ -165,6 +168,7 @@ function detectHost() {
 // --- Resolve plugin root ----------------------------------------------------
 function getPluginRoot() {
     return (
+        process.env.OPENCODE_PLUGIN_ROOT ||
         process.env.PLUGIN_ROOT ||
         process.env.CLAUDE_PLUGIN_ROOT ||
         process.env.ZCODE_PLUGIN_ROOT ||
@@ -1443,23 +1447,27 @@ function buildCanonicalEnv(host, meta, hookName, options = {}) {
     // <ZMEM_DATA>/store.sqlite ahead of the legacy per-plugin data dirs.
     const pluginOptData =
         host === "claude" ? expandHome(process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY) : "";
-    const zmemData = process.env.ZMEM_DATA || pluginOptData || join(homedir(), ".zmem");
+    // OpenCode (issue #66): the adapter supplies the probed `storeDirectory`
+    // option in the hook payload meta — the same precedence slot the Claude
+    // userConfig option occupies. Expanded (the adapter may send "~/...").
+    const opencodeData = host === "opencode" ? expandHome(meta && meta.storeDirectory) : "";
+    const zmemData = process.env.ZMEM_DATA || pluginOptData || opencodeData || join(homedir(), ".zmem");
 
     // ZMEM_SKILLS_DIRS: existing env wins (mirrors ZMEM_DATA above); else the
-    // box-wide default of BOTH skills dirs, delimiter-joined the same way
-    // host.py's resolve_skills_dirs() parses it (os.pathsep — ';' on win32,
-    // ':' elsewhere), so hook-context and skill-context (store.py invoked
-    // directly by a skill/agent) always agree on the same target set.
-    // Promotion writes to every dir here regardless of which host promoted —
-    // a lesson promoted from either tool becomes a skill visible to both.
-    const defaultSkillsDirs =
-        host === "codex"
-            ? [
-                  join(homedir(), ".codex", "skills"),
-                  join(homedir(), ".claude", "skills"),
-                  join(homedir(), ".zcode", "skills"),
-              ]
-            : [join(homedir(), ".claude", "skills"), join(homedir(), ".zcode", "skills")];
+    // box-wide default of ALL FOUR host skills dirs (issue #66 unified the
+    // old host-conditional split into one box-wide list), delimiter-joined
+    // the same way host.py's resolve_skills_dirs() parses it (os.pathsep —
+    // ';' on win32, ':' elsewhere), so hook-context and skill-context
+    // (store.py invoked directly by a skill/agent) always agree on the same
+    // target set. Promotion writes to every dir here regardless of which
+    // host promoted — a lesson promoted from any tool becomes a skill
+    // visible to all of them, OpenCode included.
+    const defaultSkillsDirs = [
+        join(homedir(), ".codex", "skills"),
+        join(homedir(), ".claude", "skills"),
+        join(homedir(), ".zcode", "skills"),
+        join(homedir(), ".config", "opencode", "skills"),
+    ];
     const skillsDirs = process.env.ZMEM_SKILLS_DIRS || defaultSkillsDirs.join(delimiter);
     const tier0 = host === "zcode" ? "zmem" : "native";
     // Respect an operator-set ZMEM_CTX_BUDGET so resolveBudget() can actually

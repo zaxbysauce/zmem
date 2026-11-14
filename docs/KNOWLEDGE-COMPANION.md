@@ -30,11 +30,13 @@ Scope of this guide (PR1, approved plan 2026-11-13):
   local Markdown and KB HTTP targets, immutable content-addressed versions,
   readback verification, crash-recovery journal, reserved store pointers,
   and the separate capability-gated fleet delivery lane.
-- What does NOT ship here: any passive remote fetch, vault sync, or an
-  OpenCode native adapter. The PR2 routing policy ships separately
+- What does NOT ship here: any passive remote fetch or vault sync. The
+  PR2 routing policy ships separately
   ([KNOWLEDGE-ROUTING.md](KNOWLEDGE-ROUTING.md)): it is display-only —
   it names the lane and its target ids and never injects knowledge
-  content into sessions; capture stays explicit-command-only.
+  content into sessions; capture stays explicit-command-only. (A native
+  OpenCode HOST adapter now ships on main from #66/#351; the knowledge
+  policy is not wired into it — see KNOWLEDGE-ROUTING's OpenCode note.)
 - All commands and example outputs below are **illustrative** — they
   document the contract, they are not transcripts of live runs. Substitute
   your own hosts, paths, and token locations; never commit production
@@ -680,6 +682,8 @@ are content-free: `committed`/`duplicate` with `link_status` (`created`/
   names the lane and its target ids, never note content, and capture
   stays explicit-command-only.
 - No passive remote fetch, no vault sync, no vendor API (Obsidian or
-  otherwise), no OpenCode native adapter or autonomous writes.
+  otherwise), no autonomous writes, and no knowledge wiring into the
+  OpenCode adapter (the host adapter itself ships separately from
+  #66/#351; this feature adds no knowledge surface to it).
 - No new schema surface: pointer rows are ordinary fact rows; no new
   table, metadata column, type, or schema version.

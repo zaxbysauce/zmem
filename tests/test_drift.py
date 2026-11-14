@@ -242,6 +242,33 @@ class DriftSurfaceTest(unittest.TestCase):
         self.assertEqual(result["differing_count"], 12)
         self.assertEqual(len(result["differing"]), 10)
 
+    def test_opencode_plugin_is_served(self):
+        """Issue #66 (plan R2 F12): opencode-plugin/ is served surface —
+        once the plugin files exist they enter the enumeration (index.mjs
+        AND package.json; VERSION_MANIFEST_RE untouched: package.json under
+        opencode-plugin/ is runtime surface, not a version manifest)."""
+        _write_bytes(self.root / "opencode-plugin" / "index.mjs",
+                     b"export default async function zmemPlugin() {}\n")
+        _write_bytes(self.root / "opencode-plugin" / "package.json",
+                     b'{"name": "zmem-opencode"}\n')
+        files = drift.surface_files(self.root)
+        self.assertIn("opencode-plugin/index.mjs", files)
+        self.assertIn("opencode-plugin/package.json", files)
+        self.assertEqual(files.count("opencode-plugin/index.mjs"), 1)
+
+    def test_opencode_plugin_change_is_drift(self):
+        """A byte change under opencode-plugin/ flips the served tree to
+        drifted through the existing evaluate() path."""
+        _write_bytes(self.root / "opencode-plugin" / "index.mjs", b"v1\n")
+        _write_bytes(self.root / "opencode-plugin" / "package.json", b"{}\n")
+        _write_manifest(self.root)
+        self.assertEqual(drift.evaluate(self.root)["status"], "matched")
+        (self.root / "opencode-plugin" / "index.mjs").write_bytes(
+            b"v1 TAMPERED\n")
+        result = drift.evaluate(self.root)
+        self.assertEqual(result["status"], "drifted")
+        self.assertIn("opencode-plugin/index.mjs", result["differing"])
+
 
 import unittest.mock  # noqa: E402  (used by the test above)
 

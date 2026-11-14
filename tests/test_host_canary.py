@@ -7,8 +7,6 @@ fixture, which is exactly the AC4 never-touch-the-real-store contract.
 
 Runs standalone: python tests/test_host_canary.py
 """
-import _store_guard  # noqa: F401  (issue #244 isolation guard)
-
 import atexit
 import json
 import os
@@ -23,11 +21,20 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANARY = REPO_ROOT / "scripts" / "host_canary.py"
+SESSION_START = REPO_ROOT / "hooks" / "zmem-session-start.sh"
 
+# Issue #351 (A1): the decoy store pins MUST precede the _store_guard import
+# below — the guard runs at IMPORT time, so on a developer box with a real
+# ~/.zmem store this pins-then-import order is the difference between a green
+# bare `python tests/test_host_canary.py` run and a guard abort before any
+# test executes (masking every failure). The guard's protection is intact:
+# the pins point every store resolution at this scratch decoy, never the
+# real store.
 _TMP = tempfile.mkdtemp(prefix="zmem-canary-test-")
 atexit.register(shutil.rmtree, _TMP, True)
 os.environ["ZMEM_STORE"] = os.path.join(_TMP, "decoy-store.sqlite")
 os.environ["ZMEM_DATA"] = os.path.join(_TMP, "decoy-data")
+import _store_guard  # noqa: F401,E402  (issue #244 isolation guard — AFTER the decoy pins, see A1)
 for _v in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA", "ZMEM_INJECT", "ZMEM_NAMESPACE"):
     os.environ.pop(_v, None)
 
@@ -1131,6 +1138,109 @@ class CanaryHelperUnitTest(unittest.TestCase):
                     self.assertIsNone(
                         mod.seed_row({}, REPO_ROOT, "ns", _TMP))
 
+    def test_namespace_delay_within_pin(self):
+        """#351 B7: a namespace resolution slower than the launcher's old 2s
+        default (zmem-launch.js DEFAULT_NAMESPACE_RESOLVE_MS) but within the
+        new 30s pin stays inside budget — the pin must be present in every
+        driven child's env (at base the pin is ABSENT and the 2s default
+        falls back to user:global under load, so the seeded row goes
+        missing)."""
+        import time as _time
+
+        mod = self._load()
+        d = self._data_dir("ns-pin")
+        env = mod.build_child_env("claude", REPO_ROOT, d)
+        # The regression pin itself: absent at base.
+        self.assertEqual(env.get("ZMEM_NAMESPACE_RESOLVE_MS"), "30000")
+        # The discriminating delay window: beyond the old 2000ms default,
+        # within the pinned budget.
+        delay_ms = 2100
+        self.assertGreater(delay_ms, 2000,
+                           "the simulated delay must exceed the old default")
+        self.assertLess(delay_ms, int(env["ZMEM_NAMESPACE_RESOLVE_MS"]),
+                        "the simulated delay must stay within the pin")
+
+        class SlowHostModule:
+            """Stand-in host module whose resolver is slower than the old
+            launcher default — the shape B7 observed under load."""
+
+            @staticmethod
+            def resolve_namespace(path):
+                _time.sleep(delay_ms / 1000.0)
+                return "project:slow-resolver"
+
+        ns = mod.resolve_namespace(SlowHostModule, d / "workdir")
+        self.assertEqual(ns, "project:slow-resolver",
+                         "a >2s resolution must still complete and ground "
+                         "the seed namespace")
+
+    def test_seed_retry_transient_then_success(self):
+        """#351 D1: a TRANSIENT seed spawn failure (TimeoutExpired / OSError,
+        the observed under-load shapes) retries and succeeds — the row seeds,
+        no seed-failed verdict path — with the attempt=N suffix on the retry
+        diagnostic."""
+        import contextlib
+        import io
+
+        mod = self._load()
+        ok = subprocess.CompletedProcess(
+            ["store.py"], 0, '{"id": "row-retry-ok"}\n', "")
+        for transient in (subprocess.TimeoutExpired(cmd="store.py",
+                                                    timeout=120),
+                          OSError("locked")):
+            with self.subTest(exc=type(transient).__name__):
+                calls = []
+
+                def fake_run(*a, **kw):
+                    calls.append(1)
+                    if len(calls) == 1:
+                        raise transient
+                    return ok
+
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    with unittest.mock.patch.object(mod.subprocess, "run",
+                                                    side_effect=fake_run):
+                        row = mod.seed_row({}, REPO_ROOT, "ns", _TMP)
+                self.assertEqual(row, "row-retry-ok")
+                self.assertEqual(len(calls), 2,
+                                 "exactly one retry after a transient "
+                                 "failure")
+                self.assertIn("attempt=1", err.getvalue(),
+                              "the retry diagnostic carries attempt=N")
+
+    def test_seed_permanent_failure_fails_fast(self):
+        """#351 D1: PERMANENT seed failures (rc!=0, unparseable output) fail
+        IMMEDIATELY — no retry burn, the documented seed-failed message
+        shapes intact (a deterministic store error does not heal by
+        re-running)."""
+        import contextlib
+        import io
+
+        mod = self._load()
+        for proc, needle in (
+            (subprocess.CompletedProcess(["store.py"], 3, "", "boom"),
+             "seed failed rc=3"),
+            (subprocess.CompletedProcess(["store.py"], 0, "not json\n", ""),
+             "seed output not parseable"),
+        ):
+            with self.subTest(needle=needle):
+                calls = []
+
+                def fake_run(*a, **kw):
+                    calls.append(1)
+                    return proc
+
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    with unittest.mock.patch.object(mod.subprocess, "run",
+                                                    side_effect=fake_run):
+                        self.assertIsNone(
+                            mod.seed_row({}, REPO_ROOT, "ns", _TMP))
+                self.assertEqual(len(calls), 1,
+                                 "permanent failures never burn a retry")
+                self.assertIn(needle, err.getvalue())
+
     def test_resolve_override_rejects_non_files_and_still_finds_which(self):
         """F-004/F-014: _resolve_override must refuse directories (skip
         contract, no spawn crash) on EVERY platform, and the shutil.which
@@ -1253,6 +1363,216 @@ class CanaryHelperUnitTest(unittest.TestCase):
                          "the canary must ground on zmem-decisions.log when "
                          "both logs exist")
         self.assertEqual(verdict[5], seeded_id)
+
+
+class CanaryHermeticityTest(unittest.TestCase):
+    """Issue #351: ambient-coupling regressions for the canary's own seams —
+    the driven-child env pins (build_child_env) and the session-start.sh
+    cadence kill switch, exercised as the CI step / operator would hit them
+    (subprocess drives with hostile ambient env, no unittest-layer
+    scrubbing)."""
+
+    # Ambient zmem/host vars stripped for the direct script drives (the
+    # test_bg_log_sid.py _STRIP_ENV family plus the #351 marker/pin set).
+    _SCRIPT_DRIVE_STRIP = (
+        "ZMEM_STORE", "ZMEM_DATA", "ZMEM_HOME", "ZMEM_NAMESPACE", "ZMEM_HOST",
+        "ZMEM_PROJECT", "ZCODE_PROJECT_DIR", "CLAUDE_PROJECT_DIR",
+        "CODEX_PROJECT_DIR", "ZMEM_SESSION", "CLAUDE_SESSION_ID",
+        "ZCODE_SESSION_ID", "ZMEM_QUERY_CONTEXT", "ZMEM_INJECT",
+        "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR",
+        "ZMEM_EMBED_PROFILE", "ZMEM_TEST_NOW", "CLAUDE_PLUGIN_DATA",
+        "ZCODE_PLUGIN_DATA", "ZMEM_ROOT", "ZCODE_PLUGIN_ROOT",
+        "CLAUDE_PLUGIN_ROOT", "ZMEM_SESSION_CADENCE", "ZMEM_REMOTE_URL",
+        "ZMEM_MCP_URL", "ZMEM_LAUNCHER_WATCHDOG_MS", "ZMEM_NAMESPACE_RESOLVE_MS",
+        "ZMEM_CTX_BUDGET",
+    )
+
+    def _data_dir(self, name):
+        d = Path(tempfile.mkdtemp(prefix="zmem-canary-%s-" % name))
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    @staticmethod
+    def _bash():
+        """A WORKING bash for driving the hook script. shutil.which("bash")
+        alone resolves to the WSL relay on some Windows boxes (present but
+        broken), so the known Git Bash locations are preferred first — the
+        same candidate list hooks/zmem-launch.js resolveShell uses."""
+        for cand in (os.environ.get("ZMEM_BASH_PATH"),
+                     r"C:\Program Files\Git\usr\bin\bash.exe",
+                     r"C:\Program Files\Git\bin\bash.exe"):
+            if cand and Path(cand).is_file():
+                return cand
+        return shutil.which("bash")
+
+    @staticmethod
+    def _write_sentinel_store(path):
+        """A stub store.py that records every invocation's argv (JSON lines)
+        to $ZMEM_CANARY_TEST_SENTINEL and exits 0 — the sentinel proving
+        whether a session-cadence child ever spawns."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "import json, os, sys\n"
+            "sentinel = os.environ.get('ZMEM_CANARY_TEST_SENTINEL', '')\n"
+            "if sentinel:\n"
+            "    try:\n"
+            "        with open(sentinel, 'a', encoding='utf-8') as fh:\n"
+            "            fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "sys.exit(0)\n",
+            encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _sentinel_argv(sentinel):
+        if not sentinel.is_file():
+            return []
+        out = []
+        for line in sentinel.read_text(encoding="utf-8").splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
+    def test_cadence_worker_not_started_with_knob(self):
+        """#351 B8/C: with ZMEM_SESSION_CADENCE=0 in the driven child env no
+        session-cadence child ever spawns from hooks/zmem-session-start.sh
+        (asserted on a sentinel store.py stub recording invocations), and
+        the canary's build_child_env carries the knob. With the knob unset
+        (production default) the spawn DOES happen — the positive control a
+        dead spawn site must fail."""
+        # Unit half: the canary pins the kill switch for every driven child.
+        mod = load_canary_module()
+        env = mod.build_child_env("claude", REPO_ROOT, self._data_dir("knob"))
+        self.assertEqual(env.get("ZMEM_SESSION_CADENCE"), "0")
+
+        bash = self._bash()
+        if not bash:
+            self.skipTest("no bash on PATH")
+        stub_root = self._data_dir("cadence-root")
+        stub = self._write_sentinel_store(
+            stub_root / "skills" / "memory" / "scripts" / "store.py")
+
+        def drive(knob_value):
+            tmp = self._data_dir("cadence-" + ("knob" if knob_value
+                                               else "default"))
+            sentinel = tmp / "sentinel.jsonl"
+            child_env = {k: v for k, v in os.environ.items()
+                         if k not in self._SCRIPT_DRIVE_STRIP}
+            child_env.update({
+                "ZMEM_ROOT": str(stub_root),
+                "ZMEM_HOST": "zcode",
+                "ZMEM_STORE": str(tmp / "store.sqlite"),
+                "ZMEM_DATA": str(tmp),
+                "ZMEM_NAMESPACE": "project:cadence-knob",
+                "ZMEM_CTX_BUDGET": "25000",
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "HOME": str(tmp / "home"),
+                "USERPROFILE": str(tmp / "home"),
+                "PYTHONUTF8": "1",
+                "ZMEM_CANARY_TEST_SENTINEL": str(sentinel),
+            })
+            (tmp / "home").mkdir(exist_ok=True)
+            if knob_value is not None:
+                child_env["ZMEM_SESSION_CADENCE"] = knob_value
+            r = subprocess.run(
+                [bash, str(SESSION_START)],
+                input=json.dumps({"session_id": "sess-cadence"}),
+                capture_output=True, text=True, env=child_env, timeout=180,
+                cwd=str(tmp))
+            return r, sentinel
+
+        import time as _t
+
+        # Knob leg: no session-cadence invocation, ever — wait past the
+        # wrapper's 15s race-guard delay (plus spawn overhead) so a would-be
+        # worker had every chance to record before the assertion.
+        r, sentinel = drive("0")
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        deadline = _t.monotonic() + 25
+        while _t.monotonic() < deadline:
+            _t.sleep(1)
+        cadence_argv = [a for a in self._sentinel_argv(sentinel)
+                        if "session-cadence" in a]
+        self.assertEqual(
+            cadence_argv, [],
+            "ZMEM_SESSION_CADENCE=0 must skip the session-cadence worker "
+            "(recorded argv: %r)" % (self._sentinel_argv(sentinel),))
+
+        # Default leg (knob unset): the spawn MUST happen — a dead spawn
+        # site must fail this positive control.
+        r, sentinel = drive(None)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        deadline = _t.monotonic() + 75
+        cadence_argv = []
+        while _t.monotonic() < deadline:
+            cadence_argv = [a for a in self._sentinel_argv(sentinel)
+                            if "session-cadence" in a]
+            if cadence_argv:
+                break
+            _t.sleep(2)
+        self.assertTrue(
+            cadence_argv,
+            "the session-cadence worker must still spawn with the knob "
+            "unset (production default unchanged)")
+
+    def test_hostile_env_regression_direct_path(self):
+        """#351 B1/B2 (the frozen C7 check as a fast unit pin): driving the
+        canary binary DIRECTLY (the CI step / operator form — none of the
+        unittest wrapper's env scrubbing) under hostile ambient project-dir
+        markers pointing at a DECOY GIT REPO with an origin remote (its
+        namespace can never equal the workdir's path key, so the divert is
+        deterministic) plus a decoy session id must still end verdict=pass —
+        STRIP_VARS neutralizes the family before any driven child runs."""
+        decoy = self._data_dir("hostile-decoy")
+        (decoy / "file.txt").write_text("decoy\n", encoding="utf-8")
+        git = ["git", "-C", str(decoy), "-c", "core.hooksPath="]
+        for argv in (
+            ["init", "-q"],
+            ["add", "-A"],
+            ["-c", "user.email=canary@example.com", "-c", "user.name=canary",
+             "-c", "commit.gpgsign=false", "commit", "-q", "-m", "decoy"],
+            ["remote", "add", "origin",
+             "https://example.com/hostile/canary-decoy.git"],
+        ):
+            # GIT_TERMINAL_PROMPT='0' as the EFFECTIVE env value per the
+            # git-hygiene ratchet (the remote-add carries an https:// URL,
+            # so this invocation is network-capable even though it never
+            # contacts the network).
+            subprocess.run(git + argv, check=True, capture_output=True,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+        home = self._data_dir("hostile-home")
+        d = self._data_dir("hostile-run")
+        env = dict(os.environ)
+        env.update({
+            # The hostile marker family (launcher precedence: CODEX ||
+            # CLAUDE || ZCODE beats the canary's payload cwd at base).
+            "ZCODE_PROJECT_DIR": str(decoy),
+            "CLAUDE_PROJECT_DIR": str(decoy),
+            "CODEX_PROJECT_DIR": str(decoy),
+            "ZMEM_PROJECT": str(decoy),
+            "ZMEM_SESSION": "zmem-66351-decoy-sid",
+            # Scratch pins per the C7 recipe (mirror the check's pins).
+            "ZMEM_STORE": str(home / "scratch-store.sqlite"),
+            "ZMEM_DATA": str(home),
+            "ZMEM_MODELS_DIR": str(home / "missing-models"),
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+        })
+        proc = subprocess.run(
+            [sys.executable, str(CANARY), "--host", "claude", "--self-test",
+             "--data-dir", str(d)],
+            capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
+            timeout=360)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("verdict=pass", proc.stdout)
+        # The markers must not divert the namespace: the seeded row grounds
+        # in the canary's OWN fixture store, not any decoy path.
+        self.assertNotIn("hostile-decoy", proc.stdout)
 
 
 class ReadmeCanaryDocTest(unittest.TestCase):

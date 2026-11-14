@@ -2667,7 +2667,7 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2706,7 +2706,7 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2745,7 +2745,7 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2772,7 +2772,7 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2807,15 +2807,15 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
       "min_version": "1.18.30",
       "moment": "precompact",
-      "hook_event": "PreCompact",
-      "status": "capability_gap",
-      "launcher": null,
+      "hook_event": "experimental.session.compacting",
+      "status": "registered",
+      "launcher": "precompact",
       "inputs": [
         {
           "name": "transcript",
@@ -2834,7 +2834,7 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Native OpenCode plugin surface (opencode-plugin/index.mjs, issue #66); no shell-hook manifest."
     },
     {
       "harness": "opencode",
@@ -2877,15 +2877,15 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
       "min_version": "1.18.30",
       "moment": "recall",
-      "hook_event": "UserPromptSubmit",
-      "status": "capability_gap",
-      "launcher": null,
+      "hook_event": "experimental.chat.system.transform",
+      "status": "registered",
+      "launcher": "recall",
       "inputs": [
         {
           "name": "transcript",
@@ -2924,7 +2924,7 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Native OpenCode plugin surface (opencode-plugin/index.mjs, issue #66); no shell-hook manifest."
     },
     {
       "harness": "opencode",
@@ -2959,7 +2959,7 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -2982,7 +2982,7 @@
         "flush"
       ],
       "degraded": "Degrade, never block: flush the durable op queue best-effort; never block session teardown.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -3033,7 +3033,7 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -3072,7 +3072,7 @@
         "select"
       ],
       "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -3107,7 +3107,81 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: compute failure evidence locally from the transcript, enqueue it to the durable op queue (T-09), and render the reflection nudge locally.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "precompact",
+      "hook_event": "PreCompact",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "recall",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "transcript",
+          "locality": "client_local"
+        },
+        {
+          "name": "git remote",
+          "locality": "client_local"
+        },
+        {
+          "name": "namespace",
+          "locality": "client_local"
+        },
+        {
+          "name": "cwd",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "embeddings",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "ledger",
+          "locality": "hub_authoritative"
+        },
+        {
+          "name": "policy",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: inject from a valid, unexpired broker snapshot labelled [OFFLINE SNAPSHOT r<rev>, <age> old] (T-11); if no valid unexpired snapshot exists, inject nothing and record reason: \"hub-unreachable\".",
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "opencode",
@@ -3223,8 +3297,8 @@
       "min_version": "1.18.30",
       "moment": "explicit-recall",
       "hook_event": null,
-      "status": "capability_gap",
-      "launcher": null,
+      "status": "registered",
+      "launcher": "zmem_recall/zmem_session_start tools",
       "inputs": [
         {
           "name": "query",
@@ -3255,7 +3329,7 @@
         "select"
       ],
       "degraded": "Degrade, never block: answer from the valid, unexpired broker snapshot with the same [OFFLINE SNAPSHOT r<rev>, <age> old] label; if none, return no rows with reason: \"hub-unreachable\".",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Native OpenCode plugin surface (opencode-plugin/index.mjs, issue #66); no shell-hook manifest."
     },
     {
       "harness": "opencode",
@@ -3294,7 +3368,7 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
-      "notes": "Degrade, never block: no OpenCode adapter ships yet (issue #66), so this moment has no delivery path and must not block the host."
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
       "harness": "deepseek",

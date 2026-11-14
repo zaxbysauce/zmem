@@ -19,8 +19,12 @@ const ORGANIZER_MAX_WAIT_MS = HELPER_DEADLINE_MS + CLEANUP_RESERVE_MS + 1000;
 const START_WAIT_MS = 12000;
 const CLOSE_WAIT_MS = 10000;
 const MUTANT_OBSERVE_MS = 1200;
+// The EXACT -c wrapper hooks/zmem-session-start.sh spawns for the detached
+// cadence worker (issue #351 embedded the ZMEM_SESSION_CADENCE kill switch
+// inside this string — keep the two in lockstep; the shim intercepts by
+// exact argv match).
 const DELAYED_CADENCE =
-    "import time, subprocess, sys; time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))";
+    'import os, time, subprocess, sys; (sys.exit(0) if os.environ.get("ZMEM_SESSION_CADENCE") == "0" else None); time.sleep(15); sys.exit(subprocess.call([sys.executable] + sys.argv[1:]))';
 
 if (!repo || !projectDir || !expectedNamespace || !["real", "mutant"].includes(mode)) {
     process.stderr.write("usage: maintenance-causal.js REPO PROJECT NAMESPACE real|mutant\n");

@@ -2011,8 +2011,8 @@ and never prints the token value.
 <interpreter> <store.py> promote --id <uuid> --confirm --install-approved
 ```
 `--confirm` writes a review candidate; `--install-approved` is the additional
-explicit gate that installs the reviewed skill into Codex, Claude Code, and
-ZCode skill directories. Promotion is never an unattended hook action.
+explicit gate that installs the reviewed skill into Codex, Claude Code, Zcode,
+and OpenCode skill directories. Promotion is never an unattended hook action.
 
 The promote ladder (issue #64, schema v12) decides which lessons are
 candidates. A lesson is eligible only when its EXPLICIT usage feedback says it
