@@ -1,0 +1,339 @@
+{
+ "candidates": [
+  {
+   "availability": "executed",
+   "decisions": {
+    "different-files": "two_rows",
+    "issue-number": "two_rows",
+    "same-general-lesson": "one_row",
+    "same-task-paraphrase": "two_rows",
+    "task-closeout": "two_rows",
+    "unknown-subject": "one_row"
+   },
+   "log_redacted": [],
+   "name": "deterministic-zmem",
+   "pins": {
+    "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
+    "decoding": {
+     "deterministic": true
+    },
+    "judge_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+    "kind": "deterministic",
+    "model_revision": "storelib@HEAD (deterministic write path, subject-aware dedup #376)",
+    "prompt_digest": "4a539832e12b26a7275b4a52978ae71baf5557ae329b596bff2d774ff9581851",
+    "provider": "zmem-storelib",
+    "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
+    "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
+   },
+   "reason": "",
+   "telemetry": {
+    "latency_s_total": 30.828,
+    "requests": 0,
+    "rows_added": 12,
+    "rss_mb_writer_side": 21,
+    "storage_bytes_total": 2310144,
+    "tokens": 0
+   },
+   "unpinned_fields": []
+  },
+  {
+   "availability": "executed",
+   "decisions": {
+    "different-files": "two_rows",
+    "issue-number": "two_rows",
+    "same-general-lesson": "one_row",
+    "same-task-paraphrase": "two_rows",
+    "task-closeout": "two_rows",
+    "unknown-subject": "one_row"
+   },
+   "log_redacted": [],
+   "name": "lexical-baseline",
+   "pins": {
+    "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
+    "decoding": {
+     "deterministic": true
+    },
+    "judge_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+    "kind": "lexical",
+    "model_revision": "exact-text comparison (no model)",
+    "prompt_digest": "4a539832e12b26a7275b4a52978ae71baf5557ae329b596bff2d774ff9581851",
+    "provider": "none",
+    "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
+    "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
+   },
+   "reason": "",
+   "telemetry": {
+    "latency_s_total": 0.0,
+    "requests": 0,
+    "rows_added": 0,
+    "rss_mb_writer_side": null,
+    "storage_bytes_total": 0,
+    "tokens": 0,
+    "variant": "lexical-only/no-model"
+   },
+   "unpinned_fields": []
+  },
+  {
+   "availability": "excluded_fixture_only",
+   "decisions": {},
+   "log_redacted": [],
+   "name": "deepseek-scripted",
+   "pins": {
+    "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
+    "decoding": {
+     "deterministic": true
+    },
+    "fixture_only": true,
+    "judge_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+    "kind": "fixture_only",
+    "model_revision": "scripted (no inference)",
+    "prompt_digest": "4a539832e12b26a7275b4a52978ae71baf5557ae329b596bff2d774ff9581851",
+    "provider": "deepseek scripted adapter (tests/fixtures/deepseek/helpers.mjs)",
+    "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
+    "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
+   },
+   "reason": "scripted fixture; excluded from model-quality lanes (plan R2-4)",
+   "telemetry": {},
+   "unpinned_fields": []
+  },
+  {
+   "availability": "unavailable",
+   "decisions": {},
+   "log_redacted": [],
+   "name": "local-endpoint",
+   "pins": {
+    "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
+    "decoding": {},
+    "judge_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+    "kind": "local_endpoint",
+    "model_revision": "unconfigured",
+    "prompt_digest": "4a539832e12b26a7275b4a52978ae71baf5557ae329b596bff2d774ff9581851",
+    "provider": "loopback",
+    "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
+    "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
+   },
+   "reason": "ZMEM_CURATOR_LOCAL_ENDPOINT not configured (no loopback endpoint)",
+   "telemetry": {},
+   "unpinned_fields": []
+  },
+  {
+   "availability": "unavailable",
+   "decisions": {},
+   "log_redacted": [],
+   "name": "tencent",
+   "pins": {
+    "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
+    "decoding": {},
+    "judge_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+    "kind": "tencent",
+    "model_revision": "unconfigured",
+    "prompt_digest": "4a539832e12b26a7275b4a52978ae71baf5557ae329b596bff2d774ff9581851",
+    "provider": "tencent",
+    "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
+    "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
+   },
+   "reason": "ZMEM_CURATOR_TENCENT_WRITER not configured",
+   "telemetry": {},
+   "unpinned_fields": []
+  },
+  {
+   "availability": "unavailable",
+   "decisions": {},
+   "log_redacted": [
+    "{\"duration_api_ms\":0,\"stop_reason\":\"stop_sequence\",\"session_id\":\"9b1388d4-8be1-47dc-8f2e-563d73a362b7\",\"total_cost_usd\":0,\"usage\":{\"output_tokens_details\":{\"thinking_tokens\":0},\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_inp"
+   ],
+   "name": "general",
+   "pins": {
+    "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
+    "decoding": {
+     "temperature": null,
+     "top_p": null
+    },
+    "judge_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+    "kind": "general",
+    "model_revision": "claude-cli@installed (--model pinned at run time)",
+    "prompt_digest": "4a539832e12b26a7275b4a52978ae71baf5557ae329b596bff2d774ff9581851",
+    "provider": "claude-cli",
+    "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
+    "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
+   },
+   "reason": "endpoint error: Not logged in \u00b7 Please run /login",
+   "telemetry": {
+    "endpoint_error": true,
+    "latency_s_total": 4.328,
+    "output_truncated": false,
+    "requests": 1,
+    "returncode": 1,
+    "timed_out": false
+   },
+   "unpinned_fields": [
+    "decoding.temperature",
+    "decoding.top_p"
+   ]
+  }
+ ],
+ "canonical_decision_digest": "5d64dd9229602500094fb98c68836b2dd2e01151385a5fef5559f051cd2df80f",
+ "go_no_go": {
+  "deterministic_shadow_go": true,
+  "model_go": false,
+  "note": "unavailable inference yields no score and cannot produce a model GO; a negative/no-benefit result can close this evaluation with a reproducible explanation",
+  "reason": "no executed model-backed writer: unavailable inference yields no score and cannot produce a model GO"
+ },
+ "judge_vs_human_status": {
+  "endorsed_case_count": 0,
+  "note": "AC2 judge/human measurement PARTIAL: computes only over human_endorsement rows; none at ship (owner asked twice 2026-11-14, no answer; plan-critic interim contract)",
+  "status": "awaiting_human_labels"
+ },
+ "maintainer_evidence_pending": [
+  "AC2 judge/human disagreement: awaiting per-case human labels (fixture format carries optional human_endorsement; owner asked twice 2026-11-14, no answer)"
+ ],
+ "os_runtime": "win32",
+ "raw_artifact_digest": "fab49ff2e2d818a61693e10187d2cc0ab8888b7e6e10a19d1766f9501cd6ab2e",
+ "rubric": {
+  "awaiting_human_labels": true,
+  "critical_findings": [],
+  "endorsed_case_count": 0,
+  "metric_families": [
+   "false_merges",
+   "missed_duplicates",
+   "unsupported_statements",
+   "evidence_id_precision",
+   "temporal_updates",
+   "abstention_quality",
+   "useful_accepted_lessons",
+   "storage_growth",
+   "latency_s",
+   "token_cost",
+   "disagreement.judge_vs_contract_oracle",
+   "disagreement.judge_vs_authored_oracle",
+   "disagreement.judge_vs_model_reviewed",
+   "disagreement.judge_vs_human",
+   "critical_findings"
+  ],
+  "metrics": {
+   "contract_lane": {
+    "false_merges": [],
+    "missed_duplicates": [],
+    "per_pair": {
+     "different-files": {
+      "decision": "two_rows",
+      "expected": "two_rows",
+      "verdict": "agrees"
+     },
+     "issue-number": {
+      "decision": "two_rows",
+      "expected": "two_rows",
+      "verdict": "agrees"
+     },
+     "same-general-lesson": {
+      "decision": "one_row",
+      "expected": "one_row",
+      "verdict": "agrees"
+     },
+     "same-task-paraphrase": {
+      "decision": "two_rows",
+      "expected": "two_rows",
+      "verdict": "agrees"
+     },
+     "task-closeout": {
+      "decision": "two_rows",
+      "expected": "two_rows",
+      "verdict": "agrees"
+     },
+     "unknown-subject": {
+      "decision": "one_row",
+      "expected": "one_row",
+      "verdict": "agrees"
+     }
+    }
+   },
+   "human_lane": {
+    "endorsed_case_count": 0,
+    "note": "AC2 judge/human measurement PARTIAL: computes only over human_endorsement rows; none at ship (owner asked twice 2026-11-14, no answer; plan-critic interim contract)",
+    "status": "awaiting_human_labels"
+   },
+   "model_reviewed_lane": {
+    "agrees": 8,
+    "attribution": "model-lane verdicts of record (never human)",
+    "cases": 16,
+    "disagrees": 8,
+    "per_case": {
+     "RH-001": "supported",
+     "RH-002": "supported",
+     "RH-003": "supported",
+     "RH-004": "pre_existing",
+     "RH-005": "supported",
+     "RH-006": "pre_existing",
+     "RH-007": "supported",
+     "RH-008": "supported",
+     "RH-009": "supported",
+     "RH-010": "supported",
+     "RH-011": "supported",
+     "RH-012": "supported",
+     "RH-013": "unsupported_by_probe",
+     "RH-014": "pre_existing",
+     "RH-015": "supported",
+     "RH-016": "supported"
+    }
+   },
+   "telemetry_by_candidate": {
+    "deepseek-scripted": {
+     "latency_s": null,
+     "requests": 0,
+     "rss_mb_writer_side": null,
+     "storage_bytes": null,
+     "tokens": 0
+    },
+    "deterministic-zmem": {
+     "latency_s": 30.828,
+     "requests": 0,
+     "rss_mb_writer_side": 21,
+     "storage_bytes": 2310144,
+     "tokens": 0
+    },
+    "general": {
+     "latency_s": 4.328,
+     "requests": 1,
+     "rss_mb_writer_side": null,
+     "storage_bytes": null,
+     "tokens": 0
+    },
+    "lexical-baseline": {
+     "latency_s": 0.0,
+     "requests": 0,
+     "rss_mb_writer_side": null,
+     "storage_bytes": 0,
+     "tokens": 0
+    },
+    "local-endpoint": {
+     "latency_s": null,
+     "requests": 0,
+     "rss_mb_writer_side": null,
+     "storage_bytes": null,
+     "tokens": 0
+    },
+    "tencent": {
+     "latency_s": null,
+     "requests": 0,
+     "rss_mb_writer_side": null,
+     "storage_bytes": null,
+     "tokens": 0
+    }
+   }
+  },
+  "rubric_digest": "d1096ee8262b8c2e8c042a20d861cbad8151bf9156249b5e8e421010840dd258",
+  "rubric_version": "nightly-curator-rubric-v1",
+  "variant_declarations": {
+   "lexical-only/no-model": "executed",
+   "quantized": "not_claimed"
+  }
+ },
+ "schema": "zmem-nightly-curator-decision-v1",
+ "source_sha": "93a8d30750703261fe2b0a39760124f14062b7be",
+ "staged_rollout": {
+  "stage_1_shadow_reporting": "ready (this harness; no live schedule)",
+  "stage_2_policy_approved_deterministic_maintenance": "requires maintainer policy approval",
+  "stage_3_model_proposals_through_review": "requires reviewed-promotion consumption",
+  "unattended_semantic_apply": "SEPARATE maintainer decision requiring additional evidence (never enabled by this evaluation)"
+ }
+}
