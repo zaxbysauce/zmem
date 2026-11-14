@@ -963,7 +963,7 @@ class ClaimsAuditPathTest(unittest.TestCase):
     docs/CLAIMS-AUDIT.md must resolve below the repository root."""
 
     PATH_RE = re.compile(
-        r"`([^`\n]+?\.(?:py|js|json|md|sh|toml|yaml|yml|txt))`"
+        r"`([^`\n]+?\.(?:py|js|json|jsonl|md|sh|toml|yaml|yml|txt))`"
     )
 
     def test_every_cited_local_path_exists(self):

@@ -573,6 +573,75 @@ class DoctorCliTest(unittest.TestCase):
         )
         self.assertTrue(report3["ok"], "checkout warnings never fail")
 
+    def test_registry_warning_cap_and_overflow(self):
+        """Issue #127 F-008: the per-registry warning cap records the first
+        20 warnings and counts the remainder (overflow_warnings), and the
+        summary count equals recorded + overflow (the true total)."""
+        store_dir = self.home / ".zmem"
+        _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)
+        _write_text(
+            self.home / ".claude" / "settings.json",
+            json.dumps({"autoMemoryEnabled": False}),
+        )
+        _write_text(
+            self.home / ".codex" / "config.toml",
+            "\n".join(
+                [
+                    "[features]",
+                    "memories = false",
+                    "",
+                    "[memories]",
+                    "use_memories = false",
+                    "generate_memories = false",
+                    "",
+                    f"[projects.'{str(self.project).lower()}']",
+                    'trust_level = "trusted"',
+                ]
+            ),
+        )
+        zcode_reg = self.home / ".zcode" / "cli" / "plugins" / "installed_plugins.json"
+        zcode_reg.parent.mkdir(parents=True)
+        plugins = []
+        for index in range(25):
+            plugins.append(
+                {
+                    "name": f"zmem-purge-{index}",
+                    "installPath": str(self.home / "plugins" / f"gone-{index}"),
+                    "version": "1.0.0",
+                    "enabled": False,
+                    "scope": "user",
+                }
+            )
+        zcode_reg.write_text(
+            json.dumps({"version": 1, "plugins": plugins}),
+            encoding="utf-8",
+            newline="\n",
+        )
+        result = self._run(
+            "--format",
+            "json",
+            "--repo-root",
+            str(self.repo),
+            "--project",
+            str(self.project),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["ok"])
+        check = next(
+            c for c in report["checks"] if c["id"] == "plugin-registries"
+        )
+        self.assertEqual(check["status"], "warn")
+        zcode = check["details"]["registries"]["zcode"]
+        self.assertEqual(len(zcode["warnings"]), 20)
+        self.assertEqual(zcode["overflow_warnings"], 5)
+        self.assertNotIn("probe_budget_exhausted", zcode)
+        self.assertIn(
+            "carry 25 warning(s)",
+            check["summary"],
+            "summary count must equal recorded + overflow",
+        )
+
     def test_human_report_returns_nonzero_on_native_memory_blockers(self):
         store_dir = self.home / ".zmem"
         _make_store(store_dir / "store.sqlite", schema_version=CURRENT_SCHEMA_VERSION)

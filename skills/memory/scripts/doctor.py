@@ -2255,6 +2255,13 @@ def _check_surfaces(repo_root: Path) -> dict:
 # finding A2): a registry full of purged caches must not balloon the JSON
 # report — the first N warnings are recorded, the remainder are counted.
 _REGISTRY_WARNING_CAP = 20
+# Filesystem-probe budget (PR #468 finding F-005): Path.exists() on a
+# dead UNC / disconnected-drive path can block in os.stat for seconds per
+# probe on Windows. Probing is capped per registry; past the budget the
+# dangling check is skipped and disclosed (probe_budget_exhausted) — field
+# checks (name/version/install_path string validation) still run for every
+# entry because they are pure string checks.
+_REGISTRY_PROBE_BUDGET = 200
 
 
 def _normalize_registry_entries(host_name: str, document) -> list[dict]:
@@ -2347,39 +2354,53 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
                         }
                     )
                 else:
-                    # Review finding A1/A2 (PR #468 swarm review): the
-                    # per-entry loop is the same semi-trusted-input class as
-                    # the #185 lane, so it runs under the same
-                    # never-let-host-state-crash-doctor backstop, and the
-                    # recorded warnings are capped (a registry full of
-                    # purged caches must not balloon the JSON report; the
-                    # overflow is counted, not enumerated).
+                    # Review findings A1/A2 (PR #468 swarm review) + F-003/
+                    # F-005 (pr468-20261114-full): the per-entry loop is the
+                    # same semi-trusted-input class as the #185 lane, so it
+                    # runs under the same never-let-host-state-crash-doctor
+                    # backstop; recorded warnings are capped AND every
+                    # registry-controlled string is length-capped (the
+                    # warning count cap bounds entries, not bytes — a 5MB
+                    # plugin name must not amplify into the report); and the
+                    # exists() probe is budgeted (a dead-UNC path can block
+                    # in os.stat for seconds on Windows, so probing is
+                    # bounded per registry with the truncation disclosed).
                     overflow = 0
-                    for entry in _normalize_registry_entries(host_name, document):
+                    probes = 0
+                    probe_budget_exhausted = False
+                    entries = _normalize_registry_entries(host_name, document)
+                    for entry in entries:
                         try:
                             name = entry["name"]
                             version = entry["version"]
                             install_path = entry["install_path"]
                             base = {
                                 "registry_path": _display_path(path),
-                                "name": (name if isinstance(name, str) else None),
+                                "name": (
+                                    _display_path(name)
+                                    if isinstance(name, str)
+                                    else None
+                                ),
                                 "version": (
-                                    version if isinstance(version, str) else None
+                                    _display_path(version)
+                                    if isinstance(version, str)
+                                    else None
                                 ),
                             }
+                            key = _display_path(entry["key"])
                             if not isinstance(name, str) or not name:
                                 warning = dict(
                                     base,
                                     kind="invalid-entry-field",
                                     field="name",
-                                    entry=entry["key"],
+                                    entry=key,
                                 )
                             elif not isinstance(version, str) or not version:
                                 warning = dict(
                                     base,
                                     kind="invalid-entry-field",
                                     field="version",
-                                    entry=entry["key"],
+                                    entry=key,
                                 )
                             elif (
                                 not isinstance(install_path, str)
@@ -2389,9 +2410,18 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
                                     base,
                                     kind="invalid-entry-field",
                                     field="install_path",
-                                    entry=entry["key"],
+                                    entry=key,
                                 )
+                            elif probes >= _REGISTRY_PROBE_BUDGET:
+                                # F-005: the filesystem probe is the only
+                                # unbounded-cost step; past the budget the
+                                # dangling check is skipped and disclosed
+                                # (field checks above stay complete — they
+                                # are pure string checks).
+                                probe_budget_exhausted = True
+                                warning = None
                             else:
+                                probes += 1
                                 resolved = Path(install_path)
                                 if not resolved.is_absolute():
                                     resolved = home / resolved
@@ -2411,7 +2441,7 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
                                     "version": None,
                                 },
                                 kind="entry-uninspectable",
-                                entry=entry.get("key", "?"),
+                                entry=_display_path(entry.get("key", "?")),
                             )
                         if warning is None:
                             continue
@@ -2421,6 +2451,8 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
                             overflow += 1
                     if overflow:
                         record["overflow_warnings"] = overflow
+                    if probe_budget_exhausted:
+                        record["probe_budget_exhausted"] = True
                     record["status"] = "warn" if record["warnings"] else "pass"
         registries[host_name] = record
 
@@ -2467,7 +2499,8 @@ def _check_plugin_registries(home: Path, repo_root: Path) -> dict:
         status = "warn"
         summary = (
             f"Plugin registries carry {warning_count} warning(s): dangling "
-            "install paths or invalid entries (see details)."
+            "install paths, invalid entries, or unreadable registries "
+            "(see details)."
         )
     else:
         status = "pass"
@@ -4352,6 +4385,13 @@ def _recommendations(checks: list[dict]) -> list[str]:
             "entry: refresh that host's plugin cache per the README Upgrade "
             "section, then re-run doctor to confirm the skew cleared "
             "(issue #185)."
+        )
+    if by_id.get("plugin-registries", {}).get("status") == "warn":
+        notes.append(
+            "A plugin registry names an install path or entry that no longer "
+            "resolves: inspect the registry entry named in the details and "
+            "remove or repair the stale entry yourself — doctor never edits "
+            "host registries (issue #127)."
         )
     if by_id.get("project-pin", {}).get("status") == "warn":
         notes.append(

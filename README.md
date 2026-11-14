@@ -841,6 +841,9 @@ Per-host facts at a glance (details in each host section above):
 | ZCode | SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PostToolUseFailure, Stop | `ZMEM_CTX_BUDGET` default 25000 (launcher path); 9000 non-launcher | plugin cache install (`~/.zcode/cli/plugins/`) | `memoryEnabled` false (`~/.zcode/v2/setting.json`) | `scripts/refresh_hosts.py` |
 | Hermes | provider mode has no shell hooks; compatibility mode uses `pre_llm_call` + observational `post_tool_call` | `ZMEM_MCP_TIMEOUT` float, default 8.0 s, clamp 1.0–30.0 | provider plugin dir or compat hooks config | `memory.provider` (`zmem` = provider mode) | gateway restart after config change |
 
+OpenCode host support shipped in 0.154.0 (PR #467); its host facts live in
+`opencode-plugin/` — this table covers the four hosts issue #127 scoped.
+
 ### Hermes Agent — local (memory provider + reflection hooks)
 
 The provider picks its transport from configuration alone (issue #160):
