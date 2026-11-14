@@ -388,8 +388,6 @@ jobs:
                   fi
                   ;;
               esac
-=======
->>>>>>> c9a52fa692d7119dae710326c1f13a84acfe7346
             else
               echo "::error::$f failed"
               failed=1; failed_list="$failed_list $f"

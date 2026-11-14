@@ -141,10 +141,11 @@ work.
 - No new hook events — existing seams only.
 - No passive remote fetch, vault sync, mandatory editor (Obsidian or
   otherwise), or autonomous capture; PR1's explicit-only law holds.
-- Release 0.155 ships in this PR: the CHANGELOG and release manifest
+- Release 0.156.0 ships in this PR: the CHANGELOG and release manifest
   restamp, and the deepseek canary/support host-gate evidence
-  (`docs/host-gate-evidence/deepseek/`) is regenerated against the
-  qualified working tree. The canary now includes a dedicated `policy`
+  (`docs/host-gate-evidence/deepseek/`) is regenerated at the committed
+  release head (committed-runtime evidence; see the support report's
+  provenance note). The canary now includes a dedicated `policy`
   lane exercising BOTH helper legs — the default-off render (empty,
   byte-bounded) and an explicit `knowledge.enabled=true` markdown-target
   render (target id present, word-bounded) via the real
