@@ -357,13 +357,13 @@ def _refuse_introduced_pointer_conflicts(conn: sqlite3.Connection,
     """Map-form wrapper over :func:`_refuse_pointer_collisions`: the
     post-move namespace is the FIRST map entry whose prefix matches the
     row's source_ref (mirroring _classify_rows / the apply loop order)."""
-    def post_namespace_for(row) -> str:
+    def _mapped_namespace(row) -> str:
         ref = row["source_ref"] or ""
         for prefix, target in entries:
             if ref.startswith(prefix):
                 return target
         return row["namespace"]
-    _refuse_pointer_collisions(conn, post_namespace_for)
+    _refuse_pointer_collisions(conn, _mapped_namespace)
 
 
 def _decision_lines(entries: list[tuple[str, str]],

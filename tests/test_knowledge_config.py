@@ -107,7 +107,7 @@ class DefaultOffTests(unittest.TestCase):
         path = knowledge_cfg(self.tmp, {
             "enabled": False,
             "targets": {"vault": {"kind": "markdown",
-                                  "root": "D:/vault"}},
+                                  "root": str(self.tmp / "vault")}},
         })
         cfg = load_knowledge_config(path)
         self.assertFalse(cfg.enabled)
@@ -177,18 +177,21 @@ class MarkdownTargetTests(unittest.TestCase):
         return load_knowledge_config(path).targets["v"]
 
     def test_valid(self):
-        target = self.load({"kind": "markdown", "root": "D:/vault/notes"})
+        root = self.tmp / "vault" / "notes"
+        target = self.load({"kind": "markdown", "root": str(root)})
         self.assertIsInstance(target, MarkdownTarget)
         self.assertEqual(target.id, "v")
-        self.assertEqual(target.root, Path("D:/vault/notes"))
+        self.assertEqual(target.root, root)
 
     def test_relative_root_refused(self):
         with self.assertRaises(KnowledgeConfigError):
             self.load({"kind": "markdown", "root": "vault/notes"})
 
     def test_dotdot_root_refused(self):
-        with self.assertRaises(KnowledgeConfigError):
-            self.load({"kind": "markdown", "root": "D:/vault/../etc"})
+        with self.assertRaisesRegex(KnowledgeConfigError,
+                                    "must not contain.*components"):
+            self.load({"kind": "markdown",
+                       "root": str(self.tmp / "vault" / ".." / "etc")})
 
     def test_root_not_string(self):
         with self.assertRaises(KnowledgeConfigError):
@@ -244,11 +247,11 @@ class KBHTTPTargetTests(unittest.TestCase):
                 self.load(dict(GOOD_KB, endpoint=bad))
 
     def test_credential_exactly_one(self):
-        with self.assertRaises(KnowledgeConfigError):
-            self.load(dict(GOOD_KB, token_file="C:/secrets/tok"))
+        with self.assertRaisesRegex(KnowledgeConfigError, "exactly one"):
+            self.load(dict(GOOD_KB, token_file=str(self.tmp / "tok")))
         stripped = {k: v for k, v in GOOD_KB.items()
                     if k != "credential_env"}
-        with self.assertRaises(KnowledgeConfigError):
+        with self.assertRaisesRegex(KnowledgeConfigError, "exactly one"):
             self.load(stripped)
 
     def test_bad_credential_env_name(self):
@@ -260,9 +263,9 @@ class KBHTTPTargetTests(unittest.TestCase):
                     if k != "credential_env"}
         with self.assertRaises(KnowledgeConfigError):
             self.load(dict(stripped, token_file="secrets/tok"))
-        target = self.load(dict(stripped,
-                                token_file="C:/secrets/tok.txt"))
-        self.assertEqual(target.token_file, Path("C:/secrets/tok.txt"))
+        token_file = self.tmp / "tok.txt"
+        target = self.load(dict(stripped, token_file=str(token_file)))
+        self.assertEqual(target.token_file, token_file)
 
     def test_timeout_bounds(self):
         for bad in (0, -1, 121, "10", True):
