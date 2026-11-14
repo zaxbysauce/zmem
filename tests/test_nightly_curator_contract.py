@@ -321,7 +321,8 @@ def test_proposal_boundary():
 
     # self-confidence invariance
     inv = b.evaluate_confidence_invariant(dict(ok, id="P2"))
-    assert inv["invariant"] and inv["low"] == inv["high"], inv
+    assert inv["invariant"] and inv["low"] == inv["high"], \
+        f"confidence_invariance_violation: {inv}"
 
     # conflicting proposals detected pairwise
     conflicts = b.detect_conflicts([
