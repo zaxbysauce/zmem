@@ -280,6 +280,11 @@ async function main() {
       envelope.count === 0 && envelope.rendered === "");
     ok("testBridgeFailureIsEmptyEnvelope: excluded []",
       Array.isArray(envelope.excluded) && envelope.excluded.length === 0);
+    // Review R19/FB-019: the fail-open REASON must be observable, not just
+    // the empty shape — a green-but-reasonless envelope would mask which
+    // leg failed.
+    ok("testBridgeFailureIsEmptyEnvelope: reason is bridge-error",
+      envelope.reason === "bridge-error");
   }
 
   // --- unsessioned drives (plan F2) -------------------------------------------
@@ -395,25 +400,26 @@ async function main() {
                                                       "opencode", "t.jsonl");
     mod._resetCaptureStateForTests();
 
-    // out-of-order parts: part events before the message record
-    const mk = (id, status, parts) => ({
+    // interleaved assistant streams completing on time.completed (the SDK
+    // Message carries NO status — the old fixture `status` vocabulary is
+    // only a fallback shape, never the terminality signal)
+    const mk = (id, parts, done) => ({
       type: "message.updated",
       sessionID: "sess-cap-engine",
-      info: { id, sessionID: "sess-cap-engine", role: "user",
-        time: { created: 1767225600000 }, worktree: "C:/oc",
-        status, parts },
+      info: { id, sessionID: "sess-cap-engine", role: "assistant",
+        time: done
+          ? { created: 1767225600000, completed: 1767225600500 }
+          : { created: 1767225600000 },
+        worktree: "C:/oc", parts },
     });
     // interleaved sessions
-    await hooks.event({ event: mk("msg-a", "running",
-      [{ type: "text", text: "a part 1" }]) });
-    await hooks.event({ event: mk("msg-b", "running",
-      [{ type: "text", text: "b part 1" }]) });
-    await hooks.event({ event: mk("msg-a", "running",
-      [{ type: "text", text: "a part 1" }, { type: "text", text: "a part 2" }]) });
-    await hooks.event({ event: mk("msg-a", "completed",
-      [{ type: "text", text: "a part 1" }, { type: "text", text: "a part 2" }]) });
-    await hooks.event({ event: mk("msg-b", "completed",
-      [{ type: "text", text: "b part 1" }]) });
+    await hooks.event({ event: mk("msg-a", [{ type: "text", text: "a part 1" }], false) });
+    await hooks.event({ event: mk("msg-b", [{ type: "text", text: "b part 1" }], false) });
+    await hooks.event({ event: mk("msg-a", [{ type: "text", text: "a part 1" },
+      { type: "text", text: "a part 2" }], false) });
+    await hooks.event({ event: mk("msg-a", [{ type: "text", text: "a part 1" },
+      { type: "text", text: "a part 2" }], true) });
+    await hooks.event({ event: mk("msg-b", [{ type: "text", text: "b part 1" }], true) });
 
     const tPath = process.env.ZMEM_OPENCODE_TRANSCRIPTS;
     const turns = readJsonLines(tPath);
@@ -429,15 +435,14 @@ async function main() {
       && aTurn.blocks[1].text === "a part 2");
 
     // append-exactly-once: re-finalize a completed message
-    await hooks.event({ event: mk("msg-a", "completed",
-      [{ type: "text", text: "a part 1" }, { type: "text", text: "a part 2" }]) });
+    await hooks.event({ event: mk("msg-a", [{ type: "text", text: "a part 1" },
+      { type: "text", text: "a part 2" }], true) });
     ok("testAppendExactlyOnce: duplicate terminal event appends nothing",
       readJsonLines(tPath).length === 2);
 
     // terminal vs transform finalization: a non-terminal message finalizes
     // on the next system transform, once.
-    await hooks.event({ event: mk("msg-c", "running",
-      [{ type: "text", text: "c part 1" }]) });
+    await hooks.event({ event: mk("msg-c", [{ type: "text", text: "c part 1" }], false) });
     const out3 = { system: [] };
     await hooks["experimental.chat.system.transform"](
       { sessionID: "sess-cap-engine", model: {} }, out3);
@@ -575,6 +580,191 @@ async function main() {
         env2 !== null && env2.candidate_ids.includes(nsInfo.id),
         "ns=" + nsInfo.ns + " reason=" + (env2 && env2.reason));
     }
+  }
+
+  // --- feedback round: LIVE SDK envelope shapes (FB-001/R1) ------------------
+  // The pinned SDK 1.18.3 nests payloads under `properties`
+  // (EventMessageUpdated = {type, properties:{info: Message}};
+  // EventMessagePartUpdated = {type, properties:{part}}); Message has NO
+  // `status` — assistant terminality is time.completed. These legs feed the
+  // event hook through the REAL host event vocabulary (not the fixture
+  // shape) so the fixture-vs-live drift class (review R44) is pinned shut.
+  {
+    const dir = scratchDir("sdkenv");
+    pinStore(dir);
+    const tdir = path.join(dir, "transcripts", "opencode");
+    process.env.ZMEM_OPENCODE_TRANSCRIPTS = tdir;
+    mod._resetCaptureStateForTests();
+    const sdkMsg = (id, role, extra) => ({
+      type: "message.updated",
+      properties: { info: { id, sessionID: "sess-sdk", role,
+        time: { created: 1767225600000 }, worktree: "C:/oc", ...extra } },
+    });
+    const sdkPart = (partId, msgId, text) => ({
+      type: "message.part.updated",
+      properties: { part: { id: partId, messageID: msgId,
+        type: "text", text, sessionID: "sess-sdk" } },
+    });
+    const sdkFile = path.join(tdir, "sess-sdk.jsonl");
+    const sdkTurns = () => fs.existsSync(sdkFile)
+      ? readJsonLines(sdkFile) : [];
+
+    // user message arrives complete -> finalized on first sight
+    await hooks.event({ event: sdkMsg("u1", "user",
+      { parts: [{ type: "text", text: "sdk user turn" }] }) });
+    let turns = sdkTurns();
+    ok("SDK envelope: user message finalized on arrival",
+      turns.length === 1 && turns[0].turn_uuid === "u1"
+      && turns[0].role === "user");
+
+    // assistant opens, streams parts keyed by part.id, completes only on
+    // time.completed (no `status` field exists on the SDK Message).
+    await hooks.event({ event: sdkMsg("a1", "assistant", {}) });
+    await hooks.event({ event: sdkPart("p1", "a1", "hello ") });
+    await hooks.event({ event: sdkPart("p2", "a1", "world") });
+    // a repeated part id REPLACES its snapshot (no accumulation — R12)
+    await hooks.event({ event: sdkPart("p2", "a1", "world!") });
+    ok("SDK envelope: streaming assistant not yet finalized",
+      sdkTurns().length === 1);
+    await hooks.event({ event: sdkMsg("a1", "assistant",
+      { time: { created: 1767225600000, completed: 1767225601000 } }) });
+    turns = sdkTurns();
+    ok("SDK envelope: assistant finalized on time.completed",
+      turns.length === 2
+      && turns.some((t) => t.turn_uuid === "a1"));
+    const aTurn = turns.find((t) => t.turn_uuid === "a1");
+    ok("SDK envelope: parts keyed by id, replaced not accumulated",
+      aTurn !== undefined && aTurn.blocks.length === 2
+      && aTurn.blocks[0].text === "hello "
+      && aTurn.blocks[1].text === "world!");
+
+    // ZMEM_CAPTURE=0 kill switch (R6/FB-009): production default ON; "0"
+    // suppresses the transcript write entirely and clears on unset.
+    process.env.ZMEM_CAPTURE = "0";
+    await hooks.event({ event: sdkMsg("u2", "user",
+      { parts: [{ type: "text", text: "must not be captured" }] }) });
+    ok("ZMEM_CAPTURE=0 suppresses capture",
+      sdkTurns().length === 2);
+    delete process.env.ZMEM_CAPTURE;
+    await hooks.event({ event: sdkMsg("u3", "user",
+      { parts: [{ type: "text", text: "capture resumes" }] }) });
+    ok("capture resumes after the kill switch clears",
+      sdkTurns().length === 3
+      && sdkTurns().some((t) => t.turn_uuid === "u3"));
+    delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
+  }
+
+  // --- FB-008/R11 + routing: own-session finalize, per-session files ---------
+  {
+    const dir = scratchDir("ownsess");
+    pinStore(dir);
+    const tdir = path.join(dir, "transcripts", "opencode");
+    process.env.ZMEM_OPENCODE_TRANSCRIPTS = tdir;
+    mod._resetCaptureStateForTests();
+    const mkFlat = (id, sess, extra) => ({
+      type: "message.updated", sessionID: sess,
+      info: { id, sessionID: sess, role: "assistant",
+        time: { created: 1767225600000 }, worktree: "C:/oc", ...extra },
+    });
+    await hooks.event({ event: mkFlat("oa", "sess-own-a", {}) });
+    await hooks.event({ event: mkFlat("ob", "sess-own-b", {}) });
+    // transform on A finalizes ONLY A's aggregate
+    await hooks["experimental.chat.system.transform"](
+      { sessionID: "sess-own-a", model: {} }, { system: [] });
+    const fileA = path.join(tdir, "sess-own-a.jsonl");
+    const fileB = path.join(tdir, "sess-own-b.jsonl");
+    ok("own-session finalize: A finalized on its transform",
+      fs.existsSync(fileA) && readJsonLines(fileA).length === 1
+      && readJsonLines(fileA)[0].turn_uuid === "oa");
+    ok("own-session finalize: B untouched by A's transform (file routing)",
+      !fs.existsSync(fileB));
+    // B completes on its own terminal event later — full content retained
+    await hooks.event({ event: mkFlat("ob", "sess-own-b",
+      { time: { created: 1767225600000, completed: 1767225602000 } }) });
+    const turnsB = readJsonLines(fileB);
+    ok("own-session finalize: B completes later with full content",
+      turnsB.length === 1 && turnsB[0].turn_uuid === "ob");
+    delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
+  }
+
+  // --- FB-006/R13: a transform without sessionID never guesses ----------------
+  {
+    mod._resetCaptureStateForTests();
+    const tdir0 = scratchDir("nosess");
+    pinStore(tdir0);
+    const tdir = path.join(tdir0, "transcripts", "opencode");
+    process.env.ZMEM_OPENCODE_TRANSCRIPTS = tdir;
+    mod._resetCaptureStateForTests();
+    await hooks.event({ event: { type: "message.updated",
+      sessionID: "sess-x",
+      info: { id: "mx", sessionID: "sess-x", role: "assistant",
+        time: { created: 1767225600000 }, worktree: "C:/oc" } } });
+    const out = { system: ["base"] };
+    await hooks["experimental.chat.system.transform"]({}, out);
+    ok("no-session transform: prompt unchanged (fail-open envelope)",
+      out.system.length === 1);
+    ok("no-session transform: session X aggregate NOT finalized",
+      !fs.existsSync(path.join(tdir, "sess-x.jsonl")));
+    ok("no-session transform: session X pending NOT drained",
+      mod.drainPending("sess-x").length === 1);
+    delete process.env.ZMEM_OPENCODE_TRANSCRIPTS;
+  }
+
+  // --- FB-002/S1: tool args are zod schemas (ZodRawShape contract) ------------
+  {
+    const requireFromPlugin = require("module").createRequire(
+      path.join(REPO, "opencode-plugin", "package.json"));
+    const { z } = requireFromPlugin("zod");
+    const shapes = [hooks.tool.zmem_recall.args,
+      hooks.tool.zmem_session_start.args];
+    const allZod = (shape) => Object.values(shape).every(
+      (v) => v && typeof v === "object"
+      && typeof v.safeParse === "function");
+    ok("zod args: every declared arg is a zod schema",
+      shapes.every(allZod));
+    const recall = z.object(hooks.tool.zmem_recall.args);
+    ok("zod args: recall parses the happy-path args",
+      recall.safeParse({ query: "stash pop" }).success);
+    ok("zod args: recall parses full args",
+      recall.safeParse({ query: "q", namespace: "project:x",
+        session_id: "s", limit: 5, global_limit: 3,
+        budget_tokens: 1500 }).success);
+    ok("zod args: query is REQUIRED (parse without it fails)",
+      !recall.safeParse({}).success);
+    ok("zod args: limit rejects non-integers",
+      !recall.safeParse({ query: "q", limit: 1.5 }).success);
+    const start = z.object(hooks.tool.zmem_session_start.args);
+    ok("zod args: session_start parses empty args (all optional)",
+      start.safeParse({}).success);
+    ok("zod args: session_start has NO query key",
+      !("query" in hooks.tool.zmem_session_start.args));
+    // the host's tool-listing projection works end to end
+    const js = z.toJSONSchema(recall);
+    ok("zod args: toJSONSchema exposes required [query]",
+      Array.isArray(js.required) && js.required.includes("query"));
+  }
+
+  // --- FB-004: >64KB request round-trips through the bridge stdin -------------
+  {
+    const dir = scratchDir("stdin");
+    pinStore(dir);
+    seedFixtureRows();
+    const big = await mod.runInjection({
+      query: "stash pop " + "x".repeat(100 * 1024),
+      moment: "user_prompt",
+      namespace: "project:opencode",
+      session_id: "00000000-0000-4000-8000-000000000660",
+      budget_tokens: 1500,
+    });
+    const required = ["results", "count", "omitted", "reason", "excluded",
+      "candidate_ids", "tokens_used", "tokens_budget", "budget_dropped",
+      "budget_admission", "budget_truncated", "budget_dropped_protected",
+      "arms", "rendered"];
+    ok(">64KB request resolves to a well-formed envelope",
+      required.every((k) => k in big));
+    ok(">64KB request carries a real selector verdict",
+      big.reason === "injected" || big.reason === "empty-pool",
+      "reason=" + big.reason);
   }
 
   console.log("");

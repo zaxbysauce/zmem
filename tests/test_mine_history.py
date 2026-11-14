@@ -1228,6 +1228,104 @@ class OpenCodeMineHistoryTest(unittest.TestCase):
         items2 = json.loads(qfiles[0].read_text(encoding="utf-8"))
         self.assertEqual(len(items2), 1)
 
+    # -- feedback-round hardening (FB-010..013, FB-023) ----------------------
+
+    def test_hostile_lines_are_skipped_never_fatal(self):
+        # Review R8/F-008 (FB-010): a hostile line that PARSES as JSON must
+        # not crash the miner — the contract is "skipped, never fatal", and
+        # a hostile line must not suppress the following good line.
+        tdir = os.path.join(self.tmp, "hostile")
+        os.makedirs(tdir, exist_ok=True)
+        good = self._fixture_records()[0]
+        with open(os.path.join(tdir, "h.jsonl"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps({  # role-less canonical record
+                "harness": "opencode", "session_id": "s", "blocks": []})
+                + "\n")
+            fh.write(json.dumps({  # object-shaped text block
+                "info": {"id": "h2", "role": "user",
+                         "time": "2026-01-01T00:00:00Z"},
+                "parts": [{"type": "text", "text": {"k": 1}}]}) + "\n")
+            fh.write(json.dumps({  # Infinity / huge float payloads
+                "info": {"id": "h3", "role": "user",
+                         "time": "2026-01-01T00:00:00Z"},
+                "parts": [{"type": "text",
+                           "text": float("inf")}]}) + "\n")
+            fh.write("{not json at all\n")  # unparseable
+            fh.write(json.dumps(good) + "\n")  # must STILL be harvested
+        candidates = mine_mod._mine_opencode_candidates(tdir)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["type"], "explicit")
+        self.assertIn("store the test command", candidates[0]["message"])
+
+    def test_u2028_inside_json_strings_is_content(self):
+        # Review F-002 (FB-011): splitlines() breaks on U+2028/U+0085/U+2029
+        # — legal INSIDE JSON strings — so the old framing split mid-record
+        # (the tail fragments parse as garbage and vanish). Newline-only
+        # framing keeps the record whole; sanitize collapses the separators
+        # in the message, not the framing.
+        tdir = os.path.join(self.tmp, "u2028")
+        os.makedirs(tdir, exist_ok=True)
+        rec = {"info": {"id": "u1", "role": "user",
+                        "time": "2026-01-01T00:00:00Z"},
+               "parts": [{"type": "text",
+                          "text": "remember: alpha\u2028beta\u0085gamma"}]}
+        with open(os.path.join(tdir, "u.jsonl"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        candidates = mine_mod._mine_opencode_candidates(tdir)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["message"],
+                         "remember: alpha beta gamma")
+
+    def test_oversize_file_skipped_whole(self):
+        # Review F-003 (FB-012): an oversize file is skipped ENTIRELY (the
+        # hermes shape) — the old head-biased byte slice mined the file's
+        # oldest turns and silently dropped the newest.
+        tdir = os.path.join(self.tmp, "oversize")
+        os.makedirs(tdir, exist_ok=True)
+        filler = json.dumps({"info": {"id": "f", "role": "user",
+                                      "time": "2026-01-01T00:00:00Z"},
+                             "parts": []}) + "\n"
+        with open(os.path.join(tdir, "big.jsonl"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(filler * 5000)  # ~10.5MB > the 8MB per-file cap
+        small = os.path.join(tdir, "small.jsonl")
+        with open(small, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(self._fixture_records()[0]) + "\n")
+        candidates = mine_mod._mine_opencode_candidates(tdir)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["source"],
+                         "opencode-session:small.jsonl")
+
+    def test_capture_mode_redaction_applies(self):
+        # Review R9 (FB-013): the opencode lane runs the Claude-lane
+        # pipeline (sanitize -> redact). In auto mode a secret-bearing
+        # candidate is redacted + flagged; manual keeps verbatim + flag.
+        tdir = os.path.join(self.tmp, "redact")
+        os.makedirs(tdir, exist_ok=True)
+        token = "ghp_" + "A1b2C3d4" * 6  # 48 alnum chars -> ghp_ pattern
+        rec = {"info": {"id": "r1", "role": "user",
+                        "time": "2026-01-01T00:00:00Z"},
+               "parts": [{"type": "text",
+                          "text": "remember: my token is " + token}]}
+        with open(os.path.join(tdir, "r.jsonl"), "w",
+                  encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        with mock.patch.dict(os.environ,
+                             {"ZMEM_CAPTURE_MODE": "auto"}):
+            auto = mine_mod._mine_opencode_candidates(tdir)
+        self.assertEqual(len(auto), 1)
+        self.assertNotIn(token, auto[0]["message"])
+        self.assertIn("[REDACTED_SECRET]", auto[0]["message"])
+        self.assertTrue(auto[0].get("secret_warning"))
+        with mock.patch.dict(os.environ,
+                             {"ZMEM_CAPTURE_MODE": "manual"}):
+            manual = mine_mod._mine_opencode_candidates(tdir)
+        self.assertEqual(len(manual), 1)
+        self.assertIn(token, manual[0]["message"])
+        self.assertTrue(manual[0].get("secret_warning"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

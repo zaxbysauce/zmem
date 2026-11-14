@@ -9,6 +9,7 @@
     "@opencode-ai/plugin": "1.18.3"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.3"
+    "@opencode-ai/plugin": "1.18.3",
+    "zod": "4.1.8"
   }
 }

@@ -1314,6 +1314,7 @@ def _mine_deepseek_candidates(root):
 
 
 _OPENCODE_MAX_FILE_BYTES = 8 * 1024 * 1024
+_OPENCODE_MAX_SESSION_FILES = 50
 
 
 def _utc_rfc3339(epoch_ms: int) -> str:
@@ -1410,83 +1411,113 @@ def _mine_opencode_candidates(transcript_dir: str) -> list[dict]:
     candidate). Candidates are REVIEWED before any store write; --queue is
     owned by the dispatch wrapper (cmd_mine_history_adapters), never this
     adapter. Transcript JSONL shape is upstream-owned: an unparseable line
-    is skipped, never fatal."""
+    is skipped, never fatal. Bounded like the hermes lane: the newest
+    _OPENCODE_MAX_SESSION_FILES files, each whole (an oversize file is
+    skipped, not byte-truncated — the old head-biased slice silently
+    dropped the file's newest turns); framing is newline-only (U+2028/
+    U+0085 inside JSON strings are CONTENT, not breaks); capture-mode
+    redaction runs on every candidate (same pipeline as the Claude lane)."""
     import corrections as _corr
     root = Path(transcript_dir).expanduser()
     if not root.is_dir():
         raise FileNotFoundError(str(root))
     candidates: list[dict] = []
-    for path in sorted(root.glob("*.jsonl")):
-        if not path.is_file():
-            continue
+    mode = _normalize_capture_mode(None)
+    files = sorted(
+        (p for p in root.glob("*.jsonl") if p.is_file()
+         and p.stat().st_size <= _OPENCODE_MAX_FILE_BYTES),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files[:_OPENCODE_MAX_SESSION_FILES]:
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        lines = [ln for ln in raw[:_OPENCODE_MAX_FILE_BYTES].splitlines()
-                 if ln.strip()]
+        # Newline-only framing (review F-002): str.splitlines() also breaks
+        # on U+2028/U+0085/U+2029 — legal INSIDE JSON strings — so a string
+        # containing them splits mid-record and corrupts the framing.
+        lines = [ln for ln in raw.split("\n") if ln.strip()]
         source_name = "opencode-session:" + path.name
         for seq, line in enumerate(lines):
+            # Whole-line try (review R8/F-008): "skipped, never fatal" —
+            # a hostile line that PARSES (role-less canonical record,
+            # object-shaped text, Infinity/1e23 floats) must not crash the
+            # miner outside the parse-except tuple.
             try:
                 obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            # Two accepted record shapes: RAW {info, parts} messages (the
-            # fixture family) and CANONICAL Turn records already emitted
-            # by the plugin's capture engine (harness == "opencode" with a
-            # blocks list) — the canonical form passes through unchanged.
-            is_canonical_turn = (
-                obj.get("harness") == "opencode"
-                and isinstance(obj.get("blocks"), list)
-                and "session_id" in obj)
-            if is_canonical_turn:
-                turn = dict(obj)
-                turn.setdefault("seq", seq)
-            else:
-                turn = normalize_opencode_message(obj, path.name, seq)
-            user_text = " ".join(
-                b.get("text", "") for b in turn["blocks"]
-                if isinstance(b, dict) and b.get("type") == "text").strip()
-            if turn["role"] == "user" and len(user_text) >= 5 \
-                    and _corr.should_include_message(user_text):
-                item_type, patterns, confidence, sentiment, decay = \
-                    _corr.detect_patterns(user_text)
-                if item_type:
-                    candidates.append({
-                        "message": user_text,
-                        "type": item_type,
-                        "patterns": patterns,
-                        # PRR-013: keep the detector's per-pattern calibration
-                        # (same as the hermes lane).
-                        "confidence": confidence,
-                        "decay_days": decay,
+                if not isinstance(obj, dict):
+                    continue
+                # Two accepted record shapes: RAW {info, parts} messages (the
+                # fixture family) and CANONICAL Turn records already emitted
+                # by the plugin's capture engine (harness == "opencode" with a
+                # blocks list) — the canonical form passes through unchanged.
+                is_canonical_turn = (
+                    obj.get("harness") == "opencode"
+                    and isinstance(obj.get("blocks"), list)
+                    and "session_id" in obj)
+                if is_canonical_turn:
+                    turn = dict(obj)
+                    turn.setdefault("seq", seq)
+                else:
+                    turn = normalize_opencode_message(obj, path.name, seq)
+                user_text = " ".join(
+                    (b.get("text") or "") for b in turn["blocks"]
+                    if isinstance(b, dict) and b.get("type") == "text").strip()
+                if turn["role"] == "user" and len(user_text) >= 5 \
+                        and _corr.should_include_message(user_text):
+                    item_type, patterns, confidence, sentiment, decay = \
+                        _corr.detect_patterns(user_text)
+                    if item_type:
+                        item = {
+                            "message": _sanitize_correction_message(user_text),
+                            "type": item_type,
+                            "patterns": patterns,
+                            # PRR-013: keep the detector's per-pattern
+                            # calibration (same as the hermes lane).
+                            "confidence": confidence,
+                            "decay_days": decay,
+                            "source": source_name,
+                            "dedup_key": hashlib.sha1(
+                                (item_type + "\x00" + user_text)
+                                .encode("utf-8", "replace")).hexdigest(),
+                        }
+                        # Capture-mode redaction (review R9/FB-013): the
+                        # Claude-lane pipeline — sanitize -> redact; 'auto'
+                        # replaces the message, manual/reviewed keeps it
+                        # verbatim with the secret_warning flag.
+                        redacted, n = redact_text(item["message"])
+                        if n:
+                            item["secret_warning"] = True
+                            if mode == "auto":
+                                item["message"] = redacted
+                        candidates.append(item)
+                for block in turn["blocks"]:
+                    if not (isinstance(block, dict)
+                            and block.get("type") == "tool"):
+                        continue
+                    err_text = str(block.get("text") or "")
+                    if not err_text:
+                        continue
+                    # classify_error_type returns a TUPLE — test the first
+                    # element (the type), or unfiltered tool output becomes a
+                    # hub memory row (same guard as the deepseek lane).
+                    _etype = _corr.classify_error_type(err_text)
+                    if not (_etype and _etype[0]):
+                        continue
+                    sample = err_text[:2000]
+                    redacted, n = redact_text(sample)
+                    candidate = {
+                        "type": "error_pattern",
                         "source": source_name,
-                        "dedup_key": hashlib.sha1(
-                            (item_type + "\x00" + user_text)
-                            .encode("utf-8", "replace")).hexdigest(),
-                    })
-            for block in turn["blocks"]:
-                if not (isinstance(block, dict)
-                        and block.get("type") == "tool"):
-                    continue
-                err_text = str(block.get("text") or "")
-                if not err_text:
-                    continue
-                # classify_error_type returns a TUPLE — test the first
-                # element (the type), or unfiltered tool output becomes a
-                # hub memory row (same guard as the deepseek lane).
-                _etype = _corr.classify_error_type(err_text)
-                if not (_etype and _etype[0]):
-                    continue
-                candidates.append({
-                    "type": "error_pattern",
-                    "source": source_name,
-                    "message": err_text[:2000],
-                    "dedup_key": "err|%s|%s" % (
-                        path.stem, " ".join(err_text.split())[:120]),
-                })
+                        "message": (redacted if (n and mode == "auto")
+                                    else sample),
+                        "dedup_key": "err|%s|%s" % (
+                            path.stem, " ".join(err_text.split())[:120]),
+                    }
+                    if n:
+                        candidate["secret_warning"] = True
+                    candidates.append(candidate)
+            except Exception:  # noqa: BLE001 - skipped, never fatal (R8)
+                continue
     return candidates
 
 

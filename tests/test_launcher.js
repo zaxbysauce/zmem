@@ -1756,6 +1756,29 @@ console.log("\n[13] storeDirectory plugin userConfig feeds ZMEM_DATA (claude hos
         launch.buildCanonicalEnv("claude", { cwd: PROJ }, "recall").ZMEM_DATA,
         path.join(os.homedir(), ".zmem"));
 
+    // Review R23/FB-021 NEGATIVE CONTROL: the opencode storeDirectory arm
+    // (zmem-launch.js:1453) is gated host === "opencode". Delete that gate
+    // and THIS assertion is the one that fails — a non-opencode host must
+    // never adopt adapter meta.storeDirectory (that value is ONLY legal via
+    // its own host's plugin option, tested above).
+    {
+        const savedData = process.env.ZMEM_DATA;
+        const savedOpt = process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        delete process.env.ZMEM_DATA;
+        delete process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        for (const host of ["claude", "zcode", "codex"]) {
+            eq("storeDirectory: " + host + " ignores adapter meta.storeDirectory",
+                launch.buildCanonicalEnv(host, { cwd: PROJ,
+                    storeDirectory: "/tmp/oc-misrouted-store" }, "recall")
+                    .ZMEM_DATA,
+                path.join(os.homedir(), ".zmem"));
+        }
+        if (savedData === undefined) delete process.env.ZMEM_DATA;
+        else process.env.ZMEM_DATA = savedData;
+        if (savedOpt === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY;
+        else process.env.CLAUDE_PLUGIN_OPTION_STOREDIRECTORY = savedOpt;
+    }
+
     restore();
 }
 

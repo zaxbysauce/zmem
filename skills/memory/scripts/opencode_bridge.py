@@ -86,8 +86,12 @@ def _resolve_namespace(request: dict) -> str:
 
 def run_request(request: dict) -> dict:
     """Run one injection request through the #158 selector. Fail-open."""
-    budget = int(request.get("budget_tokens") or 1500)
+    budget = 1500  # safe default for the fail-open path
     try:
+        # Cast inside the try (review R8/F-008): a hostile budget_tokens
+        # ("abc", 1e999) must fail open into the empty envelope, not crash
+        # the bridge before the guard can convert the failure.
+        budget = int(request.get("budget_tokens") or 1500)
         moment = str(request.get("moment") or "")
         if moment not in PERMITTED_MOMENTS:
             raise ValueError("moment not permitted for opencode: %r"

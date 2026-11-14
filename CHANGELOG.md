@@ -19,8 +19,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `skills/memory/scripts/opencode_bridge.py` — one python subprocess per
   injection over the #158 selector, no lane, fail-open everywhere, and
   unknown-session drives never inject under a shared identity; canonical
-  OpenCode Turn transcript capture (fixture + live SDK message shapes,
-  cross-language byte parity with `storelib/mine.py`); `mine-history
+  OpenCode Turn transcript capture over the live SDK event envelope
+  (`properties`-nested payloads, `time.completed` terminality, part-id-keyed
+  streaming, own-session finalize; fixture and flattened shapes still read);
+  `ZMEM_CAPTURE=0` disables capture entirely and the mining lane applies
+  capture-mode redaction + hermes-parity bounds; `mine-history
   --source opencode`; a doctor OpenCode-adapter check (`pass` / `fail` /
   `not_applicable`) with report aggregation for the new status; drift
   coverage for `opencode-plugin/` via `_SURFACE_DIRS`.

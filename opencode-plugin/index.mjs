@@ -26,6 +26,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 import { tool } from "@opencode-ai/plugin";
+import { z } from "zod";
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.dirname(PLUGIN_DIR);
@@ -42,6 +43,11 @@ const ENVELOPE_REQUIRED_KEYS = ["results", "count", "omitted", "reason",
   "excluded", "candidate_ids", "tokens_used", "tokens_budget",
   "budget_dropped", "budget_admission", "budget_truncated",
   "budget_dropped_protected", "arms", "rendered"];
+
+// Stream-aware UTF-8 decoder for pipe chunks: per-chunk toString("utf-8")
+// corrupts a multibyte codepoint split across chunk boundaries (review
+// R4/F-00x empirical).
+const decoder = new TextDecoder("utf-8");
 
 const EMPTY_ENVELOPE_REASON = "bridge-error";
 
@@ -103,21 +109,52 @@ function expandHome(p) {
 }
 
 // --- Injection bridge (ONE python subprocess per request) --------------------
+//
+// Bounds (review R2/R3/R30/F-004/F-005): the spawn carries a hard 30s
+// timeout with kill + empty-envelope fallback (deepseek precedent), the
+// stdin stream carries an error listener (a child that exits before the
+// write flushes would otherwise crash the host process), and stderr is
+// drained and surfaced on abnormal exits.
 
-async function callBridge(request) {
+const BRIDGE_TIMEOUT_MS = 30000;
+
+async function callBridge(request, spawnEnv) {
   return await new Promise((resolve) => {
     const child = spawn(PYTHON, [BRIDGE], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: spawnEnv,
     });
     let out = "";
+    let errTail = "";
     let settled = false;
     const finish = (value) => {
-      if (!settled) { settled = true; resolve(value); }
+      if (!settled) { settled = true; clearTimeout(timer); resolve(value); }
     };
-    child.stdout.on("data", (chunk) => { out += chunk.toString("utf-8"); });
-    child.on("error", () => finish(emptyEnvelope(request.budget_tokens || 1500)));
-    child.on("close", () => {
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* already gone */ }
+      finish(emptyEnvelope(request.budget_tokens || 1500));
+    }, BRIDGE_TIMEOUT_MS);
+    child.stdout.on("data", (chunk) => {
+      // TextDecoder(stream) instead of per-chunk toString: a multibyte
+      // codepoint split across pipe chunks would decode as U+FFFD pairs.
+      out += decoder.decode(chunk, { stream: true });
+    });
+    child.stderr.on("data", (chunk) => {
+      errTail = (errTail + chunk.toString("utf-8")).slice(-800);
+    });
+    // A child that exits before the stdin write flushes emits an error on
+    // the stdin stream; without this listener it is an uncaughtException
+    // (host crash). Drain and let the close/error arms settle the promise.
+    child.stdin.on("error", () => {});
+    child.on("error", (exc) => {
+      try {
+        process.stderr.write("[zmem-opencode] bridge spawn failed: "
+          + String(exc && exc.message || exc) + "\n");
+      } catch { /* best-effort */ }
+      finish(emptyEnvelope(request.budget_tokens || 1500));
+    });
+    child.on("close", (code) => {
+      out += decoder.decode(new Uint8Array(), { stream: true });
       try {
         const parsed = JSON.parse(out);
         if (isEnvelope(parsed)) {
@@ -127,6 +164,12 @@ async function callBridge(request) {
           finish(emptyEnvelope(request.budget_tokens || 1500));
         }
       } catch {
+        if (errTail.trim()) {
+          try {
+            process.stderr.write("[zmem-opencode] bridge stderr (tail): "
+              + errTail.trim() + "\n");
+          } catch { /* best-effort */ }
+        }
         finish(emptyEnvelope(request.budget_tokens || 1500));
       }
     });
@@ -135,14 +178,14 @@ async function callBridge(request) {
   });
 }
 
-export async function runInjection(request) {
+export async function runInjection(request, spawnEnv) {
   const req = request || {};
   if (!req.session_id) {
     // Unknown session: fail open WITHOUT a ledger entry (plan F2) — no
     // bridge call, no shared injection identity.
     return emptyEnvelope(req.budget_tokens || 1500, "no-session");
   }
-  return await callBridge(req);
+  return await callBridge(req, spawnEnv || process.env);
 }
 
 // --- Pending event queue -----------------------------------------------------
@@ -243,26 +286,36 @@ function transcriptFileFor(sessionId) {
 }
 
 function readMaxSeq(target) {
-  // Persisted sequence state across reloads: the seq counter is recovered
-  // from the transcript file's own tail (the transcript IS the seq state).
+  // Persisted capture state across reloads: the seq counter AND the seen
+  // turn_uuid set are recovered from the transcript file itself (review
+  // R10 — the old code recovered seq but not uuids, so a replayed event
+  // after reload appended a duplicate turn).
   try {
     const raw = fs.readFileSync(target, "utf-8");
     const lines = raw.split("\n").filter((l) => l.trim());
-    for (let i = lines.length - 1; i >= 0; i--) {
+    let maxSeq = -1;
+    for (const line of lines) {
       try {
-        const turn = JSON.parse(lines[i]);
-        if (typeof turn.seq === "number") return turn.seq;
-      } catch { /* skip malformed tail lines */ }
+        const turn = JSON.parse(line);
+        if (typeof turn.seq === "number" && turn.seq > maxSeq) {
+          maxSeq = turn.seq;
+        }
+        if (turn.turn_uuid) finalizedTurns.add(turn.turn_uuid);
+      } catch { /* skip malformed lines */ }
     }
+    return maxSeq;
   } catch { /* absent transcript starts at -1 */ }
   return -1;
 }
 
-const finalizedTurns = new Set(); // turn_uuid idempotency (in-process)
+const finalizedTurns = new Set(); // turn_uuid idempotency (durable via transcript)
 const seqCounters = new Map();    // per-FILE seq state (per session file)
 
 export function appendTurn(message, sourcePath) {
   try {
+    // Capture kill switch (review R6/UR-3 — deepseek ZMEM_CAPTURE parity):
+    // production default is ON; "0" disables transcript capture entirely.
+    if ((process.env.ZMEM_CAPTURE || "") === "0") return false;
     const info = (message && message.info) || {};
     const turnUuid = info.id || "";
     if (!turnUuid || finalizedTurns.has(turnUuid)) return false; // exactly once
@@ -296,40 +349,94 @@ export function _resetCaptureStateForTests() {
   openMessages.clear();
 }
 
-// Message capture engine: aggregates SDK message events by (sessionID,
-// messageID); a terminal-state message finalizes immediately; a
-// non-terminal one finalizes on the NEXT system transform — exactly once
-// either way.
-const openMessages = new Map(); // messageID -> {sessionID, message, terminal}
+// Message capture engine (review R1/F-001 rewrite): the pinned SDK
+// (@opencode-ai/sdk 1.18.3) wraps every event payload in `properties`
+// (EventMessageUpdated = {type, properties:{info: Message}};
+// EventMessagePartUpdated = {type, properties:{part}}); the fixture/
+// legacy vocabulary carries the same fields flat. Both shapes are read.
+// Terminality: the SDK Message type has NO `status` field — an assistant
+// message is finished when `time.completed` (or time.error) exists, and a
+// user message arrives complete. Parts are keyed by part id and replaced
+// in place (streamed part updates must not accumulate snapshots).
+const openMessages = new Map(); // messageID -> aggregate
+
+function readEventEnvelope(event) {
+  if (!event || typeof event !== "object") return null;
+  const props = (event.properties && typeof event.properties === "object")
+    ? event.properties
+    : event; // fixture/legacy flattened shape
+  const raw = props.message || props.info || null;
+  const info = (raw && typeof raw === "object" && raw.info
+    && typeof raw.info === "object") ? raw.info : raw;
+  return {
+    props,
+    info: (info && typeof info === "object") ? info : null,
+    part: (props.part && typeof props.part === "object") ? props.part : null,
+    sessionID: props.sessionID
+      || ((info && typeof info === "object") ? info.sessionID : "") || "",
+  };
+}
+
+function messageFinished(info) {
+  if (!info || typeof info !== "object") return false;
+  if (info.role === "user") return true; // user messages arrive complete
+  const time = info.time;
+  return !!(time && typeof time === "object"
+    && (time.completed || time.error));
+}
 
 export function _ingestMessageEvent(event) {
   if (!event || typeof event !== "object") return;
-  // Message events carry the message either nested (event.message) or
-  // flattened onto the event itself (info/parts at the top level); part
-  // events carry a single `part` that merges into the aggregate.
-  const payload = event.message || event;
-  const info = payload.info || payload;
+  const envelope = readEventEnvelope(event);
+  if (!envelope) return;
+  const { info, part, sessionID } = envelope;
+
+  // Part-delta event (SDK: message.part.updated carries properties.part
+  // with .messageID + .id): upsert by part id into the open aggregate.
+  if (part && !info) {
+    const messageID = part.messageID || "";
+    if (!messageID) return;
+    const existing = openMessages.get(messageID);
+    if (!existing) return; // part before its message snapshot: wait for it
+    existing.terminal = false;
+    if (part.id != null) {
+      existing.partsById.set(String(part.id), part);
+    } else {
+      existing.partsById.set(String(existing.partsById.size), part);
+    }
+    return;
+  }
+
+  if (!info) return;
   const messageID = info.id;
   if (!messageID) return;
-  const sessionID = info.sessionID || info.session_id || "";
-  const status = info.status || payload.status;
-  const terminal = status === "completed" || status === "aborted"
-    || status === "error" || status === "cancelled";
-  const existing = openMessages.get(messageID)
-    || { sessionID, message: { info: { ...info }, parts: [] } };
-  // Merge: the latest event's info wins (status transitions), parts union
-  // in first-seen order, a single `part` payload appends when new.
-  existing.message.info = { ...existing.message.info, ...info };
-  const parts = payload.parts || info.parts || [];
-  const known = new Set(existing.message.parts.map((p) => JSON.stringify(p)));
-  for (const part of parts) {
-    const key = JSON.stringify(part);
-    if (!known.has(key)) { existing.message.parts.push(part); known.add(key); }
+  const finished = messageFinished(info);
+
+  let existing = openMessages.get(messageID);
+  if (!existing) {
+    existing = {
+      sessionID: info.sessionID || info.session_id || sessionID,
+      info: {},
+      partsById: new Map(),
+      terminal: false,
+    };
   }
-  if (event.part && !known.has(JSON.stringify(event.part))) {
-    existing.message.parts.push(event.part);
+  // Latest info wins (session/role/time transitions).
+  existing.info = { ...existing.info, ...info };
+  existing.sessionID = existing.info.sessionID
+    || existing.info.session_id || existing.sessionID || sessionID;
+  existing.terminal = finished || existing.terminal;
+  // A full parts array on the info snapshot replaces the map (authoritative
+  // ordering); individual part events have already been upserted above.
+  const snapshotParts = existing.info.parts;
+  if (Array.isArray(snapshotParts)) {
+    existing.partsById = new Map();
+    let i = 0;
+    for (const p of snapshotParts) {
+      existing.partsById.set(String((p && p.id != null) ? p.id : i), p);
+      i += 1;
+    }
   }
-  existing.terminal = terminal || existing.terminal;
   openMessages.set(messageID, existing);
   if (existing.terminal) {
     finalizeMessage(messageID);
@@ -340,11 +447,31 @@ function finalizeMessage(messageID) {
   const entry = openMessages.get(messageID);
   if (!entry) return;
   openMessages.delete(messageID);
-  appendTurn(entry.message, path.basename(transcriptFileFor(
-    entry.sessionID)));
+  const parts = Array.from(entry.partsById.values());
+  const info = { ...entry.info };
+  if (!info.sessionID && entry.sessionID) info.sessionID = entry.sessionID;
+  // RAW message shape {info, parts} — the same vocabulary normalizeOpen-
+  // CodeMessage and the miner's RAW-shape lane read; parts ride TOP LEVEL
+  // (info.parts is NOT the capture contract).
+  appendTurn({ info, parts },
+    path.basename(transcriptFileFor(entry.sessionID)));
 }
 
-function finalizePendingMessages() {
+// Finalize ONLY the transform's own session's open messages (review
+// R11/CS-003: the previous all-session finalize truncated still-streaming
+// messages of other sessions and latched their uuids, permanently losing
+// the completed content). A falsy sessionId finalizes NOTHING — a
+// transform without a session identity cannot attribute open aggregates.
+function finalizePendingMessages(sessionId) {
+  if (!sessionId) return;
+  for (const [messageID, entry] of Array.from(openMessages)) {
+    if (entry.sessionID !== sessionId) continue;
+    finalizeMessage(messageID);
+  }
+}
+
+function finalizeAllPending() {
+  // dispose-only flush: no further events can arrive.
   for (const messageID of Array.from(openMessages.keys())) {
     finalizeMessage(messageID);
   }
@@ -361,15 +488,39 @@ export default async function zmemPlugin(input, options = {}) {
     worktree: input && input.worktree,
     sessionId: "",
   });
-  for (const [key, value] of Object.entries(pluginEnv)) {
-    if (value !== "" && !process.env[key]) process.env[key] = value;
+  // Review R39: only the path-carrying keys land in the host process env
+  // (read by this module's own helpers). Identity keys (ZMEM_HOST, TIER0,
+  // PROJECT, SESSION, SKILLS_DIRS, NAMESPACE) stay OUT of the host env so
+  // nested hosts launched from OpenCode are never misattributed; they ride
+  // the bridge spawn env instead (see callBridge spawn + hook injection).
+  for (const key of ["ZMEM_DATA", "ZMEM_OPENCODE_TRANSCRIPTS",
+                     "ZMEM_NAMESPACE"]) {
+    const value = pluginEnv[key];
+    if (value !== "" && value !== undefined && !process.env[key]) {
+      process.env[key] = value;
+    }
+  }
+  // Full child env for the bridge: host env + the complete plugin env,
+  // RESOLVED AT CALL TIME (a factory-time snapshot would freeze the host
+  // env before the caller's pins — identity keys still reach ONLY this
+  // child, never the host's other children or process.env itself).
+  function bridgeEnv() {
+    // pluginEnv values are DEFAULTS: a host/test pin in process.env wins,
+    // an empty value never masks one (buildOpenCodeEnv emits "" for unset
+    // optionals and a ~/.zmem default that must not override a pin).
+    const env = { ...process.env };
+    for (const [key, value] of Object.entries(pluginEnv)) {
+      if (value !== "" && value !== undefined && !env[key]) env[key] = value;
+    }
+    return env;
   }
 
-  let lastSessionId = "";
-
   function sessionIdFor(inputArg) {
+    // Review R13/F-006: no cross-session fallback. A transform without a
+    // sessionID fails open with the no-session envelope (the SDK types the
+    // field optional; guessing an identity would misattribute the ledger).
     return (inputArg && inputArg.sessionID)
-      || (inputArg && inputArg.sessionId) || lastSessionId || "";
+      || (inputArg && inputArg.sessionId) || "";
   }
 
   return {
@@ -380,14 +531,14 @@ export default async function zmemPlugin(input, options = {}) {
     "experimental.chat.system.transform": async (hookInput, output) => {
       const sessionId = sessionIdFor(hookInput);
       drainPending(sessionId);          // drained exactly once
-      finalizePendingMessages();        // non-terminal messages finalize here
+      finalizePendingMessages(sessionId); // THIS session's open messages only
       const envelope = await runInjection({
         query: "",
         moment: "user_prompt",
         session_id: sessionId,
         worktree: input && input.worktree,
         budget_tokens: 1500,
-      });
+      }, bridgeEnv());
       if (envelope && envelope.rendered
           && Array.isArray(output.system)) {
         output.system.push(envelope.rendered); // exactly one non-empty fence
@@ -401,7 +552,7 @@ export default async function zmemPlugin(input, options = {}) {
         session_id: sessionId,
         worktree: input && input.worktree,
         budget_tokens: 1500,
-      });
+      }, bridgeEnv());
       if (envelope && envelope.rendered
           && Array.isArray(output.context)) {
         output.context.push(envelope.rendered);
@@ -411,9 +562,11 @@ export default async function zmemPlugin(input, options = {}) {
     event: async (hookInput) => {
       const evt = hookInput && hookInput.event;
       if (!evt || typeof evt !== "object") return;
-      const sessionID = evt.sessionID || evt.session_id || "";
-      if (sessionID) lastSessionId = sessionID;
-      const type = evt.type || "";
+      // Review R52: a non-string truthy evt.type must not throw into the
+      // host's event dispatch.
+      const type = typeof evt.type === "string" ? evt.type : "";
+      const envelope = readEventEnvelope(evt);
+      const sessionID = envelope ? envelope.sessionID : "";
       if (type.startsWith("message")) {
         _ingestMessageEvent(evt); // capture engine (aggregation + finalize)
       }
@@ -423,13 +576,21 @@ export default async function zmemPlugin(input, options = {}) {
       zmem_recall: tool({
         description: "Recall memories from the shared ZMem store "
           + "(OpenCode adapter, issue #66).",
+        // Review S1: the pinned tool() contract is tool<Args extends
+        // z.ZodRawShape> — plain descriptor objects fail zod safeParse on
+        // a real host. Declare zod schemas (query REQUIRED per the issue
+        // contract; the rest optional).
         args: {
-          query: { type: "string", description: "recall query" },
-          namespace: { type: "string", description: "optional namespace" },
-          session_id: { type: "string", description: "optional session id" },
-          limit: { type: "number", description: "rows (default 5)" },
-          global_limit: { type: "number", description: "user:global rows (default 3)" },
-          budget_tokens: { type: "number", description: "token budget (default 1500)" },
+          query: z.string().describe("recall query"),
+          namespace: z.string().optional()
+            .describe("optional namespace override"),
+          session_id: z.string().optional()
+            .describe("optional session id override"),
+          limit: z.number().int().optional().describe("rows (default 5)"),
+          global_limit: z.number().int().optional()
+            .describe("user:global rows (default 3)"),
+          budget_tokens: z.number().int().optional()
+            .describe("token budget (default 1500)"),
         },
         execute: async (args, ctx) => {
           const envelope = await runInjection({
@@ -441,7 +602,7 @@ export default async function zmemPlugin(input, options = {}) {
             limit: args.limit,
             global_limit: args.global_limit,
             budget_tokens: args.budget_tokens || 1500,
-          });
+          }, bridgeEnv());
           // ToolResult string arm (plan F2): the JSON string directly.
           return JSON.stringify(envelope);
         },
@@ -450,11 +611,15 @@ export default async function zmemPlugin(input, options = {}) {
         description: "Session-start memory injection for OpenCode "
           + "(issue #66).",
         args: {
-          namespace: { type: "string", description: "optional namespace" },
-          session_id: { type: "string", description: "optional session id" },
-          limit: { type: "number", description: "rows (default 5)" },
-          global_limit: { type: "number", description: "user:global rows (default 3)" },
-          budget_tokens: { type: "number", description: "token budget (default 1500)" },
+          namespace: z.string().optional()
+            .describe("optional namespace override"),
+          session_id: z.string().optional()
+            .describe("optional session id override"),
+          limit: z.number().int().optional().describe("rows (default 5)"),
+          global_limit: z.number().int().optional()
+            .describe("user:global rows (default 3)"),
+          budget_tokens: z.number().int().optional()
+            .describe("token budget (default 1500)"),
         },
         execute: async (args, ctx) => {
           const envelope = await runInjection({
@@ -466,13 +631,18 @@ export default async function zmemPlugin(input, options = {}) {
             limit: args.limit,
             global_limit: args.global_limit,
             budget_tokens: args.budget_tokens || 1500,
-          });
+          }, bridgeEnv());
           return JSON.stringify(envelope);
         },
       }),
     },
     dispose: async () => {
-      finalizePendingMessages();
+      // Host shutdown: no further events can arrive, so flush every still-
+      // open aggregate (any session — a scoped finalize here would drop
+      // half-streamed messages permanently) before clearing the buffer.
+      finalizeAllPending();
+      pending.clear();
+      openMessages.clear();
     },
   };
 }

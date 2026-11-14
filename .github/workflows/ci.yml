@@ -523,11 +523,14 @@ jobs:
           if-no-files-found: warn
 
       - name: Install OpenCode plugin SDK (fail-closed npm ci)
+        # Review R29/FB-014: run even on prior-step failure so an already-
+        # red job keeps this step's diagnostics (still skipped on cancel).
+        if: ${{ !cancelled() }}
         # Issue #66: tests/test_opencode_plugin.js loads
         # opencode-plugin/index.mjs, which imports @opencode-ai/plugin
         # resolved through opencode-plugin/node_modules. UNCONDITIONAL by
         # design (unlike the guarded deepseek install above): a missing
-        # package-lock.json or a failed install is a hard error, never a
+        # package-lock.json or a failed install is hard error, never a
         # silently skipped suite. node_modules stays gitignored.
         shell: bash
         run: |
