@@ -6,9 +6,10 @@ candidate runs at the current HEAD. The judge method is disclosed in the report
 
     python tests/support/nightly_curator/evidence_run.py
 
-Optional env (both required together for the general-writer leg; without them the
-leg records its honest unavailability — by construction under the hermetic child
-env, which withholds credentials by design):
+Optional env, read ONLY from the calling environment (this generator never sets
+them itself; without BOTH the general-writer leg records its honest
+unavailability — by construction under the hermetic child env, which withholds
+credentials by design):
     ZMEM_CURATOR_GENERAL_WRITER=<model>
     ZMEM_CURATOR_TRANSMIT_CONSENT=1
 """
@@ -41,9 +42,9 @@ def main() -> int:
     from nightly_curator import resources as rs
     from nightly_curator import writers as wr
 
+    # R2-3: consent and the endpoint model come ONLY from the caller's
+    # environment — this generator never grants transmission consent itself.
     consent_env = dict(os.environ)
-    consent_env[rs.GENERAL_WRITER_ENV] = os.environ.get("ZMEM_CURATOR_GENERAL_MODEL", "sonnet")
-    consent_env[rs.TRANSMIT_CONSENT_ENV] = "1"
 
     corpus = co.build_corpus()
     reviewed = co.load_reviewed_histories()
@@ -54,6 +55,9 @@ def main() -> int:
     runs = []
     for name in names:
         env = consent_env if name == "general" else dict(os.environ)
+        # (consent_env IS the caller env verbatim; without the caller setting
+        # ZMEM_CURATOR_GENERAL_WRITER + ZMEM_CURATOR_TRANSMIT_CONSENT=1 the
+        # general leg records its honest unavailability.)
         print(f"running candidate: {name} ...", flush=True)
         run = wr.run_candidate(name, corpus, scratch / name, budget,
                                me.rubric_digest(), env=env)

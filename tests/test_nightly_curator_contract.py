@@ -257,6 +257,11 @@ def test_quality_metrics():
         f"authored lane boundary outcomes disagreed with the frozen rubric: {authored}"
     assert "AQ-003" in authored["unsupported_statements_refused"], \
         "grounding: the fabricated-evidence case must be refused (evidence precision)"
+    # R2-1 honest scope: only AQ-003 is measured; the three default-lane
+    # families are not_measured (reported as such, never as agreement).
+    assert authored["not_measured"] == ["AQ-001", "AQ-002", "AQ-004"], authored
+    assert set(authored["not_measured_families"]) == \
+        set(me.AUTHORED_NOT_MEASURED_FAMILIES)
 
     # judge the model-reviewed lane: the judge maps each claim to a label by the
     # deterministic keyword-rule judge (disclosed as judge_method=keyword-rule-v1
@@ -291,7 +296,9 @@ def test_quality_metrics():
         "judge_vs_contract_oracle must carry measured agrees (content, not name)"
     assert m["authored_lane"]["judge_vs_authored_oracle"]["agrees"] == \
         len(me.AUTHORED_EXPECTED_ACTIONS), \
-        "judge_vs_authored_oracle must carry measured agrees (content, not name)"
+        "judge_vs_authored_oracle must carry MEASURED agrees (AQ-003 only)"
+    assert m["authored_lane"]["judge_vs_authored_oracle"]["cases_not_measured"] == 3, \
+        "the three default-lane families must be reported not_measured"
     assert m["authored_lane"]["unsupported_statements_refused"], \
         "evidence_id_precision must carry a measured refusal"
     assert m["model_reviewed_lane"]["cases"] == len(reviewed["cases"]) and \
@@ -301,7 +308,7 @@ def test_quality_metrics():
         "grounding: AQ-003 measured boundary action must be refuse (evidence-id precision)"
     assert m["judge_vs_contract_oracle"]["false_merges"] == 0 and \
         m["judge_vs_contract_oracle"]["missed_duplicates"] == 0, \
-        "temporal/abstention families carry measured zero-defect values (not absence)"
+        "contract-lane zero-defect values are MEASURED (per-pair verdicts above)"
     for family in me.METRIC_FAMILIES:
         assert family.split(".")[0] in json.dumps(doc), \
             f"metric family missing: {family}"

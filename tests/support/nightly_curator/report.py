@@ -22,24 +22,36 @@ from typing import Any
 TELEMETRY_KEYS = {"latency_s", "storage_bytes", "tokens", "requests",
                   "rss_mb_writer_side", "latency_s_total", "storage_bytes_total"}
 RUN_ID_KEYS = {"run_id", "taken_at"}
+# Per-run artifacts that vary across identical-input runs (claude CLI session ids
+# inside redacted logs, scratch paths) — excluded from the canonical digest
+# (final-critic R2-2) but retained in the raw artifact.
+PER_RUN_KEYS = {"log_redacted", "scratch", "duration_s"}
 
 
 def _canonicalize(node: Any) -> Any:
     if isinstance(node, dict):
         return {k: _canonicalize(v) for k, v in sorted(node.items())
-                if k not in TELEMETRY_KEYS and k not in RUN_ID_KEYS}
+                if k not in TELEMETRY_KEYS and k not in RUN_ID_KEYS
+                and k not in PER_RUN_KEYS}
     if isinstance(node, list):
         return [_canonicalize(v) for v in node]
     return node
 
 
 def canonical_digest(report: dict) -> str:
-    payload = json.dumps(_canonicalize(report), sort_keys=True).encode("utf-8")
+    """Digest over the report MINUS both digest keys (final-critic R2-2): compute
+    from {k: v for k, v in report.items() if k not in (digest keys)} so the value
+    never feeds itself."""
+    stripped = {k: v for k, v in report.items()
+                if k not in ("canonical_decision_digest", "raw_artifact_digest")}
+    payload = json.dumps(_canonicalize(stripped), sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 def raw_digest(report: dict) -> str:
-    payload = json.dumps(report, sort_keys=True).encode("utf-8")
+    stripped = {k: v for k, v in report.items()
+                if k not in ("canonical_decision_digest", "raw_artifact_digest")}
+    payload = json.dumps(stripped, sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -120,18 +132,21 @@ def build_report(
             "(fixture format carries optional human_endorsement; owner asked twice "
             "2026-11-14, no answer)"
         )
+    authored = ((rubric_json.get("metrics") or {}).get("authored_lane") or {})
+    if authored.get("not_measured"):
+        report["maintainer_evidence_pending"].append(
+            "AC2 quality families NOT MEASURED (boundary default lane does not "
+            "discriminate them): " + ", ".join(authored.get(
+                "not_measured_families", [])) + " - measuring them requires "
+            "case-discriminating writer output (see PR discussion)"
+        )
     if rubric_json.get("critical_findings"):
         report["go_no_go"]["model_go"] = False
         report["go_no_go"]["reason"] = (
             f"critical findings present: {rubric_json['critical_findings']}"
         )
-    report["canonical_decision_digest"] = canonical_digest(
-        {k: v for k, v in report.items() if k != "raw_artifact_digest"}
-    )
-    report["raw_artifact_digest"] = raw_digest(
-        {k: v for k, v in report.items()
-         if k not in ("canonical_decision_digest", "raw_artifact_digest")}
-    )
+    report["canonical_decision_digest"] = canonical_digest(report)
+    report["raw_artifact_digest"] = raw_digest(report)
     return report
 
 

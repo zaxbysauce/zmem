@@ -111,25 +111,32 @@ def score_contract_lane(corpus, run) -> dict[str, Any]:
 
 
 AUTHORED_PROPOSALS = {
-    # Final-critic F-C1: authored cases are scored through REAL ProposalBoundary
-    # dispositions (tests/support/nightly_curator/proposals.py), never by feeding
-    # the expectations back. Each authored case maps to the proposal a curator
-    # writer would emit; the boundary's action is the measured outcome.
-    "AQ-001": {"kind": "dedup_merge", "reason_hint": "update_not_duplicate"},
-    "AQ-002": {"kind": "dedup_merge", "reason_hint": "abstain_to_review"},
-    "AQ-003": {"kind": "novel_lesson", "reason_hint": "reject_ungrounded_evidence_id"},
-    "AQ-004": {"kind": "dedup_merge", "reason_hint": "collate_ok"},
+    # Final-critic F-C1/R2-1: authored cases are scored through REAL
+    # ProposalBoundary dispositions. HONEST MEASUREMENT SCOPE: only AQ-003
+    # (grounding / evidence-id precision) is MEASURED — its refusal genuinely
+    # discriminates (a review-everything boundary fails it). AQ-001 (temporal
+    # update), AQ-002 (abstention) and AQ-004 (useful lesson) all route to the
+    # boundary's default review lane, which does NOT discriminate those
+    # semantics, so they are reported not_measured and carried in the report's
+    # maintainer_evidence_pending — never claimed as measured agreement.
+    "AQ-001": {"kind": "novel_lesson", "quality_family": "temporal_updates",
+               "measured": False},
+    "AQ-002": {"kind": "dedup_merge", "quality_family": "abstention_quality",
+               "measured": False},
+    "AQ-003": {"kind": "novel_lesson", "quality_family": "evidence_id_precision",
+               "measured": True},
+    "AQ-004": {"kind": "dedup_merge", "quality_family": "useful_accepted_lessons",
+               "measured": False},
 }
 
-# authored-case expectation -> the boundary action that satisfies it (the
-# mapping is part of the frozen rubric; a mutant that swaps the mapping or the
-# boundary labels fails C2 by name).
+# the single MEASURED authored expectation: fabricated evidence is refused.
 AUTHORED_EXPECTED_ACTIONS = {
-    "AQ-001": "review",   # temporal update: never auto-merged; routed to review
-    "AQ-002": "review",   # ambiguity abstains to review
-    "AQ-003": "refuse",   # fabricated evidence id is refused outright
-    "AQ-004": "review",   # a genuine shared lesson is a review-routed collation
+    "AQ-003": "refuse",
 }
+
+AUTHORED_NOT_MEASURED_FAMILIES = (
+    "temporal_updates", "abstention_quality", "useful_accepted_lessons",
+)
 
 
 def score_authored_lane(boundary_outcomes: dict[str, str]) -> dict[str, Any]:
@@ -139,11 +146,21 @@ def score_authored_lane(boundary_outcomes: dict[str, str]) -> dict[str, Any]:
     agrees = []
     disagrees = []
     unsupported = []
+    not_measured = []
     for cid, action in boundary_outcomes.items():
-        expected = AUTHORED_EXPECTED_ACTIONS.get(cid)
-        ok = expected is not None and action == expected
-        per_case[cid] = {"action": action, "expected": expected, "verdict":
-                         "agrees" if ok else "disagrees"}
+        spec = AUTHORED_PROPOSALS[cid]
+        if not spec["measured"]:
+            not_measured.append(cid)
+            per_case[cid] = {"action": action, "status": "not_measured",
+                             "quality_family": spec["quality_family"],
+                             "note": "routes to the boundary's default review "
+                                     "lane; semantics not discriminated"}
+            continue
+        expected = AUTHORED_EXPECTED_ACTIONS[cid]
+        ok = action == expected
+        per_case[cid] = {"action": action, "expected": expected,
+                         "quality_family": spec["quality_family"],
+                         "verdict": "agrees" if ok else "disagrees"}
         (agrees if ok else disagrees).append(cid)
         if cid == "AQ-003" and action == "refuse":
             unsupported.append(cid)  # ungrounded statement refused = precision hit
@@ -151,11 +168,14 @@ def score_authored_lane(boundary_outcomes: dict[str, str]) -> dict[str, Any]:
         "per_case": per_case,
         "agrees": agrees,
         "disagrees": disagrees,
+        "not_measured": not_measured,
+        "not_measured_families": list(AUTHORED_NOT_MEASURED_FAMILIES),
         "unsupported_statements_refused": unsupported,
         "judge_vs_authored_oracle": {
-            "cases": len(boundary_outcomes),
+            "cases_measured": len(agrees) + len(disagrees),
             "agrees": len(agrees),
             "disagrees": len(disagrees),
+            "cases_not_measured": len(not_measured),
         },
     }
 
