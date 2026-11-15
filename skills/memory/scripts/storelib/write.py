@@ -1799,6 +1799,29 @@ def add_memory(
                     "own occurrence data; the supplied occurred_start/"
                     "occurred_end were not applied"
                 )
+            # #469 AC1: a fold discards the INCOMING content entirely (the
+            # keeper's content is untouched; only confidence/signal/tags/
+            # taint/trust merge). Disclose that disposition explicitly — the
+            # refresh notice below names the keeper and similarity but never
+            # says the caller's content was dropped, which read as "merged".
+            # PR #470 review: on the exact-match lane (similarity 1.000) the
+            # identical text IS already stored as the keeper, so the near-dup
+            # wording ("not stored anywhere" + re-add advice) would be false
+            # there — give that lane its own truthful line. The --no-dedup
+            # hint names its command because only store.py add has the flag
+            # (apply-ops/organize/episodes folds print this line too).
+            if dedup_sim < 1.0:
+                print(f"[zmem] dedup: existing memory {existing['id']} folded the "
+                      f"incoming add — the incoming content was NOT stored "
+                      f"(only metadata merged); the incoming content is not "
+                      f"stored anywhere (similarity={dedup_sim:.3f}). "
+                      "Re-phrase it as distinct content, or pass --no-dedup "
+                      "(a store.py add flag) to store it as its own row")
+            else:
+                print(f"[zmem] dedup: existing memory {existing['id']} already "
+                      f"contains this exact content (similarity={dedup_sim:.3f}) "
+                      "— nothing new was stored; the identical text is already "
+                      "stored in that row")
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
             return WriteResult(existing["id"], warnings=warns, deduped=True)
