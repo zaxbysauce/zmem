@@ -64,12 +64,19 @@ Static analysis only — no store is opened, no ZMEM_* environment is
 pinned, and _store_guard is intentionally not imported (nothing here can
 resolve a store).
 
+CI-003-R1 counter-mutant: ``Ci003R1CounterMutantTest`` plants synthetic
+defs in a scratch scan tree (the census's scan root is swapped for the
+test and restored in finally — the census logic itself is untouched) to
+prove parameter-name subtraction only masks real references and never
+creates false negatives.
+
 Run: python tests/test_stranded_census.py
 """
 from __future__ import annotations
 
 import ast
 import sys
+import tempfile
 import unittest
 import warnings
 from contextlib import contextmanager
@@ -263,6 +270,93 @@ class StrandedCensusTest(unittest.TestCase):
                 self.wired_callers.get(name),
                 "anchor " + name + " must have at least one caller in the "
                 "census's caller scope")
+
+
+class Ci003R1CounterMutantTest(unittest.TestCase):
+    """CI-003-R1 counter-mutant (round-3 cluster 5): parameter-name
+    subtraction in the reference model may only ever MASK references that
+    are not real, never mask a real one — and, symmetrically, a
+    same-named PARAMETER elsewhere must never count as a reference that
+    rescues a stranded def (the exact collision class behind the rekey
+    false positive).
+
+    The mutation this pins against: a census variant that stopped
+    subtracting parameter names (``loads - stores - params``) would count
+    the parameter's own Load as a reference, and a genuinely stranded def
+    would slip through unflagged. The fixture plants, in a scratch scan
+    tree (REPO_ROOT is swapped for the test and restored in finally —
+    the census logic itself is untouched):
+
+      * a synthetic storelib def whose name is ALSO a parameter name in
+        another in-scope module — its only appearance there is the
+        parameter and that parameter's own Load, and it has ZERO real
+        call-site references: the census MUST flag it stranded;
+      * the inverse control: a second synthetic def WITH a real
+        call-site reference in another in-scope module: the census must
+        NOT flag it (subtraction never masks a real reference).
+    """
+
+    _DEFS_REL = "skills/memory/scripts/storelib/ci003r1_defs.py"
+    _STRANDED_ENTRY = _DEFS_REL + ":ci003r1_collision_probe"
+    _CONTROL_ENTRY = _DEFS_REL + ":ci003r1_referenced_probe"
+
+    def test_param_collision_still_strands_and_real_reference_does_not(self):
+        with tempfile.TemporaryDirectory(prefix="zmem-ci003r1-") as raw:
+            root = Path(raw)
+            defs_dir = root / "skills" / "memory" / "scripts" / "storelib"
+            defs_dir.mkdir(parents=True)
+            (defs_dir / "ci003r1_defs.py").write_text(
+                "def ci003r1_collision_probe(record):\n"
+                "    # Synthetic CI-003-R1 def: its name collides with a\n"
+                "    # PARAMETER in ci003r1_param_user.py and it has ZERO\n"
+                "    # real call-site references - it must be flagged.\n"
+                "    return record\n"
+                "\n"
+                "\n"
+                "def ci003r1_referenced_probe(record):\n"
+                "    # Synthetic CI-003-R1 control def: wired by a REAL\n"
+                "    # call site in ci003r1_real_caller.py - never flagged.\n"
+                "    return record\n",
+                encoding="utf-8")
+            scripts_dir = root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / "ci003r1_param_user.py").write_text(
+                "def enqueue(ci003r1_collision_probe=None):\n"
+                "    # The name appears ONLY as a parameter (and that\n"
+                "    # parameter's own Load): a bound parameter is not a\n"
+                "    # reference to the storelib function - the exact\n"
+                "    # collision class that caused the rekey false\n"
+                "    # positive.\n"
+                "    return ci003r1_collision_probe\n",
+                encoding="utf-8")
+            (scripts_dir / "ci003r1_real_caller.py").write_text(
+                "def run(record):\n"
+                "    return ci003r1_referenced_probe(record)\n",
+                encoding="utf-8")
+            # Swap the census's scan root for the scratch tree; restore
+            # the real repo root in finally (the census reads REPO_ROOT
+            # at scan time, so the swap scopes exactly this run).
+            global REPO_ROOT
+            saved_root = REPO_ROOT
+            REPO_ROOT = root
+            try:
+                stranded, _wired = run_census()
+            finally:
+                REPO_ROOT = saved_root
+        self.assertIn(self._STRANDED_ENTRY, stranded,
+                      "the census MUST flag the zero-reference def whose "
+                      "name collides with a parameter elsewhere - "
+                      "parameter-name subtraction may never create a "
+                      "false negative (the rekey collision class)")
+        self.assertNotIn(self._CONTROL_ENTRY, stranded,
+                         "the census must NOT flag the same-shaped def "
+                         "that HAS a real call-site reference - "
+                         "subtraction only masks non-references")
+        self.assertEqual(
+            stranded, [self._STRANDED_ENTRY],
+            "the synthetic tree's full stranded set is exactly the "
+            "collision probe: nothing else may strand, and the collision "
+            "may not be masked")
 
 
 if __name__ == "__main__":

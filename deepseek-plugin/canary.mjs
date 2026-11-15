@@ -3,9 +3,10 @@
 // Usage: node canary.mjs --out <path>
 //
 // Boots the real pinned dsh runtime + the plugin against an ISOLATED store,
-// exercises delivery/ack/tools/capture/offline/compaction legs, and writes
-// the version-bound canary report (schema zmem-deepseek-canary-v1; the
-// claim-gate test validates it). No model provider, no network to a model.
+// exercises delivery/ack/tools/capture/offline/compaction/policy legs, and
+// writes the version-bound canary report (schema zmem-deepseek-canary-v1;
+// the claim-gate test validates it). No model provider, no network to a
+// model.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -154,6 +155,109 @@ async function main() {
         resolve({ ok: !err, state: st });
       });
   });
+  // Policy lane (round 3): exercise the knowledge routing policy helper
+  // in BOTH modes against the canary's isolated store dir — no vault, no
+  // network, no model, nothing outside the canary temp dir. (a) The
+  // default-off leg runs the helper with NO --config so it resolves the
+  // config beside the ISOLATED store (no knowledge object exists there
+  // yet) and must render the bounded EMPTY policy block: enabled false,
+  // zero target ids, no text, capture off. (b) The enabled leg writes a
+  // scratch config.json beside the SAME store with knowledge.enabled=true
+  // plus one markdown target rooted inside this temp dir (the exact
+  // load_knowledge_config grammar; skills/memory/scripts/knowledge/
+  // config.py is authoritative) and the render must NAME the target id
+  // while staying under the helper's documented 200-word cap. A checkout
+  // that ships no policy helper (the companion stack renders no routing
+  // policy) passes on that stack's default-off contract — no helper
+  // means no policy render anywhere — with the enabled leg disclosed as
+  // not applicable; the lane FAILS whenever the helper exists and any
+  // render is missing, the enabled state is wrong, the target id is
+  // absent/present in the wrong leg, or output is unbounded.
+  const POLICY_PY = path.join(ROOT, "skills", "memory", "scripts",
+    "knowledge", "policy.py");
+  const policyEnv = () => {
+    const child = {
+      ZMEM_STORE: path.join(tmp, "store.sqlite"),
+      ZMEM_DATA: tmp,
+      PYTHONIOENCODING: "utf-8",
+    };
+    for (const key of ["HOME", "USERPROFILE", "USERNAME", "SystemRoot",
+      "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "PATH", "TEMP", "TMP"]) {
+      if (process.env[key] !== undefined) child[key] = process.env[key];
+    }
+    return child;
+  };
+  const runPolicy = (args) => new Promise((resolve) => {
+    execFile(process.env.PYTHON || "python",
+      ["-X", "utf8", POLICY_PY, ...args, "--json"],
+      { env: policyEnv(), cwd: ROOT, timeout: 30000 },
+      (err, stdout) => {
+        let json = null;
+        try {
+          json = JSON.parse((stdout || "").trim().split(/\r?\n/).pop());
+        } catch {}
+        resolve({
+          ok: !err,
+          bytes: Buffer.byteLength(stdout || "", "utf8"),
+          err: err ? String(err.message).slice(0, 160) : null,
+          json,
+        });
+      });
+  });
+  const policy = await (async () => {
+    const lane = { status: "fail", detail: "", legs: {} };
+    if (!fs.existsSync(POLICY_PY)) {
+      lane.status = "pass";
+      lane.detail = "policy helper absent from this checkout: the "
+        + "default-off contract holds (no helper => no policy render "
+        + "anywhere); enabled leg not applicable";
+      lane.legs = { helper: "absent", disabled: "default-off-by-contract",
+        enabled: "not-applicable" };
+      return lane;
+    }
+    // (a) default-off: resolver-based config lookup beside the isolated
+    // store must yield the empty, bounded, capture-free disabled block.
+    const off = await runPolicy(["--no-capture"]);
+    lane.legs.disabled = {
+      ok: off.ok, err: off.err, reason: off.json && off.json.reason,
+      enabled: off.json ? off.json.enabled : null,
+      targets: off.json ? (off.json.targets || []).length : null,
+      word_count: off.json ? off.json.word_count : null,
+      capture: off.json ? off.json.capture : null,
+      bytes: off.bytes };
+    const offOk = off.ok && off.json && off.json.enabled === false
+      && (off.json.targets || []).length === 0
+      && off.json.text === "" && off.json.word_count === 0
+      && off.json.capture === false && off.bytes <= 2048;
+    // (b) knowledge.enabled=true: markdown target rooted INSIDE the
+    // canary temp dir; the roster must name the target id, word-capped.
+    const vault = path.join(tmp, "policy-vault");
+    fs.mkdirSync(vault, { recursive: true });
+    const configPath = path.join(tmp, "config.json");
+    fs.writeFileSync(configPath, JSON.stringify({
+      knowledge: { enabled: true, targets: {
+        kb: { kind: "markdown", root: vault } } } }));
+    const on = await runPolicy(["--config", configPath]);
+    lane.legs.enabled = {
+      ok: on.ok, err: on.err, reason: on.json && on.json.reason,
+      enabled: on.json ? on.json.enabled : null,
+      target_id: on.json
+        ? ((on.json.targets || []).includes("kb")
+          && typeof on.json.text === "string"
+          && on.json.text.includes("kb")) : null,
+      word_count: on.json ? on.json.word_count : null,
+      bytes: on.bytes };
+    const onOk = on.ok && on.json && on.json.enabled === true
+      && (on.json.targets || []).includes("kb")
+      && typeof on.json.text === "string" && on.json.text.includes("kb")
+      && typeof on.json.word_count === "number"
+      && on.json.word_count > 0 && on.json.word_count < 200
+      && on.bytes <= 8192;
+    lane.status = offOk && onOk ? "pass" : "fail";
+    lane.detail = "knowledge policy render: default-off empty block + "
+      + "knowledge.enabled=true markdown-target roster (word-capped)";
+    return lane;
+  })();
   // Aggregate: acked/reserved from the DELIVERY leg; receipts from the
   // reconnect leg (the tools lane); compaction resets + identity from the
   // identity leg; capture from the corrections leg.
@@ -195,6 +299,8 @@ async function main() {
           + "(real compactor package not in 0.2.1-rc.2 — disclosed)" },
       offline: { status: offline.ok ? "pass" : "fail",
         detail: "T-11 snapshot labelled offline delivery" },
+      policy: { status: policy.status, detail: policy.detail,
+        legs: policy.legs },
     },
     corrections_leg: corrections,
     git_sha: process.env.ZMEM_CANARY_GIT_SHA || gitSha,

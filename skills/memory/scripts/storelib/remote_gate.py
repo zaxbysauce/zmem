@@ -11,7 +11,10 @@ route through the fleet backend instead of a local store — no split brain:
   plus the pre-flush pending overlay.
 - ALLOW-LOCAL: store-independent sidecar / transcript commands and the
   read-only no-create probes keep their local execution (hooks depend on
-  them; none writes the memory table).
+  them; none writes the memory table).  PR1 adds ``knowledge`` here as a
+  helper sidecar — the knowledge workflow itself enforces the mode (in
+  remote mode: no local store, pointer ops via the separate
+  capability-gated knowledge delivery queue, never ROUTE-WRITE).
 - REFUSE: everything else exits 2 with ``this command runs on the hub;
   ZMEM_REMOTE_URL is set``.
 
@@ -56,6 +59,14 @@ _ALLOW_LOCAL = frozenset({
     "queue-add", "source-exists", "source-ref-exists", "ops-append",
     "retain", "retain-adapt", "ledger-clear", "delivery-clear",
     "hermes-reflect", "hermes-context", "ops-enqueue",
+    # PR1 (knowledge companion): the knowledge CLI is a helper SIDECAR —
+    # it runs locally (config, markdown vault / KB HTTP targets, journal
+    # and delivery sidecars in the data dir) and the WORKFLOW enforces
+    # the mode itself: in remote mode it never opens or creates a local
+    # store (the ZMEM_STORE refusal above applies) and pointer ops ride
+    # the separate capability-gated knowledge delivery queue, never this
+    # gate's ROUTE-WRITE op-queue lane.
+    "knowledge",
 })
 _HERMES_CONTEXT_ALLOWED_ACTIONS = frozenset({"commit-cursor"})
 

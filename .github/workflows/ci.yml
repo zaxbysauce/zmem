@@ -340,7 +340,12 @@ jobs:
       - name: Run Python test suites
         shell: bash
         run: |
-          set -e
+          set -uo pipefail
+          # Aggregate, don't fail-fast: a `set -e` loop stops at the first
+          # failing file and masks every later suite (round-3 FB-019). Run
+          # ALL suites, then fail once with the full list.
+          failed=0
+          failed_list=""
           for f in tests/test_*.py; do
             # Issue #77: the sqlite-vec smoke test has NO skip guard — it needs
             # the embedding requirements and is exercised by the dedicated
@@ -353,8 +358,24 @@ jobs:
             # test_q02_passive_secret_withhold.py file — AC6 class included —
             # runs in this loop.)
             echo "=== $f ==="
-            python "$f"
+            log="$(mktemp)"
+            if python "$f" 2>&1 | tee "$log"; then
+              # Executed-count gate: a suite that reports "Ran 0 tests" is a
+              # collection bomb or a silent no-op, not a green run.
+              if grep -Eq '^Ran 0 tests' "$log"; then
+                echo "::error::$f ran zero tests (collection failure or no-op)"
+                failed=1; failed_list="$failed_list $f(zero-tests)"
+              fi
+            else
+              echo "::error::$f failed"
+              failed=1; failed_list="$failed_list $f"
+            fi
+            rm -f "$log"
           done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::failing suites:$failed_list"
+            exit 1
+          fi
 
       # Issue #108: post-install canary in deterministic --self-test mode —
       # seeds an isolated scratch store, drives the SessionStart hook chain,

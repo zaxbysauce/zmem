@@ -26,7 +26,11 @@ from storelib.entity import link_memory_entities, relink_memory, split_tag_token
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.state_expiry import validate_inject_until
-from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref
+from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref, KNOWLEDGE_SOURCE_REF_PREFIX
+# PR1 (knowledge companion): the ingest-side demotion of imported pointer
+# payloads. storelib.knowledge imports storelib.write only, so this import
+# introduces no cycle.
+from storelib.knowledge import demote_imported_payload
 from storelib.write import SUBJECT_MAX_EXACT_CANDIDATES as _CAP
 from schema_meta import worse_taint  # noqa: F401
 from storelib.evidence import (
@@ -1626,7 +1630,10 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
 
-        local = conn.execute("SELECT superseded_at FROM memory WHERE id=?", (mid,)).fetchone()
+        local = conn.execute(
+            "SELECT superseded_at, source_ref FROM memory WHERE id=?",
+            (mid,),
+        ).fetchone()
 
         if local is not None:
             # id already known locally: local content is NEVER overwritten by a
@@ -1634,6 +1641,23 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # a tombstone, and only if the incoming row is superseded and the
             # local one is not already -- everything else is a no-op skip.
             if superseded_at and local["superseded_at"] is None:
+                # PR1 (knowledge companion): a remote tombstone can never
+                # remove an authoritative knowledge pointer — that is a
+                # pointer state transition outside the handler's CAS, and a
+                # hostile sync file carrying the row's id is exactly the
+                # rollback/DoS shape the reserved-ref law closes. Counted as
+                # tombstone_refused (the same fate as an unpermitted
+                # tombstone), never a crash and never a skip-that-lands.
+                if (local["source_ref"] or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+                    print(
+                        f"[zmem] ingest-jsonl: refused tombstone for {mid}: "
+                        "knowledge pointer rows advance only through the "
+                        "knowledge handler (storelib.knowledge.link_pointer)",
+                        file=sys.stderr,
+                    )
+                    if started_tx and conn.in_transaction:
+                        conn.rollback()
+                    return "tombstone_refused"
                 if not allow_tombstones:
                     if started_tx and conn.in_transaction:
                         conn.rollback()
@@ -1733,6 +1757,29 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         for w in cap_warns:
             print(f"[zmem] ingest-jsonl: capture policy: {w['message']}", file=sys.stderr)
 
+        # PR1 (knowledge companion): an imported knowledge: ref is PRESERVED
+        # but never newly verified. Any parsed pointer payload is re-emitted
+        # with verified=false before it can land, so a roundtripped
+        # (export-jsonl -> ingest-jsonl, or a peer store's) pointer can never
+        # arrive as authoritative state — re-verification requires an
+        # explicit relink/readback through storelib.knowledge.link_pointer.
+        # Unparseable payloads are left byte-identical: get_pointer ignores
+        # them (it requires a parsed, verified payload), so there is nothing
+        # to demote and nothing to gain by refusing the row. Both INSERT
+        # sites below (history + live) consume the demoted bytes; the
+        # closed-set warning above already fired for the reserved prefix.
+        if (source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+            demoted = demote_imported_payload(content)
+            if demoted is not None:
+                if demoted != content:
+                    print(
+                        f"[zmem] ingest-jsonl: row {mid} carries a knowledge "
+                        "pointer ref; imported as UNVERIFIED (explicit "
+                        "relink required to re-establish it)",
+                        file=sys.stderr,
+                    )
+                content = demoted
+
         if superseded_at:
             # New locally, but already tombstoned upstream: insert as history so
             # future syncs stay consistent, without letting it participate in
@@ -1778,7 +1825,8 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             _emb_sync.warn_fake_active()
         except Exception:
             pass  # banner must never break ingest (mirror write.py guard)
-        if preserve_ids or obj.get("_peer_no_dedup"):
+        if (preserve_ids or obj.get("_peer_no_dedup")
+                or (source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)):
             # Strict evidence transfers are identity-preserving.  Content
             # dedup is a useful legacy best-effort policy, but it would drop a
             # supplied memory UUID that an evidence association references.
@@ -1787,6 +1835,13 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # writes to it (max-confidence lift, tag union, retrieval_count
             # bump), which no field clamp can undo. The row lands as its own
             # live row instead.
+            # PR1 (knowledge companion): an imported knowledge: ref is
+            # identity-bearing, exactly like a supplied UUID — generic subject
+            # dedup would fold this row (already demoted to verified=false
+            # above) into any payload-identical ORDINARY local keeper via
+            # _merge_on_dedup, silently dropping the reserved source_ref and
+            # losing the reference. Each distinct ref lands as its own live
+            # unverified row; the handler's relink owns folding them later.
             existing, _sim, emb = None, None, None
         else:
             existing, _sim, emb, _legacy_det = _detect_duplicate_subject(
@@ -2861,7 +2916,13 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
             from storelib.write import SUBJECT_MAX_EXACT_CANDIDATES as _CAP
             for r in conn.execute(
                 "SELECT id, content, namespace FROM memory "
-                "WHERE superseded_at IS NULL ORDER BY rowid"
+                "WHERE superseded_at IS NULL "
+                # PR1: pointer rows never enter the exact-match cache —
+                # a normal fact must not fold into a pointer row. The
+                # cache-hit fetch in write._detect_duplicate re-checks the
+                # prefix too (belt and braces for in-batch seeds).
+                "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%') "
+                "ORDER BY rowid"
             ).fetchall():
                 norm = _normalize_content(r["content"])
                 if norm:

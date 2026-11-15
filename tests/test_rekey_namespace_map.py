@@ -582,6 +582,50 @@ class RekeyNamespaceMapTest(unittest.TestCase):
         self.assertEqual(census["by_prefix"][0]["total"], 12)
         self.assertEqual(census["by_prefix"][0]["live"], 11)
 
+    def test_map_confirm_refuses_when_knowledge_publication_in_flight(self):
+        """FB-031 (Cluster 6): the CLI map apply lane coordinates the
+        knowledge sidecars. A durably in-flight publication under a
+        namespace the map moves (here the fixture's source namespace
+        user:global) refuses BEFORE any mutation — exit 1, nothing moved,
+        no decision log, sidecar bytes untouched."""
+        sys.path.insert(0, str(SCRIPTS))
+        from knowledge.documents import prepare_document
+        from knowledge.journal import KnowledgeJournal
+
+        journal = KnowledgeJournal(self.tmp / "knowledge" / "journal.json")
+        doc = prepare_document("notes", "run/map-cli", "map cli body\n")
+        journal.record_intent(
+            target_id="notes", logical_key="run/map-cli",
+            locator=doc.locator, digest=doc.digest,
+            namespace="user:global")
+        journal_bytes = (self.tmp / "knowledge" / "journal.json").read_bytes()
+
+        result = self._map_command("--confirm")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refusing namespace rekey", result.stderr)
+        self.assertIn("user:global", result.stderr)
+        self.assertIn("in flight", result.stderr)
+        self.assertEqual(
+            self.query(
+                "SELECT COUNT(*) AS n FROM memory WHERE namespace='user:global' "
+                "AND superseded_at IS NULL")[0][0], 20,
+            "nothing may move on a guarded refusal")
+        self.assertEqual(
+            (self.tmp / "knowledge" / "journal.json").read_bytes(),
+            journal_bytes)
+        self.assertFalse((self.data / "zmem-decisions.log").exists())
+
+    def test_map_confirm_disabled_creates_no_knowledge_directory(self):
+        """Default-off (FB-031 lock protocol rule 1): this fixture has no
+        knowledge config and no sidecars, so a successful map apply must
+        not create the knowledge directory or any sidecar lock file."""
+        result = self._map_command("--confirm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.tmp / "knowledge").exists(),
+                         "default-off rekey must not create <store_dir>/"
+                         "knowledge")
+        self.assertEqual([p for p in self.tmp.glob("*.lock")], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

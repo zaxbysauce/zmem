@@ -526,6 +526,24 @@ per-event `feedback_associations` in the miss-rate JSON. Each event is
 recorded in a per-session sidecar (`<data>/ops/<sha256(session)[:32]>.feedback.jsonl`)
 so replays stay idempotent.
 
+### Knowledge companion (optional, off by default)
+
+An explicit, opt-in external-knowledge workflow (PR1): publish a note you
+author as an immutable, content-addressed version to a local Markdown vault
+or a configured knowledge-base HTTP endpoint, and record a reserved
+`knowledge:<target>:<key>` pointer row in the store so the note stays
+findable, re-readable, and digest-checkable
+(`<interpreter> <store.py> knowledge capture|read|check|status|flush`). It
+is OFF BY DEFAULT — nothing activates until a strict `knowledge` object is
+added to the store's `config.json` — and it never injects, never rides the
+core op queue, and never publishes raw session transcripts. In remote mode
+(`ZMEM_REMOTE_URL`) the pointer op goes to the hub through a separate
+capability-gated delivery queue (`knowledge_link_v1`); an old hub leaves
+the pointer explicitly pending without affecting core memory. The
+conditional instruction/skill/closeout discovery wiring (PR2) is not
+shipped. Config schema, CLI contract, security posture, and limits:
+[docs/KNOWLEDGE-COMPANION.md](docs/KNOWLEDGE-COMPANION.md).
+
 ## Requirements
 
 - ZCode and/or Claude Code (the plugin registers hooks + a skill via each
