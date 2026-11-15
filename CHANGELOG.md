@@ -27,9 +27,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   guard, so a rejected fold can never mutate the keeper. Adds
   `update --no-dedup` (local mode; remote use is refused loudly by
   the queue gate). Sibling fix on the add path: the dedup fold's
-  `already contains this exact content` lane now also requires
+  `already contains this content` lane now also requires
   normalized content equality — colliding embeddings get the near-dup
-  drop disclosure instead of a false exact claim.
+  drop disclosure instead of a false exact claim, and both exact
+  lanes say `normalized-equal` rather than `identical` (the verbatim
+  text need not be stored). Fold exactness is decided across ALL
+  live rows (an in-transaction content_norm re-rank with a visible
+  `dedup re-ranked` notice), never only the detector's top-ranked
+  candidate — a colliding row or a vector-less keeper outranking the
+  true exact keeper used to refuse the fold (duplicate live rows) or
+  mis-disclose. The re-rank honors the #376 subject-identity veto
+  and the knowledge-pointer exclusion; `store.py organize` converts
+  a malformed ZMEM_UPDATE_FOLD_THRESHOLD to the clean exit-2
+  refusal.
 
 ## [0.158.0] - 2026-11-15
 ### Added

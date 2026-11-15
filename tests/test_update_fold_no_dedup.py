@@ -302,15 +302,23 @@ class RemoteRefusalTest(_CliCase):
     def test_remote_no_dedup_refuses_loudly(self):
         # Strip ZMEM_STORE/ZMEM_DATA (the config combo refuses BEFORE write
         # flags — the refusal under test is the FLAG's), dead-localhost hub.
+        # R5-3: sandbox HOME/USERPROFILE at a throwaway dir so the
+        # no-default-store assertion cannot flake on the operator's LIVE
+        # home store being touched by concurrent hooks mid-run (the mtime
+        # equality form measured the real store; this form measures a store
+        # that must never exist).
+        sandbox_home = Path(tempfile.mkdtemp(prefix="zmem-472remote-"))
+        self.addCleanup(shutil.rmtree, sandbox_home, True)
         env = {**os.environ}
         env.pop("ZMEM_STORE", None)
         env.pop("ZMEM_DATA", None)
+        env["HOME"] = str(sandbox_home)
+        env["USERPROFILE"] = str(sandbox_home)
         env["ZMEM_REMOTE_URL"] = "http://127.0.0.1:9/zmem"
         env["ZMEM_MCP_TOKEN"] = "test-token-local-only"
         env["PYTHONIOENCODING"] = "utf-8"
-        store_default = Path.home() / ".zmem" / "store.sqlite"
-        mtime_before = (store_default.stat().st_mtime
-                        if store_default.exists() else None)
+        store_default = sandbox_home / ".zmem" / "store.sqlite"
+        mtime_before = store_default.exists()
         r = subprocess.run(
             [PYTHON, "-X", "utf8", str(STORE_PY), "update", "--id",
              "00000000-0000-0000-0000-000000000000", "--namespace", NS,
@@ -324,11 +332,9 @@ class RemoteRefusalTest(_CliCase):
         # The refusal created no local store and did not touch an existing
         # one (before/after mtime — an operator box carries a real default
         # store that exists regardless of this run).
-        mtime_after = (store_default.stat().st_mtime
-                       if store_default.exists() else None)
-        self.assertEqual(mtime_after, mtime_before,
-                         "the remote refusal must not create or modify the "
-                         "default local store")
+        self.assertFalse(store_default.exists(),
+                         "the remote refusal must not create any local "
+                         "store under the sandboxed HOME")
 
 
 class StateKeeperRegressionTest(_CliCase):
@@ -486,6 +492,52 @@ class OrganizeKnobRefusalTest(_CliCase):
             # under this fixture shape — the refusal path was not exercised;
             # assert the run at least did not traceback.
             self.assertNotIn("Traceback", combined, combined)
+
+
+
+
+class UpdateRerankLessonCarveoutTest(_CliCase):
+    """Final-critic r5 R5-2 falsifier: an update WITHOUT --type (type_
+    None -> type_eff 'lesson') must admit the lesson/lesson exact keeper
+    through the re-rank subject check — the raw-type_ form printed a FALSE
+    subject_veto and left a duplicate live row."""
+
+    def test_lesson_carveout_update_folds_without_type_flag(self):
+        import re as _re
+        ns = "project:fold472carve"
+        env = _env(self.tmp)
+        r1 = self._run("add", "--namespace", ns, "--type", "lesson",
+                       "--content", "carveout keeper text for the rerank leg",
+                       "--tags", "task:alpha", "--signal", "test",
+                       "--no-dedup", env=env)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        keeper = _re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
+                            r1.stdout).group(1)
+        r2 = self._run("add", "--namespace", ns, "--type", "fact",
+                       "--content", OTHER_WORD, "--signal", "test",
+                       "--no-dedup", env=env)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        rv = self._run("add", "--namespace", ns, "--type", "lesson",
+                       "--content", "victim row two for the carveout leg",
+                       "--tags", "task:beta", "--signal", "test",
+                       "--no-dedup", env=env)
+        victim = _re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
+                            rv.stdout).group(1)
+        # NO --type on the update: type_eff resolves to the old row's
+        # 'lesson'; the exact keeper is lesson/lesson (the #376 carve-out).
+        r = self._run("update", "--id", victim, "--namespace", ns,
+                      "--content", "carveout keeper text for the rerank leg",
+                      "--tags", "task:beta", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        combined = r.stdout + r.stderr
+        self.assertNotIn("subject_veto", combined,
+                         "the lesson/lesson carve-out must admit the exact "
+                         f"keeper; output: {combined[-400:]}")
+        self.assertNotIn("lands as its own live row", combined, combined)
+        live_keep = [row for row in self._list(ns=ns, env=env)
+                     if row["id"] == keeper]
+        self.assertTrue(live_keep and
+                        live_keep[0].get("superseded_at") is None)
 
 
 if __name__ == "__main__":

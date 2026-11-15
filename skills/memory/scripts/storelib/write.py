@@ -2929,7 +2929,7 @@ def update_memory(
                 # outrank the TRUE exact keeper, refusing an exact-content
                 # fold and landing a duplicate live row. Re-rank against the
                 # store's own canonical exact basis (content_norm, live rows
-                # only, same namespace/type window) before declining.
+                # only, same live-namespace content_norm window) before declining.
                 exact_row = conn.execute(
                     "SELECT id, content, tags, type FROM memory "
                     "WHERE namespace=? AND content_norm=? "
@@ -2945,7 +2945,7 @@ def update_memory(
                     # incompatible or otherwise-vetoed exact row is not a
                     # fold target; the update lands as its own row instead.
                     admitted = _subject_admit(
-                        [(exact_row, 1.0)], tags_eff, type_)
+                        [(exact_row, 1.0)], tags_eff, type_eff)
                     if admitted:
                         existing = {"id": exact_row["id"]}
                         dedup_sim = 1.000
