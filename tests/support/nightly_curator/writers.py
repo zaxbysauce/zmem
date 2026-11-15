@@ -122,25 +122,30 @@ def _pins_for(cfg: CandidateConfig, corpus_digest: str, judge_digest: str) -> di
 
 
 def _add_row(scratch: Path, env: dict, text: str, subject: str | None, eid: str | None,
-             budget: resources.Budget) -> dict[str, Any]:
+             budget: resources.Budget, type_: str = "fact") -> dict[str, Any]:
     """One store.py add through the bounded runner (real CLI, scratch store).
 
-    The deterministic writer pins ZMEM_EMBED_PROFILE=fake (the 16-dim hash embedder
-    — the same deterministic profile the eval-store fixtures use) so similarity is
-    reproducible without model files; identical texts fold, distinct texts stay
-    separate, matching the shipped contract expectations model-absently.
+    The deterministic writer pins ZMEM_EMBED_PROFILE=fake (the hash-bucket
+    embedder — the same deterministic profile the eval-store fixtures use) so
+    no model files are needed. The six contract pairs are added with
+    ``--type fact`` (the #376 harness's own default): under ``fact`` the
+    subject-aware dedup VETO is live for disjoint task keys, so the
+    distinct-subject pairs (task-closeout, issue-number, different-files) stay
+    two rows BY CONTRACT instead of riding the fake-profile cosine — which sits
+    at 0.65-0.80 for those pairs and crossed the 0.85 fold boundary on a CI
+    windows runner when both rows were typed ``lesson`` (the symmetric lesson
+    carve-out disables the veto; observed as a false-merge of the
+    different-files contract pair at similarity 0.910).
     """
     tags = []
     if subject:
         # ALWAYS prefix task: (the #376 contract's identity convention — its own
         # harness builds tags the same way). Skipping the prefix for subjects
         # that already look like "file:..."/"lesson:..." defeats the
-        # subject-aware dedup veto: the different-files pair then folds on the
-        # fake-embedder cosine (observed on a CI windows runner as a
-        # false-merge of a contract pair).
+        # subject-aware dedup veto.
         tags.append(f"task:{subject}")
     argv = [sys.executable, str(resources.STORE_PY), "add", "--namespace", "project:synthetic/curator",
-            "--content", text, "--type", "lesson", "--signal", "test"]
+            "--content", text, "--type", type_, "--signal", "test"]
     if tags:
         argv += ["--tags", ",".join(tags)]
     if eid:
