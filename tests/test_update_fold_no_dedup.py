@@ -1,0 +1,376 @@
+"""Issue #472 supplementary guards: --no-dedup escape hatch, the embedding
+COLLISION matrix (normalized-content equality, never similarity), the
+update-fold knob's strict parsing, and remote-mode refusal.
+
+The frozen acceptance contract lives in tests/test_update_fold_disclosure.py
+(C1/C2). This file pins the surrounding guardrails the plan-critic ladder
+required:
+
+- papa/romeo collision (plan-critic r2, executed): distinct strings share a
+  16-dim feature-hash embedding under the fake profile, so similarity=1.000
+  does NOT mean identical content. Exactness must be decided by normalized
+  content equality:
+  * UPDATE at the default gate: the colliding update LANDS as its own
+    searchable row and never mutates the keeper.
+  * UPDATE with the knob lowered below 1.0: the fold fires with the
+    NON-exact content-drop disclosure + a --json warning (never the
+    identical-text lane).
+  * ADD: the colliding add gets the near-dup drop disclosure, never the
+    "already contains this exact content" claim.
+- T>1.0 (valid, exact-only): exact content still folds; non-exact lands.
+- ZMEM_DEDUP_THRESHOLD above the knob: the detector never returns the
+  in-between candidate — no fold.
+- Knob parsing: garbage/empty/nan/inf/zero/negative refuse the update
+  (exit 2) with NOTHING written and unrelated commands unaffected; >1.0 is
+  valid exact-only.
+- Local --no-dedup bypass: the update lands its own row at similarity 1.000.
+- Remote mode: an explicit --no-dedup REFUSES (exit 2) naming the flag,
+  queues no op, and creates no local store (the queued-op payload cannot
+  carry the bypass).
+- State-keeper regression (plan-critic r1 BLOCKER 1): an in-band state
+  update (knob lowered) leaves the keeper's memory_expiry byte-identical
+  while the replacement row receives the resolved pair.
+
+Drives the REAL skills/memory/scripts/store.py CLI via subprocess against
+hermetic throwaway stores (fake embed profile).
+
+Run: python -X utf8 tests/test_update_fold_no_dedup.py
+"""
+
+from __future__ import annotations
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
+
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+STORE_PY = REPO_ROOT / "skills" / "memory" / "scripts" / "store.py"
+PYTHON = sys.executable
+
+# Fake-profile collision pair (plan-critic r2 probe; verified locally):
+# distinct 5-letter words whose 16-dim feature-hash embeddings collide, so
+# the detector reports similarity=1.000 for DIFFERENT content.
+KEEPER_WORD = "papa"
+OTHER_WORD = "romeo"
+
+NS = "project:fold472supp"
+
+
+def _env(tmp: str, **extra: str) -> dict:
+    env = {**os.environ}
+    env["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
+    env.pop("ZMEM_DATA", None)
+    env["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-models")
+    env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+    env["ZMEM_EMBED_PROFILE"] = "fake"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.pop("ZMEM_DEDUP_THRESHOLD", None)
+    env.pop("ZMEM_REMOTE_URL", None)
+    env.pop("ZMEM_UPDATE_FOLD_THRESHOLD", None)
+    env.update({k: v for k, v in extra.items() if v is not None})
+    for k, v in extra.items():
+        if v is None:
+            env.pop(k, None)
+    return env
+
+
+class _CliCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zmem-472supp-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _run(self, *args, env=None):
+        return subprocess.run(
+            [PYTHON, "-X", "utf8", str(STORE_PY), *args],
+            env=env or _env(self.tmp), capture_output=True, text=True,
+            timeout=180, cwd=str(REPO_ROOT))
+
+    def _add(self, content, ns=NS, env=None):
+        r = self._run("add", "--namespace", ns, "--type", "fact",
+                      "--content", content, "--signal", "test", env=env)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        import re
+        m = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})", r.stdout)
+        assert m, r.stdout
+        return m.group(1), r
+
+    def _list(self, ns=NS, env=None):
+        r = self._run("list", "--json", "--namespace", ns, env=env)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        return json.loads(r.stdout).get("memories", [])
+
+    def _search(self, text, ns=NS, env=None):
+        r = self._run("search", "--text", text, "--json",
+                      "--namespace", ns, env=env)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        return json.loads(r.stdout)
+
+
+class CollisionMatrixTest(_CliCase):
+    """similarity=1.000 with DIFFERENT content: exactness must come from
+    normalized content equality, never similarity."""
+
+    def _setup(self, **knob):
+        keeper, _ = self._add(KEEPER_WORD, env=_env(self.tmp, **knob))
+        victim, _ = self._add("unrelated third row for the update victim",
+                              env=_env(self.tmp, **knob))
+        return keeper, victim
+
+    def test_collision_update_at_default_lands_own_row(self):
+        keeper, victim = self._setup()
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content", OTHER_WORD)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        combined = r.stdout + r.stderr
+        self.assertIn("update fold skipped", combined, combined)
+        self.assertNotIn("identical text", combined, combined)
+        # The colliding content LANDED — searchable on its own row.
+        found = self._search(OTHER_WORD)
+        self.assertTrue(
+            any(row.get("content") == OTHER_WORD
+                for row in found.get("results") or []),
+            f"collision content must land as its own searchable row; "
+            f"search: {json.dumps(found)[:400]}")
+        # The keeper is untouched.
+        rows = {row["id"]: row for row in self._list()}
+        self.assertIsNone(rows[keeper].get("superseded_at"))
+        self.assertEqual(rows[keeper].get("preview"), KEEPER_WORD)
+
+    def test_collision_update_with_lowered_knob_discloses_drop(self):
+        keeper, victim = self._setup(ZMEM_UPDATE_FOLD_THRESHOLD="0.95")
+        rj = self._run("update", "--json", "--id", victim, "--namespace", NS,
+                       "--type", "fact", "--content", OTHER_WORD,
+                       env=_env(self.tmp,
+                                ZMEM_UPDATE_FOLD_THRESHOLD="0.95"))
+        self.assertEqual(rj.returncode, 0, rj.stderr)
+        payload = json.loads(rj.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload.get("id"), keeper)
+        self.assertFalse(payload.get("created_new"))
+        warnings = payload.get("warnings") or []
+        self.assertTrue(
+            any(keeper in json.dumps(w) and "not" in json.dumps(w)
+                and "stored" in json.dumps(w) for w in warnings),
+            f"a collision fold must warn with the drop disposition "
+            f"(keeper + not-stored); payload: {json.dumps(payload)}")
+        # The disclosure on stderr (human lane under --json) must use the
+        # NON-exact lane — never the identical-text claim.
+        self.assertNotIn("identical text", rj.stderr, rj.stderr)
+        self.assertIn("was NOT stored", rj.stderr, rj.stderr)
+
+    def test_collision_add_never_claims_exact_content(self):
+        _keeper, _ = self._add(KEEPER_WORD)
+        # NOTE: a folding add prints no "[zmem] added memory" line, so this
+        # leg drives the CLI directly instead of via _add.
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", OTHER_WORD, "--signal", "test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        combined = r.stdout + r.stderr
+        self.assertIn("was NOT stored", combined, combined)
+        self.assertNotIn("already contains this exact content", combined,
+                         combined)
+        found = self._search(OTHER_WORD)
+        self.assertEqual(found.get("count"), 0)
+
+
+class ThresholdBoundaryTest(_CliCase):
+    def test_exact_content_still_folds_above_one(self):
+        keeper, _ = self._add("alpha beta exact gate content")
+        victim, _ = self._add("unrelated row to be updated now")
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content",
+                      "alpha beta exact gate content",
+                      env=_env(self.tmp,
+                               ZMEM_UPDATE_FOLD_THRESHOLD="1.1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("the identical text is already stored in that row",
+                      r.stdout, r.stdout)
+        rows = {row["id"]: row for row in self._list()}
+        self.assertIsNone(rows[keeper].get("superseded_at"))
+
+    def test_non_exact_lands_above_one(self):
+        _keeper, _ = self._add("alpha beta exact gate content")
+        victim, _ = self._add("unrelated row to be updated now")
+        new_text = "alpha beta exact gate contents modified tail"
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content", new_text,
+                      env=_env(self.tmp,
+                               ZMEM_UPDATE_FOLD_THRESHOLD="1.1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Landed as its own searchable row (no fold either way — the
+        # expectation is landing, whatever the detector returned).
+        found = self._search("modified tail",
+                             env=_env(self.tmp,
+                                      ZMEM_UPDATE_FOLD_THRESHOLD="1.1"))
+        self.assertTrue(
+            any(new_text in (row.get("content") or "")
+                for row in found.get("results") or []),
+            f"non-exact content must land as its own row; "
+            f"search: {json.dumps(found)[:400]}")
+
+    def test_detector_floor_above_knob_means_no_fold(self):
+        # Knob 0.90, dedup floor 0.98: a mid-band candidate never reaches
+        # the gate (the detector filters first) — the update lands.
+        _keeper, _ = self._add(
+            "shared prefix tokens for the detector floor probe row one")
+        victim, _ = self._add("totally different victim row content here")
+        new_text = ("shared prefix tokens for the detector floor probe "
+                    "row one extra tail words here")
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content", new_text,
+                      env=_env(self.tmp, ZMEM_UPDATE_FOLD_THRESHOLD="0.90",
+                               ZMEM_DEDUP_THRESHOLD="0.98"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("FOLDED into existing live memory",
+                         r.stdout + r.stderr, r.stdout + r.stderr)
+        found = self._search(
+            "extra tail words",
+            env=_env(self.tmp, ZMEM_UPDATE_FOLD_THRESHOLD="0.90",
+                     ZMEM_DEDUP_THRESHOLD="0.98"))
+        self.assertTrue(
+            any(new_text in (row.get("content") or "")
+                for row in found.get("results") or []),
+            f"the detector-floor-blocked update must land; "
+            f"search: {json.dumps(found)[:400]}")
+
+
+class KnobParsingTest(_CliCase):
+    def _refusals(self):
+        for i, bad in enumerate(("garbage", "", "nan", "inf", "0", "-0.5")):
+            with self.subTest(bad=bad):
+                # Setup adds use --no-dedup so near-identical victim rows
+                # never fold during SETUP (a folded add prints no added-id).
+                r = self._run("add", "--namespace", NS, "--type", "fact",
+                              "--content",
+                              f"victim row {i} for knob parsing leg {bad!r}",
+                              "--signal", "test", "--no-dedup")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                import re
+                m = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
+                              r.stdout)
+                self.assertIsNotNone(m, r.stdout)
+                victim = m.group(1)
+                r = self._run("update", "--id", victim, "--namespace", NS,
+                              "--type", "fact", "--content",
+                              "content that must never be written " + repr(bad),
+                              env=_env(self.tmp,
+                                       ZMEM_UPDATE_FOLD_THRESHOLD=bad))
+                self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+                self.assertIn("ZMEM_UPDATE_FOLD_THRESHOLD", r.stderr, r.stderr)
+                # NOTHING written: the victim is still live.
+                rows = {row["id"]: row for row in self._list()}
+                self.assertIsNone(rows[victim].get("superseded_at"))
+        # Unrelated commands unaffected by the ambient garbage knob.
+        r = self._run("list", "--json", "--namespace", NS,
+                      env=_env(self.tmp,
+                               ZMEM_UPDATE_FOLD_THRESHOLD="garbage"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_refusals(self):
+        self._refusals()
+
+
+class NoDedupBypassTest(_CliCase):
+    def test_local_no_dedup_lands_own_row_at_similarity_one(self):
+        keeper, _ = self._add("bypass probe identical content text")
+        victim, _ = self._add("unrelated victim for the bypass leg")
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content",
+                      "bypass probe identical content text", "--no-dedup")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The update target is superseded by design (append-only update) --
+        # --no-dedup guarantees the REPLACEMENT landed as its own row
+        # instead of folding into the keeper.
+        rows = {row["id"]: row for row in self._list()}
+        self.assertIn(keeper, rows)
+        self.assertIsNone(rows[keeper].get("superseded_at"),
+                          "the keeper must not be the fold target")
+        live = [r_ for r_ in rows.values()
+                if r_.get("preview") == "bypass probe identical content text"]
+        self.assertEqual(len(live), 2,
+                         "both the keeper and the bypassed replacement must "
+                         f"live; rows: {json.dumps(list(rows.values()))[:400]}")
+
+
+class RemoteRefusalTest(_CliCase):
+    def test_remote_no_dedup_refuses_loudly(self):
+        # Strip ZMEM_STORE/ZMEM_DATA (the config combo refuses BEFORE write
+        # flags — the refusal under test is the FLAG's), dead-localhost hub.
+        env = {**os.environ}
+        env.pop("ZMEM_STORE", None)
+        env.pop("ZMEM_DATA", None)
+        env["ZMEM_REMOTE_URL"] = "http://127.0.0.1:9/zmem"
+        env["ZMEM_MCP_TOKEN"] = "test-token-local-only"
+        env["PYTHONIOENCODING"] = "utf-8"
+        store_default = Path.home() / ".zmem" / "store.sqlite"
+        mtime_before = (store_default.stat().st_mtime
+                        if store_default.exists() else None)
+        r = subprocess.run(
+            [PYTHON, "-X", "utf8", str(STORE_PY), "update", "--id",
+             "00000000-0000-0000-0000-000000000000", "--namespace", NS,
+             "--type", "fact", "--content", "remote refusal probe",
+             "--no-dedup"],
+            env=env, capture_output=True, text=True, timeout=180,
+            cwd=str(REPO_ROOT))
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("--no-dedup", r.stderr, r.stderr)
+        self.assertIn("not supported in remote mode", r.stderr, r.stderr)
+        # The refusal created no local store and did not touch an existing
+        # one (before/after mtime — an operator box carries a real default
+        # store that exists regardless of this run).
+        mtime_after = (store_default.stat().st_mtime
+                       if store_default.exists() else None)
+        self.assertEqual(mtime_after, mtime_before,
+                         "the remote refusal must not create or modify the "
+                         "default local store")
+
+
+class StateKeeperRegressionTest(_CliCase):
+    def test_in_band_state_update_leaves_keeper_expiry_untouched(self):
+        env = _env(self.tmp, ZMEM_UPDATE_FOLD_THRESHOLD="0.95")
+        r = self._run("add", "--namespace", NS, "--type", "state",
+                      "--content", "state keeper for the fold gate probe",
+                      "--expiry-class", "endpoint", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rows = self._list(env=env)
+        keeper = next(row["id"] for row in rows
+                      if "state keeper" in (row.get("preview") or ""))
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        conn.row_factory = sqlite3.Row
+        before = dict(conn.execute(
+            "SELECT inject_until, expiry_class FROM memory_expiry "
+            "WHERE memory_id=?", (keeper,)).fetchone() or {})
+        conn.close()
+        victim, _ = self._add("plain victim row for the state leg", env=env)
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "state", "--content",
+                      "state keeper for the fold gate probe amended tail",
+                      "--expiry-class", "metric", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("update fold skipped", r.stdout + r.stderr,
+                      r.stdout + r.stderr)
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        conn.row_factory = sqlite3.Row
+        after = conn.execute(
+            "SELECT inject_until, expiry_class FROM memory_expiry "
+            "WHERE memory_id=?", (keeper,)).fetchone()
+        # Keeper's side row byte-identical (same pair, nothing added).
+        self.assertIsNotNone(after, "keeper expiry row must survive")
+        self.assertEqual(dict(after), before)
+        # The REPLACEMENT row received the resolved pair.
+        repl = conn.execute(
+            "SELECT memory_id FROM memory_expiry WHERE expiry_class=?",
+            ("metric",)).fetchall()
+        self.assertTrue(repl, "replacement row must carry the resolved pair")
+        self.assertNotEqual(repl[0]["memory_id"], keeper)
+        conn.close()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

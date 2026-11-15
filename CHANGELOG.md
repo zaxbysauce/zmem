@@ -5,146 +5,32 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.158.0] - 2026-11-15
-### Added
-- Knowledge routing policy, PR2 of the knowledge-companion workstream
-  (display-only, OFF BY DEFAULT, no auto-capture): one stdlib-only helper
-  (`skills/memory/scripts/knowledge/policy.py`, `render_policy` /
-  `resolve_config_path`, CLI `--config` / `--no-capture` / `--text` /
-  `--json`) renders the canonical concise policy — it names the knowledge
-  lane, the enabled state, and the configured target IDS ONLY (never
-  target values, endpoints, credential locations, or note content), stays
-  under 200 words, is identical on every host, and performs no network
-  I/O, vault-root stat, or model call while rendering. `ZMEM_INJECT=0` is
-  enforced by each adapter BEFORE any spawn (no output, no subprocess);
-  `ZMEM_CAPTURE=0` does not silence the policy — the adapter passes
-  `--no-capture` and the helper renders read-routing with no capture
-  invitation. With no `knowledge` object, or `enabled: false`, the helper
-  renders empty text, adapters append nothing, and every surface's output
-  is byte-identical to the pre-knowledge output. Capture itself stays
-  explicit-command-only — the PR1 `knowledge
-  capture|read|check|status|flush` law is unchanged and nothing injects
-  note content into sessions.
-- Native surfaces, one bounded delivery each: Hermes provider mode appends
-  the policy after the Tier-0 block in `system_prompt_block`
-  (`hermes-plugin/__init__.py` `_knowledge_policy_block`, cached per
-  capture mode; compat mode never calls it, so no new per-turn path
-  exists there); the DeepSeek (dsh/Cordis) plugin appends one
-  `agent/pre-step` message of source kind `zmem-policy` before the fenced
-  recall text with a per-session `policyResolved`/`policyDelivered` latch
-  (at most ONE helper spawn per session per adapter process, independent
-  of recall delivery, top-level preview `policyDeliveredText` /
-  `policyReason`); hook hosts (ZCode / Claude Code / Codex) append to the
-  SessionStart final context via `hooks/lib/zmem-session-start-payload.py`
-  `_knowledge_policy_note` (2.0 s bounded spawn). A missing helper, a
-  non-zero exit, a timeout, or empty output all fail open to
-  append-nothing; adapters never import storelib. The dsh message
-  deliberately uses its own `zmem-policy` source kind — never `zmem` — so
-  the admission matcher cannot false-ack a recall reservation. No
-  server/hub canonical recall envelope is modified and no new hook events
-  are introduced.
-- Fallback and gap honesty: hosts without native wiring get the explicit
-  portable `skills/knowledge/SKILL.md`, surfaced at closeout by
-  `skills/closeout/SKILL.md` only when a bounded `knowledge status` check
-  reports the companion enabled (silent otherwise) — documented
-  NON-equivalence: manual, explicit-only, no per-session injection.
-  `skills/closeout-remote/SKILL.md` carries the remote-mode half: when
-  local capture/flush cannot run, the closeout surfaces a draft-only
-  knowledge handoff (no pointer write, no flush) for the operator to
-  capture from a capable host. The native OpenCode HOST adapter shipped
-  separately on main (0.154.0, #66/#351); PR2 does not wire the routing
-  policy into it — the supported knowledge-policy path on OpenCode is
-  still the manual operator shim `python
-  skills/memory/scripts/knowledge/policy.py --text` pasted into
-  OpenCode's own instructions config — no automatic sync, no
-  adapter-rendered policy claim.
-- Documentation: `docs/KNOWLEDGE-ROUTING.md` (the routing truth table —
-  helper contract, per-host gates and cadence, default-off byte-identity,
-  compat fallback, OpenCode policy-note gap); README, `docs/KNOWLEDGE-COMPANION.md`,
-  `skills/memory/SKILL.md`, and `docs/CLAIMS-AUDIT.md` now state PR2 as
-  implemented instead of "not shipped" (PR1's explicit-only, no-injection
-  law unchanged). Pinned by `tests/test_knowledge_policy.py` and
-  `tests/test_knowledge_policy_hooks.py` (helper config resolution,
-  rendering, gates) and `tests/test_knowledge_policy_native.py` (Hermes
-  block, hook payload, dsh pre-step latch/kind/default-off byte-identity).
+## [0.157.0] - 2026-11-15
 
-## [0.157.0] - 2026-11-14
-### Added
-- Knowledge companion, PR1 of the knowledge-companion workstream (explicit,
-  operator-driven, OFF BY DEFAULT): a new early-dispatch `store.py knowledge
-  capture|read|check|status|flush` command family publishes a note you
-  explicitly author as an immutable, content-addressed version to a
-  configured target and records a reserved `knowledge:<target>:<key>` pointer
-  row in the store so the note stays findable, re-readable, and
-  digest-checkable. Nothing activates without a strict `knowledge` object
-  (`enabled` + `targets`, riding the issue #177 config surface) in the
-  store's `config.json`: with no object, `capture`/`read`/`check` refuse with
-  the operator hint (exit 2) and `status` reports `enabled=false`; no journal
-  or queue entry is ever written. Nothing in PR1 injects knowledge content
-  into sessions — the conditional instruction/skill/closeout discovery
-  wiring is PR2 and is NOT shipped (no passive remote fetch, no vault sync).
-- Two target kinds, both provider-neutral and never Obsidian-mandatory:
-  `markdown` (a plain local directory of immutable versions addressed by
-  `<key>/<digest>.md`) and `kb-http` (a minimal custom JSON create/read API
-  implemented by a self-hosted fleet KB; it is deliberately NOT the official
-  Obsidian API or any vendor API). Bodies are secret-screened BEFORE
-  anything is written — any detection refuses the publication (exit 2, no
-  partial write, no journal stake), and a user-supplied `--summary` is
-  screened with the same single pattern source in the same admission step
-  (it rides the pointer row verbatim, so nothing downstream re-scans it);
-  re-running `capture` with the SAME
-  screened input is idempotent — the fixed journal stake is reused, the
-  target create answers `existed_match`, and the pointer CAS reconciles
-  explicitly against the live row (same version+digest is a `noop`; a
-  pointer another writer already advanced goes through the CAS/version
-  law, never a blind noop) — while a different digest under a live intent
-  is refused before the create.
-- Exit-code contract (frozen by tests): `0` completed; `3` pending — a
-  pointer left `pending` or merely `queued` (the immutable version IS
-  published; the pointer is not) and a `flush` that left entries pending,
-  including local-mode leftovers that require remote mode; `2` refusal —
-  usage errors, an invalid or disabled `knowledge` config, an unknown
-  target, a screening refusal, or an unavailable store; `1` failure/conflict
-  — a pointer `cas_stale`/`conflict`, a `rejected` delivery, or a `check`
-  digest mismatch (`check` verifies SHA-256 readback of the canonical bytes:
-  `0` match, `1` drift).
-- Remote mode (`ZMEM_REMOTE_URL`): the knowledge command runs as a helper
-  sidecar and NEVER opens or creates a local store. Pointer ops ride a
-  separate bounded, capability-gated delivery queue — never the core op
-  queue: capability is checked BEFORE enqueue, so an old hub that does not
-  advertise `knowledge_link_v1` leaves the pointer explicitly `pending`
-  with nothing queued and core memory unaffected. `knowledge flush` drains
-  the queue to a capable hub and re-checks the capability before every
-  apply (`pointer_cas_stale`/`pointer_conflict` are distinct receipt codes);
-  local capture applies pointers directly under the same writer lease and
-  schema gates as every other write, while `read`/`check`/`status` open
-  the STORE CONNECTION read-only (their journal/delivery sidecars may
-  still take their advisory locks and create their dirs — sidecar
-  bookkeeping, not a store write).
-- Reserved-source-ref boundary: `knowledge:` joins the reserved
-  `source_ref` prefixes (`organize:`, `card:`). Pointer state mutates only
-  inside the knowledge handler's CAS transaction
-  (`storelib.knowledge.link_pointer`); `add`/`update` hard-refuse a row
-  claiming the prefix (a manually written row could masquerade as a
-  verified pointer), and the sync/import paths DEMOTE such a ref rather
-  than refuse — a synced ref is preserved but never newly verified. The
-  hub's ops engine (and the Hermes MCP server's advertised capabilities)
-  implement the typed `knowledge_link` op as a CLOSED whitelist of pointer
-  metadata (digest as eight 8-hex chunks — never note content, and never
-  server-filesystem path access: the `locator` is relative metadata the
-  hub records but never resolves against its filesystem),
-  namespace-scoped before any pointer-existence lookup (no
-  cross-namespace oracle); the op bypasses the identical-content replay
-  lane, needs the `write` capability for the initial create only
-  (`expected_row_id: null`; the handler CAS refuses a null stake when a
-  verified pointer already exists) and `mutate` for any op supplying a
-  non-null `expected_row_id` stake — an advance or an idempotent noop —
-  and is additive to the protocol (an old hub simply omits it).
-- Documentation: `docs/KNOWLEDGE-COMPANION.md` (config schema, CLI
-  contract, capture pipeline and crash recovery, security posture, limits),
-  a README "Knowledge companion (optional, off by default)" section, and a
-  `SKILL.md` "knowledge — explicit external knowledge companion (PR1)"
-  command section pointing at it.
+### Fixed
+
+- **Update-path dedup fold honesty + exact-only fold gate** (issue
+  #472): `store.py update` no longer claims `new content merged into
+  existing live memory` while dropping the update's content. The update
+  fold now (a) fires only when the update's content is NORMALIZED-EXACT
+  to the keeper (content equality — never similarity; distinct strings
+  can share an embedding, proven by the fake-profile collision probe
+  papa/romeo at similarity=1.000) — every other update lands as its own
+  live row with a skip notice; (b) discloses the content drop on BOTH
+  surfaces when a fold does fire (truthful two-lane wording + a
+  `warnings` entry on `update --json` naming the keeper and
+  similarity); (c) honors the new `ZMEM_UPDATE_FOLD_THRESHOLD` knob
+  (default `1.0` exact-only; below `1.0` opts into near-dup folding
+  above max(knob, `ZMEM_DEDUP_THRESHOLD`) with drop disclosure;
+  malformed values refuse the update at exit 2 before anything is
+  written). The fold decision runs BEFORE the expiry keeper-write
+  guard, so a rejected fold can never mutate the keeper. Adds
+  `update --no-dedup` (local mode; remote use is refused loudly by
+  the queue gate). Sibling fix on the add path: the dedup fold's
+  `already contains this exact content` lane now also requires
+  normalized content equality — colliding embeddings get the near-dup
+  drop disclosure instead of a false exact claim.
+
 ## [0.156.0] - 2026-11-14
 
 ### Fixed

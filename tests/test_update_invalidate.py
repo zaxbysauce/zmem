@@ -428,7 +428,12 @@ class UpdateDedupFoldTest(_StoreCase):
         r = self.store.run("update", "--id", mid, "--content",
                            "identical destination content lives here")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("merged into existing", r.stdout, r.stdout)
+        # Issue #472 wording retarget: the fold now discloses truthfully
+        # (exact-content lane) — this pin proves the fold FIRED (identical
+        # text matched the keeper), replacing the retired false "merged"
+        # phrasing with the same anti-vacuous guarantee.
+        self.assertIn("the identical text is already stored in that row",
+                      r.stdout, r.stdout)
 
         # The target was tombstoned (append-only history still holds).
         old = self.store.row(mid)
