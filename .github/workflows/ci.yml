@@ -337,6 +337,16 @@ jobs:
           fi
           echo "minilm.onnx absent, as expected — suites must pass in degraded mode."
 
+      - name: Fetch pinned provenance base (knowledge policy hooks)
+        shell: bash
+        run: |
+          # test_knowledge_policy_hooks.py pins BASE_REF 5bee7e69 (the PR1
+          # base builder) and self-skips its provenance check when that git
+          # object is unreachable on the shallow checkout (round-3 FB-026).
+          # Fetch the exact commit so provenance RUNS in CI instead of
+          # silently skipping.
+          git fetch --no-tags --depth=1 origin 5bee7e6909cf4e2af98eb6903141f0fc5fbf436d
+
       - name: Run Python test suites
         shell: bash
         run: |
@@ -366,6 +376,18 @@ jobs:
                 echo "::error::$f ran zero tests (collection failure or no-op)"
                 failed=1; failed_list="$failed_list $f(zero-tests)"
               fi
+              # Zero-skip gate for the three knowledge policy suites
+              # (round-3 FB-026): the pinned dsh runtime IS installed in this
+              # job, so every policy leg must RUN — a skip here is a silent
+              # coverage hole, not an environment pass.
+              case "$f" in
+                tests/test_knowledge_policy.py|tests/test_knowledge_policy_hooks.py|tests/test_knowledge_policy_native.py)
+                  if grep -Eq 'skipped=[1-9]' "$log"; then
+                    echo "::error::$f reported skipped tests — policy suites must run with zero skips in CI"
+                    failed=1; failed_list="$failed_list $f(skips)"
+                  fi
+                  ;;
+              esac
             else
               echo "::error::$f failed"
               failed=1; failed_list="$failed_list $f"
