@@ -27,7 +27,7 @@
    },
    "reason": "",
    "telemetry": {
-    "latency_s_total": 4.703,
+    "latency_s_total": 6.298,
     "requests": 0,
     "rows_added": 12,
     "rss_mb_writer_side": 21,
@@ -160,7 +160,7 @@
    "unpinned_fields": []
   }
  ],
- "canonical_decision_digest": "de8bde5a1e978b4ab8bb0477ec37a3088a7286770802fc4342d8b8208cda70fb",
+ "canonical_decision_digest": "bef2d5fb66c08e51682647cd7c9f3fdb62bf9be3b9709776d3786fe613b0849f",
  "evidence_run": {
   "generator": "tests/support/nightly_curator/evidence_run.py",
   "regenerate_command": "python tests/support/nightly_curator/evidence_run.py",
@@ -183,7 +183,7 @@
   "judge_vs_model_reviewed label-coverage gap: the keyword-rule judge emits 3 of the fixture's 5 verdict labels (out_of_scope / was_valid_fixed unreachable), so part of the measured disagreement is structural label mismatch, not verdict error (agrees=8, disagrees=8)"
  ],
  "os_runtime": "win32",
- "raw_artifact_digest": "a906d40a07706d3e75437ee8eb6d2b3c23283cffa247d3b27ba1f56f8a65b7cd",
+ "raw_artifact_digest": "167c5ed92e9bf3d26d3ac4391909fc627aefbf0dcb08f012d1641cc80a556839",
  "rubric": {
   "awaiting_human_labels": true,
   "critical_findings": [],
@@ -338,7 +338,7 @@
      "tokens": 0
     },
     "deterministic-zmem": {
-     "latency_s": 4.703,
+     "latency_s": 6.298,
      "requests": 0,
      "rss_mb_writer_side": 21,
      "storage_bytes": 2310144,
@@ -382,7 +382,7 @@
   }
  },
  "schema": "zmem-nightly-curator-decision-v1",
- "source_sha": "57fc6cf79c4011eba8646ca148be8ab7dcb3f8be",
+ "source_sha": "d2075336c60424f693485ec876cde4aab3e7e22c",
  "staged_rollout": {
   "stage_1_shadow_reporting": "ready (this harness; no live schedule)",
   "stage_2_policy_approved_deterministic_maintenance": "requires maintainer policy approval",
