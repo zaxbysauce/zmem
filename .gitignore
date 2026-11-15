@@ -48,6 +48,7 @@ graphify-out/
 
 # Session scratch (isolated test stores / probe scripts) — never committed.
 /tmp/
+scratch/
 
 # Issue #82 self-corpus probe reports (may embed operator content)
 self-corpus-results.json

@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "91fce6ac3a4ce2b76fdc7d350a56bf1c589809923dbc0d60f92cbb4bb769db1c",
+  "digest": "c0e7c0bd0f982afc485c17eefeacb9249a914eed0a1dc2a38589d1d8421da637",
   "files": {
     ".agents/plugins/marketplace.json": "c4bb20c2ad7aa07ef5f81a88e1f8415d51a36c049c19762908fa672fc52c2c31",
     ".claude-plugin/marketplace.json": "666042eb5a8ebce153cd0f6622d062840cc937c2d530f32d152e78688015a477",
@@ -62,6 +62,7 @@
     "opencode-plugin/package.json": "64c573eb2c32f06eebce9f13c8a68da71e9ba6b8aa00a818566f8c7b60b32ece",
     "scripts/bench_hook_latency.py": "ed77a76b54b97faab045c90a04acb3673651b3243967f1ebb6833c631e1b16be",
     "scripts/canary-schema.json": "8b634ff86023a94847be4c595623b03d23588140286f14c3c1933158a9d29fcd",
+    "scripts/check_work_pr_no_bump.py": "d3b50b242fee0eafdf884ba8d1573ade92a89db9891a5e1678507ad2a3d7bfb2",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_counterfactual.py": "8a3d30350c294c17cdc617efe40f390f39e8d213a665ff7aaeb88f67c3dd1860",
     "scripts/eval_inject_runner.py": "8323141ca4044e90e51277e6b12e5763c7a0ac6b09d9790a27c75dc7db5181db",

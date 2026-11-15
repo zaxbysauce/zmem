@@ -96,6 +96,21 @@ jobs:
         shell: bash
         run: python -m pip install --disable-pip-version-check "jsonschema>=4,<5" "pytest>=8"
 
+      # Release ownership (owner decision 2026-11-15): ordinary work PRs never
+      # reserve release versions — the designated release step assigns them.
+      # This guard fails fast (before the long matrix) when a work PR bumps a
+      # canonical manifest, ending the version-collision retarget ritual for
+      # ordinary merges. `release`-labeled PRs skip it (that is the release
+      # step's own bump, assigned after the work PRs it carries merged).
+      - name: Work-PR version guard
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'release')
+        shell: bash
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          git cat-file -e "$BASE" 2>/dev/null || git fetch --depth=1 origin "$BASE"
+          python scripts/check_work_pr_no_bump.py --base "$BASE"
+
+
       # Issue #159 (Workstream H-2): the MCP transport is a first-class
       # passive lane — install its declared requirements in BOTH matrix jobs
       # so the mcp-gated suites RUN instead of silently skipping (the
