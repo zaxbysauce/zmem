@@ -138,7 +138,15 @@ class Budget:
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """Best-effort process-tree termination per platform (no claim of job-kill)."""
+    """Best-effort process-tree termination per platform (no claim of job-kill).
+
+    POSIX: every harness child is spawned with start_new_session=True (its own
+    process group), so killpg targets ONLY the child's group. The self-group
+    guard below is belt-and-braces: a child that somehow shares OUR process
+    group must never cause killpg to SIGKILL the harness itself (the exact
+    failure that silently cancelled the ubuntu CI lane mid-suite: killing the
+    shared group killed the pytest runner, leaving a step-less 'cancelled' job).
+    """
     try:
         if os.name == "nt":
             subprocess.run(
@@ -147,7 +155,9 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             )
         else:
             import signal
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            child_group = os.getpgid(proc.pid)
+            if child_group != os.getpgid(os.getpid()):
+                os.killpg(child_group, signal.SIGKILL)
     except Exception:
         pass
     finally:
@@ -182,6 +192,9 @@ def run_bounded(
         stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=(os.name != "nt"),  # POSIX: own group so _kill_tree
+        # can never SIGKILL the harness's own process group (the ubuntu CI
+        # cancellation: the timeout probe killed the shared pytest group).
     )
     timed_out = False
     out = b""

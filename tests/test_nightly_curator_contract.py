@@ -787,7 +787,9 @@ def test_resource_privacy():
         proc = subprocess.Popen(
             [sys.executable, "-c", alloc],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=rs.child_env(_MODULE_TMP / "c7-env"), cwd=_MODULE_TMP)
+            env=rs.child_env(_MODULE_TMP / "c7-env"), cwd=_MODULE_TMP,
+            start_new_session=(sys.platform != "win32"))  # own pgroup on POSIX
+        # so the monitor's kill can never take out the pytest runner.
         limiter.attach(proc)
         mon = limiter.monitor_and_terminate(proc, poll_s=0.1, hard_deadline_s=90.0)
         assert "COMPLETED-ALL-ALLOCATIONS" not in mon["stdout"], \
