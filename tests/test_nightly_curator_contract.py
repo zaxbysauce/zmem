@@ -798,11 +798,14 @@ def test_resource_privacy():
         limiter.terminate()
         limiter.close()
 
-    # redaction on every harness surface
+    # redaction on every harness surface (drive-letter path WITHOUT a Users/
+    # home segment: the doc-drift hygiene ratchet forbids home-shaped literals
+    # in tracked files; the production redactor covers any drive-root path)
     probe = ("secret: ghp_0123456789abcdefghijklmnopqrstuvwxyz and path "
-             r"C:\Users\brett\secret.txt" + " and mail a@b.example.com")
+             r"C:\data\secret.txt" + " and mail a@b.example.com")
     red = rs.redact(probe)
-    assert "ghp_0123456789" not in red and "brett" not in red and "a@b.example.com" not in red
+    assert "ghp_0123456789" not in red and r"data\secret" not in red \
+        and "a@b.example.com" not in red
     run = wr.CandidateRun(name="redact-probe", availability="executed")
     run.log_redacted.append(rs.redact(probe))
     joined = json.dumps(run.to_json())
