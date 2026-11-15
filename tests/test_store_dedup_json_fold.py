@@ -70,6 +70,38 @@ class DedupJsonFoldTest(unittest.TestCase):
             env=self.env, capture_output=True, text=True, timeout=180,
         )
 
+    def test_exact_lane_wording_is_truthful(self):
+        """PR #470 closeout critic (c): the exact-match lane (similarity
+        1.000) must say the identical text is already stored in the keeper
+        — never the near-dup wording ('not stored anywhere', false there)
+        nor the --no-dedup advice (following it would create a true
+        duplicate). Committed pin for the sim-conditional branch."""
+        rinit = self._run("init")
+        self.assertEqual(rinit.returncode, 0, rinit.stderr)
+        text = ("exact lane probe quantumflapjack content unique token "
+                "pr 470 check")
+        ra = self._run("add", "--namespace", NS, "--type", "fact",
+                       "--content", text, "--signal", "test")
+        self.assertEqual(ra.returncode, 0, ra.stderr)
+        rb = self._run("add", "--namespace", NS, "--type", "fact",
+                       "--content", text, "--signal", "test")
+        self.assertEqual(rb.returncode, 0, rb.stderr)
+        self.assertIn(
+            "already contains this exact content", rb.stdout,
+            f"the exact-match fold must disclose the content is already "
+            f"stored in the keeper; stdout:\n{rb.stdout}")
+        self.assertNotIn(
+            "--no-dedup", rb.stdout,
+            f"the exact-match lane must not advise --no-dedup (it would "
+            f"create a true duplicate); stdout:\n{rb.stdout}")
+        rs = self._run("search", "--text", "quantumflapjack",
+                       "--namespace", NS)
+        self.assertEqual(rs.returncode, 0, rs.stderr)
+        self.assertIn(
+            "quantumflapjack", rs.stdout,
+            f"the identical content must remain searchable (it IS stored "
+            f"as the keeper); search stdout:\n{rs.stdout}")
+
     def test_fold_under_json_keeps_stdout_machine_readable(self):
         """A near-duplicate fold under --json keeps stdout exactly one
         JSON object (result "deduped") with the human notices on stderr.
