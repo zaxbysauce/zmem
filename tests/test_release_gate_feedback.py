@@ -92,10 +92,12 @@ class IndeterminateInputsTest(unittest.TestCase):
     def test_git_failure_tag_universe_warns(self):
         tmp, repo, git = _scratch_repo(tags=("v0.9.0",))
         try:
-            _bump_and_commit(repo, git)  # claims a target (bumped)
-            with mock.patch.object(gate, "_tag_versions", return_value=None), \
-                 mock.patch.object(gate, "_manifest_blob",
-                                   side_effect=lambda r, ref: "a" if ref == "HEAD" else "b"):
+            _bump_and_commit(repo, git, version="0.6.0")  # claims a target (bumped)
+            # Serialized-release ownership: only a version bump claims the
+            # target, so the git-failure arm is reached with a REAL bump and
+            # real manifests — no garbage-blob mock (that mock compensated
+            # for the retired release_manifest_changed claim path).
+            with mock.patch.object(gate, "_tag_versions", return_value=None):
                 rc, out = _captured(gate.check_manifest_freshness, repo, "HEAD~1")
             self.assertIn("::warning::", out)
             self.assertIn("collision/ordering check skipped", out)
@@ -109,7 +111,8 @@ class IndeterminateInputsTest(unittest.TestCase):
             with mock.patch.object(gate, "_manifest_blob", return_value=None):
                 rc, out = _captured(gate.check_manifest_freshness, repo, "HEAD~1")
             self.assertIn("::warning::", out)
-            self.assertIn("collision trigger is indeterminate", out)
+            self.assertIn("verify-manifest remains authoritative for tree "
+                          "freshness", out)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -213,11 +216,12 @@ class CollisionMatchingTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_equal_version_collision_message_names_the_reemit_remedy(self):
+    def test_equal_version_reemit_passes_fresh_and_bump_names_retag_remedy(self):
         tmp, repo, git = _scratch_repo(version="0.5.0", tags=("v0.5.0",))
         try:
-            # Equal version, only the manifest bytes change (re-emit at HEAD):
-            # the #388 shape. The collision remedy must name the re-emit.
+            # Serialized-release ownership (2026-11-15): an equal-version
+            # re-emit reserves nothing and passes when fresh; the collision
+            # remedy names the retarget only for a real version bump.
             (repo / "hooks" / "a.txt").write_text("s2\n", encoding="utf-8")
             r = subprocess.run(
                 [PYTHON, str(GATE_PY), "--emit-manifest", "--repo-root", str(repo)],
@@ -227,9 +231,9 @@ class CollisionMatchingTest(unittest.TestCase):
             git("commit", "-qm", "reemit")
             r = _freshness(repo, "HEAD~1")
             combined = r.stdout + r.stderr
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn("collision", combined.lower())
-            self.assertIn("revert the re-emit", combined)
+            self.assertEqual(r.returncode, 0,
+                             f"equal-version re-emit must pass: {combined}")
+            self.assertIn("release manifest fresh", combined)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -245,9 +249,11 @@ class UnreleasedCensusHardeningTest(unittest.TestCase):
                 "\ufeff## [Unreleased]\n\n- real entry\n",
                 encoding="utf-8")
             rc, out = _captured(gate.check_unreleased_drift, tmp)
-            self.assertEqual(rc, 1,
-                             "BOM must not void the Unreleased census")
-            self.assertIn("unreleased drift", out)
+            self.assertEqual(rc, 0,
+                             "BOM must not void the Unreleased census: the "
+                             "work-merge accumulation state must still be "
+                             "seen (and passed) with the BOM present")
+            self.assertIn("work merge", out)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

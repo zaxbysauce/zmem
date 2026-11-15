@@ -421,19 +421,19 @@ def head_bumps_version(repo_root: Path) -> bool:
 
 
 def check_unreleased_drift(repo_root: Path) -> int:
-    """Issue #106: fail when merged work sits unserved under [Unreleased].
+    """Serialized-release drift gate (supersedes the issue #106 rule).
 
-    Drift = the CHANGELOG's `## [Unreleased]` section carries content AND
-    HEAD did not bump a manifest version relative to HEAD~1 AND the merge
-    subject carries no [skip release] marker. Order: the CHANGELOG-state
-    check runs first (cheap, history-free — the common clean case never
-    needs git), then the duplicate-heading structural check (issue #364),
-    which deliberately runs BEFORE the marker escape and the content
-    early-exit: empty duplicates are the defect itself (an unmonitored
-    heading), and a cleanup merge resolves the duplication rather than
-    needing to carry it, so the marker cannot bypass this one. The file is
-    decoded utf-8-sig so a BOM before a line-1 heading cannot make the
-    whole census vacuous.
+    Under serialized-release ownership (owner decision 2026-11-15) a WORK
+    merge accumulating notes under `## [Unreleased]` with no version bump is
+    the EXPECTED state — the designated release step promotes those notes
+    when it assigns the version (issue #484). The gate now enforces the
+    RELEASE STEP's hygiene instead: a version bump must consume the section
+    (content + bump = fail: notes not promoted; no content + bump = fail:
+    a release without notes), the [skip release] marker stays an explicit
+    operator escape, and the duplicate-heading structural check (issue #364)
+    runs unconditionally BEFORE any escape — empty duplicates are the defect
+    itself. The file is decoded utf-8-sig so a BOM before a line-1 heading
+    cannot make the whole census vacuous.
     """
     try:
         changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8-sig")
@@ -468,12 +468,13 @@ def check_unreleased_drift(repo_root: Path) -> int:
         print("[release-gate] HEAD carries a version bump — the [Unreleased] "
               "content rides the new release")
         return 0
-    print("::error::unreleased drift: CHANGELOG.md has content under "
-          "## [Unreleased] but HEAD carries no version bump — merged work "
-          "sits unserved (the PR #86–#104 stall, issue #106). Bump every "
-          "host-facing manifest and promote the section, or add "
-          f"{SKIP_RELEASE_MARKER} to the merge subject.")
-    return 1
+    # Serialized-release ownership: a work merge accumulating notes under
+    # ## [Unreleased] with no version bump is the EXPECTED state — the
+    # designated release step promotes them when it assigns the version
+    # (issue #484). Supersedes the issue #106 no-bump failure.
+    print("[release-gate] work merge: ## [Unreleased] notes accumulate for "
+          "the designated release step (serialized-release ownership)")
+    return 0
 
 
 # --- Release-manifest modes (issue #107) --------------------------------------
@@ -804,12 +805,20 @@ def check_manifest_freshness(repo_root: Path, base_ref: str) -> int:
     base_blob = _manifest_blob(repo_root, base_ref)
     if head_blob is None or base_blob is None:
         print(f"::warning::--check-manifest-freshness could not read "
-              f"release-manifest.json at HEAD or {base_ref} — the "
-              f"manifest-changed collision trigger is indeterminate")
-        release_manifest_changed = False
-    else:
-        release_manifest_changed = head_blob != base_blob
-    claims_target = bumped or release_manifest_changed
+              f"release-manifest.json at HEAD or {base_ref} — "
+              f"verify-manifest remains authoritative for tree freshness")
+    # Release ownership (owner decision 2026-11-15): only a host-manifest
+    # version CHANGE claims the release version. An equal-version manifest
+    # re-emit (a work PR re-emitting under the published version after
+    # adding tracked files) reserves nothing and passes when verify_manifest
+    # reports fresh; the collision below fires only on a real version
+    # reservation (issue #354). This deliberately supersedes the #388
+    # equal-version rule on the install path — the release-please migration
+    # (issue #484) re-tethers installs to release refs — and it is paired
+    # with the serialized-release work-PR guard
+    # (scripts/check_work_pr_no_bump.py) so work PRs cannot bump versions
+    # at all.
+    claims_target = bumped
     if claims_target:
         distinct = set(head_versions.values())
         if len(distinct) == 1:

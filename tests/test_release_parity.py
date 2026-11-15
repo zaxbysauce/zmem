@@ -318,23 +318,25 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
         )
 
     def test_step5_drift_fails_on_the_exact_issue_history(self):
-        # The #106 history: 8 merges appended under [Unreleased] while every
-        # manifest sat static at 0.13.1 — no bump, no marker, content present.
+        # SUPERSEDED law (serialized-release ownership, 2026-11-15): the
+        # #106 shape (notes under [Unreleased], no version bump) is now the
+        # EXPECTED work-merge state — the release step promotes the notes
+        # when it assigns the version. The gate keeps its structural teeth
+        # (duplicate headings) and the default mode keeps the newest-section
+        # match; pin the new pass here so the supersession is explicit.
         import tempfile
-        with tempfile.TemporaryDirectory(prefix="zmem-drift-") as td:
+        with tempfile.TemporaryDirectory(prefix="zmem-drift-step5-") as td:
             repo = self._make_repo(Path(td))
-            self._merge(
-                repo,
-                changelog=(
-                    "# Changelog\n\n## [Unreleased]\n\n"
-                    "- merged feature (#86)\n- merged fix (#89)\n\n"
-                    "## [0.13.1] — 2026-08-28\n\nPrior release.\n"),
-                version=None,
-                subject="feat(memory): something user-facing (#86)")
+            # The #106 history shape: notes under [Unreleased], no bump.
+            # The _make_repo fixture leaves [Unreleased] EMPTY, so seed the
+            # notes explicitly before running the gate.
+            (repo / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n- the #106 drifted work\n\n"
+                "## [0.13.1] — 2026-08-28\n\nPrior release.\n",
+                encoding="utf-8")
             r = self._run_gate(repo)
-            self.assertEqual(r.returncode, 1,
-                             f"drift must fail the #106 history:\n{r.stdout}")
-            self.assertIn("::error::", r.stdout)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("work merge", r.stdout)
 
     def test_step2_conventional_bump_promotes_and_passes(self):
         # The repo-convention bump: content PROMOTED out of [Unreleased] into
@@ -403,10 +405,12 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
     def test_drift_negative_paths(self):
         # PRR-006: the two failure paths the original sweep never exercised —
         # (a) CHANGELOG.md unreadable/absent -> error exit 1;
-        # (b) --repo-root on a non-git directory carrying drift content ->
-        # head_bumps_version finds no git history, treats it as NO bump
-        # (strict), no marker -> exit 1. An empty-Unreleased non-git dir
-        # passes at the history-free step (rc 0, no git needed).
+        # (b) --repo-root on a non-git directory carrying [Unreleased]
+        # content -> head_bumps_version finds no git history, treats it as
+        # NO bump, which under serialized-release ownership (2026-11-15) is
+        # the EXPECTED work-merge state: notes accumulate for the release
+        # step (exit 0, "work merge" message). An empty-Unreleased non-git
+        # dir passes at the history-free step (rc 0, no git needed).
         import tempfile
         with tempfile.TemporaryDirectory(prefix="zmem-drift-neg-") as td:
             root = Path(td)
@@ -421,14 +425,16 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
                 "# Changelog\n\n## [Unreleased]\n\n- drift content (#1)\n",
                 encoding="utf-8")
             r = self._run_gate(nogit)
-            self.assertEqual(r.returncode, 1, r.stdout)
-            self.assertIn("::error::unreleased drift", r.stdout)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("work merge", r.stdout)
 
             (nogit / "CHANGELOG.md").write_text(
                 "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] — x\n\nb\n",
                 encoding="utf-8")
             r = self._run_gate(nogit)
             self.assertEqual(r.returncode, 0, r.stdout)
+            # The [Unreleased] heading here is EMPTY (the dated heading
+            # follows immediately), so the empty arm's message is correct.
             self.assertIn("no unreleased drift", r.stdout)
 
     def test_live_repo_drift_mode_reports_a_sane_verdict(self):
