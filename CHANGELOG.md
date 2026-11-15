@@ -82,6 +82,33 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   a README "Knowledge companion (optional, off by default)" section, and a
   `SKILL.md` "knowledge — explicit external knowledge companion (PR1)"
   command section pointing at it.
+## [0.156.0] - 2026-11-14
+
+### Fixed
+
+- **Dedup-fold content-disposition disclosure** (issue #469 AC1): when a
+  `store.py add` folds into an existing row at similarity >= 0.85, the
+  fold now prints an explicit disclosure that the INCOMING content was
+  NOT stored (only metadata merged), naming the existing row id and the
+  fold similarity, with the `--no-dedup` remediation hint - previously
+  the bare "refreshed" notice let operators believe their content was
+  stored while the incoming row was silently discarded. The refresh
+  notice is unchanged and still printed.
+- **Release-evidence stamp-ordering guardrail** (issue #469 AC2): the
+  deepseek evidence parity suite now parses both reports'
+  `generated_at` values and fails closed unless the support report's
+  stamp is strictly after the canary report's (the PR #451 convention,
+  previously policed only by operator memory and violated twice).
+
+### Added
+
+- OpenCode package-version parity test
+  (`tests/test_opencode_package_version_parity.py`) pinning
+  `opencode-plugin/package.json`, both lockfile version fields, and the
+  canonical marketplace entry equal (no prior check covered these
+  surfaces; the retarget found the opencode pair stranded at 0.154.0
+  after the 0.155.0 release).
+
 ## [0.155.0] - 2026-11-14
 ### Fixed
 - Documentation truth pass for the shipped Codex plugin and Hermes capture
