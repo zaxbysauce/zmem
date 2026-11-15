@@ -454,7 +454,8 @@ def _open_sidecar_lock(path: Path, timeout_s: float) -> int:
     :class:`RekeyKnowledgeBusy` when another writer (a capture, flush or
     status in flight) holds the OS lock past the deadline."""
     _ensure_knowledge_package()
-    from knowledge.locking import try_lock_nb
+    _ensure_knowledge_package()
+    from knowledge.locking import LockError, try_lock_nb
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,6 +475,14 @@ def _open_sidecar_lock(path: Path, timeout_s: float) -> int:
                     "that writer exits; retry the rekey once it finishes): "
                     "%r" % (timeout_s, str(path)))
             time.sleep(0.03)
+    except LockError as exc:
+        # F-003: a FATAL locking.LockError (REL-015) must land in the
+        # same fail-closed refusal as contention, so schema.migrate's
+        # defer-and-retry contract covers it (schema.py catches only
+        # RekeyKnowledgeBusy).
+        raise RekeyKnowledgeBusy(
+            "knowledge sidecar lock fatal error (%s): %r"
+            % (exc.__class__.__name__, str(path))) from exc
     except BaseException:
         # The descriptor is owned by THIS attempt: the busy refusal and a
         # FATAL locking.LockError (REL-015) both release it.

@@ -384,6 +384,35 @@ def _journal_quarantine(journal: KnowledgeJournal | None, *, target_id: str,
 # ---------------------------------------------------------------------------
 # capture
 
+_GLOBAL_NEAR_MISS = frozenset(
+    {"global", "userglobal", "users:global", "user_global", "users_global"})
+
+
+def _admit_namespace(namespace: str) -> None:
+    """Pure-string namespace grammar check at admission (F-001).
+
+    Mirrors the write-time admission guard's pure-string rules (empty,
+    near-miss, grammar) without needing a store connection — so a typo'd
+    namespace refuses BEFORE the journal intent, target create, or
+    pointer_queued mark. Raises :class:`WorkflowError`.
+    """
+    if not isinstance(namespace, str) or not namespace.strip():
+        raise WorkflowError(
+            "namespace is empty; use 'user:global' for cross-project "
+            "knowledge or 'project:<name>' for project-scoped")
+    trimmed = namespace.strip()
+    if trimmed.lower() in _GLOBAL_NEAR_MISS:
+        raise WorkflowError(
+            "namespace %r is a near-miss of the global namespace; "
+            "use 'user:global'" % trimmed)
+    import re  # noqa: PLC0415
+    if not re.fullmatch(
+            r"[a-zA-Z][a-zA-Z0-9_:./\-]*", trimmed):
+        raise WorkflowError(
+            "namespace %r contains characters outside the allowed "
+            "grammar (letters, digits, colons, hyphens, underscores, "
+            "slashes, dots)" % trimmed)
+
 
 def capture(*, target_id: str, logical_key: str, text: str,
             summary: str | None = None,
@@ -421,6 +450,14 @@ def capture(*, target_id: str, logical_key: str, text: str,
         document = prepare_document(target_id, logical_key, text)
     except DocumentRejected as exc:
         raise WorkflowError(str(exc)) from exc
+
+    # 1a. Namespace grammar check BEFORE any durable write (F-001): a
+    # typo'd namespace (e.g. "global" near-miss) must refuse at
+    # admission — never after the journal intent, target create, or
+    # pointer_queued mark — because a stranded ACTIVE entry blocks both
+    # the identity and the FB-031 rekey fence. Uses the same pure-string
+    # rules as the write-time admission guard.
+    _admit_namespace(namespace)
 
     note_summary = (summary or "").strip() or _default_summary(document)
     # A user-supplied summary rides the pointer row and the delivery
@@ -672,6 +709,19 @@ def capture(*, target_id: str, logical_key: str, text: str,
                 logical_key=logical_key, namespace=namespace,
                 digest=document.digest) or envelope["journal_state"]
             return envelope
+        except ValueError as exc:
+            # F-001 defense-in-depth: CapturePolicyRefusal (or any other
+            # ValueError from _validate_namespace inside link_pointer)
+            # escapes the typed handlers above. Quarantine the attempt so
+            # the identity can't strand ACTIVE forever, then raise a
+            # typed WorkflowError for the CLI's refusal contract.
+            _journal_quarantine(
+                tracked_journal, target_id=target_id,
+                logical_key=logical_key, namespace=namespace,
+                digest=document.digest)
+            raise WorkflowError(
+                "knowledge capture refused after partial state: %s "
+                "(the attempt has been quarantined)" % str(exc)) from exc
         _journal_mark(tracked_journal, target_id=target_id,
                       logical_key=logical_key, state="applied",
                       namespace=namespace)
@@ -963,8 +1013,16 @@ def _resolve_current(*, mode: str, conn, namespace: str, delivery,
     ref = _ref_for(target_id, logical_key)
     if mode == "local" and conn is not None:
         store_knowledge = _storelib_knowledge()
-        pointer = store_knowledge.get_pointer(
-            conn, namespace, target_id, logical_key)
+        try:
+            pointer = store_knowledge.get_pointer(
+                conn, namespace, target_id, logical_key)
+        except Exception as exc:  # noqa: BLE001 — F-004: typed refusal
+            if isinstance(exc, store_knowledge.KnowledgeError):
+                raise WorkflowError(
+                    "pointer lookup refused for knowledge:%s:%s "
+                    "(namespace %r): %s" %
+                    (target_id, logical_key, namespace, exc)) from exc
+            raise
         if pointer is not None:
             return pointer.locator, pointer.full_sha256, "pointer"
     intent = (delivery.get_intent(ref, namespace=namespace)

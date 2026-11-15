@@ -7237,6 +7237,9 @@ def main():
             except ValueError as exc:
                 print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
                 sys.exit(2)
+            except Exception as exc:  # noqa: BLE001 — F-002: RekeyKnowledgeBusy
+                print(f"[zmem] rekey-namespace: {exc}", file=sys.stderr)
+                sys.exit(2)
         elif args.cmd == "promote":
             # --confirm is a REAL gate, not decoration. Promotion writes a SKILL.md
             # into the review-candidate area, and live installation now needs the
