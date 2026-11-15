@@ -1881,11 +1881,20 @@ def add_memory(
         add_fold_exact = False
         if existing:
             exact_row = conn.execute(
-                "SELECT id FROM memory "
+                "SELECT id, content, tags, type FROM memory "
                 "WHERE namespace=? AND content_norm=? "
-                "AND superseded_at IS NULL LIMIT 1",
+                "AND superseded_at IS NULL "
+                "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                "'knowledge:%') ORDER BY rowid LIMIT 1",
                 (namespace, _normalize_content(content)),
             ).fetchone()
+            if exact_row is not None:
+                # Review r2 N-A: subject-recheck the exact row exactly like
+                # the detector lanes (a vetoed row is not a fold target and
+                # never licenses the "already stored" wording).
+                admitted = _subject_admit(
+                    [(exact_row, 1.0)], tags, type_)
+                exact_row = exact_row if admitted else None
             if exact_row is not None and exact_row["id"] != existing["id"]:
                 print(
                     "[zmem] dedup re-ranked: the top semantic candidate was "
@@ -2922,24 +2931,42 @@ def update_memory(
                 # store's own canonical exact basis (content_norm, live rows
                 # only, same namespace/type window) before declining.
                 exact_row = conn.execute(
-                    "SELECT id FROM memory "
+                    "SELECT id, content, tags, type FROM memory "
                     "WHERE namespace=? AND content_norm=? "
-                    "AND superseded_at IS NULL AND id<>? LIMIT 1",
+                    "AND superseded_at IS NULL AND id<>? "
+                    "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                    "'knowledge:%') ORDER BY rowid LIMIT 1",
                     (ns, _normalize_content(content_eff), mid),
                 ).fetchone()
                 if exact_row is not None:
-                    existing = {"id": exact_row["id"]}
-                    dedup_sim = 1.000
-                    keeper_row = conn.execute(
-                        "SELECT content FROM memory WHERE id=?",
-                        (existing["id"],),
-                    ).fetchone()
-                    fold_is_exact = True
-                    print(
-                        "[zmem] update dedup re-ranked: the top semantic "
-                        f"candidate was not content-exact; folding into the "
-                        f"exact live row {existing['id']} instead"
-                    )
+                    # Review r2 N-A: the re-ranked target must clear the
+                    # SAME #376 subject-identity veto and #463/#466 veto
+                    # print the detector lanes enforce — a subject-
+                    # incompatible or otherwise-vetoed exact row is not a
+                    # fold target; the update lands as its own row instead.
+                    admitted = _subject_admit(
+                        [(exact_row, 1.0)], tags_eff, type_)
+                    if admitted:
+                        existing = {"id": exact_row["id"]}
+                        dedup_sim = 1.000
+                        keeper_row = conn.execute(
+                            "SELECT content FROM memory WHERE id=?",
+                            (existing["id"],),
+                        ).fetchone()
+                        fold_is_exact = True
+                        print(
+                            "[zmem] update dedup re-ranked: the top "
+                            "semantic candidate was not content-exact; "
+                            "folding into the exact live row "
+                            f"{existing['id']} instead"
+                        )
+                    else:
+                        print(
+                            "[zmem] update dedup re-ranked candidate "
+                            f"{exact_row['id']} was content-exact but "
+                            "subject-incompatible; the update lands as "
+                            "its own live row"
+                        )
             should_fold = (
                 fold_is_exact
                 or (fold_threshold < 1.0 and dedup_sim >= fold_threshold)
