@@ -283,7 +283,9 @@ def test_quality_metrics():
 
     doc = rubric.to_json()
     # final-critic F-C1: assert on CONTENTS, not the family-name list — a removed
-    # or emptied metric family must fail by name.
+    # or emptied metric family must fail by name. The CONTENT assertions below
+    # each pin a measured VALUE, so emptying a family's computation fails here
+    # even when the name still appears in the family list.
     m = doc["metrics"]
     assert m["judge_vs_contract_oracle"]["agrees"] == len(corpus.contract_pairs), \
         "judge_vs_contract_oracle must carry measured agrees (content, not name)"
@@ -295,8 +297,29 @@ def test_quality_metrics():
     assert m["model_reviewed_lane"]["cases"] == len(reviewed["cases"]) and \
         "attribution" in m["model_reviewed_lane"]
     assert m["human_lane"]["status"] == "awaiting_human_labels"
+    assert m["authored_lane"]["per_case"]["AQ-003"]["action"] == "refuse", \
+        "grounding: AQ-003 measured boundary action must be refuse (evidence-id precision)"
+    assert m["judge_vs_contract_oracle"]["false_merges"] == 0 and \
+        m["judge_vs_contract_oracle"]["missed_duplicates"] == 0, \
+        "temporal/abstention families carry measured zero-defect values (not absence)"
     for family in me.METRIC_FAMILIES:
-        assert family.split(".")[0] in json.dumps(doc), f"metric family missing: {family}"
+        assert family.split(".")[0] in json.dumps(doc), \
+            f"metric family missing: {family}"
+    # frozen family-list pin: the loop above iterates the (mutable) source list,
+    # so a family DROPPED from metrics.py would pass it vacuously. Pin the exact
+    # set — a removal or addition fails here naming the difference.
+    FROZEN_FAMILIES = {
+        "false_merges", "missed_duplicates", "unsupported_statements",
+        "evidence_id_precision", "temporal_updates", "abstention_quality",
+        "useful_accepted_lessons", "storage_growth", "latency_s", "token_cost",
+        "disagreement.judge_vs_contract_oracle",
+        "disagreement.judge_vs_authored_oracle",
+        "disagreement.judge_vs_model_reviewed",
+        "disagreement.judge_vs_human",
+        "critical_findings",
+    }
+    assert set(me.METRIC_FAMILIES) == FROZEN_FAMILIES, \
+        f"metric family set changed: {set(me.METRIC_FAMILIES) ^ FROZEN_FAMILIES}"
     assert doc["variant_declarations"]["lexical-only/no-model"] == "executed"
     assert doc["variant_declarations"]["quantized"] == "not_claimed"
     assert doc["rubric_digest"] == me.rubric_digest(), "rubric frozen pre-run"
