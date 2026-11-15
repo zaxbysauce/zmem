@@ -158,7 +158,7 @@ def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
 
 
 def _data_dir() -> str:
-    """Resolve the sidecar/log directory using the host's store chain."""
+    """Resolve the decision-log data directory using the host's store chain."""
     store = os.environ.get("ZMEM_STORE", "")
     if store and os.path.dirname(store):
         return os.path.expanduser(os.path.dirname(store))

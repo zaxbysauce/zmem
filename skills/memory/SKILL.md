@@ -151,8 +151,9 @@ store or host config. Checks:
   dirs, `~/.zcode/memory/store.sqlite`); inspect then merge with
   `promote-store --from <path>` — doctor never deletes or migrates
 - canonical namespace for the provided project
-- host surface presence (Claude plugin, ZCode plugin, memory skill; repo-local
-  Codex adapter files are optional until that lane exists)
+- host surface presence (Claude plugin, Codex plugin, ZCode plugin, memory
+  skill — all four are REQUIRED surfaces; a missing Codex plugin file fails
+  `host-surfaces`, and the repo-local Codex adapter lane never shipped)
 - served-tree drift vs `release-manifest.json` (`served-drift` check, issue
   #107): `matched`/`drifted` (warn — first 10 differing paths + both digests)/
   `unknown`-skip when the tree predates 0.17.0 and carries no manifest, and
@@ -643,7 +644,13 @@ slice, so no token is severed). UserPromptSubmit and Hermes prefetch no
 longer append a caller-owned ops tail.
 `ZMEM_QUERY_CONTEXT=0` is the lane kill switch — it stops BOTH composition
 and ring collection (an operator disabling the lane expects no sidecar
-writes). Operation derivation remains store-owned; no operation count crosses
+writes). The ring resolves through the same unified data-dir chain as the
+decision log (`hooks/lib/zmem-recall-body.py::_data_dir()`, which resolves
+the decision-log data directory: a directory-qualified `ZMEM_STORE` parent
+first, then `ZMEM_DATA` / `CLAUDE_PLUGIN_DATA` / `ZCODE_PLUGIN_DATA`, then
+`~/.zmem`) — `read_ops_ring(data_dir, ...)` reads the ring from exactly the
+directory it is given, including plugin-data directories by #88 design.
+Operation derivation remains store-owned; no operation count crosses
 the exact hook envelope. Explicit surfaces (`recall --query`, `search`) are unchanged.
 Limitation (deliberate, see #88): this helps LATER turns only — the first
 tool call of a turn still runs before any operation context exists.
@@ -892,7 +899,9 @@ capped at 8000 encoded bytes (≈2000 tokens at the plugin's 4-chars/token
 estimator; dense multi-byte (CJK) content has less real headroom) — 20% margin under upstream's 2,500-token hook-output spill
 limit (`DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT`, codex-rs output_spill.rs,
 verified against tag rust-v0.153.0); the cap applies even when an operator
-sets a larger `ZMEM_CTX_BUDGET`. Keep the verification-first convention: re-probe
+sets a larger `ZMEM_CTX_BUDGET`. The unset `ZMEM_CTX_BUDGET` default is
+host-dependent: 25000 on the ZCode launcher path, 9000 on the Claude Code
+path and the ZCode non-launcher path. Keep the verification-first convention: re-probe
 with a live tool_name dump before changing the matcher.
 
 Inject surface parity (host facts, not aspirations): Claude Code registers
@@ -1009,7 +1018,9 @@ on PostToolUse parses the same tool_name/tool_input-shaped fields, not the
 response payload. Codex registers SessionStart,
 UserPromptSubmit,
 PreToolUse (matcher `Bash|apply_patch`, probe 2026-09-09, codex-cli
-0.153.0), PostToolUse, Stop, SubagentStart, SubagentStop, and PreCompact —
+0.153.0), PostToolUse (matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|apply_patch`,
+per the shipped `hooks/hooks.codex.json` manifest), Stop, SubagentStart,
+SubagentStop, PreCompact, and SessionEnd —
 the Codex DELEGATION tool surface is UNVERIFIED by #119 (2026-09-10): the
 #95 dump covered only the shell and patch/apply tools and cannot say
 whether a delegation facility fires PreToolUse at all, so no matcher entry

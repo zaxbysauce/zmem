@@ -1,6 +1,10 @@
 {
   "algorithm": "sha256-crlf-norm",
+<<<<<<< HEAD
   "digest": "2d5b6bce1597b59ce32584c67f2e7b68a8c0004ccb6a808c35a39d80d0032339",
+=======
+  "digest": "cf5a9e863d701104b8a86eb449f840b936069f638ed560553f3092a4dbc252e0",
+>>>>>>> origin/main
   "files": {
     ".agents/plugins/marketplace.json": "036c1818b4eb01d5c168869e9e6bac78512172875085b5301c45caab61ee8cab",
     ".claude-plugin/marketplace.json": "d64e9293daf12ba00ca95c56424958d6ba95c6ab96be6f05c7df4ebcb3184234",
@@ -36,7 +40,7 @@
     "hooks/hooks.zcode.json": "8c1f63f4f8be8cd1bf28fe1cb36f5aaf316cb9c293d2db941e6b25b9cf63134c",
     "hooks/lib/zmem-capture-entry.py": "1ccd97cf28f0b5048fb637f050f67fcbb5aa9969202a6dfbd104b81da17e5762",
     "hooks/lib/zmem-log-rotate.py": "d39b64d4b38856771fc91b6a2060ae585028baea6dc2415a9060cc96364f72d0",
-    "hooks/lib/zmem-recall-body.py": "81de92331ca963c779d4110ecf40e75c3959466d26c0a615d528a57f8ec36c1e",
+    "hooks/lib/zmem-recall-body.py": "9de37d427be2d3939fd84c86a972cae9753e4f81fc6f35af67d4f8dd0cdefb10",
     "hooks/lib/zmem-retain-process.py": "2d51fd826c43f96a6b53f60cf274c99156227d05244a4ed8f24fd7937e925639",
     "hooks/lib/zmem-session-start-payload.py": "ac71b58ff7f59eebcb73195286e923fc5db33e78655debb8841b75ad5923d318",
     "hooks/lib/zmem-tilde-expand.sh": "c026ac5d29070a25bfb46aec140b1487908a51d70e8f413934d0265a7e4cbe88",
@@ -86,12 +90,16 @@
     "scripts/release_gate.py": "0cfa3efc35fb665373776aa146d010582bfabda5170a84b25848e86676485f31",
     "skills/closeout-remote/SKILL.md": "72ef37990a67c16fb1e9b12bd1f5bd0d39d0499036e15a3fd7c77cc40456fdf9",
     "skills/closeout/SKILL.md": "2be122a8a51aab69216b09f8eae90190f54f3002e75472662ffd7373907bf053",
+<<<<<<< HEAD
     "skills/memory/SKILL.md": "7598b559543874ff2f938dbdc0f14ca8634e1903debdcfff4dec05098f17fb95",
+=======
+    "skills/memory/SKILL.md": "e10bcfbb1c04d739c7acfbc32de64906420a33afc7793f7a29a219d44c23fb46",
+>>>>>>> origin/main
     "skills/memory/scripts/capture_quality.py": "144952fd06464e4164c6e0ea80cc32a90eb77a3d632934528a5b04842cefe19c",
     "skills/memory/scripts/correction_queue.py": "cfeed1f228488fa926eefc7ad4b9c48ac8370f5ceb29340ed02921ef94c9dbfb",
     "skills/memory/scripts/corrections.py": "cf6ac131d092bb319cf9cfcf762b8384105588c8adb968349c804efb50bbaf7a",
     "skills/memory/scripts/cross_encoder_profiles.py": "8fbada332da7c8710ca402cf7a082d903c55a0d6178084bc44a7bee6fd5f1c9a",
-    "skills/memory/scripts/doctor.py": "67ad98e5b3e8996a24e87dae5ed78a560be11b2e2a1fa71ab3c9833d2822f0a3",
+    "skills/memory/scripts/doctor.py": "7fbf1cd5eb7057b98b0a398bba0e5d37d8c641c99caf1faf4a2ec5245a27e784",
     "skills/memory/scripts/drift.py": "f921c25e49465e85a01c5973beddc1640419fd2306d7b318e9d20bd29c5cce35",
     "skills/memory/scripts/embed_profiles.py": "25472fda70a7fe9c704066d6a9badb0eb60c14350e36c73ed983321958e3157c",
     "skills/memory/scripts/embeddings.py": "dcfdc7750eaf0ffbd8be8cd4f90451da45d4fb4fafeea76661a8a84636e80daf",
