@@ -128,6 +128,29 @@ Field rules:
 If nothing clears the bar, emit an empty array `[]` — do not omit the fenced
 block, and do not pad it with narrative to look productive.
 
+## Knowledge companion notes (conditional, honest handoff)
+
+The `store.py knowledge ...` workflow cannot run here — it needs a
+store-reachable session, so this variant is draft-only by construction.
+When knowledge is in scope — the user asked to save/publish knowledge
+this session, or a closeout the ACTUAL USER requested this session runs
+with the companion enabled — evaluate this session's candidates under the
+`knowledge` skill's bar — long-lived, evidence-cited, curated content
+only; never transcripts or credentials — and do NOT fabricate
+publication, a pointer, or a "captured" claim of any kind (an
+agent-initiated or hook-reminder closeout carries no user authorization
+here either; draft only):
+
+- Deliver the authored note draft (target id, key, curated body with its
+  evidence/sources, derived-or-`user:global` namespace) in your plain
+  reply.
+- State plainly that capture, readback verification, and the pointer must
+  be completed by a store-reachable session running `knowledge capture`.
+- Do not add knowledge fields to the harvest JSON above — its key set is
+  frozen; the note draft rides the reply text, not the harvest.
+
+If knowledge was never in scope, say nothing about knowledge.
+
 ## Never
 
 - Never include secrets, credentials, tokens, API keys, or PII in `content`
@@ -138,6 +161,8 @@ block, and do not pad it with narrative to look productive.
 - Never capture in-trajectory narrative ("first tried X, then Y") — capture
   only the conclusion that would help next time.
 - Never claim a namespace derivation you did not actually check.
+- Never claim a knowledge note was captured, published, or pointed from
+  here — this variant cannot run the knowledge commands at all.
 
 ## Delivery
 

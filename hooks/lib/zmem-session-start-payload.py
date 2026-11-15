@@ -525,6 +525,56 @@ def _promotion_note(store_py):
     return ""
 
 
+# Knowledge companion (PR2): the shared loader lives beside the store CLI
+# (skills/memory/scripts/knowledge/policy.py, stdlib-only, standalone).  A
+# bounded spawn keeps a wedged helper (e.g. a config on a dead share) from
+# delaying the final payload past this cap; the helper itself resolves the
+# client-side config path from the inherited environment.
+_KNOWLEDGE_POLICY_TIMEOUT_S = 2.0
+
+
+def _knowledge_policy_note(store_py):
+    """Render the optional knowledge-companion discovery policy (PR2).
+
+    Off by default: the helper prints nothing unless the store config.json
+    carries a strict ``knowledge.enabled=true`` object, so a default
+    install composes a final payload byte-identical to the pre-knowledge
+    one.  This adapter never reads config.json itself (one loader) and
+    never gates on ZMEM_INJECT - main() already returned when injection is
+    off.  ZMEM_CAPTURE is caller policy: the canonical literal-"0" switch
+    selects the helper's read-only variant (reads stay allowed; no write
+    invitation).  Fail-open on any spawn failure, timeout, nonzero exit,
+    payload sentinel inside the text, or an over-cap (< 200 word) body.
+    """
+    if not store_py or not os.path.isfile(store_py):
+        return ""
+    helper = os.path.join(os.path.dirname(os.path.abspath(store_py)),
+                          "knowledge", "policy.py")
+    if not os.path.isfile(helper):
+        return ""
+    argv = [sys.executable, helper, "--text"]
+    if os.environ.get("ZMEM_CAPTURE", "").strip() == "0":
+        argv.append("--no-capture")
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=_KNOWLEDGE_POLICY_TIMEOUT_S,
+                              check=False)
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    raw = proc.stdout
+    text = (raw.decode("utf-8", "replace").strip()
+            if isinstance(raw, bytes) else str(raw or "").strip())
+    if not text:
+        return ""
+    for marker, _replacement in _NEUTRALIZE:
+        if marker in text:
+            return ""
+    if len(text.split()) >= 200:
+        return ""
+    return text
+
+
 def main():
     core = sys.argv[1] if len(sys.argv) > 1 else ""
     agents = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -611,10 +661,30 @@ def main():
                                 attribution_lane=attribution_lane,
                                 attribution_version=attribution_version)
     promotion = _promotion_note(store_py)
-    final_ctx = _soft_trim("\n\n".join(x for x in
+    # Knowledge companion (PR2): append-only to the FINAL payload.  The
+    # first Tier 0 fast-path emission above is untouched, and the base
+    # context is composed and trimmed exactly as before; the policy is
+    # appended whole or not at all (never truncated mid-policy, never
+    # displacing memory context), so the pre-knowledge payload is always a
+    # byte-identical prefix whenever the policy is absent or over budget.
+    knowledge_policy = _knowledge_policy_note(store_py)
+    final_base = _soft_trim("\n\n".join(x for x in
                             (correction, tier0, tier2, promotion, store_note,
                              nudge, closeout_reminder)
                             if x), budget)
+    if knowledge_policy:
+        # The separator only exists between two sections; an empty base
+        # needs no headroom for it (store_note always accompanies a
+        # spawnable helper, so an empty base is a degenerate edge).
+        separator = 2 if final_base else 0
+        if (budget <= 0 or len(final_base) + separator
+                + len(knowledge_policy) <= budget):
+            final_ctx = (final_base + "\n\n" + knowledge_policy
+                         if final_base else knowledge_policy)
+        else:
+            final_ctx = final_base
+    else:
+        final_ctx = final_base
     payload = {}
     if final_ctx:
         payload["additionalContext"] = final_ctx
