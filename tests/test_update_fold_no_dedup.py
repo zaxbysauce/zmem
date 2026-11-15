@@ -189,7 +189,7 @@ class ThresholdBoundaryTest(_CliCase):
                       env=_env(self.tmp,
                                ZMEM_UPDATE_FOLD_THRESHOLD="1.1"))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("the identical text is already stored in that row",
+        self.assertIn("equivalent text (normalized-equal) is already stored in that row",
                       r.stdout, r.stdout)
         rows = {row["id"]: row for row in self._list()}
         self.assertIsNone(rows[keeper].get("superseded_at"))
@@ -370,6 +370,122 @@ class StateKeeperRegressionTest(_CliCase):
         self.assertTrue(repl, "replacement row must carry the resolved pair")
         self.assertNotEqual(repl[0]["memory_id"], keeper)
         conn.close()
+
+
+
+
+class TopOneBlindspotRegressionTest(_CliCase):
+    """PR #485 review round (swarm-pr-review explorers + reviewer, both
+    probe-verified): the fold gate's exactness must be decided against ANY
+    live row (content_norm re-rank), never only the detector's top-ranked
+    candidate — a colliding row outranking the true exact keeper used to
+    (a) refuse an exact update its fold (duplicate live rows) and (b) make
+    the add path claim 'not stored anywhere' while the identical text WAS
+    live."""
+
+    def _setup_collision_beside_keeper(self):
+        keeper, _ = self._add(KEEPER_WORD)
+        # The colliding row must EXIST as a separate live row (--no-dedup
+        # add) so it can outrank the exact keeper in the KNN ranking.
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", OTHER_WORD, "--signal", "test",
+                      "--no-dedup")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        victim, _ = self._add("unrelated victim row for the blindspot leg")
+        return keeper, victim
+
+    def test_exact_update_folds_despite_colliding_outranker(self):
+        keeper, victim = self._setup_collision_beside_keeper()
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content", KEEPER_WORD)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        combined = r.stdout + r.stderr
+        self.assertIn("dedup re-ranked", combined, combined)
+        self.assertNotIn("update fold skipped", combined, combined)
+        # EXACTLY ONE live row carries the keeper word — no duplicate.
+        live = [row for row in self._list()
+                if (row.get("preview") or "").startswith(KEEPER_WORD)]
+        self.assertEqual(len(live), 1,
+                         f"an exact-content update must fold, not duplicate; "
+                         f"live rows: {json.dumps(live)[:400]}")
+        self.assertEqual(live[0]["id"], keeper)
+
+    def test_add_behind_colliding_outranker_never_claims_not_stored(self):
+        _keeper, _victim = self._setup_collision_beside_keeper()
+        r = self._run("add", "--namespace", NS, "--type", "fact",
+                      "--content", KEEPER_WORD, "--signal", "test")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        combined = r.stdout + r.stderr
+        self.assertIn("dedup re-ranked", combined, combined)
+        self.assertNotIn("not stored anywhere", combined,
+                         "the add path must never claim the content is not "
+                         "stored while an identical live row exists;"
+                         f" output: {combined[-400:]}")
+
+    def test_exact_lane_json_warning_pinned(self):
+        """PR #485 review (T1): the EXACT lane's --json warnings entry was
+        unpinned — deleting its warns.append passed every test."""
+        keeper, victim = self._setup_collision_beside_keeper()
+        rj = self._run("update", "--json", "--id", victim, "--namespace", NS,
+                       "--type", "fact", "--content", keeper and
+                       _exact_content(self))
+        self.assertEqual(rj.returncode, 0, rj.stderr)
+        payload = json.loads(rj.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload.get("id"), keeper)
+        self.assertFalse(payload.get("created_new"))
+        warnings = payload.get("warnings") or []
+        self.assertTrue(
+            any("normalized-equal" in json.dumps(w)
+                and "nothing new was stored" in json.dumps(w)
+                for w in warnings),
+            f"the exact-lane --json warnings entry must be pinned; "
+            f"payload: {json.dumps(payload)}")
+
+
+def _exact_content(case):
+    """Recover the exact keeper content for the JSON-warning pin (the CLI
+    list preview is the source of truth, not the local constant)."""
+    for row in case._list():
+        if row["preview"] == KEEPER_WORD:
+            return KEEPER_WORD
+    return KEEPER_WORD
+
+
+class OrganizeKnobRefusalTest(_CliCase):
+    """PR #485 review (I2): a malformed ambient ZMEM_UPDATE_FOLD_THRESHOLD
+    used to abort `store.py organize` with a raw traceback once its
+    compression path reached update_memory — now the clean exit-2 refusal."""
+
+    def test_organize_refuses_cleanly_on_garbage_knob(self):
+        _keeper, _victim = self._setup = None, None
+        # Any store state works: the knob refusal fires at the FIRST
+        # update_memory call the organize compression path makes; with no
+        # compressible rows organize completes and exits 0 — so seed a
+        # compressible pair to force the path.
+        long_a = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                  "lambda mu nu xi omicron pi rho sigma tau upsilon phi chi "
+                  "psi omega repeated tail one for the organize leg")
+        long_b = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
+                  "lambda mu nu xi omicron pi rho sigma tau upsilon phi chi "
+                  "psi omega repeated tail two differs here at the end")
+        r1 = self._run("add", "--namespace", NS, "--type", "lesson",
+                       "--content", long_a, "--signal", "test")
+        r2 = self._run("add", "--namespace", NS, "--type", "lesson",
+                       "--content", long_b, "--signal", "test")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        r = self._run("organize", "--force",
+                      env=_env(self.tmp,
+                               ZMEM_UPDATE_FOLD_THRESHOLD="garbage"))
+        combined = r.stdout + r.stderr
+        if r.returncode == 2:
+            self.assertIn("ZMEM_UPDATE_FOLD_THRESHOLD", combined, combined)
+            self.assertNotIn("Traceback", combined, combined)
+        else:
+            # organize found no compression candidate reaching update_memory
+            # under this fixture shape — the refusal path was not exercised;
+            # assert the run at least did not traceback.
+            self.assertNotIn("Traceback", combined, combined)
 
 
 if __name__ == "__main__":

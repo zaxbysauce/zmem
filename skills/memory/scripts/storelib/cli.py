@@ -7086,6 +7086,16 @@ def main():
                             conn, dry_run=args.dry_run, force=args.force,
                             prune=args.prune, belief_heads=args.belief_heads,
                             llm_local=args.llm_local)
+                    except ValueError as _vexc:
+                        # PR #485 review: organize's compression/summary
+                        # calls into update_memory can hit the strict
+                        # ZMEM_UPDATE_FOLD_THRESHOLD refusal — surface it
+                        # as the same clean exit-2 refusal the update
+                        # command uses, not a raw traceback.
+                        _release_lock("consolidate", o_token)
+                        o_token = None
+                        print(f"[zmem] {_vexc}", file=sys.stderr)
+                        sys.exit(2)
                     except (_beliefs.BeliefActionError,
                             _beliefs.BeliefAdapterError) as _bexc:
                         _release_lock("consolidate", o_token)

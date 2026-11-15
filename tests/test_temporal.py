@@ -780,7 +780,7 @@ class OccurrenceWriteTest(unittest.TestCase):
                 now="2026-09-10T16:00:00Z")
         self.assertFalse(created_new)
         self.assertEqual(str(upd), keeper_id)
-        self.assertIn("the identical text is already stored in that row",
+        self.assertIn("equivalent text (normalized-equal) is already stored in that row",
                       buf.getvalue(),
                       "the update did not fold at all — pin is vacuous")
         # Retention: the OLD row's occurrence survives its soft tombstone;
@@ -1280,7 +1280,7 @@ class TemporalReviewRegressionTest(unittest.TestCase):
             "--content", "outage during last week at the fold cluster"])
         self.assertEqual(upd.returncode, 0, upd.stderr)
         combined = upd.stdout + upd.stderr
-        self.assertIn("the identical text is already stored in that row",
+        self.assertIn("equivalent text (normalized-equal) is already stored in that row",
                       combined,
                       "the update did not fold at all — pin is vacuous")
         self.assertIn("kept its own occurrence data", combined,

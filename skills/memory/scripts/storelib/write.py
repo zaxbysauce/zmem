@@ -1871,6 +1871,32 @@ def add_memory(
                 )
                 existing = None
 
+        # PR #485 review (top-1 blindspot, add path): the detector's exact
+        # (content_norm) lane never runs once a semantic candidate is
+        # admitted, so a colliding row can outrank the TRUE exact keeper —
+        # the fold then merges metadata into the wrong row and (post-#472)
+        # the disclosure claims "not stored anywhere" while the identical
+        # text IS live. Re-rank against the canonical exact basis (live rows
+        # only) BEFORE the merge, exactly like the update gate.
+        add_fold_exact = False
+        if existing:
+            exact_row = conn.execute(
+                "SELECT id FROM memory "
+                "WHERE namespace=? AND content_norm=? "
+                "AND superseded_at IS NULL LIMIT 1",
+                (namespace, _normalize_content(content)),
+            ).fetchone()
+            if exact_row is not None and exact_row["id"] != existing["id"]:
+                print(
+                    "[zmem] dedup re-ranked: the top semantic candidate was "
+                    "not content-exact; merging into the exact live row "
+                    f"{exact_row['id']} instead"
+                )
+                existing = {"id": exact_row["id"]}
+                dedup_sim = 1.000
+            if exact_row is not None:
+                add_fold_exact = True
+
         if existing:
             # Merge: upgrade confidence/signal if the new add is stronger.
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags, now=tx_now)
@@ -1940,15 +1966,12 @@ def add_memory(
             # embedding (collision probe: two different words fold at
             # similarity=1.000 under the fake profile), and the similarity
             # key would falsely call such content "exactly contained".
-            add_keeper_row = conn.execute(
-                "SELECT content FROM memory WHERE id=?", (existing["id"],)
-            ).fetchone()
-            add_is_exact = bool(
-                add_keeper_row is not None
-                and _normalize_content(content)
-                == _normalize_content(add_keeper_row["content"])
-            )
-            if not add_is_exact:
+            # PR #485 review: the exactness decision now rides the IN-TX
+            # content_norm re-rank above (add_fold_exact), computed against
+            # ANY live row — not a post-commit re-read of the top-1 row
+            # (which both raced a concurrent purge and missed the true exact
+            # keeper sitting behind a colliding candidate).
+            if not add_fold_exact:
                 print(f"[zmem] dedup: existing memory {existing['id']} folded the "
                       f"incoming add — the incoming content was NOT stored "
                       f"(only metadata merged); the incoming content is not "
@@ -1957,9 +1980,9 @@ def add_memory(
                       "(a store.py add flag) to store it as its own row")
             else:
                 print(f"[zmem] dedup: existing memory {existing['id']} already "
-                      f"contains this exact content (similarity={dedup_sim:.3f}) "
-                      "— nothing new was stored; the identical text is already "
-                      "stored in that row")
+                      f"contains this content (normalized-equal; similarity="
+                      f"{dedup_sim:.3f}) — nothing new was stored; the "
+                      "equivalent text is already stored in that row")
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
             return WriteResult(existing["id"], warnings=warns, deduped=True)
@@ -2889,16 +2912,50 @@ def update_memory(
                 and _normalize_content(content_eff)
                 == _normalize_content(keeper_row["content"])
             )
+            if not fold_is_exact:
+                # PR #485 review (top-1 blindspot): the detector returns ONE
+                # top-ranked candidate, and its exact lane never runs once a
+                # semantic candidate is admitted — a colliding row (or a
+                # vector-less keeper, the supported degraded state) can
+                # outrank the TRUE exact keeper, refusing an exact-content
+                # fold and landing a duplicate live row. Re-rank against the
+                # store's own canonical exact basis (content_norm, live rows
+                # only, same namespace/type window) before declining.
+                exact_row = conn.execute(
+                    "SELECT id FROM memory "
+                    "WHERE namespace=? AND content_norm=? "
+                    "AND superseded_at IS NULL AND id<>? LIMIT 1",
+                    (ns, _normalize_content(content_eff), mid),
+                ).fetchone()
+                if exact_row is not None:
+                    existing = {"id": exact_row["id"]}
+                    dedup_sim = 1.000
+                    keeper_row = conn.execute(
+                        "SELECT content FROM memory WHERE id=?",
+                        (existing["id"],),
+                    ).fetchone()
+                    fold_is_exact = True
+                    print(
+                        "[zmem] update dedup re-ranked: the top semantic "
+                        f"candidate was not content-exact; folding into the "
+                        f"exact live row {existing['id']} instead"
+                    )
             should_fold = (
                 fold_is_exact
                 or (fold_threshold < 1.0 and dedup_sim >= fold_threshold)
             )
             if not should_fold:
+                gate_reason = (
+                    "(your ZMEM_UPDATE_FOLD_THRESHOLD="
+                    f"{fold_threshold:g} gate)"
+                    if fold_threshold < 1.0
+                    else "(default: exact content match only; set "
+                         "ZMEM_UPDATE_FOLD_THRESHOLD below 1.0 to fold "
+                         "near-duplicates with disclosure)"
+                )
                 print(
                     f"[zmem] update fold skipped: similarity={dedup_sim:.3f} "
-                    f"does not clear the update fold gate (default: exact "
-                    "content match only; set ZMEM_UPDATE_FOLD_THRESHOLD "
-                    "below 1.0 to fold near-duplicates with disclosure) — "
+                    f"does not clear the update fold gate {gate_reason} — "
                     "the update lands as its own live row"
                 )
                 existing = None
@@ -3000,13 +3057,14 @@ def update_memory(
                 print(
                     f"[zmem] update: {mid} superseded; the update matched "
                     f"existing live memory {dup_id} (similarity="
-                    f"{dedup_sim:.3f}) — the identical text is already "
-                    f"stored in that row; nothing new was stored"
+                    f"{dedup_sim:.3f}) — equivalent text (normalized-equal) "
+                    f"is already stored in that row; nothing new was stored"
                 )
                 warns.append(
                     f"update folded into {dup_id} (similarity="
-                    f"{dedup_sim:.3f}): the update's content is identical "
-                    f"to the existing row; nothing new was stored"
+                    f"{dedup_sim:.3f}): the update's content is "
+                    f"normalized-equal to the existing row; nothing new was "
+                    f"stored"
                 )
             else:
                 print(

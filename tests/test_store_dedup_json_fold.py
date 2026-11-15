@@ -87,7 +87,7 @@ class DedupJsonFoldTest(unittest.TestCase):
                        "--content", text, "--signal", "test")
         self.assertEqual(rb.returncode, 0, rb.stderr)
         self.assertIn(
-            "already contains this exact content", rb.stdout,
+            "already contains this content (normalized-equal", rb.stdout,
             f"the exact-match fold must disclose the content is already "
             f"stored in the keeper; stdout:\n{rb.stdout}")
         self.assertNotIn(

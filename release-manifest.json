@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "511ca2f9ee9ce7c22bb34eb00f2c112958e0965283cda48bf94240ae6628cc37",
+  "digest": "b9ef23bdad24c0edd48bc951e68a5aca16e2faafb612c98d2cd015061791d9f4",
   "files": {
     ".agents/plugins/marketplace.json": "043f4dbd638014c248b73920cfc91dd811b53655fc9906953096732a126cb4c9",
     ".claude-plugin/marketplace.json": "07220cd1c30f8237c267473846fb61eb29d403efe72f6098bbe0c3c6e7781506",
@@ -123,7 +123,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "2284e7552f2bdb31752e2414f8e4546510a70b888e0a41a7890a67a85dfdd300",
     "skills/memory/scripts/storelib/beliefs.py": "4c28a91a82e585c0955b63442b33bde53da6902e87c6d5131b7a0f12cfcbb827",
-    "skills/memory/scripts/storelib/cli.py": "78d13f7e5c70e0597403ad561510d4214e5cb2ccc811cea675df867bbd661f56",
+    "skills/memory/scripts/storelib/cli.py": "ee1d564c69ca072af0e141d09171f061f2f61aec4e26b3998595bd8cd2d7caa0",
     "skills/memory/scripts/storelib/config.py": "36448a1f80cdfc60b5ddd101a679a166f1522ad1e2eb3555139bac351ec7fc38",
     "skills/memory/scripts/storelib/consolidate.py": "0cdb407079f3bf4d82352efe6933f6e1e9d6d23ba518d04d0cde5aa8f1fec04c",
     "skills/memory/scripts/storelib/cross_encoder.py": "175a3cc3cb7241ecc317f1d138863e437ae0585b5112062caf97c94125ba8ed4",
@@ -168,7 +168,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "2bb4eb07d81f05dd86dcab1f4acc2fb1e1d483a689e400d9c1c744114640e88b",
+    "skills/memory/scripts/storelib/write.py": "ee3c615725bf7c9ff7228f0f9d5ad42f42ccccbadf840bd330b1660e92dbb925",
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },
