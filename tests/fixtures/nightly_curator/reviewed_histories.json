@@ -1,0 +1,269 @@
+{
+ "schema": "zmem-nightly-curator-reviewed-histories-v1",
+ "harvest_rule": "Verdict-bearing review comments harvested 2026-11-14 via gh. The 16 cases come from FOUR comments on merged PR #451 and #467/#468 threads (pull/451#issuecomment-6729549997 and 6730207888; pull/467#issuecomment-6869102102; pull/468#issuecomment-6880381443): they are verdict-bearing threads of record, NOT 16 independent histories \u2014 cases from one comment share that comment's reviewer lane and date. PRs #454 and #462 were swept but contributed no verdict-bearing rows. Every verdict is attributed to its model reviewer/critic lane of record; NONE are human labels. human_endorsement is null at ship: the AC2 judge/human disagreement computes only over endorsed cases and otherwise reports awaiting_human_labels (plan-critic Rounds 4-6 interim contract; owner asked twice 2026-11-14, no answer). Provenance identity is the (pr, comment_id, url) triple, captured live at harvest time.",
+ "label_vocabulary": [
+  "supported",
+  "unsupported_by_probe",
+  "pre_existing",
+  "out_of_scope",
+  "was_valid_fixed"
+ ],
+ "cases": [
+  {
+   "id": "RH-001",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane (swarm-pr-review run pr451-20261108-180451)",
+   "claim": "PRR-002: the unsafe-incident-shape allowlist join accepts absolute and dot-dot paths, so a crafted path escapes the allowed root (probe-verified).",
+   "verdict": "supported",
+   "verdict_authorship": "model-lane-verified",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "host-evidence-guard-allowlist"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-002",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane",
+   "claim": "PRR-005: the allowlist path escape allows joining an attacker-controlled capture path outside the guard root.",
+   "verdict": "unsupported_by_probe",
+   "verdict_authorship": "model-lane-rejected",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "host-evidence-guard-allowlist"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-003",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane",
+   "claim": "PRR-007: the release evidence note claiming canary provenance continuity is false for the H1-to-H2 delta.",
+   "verdict": "unsupported_by_probe",
+   "verdict_authorship": "model-lane-rejected",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "release-evidence-provenance"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-004",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane",
+   "claim": "PRR-009: the rotation-clobber defect was introduced by this PR.",
+   "verdict": "pre_existing",
+   "verdict_authorship": "model-lane-rejected-as-pr-introduced",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "log-rotation"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-005",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane",
+   "claim": "PRR-013: the mixed-fence rule must also cover bare .json fences.",
+   "verdict": "out_of_scope",
+   "verdict_authorship": "model-lane-rejected",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "fence-rule-scope"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-006",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane",
+   "claim": "PRR-017: the engines field mismatch was introduced by this PR.",
+   "verdict": "pre_existing",
+   "verdict_authorship": "model-lane-rejected",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "package-engines-field"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-007",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkRzIrQ",
+   "date": "2026-11-09T00:44:33Z",
+   "lane": "5 reviewer shards (Sonnet) + 2 critic shards (Opus), swarm run",
+   "claim": "No CRITICAL or HIGH finding survived validation on PR 451, but two PR-body accuracy problems must be corrected before merge.",
+   "verdict": "supported",
+   "verdict_authorship": "model-lane-verified",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "pr-body-accuracy"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6729549997",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-008",
+   "pr": 451,
+   "comment_id": "IC_kwDOTTD9lc8AAAABkSbSkA",
+   "date": "2026-11-09T01:39:45Z",
+   "lane": "deepseek-v4.1-flash reviewer lane",
+   "claim": "PRR-004: a verified LOW finding exists in the guard surface (via cubic bot claim CUBIC-1).",
+   "verdict": "supported",
+   "verdict_authorship": "model-lane-verified",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "host-evidence-guard"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/451#issuecomment-6730207888",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-009",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger (reviewer/critic lanes disclosed in run artifacts)",
+   "claim": "FB-001: the PR claimed release 0.154.0, colliding with the already-merged PR 467 release.",
+   "verdict": "was_valid_fixed",
+   "verdict_authorship": "model-lane-verified-then-fixed",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "release-version-collision"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-010",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger",
+   "claim": "FB-002: the support report lacked the canary-to-evidence delta disclosure sentence.",
+   "verdict": "was_valid_fixed",
+   "verdict_authorship": "model-lane-verified-then-fixed",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "release-evidence-disclosure"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-011",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger",
+   "claim": "FB-003: the doctor diagnostic printed unbounded names instead of a bounded display path.",
+   "verdict": "was_valid_fixed",
+   "verdict_authorship": "model-lane-verified-then-fixed",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "doctor-diagnostics"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-012",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger",
+   "claim": "FB-008: the registry-warning recording lacked a cap and overflow accounting.",
+   "verdict": "was_valid_fixed",
+   "verdict_authorship": "model-lane-verified-then-fixed",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "doctor-plugin-registries"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-013",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger",
+   "claim": "FB-014: the deepseek plugin prefetch timeout is not configurable in-repo.",
+   "verdict": "unsupported_by_probe",
+   "verdict_authorship": "model-lane-disproved",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "deepseek-prefetch-timeout"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-014",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger",
+   "claim": "FB-015: the duplicate-key rejection defect was introduced by this PR.",
+   "verdict": "pre_existing",
+   "verdict_authorship": "model-lane-disproved-as-pr-introduced",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "host-registry-duplicate-keys"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-015",
+   "pr": 468,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmhpKAw",
+   "date": "2026-11-14T16:09:52Z",
+   "lane": "swarm-pr-feedback ledger + closeout critic fresh fetch (Copilot inline 4571864794/4571864827)",
+   "claim": "FB-016/FB-017: the docs listed a subset of registered hook events and the untrusted-hook comparison covered only the pre-approval event subset.",
+   "verdict": "was_valid_fixed",
+   "verdict_authorship": "model-lane-verified-then-fixed",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "hook-event-docs-truth"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/468#issuecomment-6880381443",
+   "human_endorsement": null
+  },
+  {
+   "id": "RH-016",
+   "pr": 467,
+   "comment_id": "IC_kwDOTTD9lc8AAAABmW4uFg",
+   "date": "2026-11-14T01:09:43Z",
+   "lane": "independent swarm review (model lanes disclosed in run artifacts)",
+   "claim": "The OpenCode plugin writes ZMEM_* variables into the host process.env once, so child hooks inherit the session-scoped environment (UR-001 family, LOW).",
+   "verdict": "supported",
+   "verdict_authorship": "model-lane-verified",
+   "proposal_shape": {
+    "kind": "review_claim",
+    "subject": "opencode-env-inheritance"
+   },
+   "url": "https://github.com/zaxbysauce/zmem/pull/467#issuecomment-6869102102",
+   "human_endorsement": null
+  }
+ ]
+}
