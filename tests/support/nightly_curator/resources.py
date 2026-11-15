@@ -125,9 +125,11 @@ def assert_contained(paths: list[Path], scratch: Path, what: str = "path") -> No
 @dataclass
 class Budget:
     """Finite caps ENFORCED by run_bounded for one bounded child run (AC7):
-    wall-clock timeout, stdout/stderr byte caps, input byte cap, row cap.
-    (Request counting and OS-level memory capping are NOT wired into
-    run_bounded — see MemoryLimiter for the harness-monitored memory path.)"""
+    wall-clock timeout, stdout/stderr byte caps, input byte cap.
+    (Request counting, OS-level memory capping, and the proposal row cap are
+    NOT wired into run_bounded — memory goes through MemoryLimiter's
+    harness-monitored path; max_rows is enforced by the proposal boundary and
+    the orchestration ledger, not here.)"""
 
     timeout_s: float = 120.0
     max_output_bytes: int = 1_000_000

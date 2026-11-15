@@ -785,6 +785,27 @@ def test_cleanup_recovery():
         checkpoint_ids={"r1", "r2"})
     assert ok["checkpoint_rows_match"] is True and ok["contents_match"] is True
 
+    # closeout round-3 pins (final-critic mutation probe): a content-blind or
+    # post-lane-blind comparator must FAIL these — a same-id content swap and
+    # a superseded_at flip both break the checkpoint lane; a duplicated
+    # post-checkpoint row breaks the multiset lane.
+    swap = cu.compare_recovery_contents(
+        base_rows=[("r1", NS, "a", None)],
+        target_rows=[("r1", NS, "CHANGED", None)],
+        checkpoint_ids={"r1"})
+    assert swap["checkpoint_rows_match"] is False and swap["contents_match"] is False
+    flip = cu.compare_recovery_contents(
+        base_rows=[("r1", NS, "a", None)],
+        target_rows=[("r1", NS, "a", "2026-11-15T00:00:00Z")],
+        checkpoint_ids={"r1"})
+    assert flip["checkpoint_rows_match"] is False and flip["contents_match"] is False
+    dup = cu.compare_recovery_contents(
+        base_rows=[("x", NS, "p", None)],
+        target_rows=[("y", NS, "p", None), ("z", NS, "p", None)],
+        checkpoint_ids=set())
+    assert dup["post_checkpoint_rows_match"] is False, dup
+    assert dup["contents_match"] is False
+
 
 # ---------------------------------------------------------------------------
 # C7 / AC7 — resource/privacy bounds
