@@ -127,6 +127,14 @@ class ProposalBoundary:
             return Disposition(action="refuse", reason="malformed_json",
                                proposal_id=pid)
         evidence_ids = list(raw_evidence)
+        # Owner-review Stage-B R-3: nested list fields are type-gated too —
+        # `rows: null` or `subjects: [[]]` get the typed refusal, not an
+        # untyped TypeError from list()/set() coercion.
+        for field in ("memory_ids", "rows", "subjects"):
+            v = proposal.get(field, [])
+            if not isinstance(v, list) or not all(isinstance(e, str) for e in v):
+                return Disposition(action="refuse", reason="malformed_json",
+                                   proposal_id=pid)
         snap_before = self._evidence_snapshot(evidence_ids)
 
         def finish(action: str, reason: str) -> Disposition:

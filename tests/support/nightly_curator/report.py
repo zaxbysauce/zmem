@@ -129,16 +129,22 @@ def build_report(
         "maintainer_evidence_pending": [],
     }
     contract = ((rubric_json.get("metrics") or {}).get("contract_lane") or {})
-    no_false_merges = not contract.get("false_merges")
-    report["go_no_go"]["deterministic_shadow_go"] = bool(
-        no_false_merges and not rubric_json.get("critical_findings"))
-    if not report["go_no_go"]["deterministic_shadow_go"]:
-        report["go_no_go"]["shadow_blockers"] = [
-            f for f in (["measured false merges: " + ", ".join(
-                contract.get("false_merges", []))] if not no_false_merges else [])
-        ] + [
-            f"critical finding: {c}" for c in rubric_json.get("critical_findings", [])
-        ]
+    # Owner-review Stage-B R-6: absence of a measurement is NOT measured-zero.
+    # The shadow GO requires a PRESENT, well-formed false-merge measurement
+    # (an explicit list, possibly empty) plus no critical findings.
+    shadow_blockers: list[str] = []
+    false_merges = contract.get("false_merges")
+    if not isinstance(false_merges, list):
+        shadow_blockers.append("contract lane not measured (no false_merges "
+                               "measurement present)")
+    elif false_merges:
+        shadow_blockers.append(
+            "measured false merges: " + ", ".join(false_merges))
+    for c in rubric_json.get("critical_findings", []):
+        shadow_blockers.append(f"critical finding: {c}")
+    report["go_no_go"]["deterministic_shadow_go"] = not shadow_blockers
+    if shadow_blockers:
+        report["go_no_go"]["shadow_blockers"] = shadow_blockers
     if human.get("status") == "awaiting_human_labels":
         report["maintainer_evidence_pending"].append(
             "AC2 judge/human disagreement: awaiting per-case human labels "

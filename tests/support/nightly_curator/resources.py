@@ -177,9 +177,13 @@ def run_bounded(
 ) -> dict[str, Any]:
     """Run one subprocess under the budget: timeout + tree-kill + output cap.
 
-    Returns {returncode, stdout, stderr, timed_out, output_truncated, duration_s}.
-    Output beyond the cap is TRUNCATED and flagged — never silently dropped, never
-    unbounded.
+    Returns {returncode, stdout, stderr, stderr_truncated, timed_out,
+    output_truncated, duration_s}. RETURNED output beyond the cap is TRUNCATED
+    and flagged, never silently dropped. BOUNDING SCOPE (owner-review R-5):
+    communicate() buffers each stream in harness memory before the cap is
+    applied, so the cap bounds the RETURNED strings, not the child's peak
+    output rate or the harness's transient buffering; a genuinely streaming
+    bound would require incremental reads and is out of scope here.
     """
     import time
 
@@ -213,8 +217,9 @@ def run_bounded(
     truncated = len(out) > budget.max_output_bytes
     if truncated:
         out = out[: budget.max_output_bytes]
-    # Owner-review R-5: stderr is capped identically to stdout — a chatty
-    # child cannot grow the harness without bound on either stream.
+    # Owner-review R-5: stderr is capped identically to stdout in the RETURNED
+    # dict (both streams are buffered by communicate() before this point —
+    # see the BOUNDING SCOPE note in the docstring).
     err_truncated = len(err) > budget.max_output_bytes
     if err_truncated:
         err = err[: budget.max_output_bytes]
