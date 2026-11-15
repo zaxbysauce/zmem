@@ -95,21 +95,44 @@ def _export_via_real_seam(store_path: Path, out_path: Path) -> int:
         conn.close()
 
 
-def _content_set(store_path: Path) -> list[tuple]:
-    """Multiset of (namespace, content, superseded_at) as a sorted list — a
-    plain set would hide row DUPLICATION and drops (owner-review F-2), while
-    ids must NOT be compared across base vs replayed target: replayed CLI adds
-    mint fresh uuids. Row count is carried separately."""
+def _content_rows(store_path: Path) -> list[tuple]:
+    """Full row identity (id, namespace, content, superseded_at), ordered by id
+    (owner-review F-2: identity drift must be visible)."""
     conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
     try:
-        rows = list(
+        return list(
             conn.execute(
-                "SELECT namespace, content, superseded_at FROM memory ORDER BY id"
+                "SELECT id, namespace, content, superseded_at FROM memory ORDER BY id"
             ).fetchall()
         )
     finally:
         conn.close()
-    return sorted(rows)
+
+
+def compare_recovery_contents(
+    base_rows: list[tuple], target_rows: list[tuple], checkpoint_ids: set[str],
+) -> dict[str, Any]:
+    """Identity-preserving comparison (closeout round): rows that existed at
+    checkpoint time keep their ids across restore, so they are compared by
+    FULL identity; post-checkpoint rows legitimately regenerate ids on CLI
+    replay, so those are compared as a (namespace, content, superseded_at)
+    multiset — duplication and drops remain visible in both lanes."""
+    base_by_id = {r[0]: r for r in base_rows}
+    tgt_by_id = {r[0]: r for r in target_rows}
+    checkpoint_rows_match = all(
+        tgt_by_id.get(i) == base_by_id.get(i) for i in checkpoint_ids)
+    base_post = sorted(
+        r[1:] for r in base_rows if r[0] not in checkpoint_ids)
+    tgt_post = sorted(
+        r[1:] for r in target_rows if r[0] not in checkpoint_ids)
+    post_rows_match = base_post == tgt_post
+    return {
+        "checkpoint_rows_match": checkpoint_rows_match,
+        "post_checkpoint_rows_match": post_rows_match,
+        "checkpoint_row_count": len(checkpoint_ids),
+        "post_checkpoint_row_count": len(base_post),
+        "contents_match": checkpoint_rows_match and post_rows_match,
+    }
 
 
 def _evidence_set(store_path: Path) -> list[tuple]:
@@ -143,9 +166,12 @@ def recovery_drill(
     scratch = Path(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
 
-    # 1. checkpoint (file copy) + baseline export
+    # 1. checkpoint (file copy) + baseline export; record the checkpoint-time
+    #    row ids — those rows must keep their identity across restore/replay
+    #    (closeout round: identity-preserving comparison).
     checkpoint = scratch / "checkpoint.sqlite"
     shutil.copy2(base_store, checkpoint)
+    checkpoint_ids = {r[0] for r in _content_rows(base_store)}
     baseline_export = scratch / "baseline.jsonl"
     _export_via_real_seam(base_store, baseline_export)
 
@@ -186,17 +212,20 @@ def recovery_drill(
                 f"replay op failed: {resources.redact(res['stderr'][:200])}"
             )
 
-    # 6. compare ids/evidence/references/op-uniqueness (multiset comparison —
-    #    catches row duplication AND drops; ids excluded, see _content_set)
-    base_contents = _content_set(base_store)
-    target_contents = _content_set(target)
-    contents_match = base_contents == target_contents
+    # 6. compare ids/evidence/references/op-uniqueness: checkpoint rows by
+    #    FULL identity (ids survive restore); post-checkpoint rows as a
+    #    content multiset (replayed CLI adds mint fresh uuids)
+    base_rows = _content_rows(base_store)
+    target_rows = _content_rows(target)
+    comparison = compare_recovery_contents(
+        base_rows, target_rows, checkpoint_ids)
+    contents_match = comparison["contents_match"]
     evidence_match = _evidence_set(base_store) == _evidence_set(target)
 
     # idempotence of replay: the SECOND replay must also SUCCEED (owner-review
     # F-2: a failed replay silently changes nothing and would otherwise count
     # as idempotent) and must not change the row identity list.
-    set_after_first = _content_set(target)
+    rows_after_first = _content_rows(target)
     for op in applied_ops:
         res = resources.run_bounded(
             [sys.executable, str(resources.STORE_PY)] + op["argv"], budget, target_env, cwd=target_dir,
@@ -205,8 +234,8 @@ def recovery_drill(
             raise AssertionError(
                 f"idempotence replay op failed: {resources.redact(res['stderr'][:200])}"
             )
-    set_after_second = _content_set(target)
-    replay_idempotent = set_after_first == set_after_second
+    rows_after_second = _content_rows(target)
+    replay_idempotent = rows_after_first == rows_after_second
 
     forbidden_invoked = sorted({tok for op in applied_ops for tok in op["forbidden"]})
 
@@ -216,6 +245,10 @@ def recovery_drill(
         "second_export": str(second_export),
         "restored_target": str(target),
         "ops_recorded": len(applied_ops),
+        "checkpoint_rows_match": comparison["checkpoint_rows_match"],
+        "post_checkpoint_rows_match": comparison["post_checkpoint_rows_match"],
+        "checkpoint_row_count": comparison["checkpoint_row_count"],
+        "post_checkpoint_row_count": comparison["post_checkpoint_row_count"],
         "forward_recovery_contents_match": contents_match,
         "forward_recovery_evidence_match": evidence_match,
         "replay_idempotent": replay_idempotent,

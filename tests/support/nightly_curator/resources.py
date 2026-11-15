@@ -4,12 +4,16 @@ Single source of truth for:
 - child_env(): FIXED-ALLOWLIST environment builder (nothing inherited beyond the
   allowlist + explicit pins) — plan-critic R2-5.
 - assert_contained(): realpath containment for every scratch path the harness touches.
-- Budget + run_bounded(): finite subprocess time/output/request/input caps with
-  process-tree kill (plan-critic R2-4).
-- Memory enforcement with ACCURATE platform semantics (R3-4): Windows Job Object
-  memory limit (violating commits FAIL; the harness terminates the job explicitly on
-  detected breach — no claim of automatic OS kill on memory overflow) and POSIX
-  RLIMIT_AS per-process caps; aggregate tree monitoring is the harness's job.
+- Budget + run_bounded(): finite wall-clock cap with process-tree kill (plan-critic
+  R2-4); stdout/stderr are CAPPED on the returned strings (post-hoc — communicate()
+  buffers transiently, so the bound applies to what the harness reads, not to
+  transient pipe buffering). ACCURATE SCOPE: run_bounded bounds the strings it
+  returns, not transient buffering.
+- Memory: the ENFORCING mechanism is the harness's process-tree RSS monitor plus
+  explicit termination (MemoryLimiter.mechanism_status defaults to "monitor-only").
+  A Windows Job Object memory limit is attempted opportunistically and its outcome
+  is REPORTED (job-honored / inert-on-host / unavailable-on-host / unknown-on-host),
+  never claimed as the enforcement mechanism. No POSIX RLIMIT_AS is applied.
 - redact(): every logged/report surface routes through redaction.redact_training_text.
 - Consent gating for any remote writer transmission (default OFF; spy-assertable).
 """

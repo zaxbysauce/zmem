@@ -176,6 +176,20 @@ def test_writer_comparison():
     assert ("not configured" in gen.reason) or ("consent" in gen.reason.lower()), \
         f"unconfigured/consent-gated honest reason required: {gen.reason}"
 
+    # Owner-review R-4 committed pin: an endpoint SET but consent ABSENT must
+    # refuse transmission — the general writer cannot run its remote leg, and
+    # no decisions are recorded. The env dict carries ONLY the endpoint, so the
+    # consent key is absent by construction (an ambient consent pair cannot
+    # contaminate this case).
+    r4 = wr.run_candidate("general", corpus, scratch / "gen-r4", _BUDGET,
+                          me.rubric_digest(),
+                          env={rs.GENERAL_WRITER_ENV: "https://api.example.invalid"})
+    assert r4.availability == "unavailable", r4.reason
+    assert "consent" in r4.reason.lower(), \
+        f"endpoint-set/consent-absent must refuse on consent: {r4.reason}"
+    assert not r4.decisions, "consent-refused general writer must record no decisions"
+    assert not r4.telemetry, "consent-refused general writer must record no telemetry"
+
     # identical reader/retrieval/judge/prompt pins across ALL candidates
     digests = {r.name: (r.pins.get("corpus_digest"), r.pins.get("prompt_digest"),
                         r.pins.get("reader_digest"), r.pins.get("judge_digest"))
@@ -737,6 +751,15 @@ def test_cleanup_recovery():
         budget=_BUDGET,
     )
     assert drill["ops_recorded"] == 1
+    # closeout round: identity lanes asserted separately — checkpoint-era rows
+    # keep FULL identity (ids persist across restore); post-checkpoint rows
+    # match as a content multiset (replayed adds mint fresh uuids).
+    assert drill["checkpoint_rows_match"], \
+        "checkpoint-era rows must survive restore with identical ids+content"
+    assert drill["post_checkpoint_rows_match"], \
+        "post-checkpoint rows must replay as an identical content multiset"
+    assert drill["checkpoint_row_count"] == 2, drill  # r1 + r2
+    assert drill["post_checkpoint_row_count"] == 1, drill  # the drill add
     assert drill["forward_recovery_contents_match"], "replayed contents must match"
     assert drill["forward_recovery_evidence_match"], "seeded evidence must survive recovery"
     assert drill["replay_idempotent"], "second replay must add no new distinct content"
@@ -879,6 +902,10 @@ def test_decision_report():
         assert field in rep, f"report missing {field}"
     assert rep["go_no_go"]["model_go"] is False
     assert "unavailable inference yields no score" in rep["go_no_go"]["reason"]
+    # Owner-review R-6 committed pin (positive leg): a MEASURED clean contract
+    # lane (present, empty false_merges) with no critical findings yields a
+    # shadow GO — measured zero, not an absent measurement.
+    assert rep["go_no_go"]["deterministic_shadow_go"] is True, rep["go_no_go"]
     assert any("awaiting per-case human labels" in p
                for p in rep["maintainer_evidence_pending"])
     assert rep["staged_rollout"]["unattended_semantic_apply"].startswith("SEPARATE")
@@ -910,6 +937,25 @@ def test_decision_report():
                            human_label_status=human)
     assert rep4["go_no_go"]["model_go"] is False
     assert "critical findings" in rep4["go_no_go"]["reason"]
+    # Owner-review R-6 committed pins (negative legs): the shadow GO is
+    # DERIVED, and each blocker leg independently blocks it.
+    assert rep4["go_no_go"]["deterministic_shadow_go"] is False
+    assert any("critical finding" in b for b in rep4["go_no_go"].get("shadow_blockers", []))
+
+    rubric_fm = me.Rubric()
+    rubric_fm.metrics["contract_lane"] = {"false_merges": ["p3 merged a distinctive pair"]}
+    rep5 = rp.build_report([det, lex], rubric_fm, source_sha=rep["source_sha"],
+                           os_runtime=rep["os_runtime"], human_label_status=human)
+    assert rep5["go_no_go"]["deterministic_shadow_go"] is False
+    assert any("measured false merges" in b
+               for b in rep5["go_no_go"].get("shadow_blockers", []))
+
+    rubric_unmeasured = me.Rubric()  # no contract_lane metrics at all
+    rep6 = rp.build_report([det, lex], rubric_unmeasured, source_sha=rep["source_sha"],
+                           os_runtime=rep["os_runtime"], human_label_status=human)
+    assert rep6["go_no_go"]["deterministic_shadow_go"] is False
+    assert any("contract lane not measured" in b
+               for b in rep6["go_no_go"].get("shadow_blockers", []))
 
     # write/read round-trip
     dest = rp.write_report(rep, scratch / "out" / "decision-report.json")
