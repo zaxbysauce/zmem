@@ -132,7 +132,13 @@ def _add_row(scratch: Path, env: dict, text: str, subject: str | None, eid: str 
     """
     tags = []
     if subject:
-        tags.append(f"task:{subject}" if not subject.startswith(("lesson:", "file:")) else subject)
+        # ALWAYS prefix task: (the #376 contract's identity convention — its own
+        # harness builds tags the same way). Skipping the prefix for subjects
+        # that already look like "file:..."/"lesson:..." defeats the
+        # subject-aware dedup veto: the different-files pair then folds on the
+        # fake-embedder cosine (observed on a CI windows runner as a
+        # false-merge of a contract pair).
+        tags.append(f"task:{subject}")
     argv = [sys.executable, str(resources.STORE_PY), "add", "--namespace", "project:synthetic/curator",
             "--content", text, "--type", "lesson", "--signal", "test"]
     if tags:
