@@ -194,6 +194,14 @@ def test_quality_metrics():
         f"deterministic writer false-merged contract pairs: {contract}"
     assert contract["missed_duplicates"] == [], \
         f"deterministic writer missed contract duplicates: {contract}"
+    # disagreement-taxonomy pin (review round 1, part-2 novel-mutant gap): the
+    # all-agreeing writer never exercises WHICH label a disagreement earns, so
+    # pin the judge taxonomy directly — a label swap must fail here by name.
+    assert me.judge_pair("two_rows", "one_row") == "false_merge", \
+        "judge taxonomy: merging distinct rows must read as false_merge"
+    assert me.judge_pair("one_row", "two_rows") == "missed_duplicate", \
+        "judge taxonomy: splitting identical rows must read as missed_duplicate"
+    assert me.judge_pair("two_rows", "two_rows") == "agrees"
 
     rubric = me.Rubric()
     rubric.metrics["contract_lane"] = contract
