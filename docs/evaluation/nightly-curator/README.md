@@ -21,10 +21,13 @@ python tests/support/nightly_curator/orchestration.py disable <scratch-cfg-dir>
 ```
 
 Reproducibility proof: run the generator TWICE — the canonical digest is
-identical across runs (verified at the committed head: two consecutive
-regenerations both produced e105c1b455a5dc22aafbc09d815c45080803125d45df8be42f49de224d4e3a35;
-telemetry, per-run logs and the run's own dirty-tree observation are excluded
-from the canonical digest by design and retained only in the raw artifact).
+identical across runs at the same source_sha (two consecutive regenerations
+produce one stable digest; telemetry, per-run logs and the run's own dirty-tree
+observation are excluded from the canonical digest by design and retained only
+in the raw artifact). The committed file's canonical digest is bound to the
+source_sha recorded inside it; regenerating at a NEW head yields a different —
+but equally stable — canonical digest because source_sha is part of the
+canonical content.
 
 ## Evidence run contents
 
@@ -62,12 +65,16 @@ model; its agreement with the model-lane verdicts of record is reported as
   re-runs) and `raw_artifact_digest` (immutable, telemetry included).
 - `go_no_go.model_go` is false while no executed MODEL-BACKED writer exists;
   unavailable inference yields no score and can never produce a model GO.
-- `maintainer_evidence_pending` lists the AC2 judge/human-disagreement evidence
-  gap: the fixture (`tests/fixtures/nightly_curator/reviewed_histories.json`)
-  carries model-attributed verdicts of record (never human; the 16 cases come
-  from four review comments, not 16 independent histories — see its
-  `harvest_rule`); the metric computes only over per-case `human_endorsement`
-  rows, which are empty until the owner annotates or amends the contract (asked
-  twice 2026-11-14, no answer — see the PR body).
+- `maintainer_evidence_pending` lists BOTH parts of AC2's PARTIAL scope:
+  (a) the judge/human-disagreement gap — the fixture
+  (`tests/fixtures/nightly_curator/reviewed_histories.json`) carries
+  model-attributed verdicts of record (never human; the 16 cases come from four
+  review comments, not 16 independent histories — see its `harvest_rule`); the
+  metric computes only over per-case `human_endorsement` rows, empty until the
+  owner annotates or amends the contract (asked twice 2026-11-14, no answer);
+  (b) the three quality families NOT MEASURED (temporal_updates,
+  abstention_quality, useful_accepted_lessons) — the proposal boundary's
+  default review lane does not discriminate those semantics, so they are
+  reported not_measured rather than claimed as agreement. See the PR body.
 - The plan-critic's six-round review trail and the interim-contract boundaries
   are in the PR description.
