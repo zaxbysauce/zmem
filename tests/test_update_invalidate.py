@@ -428,12 +428,15 @@ class UpdateDedupFoldTest(_StoreCase):
         r = self.store.run("update", "--id", mid, "--content",
                            "identical destination content lives here")
         self.assertEqual(r.returncode, 0, r.stderr)
-        # Issue #472 wording retarget: the fold now discloses truthfully
-        # (exact-content lane) — this pin proves the fold FIRED (identical
-        # text matched the keeper), replacing the retired false "merged"
-        # phrasing with the same anti-vacuous guarantee.
-        self.assertIn("the identical text is already stored in that row",
-                      r.stdout, r.stdout)
+        # Issue #472: prove the fold FIRED without pinning either era's
+        # wording — every fold line (base and fixed trees) names the
+        # "existing live memory" keeper, so this anti-vacuous guard holds
+        # on BOTH legs of the PRESERVING replay while the behavioral
+        # assertions below (no second row, tombstone, worst-of taint)
+        # carry the real preservation weight. The exact wording is pinned
+        # by the DISCRIMINATING check (tests/test_update_fold_disclosure.py)
+        # and the unfrozen temporal suites.
+        self.assertIn("existing live memory", r.stdout, r.stdout)
 
         # The target was tombstoned (append-only history still holds).
         old = self.store.row(mid)
