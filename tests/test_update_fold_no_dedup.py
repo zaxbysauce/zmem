@@ -42,6 +42,7 @@ import _store_guard  # noqa: F401  (issue #244 isolation guard)
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -497,47 +498,54 @@ class OrganizeKnobRefusalTest(_CliCase):
 
 
 class UpdateRerankLessonCarveoutTest(_CliCase):
-    """Final-critic r5 R5-2 falsifier: an update WITHOUT --type (type_
-    None -> type_eff 'lesson') must admit the lesson/lesson exact keeper
-    through the re-rank subject check — the raw-type_ form printed a FALSE
-    subject_veto and left a duplicate live row."""
+    """Final-critic r5 R5-2 falsifier (r6-corrected shape): an update
+    WITHOUT --type whose EXACT keeper sits BEHIND a colliding outranker
+    must reach the re-rank and admit the lesson/lesson keeper through the
+    #376 carve-out. The raw-type_ form printed a FALSE subject_veto and
+    left a duplicate live row; the fixture MUST drive the outranker so the
+    re-rank code path (the only _subject_admit call with the type
+    argument) actually executes."""
 
     def test_lesson_carveout_update_folds_without_type_flag(self):
-        import re as _re
         ns = "project:fold472carve"
         env = _env(self.tmp)
-        r1 = self._run("add", "--namespace", ns, "--type", "lesson",
-                       "--content", "carveout keeper text for the rerank leg",
-                       "--tags", "task:alpha", "--signal", "test",
-                       "--no-dedup", env=env)
-        self.assertEqual(r1.returncode, 0, r1.stderr)
-        keeper = _re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
-                            r1.stdout).group(1)
-        r2 = self._run("add", "--namespace", ns, "--type", "fact",
-                       "--content", OTHER_WORD, "--signal", "test",
-                       "--no-dedup", env=env)
-        self.assertEqual(r2.returncode, 0, r2.stderr)
+        # Keeper: the short collision word, typed lesson, tagged task:alpha.
+        rk = self._run("add", "--namespace", ns, "--type", "lesson",
+                       "--content", KEEPER_WORD, "--tags", "task:alpha",
+                       "--signal", "test", "--no-dedup", env=env)
+        self.assertEqual(rk.returncode, 0, rk.stderr)
+        keeper = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
+                           rk.stdout).group(1)
+        # Decoy: the colliding outranker (same embedding bucket).
+        rd_ = self._run("add", "--namespace", ns, "--type", "fact",
+                        "--content", OTHER_WORD, "--signal", "test",
+                        "--no-dedup", env=env)
+        self.assertEqual(rd_.returncode, 0, rd_.stderr)
+        # Victim: a lesson tagged with a DISJOINT task id.
         rv = self._run("add", "--namespace", ns, "--type", "lesson",
-                       "--content", "victim row two for the carveout leg",
+                       "--content", "victim row for the carveout rerank leg",
                        "--tags", "task:beta", "--signal", "test",
                        "--no-dedup", env=env)
-        victim = _re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
-                            rv.stdout).group(1)
-        # NO --type on the update: type_eff resolves to the old row's
-        # 'lesson'; the exact keeper is lesson/lesson (the #376 carve-out).
+        victim = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})",
+                           rv.stdout).group(1)
+        # Update to the EXACT keeper text with NO --type: type_eff resolves
+        # to the victim's 'lesson', the outranker outranks the exact keeper,
+        # and the re-rank must fire and admit lesson/lesson.
         r = self._run("update", "--id", victim, "--namespace", ns,
-                      "--content", "carveout keeper text for the rerank leg",
-                      "--tags", "task:beta", env=env)
+                      "--content", KEEPER_WORD, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         combined = r.stdout + r.stderr
+        self.assertIn("dedup re-ranked", combined,
+                      "the fixture must DRIVE the re-rank (outranker beside "
+                      f"the exact keeper); output: {combined[-400:]}")
         self.assertNotIn("subject_veto", combined,
                          "the lesson/lesson carve-out must admit the exact "
-                         f"keeper; output: {combined[-400:]}")
+                         f"keeper (type_eff, not raw type_); output: "
+                         f"{combined[-400:]}")
         self.assertNotIn("lands as its own live row", combined, combined)
-        live_keep = [row for row in self._list(ns=ns, env=env)
-                     if row["id"] == keeper]
-        self.assertTrue(live_keep and
-                        live_keep[0].get("superseded_at") is None)
+        live = [row for row in self._list(ns=ns, env=env)
+                if row["id"] == keeper]
+        self.assertTrue(live and live[0].get("superseded_at") is None)
 
 
 if __name__ == "__main__":
