@@ -62,6 +62,13 @@ def _env(tmp: str) -> dict:
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
     env["ZMEM_EMBED_PROFILE"] = "fake"
     env["PYTHONIOENCODING"] = "utf-8"
+    # PR #470 review (F-005/OFB-02): strip ambient knobs that gate the
+    # behavior under test or the store child's config — an operator-level
+    # ZMEM_DEDUP_THRESHOLD above the fold similarity suppresses the fold
+    # (misleading false-RED), and an ambient ZMEM_REMOTE_URL flips the
+    # child into remote mode (config error).
+    env.pop("ZMEM_DEDUP_THRESHOLD", None)
+    env.pop("ZMEM_REMOTE_URL", None)
     return env
 
 
@@ -82,7 +89,8 @@ class DedupDisclosureTest(unittest.TestCase):
         disposition: folded into the existing row and NOT stored as its
         own row. RED at base (the disclosure does not exist), GREEN after
         the fix."""
-        self._run("init")
+        rinit = self._run("init")
+        self.assertEqual(rinit.returncode, 0, rinit.stderr)
         ra = self._run("add", "--namespace", NS, "--type", "fact",
                        "--content", CONTENT_A, "--signal", "test")
         self.assertEqual(ra.returncode, 0, ra.stderr)
@@ -105,8 +113,8 @@ class DedupDisclosureTest(unittest.TestCase):
         disclosures = [
             ln for ln in dedup_lines
             if mem_a_id in ln
-            and "incoming" in ln
-            and "not stored" in ln
+            and "incoming" in ln.lower()
+            and "not stored" in ln.lower()
             and re.search(r"similarity=\d+\.\d{3}", ln)
         ]
         if not dedup_lines:
@@ -128,6 +136,16 @@ class DedupDisclosureTest(unittest.TestCase):
         # (not stored) content's distinctive token must be absent from the
         # store (row A's id MAY appear; only the incoming content's
         # absence is asserted).
+        # PR #470 review (F-006/OFB-11): positive control — the search path
+        # must still return rows for STORED content, so the no-match leg
+        # below cannot pass on a regression to unconditional no-match.
+        ra_search = self._run("search", "--text", "pr 467", "--namespace", NS)
+        self.assertEqual(ra_search.returncode, 0, ra_search.stderr)
+        self.assertIn(
+            "pr 467", ra_search.stdout,
+            "positive control: a token of the stored row A must be "
+            f"searchable; search stdout:\n{ra_search.stdout}")
+
         rs = self._run("search", "--text", "zetafold", "--namespace", NS)
         self.assertEqual(rs.returncode, 0, rs.stderr)
         self.assertIn(
