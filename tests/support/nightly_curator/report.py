@@ -25,7 +25,7 @@ RUN_ID_KEYS = {"run_id", "taken_at"}
 # Per-run artifacts that vary across identical-input runs (claude CLI session ids
 # inside redacted logs, scratch paths) — excluded from the canonical digest
 # (final-critic R2-2) but retained in the raw artifact.
-PER_RUN_KEYS = {"log_redacted", "scratch", "duration_s"}
+PER_RUN_KEYS = {"log_redacted", "scratch", "duration_s", "tree_dirty_at_run"}
 
 
 def _canonicalize(node: Any) -> Any:
