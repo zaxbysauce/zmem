@@ -333,9 +333,17 @@ def _run_claude_cli(cfg, corpus, scratch, budget, judge_digest, endpoint, env) -
         payload = json.loads(res["stdout"])
         if isinstance(payload, dict) and payload.get("is_error"):
             run.availability = "unavailable"
-            run.reason = ("endpoint error: " + resources.redact(
-                str(payload.get("result", ""))[:160]))
+            err = resources.redact(str(payload.get("result", ""))[:160])
             run.telemetry["endpoint_error"] = True
+            run.telemetry["by_construction"] = (
+                "the harness child env is hermetic BY DESIGN (scratch HOME/"
+                "USERPROFILE, no credential channel), so the CLI cannot see host "
+                "credentials; authentication failures are expected under this env"
+            )
+            run.reason = (
+                "unavailable by construction: hermetic child env withholds "
+                "credentials (recorded CLI error: " + err + ")"
+            )
             return run
         text = payload.get("result", "") if isinstance(payload, dict) else str(payload)
         start = text.find("{")

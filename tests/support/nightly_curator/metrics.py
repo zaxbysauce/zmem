@@ -110,12 +110,53 @@ def score_contract_lane(corpus, run) -> dict[str, Any]:
     return out
 
 
-def score_authored_lane(decisions: dict[str, str]) -> dict[str, Any]:
+AUTHORED_PROPOSALS = {
+    # Final-critic F-C1: authored cases are scored through REAL ProposalBoundary
+    # dispositions (tests/support/nightly_curator/proposals.py), never by feeding
+    # the expectations back. Each authored case maps to the proposal a curator
+    # writer would emit; the boundary's action is the measured outcome.
+    "AQ-001": {"kind": "dedup_merge", "reason_hint": "update_not_duplicate"},
+    "AQ-002": {"kind": "dedup_merge", "reason_hint": "abstain_to_review"},
+    "AQ-003": {"kind": "novel_lesson", "reason_hint": "reject_ungrounded_evidence_id"},
+    "AQ-004": {"kind": "dedup_merge", "reason_hint": "collate_ok"},
+}
+
+# authored-case expectation -> the boundary action that satisfies it (the
+# mapping is part of the frozen rubric; a mutant that swaps the mapping or the
+# boundary labels fails C2 by name).
+AUTHORED_EXPECTED_ACTIONS = {
+    "AQ-001": "review",   # temporal update: never auto-merged; routed to review
+    "AQ-002": "review",   # ambiguity abstains to review
+    "AQ-003": "refuse",   # fabricated evidence id is refused outright
+    "AQ-004": "review",   # a genuine shared lesson is a review-routed collation
+}
+
+
+def score_authored_lane(boundary_outcomes: dict[str, str]) -> dict[str, Any]:
+    """boundary_outcomes: authored-case id -> the REAL ProposalBoundary action
+    ('refuse' | 'quarantine' | 'review' | 'accept_deterministic')."""
+    per_case = {}
+    agrees = []
+    disagrees = []
+    unsupported = []
+    for cid, action in boundary_outcomes.items():
+        expected = AUTHORED_EXPECTED_ACTIONS.get(cid)
+        ok = expected is not None and action == expected
+        per_case[cid] = {"action": action, "expected": expected, "verdict":
+                         "agrees" if ok else "disagrees"}
+        (agrees if ok else disagrees).append(cid)
+        if cid == "AQ-003" and action == "refuse":
+            unsupported.append(cid)  # ungrounded statement refused = precision hit
     return {
-        "per_case": dict(decisions),
-        "unsupported_statements": [
-            k for k, v in decisions.items() if v == "reject_ungrounded_evidence_id"
-        ],
+        "per_case": per_case,
+        "agrees": agrees,
+        "disagrees": disagrees,
+        "unsupported_statements_refused": unsupported,
+        "judge_vs_authored_oracle": {
+            "cases": len(boundary_outcomes),
+            "agrees": len(agrees),
+            "disagrees": len(disagrees),
+        },
     }
 
 

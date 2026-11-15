@@ -168,6 +168,13 @@ class ProposalBoundary:
         if proposal["kind"] == "novel_lesson":
             if not proposal.get("evidence_ids"):
                 return finish("refuse", "missing_evidence")
+            absent_ev = [e for e in evidence_ids
+                         if self._evidence_snapshot([e]).get(e) == "<absent>"]
+            if absent_ev:
+                # final-critic F-C1: a novel lesson citing fabricated evidence is
+                # refused exactly like an ungrounded merge (evidence-id precision
+                # applies to every evidence-carrying proposal kind).
+                return finish("refuse", "fabricated_evidence_id")
             return finish("review", "needs_review")
 
         if proposal["kind"] == "stale_snapshot_update":

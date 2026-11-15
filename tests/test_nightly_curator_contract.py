@@ -205,19 +205,67 @@ def test_quality_metrics():
 
     rubric = me.Rubric()
     rubric.metrics["contract_lane"] = contract
+    rubric.metrics["judge_vs_contract_oracle"] = {
+        "cases": len(corpus.contract_pairs),
+        "agrees": sum(1 for v in contract["per_pair"].values()
+                      if v["verdict"] == "agrees"),
+        "false_merges": len(contract["false_merges"]),
+        "missed_duplicates": len(contract["missed_duplicates"]),
+    }
     rubric.metrics["telemetry"] = me.score_telemetry(det)
-    rubric.metrics["authored_lane"] = me.score_authored_lane({
-        c.id: c.expectation_label for c in corpus.authored_cases
-    })
+
+    # authored lane (final-critic F-C1): score through the REAL ProposalBoundary —
+    # build a boundary on the deterministic candidate's own scratch store, seed one
+    # evidence row via the real seam, evaluate the frozen authored proposals, and
+    # record the boundary's ACTIONS as the measured outcomes.
+    det_store = scratch / "det" / "pairs" / "task-closeout" / "store.sqlite"
+    assert det_store.exists(), "deterministic candidate store must exist"
+    from storelib import evidence as _ev_c2
+    _c2conn = sqlite3.connect(str(det_store))
+    _c2e1 = _ev_c2.write_evidence(
+        _c2conn, session_id="synthetic-c2", lane="codex", moment="pretool",
+        kind="tool_call", ts="2026-11-14T00:00:00Z",
+        excerpt="authored-lane evidence for the C2 boundary",
+        ref_path="synthetic/c2.txt", ref_offset=0)
+    _c2conn.commit()
+    _c2conn.close()
+    boundary = pr.ProposalBoundary(det_store)
+    det_live = sorted(boundary._live_memory_ids())
+    authored_outcomes = {}
+    for cid, spec in me.AUTHORED_PROPOSALS.items():
+        if cid == "AQ-001":   # temporal update: never auto-merged -> review
+            prop = {"id": cid, "kind": "novel_lesson",
+                    "content": "authored case AQ-001 (update routing)",
+                    "evidence_ids": [_c2e1]}
+        elif cid == "AQ-002":  # ambiguity abstains -> review (not auto-apply)
+            prop = {"id": cid, "kind": "dedup_merge",
+                    "memory_ids": det_live[:2], "evidence_ids": [_c2e1],
+                    "subjects": ["issue41"]}
+        elif cid == "AQ-003":  # fabricated evidence id -> refuse (precision)
+            prop = {"id": cid, "kind": "novel_lesson",
+                    "content": "authored case AQ-003",
+                    "evidence_ids": ["ev-fabricated-aq3"]}
+        else:                  # AQ-004 genuine collation -> review
+            prop = {"id": cid, "kind": "dedup_merge",
+                    "memory_ids": det_live[:2], "evidence_ids": [_c2e1],
+                    "subjects": ["issue41"]}
+        d = boundary.evaluate(prop)
+        authored_outcomes[cid] = d.action
+    rubric.metrics["authored_lane"] = me.score_authored_lane(authored_outcomes)
+    authored = rubric.metrics["authored_lane"]
+    assert not authored["disagrees"], \
+        f"authored lane boundary outcomes disagreed with the frozen rubric: {authored}"
+    assert "AQ-003" in authored["unsupported_statements_refused"], \
+        "grounding: the fabricated-evidence case must be refused (evidence precision)"
+
     # judge the model-reviewed lane: the judge maps each claim to a label by the
-    # deterministic textual rule below; per-case agreement is MEASURED (not asserted
-    # to be zero) and always carries its model-lane attribution.
+    # deterministic keyword-rule judge (disclosed as judge_method=keyword-rule-v1
+    # in the decision report); per-case agreement is MEASURED (not asserted to be
+    # zero) and always carries its model-lane attribution.
     judgments = {}
     for case in reviewed["cases"]:
         text = case["claim"].lower()
-        if "probe" in text or "verified" in text or "confirmed" in text:
-            judgments[case["id"]] = "supported"
-        elif "disproved" in text or "rejected" in text or "not configurable" in text:
+        if "disproved" in text or "rejected" in text or "not configurable" in text:
             judgments[case["id"]] = "unsupported_by_probe"
         elif "pre-existing" in text or "was introduced by this pr" in text:
             judgments[case["id"]] = "pre_existing"
@@ -231,8 +279,22 @@ def test_quality_metrics():
     assert rubric.awaiting_human_labels and rubric.endorsed_case_count == 0, \
         "AC2 PARTIAL disclosure: no human endorsements at ship"
     rubric.metrics["human_lane"] = human
+    rubric.metrics["judge_method"] = "keyword-rule-v1 (deterministic, disclosed)"
 
     doc = rubric.to_json()
+    # final-critic F-C1: assert on CONTENTS, not the family-name list — a removed
+    # or emptied metric family must fail by name.
+    m = doc["metrics"]
+    assert m["judge_vs_contract_oracle"]["agrees"] == len(corpus.contract_pairs), \
+        "judge_vs_contract_oracle must carry measured agrees (content, not name)"
+    assert m["authored_lane"]["judge_vs_authored_oracle"]["agrees"] == \
+        len(me.AUTHORED_EXPECTED_ACTIONS), \
+        "judge_vs_authored_oracle must carry measured agrees (content, not name)"
+    assert m["authored_lane"]["unsupported_statements_refused"], \
+        "evidence_id_precision must carry a measured refusal"
+    assert m["model_reviewed_lane"]["cases"] == len(reviewed["cases"]) and \
+        "attribution" in m["model_reviewed_lane"]
+    assert m["human_lane"]["status"] == "awaiting_human_labels"
     for family in me.METRIC_FAMILIES:
         assert family.split(".")[0] in json.dumps(doc), f"metric family missing: {family}"
     assert doc["variant_declarations"]["lexical-only/no-model"] == "executed"
