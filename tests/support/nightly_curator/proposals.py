@@ -111,9 +111,22 @@ class ProposalBoundary:
             conn.close()
 
     # -- the boundary --------------------------------------------------------
-    def evaluate(self, proposal: dict) -> Disposition:
+    def evaluate(self, proposal: Any) -> Disposition:
+        # Owner-review R-3: shape/type validation happens BEFORE any field
+        # access, so the most obviously malformed inputs get the typed
+        # malformed_json refusal instead of an AttributeError/TypeError
+        # escaping the boundary.
+        if not isinstance(proposal, dict) or not isinstance(
+                proposal.get("kind"), str):
+            return Disposition(action="refuse", reason="malformed_json",
+                               proposal_id="<untypeable>")
         pid = str(proposal.get("id", "<no-id>"))
-        evidence_ids = list(proposal.get("evidence_ids", []))
+        raw_evidence = proposal.get("evidence_ids", [])
+        if not isinstance(raw_evidence, list) or not all(
+                isinstance(e, str) for e in raw_evidence):
+            return Disposition(action="refuse", reason="malformed_json",
+                               proposal_id=pid)
+        evidence_ids = list(raw_evidence)
         snap_before = self._evidence_snapshot(evidence_ids)
 
         def finish(action: str, reason: str) -> Disposition:
@@ -127,11 +140,12 @@ class ProposalBoundary:
                 self.applied_deterministic.append(proposal)
             return d
 
-        raw = json.dumps(proposal, sort_keys=True)
+        try:
+            raw = json.dumps(proposal, sort_keys=True)
+        except (TypeError, ValueError):
+            return finish("refuse", "malformed_json")
         if len(raw.encode("utf-8")) > MAX_PROPOSAL_BYTES:
             return finish("refuse", "oversize_payload")
-        if not isinstance(proposal, dict) or "kind" not in proposal:
-            return finish("refuse", "malformed_json")
 
         text = json.dumps(proposal).lower()
         inj_markers = ("ignore previous instructions", "system prompt",
@@ -153,8 +167,11 @@ class ProposalBoundary:
                 ns = self._memory_namespace(i)
                 if ns and ns != self.namespace:
                     return finish("refuse", "cross_namespace_target")
-            subjects = set(proposal.get("subjects", []))
-            if len(subjects) > 1 and None not in subjects:
+            subjects = {s for s in proposal.get("subjects", []) if s is not None}
+            # Owner-review R-3: two conflicting concrete subjects are refused
+            # even when the list also carries an unknown (None) subject — the
+            # unknown cannot wash out a proven conflict.
+            if len(subjects) > 1:
                 return finish("refuse", "incompatible_subject")
             if not proposal.get("evidence_ids"):
                 return finish("refuse", "missing_evidence")
@@ -181,8 +198,19 @@ class ProposalBoundary:
             return finish("refuse", "stale_snapshot")
 
         if proposal["kind"] == "deterministic_reindex":
-            if len(proposal.get("rows", [])) > self.max_rows:
+            rows = list(proposal.get("rows", []))
+            if len(rows) > self.max_rows:
                 return finish("refuse", "row_cap_exceeded")
+            # Owner-review R-3: even the deterministic path validates that its
+            # rows exist and live in the boundary's namespace — a reindex is an
+            # authorized store action, not a blind one.
+            live = self._live_memory_ids()
+            for r in rows:
+                if r not in live:
+                    return finish("refuse", "fabricated_memory_id")
+                ns = self._memory_namespace(r)
+                if ns and ns != self.namespace:
+                    return finish("refuse", "cross_namespace_target")
             return finish("accept_deterministic", "deterministic_eligible")
 
         return finish("quarantine", "needs_review")

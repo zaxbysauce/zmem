@@ -40,6 +40,11 @@ _MODULE_ENV_PRIOR = {k: os.environ.get(k) for k in (
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_MODELS_DIR", "ZMEM_EMBED_PROFILE",
     "ZMEM_BELIEF_ADAPTER_ACTIONS", "ZMEM_BACKUP_DIR", "ZMEM_DEDUP_THRESHOLD",
     "ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS", "ZMEM_CONSOLIDATE_GROWTH_THRESHOLD",
+    # Owner-review R-4/A-4: the curator consent/endpoint keys MUST be captured
+    # and scrubbed — an ambient consent pair would arm the real remote leg and
+    # make the C1 availability assertions environment-dependent.
+    "ZMEM_CURATOR_GENERAL_WRITER", "ZMEM_CURATOR_TRANSMIT_CONSENT",
+    "ZMEM_CURATOR_TENCENT_WRITER", "ZMEM_CURATOR_LOCAL_ENDPOINT",
 )}
 os.environ["ZMEM_STORE"] = str(_MODULE_TMP / "store.sqlite")
 os.environ["ZMEM_DATA"] = str(_MODULE_TMP)
@@ -47,6 +52,10 @@ os.environ.pop("CLAUDE_PLUGIN_DATA", None)
 os.environ.pop("ZCODE_PLUGIN_DATA", None)
 os.environ.pop("ZMEM_EMBED_PROFILE", None)
 os.environ.pop("ZMEM_BELIEF_ADAPTER_ACTIONS", None)
+os.environ.pop("ZMEM_CURATOR_GENERAL_WRITER", None)
+os.environ.pop("ZMEM_CURATOR_TRANSMIT_CONSENT", None)
+os.environ.pop("ZMEM_CURATOR_TENCENT_WRITER", None)
+os.environ.pop("ZMEM_CURATOR_LOCAL_ENDPOINT", None)
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 os.environ["ZMEM_MODELS_DIR"] = str(_MODULE_TMP / "no-such-models")
 os.environ["ZMEM_CONSOLIDATE_MIN_INTERVAL_DAYS"] = "7.0"
@@ -607,9 +616,12 @@ def test_nightly_orchestration():
     # rotating older sample is capped
     assert len(sched.rotate_old_sample([f"old{i}" for i in range(30)], ["new1"])) == 20
 
-    # run-id idempotence across a repeated night
+    # run-id idempotence across a repeated night: the repeat is REPORTED as
+    # already_applied (owner-review: admit-once accounting is observable in
+    # the decision stream, never silently re-reported as a fresh run).
     again = sched.run_nights([{"index": 5, "run_id": "night-5-fixed"}], ledger)
-    assert again[0].action == "run"  # scheduler admits; ledger already holds it
+    assert again[0].action == "already_applied", again[0]
+    assert again[0].run_id == "night-5-fixed"
 
     # snapshot filter: authz / summaries / contradictions / protection
     rows = [
@@ -698,10 +710,23 @@ def test_cleanup_recovery():
     assert pol["protections"]["low_use_alone_cannot_delete"] is True
     assert "VACUUM" in pol["forbidden_implicit"]
 
-    # full recovery chronology on a real CLI-seeded store
+    # full recovery chronology on a real CLI-seeded store. The base store is
+    # seeded with one ATTACHED EVIDENCE ROW (owner-review F-2: an unseeded
+    # evidence table makes the evidence-preservation leg compare two empty
+    # sets — vacuous).
     base_dir = scratch / "base"
     base_dir.mkdir(parents=True, exist_ok=True)
     _seed_rows(base_dir, [("r1", "Recovery fixture row one.", "issue41", None)])
+    from storelib import evidence as _ev_c6
+    _c6conn = sqlite3.connect(str(base_dir / "store.sqlite"))
+    _c6e1 = _ev_c6.write_evidence(
+        _c6conn, session_id="synthetic-c6", lane="codex", moment="pretool",
+        kind="tool_call", ts="2026-11-15T00:00:00Z",
+        excerpt="recovery drill evidence row",
+        ref_path="synthetic/c6.txt", ref_offset=0)
+    _c6conn.commit()
+    _c6conn.close()
+    _seed_rows(base_dir, [("r2", "Recovery fixture row citing evidence.", "issue41", _c6e1)])
     drill = cu.recovery_drill(
         base_dir / "store.sqlite", scratch / "drill",
         post_mutation_cmds=[
@@ -713,9 +738,10 @@ def test_cleanup_recovery():
     )
     assert drill["ops_recorded"] == 1
     assert drill["forward_recovery_contents_match"], "replayed contents must match"
-    assert drill["forward_recovery_evidence_match"], "evidence must survive recovery"
+    assert drill["forward_recovery_evidence_match"], "seeded evidence must survive recovery"
     assert drill["replay_idempotent"], "second replay must add no new distinct content"
-    assert drill["forbidden_ops_invoked"] == []
+    assert drill["forbidden_ops_invoked"] == [], \
+        "the recorded argv must invoke no forbidden operation"
 
 
 # ---------------------------------------------------------------------------
@@ -773,8 +799,8 @@ def test_resource_privacy():
     # walks past the cap so the monitor provably kills it mid-run.
     limiter = rs.MemoryLimiter(max_memory_mb=96, label="mem-probe")
     assert limiter.mechanism_status in (
-        "job-honored", "inert-on-host", "unknown-on-host",
-        "unavailable-on-host", "posix-rlimit"), limiter.mechanism_status
+        "monitor-only", "job-honored", "inert-on-host",
+        "unknown-on-host", "unavailable-on-host"), limiter.mechanism_status
     alloc = (
         "import time\n"
         "chunks=[]\n"
@@ -889,6 +915,20 @@ def test_decision_report():
     dest = rp.write_report(rep, scratch / "out" / "decision-report.json")
     loaded = json.loads(dest.read_text(encoding="utf-8"))
     assert loaded["schema"] == "zmem-nightly-curator-decision-v1"
+
+    # Owner-review R-7: the COMMITTED evidence artifact's source_sha must be an
+    # ancestor of the current head — a dangling sha means the committed report
+    # cannot be tied to the code that produced it.
+    committed = REPO_ROOT / "docs" / "evaluation" / "nightly-curator" / "decision-report.json"
+    if committed.exists():
+        committed_sha = json.loads(committed.read_text(encoding="utf-8"))["source_sha"]
+        anc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor",
+             committed_sha, "HEAD"], capture_output=True, text=True)
+        assert anc.returncode == 0, (
+            f"committed decision-report source_sha {committed_sha[:12]} is not "
+            "an ancestor of HEAD — regenerate the report at the current head "
+            "(python tests/support/nightly_curator/evidence_run.py)")
 
 
 # ---------------------------------------------------------------------------

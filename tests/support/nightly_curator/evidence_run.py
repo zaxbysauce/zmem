@@ -127,8 +127,18 @@ def main() -> int:
 
     head = subprocess.run(["git", "-C", str(_REPO), "rev-parse", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(_REPO), "status", "--porcelain"],
-                           capture_output=True, text=True).stdout.strip()
+    # Owner-review R-7: the dirty-tree check EXCLUDES the output artifact
+    # itself (the report being regenerated is output, not an input), so a
+    # generation run immediately after committing the harness records
+    # tree_dirty_at_run=false while still flagging any real input drift.
+    REPORT_PATH = "docs/evaluation/nightly-curator/decision-report.json"
+    dirty_lines = [
+        l for l in subprocess.run(
+            ["git", "-C", str(_REPO), "status", "--porcelain"],
+            capture_output=True, text=True).stdout.splitlines()
+        if REPORT_PATH not in l
+    ]
+    dirty = "\n".join(dirty_lines).strip()
     rep = rp.build_report(runs, rubric, source_sha=head, os_runtime=sys.platform,
                           human_label_status=human)
     rep["evidence_run"] = {

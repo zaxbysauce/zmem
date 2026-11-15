@@ -120,14 +120,15 @@ def assert_contained(paths: list[Path], scratch: Path, what: str = "path") -> No
 
 @dataclass
 class Budget:
-    """Finite caps for one bounded child run (AC7)."""
+    """Finite caps ENFORCED by run_bounded for one bounded child run (AC7):
+    wall-clock timeout, stdout/stderr byte caps, input byte cap, row cap.
+    (Request counting and OS-level memory capping are NOT wired into
+    run_bounded — see MemoryLimiter for the harness-monitored memory path.)"""
 
     timeout_s: float = 120.0
     max_output_bytes: int = 1_000_000
-    max_requests: int = 8
     max_input_bytes: int = 64_000
     max_rows: int = 200
-    max_memory_mb: int = 512
     label: str = "child"
 
     def check_input(self, data: bytes) -> None:
@@ -212,10 +213,16 @@ def run_bounded(
     truncated = len(out) > budget.max_output_bytes
     if truncated:
         out = out[: budget.max_output_bytes]
+    # Owner-review R-5: stderr is capped identically to stdout — a chatty
+    # child cannot grow the harness without bound on either stream.
+    err_truncated = len(err) > budget.max_output_bytes
+    if err_truncated:
+        err = err[: budget.max_output_bytes]
     return {
         "returncode": proc.returncode,
         "stdout": out.decode("utf-8", errors="replace"),
         "stderr": err.decode("utf-8", errors="replace"),
+        "stderr_truncated": err_truncated,
         "timed_out": timed_out,
         "output_truncated": truncated,
         "duration_s": round(duration, 3),
@@ -232,27 +239,31 @@ _IS_WINDOWS = os.name == "nt"
 class MemoryLimiter:
     """Process/job memory enforcement with HONEST mechanism accounting.
 
-    Windows: a Job Object commit-memory limit is ATTEMPTED. On hosts where the job
-    mechanism is honored, a child committing past the limit FAILS ITS ALLOCATION
-    (MemoryError) — the OS does NOT auto-kill on memory overflow; the harness
-    detects and terminates explicitly. Some sandboxed hosts virtualize the job
-    APIs into no-ops (SetInformationJobObject returns success but Query does not
-    echo the limit and KILL_ON_CLOSE has no behavioral effect — observed on this
-    box, trace 377 Phase 4): the limiter records mechanism_status="inert-on-host"
-    and enforcement falls to the harness's RSS monitor + explicit termination
-    (poll the child's RSS; kill the tree past the cap) — the same harness-owned
-    aggregate enforcement the plan prescribes. Either way the harness owns the
-    kill decision; no automatic-termination claim is made.
+    THE ENFORCING MECHANISM ON EVERY PLATFORM is this harness's tree-RSS
+    monitor + explicit tree termination (monitor_and_terminate); the harness
+    owns the kill decision and no automatic-termination claim is made.
 
-    POSIX: preexec RLIMIT_AS per-process hard cap (allocation fails) + the same
-    monitored explicit termination.
+    Windows: a Job Object commit-memory limit is additionally ATTEMPTED. On
+    hosts where the job mechanism is honored (mechanism_status="job-honored"),
+    a child committing past the limit FAILS ITS ALLOCATION (MemoryError). Some
+    sandboxed hosts virtualize the job APIs into no-ops (SetInformationJobObject
+    returns success but Query does not echo the limit and KILL_ON_CLOSE has no
+    behavioral effect — observed on this box, trace 377 Phase 4): recorded as
+    "inert-on-host".
+
+    POSIX: no OS-level cap is wired into child spawning; enforcement is the
+    monitored explicit termination alone (mechanism_status stays
+    "monitor-only").
     """
 
     def __init__(self, max_memory_mb: int, label: str = "job"):
         self.max_memory_mb = max_memory_mb
         self.label = label
         self._job: Any = None
-        self.mechanism_status = "posix-rlimit"
+        # Truthful by default (owner-review): the ENFORCING mechanism on every
+        # platform is this harness's tree-RSS monitor + explicit termination;
+        # the OS job attempt below is best-effort and may be inert.
+        self.mechanism_status = "monitor-only"
         if _IS_WINDOWS:
             self._setup_job()
 
@@ -288,17 +299,11 @@ class MemoryLimiter:
             self.mechanism_status = "job-honored"
         self._job = job
 
-    def preexec(self):  # POSIX child setup
-        def _apply():
-            import resource
-            limit = self.max_memory_mb * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-        return _apply if not _IS_WINDOWS else None
-
     def attach(self, proc: subprocess.Popen) -> None:
-        """Assign a started child to the job (Windows). Children assigned before they
-        can execute are inside the limit from their first allocation (on hosts that
-        honor jobs)."""
+        """Assign an already-started child to the job (Windows). NOTE: the
+        assignment happens after Popen returns, so the child's earliest
+        allocations precede the limit; enforcement that must cover the very
+        first allocations needs the harness monitor regardless."""
         if _IS_WINDOWS and self._job is not None:
             import ctypes
             ctypes.windll.kernel32.AssignProcessToJobObject(

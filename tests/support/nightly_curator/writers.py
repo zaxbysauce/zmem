@@ -291,7 +291,15 @@ def run_candidate(
                 run.availability = "unavailable"
                 run.reason = "transmission consent not granted (ZMEM_CURATOR_TRANSMIT_CONSENT != 1)"
             else:
-                run = _run_claude_cli(cfg, corpus, scratch, budget, judge_digest, endpoint, env)
+                # Owner-review R-4: the real transmission path routes through
+                # gate.guard (the mechanism the contract test spies on), so the
+                # consent gate and its invocation ledger cover the reachable
+                # code path, not just the test double.
+                run = gate.guard(
+                    "claude-cli",
+                    _run_claude_cli, cfg, corpus, scratch, budget, judge_digest, endpoint, env)
+                if isinstance(run, dict):  # consent refusal shape from guard()
+                    run = CandidateRun(name="general", **run)
     else:
         raise KeyError(name)
 
@@ -346,15 +354,23 @@ def _run_claude_cli(cfg, corpus, scratch, budget, judge_digest, endpoint, env) -
             run.availability = "unavailable"
             err = resources.redact(str(payload.get("result", ""))[:160])
             run.telemetry["endpoint_error"] = True
-            run.telemetry["by_construction"] = (
-                "the harness child env is hermetic BY DESIGN (scratch HOME/"
-                "USERPROFILE, no credential channel), so the CLI cannot see host "
-                "credentials; authentication failures are expected under this env"
-            )
-            run.reason = (
-                "unavailable by construction: hermetic child env withholds "
-                "credentials (recorded CLI error: " + err + ")"
-            )
+            # Owner-review: the by-construction label applies ONLY to
+            # authentication-shaped errors — other CLI errors (unknown flag,
+            # unknown model, rate limit) are recorded under their own cause
+            # instead of being laundered into the credential-withholding claim.
+            auth_shaped = "log in" in err.lower() or "authenticate" in err.lower()
+            if auth_shaped:
+                run.telemetry["by_construction"] = (
+                    "the harness child env is hermetic BY DESIGN (scratch HOME/"
+                    "USERPROFILE, no credential channel), so the CLI cannot see "
+                    "host credentials; authentication failures are expected here"
+                )
+                run.reason = (
+                    "unavailable by construction: hermetic child env withholds "
+                    "credentials (recorded CLI error: " + err + ")"
+                )
+            else:
+                run.reason = "endpoint error: " + err
             return run
         text = payload.get("result", "") if isinstance(payload, dict) else str(payload)
         start = text.find("{")

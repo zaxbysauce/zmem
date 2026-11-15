@@ -95,24 +95,40 @@ def _export_via_real_seam(store_path: Path, out_path: Path) -> int:
         conn.close()
 
 
-def _content_set(store_path: Path) -> set[tuple]:
+def _content_set(store_path: Path) -> list[tuple]:
+    """Multiset of (namespace, content, superseded_at) as a sorted list — a
+    plain set would hide row DUPLICATION and drops (owner-review F-2), while
+    ids must NOT be compared across base vs replayed target: replayed CLI adds
+    mint fresh uuids. Row count is carried separately."""
     conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
     try:
-        return set(
+        rows = list(
             conn.execute(
                 "SELECT namespace, content, superseded_at FROM memory ORDER BY id"
             ).fetchall()
         )
     finally:
         conn.close()
+    return sorted(rows)
 
 
-def _evidence_set(store_path: Path) -> set[tuple]:
+def _evidence_set(store_path: Path) -> list[tuple]:
     conn = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
     try:
-        return set(conn.execute("SELECT id, excerpt FROM evidence").fetchall())
+        return list(conn.execute("SELECT id, excerpt FROM evidence ORDER BY id").fetchall())
     finally:
         conn.close()
+
+
+_FORBIDDEN_OP_TOKENS = ("purge", "vacuum", "rekey", "restore", "drop")
+
+
+def _forbidden_ops_in(argv: list[str]) -> list[str]:
+    """Derive forbidden-operation usage from the RECORDED argv (owner-review
+    F-2: the drill reports what its recorded commands actually invoke, never a
+    hardcoded constant)."""
+    joined = " ".join(str(a).lower() for a in argv)
+    return [tok for tok in _FORBIDDEN_OP_TOKENS if f" {tok}" in f" {joined}"]
 
 
 def recovery_drill(
@@ -134,7 +150,6 @@ def recovery_drill(
     _export_via_real_seam(base_store, baseline_export)
 
     # 2. perform + record post-checkpoint mutations (real CLI, real env)
-    base_dir_env = resources.child_env(base_store.parent, extra={"ZMEM_EMBED_PROFILE": "fake"})
     applied_ops: list[dict] = []
     for argv in post_mutation_cmds:
         res = resources.run_bounded(
@@ -145,7 +160,8 @@ def recovery_drill(
             raise AssertionError(
                 f"post-checkpoint mutation failed: {resources.redact(res['stderr'][:200])}"
             )
-        applied_ops.append({"argv": [str(a) for a in argv]})
+        applied_ops.append({"argv": [str(a) for a in argv],
+                            "forbidden": _forbidden_ops_in(argv)})
 
     # 3. second consistent export (contains the mutations)
     second_export = scratch / "after.jsonl"
@@ -170,22 +186,29 @@ def recovery_drill(
                 f"replay op failed: {resources.redact(res['stderr'][:200])}"
             )
 
-    # 6. compare ids/evidence/references/op-uniqueness
+    # 6. compare ids/evidence/references/op-uniqueness (multiset comparison —
+    #    catches row duplication AND drops; ids excluded, see _content_set)
     base_contents = _content_set(base_store)
     target_contents = _content_set(target)
     contents_match = base_contents == target_contents
     evidence_match = _evidence_set(base_store) == _evidence_set(target)
 
-    # idempotence of replay: replaying the SAME op set again must not add any NEW
-    # distinct content (dedup folds identical re-adds; the set must be unchanged
-    # between the first and second replay).
+    # idempotence of replay: the SECOND replay must also SUCCEED (owner-review
+    # F-2: a failed replay silently changes nothing and would otherwise count
+    # as idempotent) and must not change the row identity list.
     set_after_first = _content_set(target)
     for op in applied_ops:
-        resources.run_bounded(
+        res = resources.run_bounded(
             [sys.executable, str(resources.STORE_PY)] + op["argv"], budget, target_env, cwd=target_dir,
         )
+        if res["returncode"] != 0:
+            raise AssertionError(
+                f"idempotence replay op failed: {resources.redact(res['stderr'][:200])}"
+            )
     set_after_second = _content_set(target)
     replay_idempotent = set_after_first == set_after_second
+
+    forbidden_invoked = sorted({tok for op in applied_ops for tok in op["forbidden"]})
 
     return {
         "checkpoint": str(checkpoint),
@@ -196,6 +219,6 @@ def recovery_drill(
         "forward_recovery_contents_match": contents_match,
         "forward_recovery_evidence_match": evidence_match,
         "replay_idempotent": replay_idempotent,
-        "forbidden_ops_invoked": [],
+        "forbidden_ops_invoked": forbidden_invoked,
         "policy": policy_matrix(),
     }

@@ -42,15 +42,16 @@ inside it, with:
 - `local-endpoint` — `unavailable` (no loopback endpoint configured).
 - `tencent` — `unavailable` (no endpoint configured anywhere in-repo).
 - `general` (claude-cli) — with no caller env it records
-  `ZMEM_CURATOR_GENERAL_WRITER not configured`; when the caller DOES set the
-  endpoint + `ZMEM_CURATOR_TRANSMIT_CONSENT=1`, the leg is still `unavailable`
-  BY CONSTRUCTION: the harness's hermetic child env (scratch HOME/USERPROFILE,
-  no credential channel) withholds host credentials by design, so the CLI cannot
-  authenticate inside the harness (recorded CLI error: `Not logged in`). Logging
-  in on the host cannot change this; measuring this leg would require a
-  deliberately-designed credential channel that only opens under transmission
-  consent — out of scope for this evaluation (see the PR body's
-  Considered-not-filed table).
+  `ZMEM_CURATOR_GENERAL_WRITER not configured`. The committed artifact records
+  the not-configured state; when an operator DOES set the endpoint +
+  `ZMEM_CURATOR_TRANSMIT_CONSENT=1` and the CLI then fails to authenticate
+  inside the harness, the leg records `unavailable by construction` with the
+  CLI's own error text: the harness's hermetic child env (scratch
+  HOME/USERPROFILE, fixed allowlist with no credential channel) withholds host
+  credentials by design, so host login state cannot authenticate the harness
+  child. Measuring this leg would require a deliberately-designed credential
+  channel that only opens under transmission consent — out of scope for this
+  evaluation (see the PR body's Considered-not-filed table).
 
 ## Judge method (disclosed)
 

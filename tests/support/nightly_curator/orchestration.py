@@ -1,29 +1,41 @@
 """Bounded nightly shadow-orchestration prototype (#377 AC5 + AC4 apply protocol).
 
-The fixed apply sequence (plan Rev 6; critic R2-2):
+HONEST SCOPE (owner-review round: modeled vs enforced, stated plainly):
+- The apply protocol is a LEDGER-ONLY SKELETON: `apply_authorized_work` proves
+  lock acquisition (the REAL production "consolidate" lock, fail-closed),
+  in-transaction revalidation, and admit-once idempotence — it does NOT mutate
+  the store (no authorized deterministic work exists yet to apply). The ledger
+  and the store commit on SEPARATE connections and are NOT atomic across a
+  crash between them; a real apply path must close that window before any
+  production use.
+- Ownership is MODELED by the run-ledger's recorded owner + the contract
+  spec's assertions; the scheduler does not compare owners at runtime.
+- The scheduler (ShadowScheduler) is a SCRIPTED fake-clock evaluation fixture:
+  window/DST/ownership/cadence semantics are exercised by the contract spec —
+  C4 drives the REAL consolidate._cadence_gate_skipped via seeded meta; the
+  scheduler loop itself does not call the gate.
+
+The fixed apply sequence:
   snapshot (one-shot read, cursors closed, conn closed)
   -> inference (NO db connection, NO lock held)
-  -> ownership check (only the configured authoritative owner schedules; ownership is
-     immutable per run, recorded in the run ledger)
-  -> acquire the REAL production lock NAME ("consolidate") on the isolated store via
-     host.acquire_lock with the production _lock_path scheme — FAIL-CLOSED on None or
-     the degraded "unlocked" token
-  -> BEGIN IMMEDIATE -> revalidate revisions/retractions INSIDE the transaction ->
-     idempotent apply (admit-once run-id ledger) -> COMMIT -> release.
+  -> acquire the REAL production lock NAME ("consolidate") on the isolated
+     store via host.acquire_lock with the production _lock_path scheme —
+     FAIL-CLOSED on None or the degraded "unlocked" token
+  -> BEGIN IMMEDIATE -> revalidate revisions/retractions INSIDE the
+     transaction -> admit-once ledger entry -> COMMIT -> release.
 
-The shadow-scheduler lock ("curator-shadow") supplements (prevents two schedulers) —
-it NEVER replaces the production lock.
+The shadow-scheduler lock ("curator-shadow") supplements (prevents two
+schedulers) — it NEVER replaces the production lock.
 
-Cadence fidelity WITHOUT clock patching (critic R2/R3-5): the REAL
-consolidate._cadence_gate_skipped runs against scratch stores whose
-`last_consolidation`/`last_consolidation_count` meta rows are seeded at controlled
-ages (thresholds are pinned in resources.child_env so outcomes are deterministic); a
-skipped nightly run must NOT re-arm the clock; the nightly trigger never forces the
-gate (the only force= in this module is the literal force=False the gate call uses).
+Cadence fidelity WITHOUT clock patching: the REAL gate runs against scratch
+stores whose `last_consolidation`/`last_consolidation_count` meta rows are
+seeded at controlled ages (thresholds pinned in resources.child_env so outcomes
+are deterministic); a skipped run must NOT re-arm the clock; the nightly
+trigger never forces the gate.
 
-Install/disable: `enable` / `disable` / `dry-run` subcommands operate on a SCRATCH
-config dir only — no cron registration, no production flag (out of scope by the
-issue's own boundary; nothing outside the scratch dir changes).
+Install/disable: `enable` / `disable` / `dry-run` subcommands operate on a
+SCRATCH config dir only — no cron registration, no production flag (out of
+scope by the issue's own boundary; nothing outside the scratch dir changes).
 """
 
 from __future__ import annotations
@@ -39,10 +51,10 @@ from typing import Any, Callable
 
 try:
     from . import resources
-except ImportError:  # standalone script mode (enable/disable/dry-run): resolve
-    # the package root absolutely and import the sibling module by name.
+except ImportError:  # standalone script mode (enable/disable/dry-run):
+    # import the sibling module from THIS file's own directory.
     import sys as _sys
-    _PKG = Path(__file__).resolve().parents[1]
+    _PKG = Path(__file__).resolve().parent
     if str(_PKG) not in _sys.path:
         _sys.path.insert(0, str(_PKG))
     import resources as resources  # noqa: F401
@@ -201,8 +213,15 @@ def apply_authorized_work(
     acquire_fn: Callable[[str, float], str | None] | None = None,
     store_dir: Path | None = None,
 ) -> ApplyOutcome:
-    """The fixed sequence: lock -> BEGIN IMMEDIATE -> revalidate -> admit-once apply
-    -> commit -> release."""
+    """The fixed sequence: lock -> BEGIN IMMEDIATE -> revalidate -> admit-once
+    LEDGER entry -> commit -> release.
+
+    LEDGER-ONLY SKELETON: no store mutation is performed (there is no
+    authorized deterministic work to apply yet); "applied" means the ledger
+    admitted this run-id inside the revalidated, lock-held transaction. The
+    ledger commits on its own connection before the store COMMIT, so the two
+    are NOT atomic across a crash in that window — a real apply path must
+    close this before production use."""
     store_dir = store_dir or Path(store_path).parent
     try:
         path, token = acquire_production_lock(store_dir, acquire_fn=acquire_fn)
@@ -291,14 +310,23 @@ def run_cadence_gate(store_path: Path, dry_run: bool = False) -> dict[str, Any]:
 @dataclass
 class NightDecision:
     night: int
-    action: str  # run | skip_busy | skip_low_resource | coalesced | overlap_skipped | empty_input
+    # run | already_applied | skip_busy | skip_low_resource | coalesced |
+    # overlap_skipped | empty_input — "run" is emitted ONLY when this call
+    # performed the ledger admission (owner-review: admit-once accounting is
+    # observable in the decision stream, not silently swallowed).
+    action: str
     reason: str = ""
     run_id: str = ""
 
 
 class ShadowScheduler:
-    """Fake-clock scheduler over simulated nights. Single-flight via the shadow lock;
-    the production lock is taken ONLY inside apply_authorized_work."""
+    """SCRIPTED fake-clock scheduler over simulated nights (evaluation
+    fixture, not a production scheduler): window/DST/ownership/cadence
+    semantics are MODELED by the contract spec (C4 drives the REAL cadence
+    gate and the REAL production lock; run_nights evaluates scripted
+    scenario flags). Admit-once accounting IS enforced here: a run-id the
+    ledger already holds is reported as already_applied, never as a fresh
+    run."""
 
     def __init__(self, config: NightWindowConfig, now_fn: Callable[[], datetime] | None = None):
         self.config = config
@@ -343,8 +371,12 @@ class ShadowScheduler:
                 continue
             try:
                 run_id = n.get("run_id") or f"night-{idx}-{uuid.uuid4().hex[:8]}"
-                out.append(NightDecision(idx, "run", "", run_id))
-                ledger.admit(run_id, self.config.owner, {"night": idx})
+                if ledger.admit(run_id, self.config.owner, {"night": idx}):
+                    out.append(NightDecision(idx, "run", "", run_id))
+                else:
+                    out.append(NightDecision(
+                        idx, "already_applied",
+                        "run-id already in the ledger (admit-once)", run_id))
             finally:
                 self._shadow_lock_release(held)
         return out

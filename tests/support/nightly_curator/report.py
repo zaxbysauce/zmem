@@ -119,13 +119,26 @@ def build_report(
         "go_no_go": {
             "model_go": go_ok,
             "reason": go_reason,
-            "deterministic_shadow_go": True,
+            # Owner-review F-13: the shadow GO is DERIVED from measured
+            # contract-lane false merges + critical findings, never a constant.
+            "deterministic_shadow_go": None,  # set below
             "note": "unavailable inference yields no score and cannot produce a "
                     "model GO; a negative/no-benefit result can close this "
                     "evaluation with a reproducible explanation",
         },
         "maintainer_evidence_pending": [],
     }
+    contract = ((rubric_json.get("metrics") or {}).get("contract_lane") or {})
+    no_false_merges = not contract.get("false_merges")
+    report["go_no_go"]["deterministic_shadow_go"] = bool(
+        no_false_merges and not rubric_json.get("critical_findings"))
+    if not report["go_no_go"]["deterministic_shadow_go"]:
+        report["go_no_go"]["shadow_blockers"] = [
+            f for f in (["measured false merges: " + ", ".join(
+                contract.get("false_merges", []))] if not no_false_merges else [])
+        ] + [
+            f"critical finding: {c}" for c in rubric_json.get("critical_findings", [])
+        ]
     if human.get("status") == "awaiting_human_labels":
         report["maintainer_evidence_pending"].append(
             "AC2 judge/human disagreement: awaiting per-case human labels "
@@ -139,6 +152,15 @@ def build_report(
             "discriminate them): " + ", ".join(authored.get(
                 "not_measured_families", [])) + " - measuring them requires "
             "case-discriminating writer output (see PR discussion)"
+        )
+    model_lane = ((rubric_json.get("metrics") or {}).get("model_reviewed_lane") or {})
+    if model_lane:
+        report["maintainer_evidence_pending"].append(
+            "judge_vs_model_reviewed label-coverage gap: the keyword-rule judge "
+            "emits 3 of the fixture's 5 verdict labels (out_of_scope / "
+            "was_valid_fixed unreachable), so part of the measured disagreement "
+            "is structural label mismatch, not verdict error "
+            f"(agrees={model_lane.get('agrees')}, disagrees={model_lane.get('disagrees')})"
         )
     if rubric_json.get("critical_findings"):
         report["go_no_go"]["model_go"] = False
