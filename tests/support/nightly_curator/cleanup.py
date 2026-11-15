@@ -119,8 +119,13 @@ def compare_recovery_contents(
     multiset — duplication and drops remain visible in both lanes."""
     base_by_id = {r[0]: r for r in base_rows}
     tgt_by_id = {r[0]: r for r in target_rows}
-    checkpoint_rows_match = all(
-        tgt_by_id.get(i) == base_by_id.get(i) for i in checkpoint_ids)
+    # Presence is part of the invariant: a checkpoint id absent from BOTH
+    # sides must FAIL the lane (None==None would pass it vacuously).
+    missing_in_base = sorted(checkpoint_ids - base_by_id.keys())
+    missing_in_target = sorted(checkpoint_ids - tgt_by_id.keys())
+    checkpoint_rows_match = (
+        not missing_in_base and not missing_in_target and all(
+            tgt_by_id[i] == base_by_id[i] for i in checkpoint_ids))
     base_post = sorted(
         r[1:] for r in base_rows if r[0] not in checkpoint_ids)
     tgt_post = sorted(
@@ -131,6 +136,8 @@ def compare_recovery_contents(
         "post_checkpoint_rows_match": post_rows_match,
         "checkpoint_row_count": len(checkpoint_ids),
         "post_checkpoint_row_count": len(base_post),
+        "missing_checkpoint_ids_in_base": missing_in_base,
+        "missing_checkpoint_ids_in_target": missing_in_target,
         "contents_match": checkpoint_rows_match and post_rows_match,
     }
 

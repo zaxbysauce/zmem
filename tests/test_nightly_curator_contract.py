@@ -766,6 +766,25 @@ def test_cleanup_recovery():
     assert drill["forbidden_ops_invoked"] == [], \
         "the recorded argv must invoke no forbidden operation"
 
+    # closeout round-2 pin (reviewer delta): a checkpoint row lost from BOTH
+    # sides must FAIL the identity lane — None==None must not pass vacuously.
+    # Hand case: id "r1" existed at checkpoint but is absent from both
+    # post-mutation row lists.
+    void = cu.compare_recovery_contents(
+        base_rows=[("r2", NS, "kept row", None)],
+        target_rows=[("r2", NS, "kept row", None)],
+        checkpoint_ids={"r1", "r2"})
+    assert void["checkpoint_rows_match"] is False, void
+    assert void["missing_checkpoint_ids_in_base"] == ["r1"], void
+    assert void["missing_checkpoint_ids_in_target"] == ["r1"], void
+    assert void["contents_match"] is False, void
+    # and the all-present case still matches (no false alarm)
+    ok = cu.compare_recovery_contents(
+        base_rows=[("r1", NS, "a", None), ("r2", NS, "b", None)],
+        target_rows=[("r1", NS, "a", None), ("r2", NS, "b", None)],
+        checkpoint_ids={"r1", "r2"})
+    assert ok["checkpoint_rows_match"] is True and ok["contents_match"] is True
+
 
 # ---------------------------------------------------------------------------
 # C7 / AC7 — resource/privacy bounds
