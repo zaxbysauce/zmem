@@ -27,7 +27,7 @@
    },
    "reason": "",
    "telemetry": {
-    "latency_s_total": 7.516,
+    "latency_s_total": 10.688,
     "requests": 0,
     "rows_added": 12,
     "rss_mb_writer_side": 21,
@@ -139,9 +139,7 @@
   {
    "availability": "unavailable",
    "decisions": {},
-   "log_redacted": [
-    "{\"duration_api_ms\":0,\"stop_reason\":\"stop_sequence\",\"session_id\":\"4225eca1-c716-4d15-8f05-85723fd4bc9e\",\"total_cost_usd\":0,\"usage\":{\"output_tokens_details\":{\"thinking_tokens\":0},\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_inp"
-   ],
+   "log_redacted": [],
    "name": "general",
    "pins": {
     "corpus_digest": "44e68ae3438da4f0429d13cbea75d7f07b71f616780fedda7532278a818d576f",
@@ -157,27 +155,16 @@
     "reader_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f",
     "retrieval_digest": "b5d5d977e7a9fd7587e9d3b1669a903299406fc59ff1637b1a406d433a85cd5f"
    },
-   "reason": "unavailable by construction: hermetic child env withholds credentials (recorded CLI error: Not logged in \u00b7 Please run /login)",
-   "telemetry": {
-    "by_construction": "the harness child env is hermetic BY DESIGN (scratch HOME/USERPROFILE, no credential channel), so the CLI cannot see host credentials; authentication failures are expected under this env",
-    "endpoint_error": true,
-    "latency_s_total": 3.594,
-    "output_truncated": false,
-    "requests": 1,
-    "returncode": 1,
-    "timed_out": false
-   },
-   "unpinned_fields": [
-    "decoding.temperature",
-    "decoding.top_p"
-   ]
+   "reason": "ZMEM_CURATOR_GENERAL_WRITER not configured",
+   "telemetry": {},
+   "unpinned_fields": []
   }
  ],
- "canonical_decision_digest": "0314902227d36fa8878c9c75ec9d02573c3d7331d7528a632cde74b61771bd03",
+ "canonical_decision_digest": "e105c1b455a5dc22aafbc09d815c45080803125d45df8be42f49de224d4e3a35",
  "evidence_run": {
   "generator": "tests/support/nightly_curator/evidence_run.py",
   "regenerate_command": "python tests/support/nightly_curator/evidence_run.py",
-  "tree_dirty_at_run": false
+  "tree_dirty_at_run": true
  },
  "go_no_go": {
   "deterministic_shadow_go": true,
@@ -191,10 +178,11 @@
   "status": "awaiting_human_labels"
  },
  "maintainer_evidence_pending": [
-  "AC2 judge/human disagreement: awaiting per-case human labels (fixture format carries optional human_endorsement; owner asked twice 2026-11-14, no answer)"
+  "AC2 judge/human disagreement: awaiting per-case human labels (fixture format carries optional human_endorsement; owner asked twice 2026-11-14, no answer)",
+  "AC2 quality families NOT MEASURED (boundary default lane does not discriminate them): temporal_updates, abstention_quality, useful_accepted_lessons - measuring them requires case-discriminating writer output (see PR discussion)"
  ],
  "os_runtime": "win32",
- "raw_artifact_digest": "f522aa405554f4f65538523c795eff30ebb22544f9d856117c27b68cb7841817",
+ "raw_artifact_digest": "6c0146f74c3ce4e6bdf93e7e3fe1d34de8a90ab68b9baeb24c977e8419009238",
  "rubric": {
   "awaiting_human_labels": true,
   "critical_findings": [],
@@ -219,37 +207,49 @@
   "metrics": {
    "authored_lane": {
     "agrees": [
-     "AQ-001",
-     "AQ-002",
-     "AQ-003",
-     "AQ-004"
+     "AQ-003"
     ],
     "disagrees": [],
     "judge_vs_authored_oracle": {
-     "agrees": 4,
-     "cases": 4,
+     "agrees": 1,
+     "cases_measured": 1,
+     "cases_not_measured": 3,
      "disagrees": 0
     },
+    "not_measured": [
+     "AQ-001",
+     "AQ-002",
+     "AQ-004"
+    ],
+    "not_measured_families": [
+     "temporal_updates",
+     "abstention_quality",
+     "useful_accepted_lessons"
+    ],
     "per_case": {
      "AQ-001": {
       "action": "review",
-      "expected": "review",
-      "verdict": "agrees"
+      "note": "routes to the boundary's default review lane; semantics not discriminated",
+      "quality_family": "temporal_updates",
+      "status": "not_measured"
      },
      "AQ-002": {
       "action": "review",
-      "expected": "review",
-      "verdict": "agrees"
+      "note": "routes to the boundary's default review lane; semantics not discriminated",
+      "quality_family": "abstention_quality",
+      "status": "not_measured"
      },
      "AQ-003": {
       "action": "refuse",
       "expected": "refuse",
+      "quality_family": "evidence_id_precision",
       "verdict": "agrees"
      },
      "AQ-004": {
       "action": "review",
-      "expected": "review",
-      "verdict": "agrees"
+      "note": "routes to the boundary's default review lane; semantics not discriminated",
+      "quality_family": "useful_accepted_lessons",
+      "status": "not_measured"
      }
     },
     "unsupported_statements_refused": [
@@ -337,15 +337,15 @@
      "tokens": 0
     },
     "deterministic-zmem": {
-     "latency_s": 7.516,
+     "latency_s": 10.688,
      "requests": 0,
      "rss_mb_writer_side": 21,
      "storage_bytes": 2310144,
      "tokens": 0
     },
     "general": {
-     "latency_s": 3.594,
-     "requests": 1,
+     "latency_s": null,
+     "requests": 0,
      "rss_mb_writer_side": null,
      "storage_bytes": null,
      "tokens": 0
@@ -381,7 +381,7 @@
   }
  },
  "schema": "zmem-nightly-curator-decision-v1",
- "source_sha": "4e3477555127073d1ff1a1e9efbb7ce2b1296b10",
+ "source_sha": "aa369aea748483527a182d8e5375095085cead40",
  "staged_rollout": {
   "stage_1_shadow_reporting": "ready (this harness; no live schedule)",
   "stage_2_policy_approved_deterministic_maintenance": "requires maintainer policy approval",
