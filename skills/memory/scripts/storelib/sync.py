@@ -1863,6 +1863,55 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                     print(_subject.veto_line(existing["id"], _sim if _sim else 1.0),
                           file=sys.stderr)
                     existing = None
+        if existing is not None:
+            # Issue #486 (PR #485 follow-up): the ingest fold kept the dedup
+            # detector's top-ranked candidate as its fold target unchanged —
+            # the same top-1 blindspot the add path (write.py add re-rank)
+            # and the update gate already fixed. When the detector's top-1 is
+            # NOT normalized-equal to the incoming content, re-rank the fold
+            # target against the store's canonical exact basis (content_norm,
+            # live rows only, knowledge:% refs excluded, bounded
+            # SUBJECT_MAX_EXACT_CANDIDATES window with #376 subject
+            # fall-through) BEFORE the polarity guard below, exactly like the
+            # add/update lanes; the guard then evaluates the FINAL keeper. A
+            # colliding semantic neighbor outranking the TRUE normalized-
+            # exact keeper must never receive the merge (silent wrong-row
+            # metadata mutation on restore, content dropped).
+            from storelib.write import (
+                SUBJECT_MAX_EXACT_CANDIDATES as _EXACT_CAP,
+                _subject_admit as _exact_admit,
+            )
+            ingest_rerank_retargeted = False
+            _ex_keeper = conn.execute(
+                "SELECT content FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            if not (_ex_keeper is not None and
+                    _normalize_content(content) ==
+                    _normalize_content(_ex_keeper["content"] or "")):
+                try:
+                    exact_rows = conn.execute(
+                        "SELECT id, content, tags, type FROM memory "
+                        "WHERE namespace=? AND content_norm=? "
+                        "AND superseded_at IS NULL "
+                        "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                        "'knowledge:%') ORDER BY rowid LIMIT ?",
+                        (namespace, _normalize_content(content), _EXACT_CAP),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    exact_rows = []  # pre-v8 store without content_norm
+                exact_ranked = [(r, 1.0) for r in exact_rows]
+                if exact_ranked:
+                    # The re-ranked target must clear the SAME #376 subject
+                    # veto the detector lanes enforce (fall-through included;
+                    # a vetoed row is not a fold target). An empty admitted
+                    # list keeps the detector's top-1 — the same exhausted
+                    # fall-through contract as the add/update re-ranks.
+                    admitted = _exact_admit(exact_ranked, tags, type_)
+                    if admitted:
+                        exact_row = admitted[0][0]
+                        if exact_row["id"] != existing["id"]:
+                            existing = {"id": exact_row["id"]}
+                            ingest_rerank_retargeted = True
         # v11 (issue #61, 6.2 — PR-review R1): the SAME write-time polarity
         # guard add_memory/update_memory apply. A remote row that contradicts
         # its dedup hit ("always X" vs "never X") must NOT be folded into the
@@ -1880,6 +1929,17 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                       file=sys.stderr)
                 existing = None
         if existing:
+            if ingest_rerank_retargeted:
+                # Fires only here — AFTER the polarity guard above has
+                # accepted the FINAL keeper (write.py Stage-B lesson: a
+                # notice that promises a fold before the guard decides can
+                # contradict a subsequent decline).
+                print(
+                    "[zmem] ingest-jsonl: dedup re-ranked: the top semantic "
+                    "candidate was not content-exact; folding into the "
+                    f"exact live row {existing['id']} instead",
+                    file=sys.stderr,
+                )
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags, now=tx_now)
             # PR-review PRR-H (issue #59 review round): the surviving keeper
             # also absorbs the INCOMING row's taint — worst-of its own and the
