@@ -2,6 +2,52 @@
 
 All notable changes to the **zmem** plugin are recorded here.
 
+## [0.161.0] - 2026-11-17
+
+### Added
+
+- `knowledge retry` (#480 FB-008): scoped recovery for stale-CAS
+  quarantined publications — retries the ORIGINAL CAS stake (never
+  refreshed; a still-stale stake refuses typed naming the original
+  version), preserves the quarantined entry verbatim, lands a fresh
+  op-id applied entry with `retry_ref` linkage, completes crash-left
+  partials, and re-enqueues the original stake on a capable hub in
+  remote mode (queued, never applied at retry time; unreachable hub =
+  exit 3 pending, nothing enqueued). Gated by ZMEM_CAPTURE=0 like
+  capture/flush; journal records carry op_id/summary/staked_at
+  provenance preserved through mark().
+- Optional `description` on markdown and kb-http knowledge targets
+  (#482 AC1-AC3): 1..200 codepoints, single-line only; rendered on the
+  policy roster line and in `knowledge status` (human + JSON); strict
+  refusal for invalid forms on both validators; aggregate rendering
+  uses a deterministic downward-search truncation so a valid config
+  never renders an empty policy.
+- Knowledge namespace-maintenance contract docs (#480 FB-031): the
+  drain-first ordered procedure, the dated (2026-11-15)
+  stranded-state-remediation ruling (explicit operator action only for
+  each named state), and the explicit does-not-see-remote boundary.
+- Server-side kb-http publication contract docs (#482): create-only
+  semantics, scoped auth, locator-grammar safety, and the corrected
+  fleet note (the deployed fleet KB server does NOT yet implement the
+  grammar; tracked on #482 AC4-AC6).
+
+### Fixed
+
+- deepseek launcher `run()` timeout is now a deadline (#481 F-008):
+  the promise resolves ON the timeout with the collected output
+  (`timedOut: true`) and escalates to SIGKILL after a grace; a child
+  closing during the grace no longer stalls the pre-step indefinitely.
+  All seven consumers accept a trailing options object (merged, never
+  replacing existing options).
+- Bounded plugin state (#481 CS-010): `state.receipts` and
+  `state.captureQueue` are hard-bounded (32) with state-aware eviction
+  (terminal-first / non-current-first recency window); `disposeDrained`
+  is derived from actual drain outcomes with the legacy count disclosed
+  in `pendingAtDispose`; the policyDeliveredText retention and the
+  POLICY_VERSION deliberate-display-constant are disclosed at their
+  sites; the spawn pre-check evaluation (measured 0.2 s) is recorded as
+  a deliberately open option.
+
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
