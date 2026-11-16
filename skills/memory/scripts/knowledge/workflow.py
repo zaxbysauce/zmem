@@ -1003,6 +1003,22 @@ def retry(*, target_id: str, logical_key: str,
             "no journal entry for knowledge:%s:%s (namespace %r): "
             "nothing to retry" % (target_id, logical_key, namespace))
     original = max(entries, key=lambda e: e.seq)
+    if original.state == "pointer_queued" and original.retry_ref is not None:
+        # An in-flight REMOTE retry (its own pointer_queued entry): a
+        # repeat invocation re-selects the quarantined original below it
+        # — the idempotent recovery for a crash between enqueue and this
+        # entry's eventual application by the flush lane.
+        below = [e for e in entries
+                 if e.seq == original.retry_ref
+                 and e.state == "quarantined"
+                 and e.digest == original.digest]
+        if not below:
+            return _refusal(
+                "latest entry for knowledge:%s:%s is an in-flight retry "
+                "(pointer_queued, retry_ref=%s) whose original is not "
+                "selectable; operator review required"
+                % (target_id, logical_key, original.retry_ref))
+        original = below[0]
     if original.state == "doc_pending":
         # A crash-left partial for the SAME digest is superseded by the
         # completing retry; the quarantined entry below it is the target.

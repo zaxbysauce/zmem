@@ -1296,6 +1296,54 @@ class RetryContractTest(unittest.TestCase):
             "remote retry ENQUEUES only — ZERO apply_ops calls reached "
             "the hub during retry (apply happens at flush); calls=%r"
             % (_FakeMCPHub.tool_calls,))
+        # Round-2 pin: the retry's OWN journal entry is pointer_queued
+        # (never applied at retry time — the flush lane advances it), the
+        # quarantined ORIGINAL stays preserved, and the reported op id is
+        # the DURABLE queued identity (the queue entry carries it).
+        entries = self._entries_for(_KEY)
+        retry_entries = [e for e in entries
+                         if e["seq"] > json.loads(
+                             self._journal_path.read_text(encoding="utf-8")
+                             )["entries"][0].get("seq", 0)
+                         and e.get("retry_ref") is not None] \
+            if entries else []
+        queued_retry = [e for e in entries
+                        if e.get("state") == "pointer_queued"
+                        and e.get("retry_ref") is not None]
+        self.assertTrue(queued_retry,
+                        "the remote retry lands a pointer_queued journal "
+                        "entry (flush advances it later): %r" % (entries,))
+        self.assertEqual(queued_retry[0].get("op_id"), body.get("op_id"),
+                         "the reported op id is the DURABLE queued "
+                         "identity: %r vs %r"
+                         % (queued_retry[0].get("op_id"), body.get("op_id")))
+        quarantined = [e for e in entries
+                       if e.get("state") == "quarantined"]
+        self.assertTrue(quarantined,
+                        "the quarantined ORIGINAL is preserved verbatim "
+                        "by the remote retry")
+        # Idempotent recovery (crash window): a SECOND retry re-selects
+        # the quarantined entry; enqueue is idempotent by identity and
+        # returns the SAME queued op id — re-invocation IS the recovery
+        # path for a crash between enqueue and the journal write.
+        again = self._retry()
+        self.assertEqual(again.returncode, 0,
+                         "a repeated remote retry re-selects and stays "
+                         "queued (idempotent recovery): %r"
+                         % (again.stdout[-200:],))
+        again_body = json.loads(again.stdout)
+        self.assertEqual(again_body.get("op_id"), body.get("op_id"),
+                         "the repeated retry reports the SAME durable "
+                         "queued op id: %r vs %r"
+                         % (again_body.get("op_id"), body.get("op_id")))
+        entries2 = self._entries_for(_KEY)
+        self.assertEqual(
+            len([e for e in entries2
+                 if e.get("state") == "pointer_queued"
+                 and e.get("retry_ref") is not None]), 1,
+            "exactly ONE pointer_queued retry entry exists after the "
+            "repeat (record_retry is idempotent on the retry identity)")
+
         self.assertTrue(
             set(_FakeMCPHub.tool_calls) <= {"hello", "knowledge_pointer"},
             "only capability/read calls are allowed during retry; "
