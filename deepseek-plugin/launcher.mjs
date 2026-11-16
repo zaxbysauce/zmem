@@ -225,10 +225,9 @@ export async function runReflect(session, namespace, opts = {}) {
 // to --no-capture so the helper renders read-routing WITHOUT a capture
 // invitation. The CALLER owns the ZMEM_INJECT=0 gate (no spawn at all
 // under it). Cheap by contract — no model, no store, no network, no root
-// stat — and time-bounded by the kill timer in run(); the bound is
-// run() enforces a HARD deadline (#481 F-008): the promise resolves ON
-// the timeout and escalates to SIGKILL after a grace; a helper that
-// ignores the first kill can no longer stall the pre-step.
+// stat. run() enforces a HARD deadline (#481 F-008): the promise
+// resolves ON the timeout and escalates to SIGKILL after a grace, so a
+// helper that ignores the first kill can no longer stall the pre-step.
 // Fail-open everywhere: absent helper (checkouts without it), non-zero
 // exit, timeout, or empty output (the companion's default-off state) all
 // yield { text: "" } and the caller appends nothing.

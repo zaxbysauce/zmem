@@ -10,12 +10,17 @@ All notable changes to the **zmem** plugin are recorded here.
   quarantined publications — retries the ORIGINAL CAS stake (never
   refreshed; a still-stale stake refuses typed naming the original
   version), preserves the quarantined entry verbatim, lands a fresh
-  op-id applied entry with `retry_ref` linkage, completes crash-left
-  partials, and re-enqueues the original stake on a capable hub in
-  remote mode (queued, never applied at retry time; unreachable hub =
-  exit 3 pending, nothing enqueued). Gated by ZMEM_CAPTURE=0 like
-  capture/flush; journal records carry op_id/summary/staked_at
-  provenance preserved through mark().
+  entry with `retry_ref` linkage and a durable op id, completes
+  crash-left partials, and in remote mode enqueues the original stake on
+  a capable hub AND lands its own `pointer_queued` journal entry (the
+  reported op id is the durable queued identity; a repeat retry
+  re-selects idempotently). The flush lane advances the entry to
+  applied — including recovery from the persisted receipt alone after a
+  crash between the receipt and the journal mark (`flush()` reports the
+  new `journal_reconciled`/`recovered_from_receipts` result keys). An
+  unreachable hub exits 3 pending with nothing enqueued. Gated by
+  ZMEM_CAPTURE=0 like capture/flush; journal records carry
+  op_id/summary/staked_at provenance preserved through mark().
 - Optional `description` on markdown and kb-http knowledge targets
   (#482 AC1-AC3): 1..200 codepoints, single-line only; rendered on the
   policy roster line and in `knowledge status` (human + JSON); strict

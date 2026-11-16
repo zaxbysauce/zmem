@@ -330,12 +330,18 @@ create (drive it to a terminal state first); once the
 latest intent is terminal, a new digest records a fresh `doc_pending`
 entry — the next version of the same note.
 
-**Quarantine has no recovery command yet.** A quarantined entry is
-terminal: re-publishing the SAME digest under that identity is refused
-(there is no `clear`/`retry` command today — an explicit recovery
-surface is pending an owner decision), while publishing NEW content
-(different digest) records a fresh intent normally. The quarantined
-history is always retained for inspection via `knowledge status`.
+**Quarantine recovery is scoped by cause (#480 FB-008).** A
+quarantined entry is terminal, and the recovery surface is
+`knowledge retry`: a stale-CAS quarantine (the pointer moved after the
+stake) is recoverable — retry re-runs the ORIGINAL stake (a still-stale
+stake refuses typed, mutating nothing) and lands a fresh applied entry
+with the original preserved verbatim. Every other cause (an operator
+pull, a hub rejection, a conflict) stays terminal: retry refuses with
+the cause named, and recovery is a deliberate operator action.
+Re-publishing the SAME digest under a quarantined identity routes
+through retry; publishing NEW content (different digest) records a
+fresh intent normally. The quarantined history is always retained for
+inspection via `knowledge status`.
 
 ## The pointer contract (namespace, payload, CAS)
 
