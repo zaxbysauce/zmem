@@ -5,6 +5,20 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.160.0] - 2026-11-16
+
+### Fixed
+
+- **Ingest fold exact-keeper re-rank (issue [#486](https://github.com/zaxbysauce/zmem/issues/486)).**
+  The `ingest-jsonl` dedup fold kept the detector's top-ranked candidate as its fold
+  target unchanged — the same top-1 blindspot PR #485 fixed on the add and update
+  lanes. A synced row normalized-equal to a live keeper could fold its metadata
+  (content dropped) into an outranking colliding keeper on restore. The ingest lane
+  now re-ranks its fold target against the canonical exact basis (content_norm, live
+  rows only, knowledge refs excluded, bounded subject-admitted window) before the
+  polarity guard, which now evaluates the final keeper, with a re-rank notice
+  printed only after the guard accepts.
+
 ## [0.159.0] - 2026-11-15
 
 ### Changed
