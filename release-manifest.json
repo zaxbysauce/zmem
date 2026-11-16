@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "5d297a9f28308ceae639533e68397851ebcf3acf663484626af5ca8c89fc63e3",
+  "digest": "d515eaf45e65af7187c4070ee1018f67acc19fd50b7cbe2d2be3fc11c6e91ca6",
   "files": {
     ".agents/plugins/marketplace.json": "043f4dbd638014c248b73920cfc91dd811b53655fc9906953096732a126cb4c9",
     ".claude-plugin/marketplace.json": "07220cd1c30f8237c267473846fb61eb29d403efe72f6098bbe0c3c6e7781506",
@@ -62,6 +62,7 @@
     "opencode-plugin/package.json": "c68b70f96923e97359ff05c7fc3d0b983bd7923ddb0f7d38c71fde3ef62d4673",
     "scripts/bench_hook_latency.py": "ed77a76b54b97faab045c90a04acb3673651b3243967f1ebb6833c631e1b16be",
     "scripts/canary-schema.json": "8b634ff86023a94847be4c595623b03d23588140286f14c3c1933158a9d29fcd",
+    "scripts/check_work_pr_no_bump.py": "87bca951fb8fff96e32ce5fc49260c405ebdcb5d96b78b00a276fed57cbface7",
     "scripts/eval_adapters.py": "8bc4bf51c74f23597c484eb5b2f7b9fb63cf531e2dc011dce3b5be5fc55a3094",
     "scripts/eval_counterfactual.py": "8a3d30350c294c17cdc617efe40f390f39e8d213a665ff7aaeb88f67c3dd1860",
     "scripts/eval_inject_runner.py": "8323141ca4044e90e51277e6b12e5763c7a0ac6b09d9790a27c75dc7db5181db",
@@ -83,7 +84,7 @@
     "scripts/pattern_harness.py": "428b33978ee59b7c7bbc67f0849adfd750c9277e2e05b216721611741024652b",
     "scripts/refresh-report-schema.json": "a2105db8ca57a6e860c35bf25a6e8f943b70c0f3abaf65fcf2803d9d99b01bea",
     "scripts/refresh_hosts.py": "217b07990b3b40481bc598647bbd4edcee557c5467f5c36a07999d77a777fc1c",
-    "scripts/release_gate.py": "0cfa3efc35fb665373776aa146d010582bfabda5170a84b25848e86676485f31",
+    "scripts/release_gate.py": "3a2fed7cad4c2c5c654ffb5b376d04e7efc725cf8f54175d0d150b6c249383d4",
     "skills/closeout-remote/SKILL.md": "448390f2a139e3e2b0f1ff8041915f74e9236e73f3c41f61bf5fd8fb634a974c",
     "skills/closeout/SKILL.md": "1af4a9c27babd756d718a422df3607aa91f9f343e127ab6f2ef13393e4b0c481",
     "skills/knowledge/SKILL.md": "0314efc7ee64f8a740b0197c14ad5f1f9d7961cd3629c2b698d4d767aea2f8da",
