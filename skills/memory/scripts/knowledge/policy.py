@@ -343,11 +343,13 @@ def _nonempty_str(value):
     return isinstance(value, str) and bool(value.strip())
 
 
-def _description_ok(value):
+def _description_ok(value, *, present):
     """Display mirror of the description grammar (validator parity):
-    optional; string; 1..200 codepoints; no C0/CR/LF/TAB; not
-    whitespace-only.  Values are never rendered when this returns False."""
-    if value is None:
+    ABSENT is fine; a PRESENT value must be a string of 1..200
+    codepoints, no C0/CR/LF/TAB, not whitespace-only (an explicit JSON
+    null is refused exactly like the command validator refuses it).
+    Values are never rendered when this returns False."""
+    if not present:
         return True
     if not isinstance(value, str):
         return False
@@ -374,7 +376,8 @@ def _target_spec_ok(spec):
     keys = _TARGET_KEYS.get(kind)
     if keys is None or set(spec) - keys:
         return False
-    if not _description_ok(spec.get("description")):
+    if not _description_ok(spec.get("description"),
+                           present="description" in spec):
         return False
     if kind == "markdown":
         return _nonempty_str(spec.get("root"))

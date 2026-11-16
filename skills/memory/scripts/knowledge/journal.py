@@ -440,9 +440,13 @@ class KnowledgeJournal:
                      op_id: str | None = None,
                      summary: str | None = None,
                      staked_at: str | None = None,
-                     retry_ref: int | None = None) -> JournalEntry:
+                     retry_ref: int | None = None,
+                     state: str = "applied") -> JournalEntry:
         """Append the COMPLETING retry entry for a recovered attempt
-        (#480 FB-008).
+        (#480 FB-008).  ``state`` is the retry's own state after the
+        durable step (``pointer_queued`` in remote mode — the flush lane
+        advances it to ``applied``; ``applied`` for a completed local
+        retry).
 
         record_intent is idempotent on (digest, locator) whatever the
         state, so it returns the quarantined original forever; the retry

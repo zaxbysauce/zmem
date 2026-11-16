@@ -179,8 +179,13 @@ else:
 '''
 
 _STUB_CAPTURE_ENTRY = '''\
-import json
-print(json.dumps({"ok": True, "deduped": False, "text": "queued"}))
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    text = str(payload.get("text") or "")[:120]
+except Exception:
+    text = ""
+print(json.dumps({"ok": True, "deduped": False, "text": text}))
 '''
 
 # ------------------------------------------------------------- pure probe

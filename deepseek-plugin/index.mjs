@@ -202,7 +202,7 @@ export function plugin(ctx, config = {}) {
                 [...state.captureQueue, {
                   kind: "correction", redacted: true,
                   deduped: Boolean(r.result.deduped),
-                  text: ctext.slice(0, 120),
+                  text: String(r.result.text || ctext.slice(0, 120)),
                   host: "deepseek", session: sid,
                   namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
                 }], CAPS.captureQueue, sid);

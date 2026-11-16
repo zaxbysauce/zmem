@@ -1072,7 +1072,7 @@ def retry(*, target_id: str, logical_key: str,
                     "error": "hub unreachable: retry kept pending, "
                              "nothing enqueued"}
         op_id = new_op_id()
-        delivery.enqueue({
+        stored = delivery.enqueue({
             "op_id": op_id,
             "namespace": namespace,
             "target": target_id, "key": logical_key,
@@ -1088,8 +1088,21 @@ def retry(*, target_id: str, logical_key: str,
             "row_id": None, "ref": ref,
             "staked_at": original.staked_at,
         })
+        # The DURABLE identity is whatever enqueue stored (a repeated
+        # retry is idempotent by the enqueue identity and reports the
+        # QUEUED op id, never a freshly minted one), and a
+        # pointer_queued journal entry lands so the flush lane can
+        # reconcile this retry to applied WITHOUT touching the preserved
+        # quarantined original.
+        stored_op = str((stored or {}).get("op_id") or op_id)
+        journal.record_retry(
+            target_id=target_id, logical_key=logical_key,
+            locator=locator, digest=digest, namespace=namespace,
+            op_id=stored_op, summary=original.summary,
+            staked_at=original.staked_at, retry_ref=original.seq,
+            state="pointer_queued")
         return {"ok": True, "completed": False, "queued": True,
-                "op_id": op_id,
+                "op_id": stored_op,
                 "pointer": {"status": "queued"},
                 "ref": ref, "target": target_id, "key": logical_key,
                 "namespace": namespace}
