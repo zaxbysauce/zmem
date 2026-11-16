@@ -2,19 +2,36 @@
 
 How to file issues. This repository originated the workstream convention; the per-AC check binding below is the codified upgrade of that practice.
 
-## Release rules — every runtime-surface edit rides a release (issues #325/#354/#359)
+## Release rules — serialized release ownership (owner decision 2026-11-15; supersedes the bump-in-PR rule, issues #325/#354/#359/#388)
 
-The release gate verifies the committed `release-manifest.json` on EVERY pull request and
-fails a PR that claims a version already published as a tag (version collision) or below the
-newest published tag (version ordering). The practical consequences, all enforced:
+Version assignment belongs to the **designated release step**, not to work
+PRs. Work PRs never reserve a version; the release step (a `release`-labeled
+PR, and from issue #484 onward a release-please PR) owns the version bump,
+the dated CHANGELOG section, the tag, and the GitHub Release. The gate still
+verifies the committed `release-manifest.json` on EVERY pull request and
+fails a PR whose *version bump* claims an already-published tag (version
+collision) or a target below the newest published tag (version ordering).
+The practical consequences, all enforced:
 
 - Any edit under `hooks/`, `skills/memory/scripts/`, `skills/**/SKILL.md`, `hermes-plugin/`,
-  `scripts/`, or any of the eight host manifests requires a release-version bump in the same PR
-  (all eight manifests + a dated newest-first `## [X.Y.Z]` CHANGELOG section + a re-emitted
-  `release-manifest.json` after `git add`). There is no equal-version re-emit escape: re-emitting
-  the manifest at an already-tagged version is refused as a collision.
+  `scripts/`, or any of the eight host manifests re-emits `release-manifest.json`
+  after `git add` — at the CURRENT published version. An equal-version re-emit
+  is allowed and passes when the manifest is fresh: it reserves nothing. (The
+  old rule — bump in the same PR, no equal-version escape — is superseded;
+  main HEAD legitimately carries unreleased runtime changes under the last
+  published version between release steps.)
+- A work PR must NOT bump a host manifest version, add a new version-bearing
+  manifest, or date a new `## [X.Y.Z]` CHANGELOG section — the work-PR
+  version guard (`scripts/check_work_pr_no_bump.py`, CI step "Work-PR version
+  guard") fails such PRs. Put release notes under `## [Unreleased]`; the
+  release step promotes them when it assigns the version.
+- `release`-labeled PRs are the designated release step: their version bump
+  is expected, and the work-PR guard skips them. A release-step PR bumps all
+  eight manifests, promotes `## [Unreleased]` into a dated newest-first
+  `## [X.Y.Z]` section, re-emits `release-manifest.json` after `git add`,
+  and regenerates the five-lanes fixtures + dsh host-gate evidence.
 - Docs/tests/CI-only PRs need no bump — an unchanged version with an unchanged manifest passes.
-- `[skip release]` in a merge subject is for docs/CI-only merges; it cannot bypass the
+- `[skip release]` in a merge subject remains an explicit operator escape for the drift gate; it cannot bypass the
   collision/ordering checks or the manifest verification.
 - Version targets must be strict `X.Y.Z` and must move forward; the gate compares parsed
   version tuples, so spelling variants of a published version collide too.

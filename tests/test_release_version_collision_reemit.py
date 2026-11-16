@@ -76,21 +76,46 @@ class _Fixture(unittest.TestCase):
 
 
 class EqualVersionReemitCollisionTest(_Fixture):
-    """The #388 shape: equal tagged version + freshly re-emitted manifest."""
+    """Serialized-release ownership (2026-11-15): an equal-version re-emit
+    reserves nothing and passes when the manifest is fresh, on the tag path
+    and off it alike; a real version BUMP to an already-tagged version still
+    collides. Supersedes the #388 equal-version rule (issue #484 re-tethers
+    installs to release refs)."""
 
-    def test_equal_version_reemit_at_tagged_version_fails_with_collision(self):
+    def test_equal_version_reemit_at_tagged_version_passes_when_fresh(self):
         _git(self.repo, "tag", "v0.111.0")
-        # Same version, but the tree changes and the manifest is re-emitted:
-        # the PR claims content under an already-published version.
+        # Same version, tree changes, manifest freshly re-emitted: the work
+        # PR adds tracked files under the published version — the serialized
+        # release step owns version assignment, so this is not a reservation.
         (self.repo / "hooks" / "a.txt").write_text("surface2\n", encoding="utf-8")
         self._reemit()
         _git(self.repo, "add", "-A")
         _git(self.repo, "commit", "-qm", "reemit at equal version")
         r = _gate(self.repo, self.base)
+        self.assertEqual(
+            r.returncode, 0,
+            f"equal-version re-emit at a tagged version must PASS when the "
+            f"manifest is fresh (no version reservation), got "
+            f"{r.returncode}: {r.stdout} {r.stderr}",
+        )
+        self.assertIn("release manifest fresh", r.stdout)
+
+    def test_bump_to_tagged_version_still_collides(self):
+        # A real version reservation: the manifests move to a version whose
+        # tag already exists — the collision branch must keep firing.
+        _git(self.repo, "tag", "v0.111.0")
+        _git(self.repo, "tag", "v0.112.0")
+        p = self.repo / "plugin.json"
+        p.write_text(
+            '{"name": "x", "version": "0.112.0"}\n', encoding="utf-8")
+        self._reemit()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "bump to tagged version")
+        r = _gate(self.repo, self.base)
         self.assertNotEqual(
             r.returncode, 0,
-            f"equal-version re-emit at a tagged version must FAIL (the #388 "
-            f"live-incident shape), got exit 0: {r.stdout}",
+            f"a bump to an already-tagged version must FAIL with the "
+            f"collision branch, got exit 0: {r.stdout}",
         )
         self.assertIn("collision", (r.stdout + r.stderr).lower())
 
