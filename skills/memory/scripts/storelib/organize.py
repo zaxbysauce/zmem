@@ -125,6 +125,7 @@ from storelib.write import (
     CapturePolicyRefusal,
     _clear_expiry,
     _clear_occurrence,
+    _update_fold_threshold,
     add_memory,
     supersede_memory,
     update_memory,
@@ -868,6 +869,18 @@ def organize(
         "compressed": {"count": 0, "would_count": 0, "skipped": 0},
         "pruned": 0,
     }
+
+    # PR #485 broad-review r2 (R6/F-06): the compression/summary stages call
+    # update_memory, whose strict ZMEM_UPDATE_FOLD_THRESHOLD parse refuses
+    # loudly — but that parse is LAZY and fires at the first update call,
+    # i.e. AFTER consolidation has committed and the cadence clock is armed.
+    # A malformed knob aborts the run mid-flight instead of refusing before
+    # any write (the stage-3b card-config convention: resolve knobs BEFORE
+    # the first write). Validate up front when the update path is reachable
+    # (not under --dry-run), so the refusal is clean exit-2 with nothing
+    # committed and a retry after the env is fixed works normally.
+    if not dry_run:
+        _update_fold_threshold()
 
     # --- 1) Cadence gate (SHARED with consolidate — see module docstring) ---
     # Same maintenance act, one clock, ONE implementation (_cadence_gate_skipped

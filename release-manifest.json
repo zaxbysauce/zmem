@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "84de4babfc65c5c759ff85e3c1a530bd56e295031e365bc22098d361ec5e5745",
+  "digest": "5d297a9f28308ceae639533e68397851ebcf3acf663484626af5ca8c89fc63e3",
   "files": {
     ".agents/plugins/marketplace.json": "043f4dbd638014c248b73920cfc91dd811b53655fc9906953096732a126cb4c9",
     ".claude-plugin/marketplace.json": "07220cd1c30f8237c267473846fb61eb29d403efe72f6098bbe0c3c6e7781506",
@@ -87,7 +87,7 @@
     "skills/closeout-remote/SKILL.md": "448390f2a139e3e2b0f1ff8041915f74e9236e73f3c41f61bf5fd8fb634a974c",
     "skills/closeout/SKILL.md": "1af4a9c27babd756d718a422df3607aa91f9f343e127ab6f2ef13393e4b0c481",
     "skills/knowledge/SKILL.md": "0314efc7ee64f8a740b0197c14ad5f1f9d7961cd3629c2b698d4d767aea2f8da",
-    "skills/memory/SKILL.md": "fc06054e9419146ac1432f981a14a7114a0de89cc47c459cc304865d05a5de05",
+    "skills/memory/SKILL.md": "84ebe4e2afd098fd32200f7481fa308d49e1882e3be4a8117e175e835308ff96",
     "skills/memory/scripts/capture_quality.py": "144952fd06464e4164c6e0ea80cc32a90eb77a3d632934528a5b04842cefe19c",
     "skills/memory/scripts/correction_queue.py": "cfeed1f228488fa926eefc7ad4b9c48ac8370f5ceb29340ed02921ef94c9dbfb",
     "skills/memory/scripts/corrections.py": "cf6ac131d092bb319cf9cfcf762b8384105588c8adb968349c804efb50bbaf7a",
@@ -147,7 +147,7 @@
     "skills/memory/scripts/storelib/opcmds.py": "d34b7dc219e6aa95b1b85cce59d3ff525451df0051e1b36167255f8feacabbe0",
     "skills/memory/scripts/storelib/ops.py": "59cfdba666152f80796b893b1d47e4402c6d0498b5a6a66ce66ec607bd837129",
     "skills/memory/scripts/storelib/ops_tokens.py": "c70c23fbbad94c23a33d7d939a2765b30d2cd41844e33e89f927aeb15635a72a",
-    "skills/memory/scripts/storelib/organize.py": "995e92d3c51d298c189fe7fa38e1b6d349bceab7ef0c692723b87ed963032734",
+    "skills/memory/scripts/storelib/organize.py": "06e4c3a4f77da37ec88b405d695bea38304246d0c44ee3726b31f53c6b07c869",
     "skills/memory/scripts/storelib/pages.py": "f656bbae3f68dfa9853c81fe78240df04de61817858c5d8c2f84efb2db45cf00",
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
     "skills/memory/scripts/storelib/purge.py": "77def8a04b7b0c81c55335c9d52dcec8392c96b30b66e337e14ea1b969bba632",
@@ -168,7 +168,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "b80fbc59a45781aa15519ccacb06d58ef7cc81ffe5cb2279d95befecd45119a8",
+    "skills/memory/scripts/storelib/write.py": "d9e75ef0e0f2064b45b31c1821c7e04beb09fbd2a56a86df5de54be6c1ee4796",
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },

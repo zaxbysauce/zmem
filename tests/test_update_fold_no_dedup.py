@@ -68,6 +68,11 @@ def _env(tmp: str, **extra: str) -> dict:
     env = {**os.environ}
     env["ZMEM_STORE"] = os.path.join(tmp, "store.sqlite")
     env.pop("ZMEM_DATA", None)
+    # PR #485 broad-review r2 (F-08/TI-2): the store-resolution precedence
+    # also honors the plugin-data dirs, so a host that exports them must not
+    # leak into the sandboxed child.
+    env.pop("CLAUDE_PLUGIN_DATA", None)
+    env.pop("ZCODE_PLUGIN_DATA", None)
     env["ZMEM_MODELS_DIR"] = os.path.join(tmp, "no-models")
     env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
     env["ZMEM_EMBED_PROFILE"] = "fake"
@@ -216,13 +221,24 @@ class ThresholdBoundaryTest(_CliCase):
             f"search: {json.dumps(found)[:400]}")
 
     def test_detector_floor_above_knob_means_no_fold(self):
-        # Knob 0.90, dedup floor 0.98: a mid-band candidate never reaches
-        # the gate (the detector filters first) — the update lands.
+        # Knob 0.90, dedup floor 0.98: a candidate whose similarity (0.934
+        # under the fake profile, MEASURED via fake_embed cosine) clears the
+        # knob but not the detector's admission floor never becomes a dedup
+        # candidate at all — the update lands. The discriminating seam is the
+        # DETECTOR FLOOR (write.py's `similarity >= threshold` filter): a
+        # mutant that drops the floor check admits this candidate and the
+        # 0.90 knob then folds it, turning this test RED; deleting the
+        # update-fold gate alone cannot (the detector still filters first).
+        # A companion control leg (floor 0.90, same fixture) folds at
+        # similarity=0.934, proving the fixture CAN fold and the no-fold
+        # outcome is attributable to the floor alone. (Broad-review r2 F-08:
+        # the old fixture measured 0.623, below BOTH thresholds, so no
+        # mutation of either seam could turn it red.)
         _keeper, _ = self._add(
             "shared prefix tokens for the detector floor probe row one")
         victim, _ = self._add("totally different victim row content here")
         new_text = ("shared prefix tokens for the detector floor probe "
-                    "row one extra tail words here")
+                    "row one tail")
         r = self._run("update", "--id", victim, "--namespace", NS,
                       "--type", "fact", "--content", new_text,
                       env=_env(self.tmp, ZMEM_UPDATE_FOLD_THRESHOLD="0.90",
@@ -231,7 +247,7 @@ class ThresholdBoundaryTest(_CliCase):
         self.assertNotIn("FOLDED into existing live memory",
                          r.stdout + r.stderr, r.stdout + r.stderr)
         found = self._search(
-            "extra tail words",
+            "row one tail",
             env=_env(self.tmp, ZMEM_UPDATE_FOLD_THRESHOLD="0.90",
                      ZMEM_DEDUP_THRESHOLD="0.98"))
         self.assertTrue(
@@ -239,6 +255,48 @@ class ThresholdBoundaryTest(_CliCase):
                 for row in found.get("results") or []),
             f"the detector-floor-blocked update must land; "
             f"search: {json.dumps(found)[:400]}")
+
+
+class ExactFoldPolarityGuardTest(_CliCase):
+    """Stage-B reviewer counterexample (broad-review r2 R1 follow-up): the
+    polarity signature strips only NEWLINE-FREE quoted spans
+    (consolidate.py `r'"[^"\\n]*"'`) while normalize_content collapses
+    whitespace, so `"not\\nx"` and `"not x"` are NORMALIZED-EQUAL yet
+    polarity-CONFLICTING. The exact fold must therefore run the polarity
+    guard on the final selected keeper — an exact-content update whose
+    keeper disagrees on polarity lands as its own row (the fold declines),
+    never merging a contradiction into the keeper."""
+
+    def test_exact_content_with_newline_quote_conflict_lands(self):
+        # Real newline in the keeper content (not a literal backslash-n) so
+        # normalize_content collapses it and the update below is
+        # content_norm-equal to the keeper through the EXACT lane
+        # deterministically — while the polarity signature strips the
+        # quoted span only from the newline-free update text.
+        keeper, _ = self._add('"not\nx" is the guard probe', ns=NS)
+        victim, _ = self._add("unrelated victim row for the polarity leg",
+                              ns=NS)
+        r = self._run("update", "--id", victim, "--namespace", NS,
+                      "--type", "fact", "--content", '"not x" is the guard probe')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        combined = r.stdout + r.stderr
+        # The fold must have been DECLINED (polarity disagreement with the
+        # keeper despite normalized-equal content) and the update landed as
+        # its own NEW live row (append-only: the victim is tombstoned, the
+        # replacement row is live, and the keeper was never merged into).
+        self.assertIn("polarity disagreement", combined, combined)
+        rows = {row["id"]: row for row in self._list(ns=NS)}
+        self.assertIsNone(
+            rows[keeper].get("superseded_at"),
+            "the keeper must stay live and untouched by a conflicting "
+            f"update; rows={json.dumps(rows)[:400]}")
+        landed = [row for row in rows.values()
+                  if row["id"] != keeper and row.get("superseded_at") is None]
+        self.assertEqual(
+            len(landed), 1,
+            f"exactly ONE new live row (the landed update) expected; "
+            f"rows={json.dumps(rows)[:400]}")
+        self.assertNotIn("folded", combined.lower(), combined)
 
 
 class KnobParsingTest(_CliCase):
@@ -313,6 +371,11 @@ class RemoteRefusalTest(_CliCase):
         env = {**os.environ}
         env.pop("ZMEM_STORE", None)
         env.pop("ZMEM_DATA", None)
+        # Broad-review r2 F-08: the plugin-data dirs outrank home in
+        # host.resolve_store_path — scrub them too, so the no-default-store
+        # assertion measures every store-resolution limb the child could use.
+        env.pop("CLAUDE_PLUGIN_DATA", None)
+        env.pop("ZCODE_PLUGIN_DATA", None)
         env["HOME"] = str(sandbox_home)
         env["USERPROFILE"] = str(sandbox_home)
         env["ZMEM_REMOTE_URL"] = "http://127.0.0.1:9/zmem"
@@ -434,8 +497,7 @@ class TopOneBlindspotRegressionTest(_CliCase):
         unpinned — deleting its warns.append passed every test."""
         keeper, victim = self._setup_collision_beside_keeper()
         rj = self._run("update", "--json", "--id", victim, "--namespace", NS,
-                       "--type", "fact", "--content", keeper and
-                       _exact_content(self))
+                       "--type", "fact", "--content", KEEPER_WORD)
         self.assertEqual(rj.returncode, 0, rj.stderr)
         payload = json.loads(rj.stdout.strip().splitlines()[-1])
         self.assertEqual(payload.get("id"), keeper)
@@ -449,26 +511,22 @@ class TopOneBlindspotRegressionTest(_CliCase):
             f"payload: {json.dumps(payload)}")
 
 
-def _exact_content(case):
-    """Recover the exact keeper content for the JSON-warning pin (the CLI
-    list preview is the source of truth, not the local constant)."""
-    for row in case._list():
-        if row["preview"] == KEEPER_WORD:
-            return KEEPER_WORD
-    return KEEPER_WORD
-
-
 class OrganizeKnobRefusalTest(_CliCase):
-    """PR #485 review (I2): a malformed ambient ZMEM_UPDATE_FOLD_THRESHOLD
-    used to abort `store.py organize` with a raw traceback once its
-    compression path reached update_memory — now the clean exit-2 refusal."""
+    """PR #485 review (I2, rebuilt per broad-review r2 R5/F-01): a malformed
+    ambient ZMEM_UPDATE_FOLD_THRESHOLD must refuse `store.py organize` with
+    a clean exit 2. The rebuilt test FORCES the refusal path: the knob is
+    now validated at organize() entry (before any stage writes), so ANY
+    non-dry-run organize with a garbage knob exits 2 — no fixture-shape
+    dependence on reaching update_memory, and the rc==2 assertion is
+    unconditional (the old version passed vacuously when its fixture never
+    reached the compression stage; deleting the CLI handler kept it green)."""
 
     def test_organize_refuses_cleanly_on_garbage_knob(self):
-        _keeper, _victim = self._setup = None, None
-        # Any store state works: the knob refusal fires at the FIRST
-        # update_memory call the organize compression path makes; with no
-        # compressible rows organize completes and exits 0 — so seed a
-        # compressible pair to force the path.
+        # The knob parse is env-side and needs no store state at all, but
+        # seeding two rows makes the NOTHING-COMMITTED oracle discriminating:
+        # a mutant that moves the pre-flight AFTER consolidation (final-critic
+        # round-5 mutant, executed) still exits 2 but arms the cadence clock —
+        # caught by the meta.last_consolidation assertion below.
         long_a = ("alpha beta gamma delta epsilon zeta eta theta iota kappa "
                   "lambda mu nu xi omicron pi rho sigma tau upsilon phi chi "
                   "psi omega repeated tail one for the organize leg")
@@ -484,15 +542,43 @@ class OrganizeKnobRefusalTest(_CliCase):
         r = self._run("organize", "--force",
                       env=_env(self.tmp,
                                ZMEM_UPDATE_FOLD_THRESHOLD="garbage"))
-        combined = r.stdout + r.stderr
-        if r.returncode == 2:
-            self.assertIn("ZMEM_UPDATE_FOLD_THRESHOLD", combined, combined)
-            self.assertNotIn("Traceback", combined, combined)
-        else:
-            # organize found no compression candidate reaching update_memory
-            # under this fixture shape — the refusal path was not exercised;
-            # assert the run at least did not traceback.
-            self.assertNotIn("Traceback", combined, combined)
+        # UNCONDITIONAL: the pre-flight refusal fires before any stage
+        # writes, so exit 2 is guaranteed by the fixture-independent entry
+        # check — the old else-branch (rc==0, "refusal path not exercised")
+        # is gone by construction.
+        self.assertEqual(r.returncode, 2, (r.stdout, r.stderr))
+        self.assertIn("ZMEM_UPDATE_FOLD_THRESHOLD", r.stderr, r.stderr)
+        self.assertNotIn("Traceback", r.stderr, r.stderr)
+        # NOTHING was committed: the cadence clock must NOT be armed by the
+        # refused run (an after-consolidation mutant arms it — this is the
+        # R6/F-06 ordering oracle), and both seeded rows must still be live.
+        import sqlite3 as _sq
+        conn = _sq.connect(os.path.join(self.tmp, "store.sqlite"))
+        meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+        conn.close()
+        self.assertNotIn(
+            "last_consolidation", meta,
+            f"the refused run must not arm the cadence clock; meta keys: "
+            f"{sorted(meta)[:20]}")
+        self.assertNotIn(
+            "last_consolidation_count", meta,
+            f"the refused run must not write consolidation counts; meta "
+            f"keys: {sorted(meta)[:20]}")
+        rows = self._list()
+        live_contents = sorted(
+            (row.get("preview") or "")[:40] for row in rows)
+        self.assertEqual(
+            len(rows), 2,
+            f"both seeded rows must still be live on a refused run; "
+            f"live={json.dumps(live_contents)[:400]}")
+
+    def test_organize_valid_knob_still_runs(self):
+        # The pre-flight validation must not break a healthy organize run.
+        r = self._run("organize", "--force",
+                      env=_env(self.tmp, ZMEM_UPDATE_FOLD_THRESHOLD="0.95"))
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        r2 = self._run("organize", "--force", env=_env(self.tmp))
+        self.assertEqual(r2.returncode, 0, (r2.stdout, r2.stderr))
 
 
 

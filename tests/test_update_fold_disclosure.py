@@ -77,8 +77,8 @@ BOILER = (
     "anchor receipt published on the target issue with semantics digest stable"
 )
 CONTENT_A = BOILER + " pr 467"                 # the keeper row
-NEARDUP_HUMAN = BOILER + " pr 472 zetafold472"  # AC1 human-leg update (folds ~0.977)
-NEARDUP_JSON = BOILER + " pr 474 zetafold473"   # AC1 json-leg update  (folds ~0.976)
+NEARDUP_HUMAN = BOILER + " pr 472 zetafold472"  # AC1 human-leg update (folds ~0.977 measured)
+NEARDUP_JSON = BOILER + " pr 474 zetafold473"   # AC1 json-leg update  (folds ~0.9695 measured; margin to the 0.95 pin is thin — recalibrate both legs if BOILER changes)
 UNRELATED_B = (
     "alpha bravo charlie delta echo foxtrot golf hotel india juliet "
     "kilo lima mike november standby baseline unrelated filler row"
