@@ -1659,6 +1659,7 @@ Legacy rows already stranded under a near-miss namespace
   [--namespace NS] [--type ...] [--tags ...] [--source-ref ...] [--confidence F]
   [--signal ...] [--taint ...] [--capture-mode manual|reviewed|auto]
   [--expiry-class <endpoint|setting|metric>] [--inject-until <UTC ISO8601>]
+  [--no-dedup]
 <interpreter> <store.py> invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
 ```
 - **`update`** is append-only knowledge revision: it creates a NEW live row with the
@@ -1668,8 +1669,13 @@ Legacy rows already stranded under a near-miss namespace
   overridden; the old row's content is NEVER mutated. An unknown or
   already-superseded id is refused (exit 2, nothing written). Dedup runs against
   OTHER live rows (the replaced row is excluded, so even an unchanged-content
-  "update" creates history). Point-in-time recall (`--as-of` before the update)
-  returns the OLD content; after returns the NEW.
+  "update" creates history). By default (issue #472) the fold fires only on
+  normalized-exact content — a near-duplicate update lands as its own row with
+  a skip notice instead of silently dropping its text; `ZMEM_UPDATE_FOLD_THRESHOLD`
+  below 1.0 opts back into near-dup folding (with drop disclosure), and
+  `--no-dedup` always lands the row as its own (remote mode refuses it — the
+  queued-op payload cannot carry the bypass). Point-in-time recall (`--as-of`
+  before the update) returns the OLD content; after returns the NEW.
 - **`invalidate`** is `supersede` with a REQUIRED `--reason` — the preferred way to
   record "this fact is no longer true" so the correction is auditable (issue #59,
   4.3). `supersede` remains for general tombstones (consolidated/pruned rows)

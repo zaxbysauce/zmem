@@ -5,6 +5,65 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.159.0] - 2026-11-15
+
+### Changed
+
+- **Default update-fold behavior** (issue #472): an `update` now folds
+  into an existing row ONLY when its content is normalized-exact
+  (equality, never similarity); at the old default every in-band
+  near-duplicate update (>= 0.85) folded and silently dropped the
+  update's text. Updates that do not fold exactly now land as their
+  own live row (with a skip notice); opt back into near-dup folding
+  via `ZMEM_UPDATE_FOLD_THRESHOLD` below `1.0` (with drop
+  disclosure). The knob is read in the applying engine's environment
+  only: it does not travel with queued ops in remote/fleet mode (the
+  hub's own env decides the fold policy for queued updates), and it
+  does not gate `--no-dedup` updates. The same exact-only default
+  applies to `store.py organize`'s compression/summary updates (a
+  malformed knob there refuses the whole run at start, before any
+  stage write).
+
+### Fixed
+
+- **Update-path dedup fold honesty + exact-only fold gate** (issue
+  #472): `store.py update` no longer claims `new content merged into
+  existing live memory` while dropping the update's content. The update
+  fold now (a) fires only when the update's content is NORMALIZED-EXACT
+  to the keeper (content equality — never similarity; distinct strings
+  can share an embedding, proven by the fake-profile collision probe
+  papa/romeo at similarity=1.000) — every other update lands as its own
+  live row with a skip notice; (b) discloses the content drop on BOTH
+  surfaces when a fold does fire (truthful two-lane wording + a
+  structured `warnings` entry on `update --json` carrying the keeper
+  id, similarity, and message); (c) honors the new
+  `ZMEM_UPDATE_FOLD_THRESHOLD` knob (default `1.0` exact-only; below
+  `1.0` opts into near-dup folding above max(knob,
+  `ZMEM_DEDUP_THRESHOLD`) with drop disclosure; malformed values
+  refuse the update at exit 2 before anything is written; the knob
+  does not block `update --no-dedup`). The fold decision runs BEFORE
+  the expiry keeper-write guard, so a rejected fold can never mutate
+  the keeper. Adds `update --no-dedup` (local mode; remote use is
+  refused loudly by the queue gate). Sibling fix on the add path: the
+  dedup fold's `already contains this content` lane now also requires
+  normalized content equality — colliding embeddings get the near-dup
+  drop disclosure instead of a false exact claim, and both exact
+  lanes say `normalized-equal` rather than `identical` (the verbatim
+  text need not be stored). For `store.py add` and `store.py update`,
+  fold exactness is decided by an in-transaction content_norm re-rank
+  over the live rows behind the top-ranked candidate (bounded window,
+  fall-through past subject-vetoed exact rows, visible `dedup
+  re-ranked` notice) — a colliding row or a vector-less keeper
+  outranking the true exact keeper used to refuse the fold (duplicate
+  live rows) or mis-disclose. The re-rank honors the #376
+  subject-identity veto and the
+  knowledge-pointer exclusion. (The ingest/sync-restore fold keeps
+  its existing top-1 behavior — tracked separately.) `store.py
+  organize` validates a malformed ZMEM_UPDATE_FOLD_THRESHOLD at run
+  start (before any stage writes or the cadence clock) and converts
+  a malformed ZMEM_UPDATE_FOLD_THRESHOLD to the clean exit-2
+  refusal.
+
 ## [0.158.0] - 2026-11-15
 ### Added
 - Knowledge routing policy, PR2 of the knowledge-companion workstream

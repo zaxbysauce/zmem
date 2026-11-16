@@ -3389,6 +3389,14 @@ def main():
                     "the update returns the OLD content; after returns the NEW.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p_upd.add_argument("--id", required=True, help="id of the live memory to update")
+    p_upd.add_argument("--no-dedup", dest="no_dedup", action="store_true",
+                       help="skip the update dedup fold: the replacement row "
+                            "always lands as its own live row even when its "
+                            "content matches or nearly matches another live "
+                            "memory (issue #472: the update-path sibling of "
+                            "add's --no-dedup — an explicit correction must "
+                            "not be silently folded away; local mode only, "
+                            "remote use is refused)")
     p_upd.add_argument("--content", required=True,
                        help="the new content; the literal '-' reads content from "
                             "stdin, decoded as UTF-8 with CRLF normalized to LF "
@@ -6623,6 +6631,7 @@ def main():
                         evidence_ids=args.evidence_ids,
                         expiry_class=args.expiry_class,
                         inject_until=args.inject_until,
+                        skip_dedup=getattr(args, "no_dedup", False),
                     )
                 finally:
                     if _human_out is not None:
@@ -7077,6 +7086,16 @@ def main():
                             conn, dry_run=args.dry_run, force=args.force,
                             prune=args.prune, belief_heads=args.belief_heads,
                             llm_local=args.llm_local)
+                    except ValueError as _vexc:
+                        # PR #485 review: organize's compression/summary
+                        # calls into update_memory can hit the strict
+                        # ZMEM_UPDATE_FOLD_THRESHOLD refusal — surface it
+                        # as the same clean exit-2 refusal the update
+                        # command uses, not a raw traceback.
+                        _release_lock("consolidate", o_token)
+                        o_token = None
+                        print(f"[zmem] {_vexc}", file=sys.stderr)
+                        sys.exit(2)
                     except (_beliefs.BeliefActionError,
                             _beliefs.BeliefAdapterError) as _bexc:
                         _release_lock("consolidate", o_token)

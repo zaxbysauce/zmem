@@ -131,6 +131,10 @@ _WRITE_REFUSALS: dict[str, tuple[tuple[str, Any], ...]] = {
     "update": (
         ("confidence", None), ("evidence", None), ("reason", None),
         ("expected_old_namespace", None), ("taint", None),
+        # Issue #472: the queued-op payload cannot carry the bypass, so an
+        # explicit --no-dedup must refuse loudly here rather than queue a
+        # foldable update with the flag silently dropped (mirrors add).
+        ("no_dedup", False),
     ),
     "supersede": (("expected_namespace", None),),
     "invalidate": (("expected_namespace", None),),

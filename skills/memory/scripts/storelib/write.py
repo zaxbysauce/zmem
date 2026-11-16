@@ -1863,15 +1863,95 @@ def add_memory(
         # −0.10 trust event to BOTH rows.
         if existing:
             from storelib.consolidate import dedup_polarity_conflict
+            # PR #485 broad-review r2 (R3/R7 fix): exactness is decided from
+            # the ADMITTED KEEPER's content FIRST — mirroring update_memory's
+            # gate (the previous code keyed add_fold_exact only on the
+            # rowid-first equal row, so when that row was subject-vetoed but
+            # the keeper itself was normalized-equal, the fold merged into
+            # the keeper while the disclosure falsely claimed "not stored
+            # anywhere"). Only when the keeper is NOT content-exact do we
+            # consult the exact basis below; the polarity guard then runs on
+            # the FINAL selected keeper (exact keepers included — see the
+            # guard comment below for the newline-quoted counterexample).
+            ex_keeper = conn.execute(
+                "SELECT content FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            add_fold_exact = bool(
+                ex_keeper is not None
+                and _normalize_content(content)
+                == _normalize_content(ex_keeper["content"] or "")
+            )
+            exact_row_retargeted = False
+            if not add_fold_exact:
+                # PR #485 review (top-1 blindspot, add path): the detector's
+                # exact (content_norm) lane never runs once a semantic
+                # candidate is admitted, so a colliding row can outrank the
+                # TRUE exact keeper — the fold then merges metadata into the
+                # wrong row and (post-#472) the disclosure claims "not stored
+                # anywhere" while the identical text IS live. Re-rank against
+                # the canonical exact basis (live rows only, bounded window
+                # with #376 fall-through) BEFORE the merge, exactly like the
+                # update gate.
+                try:
+                    exact_rows = conn.execute(
+                        "SELECT id, content, tags, type FROM memory "
+                        "WHERE namespace=? AND content_norm=? "
+                        "AND superseded_at IS NULL "
+                        "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                        "'knowledge:%') ORDER BY rowid LIMIT ?",
+                        (namespace, _normalize_content(content),
+                         SUBJECT_MAX_EXACT_CANDIDATES),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    exact_rows = []  # pre-v8 store without content_norm
+                exact_ranked = [(r, 1.0) for r in exact_rows]
+                if exact_ranked:
+                    # Review r2 N-A: subject-recheck the exact candidates
+                    # exactly like the detector lanes (a vetoed row is not a
+                    # fold target and never licenses the "already stored"
+                    # wording); _subject_admit falls through vetoed rows.
+                    admitted = _subject_admit(exact_ranked, tags, type_)
+                    if admitted:
+                        exact_row = admitted[0][0]
+                        if exact_row["id"] != existing["id"]:
+                            existing = {"id": exact_row["id"]}
+                            dedup_sim = 1.000
+                            add_fold_exact = True
+                            exact_row_retargeted = True
             if dedup_polarity_conflict(conn, existing["id"], content):
+                # v11 (issue #61, 6.2) write-time polarity guard, run on
+                # the FINAL selected keeper at the `if existing:` body level
+                # — exact keepers included, regardless of add_fold_exact.
+                # (Broad-review r2's "a norm-equal keeper can never conflict"
+                # premise is FALSE: the polarity signature strips only
+                # newline-free quoted spans, while normalize_content
+                # collapses whitespace, so `"not\nx"` and `"not x"` are
+                # normalized-equal yet conflict — Stage-B reviewer
+                # counterexample. A contradiction is NOT a duplicate even at
+                # normalized equality.) Skip the merge and insert;
+                # generate_links_on_write below records the `contradicts`
+                # pair (sim >= 0.85 > link threshold 0.75) and applies
+                # the −0.10 trust event to BOTH rows.
                 print(
                     f"[zmem] dedup skipped: polarity disagreement with "
-                    f"{existing['id']} (similarity={dedup_sim:.3f}); rows stay "
-                    "separate and link as contradicts"
+                    f"{existing['id']} (similarity={dedup_sim:.3f}); "
+                    "rows stay separate and link as contradicts"
                 )
                 existing = None
 
         if existing:
+            if exact_row_retargeted:
+                # Fires only here — after EVERY fold-rejection guard (polarity
+                # above, and there is no further add-path rejection) has
+                # accepted the final keeper (Stage-B review rounds 2-3: a
+                # notice that promises a merge before the guards decide can
+                # contradict a subsequent decline).
+                print(
+                    "[zmem] dedup re-ranked: the top semantic "
+                    "candidate was not content-exact; merging "
+                    "into the exact live row "
+                    f"{existing['id']} instead"
+                )
             # Merge: upgrade confidence/signal if the new add is stronger.
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags, now=tx_now)
             # v11 (issue #61, 6.2): a polarity-AGREEING re-observation of the
@@ -1929,13 +2009,23 @@ def add_memory(
             # taint/trust merge). Disclose that disposition explicitly — the
             # refresh notice below names the keeper and similarity but never
             # says the caller's content was dropped, which read as "merged".
-            # PR #470 review: on the exact-match lane (similarity 1.000) the
-            # identical text IS already stored as the keeper, so the near-dup
-            # wording ("not stored anywhere" + re-add advice) would be false
-            # there — give that lane its own truthful line. The --no-dedup
-            # hint names its command because only store.py add has the flag
+            # PR #470 review: on the exact-match lane the identical text IS
+            # already stored as the keeper, so the near-dup wording ("not
+            # stored anywhere" + re-add advice) would be false there — give
+            # that lane its own truthful line. The --no-dedup hint names its
+            # command because only store.py add has the flag
             # (apply-ops/organize/episodes folds print this line too).
-            if dedup_sim < 1.0:
+            # Issue #472 sibling fix: exactness is NORMALIZED CONTENT
+            # EQUALITY, not similarity — distinct strings can share an
+            # embedding (collision probe: two different words fold at
+            # similarity=1.000 under the fake profile), and the similarity
+            # key would falsely call such content "exactly contained".
+            # PR #485 review: the exactness decision now rides the IN-TX
+            # content_norm re-rank above (add_fold_exact), computed against
+            # ANY live row — not a post-commit re-read of the top-1 row
+            # (which both raced a concurrent purge and missed the true exact
+            # keeper sitting behind a colliding candidate).
+            if not add_fold_exact:
                 print(f"[zmem] dedup: existing memory {existing['id']} folded the "
                       f"incoming add — the incoming content was NOT stored "
                       f"(only metadata merged); the incoming content is not "
@@ -1944,9 +2034,9 @@ def add_memory(
                       "(a store.py add flag) to store it as its own row")
             else:
                 print(f"[zmem] dedup: existing memory {existing['id']} already "
-                      f"contains this exact content (similarity={dedup_sim:.3f}) "
-                      "— nothing new was stored; the identical text is already "
-                      "stored in that row")
+                      f"contains this content (normalized-equal; similarity="
+                      f"{dedup_sim:.3f}) — nothing new was stored; the "
+                      "equivalent text is already stored in that row")
             print(f"[zmem] dedup: existing memory {existing['id']} refreshed "
                   f"(similarity={dedup_sim:.3f}, threshold={DEDUP_SIMILARITY_THRESHOLD})")
             return WriteResult(existing["id"], warnings=warns, deduped=True)
@@ -2060,6 +2150,51 @@ def add_memory(
         raise
 
 DEDUP_SIMILARITY_THRESHOLD = _env_float("ZMEM_DEDUP_THRESHOLD", 0.85)
+
+
+def _update_fold_threshold() -> float:
+    """Strict reader for ZMEM_UPDATE_FOLD_THRESHOLD (issue #472).
+
+    Unlike ``_env_float`` (which never raises and silently falls back), this
+    knob REFUSES malformed values loudly: it is the gate that decides whether
+    an update's content is stored or dropped, so a garbage value must never
+    silently become the default. Read lazily at update entry (never at import
+    time — an eager parse would break unrelated commands), BEFORE the step-1
+    tombstone, so a refusal writes nothing.
+
+    Semantics: unset -> 1.0 (exact-content-only folding). Values >= 1.0 are
+    VALID and mean the same. A value < 1.0 opts into near-dup semantic folding
+    (those folds disclose the content drop on both output surfaces). Must be
+    finite and > 0.
+    """
+    raw = os.environ.get("ZMEM_UPDATE_FOLD_THRESHOLD")
+    if raw is None:
+        return 1.0
+    text = raw.strip()
+    if not text:
+        raise ValueError(
+            "[zmem] ZMEM_UPDATE_FOLD_THRESHOLD is set but empty — unset it "
+            "or set it to a number in (0, 1] or any value >= 1.0 (values "
+            ">= 1.0 mean exact-content-only folding; values < 1.0 enable "
+            "near-dup folding with disclosure)"
+        )
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(
+            f"[zmem] ZMEM_UPDATE_FOLD_THRESHOLD={raw!r} is not a number — "
+            "set it to a value in (0, 1] or any value >= 1.0 (values "
+            ">= 1.0 mean exact-content-only folding; values < 1.0 enable "
+            "near-dup folding with disclosure)"
+        ) from None
+    if not 0.0 < value < float("inf"):
+        raise ValueError(
+            f"[zmem] ZMEM_UPDATE_FOLD_THRESHOLD={raw!r} is out of range — "
+            "it must be finite and greater than 0 (values >= 1.0 mean "
+            "exact-content-only folding; values < 1.0 enable near-dup "
+            "folding with disclosure)"
+        )
+    return value
 
 # Issue #376: frozen observability seam. Process-local int, incremented
 # once per candidate-row subject-compatibility EVALUATION (only when both
@@ -2439,6 +2574,7 @@ def update_memory(
     expiry_class: str | None = None,
     inject_until: str | None = None,
     now: str | None = None,
+    skip_dedup: bool = False,
 ) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
@@ -2720,6 +2856,15 @@ def update_memory(
 
         normalized_evidence_ids = _validated_evidence_ids(conn, evidence_ids)
 
+        # Issue #472: parse the update-fold gate STRICTLY and LAZILY, before
+        # the step-1 tombstone below — a malformed knob refuses the whole
+        # update (ValueError -> CLI exit 2) having written nothing. PR #485
+        # broad-review r2 (F-05): the knob governs the FOLD, so it is only
+        # consulted when dedup is active — `--no-dedup` bypasses the fold
+        # entirely and must stay usable under a malformed ambient knob (the
+        # bypass's whole point is landing the row regardless of fold policy).
+        fold_threshold = _update_fold_threshold() if not skip_dedup else 1.0
+
         # 1) Tombstone the old row (append-only history). valid_until=now so
         # point-in-time as-of never resurrects it (see supersede_memory).
         # Issue #109 follow-up: when an old-namespace expectation is armed,
@@ -2780,23 +2925,133 @@ def update_memory(
 
         # 2) Dedup against OTHER live rows. `mid` is tombstoned above, so it
         # cannot self-match; an unchanged-content update still creates history.
+        # Issue #472: --no-dedup bypasses the fold entirely (add's exact
+        # shape — the detector still computes the embedding the insert path
+        # needs, but never emits a dedup-cached candidate and `existing` is
+        # cleared before any guard or merge can act on it).
         _warn_fake_active_once()
+        _bypass = skip_dedup
         existing, dedup_sim, emb, _legacy = call_detect_duplicate(
             _detect_duplicate, conn, content_eff, ns, tags=tags_eff,
-            type_=type_eff)
-        # v11 (issue #61, 6.2): the same write-time polarity guard as add —
-        # a contradiction is NOT a duplicate. Disagree ⇒ skip the merge and
-        # insert the replacement row; generate_links_on_write below records
-        # the contradicts pair + trust event.
+            type_=type_eff, emit=not _bypass)
+        if _bypass:
+            existing = None
+        # Issue #472 (PR #485 broad-review r2): the exact-keeper search runs
+        # BEFORE the v11 polarity guard, so a polarity-conflicting
+        # top-ranked semantic candidate cannot suppress the exact lane and
+        # land a duplicate live row of exact content. The polarity guard is
+        # NOT skipped for exact keepers, though: it re-runs on the FINAL
+        # selected keeper below (the broad-review premise "a norm-equal
+        # keeper can never conflict" is false — the polarity signature
+        # strips only newline-free quoted spans while normalize_content
+        # collapses whitespace, so `"not\nx"` and `"not x"` normalize equal
+        # yet conflict; Stage-B reviewer counterexample).
+        # Issue #472: the update-fold gate — ONE decision, made BEFORE the
+        # expiry guard below so a REJECTED fold can never mutate the keeper
+        # (no memory_expiry write, no merge/trust/taint/relink). Exactness is
+        # NORMALIZED CONTENT EQUALITY, never similarity: the plan-critic
+        # executed a collision probe (distinct strings share embeddings and
+        # fold at similarity=1.000 under the fake profile), so a similarity
+        # key would both drop distinct content and mislabel it "identical".
+        # Default (knob >= 1.0, incl. unset): exact-content folds ONLY —
+        # every other update lands as its own live row. A knob < 1.0 opts
+        # into near-dup semantic folding; those folds disclose the content
+        # drop truthfully on both output surfaces (see the fold branch).
+        fold_is_exact = False
+        should_fold = False
+        exact_row_retargeted = False
         if existing:
             from storelib.consolidate import dedup_polarity_conflict
-            if dedup_polarity_conflict(conn, existing["id"], content_eff):
+            keeper_row = conn.execute(
+                "SELECT content FROM memory WHERE id=?", (existing["id"],)
+            ).fetchone()
+            fold_is_exact = bool(
+                keeper_row is not None
+                and _normalize_content(content_eff)
+                == _normalize_content(keeper_row["content"])
+            )
+            if not fold_is_exact:
+                # PR #485 review (top-1 blindspot): the detector returns ONE
+                # top-ranked candidate, and its exact lane never runs once a
+                # semantic candidate is admitted — a colliding row (or a
+                # vector-less keeper, the supported degraded state) can
+                # outrank the TRUE exact keeper, refusing an exact-content
+                # fold and landing a duplicate live row. Re-rank against the
+                # store's own canonical exact basis (content_norm, live rows
+                # only, same live-namespace content_norm window) before
+                # declining. PR #485 broad-review r2: fall through
+                # subject-vetoed exact rows to a compatible runner-up (the
+                # detector's own bounded window contract, #376) instead of
+                # stopping at the oldest equal row.
+                try:
+                    exact_rows = conn.execute(
+                        "SELECT id, content, tags, type FROM memory "
+                        "WHERE namespace=? AND content_norm=? "
+                        "AND superseded_at IS NULL AND id<>? "
+                        "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                        "'knowledge:%') ORDER BY rowid LIMIT ?",
+                        (ns, _normalize_content(content_eff), mid,
+                         SUBJECT_MAX_EXACT_CANDIDATES),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    exact_rows = []  # pre-v8 store without content_norm
+                exact_ranked = [(r, 1.0) for r in exact_rows]
+                exact_row_retargeted = False
+                if exact_ranked:
+                    # Review r2 N-A: the re-ranked target must clear the
+                    # SAME #376 subject-identity veto the detector lanes
+                    # enforce (fall-through included); a vetoed candidate
+                    # still prints the stable veto line via _subject_admit.
+                    # The re-rank notice deliberately fires AFTER the polarity
+                    # guard below has accepted the final keeper (Stage-B
+                    # review round 2: a notice that promises a fold before
+                    # the guard decides can contradict a subsequent decline).
+                    admitted = _subject_admit(
+                        exact_ranked, tags_eff, type_eff)
+                    if admitted:
+                        exact_row = admitted[0][0]
+                        existing = {"id": exact_row["id"]}
+                        dedup_sim = 1.000
+                        fold_is_exact = True
+                        exact_row_retargeted = True
+            # Broad-review r2: the fold decision is computed BEFORE any
+            # disposition print, so a notice can never promise a disposition
+            # the gate then contradicts (under a knob < 1.0 a vetoed exact
+            # candidate previously printed "lands as its own live row" and
+            # then still folded into the original semantic candidate).
+            # Polarity guard runs on the FINAL selected keeper — exact
+            # keepers included (Stage-B counterexample: the polarity
+            # signature strips only newline-free quoted spans while
+            # normalize_content collapses whitespace, so `"not\nx"` and
+            # `"not x"` are normalized-equal yet polarity-conflicting).
+            if existing is not None and \
+                    dedup_polarity_conflict(conn, existing["id"], content_eff):
                 print(
                     f"[zmem] update dedup skipped: polarity disagreement with "
                     f"{existing['id']} (similarity={dedup_sim:.3f}); rows stay "
                     "separate and link as contradicts"
                 )
                 existing = None
+            if existing is not None:
+                should_fold = (
+                    fold_is_exact
+                    or (fold_threshold < 1.0 and dedup_sim >= fold_threshold)
+                )
+                if not should_fold:
+                    gate_reason = (
+                        "(your ZMEM_UPDATE_FOLD_THRESHOLD="
+                        f"{fold_threshold:g} gate)"
+                        if fold_threshold < 1.0
+                        else ("(exact content match only; set "
+                              "ZMEM_UPDATE_FOLD_THRESHOLD below 1.0 to fold "
+                              "near-duplicates with disclosure)")
+                    )
+                    print(
+                        f"[zmem] update fold skipped: similarity={dedup_sim:.3f} "
+                        f"does not clear the update fold gate {gate_reason} — "
+                        "the update lands as its own live row"
+                    )
+                    existing = None
         if existing:
             dup_id = existing["id"]
             # v15 (#173 PR-review F04): an EXPLICIT expiry request must not be
@@ -2825,6 +3080,18 @@ def update_memory(
                     existing = None
         if existing:
             dup_id = existing["id"]
+            if exact_row_retargeted:
+                # Fires only here — after EVERY fold-rejection guard (polarity
+                # above, the fold gate, and the expiry state-target escape
+                # hatch) has accepted the final keeper (Stage-B review rounds
+                # 2-3: a notice that promises a fold before the guards decide
+                # can contradict a subsequent decline).
+                print(
+                    "[zmem] update dedup re-ranked: the top "
+                    "semantic candidate was not content-exact; "
+                    "folding into the exact live row "
+                    f"{dup_id} instead"
+                )
             _merge_on_dedup(conn, dup_id, conf_eff, sig_eff, tags_eff, now=tx_now)
             # v11 (issue #61, 6.2): polarity-agreeing dedup fold on update is
             # a corroborating re-observation — same +0.05 as add.
@@ -2887,8 +3154,47 @@ def update_memory(
                     )
             if started_tx:
                 _commit(conn)
-            print(f"[zmem] update: {mid} superseded; new content merged into existing "
-                  f"live memory {dup_id} (similarity={dedup_sim:.3f})")
+            # Issue #472: truthful fold disposition on BOTH output surfaces
+            # (the exactness basis — normalized content equality — was
+            # computed at the fold gate above; the old wording claimed
+            # "new content merged" while the fold drops the incoming text).
+            if fold_is_exact:
+                print(
+                    f"[zmem] update: {mid} superseded; the update matched "
+                    f"existing live memory {dup_id} (similarity="
+                    f"{dedup_sim:.3f}) — equivalent text (normalized-equal) "
+                    f"is already stored in that row; nothing new was stored"
+                )
+                warns.append({
+                    "type": "update_folded",
+                    "keeper": dup_id,
+                    "similarity": round(dedup_sim, 3),
+                    "message": (
+                        f"update folded into {dup_id} (similarity="
+                        f"{dedup_sim:.3f}): the update's content is "
+                        f"normalized-equal to the existing row; nothing new "
+                        f"was stored"),
+                })
+            else:
+                print(
+                    f"[zmem] update: {mid} superseded; the update FOLDED "
+                    f"into existing live memory {dup_id} (similarity="
+                    f"{dedup_sim:.3f}) — the update's content was NOT "
+                    f"stored (only metadata merged); it is not stored "
+                    f"anywhere. To store future updates like this as their "
+                    f"own row: pass --no-dedup or re-phrase. (Recovery for "
+                    f"dropped text: a fresh `add --no-dedup` — the "
+                    f"tombstoned id cannot be re-updated.)"
+                )
+                warns.append({
+                    "type": "update_folded",
+                    "keeper": dup_id,
+                    "similarity": round(dedup_sim, 3),
+                    "message": (
+                        f"update folded into {dup_id} (similarity="
+                        f"{dedup_sim:.3f}): the update's content was not "
+                        f"stored; only metadata merged"),
+                })
             return WriteResult(dup_id, warnings=warns), False
 
         # 3) No dedup hit — insert the NEW live row replacing `mid`.
