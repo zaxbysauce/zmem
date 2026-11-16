@@ -285,7 +285,10 @@ def default_journal() -> KnowledgeJournal:
 
 def _journal_record(journal: KnowledgeJournal | None, *, target_id: str,
                     logical_key: str, locator: str, digest: str,
-                    namespace: str = "") -> KnowledgeJournal | None:
+                    namespace: str = "",
+                    op_id: str | None = None,
+                    summary: str | None = None,
+                    staked_at: str | None = None) -> KnowledgeJournal | None:
     """record_intent, verbatim — the journal is the intent record.
 
     Same-digest retries stay idempotent whatever the entry's state, EXCEPT
@@ -301,15 +304,18 @@ def _journal_record(journal: KnowledgeJournal | None, *, target_id: str,
     try:
         journal.record_intent(target_id=target_id, logical_key=logical_key,
                               locator=locator, digest=digest,
-                              namespace=namespace)
+                              namespace=namespace,
+                              op_id=op_id, summary=summary,
+                              staked_at=staked_at)
         entry = journal.entry_for(target_id, logical_key, namespace)
         if (entry is not None and entry.digest == digest
                 and entry.state == "quarantined"):
             raise WorkflowError(
                 "journal entry for knowledge:%s:%s (namespace %r) is "
-                "quarantined: no recovery command exists yet (an explicit "
-                "recovery surface is pending an owner decision); publish "
-                "NEW content under this identity to record a fresh intent"
+                "quarantined: run `knowledge retry` on this identity to "
+                "recover a stale-CAS quarantine (operator quarantines and "
+                "non-CAS causes refuse); publish NEW content under this "
+                "identity to record a fresh intent"
                 % (target_id, logical_key, namespace))
         return journal
     except JournalError as exc:
@@ -486,7 +492,9 @@ def capture(*, target_id: str, logical_key: str, text: str,
     tracked_journal = _journal_record(
         journal, target_id=target_id, logical_key=logical_key,
         locator=document.locator, digest=document.digest,
-        namespace=namespace)
+        namespace=namespace,
+        summary=summary,
+        staked_at=_now_iso())
 
     # 3. Predecessor observation BEFORE the create — and the stake is
     #    DURABLE before the create too (crash law): the observed
@@ -917,6 +925,246 @@ def capture(*, target_id: str, logical_key: str, text: str,
 # never matched by substring.
 _READ_REFUSAL_REASONS = ("namespace_not_allowed", "authorization_denied",
                          "capability_denied", "principal_mismatch")
+
+
+def retry(*, target_id: str, logical_key: str,
+          namespace: str = _DEFAULT_NAMESPACE,
+          mode: str = "local",
+          conn=None,
+          config=None,
+          journal: KnowledgeJournal | None = None,
+          delivery=None,
+          http=None,
+          env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Recover one stale-CAS quarantined publication (#480 FB-008).
+
+    The ORIGINAL CAS stake (expected_row_id + version, verbatim from the
+    quarantined attempt's delivery intent) is retried — never refreshed:
+    a stake that is still stale refuses with a fresh typed refusal naming
+    the original version, mutating nothing.  Selection: the identity's
+    latest entry must be ``quarantined`` AND its delivery intent must
+    carry ``state == "cas_stale"`` with the original stake (any other
+    quarantine cause — operator, hub rejection, conflict — refuses typed
+    naming the cause; a crash-left ``doc_pending`` partial for the SAME
+    digest is superseded by the completing retry).  Refusals mutate
+    NOTHING (journal, delivery, pointer all byte-identical).
+
+    Local mode: the pointer CAS runs FIRST; on success a fresh op id is
+    minted, a NEW higher-seq ``applied`` journal entry lands (original
+    entry preserved verbatim; summary/staked_at copied from it onto the
+    new entry; ``retry_ref`` = the original entry's seq), and a receipt
+    keyed by the fresh op id is recorded.  Exit contract (CLI): 0 success,
+    1 typed refusal, 3 remote-pending.
+    """
+    if mode not in ("local", "remote"):
+        raise WorkflowError("mode must be 'local' or 'remote'")
+    if config is None:
+        from knowledge.config import load_knowledge_config  # noqa: PLC0415
+
+        config = load_knowledge_config(env=env)
+    if journal is None:
+        journal = default_journal()
+    if delivery is None:
+        from knowledge.delivery import (  # noqa: PLC0415
+            KnowledgeDelivery, default_delivery_path)
+
+        delivery = KnowledgeDelivery(default_delivery_path())
+    ref = _ref_for(target_id, logical_key)
+
+    def _refusal(message: str, *, envelope: dict | None = None) -> dict:
+        out = {"ok": False, "completed": False, "ref": ref,
+               "target": target_id, "key": logical_key,
+               "namespace": namespace, "error": message}
+        if envelope:
+            out.update(envelope)
+        return out
+
+    if not config.enabled:
+        return _refusal(
+            "knowledge companion is disabled: no enabled 'knowledge' "
+            "object in the store config (config.json)")
+
+    # Selection: latest journal entry + the intent's stake.  A corrupt
+    # journal or sidecar is a TYPED recovery-state refusal (never a
+    # traceback, never exit 2).
+    try:
+        entries = [e for e in journal.entries()
+                   if e.target_id == target_id
+                   and e.logical_key == logical_key
+                   and e.namespace == namespace]
+    except JournalError as exc:
+        return _refusal("journal unreadable: %s (operator review "
+                        "required; nothing mutated)" % exc)
+    except Exception as exc:  # noqa: BLE001 - typed, content-free
+        return _refusal("journal unreadable (%s); operator review "
+                        "required" % exc.__class__.__name__)
+    if not entries:
+        return _refusal(
+            "no journal entry for knowledge:%s:%s (namespace %r): "
+            "nothing to retry" % (target_id, logical_key, namespace))
+    original = max(entries, key=lambda e: e.seq)
+    if original.state == "doc_pending":
+        # A crash-left partial for the SAME digest is superseded by the
+        # completing retry; the quarantined entry below it is the target.
+        below = [e for e in entries
+                 if e.seq < original.seq and e.state == "quarantined"]
+        if not (below and below[-1].digest == original.digest):
+            return _refusal(
+                "latest entry for knowledge:%s:%s is %s (an in-flight "
+                "doc_pending, not a crashed retry partial): retry "
+                "recovers stale-CAS quarantines only"
+                % (target_id, logical_key, original.state))
+        original = below[-1]
+    if original.state == "applied":
+        return _refusal(
+            "latest entry for knowledge:%s:%s is already applied: no "
+            "quarantined attempt remains to retry"
+            % (target_id, logical_key))
+    if original.state != "quarantined":
+        return _refusal(
+            "latest entry for knowledge:%s:%s is %s (not quarantined): "
+            "retry recovers stale-CAS quarantines only"
+            % (target_id, logical_key, original.state))
+    try:
+        intent = delivery.get_intent(ref, namespace=namespace)
+    except Exception as exc:  # noqa: BLE001 - typed, content-free
+        return _refusal("quarantine recovery state unreadable in the "
+                        "delivery sidecar (%s): operator review required; "
+                        "nothing mutated" % exc.__class__.__name__)
+    if intent is None:
+        return _refusal(
+            "no delivery intent for knowledge:%s:%s: nothing staked to "
+            "retry" % (target_id, logical_key))
+    if intent.get("digest") != original.digest:
+        return _refusal(
+            "delivery intent digest does not match the quarantined entry "
+            "for knowledge:%s:%s: mismatched recovery state"
+            % (target_id, logical_key))
+    intent_state = str(intent.get("state") or "")
+    if intent_state != "cas_stale":
+        return _refusal(
+            "quarantine cause %r is not a stale CAS: retry refuses "
+            "(recoverable cause is 'cas_stale' only)"
+            % (intent_state or "unknown",))
+    expected_row_id = intent.get("expected_row_id")
+    try:
+        version = int(intent.get("version") or 1)
+    except (TypeError, ValueError):
+        return _refusal("stake version unreadable: malformed recovery state")
+    digest = original.digest
+    locator = original.locator
+
+    if mode == "remote":
+        from knowledge.delivery import (  # noqa: PLC0415
+            build_link_op, hub_capability_status, new_op_id)
+
+        if http is None:
+            http = build_hub_transport(env)
+        cap_status, _cap_detail = hub_capability_status(http)
+        if cap_status != "supported":
+            # Pending envelope; NOTHING enqueued (byte-identical sidecar).
+            return {"ok": False, "completed": False, "queued": False,
+                    "pending": True,
+                    "pointer": {"status": "pending",
+                                "reason": "hub-unreachable"},
+                    "ref": ref, "target": target_id, "key": logical_key,
+                    "namespace": namespace, "retry_pending": True,
+                    "error": "hub unreachable: retry kept pending, "
+                             "nothing enqueued"}
+        op_id = new_op_id()
+        delivery.enqueue({
+            "op_id": op_id,
+            "namespace": namespace,
+            "target": target_id, "key": logical_key,
+            "version": version,
+            "expected_row_id": expected_row_id,
+            "digest": digest, "locator": locator,
+            "fullhash": [digest[i * 8:(i + 1) * 8]
+                          for i in range(8)],
+            "summary": (original.summary
+                        or _default_summary_text(logical_key)),
+            "date": original.staked_at or _now_iso(),
+            "state": "queued", "staked": False,
+            "row_id": None, "ref": ref,
+            "staked_at": original.staked_at,
+        })
+        return {"ok": True, "completed": False, "queued": True,
+                "op_id": op_id,
+                "pointer": {"status": "queued"},
+                "ref": ref, "target": target_id, "key": logical_key,
+                "namespace": namespace}
+
+    # Local mode: verify the staked bytes on the target FIRST (a tampered
+    # or missing document refuses typed — the retry never links bytes it
+    # cannot read back), then CAS with the ORIGINAL stake (never
+    # refreshed).
+    if conn is None:
+        raise WorkflowError("local retry requires an open store")
+    from knowledge.delivery import new_op_id  # noqa: PLC0415
+
+    try:
+        from knowledge.documents import open_target  # noqa: PLC0415
+
+        reader = open_target(_require_target(config, target_id))
+        staked_bytes = reader.read(locator)
+    except Exception as exc:  # noqa: BLE001 - typed, content-free
+        return _refusal(
+            "retry refused: the staked document could not be read back "
+            "at %s (%s) — nothing linked" % (locator,
+                                             exc.__class__.__name__))
+    import hashlib
+
+    if hashlib.sha256(staked_bytes).hexdigest() != digest:
+        return _refusal(
+            "retry refused: the staked bytes at %s do not match the "
+            "recorded digest (target tampered or wrong locator); "
+            "nothing linked" % locator)
+    op_id = new_op_id()
+    store_knowledge = _storelib_knowledge()
+    try:
+        landed = store_knowledge.link_pointer(
+            conn, namespace=namespace, target=target_id,
+            key=logical_key, version=version, full_sha256=digest,
+            summary=(original.summary
+                     or _default_summary_text(logical_key)),
+            expected_row_id=(str(expected_row_id)
+                             if expected_row_id else None))
+    except store_knowledge.KnowledgePointerCasError as exc:
+        return _refusal(
+            "retry refused: the original stake (version %d) is still "
+            "stale against the live pointer — %s" % (version, exc),
+            envelope={"pointer": {"status": "cas_stale",
+                                  "detail": str(exc)}})
+    except store_knowledge.KnowledgePointerConflict as exc:
+        return _refusal(
+            "retry refused: version %d is bound to a different digest — "
+            "%s" % (version, exc),
+            envelope={"pointer": {"status": "conflict",
+                                  "detail": str(exc)}})
+    # Success: the completing entry lands as a NEW higher-seq applied
+    # entry (record_retry — record_intent is idempotent on the same
+    # digest and would return the quarantined original forever).  The
+    # original is preserved verbatim; a crash-left doc_pending partial
+    # stays in history, superseded as the identity's latest.
+    journal.record_retry(
+        target_id=target_id, logical_key=logical_key,
+        locator=locator, digest=digest, namespace=namespace,
+        op_id=op_id, summary=original.summary,
+        staked_at=original.staked_at, retry_ref=original.seq)
+    delivery.record_receipt({
+        "op_id": op_id, "target": target_id, "key": logical_key,
+        "namespace": namespace, "status": "committed",
+        "link_status": "applied", "row_id": landed.get("row_id"),
+        "retried": True,
+    })
+    return {"ok": True, "completed": True, "queued": False,
+            "op_id": op_id, "retry_ref": original.seq,
+            "pointer": {"status": "applied",
+                        "row_id": landed.get("row_id"),
+                        "version": version},
+            "journal_state": "applied",
+            "ref": ref, "target": target_id, "key": logical_key,
+            "namespace": namespace}
 
 
 def _hub_pointer_for_read(http: Any, namespace: str, target_id: str,
@@ -1461,7 +1709,11 @@ def status(*, target_id: str | None = None, logical_key: str | None = None,
         "mode": mode,
         "enabled": bool(config.enabled),
         "targets": {
-            tid: {"kind": t.kind} for tid, t in config.targets.items()
+            tid: ({"kind": t.kind,
+                   "description": t.description}
+                  if getattr(t, "description", None) is not None
+                  else {"kind": t.kind})
+            for tid, t in config.targets.items()
         },
         "namespace": namespace,
         "journal": journal_rows,

@@ -1009,6 +1009,376 @@ class CrossProcessOrderingTest(unittest.TestCase):
         self.assertTrue((env.knowledge_dir() / "journal.json").exists())
 
 
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Arm's-length maintenance pin, r2 (issue trace 480-481-482, Fix 2):
+# ALL THREE namespace-move entry points (write.rekey_namespace, i.e. the
+# rekey-namespace --from/--near-miss-global CLI lane;
+# rekey.apply_namespace_map, i.e. --map --confirm; and the automatic v5
+# migration lane schema._rekey_namespaces) REFUSE a durably in-flight
+# publication BEFORE any SQLite/sidecar mutation; terminal-only history
+# and unrelated namespaces do NOT block.  Plus the docs leg: the
+# drain-first rekey procedure (RED at base — the doc documents the FB-031
+# guard and the fleet-wide-drain disclosure already; the fix adds the
+# owner decision + the drain-first NAMING, frozen here).
+
+
+class MaintenanceGuardPin(unittest.TestCase):
+    """Published selector: test_guard_suite_green_with_drain_docs."""
+
+    @staticmethod
+    def _doc(key, body):
+        from knowledge.documents import prepare_document
+        return prepare_document("notes", key, body)
+
+    def _active_entry(self, env, key, namespace):
+        doc = self._doc(key, "maintenance pin active body\n")
+        env.journal.record_intent(
+            target_id="notes", logical_key=key, locator=doc.locator,
+            digest=doc.digest, namespace=namespace)
+
+    def _terminal_entry(self, env, key, namespace):
+        doc = self._doc(key, "maintenance pin terminal body\n")
+        env.journal.record_intent(
+            target_id="notes", logical_key=key, locator=doc.locator,
+            digest=doc.digest, namespace=namespace)
+        for state in ("doc_verified", "pointer_queued", "applied"):
+            env.journal.mark(target_id="notes", logical_key=key,
+                             state=state, namespace=namespace)
+
+    def _snapshot(self, env):
+        return (env.live_rows(), env.dead_ids(), env.journal_bytes(),
+                env.delivery_bytes())
+
+    def test_guard_suite_green_with_drain_docs(self):
+        import re
+        import subprocess
+
+        # -- entry point 1: storelib.write.rekey_namespace (the
+        #    rekey-namespace --from / --near-miss-global lane).
+        env = _Env(tag="maint1")
+        self.addCleanup(shutil.rmtree, env.tmp, True)
+        self.addCleanup(env.close)
+        _add_ordinary_row(env.conn, NS_OLD, "row the move would take")
+        env.conn.commit()
+        self._active_entry(env, "run/pin-a", NS_OLD)
+        before = self._snapshot(env)
+        with self.assertRaises(RekeyKnowledgeBusy) as ctx:
+            _rekey(env)
+        self.assertIn("in flight", str(ctx.exception))
+        self.assertFalse(env.conn.in_transaction)
+        self.assertEqual(self._snapshot(env), before,
+                         "the refusal fires BEFORE any SQLite or sidecar "
+                         "mutation")
+        # terminal-only history does NOT block the same move.
+        for state in ("doc_verified", "pointer_queued", "applied"):
+            env.journal.mark(target_id="notes", logical_key="run/pin-a",
+                             state=state, namespace=NS_OLD)
+        moved = _rekey(env)
+        env.conn.commit()
+        self.assertGreaterEqual(moved, 1,
+                                "terminal-only history must not block")
+
+        # -- entry point 2: storelib.rekey.apply_namespace_map (the
+        #    --map --confirm lane).  Trigger variants: an ACTIVE journal
+        #    entry in the DESTINATION namespace, and a QUEUED delivery op.
+        env2 = _Env(tag="maint2")
+        self.addCleanup(shutil.rmtree, env2.tmp, True)
+        self.addCleanup(env2.close)
+        with _quiet():
+            storelib_knowledge.link_pointer(
+                env2.conn, namespace=NS_OLD, target="notes", key="run/map",
+                version=1, full_sha256="a" * 64, summary="map pin",
+                expected_row_id=None)
+        env2.conn.commit()
+        entries = [("knowledge:notes:run/map", NS_NEW)]
+        self._active_entry(env2, "run/map", NS_NEW)  # destination in flight
+        before2 = self._snapshot(env2)
+        rc = _apply_map(env2, entries)
+        self.assertEqual(rc, 1, "the map apply must refuse")
+        self.assertFalse(env2.conn.in_transaction)
+        self.assertEqual(self._snapshot(env2), before2)
+        # a QUEUED delivery op in the destination is equally in flight
+        for state in ("doc_verified", "pointer_queued", "applied"):
+            env2.journal.mark(target_id="notes", logical_key="run/map",
+                              state=state, namespace=NS_NEW)
+        env2.delivery.enqueue({
+            "namespace": NS_NEW, "target": "notes", "key": "run/map",
+            "version": 1,
+            "locator": self._doc("run/map", "queued pin\n").locator,
+            "fullhash": ["12345678"] * 8, "summary": "queued pin",
+            "date": "2026-01-01T00:00:00Z", "expected_row_id": None})
+        rc = _apply_map(env2, entries)
+        self.assertEqual(rc, 1, "a queued delivery op must refuse the map")
+        env2.delivery.remove([e["op_id"] for e in env2.delivery.pending()])
+        # an UNRELATED namespace's activity never blocks (scoped check)
+        self._active_entry(env2, "run/other", NS_OTHER)
+        rc = _apply_map(env2, entries)
+        env2.conn.commit()
+        self.assertEqual(rc, 0, "unrelated-namespace activity must not "
+                         "block the map apply")
+
+        # -- entry point 3: the automatic v5 migration lane
+        #    (storelib.schema._rekey_namespaces).
+        env3 = _Env(tag="maint3")
+        self.addCleanup(shutil.rmtree, env3.tmp, True)
+        self.addCleanup(env3.close)
+        _add_ordinary_row(env3.conn, NS_OLD, "v5 row riding the move")
+        with _quiet():
+            storelib_knowledge.link_pointer(
+                env3.conn, namespace=NS_OLD, target="notes", key="run/v5p",
+                version=1, full_sha256="b" * 64, summary="v5 pin",
+                expected_row_id=None)
+        env3.conn.commit()
+        legacy = "legacy-maint-" + uuid.uuid4().hex[:8]
+        env3.conn.execute(
+            "UPDATE memory SET namespace=? WHERE namespace=?",
+            (legacy, NS_OLD))
+        env3.conn.commit()
+        checkout = env3.tmp / "checkout"
+        checkout.mkdir()
+        fake_host = types.SimpleNamespace(
+            _get_git_remote_status=lambda p: (
+                "https://example.invalid/org/repo.git", "remote"),
+            _normalize_remote=lambda url: "maintpin")
+        dest_ns = "project:maintpin"
+        with mock.patch.dict(os.environ, {
+                "ZMEM_NS_MIGRATION_MAP": json.dumps(
+                    {legacy: str(checkout)})}, clear=False), \
+                mock.patch.object(_schema, "_host", fake_host), _quiet():
+            _schema.migrate(env3.conn)   # baseline: nothing in flight
+        self._active_entry(env3, "run/v5p", dest_ns)  # destination active
+        kept = env3.conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=?",
+            (legacy,)).fetchone()[0]
+        with mock.patch.dict(os.environ, {
+                "ZMEM_NS_MIGRATION_MAP": json.dumps(
+                    {legacy: str(checkout)})}, clear=False), \
+                mock.patch.object(_schema, "_host", fake_host), _quiet():
+            mapping = _schema._rekey_namespaces(env3.conn, [legacy])
+        self.assertEqual(mapping, {},
+                         "the autoload lane must refuse an in-flight "
+                         "destination namespace")
+        still = env3.conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=?",
+            (legacy,)).fetchone()[0]
+        self.assertGreaterEqual(still, kept, "nothing moved, no partial "
+                               "migration")
+        # terminal-only: the same lane proceeds
+        for state in ("doc_verified", "pointer_queued", "applied"):
+            env3.journal.mark(target_id="notes", logical_key="run/v5p",
+                              state=state, namespace=dest_ns)
+        with mock.patch.dict(os.environ, {
+                "ZMEM_NS_MIGRATION_MAP": json.dumps(
+                    {legacy: str(checkout)})}, clear=False), \
+                mock.patch.object(_schema, "_host", fake_host), _quiet():
+            _schema.migrate(env3.conn)
+        env3.conn.commit()
+        landed = env3.conn.execute(
+            "SELECT count(*) FROM memory WHERE namespace=?",
+            (dest_ns,)).fetchone()[0]
+        self.assertGreaterEqual(landed, 1,
+                                "terminal-only history lets the migration "
+                                "proceed")
+
+        # -- the CLI end-to-end leg (real store.py rekey-namespace
+        #    --from ... --confirm) stays fail-closed.
+        import datetime
+        tmp = Path(tempfile.mkdtemp(prefix="zmem-maintcli-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        (tmp / "vault").mkdir()
+        cli_env = dict(
+            os.environ,
+            ZMEM_STORE=str(tmp / "store.sqlite"), ZMEM_DATA=str(tmp),
+            ZMEM_MODEL_AUTODOWNLOAD="0",
+            ZMEM_MODELS_DIR=str(tmp / "no-models"))
+        cli_env.pop("ZMEM_REMOTE_URL", None)
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "stats"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=cli_env, cwd=str(REPO_ROOT), timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (tmp / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "notes": {"kind": "markdown", "root": str(tmp / "vault")}}}
+        }), encoding="utf-8")
+        conn = sqlite3.connect(str(tmp / "store.sqlite"))
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO memory (id, namespace, type, content, tags, "
+            "source_ref, confidence, signal, ingestion_ts, taint, "
+            "source_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "project:pinned", "lesson",
+             "row the rekey would move", "[]", "session:maintpin", 0.9,
+             "none", now, "trusted_internal", "deadbeef"))
+        conn.commit()
+        conn.close()
+        knowledge_dir = tmp / "knowledge"
+        knowledge_dir.mkdir(exist_ok=True)
+        (knowledge_dir / "journal.json").write_text(json.dumps({
+            "version": 1,
+            "entries": [{
+                "seq": 1, "target_id": "notes",
+                "logical_key": "guides/deploy",
+                "ref": "knowledge:notes:guides/deploy",
+                "locator": "guides/deploy/0000000000000000-0000000000000000-"
+                           "0000000000000000-0000000000000000.md",
+                "digest": "0" * 64, "state": "doc_pending",
+                "updated_at": "2026-01-01T00:00:00.000+00:00",
+                "namespace": "project:pinned",
+            }],
+        }, indent=1), encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "rekey-namespace",
+             "--from", "project:pinned", "--to", "project:moved",
+             "--confirm"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=cli_env, cwd=str(REPO_ROOT), timeout=180)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refusing namespace rekey", proc.stderr + proc.stdout)
+        self.assertIn("in flight", proc.stderr + proc.stdout)
+
+        # -- docs leg: the drain-first procedure (RED at base).
+        doc_path = REPO_ROOT / "docs" / "KNOWLEDGE-COMPANION.md"
+        self.assertTrue(doc_path.is_file())
+        text = doc_path.read_text(encoding="utf-8")
+        hits = [m.start() for m in re.finditer("drain-first", text,
+                                               re.IGNORECASE)]
+        self.assertTrue(
+            hits,
+            "docs/KNOWLEDGE-COMPANION.md must carry the drain-first "
+            "procedure for rekeying a namespace that holds knowledge "
+            "pointers (frozen phrase 'drain-first'; absent at base)")
+        window = 400
+        self.assertTrue(
+            any("rekey" in text[max(0, i - window):i + window].lower()
+                for i in hits),
+            "the drain-first procedure must sit near the rekey material "
+            "(within %d chars of 'rekey')" % window)
+
+    # -- r4 SUPPLEMENTARY semantic docs probes (NOT frozen rows; they
+    #    ride in the C5 file and are RED at base / GREEN at head).
+
+    def _doc_text(self, rel: str) -> str:
+        path = REPO_ROOT / rel
+        self.assertTrue(path.is_file(), "%s must exist" % rel)
+        return path.read_text(encoding="utf-8")
+
+    def test_docs_semantic_drain_first_ordered_steps(self):
+        """C5 semantic supplement (r5-strengthened): the drain-first
+        procedure is an ORDERED step list — numbered markers "1." < "2."
+        < "3." — whose steps NAME the operations in ascending order:
+        quiesce ... drain ... journal ... rekey."""
+        import re
+        text = self._doc_text("docs/KNOWLEDGE-COMPANION.md")
+        hits = [m.start() for m in re.finditer("drain-first", text,
+                                               re.IGNORECASE)]
+        self.assertTrue(hits, "the drain-first section must exist")
+        for start in hits:
+            window = text[start:start + 1500]
+            first = window.find("1.")
+            second = window.find("2.", first + 1) if first >= 0 else -1
+            third = window.find("3.", second + 1) if second >= 0 else -1
+            if third < 0:
+                continue
+            quiesce = window.lower().find("quiesce", third)
+            drain = window.lower().find("drain", quiesce + 1) \
+                if quiesce >= 0 else -1
+            journal = window.lower().find("journal", drain + 1) \
+                if drain >= 0 else -1
+            rekey = window.lower().find("rekey", journal + 1) \
+                if journal >= 0 else -1
+            if rekey >= 0:
+                return
+            self.fail(
+                "the ordered steps must NAME the operations in ascending "
+                "order quiesce < drain < journal < rekey within the "
+                "drain-first section; positions: quiesce=%d drain=%d "
+                "journal=%d rekey=%d" % (quiesce, drain, journal, rekey))
+        self.fail("the drain-first procedure must carry an ORDERED "
+                  "numbered step list (markers '1.' < '2.' < '3.' within "
+                  "the section) naming quiesce/drain/journal/rekey in "
+                  "ascending order")
+
+    def test_docs_semantic_stranded_states_dated_ruling(self):
+        """C8 semantic supplement (r7-strengthened): EACH of the three
+        stranded-state names sits in a window carrying a DECIDED ruling
+        token ('ruled 2026-11-15' or 'decision recorded 2026-11-15') AND
+        the positive operator token 'explicit operator action', with NO
+        undecided or negated wording: 'remains pending' / 'pending an' /
+        'pending a' / 'is pending' / 'without operator action' /
+        'automatic remap' / 'auto-remap'.  The state name 'eternal
+        pending entry' never trips the bans (its 'pending' is followed
+        by ' entry').  Mutant-verified: all eight r5+r7 mutant forms
+        die; both decided forms pass."""
+        text = self._doc_text("docs/KNOWLEDGE-COMPANION.md")
+        self.assertIn("2026-11-15", text,
+                      "the owner ruling date 2026-11-15 must be recorded")
+        banned = ("remains pending", "pending an", "pending a",
+                  "is pending", "without operator action",
+                  "automatic remap", "auto-remap")
+        for name in ("quarantined old-namespace identity",
+                     "orphaned first-create pointer",
+                     "eternal pending entry"):
+            positions = [i for i in range(len(text))
+                         if text.startswith(name, i)]
+            self.assertTrue(positions,
+                            "stranded-state name %r must appear" % name)
+            for i in positions:
+                window = text[max(0, i - 400):i + 400]
+                decided = ("ruled 2026-11-15" in window
+                           or "decision recorded 2026-11-15" in window)
+                positive = "explicit operator action" in window
+                clean = not any(phrase in window for phrase in banned)
+                if decided and positive and clean:
+                    break
+            else:
+                self.fail(
+                    "stranded-state name %r must sit in a window with a "
+                    "DECIDED ruling token AND the positive operator "
+                    "token 'explicit operator action' and NONE of the "
+                    "banned wordings %r (got decided=%r positive=%r)"
+                    % (name, banned, decided, positive))
+
+    def test_docs_semantic_spawn_pre_check_measured(self):
+        """C14 semantic supplement (r5-strengthened): docs/
+        KNOWLEDGE-ROUTING.md carries the spawn pre-check phrase AND the
+        NUMERIC measured-cost token "0.2 s" AND the decision token
+        "open option"."""
+        text = self._doc_text("docs/KNOWLEDGE-ROUTING.md")
+        self.assertIn("spawn pre-check", text,
+                      "the spawn pre-check phrase must appear")
+        self.assertIn(
+            "0.2 s", text,
+            "the NUMERIC measured-cost token '0.2 s' must appear")
+        self.assertIn(
+            "open option", text,
+            "the DECISION token 'open option' must appear (the measured "
+            "adoption decision)")
+
+    def test_docs_semantic_remote_boundary_positive(self):
+        """C6/C8 supplement (r5): a POSITIVE boundary sentence — the
+        local guard does NOT see remote namespace moves AND fleet-wide
+        drain is required before rekey, both tokens in ONE 300-char
+        sentence window."""
+        text = self._doc_text("docs/KNOWLEDGE-COMPANION.md")
+        needle_a = "does not see remote"
+        starts = [i for i in range(len(text))
+                  if text.startswith(needle_a, i)]
+        self.assertTrue(starts,
+                        "the positive boundary token %r must appear"
+                        % (needle_a,))
+        for i in starts:
+            window = text[max(0, i - 150):i + 150]
+            if "fleet-wide drain" in window and "rekey" in window.lower():
+                return
+        self.fail(
+            "the local-guard remote boundary sentence must ALSO state "
+            "that fleet-wide drain is required before rekey (both "
+            "'does not see remote' and 'fleet-wide drain' + 'rekey' in "
+            "one 300-char window)")
+
+
 class ShadowedKnowledgeImportTest(unittest.TestCase):
     """CI-005 (post-retarget CI red): legacy suites (pages / as-of /
     recall families) put ``skills/memory/scripts/storelib`` ITSELF on

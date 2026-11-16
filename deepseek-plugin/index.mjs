@@ -12,6 +12,7 @@ import { identity, ledgerKey } from "./identity.mjs";
 import * as backend from "./launcher.mjs";
 import { registerTools, TOOL_SPECS } from "./tools.mjs";
 import { classifyUserCorrection, classifyToolOutcome } from "./capture.mjs";
+import { CAPS, boundReceipts, boundCaptureQueue } from "./state.mjs";
 
 const STATE_SCHEMA = "zmem-deepseek-state-v1";
 const COMPACTION_EVENTS = new Set(["compaction/start", "compaction/end",
@@ -76,8 +77,12 @@ export function plugin(ctx, config = {}) {
     // accessors; per-session policyResolved/policyDelivered entries are
     // authoritative). Empty string + "none" = no policy lane engaged.
     policyDeliveredText: "", policyReason: "none",
+    pendingAtDispose: 0, disposeDrained: 0,
   };
   const writeState = () => {
+    // AC13 pin 3 (#481): policyDeliveredText is retained per-session in
+    // this state file (bounded with the session entry) — disclosed here
+    // at the state-file write site.
     if (!statePath()) return;
     try {
       fs.writeFileSync(statePath(), JSON.stringify(state, null, 1));
@@ -193,13 +198,14 @@ export function plugin(ctx, config = {}) {
             event_id: (m.source.captureEventId || null),
           })).then((r) => {
             if (r.result && r.result.ok && !r.result.deduped) {
-              state.captureQueue.push({
-                kind: "correction", redacted: true,
-                deduped: Boolean(r.result.deduped),
-                text: String(r.result.text || ctext.slice(0, 120)),
-                host: "deepseek", session: sid,
-                namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
-              });
+              state.captureQueue = boundCaptureQueue(
+                [...state.captureQueue, {
+                  kind: "correction", redacted: true,
+                  deduped: Boolean(r.result.deduped),
+                  text: ctext.slice(0, 120),
+                  host: "deepseek", session: sid,
+                  namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
+                }], CAPS.captureQueue, sid);
               writeState();
             }
           }).catch(() => { /* fail-open */ });
@@ -234,6 +240,9 @@ export function plugin(ctx, config = {}) {
             source: { kind: POLICY_SOURCE_KIND, form: "knowledge-policy" },
           });
           entry.policyDelivered = true;
+          // AC13 pin 3 (#481): policyDeliveredText is retained per-session
+          // in the plugin state file (bounded with the session entry) —
+          // disclosed here at its write site.
           state.policyDeliveredText = pol.text;
         }
         project(ident, entry);
@@ -370,10 +379,11 @@ export function plugin(ctx, config = {}) {
       namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
     })).then((r) => {
       if (r.result && r.result.ok) {
-        state.captureQueue.push({
-          kind: "failure", redacted: true, deduped: Boolean(r.result.deduped),
-          text: text.slice(0, 120),
-        });
+        state.captureQueue = boundCaptureQueue(
+          [...state.captureQueue, {
+            kind: "failure", redacted: true, deduped: Boolean(r.result.deduped),
+            text: text.slice(0, 120),
+          }], CAPS.captureQueue, null);
         writeState();
       }
     }).catch(() => { /* fail-open */ });
@@ -459,17 +469,22 @@ export function plugin(ctx, config = {}) {
     // file itself is always preserved. Ordinary disposal is NOT
     // persisted-session termination: per-session entries persist.
     state.persistsAcrossDispose = true;
+    // AC13 pin 2 (#481): disposeDrained DERIVES from actual drain outcomes
+    // (how many pending captures settled at this dispose), with the legacy
+    // pending-at-dispose count DISCLOSED in its own field.
     const pendingCount = pendingCaptures.size;
-    if (pendingCount > 0) {
-      state.disposeDrained =
-        (state.disposeDrained || 0) + pendingCount;
-    }
-    writeState();
+    state.pendingAtDispose =
+      (state.pendingAtDispose || 0) + pendingCount;
     if (pendingCount > 0) {
       try {
-        await Promise.allSettled([...pendingCaptures]);
+        const settled = await Promise.allSettled([...pendingCaptures]);
+        const drained = settled.filter(
+          (s) => s.status === "fulfilled" && s.value
+            && s.value.result && s.value.result.ok).length;
+        state.disposeDrained = (state.disposeDrained || 0) + drained;
       } catch { /* fail-open */ }
     }
+    writeState();
   });
 
   try {
@@ -479,7 +494,8 @@ export function plugin(ctx, config = {}) {
         writeState();
       },
       onReceipt: (receipt) => {
-        state.receipts.push(receipt);
+        state.receipts = boundReceipts(
+          [...state.receipts, receipt], CAPS.receipts);
         state.pendingReceipts = state.receipts.filter(
           (x) => x.status === "pending").length;
         writeState();

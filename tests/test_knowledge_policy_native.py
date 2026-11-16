@@ -46,15 +46,23 @@ no:cacheprovider -q tests/test_knowledge_policy_native.py``
 """
 
 from __future__ import annotations
-import _store_guard  # noqa: F401  (issue #244 isolation guard)
+import os
+import sys
+import tempfile
+
+# Scratch env pinned BEFORE the isolation guard (a developer box with a
+# real default store would otherwise be refused at import time; the pin
+# mirrors the tests/test_knowledge_documents.py header idiom and changes
+# no test behavior — every test builds its own env dicts).
+_GUARD_TMP = tempfile.mkdtemp(prefix="zmem-policynative-mod-")
+os.environ["ZMEM_STORE"] = os.path.join(_GUARD_TMP, "store.sqlite")
+os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
+import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
-import sys
-import tempfile
 import time
 import types
 import unittest
@@ -1164,6 +1172,304 @@ class RealHelperSeamTest(_NodeLeg, unittest.TestCase):
         self.assertLess(len(text), 8193, "within the adapter display bound")
 
 
+# ---------------------------------------------------------------------------
+# C13 supplementary state pins (issue trace 480-481-482, r3): the five
+# residual pins, RUNTIME legs on the dsh-STUB harness (the register-hook
+# pattern DshDisposeDrainTest uses) — zero skips wherever node+python
+# exist.  The class is appended; the pre-existing tests above are
+# untouched.  Base outcomes (reported per leg): (2) disposeDrained counts
+# pending-at-dispose and pendingAtDispose is absent -> RED; (3) per-
+# session retention field absent -> RED; (4) policyVersion absent ->
+# RED; (1) latch behavior and (5) the exact policyEnv set are base-green
+# (they pin existing runtime behavior the old tests skipped/under-pinned).
+
+_SUPP_CAPTURE_ENTRY_PY = '''\
+import json, os, time
+time.sleep(0.6)   # still in flight at dispose
+if os.environ.get("ZMEM_TEST_CAPTURE_OUTCOME") == "fail":
+    raise SystemExit(1)
+print(json.dumps({"ok": True, "deduped": False, "text": "supp pin"}))
+'''
+
+# The FULL documented resolver/system set policyEnv() copies (frozen):
+# exactly launcher.mjs POLICY_ENV_KEYS.
+_POLICY_ENV_FULL_SET = frozenset((
+    "ZMEM_STORE", "ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+    "ZMEM_HOME", "ZMEM_REMOTE_URL",
+    "HOME", "USERPROFILE", "USERNAME",
+    "SystemRoot", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "PATH",
+    "TEMP", "TMP", "PYTHONIOENCODING",
+))
+
+_SUPP_PLUGIN_PROBE = """
+import fs from "node:fs";
+const handlers = {};
+const ctx = {
+  on: (name, fn) => { (handlers[name] ??= []).push(fn); },
+  tools: { register: () => {} },
+};
+const mod = await import(process.env.PLUGIN_URL);
+await mod.plugin(ctx);
+const enterMsgs = [{ source: { kind: "user", captureEventId: "ce-ok" },
+  content: [{ type: "text", text: "ok" }] }];   // <5 chars: not a correction
+await handlers["agent/pre-step"][0](
+  { agent: { id: "sess-enabled" }, messages: [] },
+  async () => ({ kind: "enter", messages: enterMsgs }));
+await handlers["agent/pre-step"][0](
+  { agent: { id: "sess-rejected" }, messages: [] },
+  async () => ({ kind: "reject" }));
+if (process.env.DRIVE_FAILURE === "1") {
+  handlers["tools/result"][0](
+    { agent: { id: "sess-dispose" } },
+    { isError: true, error: { message: "supp pin: flange tool failed" } });
+}
+if (process.env.DRIVE_DISPOSE === "1") {
+  await handlers["agent/disposed"][0]();
+}
+const state = JSON.parse(
+  fs.readFileSync(process.env.ZMEM_DEEPSEEK_STATE, "utf8"));
+process.stdout.write(JSON.stringify({
+  sessions: state.sessions || {},
+  topPolicyText: state.policyDeliveredText ?? null,
+  policyReason: state.policyReason ?? null,
+  policyVersion: state.policyVersion ?? null,
+  disposeDrained: state.disposeDrained ?? null,
+  pendingAtDispose: state.pendingAtDispose ?? null,
+}) + "\\n");
+"""
+
+
+class SupplementaryStatePinsTest(_NodeLeg, unittest.TestCase):
+    """The five C13 pins (r3), runtime legs on the dsh-stub harness."""
+
+    def setUp(self):
+        if not (self.node_on_path() and self.python_on_path()):
+            self.skipTest("node/python not on PATH for the stub legs")
+        import tempfile
+        self._tmp = Path(tempfile.mkdtemp(prefix="zmem-supp-pins-"))
+        import shutil
+        self.addCleanup(shutil.rmtree, str(self._tmp), True)
+
+    def _supp_env(self, **extra):
+        tmp = self._tmp
+        root = tmp / "root"
+        for rel, text in (
+            ("dshstub/index.mjs", _STUB_DSH_LLM_MJS),
+            ("reg/stub-resolve.mjs", _RESOLVE_HOOK_MJS),
+            ("reg/reghook.mjs", _REGISTER_HOOK_MJS),
+            ("root/skills/memory/scripts/store.py", "raise SystemExit(0)\n"),
+            ("root/skills/memory/scripts/knowledge/policy.py",
+             STUB_POLICY_PY),
+            ("root/hooks/lib/zmem-capture-entry.py", _SUPP_CAPTURE_ENTRY_PY),
+        ):
+            target = tmp / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        (tmp / "state.json").write_text("{}", encoding="utf-8")
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+                             "NODE_OPTIONS")}
+        env.update({
+            "PLUGIN_URL": (REPO_ROOT / "deepseek-plugin" / "index.mjs").as_uri(),
+            "DSH_LLM_STUB_URL": (tmp / "dshstub" / "index.mjs").as_uri(),
+            "ZMEM_ROOT": str(root),
+            "ZMEM_STORE": str(root / "store.sqlite"),
+            "ZMEM_DATA": str(tmp / "data"),
+            "ZMEM_DEEPSEEK_STATE": str(tmp / "state.json"),
+            "ZMEM_TEST_POLICY_MARKER": str(tmp / "marker.jsonl"),
+            "ZMEM_TEST_POLICY_MODE": "enabled",
+            "NODE_OPTIONS": "--import=" + (tmp / "reg" / "reghook.mjs").as_uri(),
+            "PYTHONIOENCODING": "utf-8",
+        })
+        env.update({k: str(v) for k, v in extra.items()})
+        return env
+
+    def _drive(self, **extra) -> dict:
+        return self.run_node(_SUPP_PLUGIN_PROBE, self._supp_env(**extra),
+                             timeout_s=90.0)
+
+    # pin 1: the enabled-session latch is NONEMPTY + EXACT (the fixture
+    # RUNS — no skip, no all()-over-empty-map vacuity).  EXACT means:
+    # exactly the ACCEPTED session consumed the delivery latch; no other
+    # session in the map shows a consumed latch.
+    def test_enabled_session_latch_nonempty_and_exact(self):
+        out = self._drive()
+        sessions = out["sessions"]
+        self.assertTrue(sessions,
+                        "the latch map must be NONEMPTY (the enabled-"
+                        "session fixture ran): %r" % (sessions,))
+        self.assertIn("sess-enabled", sessions,
+                      "the accepted session must keep a native entry: %r"
+                      % (sessions,))
+        enabled = sessions["sess-enabled"]
+        self.assertIs(enabled.get("policyResolved"), True)
+        self.assertIs(enabled.get("policyDelivered"), True,
+                      "the ACCEPTED session consumed the latch: %r"
+                      % (enabled,))
+        consumed = [sid for sid, entry in sessions.items()
+                    if isinstance(entry, dict)
+                    and (entry.get("policyResolved") is True
+                         or entry.get("policyDelivered") is True)]
+        self.assertEqual(consumed, ["sess-enabled"],
+                         "EXACTLY the enabled session consumed the latch "
+                         "(a rejected pre-step never resolves the policy): "
+                         "%r" % (sessions,))
+
+    # pin 2: disposeDrained is DERIVED from actually-drained outcomes and
+    # pendingAtDispose is disclosed.  RED at base (base counts
+    # pending-at-dispose; pendingAtDispose is absent).
+    def test_dispose_drained_derived_and_pending_disclosed(self):
+        failed = self._drive(DRIVE_FAILURE="1", DRIVE_DISPOSE="1",
+                             ZMEM_TEST_CAPTURE_OUTCOME="fail")
+        self.assertEqual(failed["pendingAtDispose"], 1,
+                         "the pending-at-dispose count must be DISCLOSED "
+                         "as pendingAtDispose: %r" % (failed,))
+        self.assertEqual(failed["disposeDrained"], 0,
+                         "disposeDrained must be DERIVED from actually-"
+                         "drained outcomes (the capture FAILED): %r"
+                         % (failed,))
+        succeeded = self._drive(DRIVE_FAILURE="1", DRIVE_DISPOSE="1",
+                                ZMEM_TEST_CAPTURE_OUTCOME="ok")
+        self.assertEqual(succeeded["pendingAtDispose"], 1)
+        self.assertEqual(succeeded["disposeDrained"], 1,
+                         "a drained-and-completed capture counts 1: %r"
+                         % (succeeded,))
+
+    # pin 3 (r4 retarget): the residual is that policyDeliveredText
+    # PERSISTS the rendered policy to the state file WITHOUT a retention
+    # disclosure.  The fix adds a DISCLOSURE at the state-file write
+    # site — FROZEN MARKER: the writeState function in
+    # deepseek-plugin/index.mjs carries the literal comment
+    # "policyDeliveredText is retained per-session".  RED at base (the
+    # marker is absent).  The behavioral fact that the text persists to
+    # the file is separately pinned (base-green) via topPolicyText.
+    def test_policy_delivered_text_retention_disclosed(self):
+        out = self._drive()
+        self.assertEqual(out["topPolicyText"], POLICY_TEXT,
+                         "the delivered text persists to the state file "
+                         "(top-level preview) — the RETAINED fact the "
+                         "disclosure is about")
+        source = (REPO_ROOT / "deepseek-plugin" / "index.mjs").read_text(
+            encoding="utf-8")
+        anchor = source.find("writeState")
+        self.assertGreaterEqual(
+            anchor, 0, "the writeState function must exist")
+        marker = "policyDeliveredText is retained per-session"
+        window = source[anchor:anchor + 800]
+        self.assertIn(
+            marker, window,
+            "the state-file WRITE SITE must carry the retention "
+            "disclosure (frozen marker %r within the writeState region): "
+            "%r" % (marker, window[:200]))
+
+    # pin 4 (r5 DECISION FLIP — disclose-deliberate-constant): deriving
+    # policy_version from the text would conflict with C16 (which pins
+    # the integer POLICY_VERSION constant and FORBIDS a hashlib import
+    # in policy.py).  The adopted fix adds an explicit DISCLOSURE at the
+    # POLICY_VERSION definition site — FROZEN MARKER: the literal
+    # "deliberate display constant" within 300 chars of the
+    # "POLICY_VERSION =" definition, naming it deliberate (NOT a content
+    # hash).  The pin also asserts policy_status still returns the
+    # INTEGER constant (C16-compatible).  RED at base (marker absent).
+    def test_policy_status_version_derived_from_delivered_text(self):
+        import importlib.util as _ilu
+        source = REAL_POLICY_PY.read_text(encoding="utf-8")
+        site = source.find("POLICY_VERSION =")
+        self.assertGreaterEqual(
+            site, 0, "the POLICY_VERSION definition site must exist")
+        window = source[site:site + 300]
+        marker = "deliberate display constant"
+        self.assertIn(
+            marker, window,
+            "the POLICY_VERSION definition site must carry the "
+            "disclosure (frozen marker %r — a deliberate display "
+            "constant, not a content hash); window=%r"
+            % (marker, window[:150]))
+        # C16-compat: the value stays the INTEGER constant.
+        spec = _ilu.spec_from_file_location("zmem_policy_real_r5",
+                                            REAL_POLICY_PY)
+        policy = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(policy)
+        self.assertIsInstance(policy.POLICY_VERSION, int)
+        self.assertEqual(policy.POLICY_VERSION, 1,
+                         "the disclosed constant keeps its integer value")
+        cfg = self._tmp / "cfg-enabled-r5.json"
+        (self._tmp / "vault").mkdir(exist_ok=True)
+        cfg.write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "notes": {"kind": "markdown",
+                          "root": str(self._tmp / "vault")}}}}),
+            encoding="utf-8")
+        status = policy.policy_status(str(cfg), None)
+        self.assertTrue(status.get("text"),
+                        "an enabled companion renders policy text")
+        self.assertEqual(
+            status.get("policy_version"), policy.POLICY_VERSION,
+            "policy_status.policy_version stays the DISCLOSED integer "
+            "constant (C16-compatible); got %r"
+            % (status.get("policy_version"),))
+
+    # pin 5: policyEnv copies EXACTLY the full documented resolver set
+    # (17 keys) — the pin the old test lacked (it checked ZMEM_STORE and
+    # PATH only).  CLEAN-ROOM parent env (nothing inherited beyond the
+    # explicitly set variables) so the exact-set comparison is
+    # deterministic; compared case-insensitively (Windows env-block key
+    # case is not stable across node -> python boundaries).
+    def test_policy_env_exact_full_resolver_set(self):
+        root = self._tmp / "envroot"
+        (root / "skills" / "memory" / "scripts" / "knowledge").mkdir(
+            parents=True, exist_ok=True)
+        (root / "skills" / "memory" / "scripts" / "store.py").write_text(
+            "raise SystemExit(0)\n", encoding="utf-8")
+        (root / "skills" / "memory" / "scripts" / "knowledge"
+         / "policy.py").write_text(ENV_PROBE_POLICY_PY, encoding="utf-8")
+        marker = self._tmp / "envmarker.jsonl"
+        probe_env = {
+            # EVERY documented resolver var, set explicitly.
+            "ZMEM_STORE": str(root / "store.sqlite"),
+            "ZMEM_DATA": str(self._tmp / "envdata"),
+            "CLAUDE_PLUGIN_DATA": str(self._tmp / "envdata"),
+            "ZCODE_PLUGIN_DATA": str(self._tmp / "envdata"),
+            "ZMEM_HOME": str(self._tmp / "envhome"),
+            "ZMEM_REMOTE_URL": "https://hub.invalid.example/sentinel",
+            "HOME": str(self._tmp / "envhome"),
+            "USERPROFILE": str(self._tmp / "envhome"),
+            "USERNAME": "supp-pin-user",
+            "SystemRoot": os.environ.get("SystemRoot",
+                                          os.environ.get("SYSTEMROOT",
+                                                         "C:\\Windows")),
+            "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", "C:"),
+            "COMSPEC": os.environ.get("COMSPEC", "cmd.exe"),
+            "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE"),
+            "PATH": os.environ.get("PATH", ""),
+            "TEMP": os.environ.get("TEMP", str(self._tmp)),
+            "TMP": os.environ.get("TMP", str(self._tmp)),
+            "PYTHONIOENCODING": "utf-8",
+            # Probe plumbing (never policyEnv-filtered riders).
+            "LAUNCHER_URL": LAUNCHER_MJS.as_uri(),
+            "PROBE_TIMEOUT_MS": "5000",
+            "ZMEM_ROOT": str(root),
+            "ZMEM_TEST_POLICY_MARKER": str(marker),
+            "ZMEM_TEST_POLICY_MODE": "enabled",
+        }
+        out = self.run_node(_RUNPOLICY_PROBE, probe_env, timeout_s=60.0)
+        self.assertEqual(out.get("reason"), "ok", f"leg: {out!r}")
+        rows = _read_marker(marker)
+        self.assertEqual(len(rows), 1, "exactly one policy spawn")
+        child_env = rows[0].get("env") or {}
+        observed = frozenset(k.upper() for k in child_env)
+        expected = frozenset(
+            k.upper() for k in _POLICY_ENV_FULL_SET) | {
+            "ZMEM_TEST_POLICY_MARKER", "ZMEM_TEST_POLICY_MODE"}
+        self.assertEqual(observed, expected,
+                         "policyEnv must copy EXACTLY the documented "
+                         "resolver set (+ the ZMEM_TEST_* test seam); "
+                         "missing=%r extra=%r"
+                         % (sorted(expected - observed),
+                            sorted(observed - expected)))
+
+
 def main(argv=None) -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -1171,7 +1477,8 @@ def main(argv=None) -> int:
                 DshLauncherPolicyTest,
                 DshPreStepPolicyTest, DshDisposeDrainTest,
                 RealHelperSeamTest,
-                DocsAndSkillsTruthTest):
+                DocsAndSkillsTruthTest,
+                SupplementaryStatePinsTest):
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

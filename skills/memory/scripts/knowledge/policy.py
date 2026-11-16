@@ -88,6 +88,10 @@ __all__ = [
 ]
 
 POLICY_VERSION = 1
+# AC13 pin 4 (#481): the value above is a deliberate display constant, not
+# a content hash — the routing policy's contract does not version the
+# rendered text; bump it only when the policy FORMAT changes in a way
+# readers must distinguish.
 
 # Mirror storelib.config.MAX_CONFIG_BYTES: the store config.json itself is
 # bounded, so a larger file is a broken state, not a policy input.
@@ -97,6 +101,9 @@ MAX_CONFIG_BYTES = 65536
 # stay well below this; the guard exists so a future edit cannot ship an
 # oversized policy silently - it renders nothing instead.
 MAX_POLICY_WORDS = 200
+# Per-target description display budget (words); the aggregate stays
+# bounded by MAX_POLICY_WORDS via the roster composition.
+_DESC_BUDGET = 8
 
 # How many target ids the one-line roster shows.  The remainder are VALID
 # ids beyond the cap, counted ("(+N not shown)") so the model knows more
@@ -120,9 +127,9 @@ _DIR_ENV_VARS = ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")
 # renders exactly as the real CLI would accept it.
 _KNOWLEDGE_KEYS = frozenset(("enabled", "targets"))
 _TARGET_KEYS = {
-    "markdown": frozenset(("kind", "root")),
-    "kb-http": frozenset(("kind", "endpoint", "allow_http", "credential_env",
-                          "token_file", "timeout_s", "max_response_bytes")),
+    "markdown": frozenset((("kind", "root", "description"))),
+    "kb-http": frozenset((("kind", "endpoint", "allow_http", "credential_env",
+                          "token_file", "timeout_s", "max_response_bytes", "description"))),
 }
 
 _HEADING = "# ZMem knowledge companion (operator-enabled external notes)"
@@ -336,6 +343,19 @@ def _nonempty_str(value):
     return isinstance(value, str) and bool(value.strip())
 
 
+def _description_ok(value):
+    """Display mirror of the description grammar (validator parity):
+    optional; string; 1..200 codepoints; no C0/CR/LF/TAB; not
+    whitespace-only.  Values are never rendered when this returns False."""
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    if len(value) > 200 or not value.strip():
+        return False
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
 def _target_spec_ok(spec):
     """Shape-only acceptance of one target spec (fail-closed display).
 
@@ -353,6 +373,8 @@ def _target_spec_ok(spec):
         return False
     keys = _TARGET_KEYS.get(kind)
     if keys is None or set(spec) - keys:
+        return False
+    if not _description_ok(spec.get("description")):
         return False
     if kind == "markdown":
         return _nonempty_str(spec.get("root"))
@@ -439,11 +461,69 @@ def load_policy_state(config_path=None, environ=None):
     state["enabled"] = True
     state["targets"] = safe_ids[:MAX_TARGET_IDS_DISPLAY]
     state["targets_omitted"] = len(safe_ids) - len(state["targets"])
+    state["descriptions"] = {
+        tid: (raw_targets[tid].get("description") or None)
+        for tid in state["targets"]
+    }
     state["reason"] = "enabled" if state["targets"] else "no-targets"
     return state
 
 
-def _compose(target_ids, targets_omitted, allow_capture):
+def _display_description(description, budget):
+    """Deterministic per-target display truncation (#482 AC15): the
+    largest prefix (word-aligned) that keeps the ROSTER under the word
+    budget; marker "..." when truncated.  A description that cannot fit
+    at all renders as just the marker."""
+    if description is None:
+        return None
+    words = description.split()
+    keep = words[:budget] if budget > 0 else []
+    text = " ".join(keep)
+    if text != description:
+        text = (text + " ...").strip()
+    return text
+
+
+def _compose(target_ids, targets_omitted, allow_capture,
+             descriptions=None):
+    descriptions = descriptions or {}
+    # Deterministic aggregate allocation (#482 AC15): search the
+    # per-target display prefix downward from the longest description
+    # until the WHOLE policy stays under MAX_POLICY_WORDS - the
+    # truncated units end with the frozen marker '...'.  A valid
+    # config therefore never renders an empty policy from its
+    # descriptions.
+    base = _compose_plain(target_ids, targets_omitted, allow_capture)
+    base_words = len(base.split())
+    present = [descriptions.get(tid) for tid in target_ids]
+    max_prefix = max(
+        (len(d.split()) for d in present if d), default=0)
+    for prefix in range(max_prefix, -1, -1):
+        entries = []
+        for tid, desc in zip(target_ids, present):
+            if desc is None:
+                entries.append(tid)
+                continue
+            words = desc.split()
+            if prefix < len(words):
+                entries.append("%s — %s ..."
+                               % (tid, " ".join(words[:prefix])))
+            else:
+                entries.append("%s — %s" % (tid, desc))
+        roster = "Configured target ids: %s." % ", ".join(entries)
+        if targets_omitted > 0:
+            roster += " (+%d not shown)" % targets_omitted
+        body = (_READONLY_PARA if not allow_capture else _CAPTURE_PARA)
+        text = "\n\n".join(
+            [_HEADING, roster, _SHARED_PARA, body, _FOOTER])
+        if len(text.split()) < MAX_POLICY_WORDS:
+            return text
+    # Unreachable for any config whose descriptionless base fits (the
+    # base itself is the prefix=0 roster); kept as the honest floor.
+    return base
+
+
+def _compose_plain(target_ids, targets_omitted, allow_capture):
     roster = "Configured target ids: %s." % ", ".join(target_ids)
     if targets_omitted > 0:
         roster += " (+%d not shown)" % targets_omitted
@@ -465,7 +545,7 @@ def render_policy(config_path=None, environ=None, *, allow_capture=True):
     if not state["enabled"] or not state["targets"]:
         return ""
     text = _compose(state["targets"], state["targets_omitted"],
-                    allow_capture)
+                    allow_capture, state.get("descriptions"))
     if len(text.split()) >= MAX_POLICY_WORDS:
         return ""
     return text
@@ -477,10 +557,11 @@ def policy_status(config_path=None, environ=None, *, allow_capture=True):
     text = ""
     if state["enabled"] and state["targets"]:
         candidate = _compose(state["targets"], state["targets_omitted"],
-                             allow_capture)
+                             allow_capture, state.get("descriptions"))
         if len(candidate.split()) < MAX_POLICY_WORDS:
             text = candidate
     status = dict(state)
+    status.pop("descriptions", None)
     status["capture"] = bool(allow_capture)
     status["policy_version"] = POLICY_VERSION
     status["word_count"] = len(text.split())
