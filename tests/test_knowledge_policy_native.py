@@ -1462,6 +1462,12 @@ class SupplementaryStatePinsTest(_NodeLeg, unittest.TestCase):
         expected = frozenset(
             k.upper() for k in _POLICY_ENV_FULL_SET) | {
             "ZMEM_TEST_POLICY_MARKER", "ZMEM_TEST_POLICY_MODE"}
+        # POSIX pythons inject locale keys (LC_CTYPE et al.) into
+        # spawned-child envs; they are interpreter plumbing, not the
+        # launcher's resolver copy — tolerated, everything else exact.
+        observed = frozenset(
+            k for k in observed
+            if not (k.startswith("LC_") or k == "LANG"))
         self.assertEqual(observed, expected,
                          "policyEnv must copy EXACTLY the documented "
                          "resolver set (+ the ZMEM_TEST_* test seam); "
