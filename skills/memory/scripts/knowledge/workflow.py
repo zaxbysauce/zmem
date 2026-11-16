@@ -1659,6 +1659,27 @@ def flush(*, journal=None, delivery=None, http=None,
                                         "conflict", "pending")),
             None)
         if intent is None:
+            # A RETRY op has no still-queued intent (the intent stays
+            # cas_stale by design); its durable recovery identity is the
+            # pointer_queued journal entry the retry recorded.  A flush
+            # that crashed after the receipt but before reconciliation
+            # resumes HERE (#480 FB-008 round-3): the entry advances to
+            # applied off the committed receipt.
+            retry_entry = None
+            try:
+                retry_entry = next(
+                    (e for e in journal.entries()
+                     if e.state == "pointer_queued"
+                     and e.op_id == op_id), None)
+            except Exception:  # noqa: BLE001 - journal read is advisory
+                retry_entry = None
+            if retry_entry is not None and str(
+                    receipt.get("status", "")) in ("committed", "duplicate"):
+                journal.mark(target_id=retry_entry.target_id,
+                             logical_key=retry_entry.logical_key,
+                             state="applied",
+                             namespace=retry_entry.namespace)
+                recovered += 1
             continue
         digest = _digest_of(intent)
         if digest is None:
