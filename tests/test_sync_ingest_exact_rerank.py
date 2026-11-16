@@ -656,6 +656,85 @@ class DirectIngestRowSeamTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_newest_byte_different_top1_folds_without_window_rerun(self):
+        # Impl-review r1 (M3b discriminator): the detector's cache lane
+        # serves NEWEST-first, so with TWO subject-compatible normalized-
+        # equal live rows the top-1 is the NEWEST one. When its raw bytes
+        # differ from the incoming content (case/whitespace variant), the
+        # canonical exactness check (normalize_content basis) treats the
+        # top-1 as EXACT: fold into the newest, NO re-rank notice. A
+        # raw-bytes implementation would deem it not-exact, run the
+        # oldest-first window, and retarget to the OLDER sibling -- a
+        # keeper divergence from the add lane (write.py's add_fold_exact
+        # folds into the newest here). Driven through the detector stub
+        # for determinism (the exact-cache lane's newest-first order is
+        # the load-bearing input).
+        tmp = tempfile.mkdtemp(prefix="zmem-486seam-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = _env(tmp)
+        store = os.path.join(tmp, "store.sqlite")
+        id_old = id_new = None
+        for content in ("papa", "PAPA"):
+            r = subprocess.run(
+                [PYTHON, "-X", "utf8", str(STORE_PY), "add", "--namespace",
+                 NS, "--type", "fact", "--content", content,
+                 "--signal", "test", "--no-dedup"],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT))
+            assert r.returncode == 0, (r.stdout, r.stderr)
+            m = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})", r.stdout)
+            assert m, r.stdout
+            if id_old is None:
+                id_old = m.group(1)
+            else:
+                id_new = m.group(1)
+        sync_mod = self._fresh_sync(tmp)
+        conn = sqlite3.connect(store)
+        conn.row_factory = sqlite3.Row
+        obj = {
+            "id": str(uuid.uuid4()), "namespace": NS, "type": "fact",
+            "content": "papa", "tags": "fold:sup8", "signal": "test",
+            "confidence": 0.9, "source_ref": "",
+            "ingestion_ts": "2026-11-16T15:00:00Z",
+            "valid_from": "2026-11-16T15:00:00Z", "valid_until": "",
+        }
+        row = sync_mod._validate_sync_row(obj)
+
+        def _stub(conn_, content, ns, dedup_cache=None):
+            return {"id": id_new}, 1.0, None  # cache lane: NEWEST first
+
+        import io as _io
+        import contextlib as _ctx
+        buf_out, buf_err = _io.StringIO(), _io.StringIO()
+        try:
+            with unittest.mock.patch.object(sync_mod, "_detect_duplicate",
+                                            _stub), \
+                    _ctx.redirect_stdout(buf_out), \
+                    _ctx.redirect_stderr(buf_err):
+                outcome = sync_mod._ingest_row(
+                    conn, dict(row), allow_tombstones=False)
+            conn.commit()
+            self.assertEqual(outcome, "deduped")
+            target = conn.execute(
+                "SELECT id FROM memory WHERE tags LIKE ?",
+                ("%fold:sup8%",)).fetchall()
+            self.assertEqual(len(target), 1)
+            self.assertEqual(
+                target[0]["id"], id_new,
+                "a normalized-equal top-1 IS the exact keeper: fold into it "
+                "(the add lane's add_fold_exact behavior); a raw-bytes "
+                "check would retarget to the OLDER sibling")
+            self.assertEqual(
+                conn.execute("SELECT retrieval_count FROM memory WHERE id=?",
+                             (id_old,)).fetchone()[0], 0,
+                "the older sibling must stay untouched")
+            combined = buf_out.getvalue() + buf_err.getvalue()
+            self.assertNotIn("dedup re-ranked", combined,
+                             "no re-rank notice when the top-1 is already "
+                             "normalized-equal")
+        finally:
+            conn.close()
+
     def test_pre_v8_column_absent_folds_into_detector_top1(self):
         # The re-rank's exact-window query must take the OperationalError ->
         # empty-window branch on a store whose memory table lacks
