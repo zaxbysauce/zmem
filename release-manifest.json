@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f639c6b5891fc6503ea814781c1b630bcd0eac0d2933b00e4f4b0c59410de7d9",
+  "digest": "15a12aa1f88c87f1f98c51b6cba552abadd3f40d364fac30ee9b89649983afac",
   "files": {
     ".agents/plugins/marketplace.json": "f9fd2b9253f5acf11b329d57ad7db6eb52beb340bf717e533eb829cfec0cad18",
     ".claude-plugin/marketplace.json": "0ab03447925e2dd4d79a72d590e5144007841399ede35003499e6ce68a51d131",
@@ -163,7 +163,7 @@
     "skills/memory/scripts/storelib/state.py": "f2236393c1b7a8f344a93b8ff1b89b6642db69d4aeb438b3000666f5c9595642",
     "skills/memory/scripts/storelib/state_expiry.py": "fb3f2286aa5d503cce9288e6f9382e177f22750079d311f1faa985084e43f9bf",
     "skills/memory/scripts/storelib/subject.py": "bf6e3bcf8b85834d682f9d3b473b8655f177e633b6b8470ba07dff4605648c36",
-    "skills/memory/scripts/storelib/sync.py": "86e210cfcd378c18005754ab784e559650b17f13f706c54fe6519b00ec5451f2",
+    "skills/memory/scripts/storelib/sync.py": "ac50ca43728804c4431d18c40a4e9db0a2b4a51847ed5ed8b91fd5f29ef39bf1",
     "skills/memory/scripts/storelib/temporal.py": "d687472bdc4d11b83f8ca248b0fecd3f21316397ac706d6b6cb82fcbedeab70c",
     "skills/memory/scripts/storelib/training.py": "a308dcc6289e4c16efb0286a14c65dc8de0b400334d99cda80e24ae101cea4d6",
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",

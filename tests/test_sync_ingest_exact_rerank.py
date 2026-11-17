@@ -177,6 +177,14 @@ class IngestExactRerankTest(_IngestCase):
                          f"the fold must fire exactly once; summary: "
                          f"{r.stdout.strip()[-300:]}")
         self.assertEqual(counts.get("added"), 0)
+        # Feedback F-R13 attribution pin: the notice only fires on a real
+        # window retarget, so its presence proves the detector top-1 was
+        # the NON-equal collider (the vec0 distance-0 tie order otherwise
+        # is an unspecified implementation detail).
+        self.assertIn("dedup re-ranked", r.stdout + r.stderr,
+                      "AC1 requires the collider to be the detector top-1; "
+                      "without the notice this leg would be green for the "
+                      "wrong reason (tie-order flip)")
         rows = self._db_rows()
         target = [mid for mid, rw in rows.items()
                   if "fold:ac1" in (rw["tags"] or "")]
@@ -249,12 +257,27 @@ class SubjectVetoWindow(_IngestCase):
         self.assertNotIn("fold:ac2", rows[k_row["id"]]["tags"] or "",
                          "a knowledge:% row is never a fold target")
         self.assertEqual(rows[k_row["id"]]["retrieval_count"], 0)
-        # The #376 veto machinery ran for the vetoed candidate.
+        # The #376 veto machinery ran for the vetoed candidate. NOTE
+        # (feedback round F-R12): a single subject_veto line for id_v is
+        # ALSO printed by the detector's own semantic-lane admit (write.py
+        # _subject_admit), so mere presence does not uniquely attribute the
+        # veto to the new exact window — the fold-target assertion above is
+        # what binds the window. Pin the window's own emission by demanding
+        # BOTH veto lines (an emit=False window mutant prints only one).
         combined = r.stdout + r.stderr
         self.assertIn("subject_veto", combined,
                       "the vetoed exact candidate must print the stable "
                       f"subject_veto line; output: {combined[-400:]}")
         self.assertIn(id_v, combined)
+        self.assertGreaterEqual(
+            sum(1 for _ln in combined.splitlines()
+                if "subject_veto" in _ln and id_v in _ln), 2,
+            "id_v must be vetoed twice -- once by the detector semantic "
+            "lane and once by the new exact window (feedback F-R12: the "
+            "window's _subject_admit emission is load-bearing)")
+        self.assertIn("dedup re-ranked", combined,
+                      "F-R13 attribution pin: reaching the runner-up id_c "
+                      "ran through the window retarget (notice)")
 
 
 class ParityAddIngestKeeperTest(_IngestCase):
@@ -280,6 +303,10 @@ class ParityAddIngestKeeperTest(_IngestCase):
         self.assertEqual(counts.get("deduped"), 1,
                          f"the ingest fold must fire; summary: "
                          f"{r_ing.stdout.strip()[-300:]}")
+        self.assertIn("dedup re-ranked", r_ing.stdout + r_ing.stderr,
+                      "F-R13: the ingest lane must RETARGET for this shape "
+                      "(its notice is the attribution pin; the add-lane "
+                      "notice is asserted above)")
         add_target = self._fold_target("fold:addlane")
         ingest_target = self._fold_target("fold:ingestlane")
         self.assertEqual(add_target, [id_b],
@@ -312,6 +339,10 @@ class PreservingNoExactRowTest(_IngestCase):
                          f"the top-1 semantic fold must keep firing; "
                          f"summary: {r.stdout.strip()[-300:]}")
         self.assertEqual(counts.get("added"), 0)
+        self.assertNotIn("dedup re-ranked", r.stdout + r.stderr,
+                         "F-R13: with NO exact row the window admits "
+                         "nothing -- the pre-fix shape is byte-identical "
+                         "AND notice-free")
         rows = self._db_rows()
         target = [mid for mid, rw in rows.items()
                   if "fold:ac4" in (rw["tags"] or "")]
@@ -392,6 +423,9 @@ class CriticRound1SupplementaryTest(_IngestCase):
         self.assertEqual(target, [id_b],
                          "tombstoned and cross-namespace decoys must never "
                          "be fold targets")
+        self.assertIn("dedup re-ranked", r.stdout + r.stderr,
+                      "F-R13 attribution pin: reaching B ran through the "
+                      "window retarget (collider was the detector top-1)")
         self.assertNotIn("fold:sup2", rows.get(id_dead, {}).get("tags") or "",
                          "the tombstoned decoy is older than B; only the "
                          "superseded_at IS NULL predicate excludes it")
@@ -423,12 +457,18 @@ class CriticRound1SupplementaryTest(_IngestCase):
         self.assertEqual(target, [id_b])
 
     def test_polarity_conflict_on_retargeted_keeper_inserts_instead(self):
-        # Family 4: the re-ranked exact keeper POLARITY-CONFLICTS with the
+        # Family 4: a normalized-equal keeper POLARITY-CONFLICTS with the
         # incoming row (the write.py Stage-B counterexample pair: a quoted
         # span with an embedded newline versus the same span whitespace-
         # collapsed are normalized-equal yet conflicting). The rows stay
         # separate (insert), the notice never prints, and both keepers stay
-        # untouched by the fold.
+        # untouched by the fold. NOTE (feedback round F-R22, external F-5):
+        # in this CLI shape the detector's top-1 is ALREADY the normalized-
+        # equal keeper, so this leg passes even with the retarget block
+        # disabled -- it pins the polarity guard's DECLINE path and basis,
+        # not the retarget. The retarget-then-decline ORDERING is pinned by
+        # DirectIngestRowSeamTest.test_polarity_conflict_after_retarget_
+        # declines_the_fold (collider top-1 forced via the detector stub).
         keeper_text = 'rule: "not\nx"'
         id_b = self._add(keeper_text)
         id_a = self._add(OTHER_WORD, "--no-dedup")
@@ -457,7 +497,33 @@ class CriticRound1SupplementaryTest(_IngestCase):
         # fall-through-exhausted contract keeps the detector's top-1.
         id_v1 = self._add(KEEPER_WORD, "--tags", "task:b", "--no-dedup")
         id_v2 = self._add(KEEPER_WORD, "--tags", "task:b", "--no-dedup")
-        self.assertEqual(id_v1, id_v1)
+        # Feedback F-R11 (also the live Copilot finding 4592694980): the
+        # leg's precondition is TWO DISTINCT live task:b rows -- a former
+        # self-comparison tautology asserted nothing. If --no-dedup ever
+        # regresses and the second add folds into the first, the leg must
+        # fail HERE rather than silently degrade to the single-vetoed-row
+        # variant (where a fall-through mutant survives undetected).
+        rows_pre = self._db_rows()
+        self.assertNotEqual(id_v1, id_v2,
+                            "the two --no-dedup adds must create two "
+                            "distinct rows")
+        for _vid in (id_v1, id_v2):
+            self.assertIn(_vid, rows_pre,
+                          "both vetoed seed rows must exist")
+            self.assertIn("task:b", rows_pre[_vid]["tags"] or "",
+                          "both vetoed seed rows must carry task:b")
+        # _db_rows has no superseded_at column (Stage B FB-004): liveness is
+        # asserted directly -- a TOMBSTONED seed must fail the precondition.
+        conn = sqlite3.connect(os.path.join(self.tmp, "store.sqlite"))
+        live = dict(conn.execute(
+            "SELECT id, superseded_at FROM memory WHERE id IN (?,?)",
+            (id_v1, id_v2)))
+        conn.close()
+        for _vid in (id_v1, id_v2):
+            self.assertIn(_vid, live, "vetoed seed row must be present")
+            self.assertIsNone(live[_vid],
+                              "both vetoed seed rows must be LIVE "
+                              "(superseded_at IS NULL)")
         id_a = self._add(OTHER_WORD, "--no-dedup")
         row = self._sync_row(KEEPER_WORD, tags="task:a,fold:sup5a")
         r = self._ingest(row)
@@ -471,7 +537,8 @@ class CriticRound1SupplementaryTest(_IngestCase):
             target, [id_a],
             "an all-vetoed exact window falls back to the detector's top-1 "
             "(the same exhausted-fall-through contract as the add/update "
-            "re-ranks); vetoed rows are never targets")
+            "re-ranks); window-vetoed rows are never RETARGET targets -- the "
+            "fallback top-1 was itself subject-cleared by the detector")
 
     def test_bounded_window_capped_at_32_rows(self):
         # Family 5b (critic r2 redesign): 33 subject-INCOMPATIBLE exact rows
@@ -518,6 +585,10 @@ class CriticRound1SupplementaryTest(_IngestCase):
         r2 = self._run("ingest-jsonl", "--in", path)
         for r in (r1, r2):
             self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("dedup re-ranked", r.stdout + r.stderr,
+                          "F-R13: every replay pass must route through the "
+                          "window retarget (collider top-1), not a bare "
+                          "exact fold -- the attribution pin")
             counts = _summary_counts(r.stdout)
             self.assertEqual(
                 counts.get("deduped"), 1,
@@ -535,6 +606,54 @@ class CriticRound1SupplementaryTest(_IngestCase):
         self.assertEqual(rows[id_b]["retrieval_count"], 2,
                          "two folds bump the merge counter exactly twice "
                          "(documented non-idempotent counter)")
+
+    def test_lesson_carveout_in_exact_window_admits_lesson_keeper(self):
+        # Family 8 (feedback round F-R10): the #376 LESSON/LESSON carve-out
+        # (subject.py -- two lesson-typed rows are never subject-
+        # incompatible) must be honored by the NEW exact window's admit.
+        # The sibling add/update re-rank carries exactly this pin
+        # (UpdateRerankLessonCarveoutTest, born from a real BLOCKER); the
+        # ingest lane lacked it, so mutants feeding the window a wrong type
+        # (fact / None) or a type='fact' SQL filter kept the WHOLE file
+        # green while a lesson fold landed on the non-equal collider
+        # silently -- the exact #486 harm class.
+        # Shape: B is the normalized-equal LESSON keeper (task:y) seeded
+        # first; A is a colliding fact row (task:x) seeded last so the
+        # distance-0 tie makes it the detector top-1; the incoming row is a
+        # LESSON (task:x). A is subject-compatible with the incoming row
+        # (task:x), so the detector admits it as top-1; the window's admit
+        # of B must pass via lesson/lesson despite task:y-vs-task:x
+        # incompatibility. Losing the carve-out (type_ mutants) vetoes B,
+        # the admitted set is empty, and the fold falls back to collider A.
+        r_b = self._run("add", "--namespace", NS, "--type", "lesson",
+                        "--content", KEEPER_WORD, "--tags", "task:y",
+                        "--signal", "test")
+        self.assertEqual(r_b.returncode, 0, r_b.stderr)
+        m_b = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})", r_b.stdout)
+        self.assertTrue(m_b, r_b.stdout)
+        id_b = m_b.group(1)
+        id_a = self._add(OTHER_WORD, "--tags", "task:x", "--no-dedup")
+        row = self._sync_row(KEEPER_WORD, tags="task:x,fold:sup9",
+                             type="lesson")
+        r = self._ingest(row)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        counts = _summary_counts(r.stdout)
+        self.assertEqual(counts.get("deduped"), 1, r.stdout[-300:])
+        rows = self._db_rows()
+        target = [mid for mid, rw in rows.items()
+                  if "fold:sup9" in (rw["tags"] or "")]
+        self.assertEqual(
+            target, [id_b],
+            "the exact window must admit the lesson keeper through the "
+            "lesson/lesson carve-out; fold landed on "
+            f"{target[0][:8] if target else 'no row'} -- a window without "
+            "the carve-out folds the lesson into collider A (F-R10)")
+        self.assertNotIn("fold:sup9", rows[id_a]["tags"] or "",
+                         "the colliding fact row must never receive the "
+                         "lesson fold")
+        self.assertIn("dedup re-ranked", r.stdout + r.stderr,
+                      "the retarget through the window must have run "
+                      "(notice presence is the attribution pin)")
 
 
 class DirectIngestRowSeamTest(unittest.TestCase):
@@ -656,6 +775,88 @@ class DirectIngestRowSeamTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_window_operationalerror_outside_missing_column_propagates(self):
+        # Feedback round F-R4/FB-008 discriminator: the exact-window catch
+        # is narrowed to the documented pre-v8 "no such column" shape; any
+        # OTHER sqlite3.OperationalError at that read (transient disk I/O,
+        # readonly database) must RE-RAISE so the row-level handler reports
+        # it as malformed -- NOT silently swallow into the pre-#486
+        # wrong-keeper fold. The pre-v8 column-absent branch keeps its own
+        # leg (green swallow); this leg binds the else-half. RED under a
+        # broaden-catch-back mutant (no raise -> fold proceeds into the
+        # collider).
+        tmp = tempfile.mkdtemp(prefix="zmem-486seam-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = _env(tmp)
+        store = os.path.join(tmp, "store.sqlite")
+        ids = []
+        for content in (KEEPER_WORD, OTHER_WORD):
+            r = subprocess.run(
+                [PYTHON, "-X", "utf8", str(STORE_PY), "add", "--namespace",
+                 NS, "--type", "fact", "--content", content,
+                 "--signal", "test", "--no-dedup"],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT))
+            assert r.returncode == 0, (r.stdout, r.stderr)
+            m = re.search(r"\[zmem\] added memory ([0-9a-f-]{36})", r.stdout)
+            assert m, r.stdout
+            ids.append(m.group(1))
+        id_b, id_a = ids
+        sync_mod = self._fresh_sync(tmp)
+        conn = sqlite3.connect(store)
+        conn.row_factory = sqlite3.Row
+        obj = {
+            "id": str(uuid.uuid4()), "namespace": NS, "type": "fact",
+            "content": KEEPER_WORD, "tags": "fold:rer", "signal": "test",
+            "confidence": 0.9, "source_ref": "",
+            "ingestion_ts": "2026-11-16T15:00:00Z",
+            "valid_from": "2026-11-16T15:00:00Z", "valid_until": "",
+        }
+        row = sync_mod._validate_sync_row(obj)
+
+        def _stub(conn_, content, ns, dedup_cache=None):
+            return {"id": id_a}, 1.0, None  # non-exact colliding top-1
+
+        class _WindowFail:
+            """Conn proxy raising exactly at the window SELECT."""
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+
+            def execute(self, sql, parameters=()):
+                if "AND content_norm=?" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+                return object.__getattribute__(self, "_real").execute(
+                    sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(object.__getattribute__(self, "_real"), name)
+
+        try:
+            import io as _io
+            import contextlib as _ctx
+            with unittest.mock.patch.object(sync_mod, "_detect_duplicate",
+                                            _stub), \
+                    _ctx.redirect_stdout(_io.StringIO()), \
+                    _ctx.redirect_stderr(_io.StringIO()):
+                with self.assertRaises(sqlite3.OperationalError) as cm:
+                    sync_mod._ingest_row(_WindowFail(conn), dict(row),
+                                         allow_tombstones=False)
+                self.assertIn("database is locked", str(cm.exception),
+                              "the injected non-schema OperationalError was "
+                              "silently swallowed into a fold (broadened "
+                              "catch regression)")
+            # And nothing folded: both seeded rows must keep retrieval_count
+            # 0 and no fold:rer tag.
+            for mid in (id_a, id_b):
+                r_ = conn.execute(
+                    "SELECT retrieval_count, tags FROM memory WHERE id=?",
+                    (mid,)).fetchone()
+                self.assertEqual(r_["retrieval_count"], 0,
+                                 "a swallowed fold must not have run")
+                self.assertNotIn("fold:rer", r_["tags"] or "")
+        finally:
+            conn.close()
+
     def test_newest_byte_different_top1_folds_without_window_rerun(self):
         # Impl-review r1 (M3b discriminator): the detector's cache lane
         # serves NEWEST-first, so with TWO subject-compatible normalized-
@@ -666,7 +867,11 @@ class DirectIngestRowSeamTest(unittest.TestCase):
         # raw-bytes implementation would deem it not-exact, run the
         # oldest-first window, and retarget to the OLDER sibling -- a
         # keeper divergence from the add lane (write.py's add_fold_exact
-        # folds into the newest here). Driven through the detector stub
+        # folds into the NEWEST here WITH EMBEDDINGS, via the detector's
+        # distance-0 newest-first tie; in degraded no-embedding mode the
+        # add lane's uncached exact lookup is rowid-ascending and folds
+        # into the OLDEST -- feedback round F-R6 correction to this
+        # comment). Driven through the detector stub
         # for determinism (the exact-cache lane's newest-first order is
         # the load-bearing input).
         tmp = tempfile.mkdtemp(prefix="zmem-486seam-")

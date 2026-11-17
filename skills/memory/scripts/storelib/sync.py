@@ -1875,8 +1875,11 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # fall-through) BEFORE the polarity guard below, exactly like the
             # add/update lanes; the guard then evaluates the FINAL keeper. A
             # colliding semantic neighbor outranking the TRUE normalized-
-            # exact keeper must never receive the merge (silent wrong-row
-            # metadata mutation on restore, content dropped).
+            # exact keeper must never receive the merge WHEN a compatible
+            # exact row is reachable inside the bounded window (an exhausted
+            # or all-vetoed window keeps the detector top-1 -- the sanctioned
+            # #376 fall-through contract, pinned by the sup5a/sup5b legs;
+            # external ladder F-6 scope correction).
             from storelib.write import (
                 SUBJECT_MAX_EXACT_CANDIDATES as _EXACT_CAP,
                 _subject_admit as _exact_admit,
@@ -1897,8 +1900,18 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                         "'knowledge:%') ORDER BY rowid LIMIT ?",
                         (namespace, _normalize_content(content), _EXACT_CAP),
                     ).fetchall()
-                except sqlite3.OperationalError:
-                    exact_rows = []  # pre-v8 store without content_norm
+                except sqlite3.OperationalError as exc:
+                    if "no such column" in str(exc).lower():
+                        exact_rows = []  # pre-v8 store without content_norm
+                    else:
+                        # Feedback round (PR #487 review, F-R4): only the
+                        # documented pre-v8 shape may degrade to an empty
+                        # window. Any other OperationalError (disk I/O,
+                        # readonly, corruption) re-raises so the row-level
+                        # handler reports it — silently swallowing it here
+                        # would restore the pre-#486 wrong-keeper fold with
+                        # zero diagnostic.
+                        raise
                 exact_ranked = [(r, 1.0) for r in exact_rows]
                 if exact_ranked:
                     # The re-ranked target must clear the SAME #376 subject
@@ -1929,17 +1942,6 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                       file=sys.stderr)
                 existing = None
         if existing:
-            if ingest_rerank_retargeted:
-                # Fires only here — AFTER the polarity guard above has
-                # accepted the FINAL keeper (write.py Stage-B lesson: a
-                # notice that promises a fold before the guard decides can
-                # contradict a subsequent decline).
-                print(
-                    "[zmem] ingest-jsonl: dedup re-ranked: the top semantic "
-                    "candidate was not content-exact; folding into the "
-                    f"exact live row {existing['id']} instead",
-                    file=sys.stderr,
-                )
             _merge_on_dedup(conn, existing["id"], confidence, signal, tags, now=tx_now)
             # PR-review PRR-H (issue #59 review round): the surviving keeper
             # also absorbs the INCOMING row's taint — worst-of its own and the
@@ -1958,6 +1960,25 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
             # v10 (issue #60): dedup merge unioned tags onto the local keeper
             # — re-derive its entity links (same rule as add/update).
             relink_memory(conn, existing["id"])
+            if ingest_rerank_retargeted:
+                # Fires only here — AFTER the polarity guard above accepted
+                # the FINAL keeper (write.py Stage-B lesson: a notice that
+                # promises a fold before the guard decides can contradict a
+                # subsequent decline) AND after every mutating call of the
+                # fold has succeeded (feedback round F-R19: printing it
+                # before _merge_on_dedup/taint/relink left a contradictory
+                # "folding into ..." line in stderr when a later failure
+                # rolled the row back). Wording follows the repo's
+                # normalized-equal disclosure convention (F-R20;
+                # CHANGELOG 0.159.0 law — the keeper's bytes may differ in
+                # case/whitespace; the add-lane notice's older wording is
+                # pre-existing in an untouched file).
+                print(
+                    "[zmem] ingest-jsonl: dedup re-ranked: the top semantic "
+                    "candidate was not normalized-equal; folding into the "
+                    f"normalized-equal live row {existing['id']} instead",
+                    file=sys.stderr,
+                )
             if started_tx:
                 _commit(conn)
             return "deduped"
