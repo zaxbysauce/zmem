@@ -606,7 +606,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          for f in tests/test_*.js; do
+          for f in tests/test_*.js tests/test_*.mjs; do
             echo "=== $f ==="
             node "$f"
           done

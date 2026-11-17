@@ -109,6 +109,15 @@ function run(argv, opts = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    // FB-016b: decode at the stream boundary, BEFORE the data handlers
+    // below. Without an encoding each chunk arrives as a Buffer and
+    // `out += d` stringifies it in isolation, so a multibyte UTF-8
+    // character split across chunk boundaries corrupts to U+FFFD.
+    // setEncoding("utf8") installs Node's StringDecoder, which buffers
+    // incomplete sequences across chunks and hands the handlers decoded
+    // strings instead.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     const killSafe = (signal) => {
       try { return child.kill(signal); } catch { return false; }
     };
@@ -150,7 +159,9 @@ function lastJson(text) {
 }
 
 // Passive moment through the T-05 CLI seam (both modes; remote_gate routes).
-export async function runMoment(moment, { query = "", session, namespace, cwd, ...opts } = {}) {
+// opts.env MERGES over the consumer's env defaults (caller keys win,
+// childEnv normalization + ZMEM_HOST still apply) — never replaces them.
+export async function runMoment(moment, { query = "", session, namespace, cwd, env: extraEnv, ...opts } = {}) {
   const args = [process.execPath.startsWith("python") ? process.execPath : "python",
     "-X", "utf8", STORE_PY, "prefetch", "--reserve", "--json",
     "--query", query || "", "--namespace", namespace || "user:global",
@@ -159,7 +170,7 @@ export async function runMoment(moment, { query = "", session, namespace, cwd, .
   if (process.env.ZMEM_PRINCIPAL && !(process.env.ZMEM_REMOTE_URL || "").trim()) {
     args.push("--principal", process.env.ZMEM_PRINCIPAL, "--harness", "deepseek");
   }
-  const r = await run(args, { timeoutMs: 20000, env: childEnv({ ZMEM_NAMESPACE: namespace || "" }), cwd: cwd || ROOT, ...opts });
+  const r = await run(args, { timeoutMs: 20000, env: childEnv({ ZMEM_NAMESPACE: namespace || "", ...(extraEnv || {}) }), cwd: cwd || ROOT, ...opts });
   return { envelope: lastJson(r.out), raw: r };
 }
 
@@ -208,8 +219,10 @@ export async function runCapture(kind, text, meta = {}, opts = {}) {
 }
 
 // The shared reflect hook (bounded nudge; its own eligibility governs).
-export async function runReflect(session, namespace, opts = {}) {
-  const env = childEnv({ ZMEM_NAMESPACE: namespace || "", ZMEM_SESSION: session || "" });
+// opts.env MERGES over the consumer's env defaults (caller keys win,
+// childEnv normalization + ZMEM_HOST still apply) — never replaces them.
+export async function runReflect(session, namespace, { env: extraEnv, ...opts } = {}) {
+  const env = childEnv({ ZMEM_NAMESPACE: namespace || "", ZMEM_SESSION: session || "", ...(extraEnv || {}) });
   const r = await run(["bash", path.join(ROOT, "hooks", "zmem-reflect.sh")],
     { timeoutMs: 12000, env, stdin: JSON.stringify({ session_id: session || "" }), ...opts });
   return { ok: r.code === 0, out: r.out, raw: r };
@@ -231,7 +244,7 @@ export async function runReflect(session, namespace, opts = {}) {
 // Fail-open everywhere: absent helper (checkouts without it), non-zero
 // exit, timeout, or empty output (the companion's default-off state) all
 // yield { text: "" } and the caller appends nothing.
-export async function runPolicy({ timeoutMs = 5000, ...opts } = {}) {
+export async function runPolicy({ timeoutMs = 5000, env: extraEnv, ...opts } = {}) {
   try {
     if (!fs.existsSync(POLICY_PY)) {
       return { text: "", reason: "helper-absent" };
@@ -242,7 +255,9 @@ export async function runPolicy({ timeoutMs = 5000, ...opts } = {}) {
   const captureOff = (process.env.ZMEM_CAPTURE || "").trim() === "0";
   const argv = ["python", "-X", "utf8", POLICY_PY, "--text"];
   if (captureOff) argv.push("--no-capture");
-  const r = await run(argv, { timeoutMs, env: policyEnv(), ...opts });
+  // opts.env MERGES over the minimal resolver env (caller keys win;
+  // the policyEnv exclusions otherwise stay exact).
+  const r = await run(argv, { timeoutMs, env: { ...policyEnv(), ...(extraEnv || {}) }, ...opts });
   if (r.code !== 0) return { text: "", reason: "exit-" + r.code };
   const text = (r.out || "").trim();
   if (!text) return { text: "", reason: "disabled" };

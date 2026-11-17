@@ -52,11 +52,18 @@ execFileSync("python", ["-X", "utf8", STORE_PY, "stats"],
 const OUT_BYTES = "OUT7-stdout-bytes\n";
 const ERR_BYTES = "ERR7-stderr-bytes\n";
 
+// Minimal fake stdio: EventEmitter plus the setEncoding no-op run() now
+// calls on real child streams right after spawn (FB-016b). The fakes emit
+// complete-ASCII Buffers, so the no-op changes no existing leg's bytes.
+class FakeStdio extends EventEmitter {
+  setEncoding() {}
+}
+
 class ExitSevenChild extends EventEmitter {
   constructor() {
     super();
-    this.stdout = new EventEmitter();
-    this.stderr = new EventEmitter();
+    this.stdout = new FakeStdio();
+    this.stderr = new FakeStdio();
     this.stdin = { write() {}, end() {} };
     this.killCalls = [];
   }
@@ -72,8 +79,8 @@ class ExitSevenChild extends EventEmitter {
 class KillIgnoringChild extends EventEmitter {
   constructor() {
     super();
-    this.stdout = new EventEmitter();
-    this.stderr = new EventEmitter();
+    this.stdout = new FakeStdio();
+    this.stderr = new FakeStdio();
     this.stdin = { write() {}, end() {} };
     this.killCalls = [];
   }
@@ -178,4 +185,37 @@ test("deadline leg: the typed-queue consumers inherit the deadline via trailing 
   assert.equal(flush.calls.length, 1,
     "flushLocal(opts) must pass opts through to run()");
   assert.equal(flushR.raw.timedOut, true, JSON.stringify(flushR.raw));
+});
+
+test("utf8 leg: a multibyte character split across chunks is not corrupted (FB-016b)", async () => {
+  // The helper writes the 4 UTF-8 bytes of U+1F600 as TWO separate
+  // stdout writes (2 bytes + 2 bytes) with a delay between them, so the
+  // parent receives two chunks that each end MID-CHARACTER; stderr gets
+  // the same treatment. Without setEncoding("utf8") on the child streams,
+  // `out += d` stringifies each Buffer chunk in isolation and every split
+  // byte pair corrupts to U+FFFD. The process exits naturally after the
+  // second write (no process.exit, which can truncate pending pipe
+  // writes).
+  const CH = "\u{1F600}";
+  const bytes = Buffer.from(CH, "utf8");
+  assert.equal(bytes.length, 4, "the probe character is 4 UTF-8 bytes");
+  const helper = [
+    `const b = Buffer.from("${CH}", "utf8");`,
+    "process.stdout.write(b.subarray(0, 2));",
+    "process.stderr.write(b.subarray(0, 2));",
+    "setTimeout(() => {",
+    "  process.stdout.write(b.subarray(2));",
+    "  process.stderr.write(b.subarray(2));",
+    "}, 60);",
+  ].join(" ");
+  const result = await run([process.execPath, "-e", helper], { timeoutMs: 5000 });
+  assert.equal(result.code, 0, JSON.stringify(result));
+  assert.equal(result.out, CH,
+    `stdout must decode the split multibyte character exactly, got `
+    + `${JSON.stringify(result.out)} (U+FFFD corruption means the child `
+    + `stream lacks utf8 decoding at the boundary)`);
+  assert.equal(result.err, CH,
+    `stderr must decode the split multibyte character exactly, got `
+    + `${JSON.stringify(result.err)}`);
+  assert.ok(!result.timedOut);
 });

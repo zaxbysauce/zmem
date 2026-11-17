@@ -3901,6 +3901,8 @@ are provenance inputs; trust_score is the contradiction ledger.
 <interpreter> <store.py> knowledge status [--target <id>] [--key <key>] \
   [--namespace <ns>] [--json]
 <interpreter> <store.py> knowledge flush [--json]
+<interpreter> <store.py> knowledge retry --target <id> --key <key> \
+  [--namespace <ns>] [--json]
 ```
 
 OFF BY DEFAULT and purely explicit: nothing runs, captures, publishes, or
@@ -3917,11 +3919,13 @@ no Obsidian dependency, never mandatory) and records a reserved
 and digest-checkable. Curated notes only — never raw session transcripts.
 
 Exit codes: `0` completed; `3` pending (the version is published but the
-pointer is `pending`/`queued`, or a `flush` left entries pending — a
+pointer is `pending`/`queued`, or a `flush` left entries pending, or a
+remote retry kept pending (hub unreachable: nothing enqueued) — a
 state, not success or failure); `2` refusal (usage, invalid or disabled
 config, unknown target, secret-screening of the note body or summary,
 unavailable store); `1` failure/conflict (pointer `cas_stale`/`conflict`,
-rejected delivery, `check` digest mismatch). `--content -` reads the note
+rejected delivery, `check` digest mismatch, a retry typed refusal
+(non-CAS quarantine cause, still-stale original stake)). `--content -` reads the note
 body from stdin as UTF-8. Bodies are screened for secret-like patterns
 BEFORE anything is written, and a supplied `--summary` is screened with
 the same pattern source in the same admission step; re-running `capture`

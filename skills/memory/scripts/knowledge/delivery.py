@@ -663,6 +663,11 @@ def flush_to_hub(delivery: KnowledgeDelivery, http: Any) -> dict[str, Any]:
             "status": "rejected",
             "link_status": None,
             "version": entry["version"],
+            # FB-017 rework round 2: the receipt persists the stake's ROW
+            # identity verbatim (None for an initial create) so restart
+            # recovery can require the exact original stake — never a
+            # different same-version, same-digest stake.
+            "expected_row_id": entry.get("expected_row_id"),
             "row_id": None,
             "error": reason,
         }
@@ -713,6 +718,13 @@ def flush_to_hub(delivery: KnowledgeDelivery, http: Any) -> dict[str, Any]:
                 "status": status_value,
                 "link_status": receipt.get("link_status"),
                 "version": entry["version"],
+                # FB-017 rework round 2: persist the queued op's stake ROW
+                # identity alongside its version (None verbatim for an
+                # initial create) — a real receipt must prove WHICH stake
+                # it settled, so restart recovery can REQUIRE the exact
+                # original row identity instead of guessing among
+                # same-version, same-digest stakes.
+                "expected_row_id": entry.get("expected_row_id"),
                 "row_id": receipt.get("canonical_id"),
                 "error": receipt.get("error"),
             }

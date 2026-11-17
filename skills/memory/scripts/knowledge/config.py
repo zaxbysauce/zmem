@@ -40,6 +40,10 @@ Contract (approved plan, 2026-11-13):
   only URL the client will ever touch.
 - Unknown keys are errors, not silently ignored: a typo'd field must fail
   loudly at load, not half-enable a target.
+- Stdlib only: ``re`` and ``unicodedata`` (the description charset
+  judgment — refused Unicode categories Cc/Cs/Zl/Zp; format characters
+  Cf such as ZWSP/bidi controls are deliberately ALLOWED as legitimate
+  operator text).
 - Error messages name the target id and the offending key, never a secret
   value, a token, or note content.
 """
@@ -47,6 +51,7 @@ Contract (approved plan, 2026-11-13):
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -192,9 +197,15 @@ def _abs_path(value: str, where: str, key: str) -> Path:
     return path
 
 
-# Description bounds (#482 AC1/AC3): 1..200 codepoints, no CR/LF/TAB/C0
-# controls (single-line safe), not empty/whitespace-only.
+# Description bounds (#482 AC1/AC3): 1..200 codepoints, no line/paragraph
+# separators or control/format-surrogate codepoints (single-line safe),
+# not empty/whitespace-only.  The refused set is the Unicode CATEGORY
+# classes Cc (controls, incl. NEL U+0085), Cs (lone surrogates), Zl
+# (U+2028) and Zp (U+2029) — category-based, so C1 controls beyond
+# U+007F are refused too; Cf (format: ZWSP, bidi controls, LRM...) is
+# DELIBERATELY ALLOWED as legitimate operator text (FB-005).
 MAX_DESCRIPTION_CHARS = 200
+_REFUSED_CHAR_CATEGORIES = frozenset(("Cc", "Cs", "Zl", "Zp"))
 
 
 def _opt_description(obj: dict, where: str) -> str | None:
@@ -211,7 +222,8 @@ def _opt_description(obj: dict, where: str) -> str | None:
     if not value.strip():
         raise KnowledgeConfigError(
             "%s: description must not be empty or whitespace-only" % where)
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+    if any(unicodedata.category(ch) in _REFUSED_CHAR_CATEGORIES
+           for ch in value):
         raise KnowledgeConfigError(
             "%s: description must not contain control characters "
             "(single-line text only)" % where)

@@ -382,6 +382,10 @@ class TargetDescriptionTest(unittest.TestCase):
             "line1\nline2",             # LF
             "col\ttab",                 # TAB
             "ctl\x01char",              # control char
+            "line" + chr(0x85) + "sep",    # NEL U+0085 (Cc)
+            "line" + chr(0x2028) + "sep",  # LINE SEPARATOR U+2028 (Zl)
+            "para" + chr(0x2029) + "sep",  # PARAGRAPH SEPARATOR U+2029 (Zp)
+            "bad\ud800surrogate",       # lone surrogate (Cs)
         ]
         for i, value in enumerate(invalid_values):
             for name, base_target in (
@@ -414,8 +418,12 @@ class TargetDescriptionTest(unittest.TestCase):
             self.assertIn("notes", config.targets)
 
         # The policy.py display lane renders EMPTY for an invalid
-        # description, in BOTH capture modes (strict-suppress).
-        for value in (12345, "x" * (_MAX + 1)):
+        # description, in BOTH capture modes (strict-suppress) — FB-005
+        # extends the probe to the category-class refusals the ord()
+        # range check missed (NEL, LINE/PARAGRAPH SEPARATOR, lone
+        # surrogate): policy --text must exit 0 and print NOTHING.
+        for value in (12345, "x" * (_MAX + 1), "bad\ud800surrogate",
+                      "line" + chr(0x2028) + "sep"):
             cfg = _write_config(self.tmp / "cfg-display-invalid.json",
                                 {"notes": _markdown(value,
                                                     root=str(self.vault))})
@@ -426,6 +434,74 @@ class TargetDescriptionTest(unittest.TestCase):
                     "the strict display lane must suppress the whole render "
                     "for an invalid description (mode=%r): %r"
                     % (extra or "capture", text))
+
+    def test_charset_parity_config_validator_and_policy_display(self):
+        """FB-005 PARITY: the command validator (knowledge/config.py
+        ``_opt_description``) and the display mirror (policy.py
+        ``_description_ok``, loaded FRESH via spec_from_file_location so
+        the standalone display lane is the code under test) agree
+        EXACTLY on the category-class charset: refused for Cc (\x01,
+        \x7f, \x85 NEL), Zl (\u2028), Zp (\u2029) and lone surrogates
+        (Cs); allowed for accented text, emoji, NBSP, and the Cf format
+        characters ZWSP/LRM (deliberately legitimate operator text)."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "zmem_policy_charset_parity_probe", str(POLICY_PY))
+        policy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(policy)
+
+        refused = ["x\x01y", "x\x7fy", "x" + chr(0x85) + "y",
+                   "x" + chr(0x2028) + "y", "x" + chr(0x2029) + "y",
+                   "x\ud800y"]
+        for i, value in enumerate(refused):
+            cfg = _write_config(
+                self.tmp / ("cfg-parity-refused-%d.json" % i),
+                {"notes": _markdown(value, root=str(self.vault))})
+            with self.assertRaises(
+                    KnowledgeConfigError,
+                    msg="config must refuse %r" % (value,)):
+                load_knowledge_config(cfg)
+            self.assertFalse(
+                policy._description_ok(value, present=True),
+                "the policy display mirror must also refuse %r" % (value,))
+
+        allowed = ["aéb", "🚀", "a b", "a​b", "a‎b",
+                   "y" * _MAX]
+        for i, value in enumerate(allowed):
+            cfg = _write_config(
+                self.tmp / ("cfg-parity-allowed-%d.json" % i),
+                {"notes": _markdown(value, root=str(self.vault))})
+            config = load_knowledge_config(cfg)   # must NOT raise
+            self.assertEqual(config.targets["notes"].description, value)
+            self.assertTrue(
+                policy._description_ok(value, present=True),
+                "the policy display mirror must also allow %r" % (value,))
+
+    def test_many_target_over_budget_floor_equals_plain_roster(self):
+        """FB-011 pin: 6 targets x 30-word descriptions — every
+        per-target prefix of one-or-more words pushes the aggregate over
+        the exclusive 200-word cap, so the deterministic allocation
+        falls to the prefix=0 FLOOR.  The floor roster must be EXACTLY
+        the descriptionless plain roster (bare target ids — no
+        ' — ...' residue, no double space), so the comment 'the base
+        itself is the prefix=0 roster' is true and the policy still
+        renders."""
+        words = " ".join("w%d" % i for i in range(30))   # 30 words, <=200 cp
+        ids = ["t%d" % i for i in range(6)]
+        heavy = {tid: _markdown(words, root=str(self.vault))
+                 for tid in ids}
+        cfg = _write_config(self.tmp / "cfg-floor.json", heavy)
+        rendered = self._policy_text(cfg)
+        expected = _GOLDEN_POLICY_TEXT.replace(
+            "Configured target ids: notes.\n",
+            "Configured target ids: %s.\n" % ", ".join(ids))
+        self.assertEqual(
+            rendered, expected,
+            "the prefix=0 floor roster equals the plain descriptionless "
+            "roster (bare ids, no residue): got %r" % (rendered,))
+        self.assertNotIn(" — ", rendered.splitlines()[2],
+                         "no separator residue in the floor roster")
 
 
 if __name__ == "__main__":

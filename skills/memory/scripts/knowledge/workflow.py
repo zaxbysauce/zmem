@@ -143,6 +143,21 @@ def _now_iso() -> str:
     return now_iso()
 
 
+def _default_summary_text(logical_key: str) -> str:
+    """The FIXED default pointer summary from the LOGICAL KEY alone
+    (FB-001): ``knowledge note <logical_key>``.
+
+    The retry-lane twin of :func:`_default_summary` — a retry recovers a
+    quarantined attempt whose journal entry may predate the summary field
+    (legacy entries carry no ``summary`` key), so the default derives from
+    identity metadata only, never from a document body and never from a
+    NameError.  The logical key is identity metadata (grammar-validated,
+    scanner-safe by construction), not content; the store-side cap slice
+    (``MAX_SUMMARY_CHARS``) stays as a belt-and-braces bound."""
+    cap = getattr(_storelib_knowledge(), "MAX_SUMMARY_CHARS", 512)
+    return ("knowledge note %s" % logical_key)[:cap]
+
+
 def _default_summary(document) -> str:
     """The FIXED default pointer summary: ``knowledge note <logical_key>``.
 
@@ -154,8 +169,7 @@ def _default_summary(document) -> str:
     key is identity metadata (grammar-validated, scanner-safe by
     construction), not content; the store-side cap slice stays as a
     belt-and-braces bound."""
-    cap = getattr(_storelib_knowledge(), "MAX_SUMMARY_CHARS", 512)
-    return ("knowledge note %s" % document.logical_key)[:cap]
+    return _default_summary_text(document.logical_key)
 
 
 def _digest_from_chunks(chunks: Any) -> str | None:
@@ -830,11 +844,16 @@ def capture(*, target_id: str, logical_key: str, text: str,
                           for r in flush_result["rejected"])
                       else "queued")
     reconciled_row = None
+    # FB-017: the rejection's machine error code, read ONCE above the
+    # branch — the intent write below needs it too (a pointer_cas_stale
+    # rejection that did NOT reconcile as landed must leave the intent at
+    # ``cas_stale`` so `knowledge retry` can select it; a plain
+    # ``rejected`` stays unrecoverable-by-retry with its cause named).
+    receipt_error = next(
+        (str(r.get("error") or "")
+         for r in (flush_result.get("rejected") or [])
+         if r.get("op_id") == queued["op_id"]), "")
     if pointer_status == "rejected":
-        receipt_error = next(
-            (str(r.get("error") or "")
-             for r in (flush_result.get("rejected") or [])
-             if r.get("op_id") == queued["op_id"]), "")
         if receipt_error == "pointer_cas_stale":
             # Crash-window reconciliation (remote): a cas-stale against a
             # hub pointer that EXACTLY matches what THIS attempt queued
@@ -876,7 +895,10 @@ def capture(*, target_id: str, logical_key: str, text: str,
             "target": target_id, "key": logical_key, "namespace": namespace,
             "digest": document.digest, "locator": document.locator,
             "version": version, "expected_row_id": expected_row_id,
-            "row_id": None, "state": pointer_status,
+            "row_id": None,
+            "state": ("cas_stale"
+                      if receipt_error == "pointer_cas_stale"
+                      else pointer_status),
             "op_id": queued["op_id"], "staked": True,
         })
         if pointer_status == "rejected":
@@ -1117,6 +1139,23 @@ def retry(*, target_id: str, logical_key: str,
             op_id=stored_op, summary=original.summary,
             staked_at=original.staked_at, retry_ref=original.seq,
             state="pointer_queued")
+        # FB-017 rework: associate the in-flight retry with its intent by
+        # re-pointing ONLY the intent's op_id at the durable stored retry
+        # op — the symmetric close of the local branch above, which also
+        # lands its fresh op id on the intent.  The state stays
+        # ``cas_stale`` and the digest/version/stake ride verbatim
+        # (set_intent REPLACES the record rather than merging, so the
+        # surviving fields are copied from the intent read at selection
+        # time).  Flush's rejection reconciliation keys on the intent's
+        # op_id (_attempt_is_current): without this re-pointing, a retry
+        # op rejected for a NON-CAS cause cannot update the intent, and
+        # the original cas_stale stake stays selectable forever — an
+        # endless re-enqueue loop that never surfaces the rejection
+        # cause.  Ordering: both durable retry records (queue entry +
+        # journal entry) land FIRST, so a crash before this write leaves
+        # the pre-association recovery paths intact.
+        delivery.set_intent(ref=ref, namespace=namespace,
+                            fields={**intent, "op_id": stored_op})
         return {"ok": True, "completed": False, "queued": True,
                 "op_id": stored_op,
                 "pointer": {"status": "queued"},
@@ -1159,6 +1198,58 @@ def retry(*, target_id: str, logical_key: str,
             expected_row_id=(str(expected_row_id)
                              if expected_row_id else None))
     except store_knowledge.KnowledgePointerCasError as exc:
+        # Post-link crash reconciliation (FB-002): the CAS refused, but
+        # the AUTHORITATIVE pointer may EXACTLY match what THIS retry
+        # staked — a previous retry landed the pointer and crashed before
+        # its verdict reached the journal/intent (the re-run then
+        # re-selects the quarantined original and its now-spent stake
+        # refuses).  Provable ONLY against the live pointer (exact
+        # version + FULL digest + locator); complete the recovery instead
+        # of refusing a state that already happened.  Anything else
+        # (another writer's row, no live row) keeps the honest refusal.
+        try:
+            landed = store_knowledge.get_pointer(
+                conn, namespace, target_id, logical_key)
+        except Exception:  # noqa: BLE001 - unreadable: keep the refusal
+            landed = None
+        if landed is not None and _landed_match(
+                landed, version=version, digest=digest,
+                locator=locator):
+            journal.record_retry(
+                target_id=target_id, logical_key=logical_key,
+                locator=locator, digest=digest, namespace=namespace,
+                op_id=op_id, summary=original.summary,
+                staked_at=original.staked_at, retry_ref=original.seq)
+            delivery.set_intent(ref=ref, namespace=namespace, fields={
+                "target": target_id, "key": logical_key,
+                "namespace": namespace,
+                "digest": digest, "locator": locator,
+                "version": version, "expected_row_id": expected_row_id,
+                "row_id": landed.row_id, "state": "applied",
+                "op_id": op_id, "staked": True,
+            })
+            delivery.record_receipt({
+                "op_id": op_id, "target": target_id, "key": logical_key,
+                "namespace": namespace, "status": "committed",
+                "link_status": "applied", "row_id": landed.row_id,
+                # FB-017 FINAL rework: the receipt records the stake it
+                # settled (version + row identity) so restart recovery can
+                # bind it to the EXACT original stake — never a later
+                # stale stake of the same content.
+                "version": version,
+                "expected_row_id": (str(expected_row_id)
+                                    if expected_row_id else None),
+                "retried": True, "reconciled_after_cas_stale": True,
+            })
+            return {"ok": True, "completed": True, "queued": False,
+                    "op_id": op_id, "retry_ref": original.seq,
+                    "pointer": {"status": "noop",
+                                "row_id": landed.row_id,
+                                "version": version,
+                                "reconciled_after_cas_stale": True},
+                    "journal_state": "applied",
+                    "ref": ref, "target": target_id, "key": logical_key,
+                    "namespace": namespace}
         return _refusal(
             "retry refused: the original stake (version %d) is still "
             "stale against the live pointer — %s" % (version, exc),
@@ -1184,6 +1275,11 @@ def retry(*, target_id: str, logical_key: str,
         "op_id": op_id, "target": target_id, "key": logical_key,
         "namespace": namespace, "status": "committed",
         "link_status": "applied", "row_id": landed.get("row_id"),
+        # FB-017 FINAL rework: same exact-stake provenance as the
+        # reconciled-after-cas-stale leg above.
+        "version": version,
+        "expected_row_id": (str(expected_row_id)
+                            if expected_row_id else None),
         "retried": True,
     })
     return {"ok": True, "completed": True, "queued": False,
@@ -1484,7 +1580,10 @@ def flush(*, journal=None, delivery=None, http=None,
     left the journal ACTIVE and the intent queued with the op's receipt
     on disk — the empty queue must not end recovery.  Such orphans are
     re-reconciled from the PERSISTED receipt + intent (the intent carries
-    the closed metadata: digest, locator, version, stake).
+    the closed metadata: digest, locator, version, stake).  A RETRY op's
+    crash window is keyed on its durable journal entry instead — including
+    the QUARANTINED entry a rejection-side crash leaves behind (FB-017:
+    the crashed flush quarantined the entry but never settled the stake).
     """
     from knowledge.delivery import (  # noqa: PLC0415
         KnowledgeDelivery, default_delivery_path, flush_to_hub)
@@ -1578,7 +1677,16 @@ def flush(*, journal=None, delivery=None, http=None,
                 "version": view.get("version"),
                 "expected_row_id": view.get("expected_row_id"),
                 "row_id": recorded.get("row_id"),
-                "state": "rejected", "op_id": str(view["op_id"]),
+                # FB-017: a pointer_cas_stale rejection records the
+                # CAS-specific intent state so `knowledge retry` can
+                # select and re-enqueue the original stake; any other
+                # rejection keeps the unrecoverable ``rejected`` state
+                # with its cause named at retry time.
+                "state": ("cas_stale"
+                          if str(recorded.get("error") or "")
+                          == "pointer_cas_stale"
+                          else "rejected"),
+                "op_id": str(view["op_id"]),
                 "staked": True,
             })
 
@@ -1648,6 +1756,98 @@ def flush(*, journal=None, delivery=None, http=None,
     # persisted receipts and re-locked the file per receipt).
     recovered = 0
     snapshot_intents = delivery.snapshot()["intents"]
+
+    def _stake_version(record: Mapping[str, Any]) -> int | None:
+        """The record's integer stake version, or None when absent or
+        unreadable (a stake without a readable version can never be
+        EXACT-matched, only guessed at — and guessing is refused)."""
+        try:
+            return int(record.get("version"))
+        except (TypeError, ValueError):
+            return None
+
+    def _retry_receipt_intent(retry_entry, receipt, op_id: str) -> dict | None:
+        """The cas_stale intent a RETRY op's persisted receipt may settle,
+        or None when it cannot be matched SAFELY (FB-017 rework, stage B:
+        BOTH crash windows; FINAL rework: exact ORIGINAL-STAKE binding).
+
+        The durable retry JOURNAL entry PLUS the receipt's recorded stake
+        identity are the authoritative identity: a candidate intent must
+        carry the SAME target, key and namespace, the EXACT digest, state
+        ``cas_stale``, and — the exact-stake guard — the SAME stake
+        VERSION the receipt settled.  A receipt without a readable
+        version can never prove WHICH stake it committed, so it binds
+        NOTHING (None); an intent staked at a different — e.g. NEWER —
+        version for the same content (an intervening stake after the
+        pointer moved on) is never settled from the older receipt.  The
+        stake's ROW identity is REQUIRED just as strictly (FB-017 rework
+        round 2): a real receipt — persisted by the delivery flush off
+        the queued op, or recorded by the local retry lane — always
+        carries ``expected_row_id`` (None verbatim for an initial
+        create), and it must match the candidate's EXACTLY: two stakes
+        can share version AND digest while naming DIFFERENT predecessor
+        rows, and only the row identity tells them apart.  A receipt
+        WITHOUT the key is a legacy pre-fix receipt whose row identity is
+        unrecoverable: it binds NOTHING rather than guessing which
+        same-version, same-digest stake it settled (the caller leaves
+        the intent untouched / quarantines conservatively).
+
+        Only AFTER those exact-stake guards pass is the ``op_id``
+        deliberately tolerant of both crash windows: the enqueue-time
+        re-pointing names the durable retry op, but a crash BETWEEN
+        ``record_retry`` and that re-point leaves the intent still naming
+        the ORIGINAL capture's op (or none) — either state is this
+        retry's stake and settles.  A cas_stale intent in a DIFFERENT
+        slot that also names this op (a cross-wired sidecar) makes the
+        owner ambiguous: refuse to guess — None — and the caller leaves
+        the intent untouched / quarantines conservatively.
+        """
+        receipt_version = _stake_version(receipt)
+        if receipt_version is None:
+            return None
+        # FB-017 rework round 2 (row identity REQUIRED, never optional):
+        # every real receipt carries the stake's ``expected_row_id`` key
+        # since delivery persists it off the queued op (and the local
+        # retry lane records it too).  A receipt WITHOUT the key is a
+        # legacy pre-fix receipt: which same-version, same-digest stake
+        # it settled is unrecoverable, so it binds NOTHING — refuse to
+        # guess (the caller leaves the intent untouched / quarantines
+        # conservatively).
+        if "expected_row_id" not in receipt:
+            return None
+        receipt_row = receipt.get("expected_row_id")
+        retry_digest = str(retry_entry.digest or "").lower()
+        identity: list[dict] = []
+        cross_wired: list[dict] = []
+        for record in snapshot_intents.values():
+            if not (isinstance(record, dict)
+                    and record.get("state") == "cas_stale"):
+                continue
+            if (str(record.get("target", "")) == retry_entry.target_id
+                    and str(record.get("key", ""))
+                    == retry_entry.logical_key
+                    and str(record.get("namespace", "") or "")
+                    == str(retry_entry.namespace or "")
+                    and _digest_of(record) == retry_digest):
+                if (_stake_version(record) != receipt_version
+                        or record.get("expected_row_id") != receipt_row):
+                    # Same content, DIFFERENT stake: not the stake this
+                    # receipt committed (an intervening stake for the
+                    # same digest — at a different version OR at the
+                    # SAME version against a DIFFERENT predecessor row —
+                    # is the reviewer's exact scenario).  The row
+                    # comparison is an unconditional EXACT equality
+                    # (None binds None), never a best-effort check that
+                    # only fires when the receipt happens to carry a
+                    # non-None row.  Never settled here; ownership is
+                    # NOT inferred from the intent's own op_id.
+                    continue
+                identity.append(record)
+            elif record.get("op_id") == op_id:
+                cross_wired.append(record)
+        if cross_wired or len(identity) != 1:
+            return None
+        return identity[0]
     for op_id, receipt in receipts.items():
         if op_id in before or not isinstance(receipt, dict):
             continue
@@ -1667,18 +1867,226 @@ def flush(*, journal=None, delivery=None, http=None,
             # applied off the committed receipt.
             retry_entry = None
             try:
+                journal_entries = journal.entries()
                 retry_entry = next(
-                    (e for e in journal.entries()
+                    (e for e in journal_entries
                      if e.state == "pointer_queued"
                      and e.op_id == op_id), None)
+                if (retry_entry is None
+                        and str(receipt.get("status", ""))
+                        in ("committed", "duplicate")):
+                    # FB-017 FINAL crash window (stage B): a flush that
+                    # marked the retry journal ``applied`` and crashed
+                    # BEFORE settling the stake left journal ``applied`` +
+                    # intent ``cas_stale`` + the committed receipt — the
+                    # pointer_queued selection above spent its only
+                    # recovery key and could never resume, stranding the
+                    # stale stake selectable forever.  The applied RETRY
+                    # entry itself (op_id + retry_ref) is the key, but
+                    # ONLY while the matching stake is still unsettled:
+                    # _retry_receipt_intent demands the exact identity
+                    # (target + key + namespace + digest) AND the exact
+                    # ORIGINAL STAKE (the receipt's version AND its
+                    # required row identity) off the entry + receipt, and
+                    # refuses to guess on ambiguity, so a settled — or
+                    # foreign, or NEWER — stake leaves the terminal entry
+                    # unselected: the leg fires once, never re-counts, and
+                    # the live re-check below cannot clobber a newer
+                    # stake.
+                    retry_entry = next(
+                        (e for e in journal_entries
+                         if e.state == "applied"
+                         and e.op_id == op_id
+                         and e.retry_ref is not None
+                         and _retry_receipt_intent(e, receipt, str(op_id))
+                         is not None), None)
+                if (retry_entry is None
+                        and str(receipt.get("status", ""))
+                        not in ("committed", "duplicate")
+                        and str(receipt.get("error") or "")
+                        != "pointer_cas_stale"):
+                    # FB-017 FINAL rework (rejection-side crash window):
+                    # a flush that quarantined the retry's journal entry
+                    # (the FIRST step of _reconcile_rejected) and crashed
+                    # BEFORE settling the stake left journal
+                    # ``quarantined`` + the REJECTED receipt + intent still
+                    # ``cas_stale`` — the pointer_queued selection above
+                    # had spent its only recovery key, so the stale stake
+                    # stayed selectable forever and `knowledge retry`
+                    # re-enqueued a fresh op for a NON-CAS cause that can
+                    # never land, without ever surfacing it.  The
+                    # QUARANTINED RETRY entry itself (op_id + retry_ref) is
+                    # the key, but ONLY through _retry_receipt_intent's
+                    # exact-stake guards (target + key + namespace +
+                    # digest, the receipt's stake version AND its required
+                    # row identity — a foreign or NEWER stake is never
+                    # settled).  A ``pointer_cas_stale`` rejection is
+                    # deliberately EXCLUDED: its settlement
+                    # (_reconcile_rejected's cas_stale branch) is
+                    # state-identical to the crashed state — the stake's
+                    # designed retryable end state — so firing there would
+                    # re-write the intent on EVERY flush (recovered would
+                    # never reach 0 and the sidecar would never settle);
+                    # the live pointer landed-window for cas_stale keeps
+                    # recovering through the designed retry cycle.
+                    retry_entry = next(
+                        (e for e in journal_entries
+                         if e.state == "quarantined"
+                         and e.op_id == op_id
+                         and e.retry_ref is not None
+                         and _retry_receipt_intent(e, receipt, str(op_id))
+                         is not None), None)
             except Exception:  # noqa: BLE001 - journal read is advisory
                 retry_entry = None
             if retry_entry is not None and str(
                     receipt.get("status", "")) in ("committed", "duplicate"):
-                journal.mark(target_id=retry_entry.target_id,
-                             logical_key=retry_entry.logical_key,
-                             state="applied",
-                             namespace=retry_entry.namespace)
+                if retry_entry.state != "applied":
+                    journal.mark(target_id=retry_entry.target_id,
+                                 logical_key=retry_entry.logical_key,
+                                 state="applied",
+                                 namespace=retry_entry.namespace)
+                # FB-017 rework (stage B objection): the committed receipt
+                # is authoritative for the retry's STAKE too — settle the
+                # matching cas_stale intent (state ``applied``, row_id
+                # from the receipt) so a crash between the persisted
+                # receipt and this reconciliation — or between the
+                # ``applied`` journal mark just above and this settlement
+                # (the FINAL window; the applied-entry selection resumes
+                # exactly here) — cannot leave
+                # the stale intent selectable forever (an endless
+                # re-enqueue loop).  SAFETY: the intent is matched only
+                # through _retry_receipt_intent (exact identity + digest +
+                # the EXACT ORIGINAL STAKE — the receipt's version and row
+                # identity — refuse-on-ambiguity), the settlement is
+                # guarded by the receipt's link_status (a link that names
+                # its own rejection never settles applied), and the LIVE
+                # intent is re-checked first against the SAME stake
+                # (version + the receipt's REQUIRED expected_row_id,
+                # never its own op_id alone) so a concurrently newer — or
+                # same-version, different-row — stake is never clobbered;
+                # the tolerant op_id membership (None / the retry op / the
+                # matched intent's pre-repoint op) applies only AFTER
+                # those exact-stake guards pass.
+                settled_intent = _retry_receipt_intent(retry_entry,
+                                                       receipt,
+                                                       str(op_id))
+                link_refused = str(
+                    receipt.get("link_status") or "").lower() in (
+                    "rejected", "cas_stale", "conflict")
+                if settled_intent is not None and not link_refused:
+                    settle_ref = _ref_for(retry_entry.target_id,
+                                          retry_entry.logical_key)
+                    live = delivery.get_intent(
+                        settle_ref,
+                        namespace=retry_entry.namespace or "")
+                    if (live is not None
+                            and live.get("state") == "cas_stale"
+                            and _stake_version(live)
+                            == _stake_version(settled_intent)
+                            and live.get("expected_row_id")
+                            == settled_intent.get("expected_row_id")
+                            and live.get("expected_row_id")
+                            == receipt.get("expected_row_id")
+                            and live.get("op_id")
+                            in (None, str(op_id),
+                                settled_intent.get("op_id"))
+                            and _digest_of(live)
+                            == str(retry_entry.digest or "").lower()):
+                        delivery.set_intent(
+                            ref=settle_ref,
+                            namespace=retry_entry.namespace or "",
+                            fields={
+                                "target": retry_entry.target_id,
+                                "key": retry_entry.logical_key,
+                                "namespace":
+                                    (retry_entry.namespace or ""),
+                                "digest": str(retry_entry.digest or ""),
+                                "locator": str(
+                                    settled_intent.get("locator", "")
+                                    or ""),
+                                "version": receipt.get(
+                                    "version",
+                                    settled_intent.get("version")),
+                                "expected_row_id":
+                                    settled_intent.get("expected_row_id"),
+                                "row_id": receipt.get("row_id"),
+                                "state": "applied",
+                                "op_id": str(op_id),
+                                "staked": True,
+                            })
+                recovered += 1
+            elif retry_entry is not None:
+                # FB-017 rework: a REJECTED retry receipt settles the SAME
+                # records the live rejection lane settles — the retry's
+                # journal entry to terminal quarantined and the cas_stale
+                # intent the retry belongs to — so the crash window
+                # between the persisted receipt and the reconciliation
+                # cannot leave the stake selectable forever on a
+                # non-recoverable cause.  The entry may now ALSO be the
+                # QUARANTINED retry itself (the FINAL rejection-side
+                # crash window: the crashed flush had already quarantined
+                # it before settling the stake) — _journal_quarantine's
+                # terminal guard then re-marks NOTHING, so the quarantined
+                # entry survives verbatim and the leg settles the intent
+                # only.  The intent is matched through
+                # _retry_receipt_intent (exact identity + digest + the
+                # EXACT ORIGINAL STAKE the receipt named): the crash window
+                # BETWEEN the retry's journal entry and the enqueue-time
+                # op_id re-pointing leaves the intent still naming the
+                # ORIGINAL capture's op, and that intent settles too — but
+                # only because the stake itself (version + row identity)
+                # matched, never on the op_id alone.  The LIVE slot is
+                # re-checked against that same stake — the receipt's
+                # REQUIRED row identity included directly, never merely
+                # the matched snapshot — before anything settles, so an
+                # intervening NEWER (or same-version, different-row) stake
+                # for the same content is left untouched; an ambiguous or
+                # foreign match (None) quarantines the journal below while
+                # leaving the intent untouched — conservative.
+                retry_intent = _retry_receipt_intent(retry_entry,
+                                                     receipt,
+                                                     str(op_id))
+                if retry_intent is not None:
+                    live_ref = _ref_for(retry_entry.target_id,
+                                        retry_entry.logical_key)
+                    live = delivery.get_intent(
+                        live_ref, namespace=retry_entry.namespace or "")
+                    if not (live is not None
+                            and live.get("state") == "cas_stale"
+                            and _digest_of(live) == _digest_of(retry_intent)
+                            and _stake_version(live)
+                            == _stake_version(retry_intent)
+                            and live.get("expected_row_id")
+                            == retry_intent.get("expected_row_id")
+                            and live.get("expected_row_id")
+                            == receipt.get("expected_row_id")):
+                        # The live slot no longer holds the exact stake
+                        # the receipt was bound to (a newer stake replaced
+                        # it): settle NOTHING — the conservative
+                        # quarantine below keeps the newer stake
+                        # selectable.
+                        retry_intent = None
+                settled = False
+                if retry_intent is not None:
+                    retry_digest = _digest_of(retry_intent)
+                    if retry_digest is not None:
+                        settled = True
+                        landed = _cas_stale_landed(
+                            retry_intent, retry_digest,
+                            str(receipt.get("error") or ""))
+                        if landed is not None:
+                            _reconcile_applied(retry_intent, retry_digest, {
+                                "row_id": _field(landed, "row_id"),
+                                "version": _field(landed, "version")})
+                        else:
+                            _reconcile_rejected(retry_intent, retry_digest,
+                                                receipt)
+                if not settled and _journal_quarantine(
+                        journal, target_id=retry_entry.target_id,
+                        logical_key=retry_entry.logical_key,
+                        namespace=retry_entry.namespace,
+                        digest=retry_entry.digest) == "quarantined":
+                    quarantined.append(str(op_id))
                 recovered += 1
             continue
         digest = _digest_of(intent)

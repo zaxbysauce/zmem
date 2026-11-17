@@ -4,16 +4,29 @@
 //
 // Frozen seam contract:
 //   - runMoment(moment, opts)          opts: { query, session, namespace,
-//                                          cwd, spawn?, timeoutMs?,
+//                                          cwd, env?, spawn?, timeoutMs?,
 //                                          escalateGraceMs? }  (MERGED with
 //                                          the existing defaults — an
 //                                          injected spawn replaces the
 //                                          child spawn only, never the
-//                                          argv/env/stdin plumbing)
+//                                          argv/stdin plumbing; env? MERGES
+//                                          over the consumer's env defaults
+//                                          — caller keys win, childEnv
+//                                          normalization + ZMEM_HOST still
+//                                          apply — never replaces them)
 //   - runCapture(kind, text, meta, opts)   4th positional opts, same keys
+//                                          (env? there is the run()
+//                                          either-or: it REPLACES the
+//                                          default child env wholesale)
 //   - runReflect(session, namespace, opts) 3rd positional opts, same keys
-//   - runPolicy(opts)                  single opts { spawn?, timeoutMs?,
-//                                          escalateGraceMs? }
+//                                          (env? merges over the
+//                                          ZMEM_NAMESPACE/ZMEM_SESSION
+//                                          childEnv defaults, same as
+//                                          runMoment)
+//   - runPolicy(opts)                  single opts { env?, spawn?,
+//                                          timeoutMs?, escalateGraceMs? }
+//                                          (env? merges over the minimal
+//                                          policyEnv resolver defaults)
 //   - Timeout forwarding: runMoment / runCapture / runReflect expose
 //     `result.raw.timedOut === true`; runPolicy fails open to
 //     `{ text: "" }`.
@@ -56,11 +69,18 @@ const RESOLVE_WINDOW_MS = TIMEOUT_MS + GRACE_MS + 450;
 const KILL_WINDOW_MS = 2500;
 const ESCALATION_SIGNAL = "SIGKILL";
 
+// Minimal fake stdio: EventEmitter plus the setEncoding no-op run() now
+// calls on real child streams right after spawn (FB-016b). The fakes emit
+// complete-ASCII Buffers, so the no-op changes no existing leg's bytes.
+class FakeStdio extends EventEmitter {
+  setEncoding() {}
+}
+
 class KillIgnoringChild extends EventEmitter {
   constructor() {
     super();
-    this.stdout = new EventEmitter();
-    this.stderr = new EventEmitter();
+    this.stdout = new FakeStdio();
+    this.stderr = new FakeStdio();
     this.stdin = { write() {}, end() {} };
     this.killCalls = [];
   }
@@ -74,8 +94,8 @@ class KillIgnoringChild extends EventEmitter {
 class WellBehavedChild extends EventEmitter {
   constructor({ out = "", err = "", code = 0 } = {}) {
     super();
-    this.stdout = new EventEmitter();
-    this.stderr = new EventEmitter();
+    this.stdout = new FakeStdio();
+    this.stderr = new FakeStdio();
     this.writes = [];
     this.stdin = {
       write: (chunk) => this.writes.push(String(chunk)),
@@ -162,6 +182,26 @@ test("runMoment: normal forwarding preserves query/session/namespace/env", async
   assert.ok(!result.raw.timedOut);
 });
 
+test("runMoment: caller env MERGES over the consumer env defaults", async () => {
+  const s = wellBehavedSeam({ out: "{}\n" });
+  const result = await runMoment("turn-start", {
+    query: "merge-q", session: "sess-merge", namespace: "project:merge",
+    spawn: s.spawn, timeoutMs: 5000,
+    env: { ZMEM_PROBE_MERGED_KEY: "caller-wins" },
+  });
+  assert.equal(s.calls.length, 1);
+  const opts = s.calls[0][2];
+  assert.equal(opts.env.ZMEM_PROBE_MERGED_KEY, "caller-wins",
+    "the caller's env key must survive the merge (present in the "
+    + "spawned child env)");
+  assert.equal(opts.env.ZMEM_HOST, "deepseek",
+    "the consumer default survives the merge (childEnv ZMEM_HOST "
+    + "still applies — merge, never replace)");
+  assert.equal(opts.env.ZMEM_NAMESPACE, "project:merge",
+    "the consumer default ZMEM_NAMESPACE survives the merge");
+  assert.equal(result.raw.code, 0);
+});
+
 // -- runCapture -------------------------------------------------------------
 
 test("runCapture: deadline + escalation through the shared run()", async () => {
@@ -221,6 +261,24 @@ test("runReflect: normal forwarding keeps bash argv, env merge, shape", async ()
   assert.equal(result.raw.code, 0);
 });
 
+test("runReflect: caller env MERGES over the consumer env defaults", async () => {
+  const s = wellBehavedSeam({ out: "reflect-ok\n" });
+  const result = await runReflect("sess-merge", "project:merge",
+    { spawn: s.spawn, timeoutMs: 5000,
+      env: { ZMEM_PROBE_MERGED_KEY: "caller-wins" } });
+  assert.equal(s.calls.length, 1);
+  const opts = s.calls[0][2];
+  assert.equal(opts.env.ZMEM_PROBE_MERGED_KEY, "caller-wins",
+    "the caller's env key must survive the merge (present in the "
+    + "spawned child env)");
+  assert.equal(opts.env.ZMEM_HOST, "deepseek",
+    "the consumer default survives the merge (childEnv ZMEM_HOST "
+    + "still applies — merge, never replace)");
+  assert.equal(opts.env.ZMEM_SESSION, "sess-merge",
+    "the consumer default ZMEM_SESSION survives the merge");
+  assert.ok(result.ok);
+});
+
 // -- runPolicy --------------------------------------------------------------
 
 test("runPolicy: deadline + escalation, fail-open to empty text", async () => {
@@ -245,5 +303,24 @@ test("runPolicy: normal forwarding keeps the minimal resolver env and shape", as
   assert.ok(!Object.prototype.hasOwnProperty.call(opts.env, "ZMEM_PRINCIPAL"),
     "policyEnv stays MINIMAL: sentinels never ride along");
   assert.equal(result.text, "# policy probe text");
+  assert.equal(result.reason, "ok");
+});
+
+test("runPolicy: caller env MERGES over the minimal resolver env", async () => {
+  const s = wellBehavedSeam({ out: "# policy merge probe\n" });
+  const result = await runPolicy({ spawn: s.spawn, timeoutMs: 5000,
+    env: { ZMEM_PROBE_MERGED_KEY: "caller-wins" } });
+  assert.equal(s.calls.length, 1);
+  const opts = s.calls[0][2];
+  assert.equal(opts.env.ZMEM_PROBE_MERGED_KEY, "caller-wins",
+    "the caller's env key must survive the merge (present in the "
+    + "spawned child env)");
+  assert.ok(Object.prototype.hasOwnProperty.call(opts.env, "ZMEM_STORE"),
+    "the minimal resolver defaults survive the merge (ZMEM_STORE "
+    + "still rides)");
+  assert.ok(!Object.prototype.hasOwnProperty.call(opts.env, "ZMEM_PRINCIPAL"),
+    "the minimal-env exclusions survive the merge (sentinels never "
+    + "ride along)");
+  assert.equal(result.text, "# policy merge probe");
   assert.equal(result.reason, "ok");
 });

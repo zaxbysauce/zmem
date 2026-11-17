@@ -18,7 +18,7 @@
 //
 // Base: legs (i)-(iv),(vi) are RED (opts.spawn / escalateGraceMs seam
 // missing; the real spawn resolves by child events with a non-null code);
-// leg (v) real-spawn is GREEN at base.
+// leg (vii) real-spawn is GREEN at base.
 //
 // Run: node --test tests/test_deepseek_launcher_timeout.mjs
 
@@ -34,12 +34,19 @@ const SETTLE_WINDOW_MS = TIMEOUT_MS + SLACK_MS;   // resolve ON the deadline
 const KILL_WINDOW_MS = TIMEOUT_MS + GRACE_MS + 2000;
 const ESCALATION_SIGNAL = "SIGKILL";
 
+// Minimal fake stdio: EventEmitter plus the setEncoding no-op run() now
+// calls on real child streams right after spawn (FB-016b). The fakes emit
+// complete-ASCII Buffers, so the no-op changes no existing leg's bytes.
+class FakeStdio extends EventEmitter {
+  setEncoding() {}
+}
+
 class FakeChild extends EventEmitter {
   constructor({ killBehavior = "ignore", closeAfterMs = 60,
                 throwOnKill = false, exitCode = 8 } = {}) {
     super();
-    this.stdout = new EventEmitter();
-    this.stderr = new EventEmitter();
+    this.stdout = new FakeStdio();
+    this.stderr = new FakeStdio();
     this.stdin = { write() {}, end() {} };
     this.killCalls = [];
     this.closed = false;
@@ -186,21 +193,38 @@ test("(iv) single settlement: AWAITED late error/close events change nothing", a
     "late events after settlement must not change the resolved result");
 });
 
-test("(v) timer cleanup: settlement leaves no dangling timeout handles", async () => {
+test("(v) timer cleanup: the close handler clears the escalation timer before the grace elapses", async () => {
   const s = seam({ killBehavior: "close-soon", closeAfterMs: 30 });
   const baseline = timeouts()["Timeout"] || 0;
-  const result = await run(["arm-length-probe-timer-cleanup"], {
-    timeoutMs: TIMEOUT_MS, escalateGraceMs: GRACE_MS, spawn: s.spawn,
+  const pending = run(["arm-length-probe-timer-cleanup"], {
+    timeoutMs: TIMEOUT_MS, escalateGraceMs: 800, spawn: s.spawn,
   });
+  // The fake closes closeAfterMs after the deadline's graceful kill —
+  // poll for the close (5ms interval, 400ms budget) so the handle
+  // sample below lands right after the close and BEFORE the 800ms
+  // grace elapses.
+  const closeDeadline = Date.now() + 400;
+  while (!s.fake.closed && Date.now() < closeDeadline) {
+    await sleep(5);
+  }
+  assert.ok(s.fake.closed,
+    "the fake child must close during the grace window (close-soon "
+    + "seam, closeAfterMs 30)");
+  // SAMPLE now, before the grace elapses: the close handler must
+  // already have cleared the escalation hardTimer — a mutant that
+  // leaves it armed holds a live Timeout handle for the full grace.
+  const after = timeouts()["Timeout"] || 0;
+  assert.ok(after <= baseline,
+    `the close handler must clear the escalation timer before the `
+    + `grace elapses (baseline Timeout handles ${baseline}, `
+    + `after ${after})`);
+  const result = await pending;
   assert.equal(s.spawnCalls.length, 1,
     "opts.spawn must be used instead of the real child_process.spawn");
   assert.equal(result.timedOut, true, JSON.stringify(result));
-  // Past deadline + grace: every timer run() armed must be cleared.
-  await sleep(GRACE_MS + 400);
-  const after = timeouts()["Timeout"] || 0;
-  assert.ok(after <= baseline,
-    `settlement must clear its timers (baseline Timeout handles `
-    + `${baseline}, after ${after})`);
+  assert.equal(result.code, null,
+    `the deadline result carries code null (no child verdict): `
+    + JSON.stringify(result));
 });
 
 test("(vi) partial output: the deadline result carries exactly the bytes collected", async () => {
@@ -227,6 +251,11 @@ test("(vi) partial output: the deadline result carries exactly the bytes collect
     `out carries exactly the pre-deadline bytes: ${JSON.stringify(result)}`);
   assert.equal(result.err, "PARTIAL-ERR\n",
     `err carries exactly the pre-deadline bytes: ${JSON.stringify(result)}`);
+  // Drain the background escalation timer (the kill-ignoring child never
+  // closes, so the hardTimer stays armed past this test's asserts): later
+  // legs sample live Timeout handles, and a timer firing inside their
+  // sample window would shift those counts.
+  await sleep(GRACE_MS + 400);
 });
 
 test("(vii) well-behaved helper keeps exit code and byte-for-byte out/err", async () => {
@@ -237,4 +266,20 @@ test("(vii) well-behaved helper keeps exit code and byte-for-byte out/err", asyn
   assert.equal(result.out, "ok\n", JSON.stringify(result));
   assert.equal(result.err, "", JSON.stringify(result));
   assert.ok(!result.timedOut, "a clean exit is not a timeout");
+});
+
+test("(viii) well-behaved real spawn: settle clears the deadline timer immediately", async () => {
+  const baseline = timeouts()["Timeout"] || 0;
+  const result = await run(
+    [process.execPath, "-e", "console.log('ok')"],
+    { timeoutMs: 5000 });
+  // Sample IMMEDIATELY after resolve: the child settled through the
+  // close handler long before the deadline, and settle() must already
+  // have cleared the 5000ms deadline timer — a mutant that leaves it
+  // armed holds a live Timeout handle for the rest of the window.
+  const after = timeouts()["Timeout"] || 0;
+  assert.ok(after <= baseline,
+    `settlement must clear the deadline timer immediately (baseline `
+    + `Timeout handles ${baseline}, after ${after})`);
+  assert.equal(result.code, 0, JSON.stringify(result));
 });

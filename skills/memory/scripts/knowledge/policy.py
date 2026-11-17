@@ -12,8 +12,11 @@ workflow lives.
 
 Hard boundaries (approved plan, 2026-11-13):
 - STDLIB ONLY, closed import set (``glob``, ``json``, ``os``, ``re``,
-  ``sys``): never imports ``storelib``/``host``, never opens SQLite, never
-  touches the network, never stats target roots, never writes anywhere.
+  ``sys``, ``unicodedata`` — the last for the description charset
+  judgment, refused category classes Cc/Cs/Zl/Zp, Cf deliberately
+  allowed): never imports ``storelib``/``host``, never opens SQLite,
+  never touches the network, never stats target roots, never writes
+  anywhere.
 - The config file is read BOUNDED (<= 64 KiB) and BOM-tolerant; decoding
   is STRICT UTF-8 - undecodable bytes refuse the whole render (display
   fail-closed; storelib.config's replace-decode is a store-lane behavior,
@@ -74,6 +77,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 __all__ = [
     "POLICY_VERSION",
@@ -101,9 +105,6 @@ MAX_CONFIG_BYTES = 65536
 # stay well below this; the guard exists so a future edit cannot ship an
 # oversized policy silently - it renders nothing instead.
 MAX_POLICY_WORDS = 200
-# Per-target description display budget (words); the aggregate stays
-# bounded by MAX_POLICY_WORDS via the roster composition.
-_DESC_BUDGET = 8
 
 # How many target ids the one-line roster shows.  The remainder are VALID
 # ids beyond the cap, counted ("(+N not shown)") so the model knows more
@@ -343,19 +344,31 @@ def _nonempty_str(value):
     return isinstance(value, str) and bool(value.strip())
 
 
+# Display-lane charset judgment (FB-005, validator parity with
+# knowledge/config.py): refuse the Unicode category classes Cc (controls,
+# incl. NEL U+0085), Cs (lone surrogates), Zl (U+2028) and Zp (U+2029) —
+# category-based, so C1 controls beyond U+007F are refused too; Cf
+# (format: ZWSP, bidi controls, LRM...) is DELIBERATELY ALLOWED as
+# legitimate operator text.
+_REFUSED_CHAR_CATEGORIES = frozenset(("Cc", "Cs", "Zl", "Zp"))
+
+
 def _description_ok(value, *, present):
     """Display mirror of the description grammar (validator parity):
     ABSENT is fine; a PRESENT value must be a string of 1..200
-    codepoints, no C0/CR/LF/TAB, not whitespace-only (an explicit JSON
-    null is refused exactly like the command validator refuses it).
-    Values are never rendered when this returns False."""
+    codepoints, no control/separator/surrogate category codepoints
+    (Cc/Cs/Zl/Zp — Cf format characters are allowed), not
+    whitespace-only (an explicit JSON null is refused exactly like the
+    command validator refuses it).  Values are never rendered when this
+    returns False."""
     if not present:
         return True
     if not isinstance(value, str):
         return False
     if len(value) > 200 or not value.strip():
         return False
-    return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+    return not any(unicodedata.category(ch) in _REFUSED_CHAR_CATEGORIES
+                   for ch in value)
 
 
 def _target_spec_ok(spec):
@@ -472,21 +485,6 @@ def load_policy_state(config_path=None, environ=None):
     return state
 
 
-def _display_description(description, budget):
-    """Deterministic per-target display truncation (#482 AC15): the
-    largest prefix (word-aligned) that keeps the ROSTER under the word
-    budget; marker "..." when truncated.  A description that cannot fit
-    at all renders as just the marker."""
-    if description is None:
-        return None
-    words = description.split()
-    keep = words[:budget] if budget > 0 else []
-    text = " ".join(keep)
-    if text != description:
-        text = (text + " ...").strip()
-    return text
-
-
 def _compose(target_ids, targets_omitted, allow_capture,
              descriptions=None):
     descriptions = descriptions or {}
@@ -495,7 +493,9 @@ def _compose(target_ids, targets_omitted, allow_capture,
     # until the WHOLE policy stays under MAX_POLICY_WORDS - the
     # truncated units end with the frozen marker '...'.  A valid
     # config therefore never renders an empty policy from its
-    # descriptions.
+    # descriptions: the prefix=0 floor appends the BARE target id (the
+    # descriptionless roster entry — no " — ..." residue), so the floor
+    # roster equals the plain roster and renders whenever the base does.
     base = _compose_plain(target_ids, targets_omitted, allow_capture)
     base_words = len(base.split())
     present = [descriptions.get(tid) for tid in target_ids]
@@ -508,7 +508,12 @@ def _compose(target_ids, targets_omitted, allow_capture,
                 entries.append(tid)
                 continue
             words = desc.split()
-            if prefix < len(words):
+            if prefix == 0:
+                # The floor: the descriptions cannot contribute even one
+                # word under the budget — the bare target id, exactly the
+                # descriptionless roster entry (FB-011).
+                entries.append(tid)
+            elif prefix < len(words):
                 entries.append("%s — %s ..."
                                % (tid, " ".join(words[:prefix])))
             else:

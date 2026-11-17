@@ -1049,9 +1049,22 @@ def _cmd_knowledge(args) -> int:
                           "pending (nothing enqueued)", file=sys.stderr)
                     return 3
                 if result.get("ok"):
+                    # FB-004: human mode gets a one-line stderr status
+                    # (stdout stays empty outside --json); exit 0.
+                    if not args.json:
+                        print(
+                            f"[zmem] knowledge retry: enqueued op "
+                            f"{result.get('op_id')} for the hub (run "
+                            f"'knowledge flush')", file=sys.stderr)
                     return _emit(result, exit_code=0)
-                return _fail(result.get("error") or "retry refused",
-                             payload=result)
+                # FB-004: a typed retry refusal is a REPORTED OUTCOME,
+                # not a usage error — never _fail (exit 2 is reserved
+                # for config/usage errors); exit 1 with the envelope.
+                if not args.json:
+                    print(f"[zmem] knowledge: "
+                          f"{result.get('error') or 'retry refused'}",
+                          file=sys.stderr)
+                return _emit(result, exit_code=1)
             # Local mode mirrors capture's discipline: maintenance wait,
             # writer lease, schema gates, write-capable connection — and
             # the --json stdout contract (the writer's [zmem] progress
@@ -1082,9 +1095,23 @@ def _cmd_knowledge(args) -> int:
                     conn = None
                 _release_writer_lease(lease)
             if result.get("ok"):
+                # FB-004: human mode gets a one-line stderr result (the
+                # CLI itself emits no JSON envelope outside --json; the
+                # store writer's own [zmem] progress lines are unchanged);
+                # exit 0.
+                if not args.json:
+                    pointer = result.get("pointer") or {}
+                    print(f"[zmem] knowledge retry: {pointer.get('status')} "
+                          f"version {pointer.get('version')} at row "
+                          f"{pointer.get('row_id')}", file=sys.stderr)
                 return _emit(result, exit_code=0)
             # Typed retry refusals are reported outcomes, not usage
-            # errors: exit 1 with the JSON envelope.
+            # errors: exit 1 with the JSON envelope; human mode gets the
+            # reason on stderr (FB-004).
+            if not args.json:
+                print(f"[zmem] knowledge: "
+                      f"{result.get('error') or 'retry refused'}",
+                      file=sys.stderr)
             return _emit(result, exit_code=1)
 
         # status

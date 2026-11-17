@@ -133,6 +133,7 @@ config error, exit 2 — never silently half-enabled):
 |--------|----------|---------|
 | `kind` | yes | the literal `markdown` |
 | `root` | yes | ONE absolute path to the vault root (no `..` components) |
+| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.160.0 clients under the strict unknown-key law |
 
 The root must **already exist and be a real directory** — the companion
 never creates the vault root, only note files (and the locator's
@@ -154,6 +155,7 @@ portable across operating systems (CMP-011).
 | `token_file` | (see above) | absolute path to a file holding the bearer token (≤ 4096 bytes) |
 | `timeout_s` | no | timeout per individual socket operation, 0.1..120 s (default 10) — NOT an overall request deadline: one create or read is a multi-step exchange (connect, send, receive), so a single exchange can legitimately take longer than one `timeout_s` |
 | `max_response_bytes` | no | response body cap, 256..16777216 (default 1048576) |
+| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.160.0 clients under the strict unknown-key law |
 
 Credentials are explicit by design: exactly one named location per target,
 and the token **value** is read only at request time — it is never written
@@ -212,6 +214,9 @@ decides the mode.
 <interpreter> <store.py> knowledge status [--target notes] \
   [--key recipes/sourdough] [--namespace user:global] [--json]
 
+<interpreter> <store.py> knowledge retry --target <id> --key <key> \
+  [--namespace <ns>] [--json]
+
 <interpreter> <store.py> knowledge flush [--json]
 ```
 
@@ -257,7 +262,8 @@ Argument notes:
   mismatch (the refusal below), or a `status` that found pointer-store
   corruption (duplicate live verified rows: the JSON envelope carries
   `"ok": false` plus a per-identity, content-free `corruption` entry, and
-  no winner is silently picked).
+  no winner is silently picked), or a retry typed refusal (quarantine
+  cause not a stale CAS, or the original stake still stale).
 - `2` — a refusal: usage errors, an invalid `knowledge` config object, a
   disabled companion (this refuses `capture` AND `flush`, before any
   store or hub access, preserving pending queue entries), the
@@ -268,8 +274,9 @@ Argument notes:
   or undecodable target bytes on a digest-matching `read`.
 - `3` — pending: a `capture` whose immutable version IS published but
   whose pointer is `pending` or merely `queued`, or a `flush` that left
-  entries pending (including local-mode leftovers that need remote mode).
-  Distinct from both `0` and `1` on purpose.
+  entries pending (including local-mode leftovers that need remote mode),
+  or a retry in remote mode kept pending by an unreachable hub (nothing
+  enqueued). Distinct from both `0` and `1` on purpose.
 
 `queued` and `pending` are **states**, not success. When the distinction
 matters, read `pointer.status` (`created` / `advanced` / `noop` /
@@ -307,7 +314,17 @@ anything:
 The journal lives at `<store_dir>/knowledge/journal.json` (remote mode:
 the data dir). It records identity, locator, digest, and a state — **never
 the note body** — bounded to 1000 entries / 4 MiB, written atomically
-(tmp + fsync + replace) under a cross-process OS byte lock.
+(tmp + fsync + replace) under a cross-process OS byte lock. The journal
+format version stays 1; entries written by 0.160.0+ carry retry
+provenance (op_id/retry_ref/summary/staked_at) as OPTIONAL fields, so
+a pre-0.160.0 client accepts the journal — but its writer does not
+know the fields, so any rewrite silently strips them. The consequence:
+an in-flight `pointer_queued` retry loses its recovery identity
+(retry_ref), and a repeat `knowledge retry` refuses with "(not
+quarantined)" until an operator re-queues the work. No note content or
+pointer row is lost. A pre-0.160.0 client also rejects a
+config carrying description at load (strict unknown-key refusal); do
+not mix client versions on one store.
 
 Journal states:
 
@@ -336,12 +353,14 @@ quarantined entry is terminal, and the recovery surface is
 stake) is recoverable — retry re-runs the ORIGINAL stake (a still-stale
 stake refuses typed, mutating nothing) and lands a fresh applied entry
 with the original preserved verbatim. Every other cause (an operator
-pull, a hub rejection, a conflict) stays terminal: retry refuses with
+pull, a non-CAS hub rejection, a conflict) stays terminal: retry refuses with
 the cause named, and recovery is a deliberate operator action.
-Re-publishing the SAME digest under a quarantined identity routes
-through retry; publishing NEW content (different digest) records a
-fresh intent normally. The quarantined history is always retained for
-inspection via `knowledge status`.
+Re-publishing the SAME digest under a quarantined identity is refused
+by capture (exit 2, pointing at retry); recovery of a stale-CAS
+quarantine routes through knowledge retry (0 applied / 1 typed
+refusal / 3 remote-pending), and publishing NEW content (different
+digest) records a fresh intent normally. The quarantined history is
+always retained for inspection via `knowledge status`.
 
 ## The pointer contract (namespace, payload, CAS)
 

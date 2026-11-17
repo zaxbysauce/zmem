@@ -164,12 +164,18 @@ if os.path.exists(state_path):
 if "ops-enqueue" in sys.argv:
     n = state["next"]; state["next"] = n + 1
     op_id = "kl-stub-%d" % n
-    status = "pending" if n % 4 == 0 else "committed"
+    forced = os.environ.get("STUB_ENQUEUE_STATUS")
+    if forced in ("pending", "committed"):
+        status = forced
+    else:
+        status = "pending" if n % 4 == 0 else "committed"
     state["ops"][op_id] = status
     with open(state_path, "w", encoding="utf-8") as fh:
         json.dump(state, fh)
     print(json.dumps({"ok": True, "op_id": op_id, "status": status}))
 elif "ops-flush" in sys.argv:
+    if os.environ.get("STUB_FLUSH_COMMIT") == "1":
+        state["ops"] = {k: "committed" for k in state["ops"]}
     with open(state_path, "w", encoding="utf-8") as fh:
         json.dump(state, fh)
     receipts = [{"op_id": k, "status": v} for k, v in state["ops"].items()]
@@ -391,6 +397,52 @@ process.stdout.write(JSON.stringify({
 """
 
 
+# ------------------------------------------------------------ phantom probe
+
+_PHANTOM_PROBE = """
+let capR = 32;
+try {
+  const sm = await import(process.env.STATE_URL);
+  if (sm.CAPS && Number.isInteger(sm.CAPS.receipts)) capR = sm.CAPS.receipts;
+} catch { /* base: fallback cap */ }
+const handlers = {};
+const registered = [];
+const ctx = {
+  on: (name, fn) => { (handlers[name] ??= []).push(fn); },
+  tools: { register: (spec) => registered.push(spec) },
+};
+const mod = await import(process.env.PLUGIN_URL);
+await mod.plugin(ctx);
+const add = registered.find((t) => t && t.name === "zmem_add");
+if (!add) throw new Error("zmem_add tool not registered");
+const state = globalThis.__zmemDsPluginState;
+if (!state) throw new Error("plugin state not exposed");
+// FB-008 phantom-pending leg: every op feeds the ACTUAL event
+// sequence — the enqueue receipt PENDING, then the flush receipt
+// COMMITTED, for the SAME op_id (stub knobs). The terminal flush
+// receipt must RETIRE its own stale pending twin, so the bounded
+// array holds only committed receipts and pendingReceipts is 0.
+const calls = capR + 5;
+for (let i = 0; i < calls; i++) {
+  const r = await add.execute({ namespace: "user:global",
+    text: "phantom probe " + i });
+  if (!r || r.isError) {
+    throw new Error("zmem_add execute failed: "
+      + JSON.stringify(r).slice(0, 200));
+  }
+}
+process.stdout.write(JSON.stringify({
+  cap: capR,
+  fed: calls,
+  fedEvents: 2 * calls,
+  length: state.receipts.length,
+  pendingReceipts: state.pendingReceipts,
+  array: state.receipts.map((x) => ({ op_id: x && x.op_id,
+    status: x && x.status })),
+}) + "\\n");
+"""
+
+
 def _node_available() -> bool:
     try:
         proc = subprocess.run(["node", "--version"], capture_output=True,
@@ -450,11 +502,12 @@ class StateBoundsTest(unittest.TestCase):
         })
         return env
 
-    def _run_node(self, script: str, timeout: float = 180.0) -> dict:
+    def _run_node(self, script: str, timeout: float = 180.0,
+                  env: dict | None = None) -> dict:
         proc = subprocess.run(
             ["node", "--input-type=module", "-e", script],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", env=self._env(), cwd=str(REPO_ROOT),
+            errors="replace", env=env or self._env(), cwd=str(REPO_ROOT),
             stdin=subprocess.DEVNULL, timeout=timeout)
         self.assertEqual(
             proc.returncode, 0,
@@ -557,6 +610,48 @@ class StateBoundsTest(unittest.TestCase):
                restore["fileLen"], cap))
         self.assertEqual(_statuses(restore["array"]),
                          _statuses(oracle_r))
+
+        # (2b) PHANTOM leg (FB-008): >= cap local ops feeding the
+        # ACTUAL two-event sequence per op_id — the enqueue receipt
+        # ALWAYS pending, the flush receipt COMMITTED (stub knobs).
+        # The terminal flush receipt must RETIRE its own stale pending
+        # twin, so the bounded array holds committed receipts only and
+        # pendingReceipts is 0 (no-dedupe mutant: the stale twins
+        # linger as PHANTOM pending entries behind their own committed
+        # outcomes). The oracle runs over the post-retire feed — ONE
+        # final (committed) receipt per op — under the same frozen
+        # boundReceipts law.
+        self._write_tree()
+        phantom = self._run_node(_PHANTOM_PROBE, env={
+            **self._env(),
+            "STUB_ENQUEUE_STATUS": "pending",
+            "STUB_FLUSH_COMMIT": "1",
+        })
+        cap_p = phantom["cap"]
+        calls_p = cap_p + 5
+        oracle_p = _oracle_receipts(
+            [{"op_id": None, "status": "committed"}
+             for _ in range(calls_p)], cap_p)
+        self.assertEqual(phantom["fed"], calls_p)
+        self.assertEqual(
+            phantom["fedEvents"], 2 * calls_p,
+            "the phantom leg drives the ACTUAL event feed: one pending "
+            "and one committed receipt per op through the real "
+            "enqueue+flush path")
+        self.assertEqual(
+            phantom["length"], len(oracle_p),
+            "the phantom drive is bounded per the oracle (fed=%d "
+            "oracle=%d live=%d cap=%d)"
+            % (calls_p, len(oracle_p), phantom["length"], cap_p))
+        self.assertEqual(_statuses(phantom["array"]),
+                         _statuses(oracle_p),
+                         "only COMMITTED receipts survive the phantom "
+                         "retire (status sequence)")
+        self.assertEqual(
+            phantom["pendingReceipts"], 0,
+            "no PHANTOM pending entries survive the commit "
+            "(pendingReceipts recomputed from the retired bounded "
+            "array)")
 
 
         # (3) PURE leg: state.mjs equals the INDEPENDENT ORACLE for every

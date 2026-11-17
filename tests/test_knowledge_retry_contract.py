@@ -34,7 +34,10 @@ Frozen retry contract (normative; the implementer must satisfy exactly):
 - Latest-version selection: multiple quarantined versions of one key ->
   the retry selects the LATEST cas_stale entry (its digest lands).
 - Malformed journal/intent -> typed refusal (exit 1), never a traceback.
-- Concurrent retries: exactly one succeeds.
+- Concurrent retries: exactly one succeeds at linking (FB-002) — the
+  winner links (``applied``), the loser's stale CAS reconciles against
+  the landed pointer (``noop`` + ``reconciled_after_cas_stale``) and both
+  report ok; the pointer row is still linked exactly once.
 - Crash/partial failure: a journal entry recorded but pointer not
   advanced -> a fresh retry re-selects and completes.
 - Target tamper: staked bytes altered on the target -> typed refusal,
@@ -120,6 +123,14 @@ class _FakeMCPHub(http.server.BaseHTTPRequestHandler):
     seen_ops: list[dict] = []
     tool_calls: list[str] = []     # every tools/call NAME received
     token: str = "zmem-retry-fake-hub-token"
+    # FB-017 fixtures: when reject_error is set, every knowledge_link op
+    # is answered with status "rejected" carrying that machine error
+    # code; hub_pointer_answer is what the capability-gated
+    # knowledge_pointer read returns (None = the hub holds no verified
+    # pointer, so a pointer_cas_stale rejection never reconciles as
+    # landed).
+    reject_error: str | None = None
+    hub_pointer_answer: dict | None = None
 
     def log_message(self, *args):  # silence
         pass
@@ -128,6 +139,8 @@ class _FakeMCPHub(http.server.BaseHTTPRequestHandler):
     def reset(cls) -> None:
         _FakeMCPHub.seen_ops = []
         _FakeMCPHub.tool_calls = []
+        _FakeMCPHub.reject_error = None
+        _FakeMCPHub.hub_pointer_answer = None
 
     def _send_json(self, status: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -172,13 +185,20 @@ class _FakeMCPHub(http.server.BaseHTTPRequestHandler):
                            "capabilities": ["knowledge_link_v1"],
                            "zmem_version": "retry-fake-hub"}
             elif name == "knowledge_pointer":
-                payload = {"ok": True, "pointer": None}
+                payload = {"ok": True,
+                           "pointer": _FakeMCPHub.hub_pointer_answer}
             elif name == "apply_ops":
                 _FakeMCPHub.seen_ops.append(json.loads(json.dumps(args)))
-                payload = {"ok": True, "receipts": [
-                    {"op_id": op["op_id"], "status": "committed",
-                     "canonical_id": "row-" + op["op_id"]}
-                    for op in args.get("ops", [])]}
+                if _FakeMCPHub.reject_error is not None:
+                    payload = {"ok": True, "receipts": [
+                        {"op_id": op["op_id"], "status": "rejected",
+                         "error": _FakeMCPHub.reject_error}
+                        for op in args.get("ops", [])]}
+                else:
+                    payload = {"ok": True, "receipts": [
+                        {"op_id": op["op_id"], "status": "committed",
+                         "canonical_id": "row-" + op["op_id"]}
+                        for op in args.get("ops", [])]}
             else:
                 payload = {"ok": True}
             reply["result"] = {"content": [
@@ -190,8 +210,11 @@ class _FakeMCPHub(http.server.BaseHTTPRequestHandler):
 
 
 class _FakeHubServer:
-    def __init__(self) -> None:
+    def __init__(self, *, reject_error: str | None = None,
+                 hub_pointer_answer: dict | None = None) -> None:
         _FakeMCPHub.reset()
+        _FakeMCPHub.reject_error = reject_error
+        _FakeMCPHub.hub_pointer_answer = hub_pointer_answer
         self.httpd = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), _FakeMCPHub)
         self.thread = threading.Thread(target=self.httpd.serve_forever,
@@ -271,16 +294,21 @@ class RetryContractTest(unittest.TestCase):
         return json.loads(r.stdout)
 
     def _capture_quarantined(self, key: str, text: str,
-                             summary: str = _EXPLICIT_SUMMARY) -> dict:
+                             summary: str | None = _EXPLICIT_SUMMARY) -> dict:
         """A DESIGNED-TO-QUARANTINE capture: the genuine stale-CAS
         quarantine envelope — exit 1 (the CLI's pointer-failure exit),
         ``pointer.status == "cas_stale"`` and ``journal_state ==
         "quarantined"``.  An EXPLICIT --summary rides the capture so the
         journal record the REAL capture writes (at head) carries
-        provenance the retry must copy verbatim."""
-        r = self._cli("knowledge", "capture", "--target", _TARGET,
-                      "--key", key, "--namespace", _NAMESPACE,
-                      "--content", text, "--summary", summary, "--json")
+        provenance the retry must copy verbatim; ``summary=None`` omits
+        --summary entirely (the FB-001 default-summary probe)."""
+        cli_args = ["knowledge", "capture", "--target", _TARGET,
+                    "--key", key, "--namespace", _NAMESPACE,
+                    "--content", text]
+        if summary is not None:
+            cli_args += ["--summary", summary]
+        cli_args += ["--json"]
+        r = self._cli(*cli_args)
         self.assertEqual(
             r.returncode, 1,
             "the designed-to-quarantine capture of %r must exit 1 with the "
@@ -452,6 +480,36 @@ class RetryContractTest(unittest.TestCase):
         rows = self._pointer_rows()
         return rows[0] if rows else None
 
+    def _link_other_writer(self, *, version: int, digest: str,
+                           summary: str) -> None:
+        """Another writer's link DIRECTLY on the shared store (past this
+        host's journal/delivery sidecars, which keep carrying THIS host's
+        stake verbatim) — the real maintenance lane, mirroring
+        ``_tombstone_competitor``."""
+        old = os.environ.get("ZMEM_STORE")
+        os.environ["ZMEM_STORE"] = str(self.tmp / "store.sqlite")
+        try:
+            sys.path.insert(0, str(SCRIPTS_DIR))
+            import storelib  # noqa: PLC0415
+            storelib._refresh_env_state()
+            from storelib import knowledge as sk  # noqa: PLC0415
+            conn = sqlite3.connect(str(self.tmp / "store.sqlite"))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=10000")
+            try:
+                sk.link_pointer(
+                    conn, namespace=_NAMESPACE, target=_TARGET, key=_KEY,
+                    version=version, full_sha256=digest, summary=summary,
+                    locator=_locator(_KEY, digest), expected_row_id=None)
+                conn.commit()
+            finally:
+                conn.close()
+        finally:
+            if old is None:
+                os.environ.pop("ZMEM_STORE", None)
+            else:
+                os.environ["ZMEM_STORE"] = old
+
     # -- C1 ------------------------------------------------------------------
 
     def test_retry_on_current_original_stake_succeeds(self):
@@ -599,6 +657,45 @@ class RetryContractTest(unittest.TestCase):
         rd = self._read(_KEY, fx["locator"])
         self.assertEqual(json.loads(rd.stdout)["actual_digest"],
                          fx["digest"])
+
+    # -- FB-001: the default summary when NO --summary was passed -----------
+
+    def test_retry_without_summary_lands_default_pointer_summary(self):
+        """A capture made WITHOUT --summary quarantines with a NULL
+        summary on the journal entry; the completing retry must fall
+        back to the FIXED default ``knowledge note <logical_key>`` (the
+        logical-key form, never note content) instead of raising
+        NameError (FB-001)."""
+        competitor = self._capture(_KEY, "alpha prime body")
+        seeded = self._seed_stake(_KEY, "beta body", None, 1)
+        # The designed-to-quarantine capture with NO --summary flag.
+        self._capture_quarantined(_KEY, "beta body", summary=None)
+        # The quarantined journal entry carries NO summary.
+        quarantined = [e for e in self._entries_for(_KEY)
+                       if e["digest"] == seeded["digest"]
+                       and e["state"] == "quarantined"]
+        self.assertTrue(quarantined)
+        self.assertIsNone(quarantined[0].get("summary"),
+                          "the no-summary capture records a NULL summary")
+
+        self._tombstone_competitor(competitor["pointer"]["row_id"])
+        result = self._retry()
+        self.assertEqual(result.returncode, 0,
+                         "stdout=%r stderr=%r" % (result.stdout[-300:],
+                                                  result.stderr[-300:]))
+        body = json.loads(result.stdout)
+        self.assertTrue(body.get("ok"), body)
+
+        # The landed POINTER carries the FIXED default summary.
+        status = self._cli("knowledge", "status", "--target", _TARGET,
+                           "--key", _KEY, "--namespace", _NAMESPACE,
+                           "--json")
+        pointer = json.loads(status.stdout)["pointers"][0]["pointer"]
+        self.assertEqual(
+            pointer["summary"], "knowledge note %s" % _KEY,
+            "the completing retry links the FIXED default summary "
+            "(knowledge note <logical_key>): %r" % (pointer["summary"],))
+        self.assertEqual(pointer["full_sha256"], seeded["digest"])
 
     # -- C2 ------------------------------------------------------------------
 
@@ -788,6 +885,70 @@ class RetryContractTest(unittest.TestCase):
             same = [e for e in entries if e["seq"] == fx["seq"]]
             self.assertEqual(same, [json.loads(json.dumps(fx["entry"]))])
 
+    def test_retry_same_version_different_digest_live_is_cas_stale(self):
+        """FB-002 coverage gap (critic mutant M2): a live pointer at the
+        SAME version carrying a DIFFERENT digest is ANOTHER WRITER'S row —
+        never this retry's landed crash window.  The FB-002
+        post-link-crash reconciliation must require the EXACT digest (and
+        locator), not the version alone: the retry refuses typed
+        ``cas_stale``, mutates NOTHING, and the live digest stays the
+        other writer's.  (A version-only ``_landed_match`` mutant would
+        wrongly reconcile this as applied/noop — this test is its
+        killer.)"""
+        fx = self._fixture_initial_create_quarantine()
+        # Tombstone the competing first-create: no live pointer remains,
+        # so beta's INITIAL-CREATE stake (None, 1, digest A) is CURRENT.
+        self._tombstone_competitor(fx["competitor_row"])
+        self.assertIsNone(
+            self._live_pointer(),
+            "PRE-CONDITION: no live pointer after the tombstone")
+
+        # Another writer links a DIFFERENT digest at the SAME version 1
+        # directly on the shared store (this host's sidecars untouched:
+        # the delivery intent still carries beta's (None, 1, digest A)
+        # cas_stale stake verbatim).
+        digest_b = _digest("gamma body")
+        self._link_other_writer(version=1, digest=digest_b,
+                                summary="another writer v1")
+        live = self._live_pointer()
+        self.assertIsNotNone(live, "the other writer's row is live")
+
+        journal_before = self._journal_path.read_bytes()
+        delivery_before = self._delivery_path.read_bytes()
+        result = self._retry()
+        self.assertEqual(
+            result.returncode, 1,
+            "a same-version DIFFERENT-digest live pointer must refuse "
+            "the retry typed; got %d stdout=%r" % (result.returncode,
+                                                   result.stdout))
+        body = json.loads(result.stdout)
+        self.assertIs(body.get("ok"), False)
+        self.assertEqual(
+            (body.get("pointer") or {}).get("status"), "cas_stale",
+            "the live row is another writer's (version 1, digest B != A): "
+            "the honest cas_stale refusal — the crash-window "
+            "reconciliation may not match on the version alone: %r"
+            % (body,))
+
+        # Refusals mutate NOTHING: both sidecars byte-identical.
+        self.assertEqual(self._journal_path.read_bytes(), journal_before,
+                         "the refused retry mutates no journal")
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused retry mutates no delivery sidecar")
+
+        # The LIVE pointer is untouched: still the other writer's row at
+        # version 1 with digest B.
+        status = self._cli("knowledge", "status", "--target", _TARGET,
+                           "--key", _KEY, "--namespace", _NAMESPACE,
+                           "--json")
+        pointer = json.loads(status.stdout)["pointers"][0]["pointer"]
+        self.assertEqual(pointer["version"], 1,
+                         "the live version is untouched: %r" % (pointer,))
+        self.assertEqual(
+            pointer["full_sha256"], digest_b,
+            "the live digest remains the OTHER WRITER'S B (the refused "
+            "retry never supersedes it): %r" % (pointer,))
+
     def test_retry_on_malformed_recovery_state_refuses_typed(self):
         self._fixture_initial_create_quarantine()
         # Malformed journal: corrupt JSON -> a typed refusal, no traceback.
@@ -832,12 +993,45 @@ class RetryContractTest(unittest.TestCase):
         out1 = proc1.communicate(timeout=180)
         out2 = proc2.communicate(timeout=180)
         codes = sorted([proc1.returncode, proc2.returncode])
-        self.assertEqual(codes, [0, 1],
-                         "exactly one concurrent retry must succeed (one "
-                         "exit 0, one exit 1); "
-                         "codes=%r out1=%r out2=%r" % (codes, out1[0][-200:],
-                                                       out2[0][-200:]))
-        # And the winner left exactly one live pointer row.
+        # FB-002: exactly one retry LINKS the pointer; the loser's stale
+        # CAS either reconciles against the landed pointer (both exit 0 —
+        # ``applied`` + ``noop``) OR, if the winner's journal mark landed
+        # first, receives the TYPED refusal "already applied" (exit 1).
+        # Both orderings are correct: no double link, no crash, no mutation
+        # by the loser. Pin the invariant, not the scheduling order.
+        self.assertIn(codes, ([0, 0], [0, 1]),
+                      "one winner plus a reconciled noop or a typed "
+                      "'already applied' refusal; codes=%r out1=%r out2=%r"
+                      % (codes, out1[0][-300:], out2[0][-300:]))
+        results = []
+        for proc, out in ((proc1, out1), (proc2, out2)):
+            body = json.loads(out[0]) if out[0].strip() else None
+            self.assertIsInstance(body, dict, "each retry returns a JSON "
+                                  "envelope: %r" % (out,))
+            self.assertNotIn("Traceback", out[1])
+            results.append((proc.returncode, body))
+        ok_bodies = [b for rc, b in results if rc == 0 and b.get("ok") is True]
+        refused = [b for rc, b in results if rc == 1 and b.get("ok") is False]
+        self.assertEqual(len(ok_bodies) + len(refused), 2, results)
+        if codes == [0, 0]:
+            self.assertEqual(len(ok_bodies), 2, results)
+            statuses = sorted((b.get("pointer") or {}).get("status")
+                              for b in ok_bodies)
+            self.assertEqual(statuses, ["applied", "noop"],
+                             "one winner links (applied), the loser "
+                             "completes as the reconciled noop: %r" % (results,))
+            reconciled = [b for b in ok_bodies
+                          if (b.get("pointer") or {}).get(
+                              "reconciled_after_cas_stale") is True]
+            self.assertEqual(len(reconciled), 1,
+                             "exactly one reconciled completion: %r" % (results,))
+        else:
+            self.assertEqual(len(ok_bodies), 1, results)
+            self.assertEqual(len(refused), 1, results)
+            self.assertIn("already applied", str(refused[0].get("error") or ""))
+            self.assertIn((ok_bodies[0].get("pointer") or {}).get("status"),
+                          ("applied", "noop"))
+        # In both orderings the winner left exactly one live pointer row.
         self.assertEqual(len(self._pointer_rows()), 1)
 
     def test_crash_partial_failure_is_re_retryable(self):
@@ -911,6 +1105,80 @@ class RetryContractTest(unittest.TestCase):
             active, [],
             "(3) NO remaining ACTIVE/partial entry for the digest (the "
             "crashed partial is superseded): %r" % (active,))
+
+    def test_post_link_crash_completes_on_re_retry(self):
+        """FB-002: a retry that landed the pointer but crashed BEFORE its
+        verdict reached the journal/intent leaves the sidecars saying
+        'quarantined / cas_stale' while the pointer is LIVE.  The re-run's
+        CAS refuses — but the authoritative pointer EXACTLY matches the
+        staked attempt, so the re-retry must COMPLETE (noop +
+        reconciled_after_cas_stale), never wedge on cas_stale."""
+        fx = self._fixture_initial_create_quarantine()
+        self._tombstone_competitor(fx["competitor_row"])
+        journal_before = self._journal_path.read_bytes()
+        delivery_before = self._delivery_path.read_bytes()
+
+        # The first retry SUCCEEDS: the pointer lands...
+        first = self._retry()
+        self.assertEqual(first.returncode, 0,
+                         first.stdout + first.stderr)
+        self.assertEqual(len(self._pointer_rows()), 1)
+
+        # ...then "crashes" after the SQLite commit but before the
+        # verdict: restore the PRE-RETRY sidecar bytes; the pointer
+        # stays landed.
+        self._journal_path.write_bytes(journal_before)
+        self._delivery_path.write_bytes(delivery_before)
+        self.assertEqual(len(self._pointer_rows()), 1,
+                         "the pointer stays landed across the restore")
+
+        # The re-run re-selects the quarantined original; its (None, 1)
+        # stake is now spent — the CAS refuses, the live pointer matches
+        # EXACTLY, and the retry must COMPLETE: exit 0, completed,
+        # pointer.status noop, reconciled_after_cas_stale true.
+        second = self._retry()
+        self.assertEqual(
+            second.returncode, 0,
+            "the post-link-crash re-retry must complete, not refuse; "
+            "stdout=%r stderr=%r" % (second.stdout, second.stderr[-300:]))
+        body = json.loads(second.stdout)
+        self.assertIs(body.get("ok"), True)
+        self.assertIs(body.get("completed"), True)
+        pointer = body.get("pointer") or {}
+        self.assertEqual(pointer.get("status"), "noop",
+                         "the reconciled pointer reports noop: %r" % (body,))
+        self.assertIs(pointer.get("reconciled_after_cas_stale"), True,
+                      "the reconciliation flag is reported: %r" % (body,))
+        self.assertTrue(pointer.get("row_id"))
+
+        # EXACTLY ONE fresh terminal retry entry above the original seq
+        # (the original preserved verbatim; no ACTIVE residue).
+        digest_entries = [e for e in self._entries_for(_KEY)
+                          if e["digest"] == fx["digest"]]
+        original_kept = [e for e in digest_entries
+                         if e["seq"] == fx["seq"]]
+        self.assertEqual(original_kept,
+                         [json.loads(json.dumps(fx["entry"]))],
+                         "the ORIGINAL quarantined entry stays verbatim")
+        terminal_retries = [e for e in digest_entries
+                            if e["seq"] > fx["seq"]
+                            and e["state"] in ("applied", "quarantined")]
+        self.assertEqual(
+            len(terminal_retries), 1,
+            "EXACTLY ONE fresh terminal retry entry after the re-retry: "
+            "%r" % (digest_entries,))
+        active = [e for e in digest_entries
+                  if e["state"] not in ("applied", "quarantined")]
+        self.assertEqual(active, [])
+
+        # The recovery records the LANDED row (intent applied + receipt).
+        intent = self._intent(_KEY)
+        self.assertEqual(intent.get("state"), "applied")
+        self.assertTrue(intent.get("row_id"))
+        receipts = self._delivery()["receipts"]
+        self.assertIn(body.get("op_id"), receipts)
+        self.assertIs(
+            receipts[body["op_id"]].get("reconciled_after_cas_stale"), True)
 
     def test_target_tamper_refuses_without_link(self):
         fx = self._fixture_initial_create_quarantine()
@@ -1424,6 +1692,1560 @@ class RetryContractTest(unittest.TestCase):
                         .startswith("hub-"))
         self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
                          "capability gate honored: NOTHING enqueued")
+
+    # -- FB-017: the remote stale-CAS wedge -----------------------------------
+
+    def test_remote_cas_stale_rejection_marks_intent_cas_stale(self):
+        """A remote capture whose hub flush rejects with
+        pointer_cas_stale (and the hub pointer read proves NOT landed)
+        must record the intent at state ``cas_stale`` — the
+        retry-recoverable cause — so ``knowledge retry`` can re-enqueue
+        the original stake instead of wedging on an unrecoverable
+        ``rejected``."""
+        hub = _FakeHubServer(reject_error="pointer_cas_stale")
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        r = self._cli("knowledge", "capture", "--target", _TARGET,
+                      "--key", _KEY, "--namespace", _NAMESPACE,
+                      "--content", "beta body", "--summary",
+                      _EXPLICIT_SUMMARY, "--json")
+        self.assertEqual(
+            r.returncode, 1,
+            "the pointer-cas_stale-rejected capture exits 1: %s%s"
+            % (r.stdout[-300:], r.stderr[-300:]))
+        body = json.loads(r.stdout)
+        self.assertEqual((body.get("pointer") or {}).get("status"),
+                         "rejected")
+        intent = self._intent(_KEY)
+        self.assertIsNotNone(intent, "the capture wrote its intent")
+        self.assertEqual(
+            intent.get("state"), "cas_stale",
+            "FB-017: a pointer_cas_stale rejection that did NOT "
+            "reconcile as landed records the RETRYABLE intent state "
+            "'cas_stale': %r" % (intent,))
+        entries = self._entries_for(_KEY)
+        self.assertTrue(entries)
+        self.assertEqual(entries[-1]["state"], "quarantined",
+                         "the attempt's journal entry is terminal "
+                         "quarantined: %r" % (entries[-1],))
+
+        # The remote retry now SELECTS the quarantined cas_stale attempt
+        # and ENQUEUES a fresh op carrying the ORIGINAL stake verbatim.
+        rr = self._retry()
+        self.assertEqual(
+            rr.returncode, 0,
+            "remote retry must recover the cas_stale quarantine: %s%s"
+            % (rr.stdout[-300:], rr.stderr[-300:]))
+        rbody = json.loads(rr.stdout)
+        self.assertIs(rbody.get("ok"), True)
+        self.assertIs(rbody.get("queued"), True)
+        after = self._delivery()
+        ours = [e for e in after["queue"] if e.get("key") == _KEY]
+        self.assertEqual(len(ours), 1,
+                         "exactly one freshly enqueued retry op: %r"
+                         % (after["queue"],))
+        entry = ours[0]
+        self.assertEqual(entry.get("status"), "queued")
+        self.assertEqual(entry.get("expected_row_id"), None,
+                         "the ORIGINAL stake row id rides verbatim")
+        self.assertEqual(entry.get("version"), 1,
+                         "the ORIGINAL stake version rides verbatim")
+        beta = _digest("beta body")
+        self.assertEqual(
+            entry.get("fullhash"),
+            [beta[i * 8:(i + 1) * 8] for i in range(8)],
+            "the ORIGINAL digest rides verbatim (chunked)")
+
+    def test_flush_lane_cas_stale_rejection_marks_intent_cas_stale(self):
+        """The FLUSH lane equivalent: a queued op rejected by the hub with
+        pointer_cas_stale (not landed) drives the journal entry to
+        quarantined and the intent to ``cas_stale`` — retry then
+        recovers."""
+        hub = _FakeHubServer(reject_error="pointer_cas_stale")
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        seeded = self._seed_stake(_KEY, "beta body", None, 1,
+                                  state="queued")
+        # The ACTIVE journal entry the flush will quarantine.
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_text(json.dumps({
+            "version": 1,
+            "entries": [{
+                "seq": 1, "target_id": _TARGET, "logical_key": _KEY,
+                "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                "locator": seeded["locator"], "digest": seeded["digest"],
+                "state": "pointer_queued",
+                "updated_at": "2026-01-01T00:00:00.000+00:00",
+                "namespace": _NAMESPACE,
+            }]}, indent=1), encoding="utf-8")
+        # The in-flight queue entry carrying the same stake.
+        delivery = self._delivery()
+        delivery["queue"].append({
+            "namespace": _NAMESPACE, "target": _TARGET, "key": _KEY,
+            "version": 1, "locator": seeded["locator"],
+            "fullhash": [seeded["digest"][i * 8:(i + 1) * 8]
+                         for i in range(8)],
+            "summary": _EXPLICIT_SUMMARY,
+            "date": "2026-01-01T00:00:00Z", "expected_row_id": None,
+            "op_id": "kl-flush-cas-stale-op",
+            "enqueued_at": "2026-01-01T00:00:00Z", "attempts": 0,
+            "last_error": None, "status": "queued",
+        })
+        self._delivery_path.write_text(json.dumps(delivery, indent=1),
+                                       encoding="utf-8")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 1,
+                         "the rejected flush exits 1: %r" % (flushed.stdout,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "cas_stale",
+            "FB-017 flush lane: the pointer_cas_stale rejection records "
+            "the RETRYABLE intent state: %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), "kl-flush-cas-stale-op")
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "quarantined",
+                         "the flush quarantined the ACTIVE entry")
+        receipts = self._delivery()["receipts"]
+        self.assertEqual(
+            receipts.get("kl-flush-cas-stale-op", {}).get("error"),
+            "pointer_cas_stale")
+
+        # And the retry recovers the flush-lane quarantine.
+        rr = self._retry()
+        self.assertEqual(rr.returncode, 0,
+                         "retry recovers the flush-lane cas_stale "
+                         "quarantine: %r" % (rr.stdout[-300:],))
+        rbody = json.loads(rr.stdout)
+        self.assertIs(rbody.get("queued"), True)
+
+    def test_non_cas_rejection_of_enqueued_retry_settles_intent(self):
+        """FB-017 rework: the in-flight retry op is ASSOCIATED with its
+        intent (the remote enqueue re-points the intent's op_id, the
+        symmetric close of the local branch), so a hub rejection of the
+        RETRY op for a NON-CAS cause settles the intent to terminal
+        ``rejected`` — the repeat retry refuses typed naming the cause and
+        re-enqueues NOTHING, instead of leaving the original cas_stale
+        stake selectable forever."""
+        hub = _FakeHubServer(reject_error="pointer_cas_stale")
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        # Phase 1: a REAL capture quarantines cas_stale (the recoverable
+        # cause) through the genuine hub-rejection path.
+        r = self._cli("knowledge", "capture", "--target", _TARGET,
+                      "--key", _KEY, "--namespace", _NAMESPACE,
+                      "--content", "beta body", "--summary",
+                      _EXPLICIT_SUMMARY, "--json")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(self._intent(_KEY).get("state"), "cas_stale")
+        original_entry = self._entries_for(_KEY)[-1]
+        self.assertEqual(original_entry["state"], "quarantined")
+
+        # The remote retry ENQUEUES op A (the hub is never applied during
+        # retry) and re-points the intent's op_id at the durable op.
+        rr = self._retry()
+        self.assertEqual(rr.returncode, 0,
+                         "remote retry enqueues the recovery op: %s%s"
+                         % (rr.stdout[-300:], rr.stderr[-300:]))
+        rbody = json.loads(rr.stdout)
+        self.assertIs(rbody.get("queued"), True)
+        op_a = rbody.get("op_id")
+        self.assertTrue(op_a, "the retry reports its durable op id")
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "cas_stale",
+            "the intent stays cas_stale (still retryable) while op A is "
+            "in flight: %r" % (intent,))
+        self.assertEqual(
+            intent.get("op_id"), op_a,
+            "FB-017 rework: the enqueue re-points the intent's op_id at "
+            "the durable retry op so the flush lane can settle THIS "
+            "attempt's verdict on it: %r" % (intent,))
+
+        # Phase 2: the hub now rejects op A for a NON-CAS cause; the
+        # flush records the rejection and settles the intent.
+        _FakeMCPHub.reject_error = "namespace_not_allowed"
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 1,
+                         "the non-CAS-rejected flush exits 1: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertIn(op_a, fbody.get("journal_quarantined") or [],
+                      "the retry op's rejection drives its journal entry "
+                      "to quarantined: %r" % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "rejected",
+            "the NON-CAS rejection of the RETRY op settles the intent "
+            "(the old cas_stale stake is no longer selectable): %r"
+            % (intent,))
+        self.assertEqual(intent.get("op_id"), op_a)
+        self.assertEqual(
+            (self._delivery()["receipts"].get(op_a) or {}).get("error"),
+            "namespace_not_allowed",
+            "the rejection receipt names the NON-CAS machine cause")
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "quarantined",
+                         "the retry's pointer_queued entry is terminal "
+                         "quarantined: %r" % (entries[-1],))
+        # The ORIGINAL quarantined entry survives verbatim below it.
+        self.assertEqual(
+            [e for e in entries if e["seq"] == original_entry["seq"]],
+            [original_entry], "full entry-dict equality for the preserved "
+            "original (verbatim)")
+
+        # The repeat retry refuses typed naming the cause and re-enqueues
+        # NOTHING (both sidecars byte-identical).
+        delivery_before = self._delivery_path.read_bytes()
+        journal_before = self._journal_path.read_bytes()
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "a repeat retry after the non-CAS rejection of op A must "
+            "refuse typed; got %d stdout=%r" % (again.returncode,
+                                                again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIs(body.get("ok"), False)
+        error = str(body.get("error", ""))
+        self.assertIn("rejected", error,
+                      "the refusal names the NON-CAS quarantine cause: %r"
+                      % (error,))
+        self.assertIn("stale CAS", error,
+                      "the refusal names the recoverable-cause rule: %r"
+                      % (error,))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+        self.assertEqual(self._journal_path.read_bytes(), journal_before,
+                         "the refused repeat retry mutates no journal")
+
+    def test_restart_recovery_settles_non_cas_rejected_retry_receipt(self):
+        """FB-017 rework, restart leg: a flush that persisted the RETRY
+        op's rejected receipt and emptied the queue but crashed before the
+        reconciliation leaves the retry's pointer_queued journal entry plus
+        the cas_stale intent naming the op — the NEXT flush settles BOTH
+        from the persisted receipt (journal terminal quarantined, intent
+        ``rejected``), and a repeat retry refuses typed without
+        re-enqueueing."""
+        hub = _FakeHubServer()
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        seeded = self._seed_stake(_KEY, "beta body", None, 1,
+                                  state="cas_stale")
+        op_a = "kl-retry-restart-op"
+        # The post-crash sidecar: the rejected receipt persisted, the
+        # queue EMPTY, the intent still cas_stale but naming the
+        # in-flight retry op (the enqueue-time re-pointing).
+        delivery = self._delivery()
+        delivery["intents"]["%s|%s" % (_NAMESPACE,
+                                       "knowledge:%s:%s" % (_TARGET,
+                                                            _KEY))]["op_id"] \
+            = op_a
+        delivery["receipts"][op_a] = {
+            "op_id": op_a, "target": _TARGET, "key": _KEY,
+            "status": "rejected", "link_status": "rejected",
+            "error": "namespace_not_allowed", "row_id": None,
+            # FB-017 round 2: the REAL receipt a flush persists for this
+            # op carries the stake's row identity (the seeded stake is
+            # the C1 INITIAL create: None) — the seeded receipt models
+            # that shape; recovery REQUIRES it.
+            "version": 1, "expected_row_id": None,
+            "received_at": "2026-01-03T00:00:00Z",
+        }
+        self._delivery_path.write_text(json.dumps(delivery, indent=1),
+                                       encoding="utf-8")
+        # The journal: the preserved quarantined ORIGINAL plus the
+        # retry's pointer_queued entry (retry_ref -> the original).
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_text(json.dumps({
+            "version": 1,
+            "entries": [
+                {"seq": 1, "target_id": _TARGET, "logical_key": _KEY,
+                 "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                 "locator": seeded["locator"], "digest": seeded["digest"],
+                 "state": "quarantined",
+                 "updated_at": "2026-01-01T00:00:00.000+00:00",
+                 "namespace": _NAMESPACE,
+                 "summary": _EXPLICIT_SUMMARY,
+                 "staked_at": "2026-01-02T03:04:05Z"},
+                {"seq": 2, "target_id": _TARGET, "logical_key": _KEY,
+                 "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                 "locator": seeded["locator"], "digest": seeded["digest"],
+                 "state": "pointer_queued",
+                 "updated_at": "2026-01-03T00:00:00.000+00:00",
+                 "namespace": _NAMESPACE, "op_id": op_a, "retry_ref": 1,
+                 "summary": _EXPLICIT_SUMMARY,
+                 "staked_at": "2026-01-02T03:04:05Z"},
+            ]}, indent=1), encoding="utf-8")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 1,
+                         "the settled-rejection flush exits 1: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the persisted "
+                         "rejected retry receipt: %r" % (fbody,))
+        self.assertIn(op_a, fbody.get("journal_quarantined") or [],
+                      "the retry's journal entry is driven to quarantined "
+                      "off the persisted receipt: %r" % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "rejected",
+            "the restart lane settles the intent off the persisted "
+            "NON-CAS rejected retry receipt (the stake is no longer "
+            "selectable): %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_a)
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "quarantined",
+                         "the retry's journal entry is terminal "
+                         "quarantined: %r" % (entries[-1],))
+        self.assertEqual(
+            [e for e in entries if e["seq"] == 1 and e["state"]
+             == "quarantined"][0].get("digest"), seeded["digest"],
+            "the ORIGINAL quarantined entry survives verbatim below it")
+
+        # The repeat retry refuses typed (the cause is not a stale CAS)
+        # and re-enqueues NOTHING.
+        delivery_before = self._delivery_path.read_bytes()
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "the repeat retry must refuse typed after the "
+            "restart-settled rejection; got %d stdout=%r"
+            % (again.returncode, again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIs(body.get("ok"), False)
+        error = str(body.get("error", ""))
+        self.assertIn("rejected", error,
+                      "the refusal names the quarantine cause: %r"
+                      % (error,))
+        self.assertIn("stale CAS", error,
+                      "the refusal names the recoverable-cause rule: %r"
+                      % (error,))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    # -- FB-017 stage B rework: BOTH crash windows -----------------------------
+
+    def _seed_crashed_retry_flush(self, *, retry_op: str, intent_op: str,
+                                  receipt: dict,
+                                  retry_state: str = "pointer_queued",
+                                  stake_version: int = 1,
+                                  stake_expected_row_id=None) -> str:
+        """The post-crash sidecars for a RETRY op's restart recovery: the
+        retry's receipt persisted by a flush that died BEFORE its
+        reconciliation, the queue EMPTY, the journal carrying the
+        preserved quarantined ORIGINAL plus the retry's entry (retry_ref
+        -> the original) seeded in ``retry_state`` — ``pointer_queued``
+        (crash before the journal's applied mark), ``applied`` (the
+        FB-017 FINAL window: crash between the applied mark and the stake
+        settlement) or ``quarantined`` (the FINAL rejection-side window:
+        crash between the journal quarantine and the stake settlement) —
+        and the intent still ``cas_stale`` naming
+        ``intent_op`` — either the durable retry op (the enqueue-time
+        re-pointing ran) or the ORIGINAL capture's op (the crash window
+        between record_retry and the re-point).  ``stake_version`` /
+        ``stake_expected_row_id`` control the seeded stake (default: the
+        C1 INITIAL stake (None, 1)).
+        Returns the staked digest."""
+        hub = _FakeHubServer()
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        seeded = self._seed_stake(_KEY, "beta body", stake_expected_row_id,
+                                  stake_version, state="cas_stale")
+        # FB-017 rework round 2: the REAL receipt a flush persists for a
+        # queued op carries the stake's row identity alongside its
+        # version (delivery persists ``expected_row_id`` off the queue
+        # entry).  The seeded receipt models that real shape — the key is
+        # filled from the seeded stake unless the caller pins it
+        # explicitly — because restart recovery now REQUIRES it (a
+        # receipt lacking the key binds nothing).
+        receipt.setdefault("expected_row_id", stake_expected_row_id)
+        delivery = self._delivery()
+        delivery["intents"]["%s|%s" % (_NAMESPACE,
+                                       "knowledge:%s:%s" % (_TARGET,
+                                                            _KEY))]["op_id"] \
+            = intent_op
+        delivery["receipts"][retry_op] = receipt
+        self._delivery_path.write_text(json.dumps(delivery, indent=1),
+                                       encoding="utf-8")
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_text(json.dumps({
+            "version": 1,
+            "entries": [
+                {"seq": 1, "target_id": _TARGET, "logical_key": _KEY,
+                 "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                 "locator": seeded["locator"], "digest": seeded["digest"],
+                 "state": "quarantined",
+                 "updated_at": "2026-01-01T00:00:00.000+00:00",
+                 "namespace": _NAMESPACE,
+                 "summary": _EXPLICIT_SUMMARY,
+                 "staked_at": "2026-01-02T03:04:05Z"},
+                {"seq": 2, "target_id": _TARGET, "logical_key": _KEY,
+                 "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                 "locator": seeded["locator"], "digest": seeded["digest"],
+                 "state": retry_state,
+                 "updated_at": "2026-01-03T00:00:00.000+00:00",
+                 "namespace": _NAMESPACE, "op_id": retry_op,
+                 "retry_ref": 1,
+                 "summary": _EXPLICIT_SUMMARY,
+                 "staked_at": "2026-01-02T03:04:05Z"},
+            ]}, indent=1), encoding="utf-8")
+        return seeded["digest"]
+
+    def test_restart_recovery_committed_receipt_settles_repointed_intent(self):
+        """FB-017 stage B, window A (committed receipt): a flush that
+        persisted the RETRY op's COMMITTED receipt and crashed before the
+        reconciliation used to advance the retry's journal entry to
+        applied while leaving the cas_stale intent — here naming the
+        durable retry op (the enqueue-time re-pointing ran) — selectable
+        forever.  The next flush settles BOTH: journal applied AND intent
+        ``applied`` with the receipt's authoritative row_id; the stake is
+        spent and a repeat retry refuses typed."""
+        op_a = "kl-retry-commit-op"
+        digest = self._seed_crashed_retry_flush(
+            retry_op=op_a, intent_op=op_a,
+            receipt={"op_id": op_a, "target": _TARGET, "key": _KEY,
+                     "status": "committed", "link_status": None,
+                     "version": 1, "row_id": "row-" + op_a,
+                     "error": None,
+                     "received_at": "2026-01-03T00:00:00Z"})
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the committed-receipt recovery flush exits 0: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertIs(fbody.get("ok"), True,
+                      "nothing pending, rejected or quarantined: %r"
+                      % (fbody,))
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the persisted "
+                         "committed retry receipt: %r" % (fbody,))
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "applied",
+                         "the retry's journal entry advances to applied "
+                         "off the committed receipt: %r" % (entries[-1],))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "applied",
+            "window A: the committed receipt settles the cas_stale intent "
+            "naming the durable retry op (the stale stake is no longer "
+            "selectable): %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_a,
+                         "the settled intent names the durable retry op")
+        self.assertEqual(intent.get("row_id"), "row-" + op_a,
+                         "the settled intent carries the receipt's "
+                         "authoritative row_id: %r" % (intent,))
+        self.assertEqual(intent.get("digest"), digest,
+                         "the settled intent keeps the staked digest")
+        self.assertEqual(
+            [e for e in entries if e["seq"] == 1][0]["state"],
+            "quarantined",
+            "the ORIGINAL quarantined entry survives verbatim below it")
+
+        # The stake is spent: a repeat retry refuses typed and re-enqueues
+        # NOTHING (the latest journal entry is applied).
+        delivery_before = self._delivery_path.read_bytes()
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "the repeat retry must refuse typed after the committed-"
+            "receipt settlement; got %d stdout=%r"
+            % (again.returncode, again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIs(body.get("ok"), False)
+        self.assertIn("already applied", str(body.get("error", "")),
+                      "the refusal names the applied state: %r"
+                      % (body.get("error"),))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    def test_restart_recovery_committed_receipt_settles_pre_repoint_intent(self):
+        """FB-017 stage B, window B (crash BEFORE the op_id re-point), the
+        committed leg: the retry's journal entry and queue op landed, the
+        flush persisted the COMMITTED receipt — but the host crashed
+        between record_retry and the enqueue-time intent re-pointing, so
+        the cas_stale intent still names the ORIGINAL capture's op.  The
+        identity match (target+key+namespace+exact digest off the durable
+        retry journal entry) must settle that intent too — the receipt's
+        op id alone can never match it."""
+        op_a = "kl-retry-prerepoint-op"
+        op_o = "kl-original-capture-op"
+        digest = self._seed_crashed_retry_flush(
+            retry_op=op_a, intent_op=op_o,
+            receipt={"op_id": op_a, "target": _TARGET, "key": _KEY,
+                     "status": "committed", "link_status": None,
+                     "version": 1, "row_id": "row-" + op_a,
+                     "error": None,
+                     "received_at": "2026-01-03T00:00:00Z"})
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the committed-receipt recovery flush exits 0: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the persisted "
+                         "committed retry receipt: %r" % (fbody,))
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "applied",
+                         "the retry's journal entry advances to applied: %r"
+                         % (entries[-1],))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "applied",
+            "window B: the identity fallback settles the intent that "
+            "still names the ORIGINAL capture's op (the receipt's op id "
+            "alone can never match it): %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_a,
+                         "the settled intent names the durable RETRY op "
+                         "that actually landed: %r" % (intent,))
+        self.assertEqual(intent.get("row_id"), "row-" + op_a,
+                         "the settled intent carries the receipt's "
+                         "authoritative row_id")
+        self.assertEqual(intent.get("digest"), digest,
+                         "the settled intent keeps the staked digest")
+
+        # The stake is spent: a repeat retry refuses typed.
+        delivery_before = self._delivery_path.read_bytes()
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "the repeat retry must refuse typed after the pre-re-point "
+            "committed settlement; got %d stdout=%r"
+            % (again.returncode, again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIn("already applied", str(body.get("error", "")),
+                      "the refusal names the applied state: %r"
+                      % (body.get("error"),))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    def test_restart_recovery_rejected_receipt_settles_pre_repoint_intent(self):
+        """FB-017 stage B, window B (crash BEFORE the op_id re-point), the
+        rejected leg — the reviewer's exact objection: a rejected retry
+        receipt for an intent still naming the ORIGINAL op used to fall
+        through to the quarantine fallback, which terminalized the
+        journal while leaving the stale cas_stale intent SELECTABLE
+        forever.  The tolerant match must settle the intent to terminal
+        ``rejected`` off the receipt, and the repeat retry refuses typed
+        without re-enqueueing."""
+        op_a = "kl-retry-prerepoint-rej-op"
+        op_o = "kl-original-capture-op"
+        self._seed_crashed_retry_flush(
+            retry_op=op_a, intent_op=op_o,
+            receipt={"op_id": op_a, "target": _TARGET, "key": _KEY,
+                     "status": "rejected", "link_status": "rejected",
+                     "error": "namespace_not_allowed", "row_id": None,
+                     "version": 1,
+                     "received_at": "2026-01-03T00:00:00Z"})
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 1,
+                         "the settled-rejection flush exits 1: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the persisted "
+                         "rejected retry receipt: %r" % (fbody,))
+        self.assertEqual(
+            fbody.get("journal_quarantined") or [], [op_o],
+            "the quarantine envelope names the settled intent's op (the "
+            "pre-re-point intent still names the ORIGINAL capture's op): "
+            "%r" % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "rejected",
+            "window B: the tolerant match settles the intent still naming "
+            "the ORIGINAL capture's op (the old op_id-only match could "
+            "never find it, and the fallback left the stale stake "
+            "selectable): %r" % (intent,))
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "quarantined",
+                         "the retry's journal entry is terminal "
+                         "quarantined: %r" % (entries[-1],))
+        self.assertEqual(
+            [e for e in entries if e["seq"] == 1][0]["state"],
+            "quarantined",
+            "the ORIGINAL quarantined entry survives verbatim below it")
+
+        # The stake is terminal: a repeat retry refuses typed (the cause
+        # is not a stale CAS) and re-enqueues NOTHING.
+        delivery_before = self._delivery_path.read_bytes()
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "the repeat retry must refuse typed after the pre-re-point "
+            "rejected settlement; got %d stdout=%r"
+            % (again.returncode, again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIs(body.get("ok"), False)
+        error = str(body.get("error", ""))
+        self.assertIn("rejected", error,
+                      "the refusal names the quarantine cause: %r"
+                      % (error,))
+        self.assertIn("stale CAS", error,
+                      "the refusal names the recoverable-cause rule: %r"
+                      % (error,))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    def test_restart_recovery_rejected_receipt_settles_quarantined_entry(
+            self):
+        """FB-017 FINAL rework (rejection-side crash window): a flush
+        quarantined the retry's journal entry — the FIRST step of
+        _reconcile_rejected — and crashed BEFORE settling the stake,
+        leaving journal ``quarantined`` + intent ``cas_stale`` + the
+        persisted NON-CAS rejected receipt + an EMPTY queue.  The
+        pointer_queued selection could never resume (the quarantine spent
+        its only recovery key), so the stale stake stayed selectable
+        forever and `knowledge retry` re-enqueued a fresh op for a cause
+        that can never land.  The next flush settles the intent to
+        terminal ``rejected`` off the QUARANTINED retry entry + receipt
+        (exact stake identity), re-marks NOTHING on the journal, recovers
+        nothing on the repeat flush, and the repeat retry refuses typed
+        without re-enqueueing."""
+        op_a = "kl-retry-rejquar-op"
+        self._seed_crashed_retry_flush(
+            retry_op=op_a, intent_op=op_a, retry_state="quarantined",
+            receipt={"op_id": op_a, "target": _TARGET, "key": _KEY,
+                     "status": "rejected", "link_status": "rejected",
+                     "error": "namespace_not_allowed", "row_id": None,
+                     "version": 1,
+                     "received_at": "2026-01-03T00:00:00Z"})
+        journal_before = self._journal()["entries"]
+        self.assertEqual(
+            [e for e in journal_before if e["seq"] == 2][0]["state"],
+            "quarantined",
+            "seed sanity: the retry's journal entry is ALREADY quarantined "
+            "(the crash happened after the journal quarantine, before the "
+            "stake settlement)")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 1,
+                         "the settled-rejection flush exits 1: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the persisted rejected "
+                         "retry receipt off the QUARANTINED entry: %r"
+                         % (fbody,))
+        self.assertEqual(
+            fbody.get("journal_quarantined") or [], [op_a],
+            "the quarantine envelope names the settled intent's op (no "
+            "fresh journal mark — the entry was already terminal): %r"
+            % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "rejected",
+            "the rejection-side crash window settles the cas_stale intent "
+            "to terminal ``rejected`` off the quarantined retry entry + "
+            "receipt (the pointer_queued-only selection left it selectable "
+            "forever): %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_a,
+                         "the settled intent names the retry op")
+        self.assertEqual(
+            (self._delivery()["receipts"].get(op_a) or {}).get("error"),
+            "namespace_not_allowed",
+            "the NON-CAS machine cause stays retained on the receipt: %r"
+            % (self._delivery()["receipts"].get(op_a),))
+        self.assertEqual(
+            self._journal()["entries"], journal_before,
+            "the quarantined retry entry is NOT re-marked and the "
+            "quarantined ORIGINAL survives verbatim (nothing advanced, "
+            "nothing re-enqueued)")
+
+        # Idempotency: a second flush recovers NOTHING and both sidecars
+        # stay byte-identical.
+        delivery_after = self._delivery_path.read_bytes()
+        journal_after = self._journal_path.read_bytes()
+        reflushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(reflushed.returncode, 0,
+                         "the repeat flush has nothing left to settle: %r"
+                         % (reflushed.stdout,))
+        rbody = json.loads(reflushed.stdout)
+        self.assertIs(rbody.get("ok"), True,
+                      "nothing pending, rejected or quarantined: %r"
+                      % (rbody,))
+        self.assertEqual(rbody.get("recovered_from_receipts"), 0,
+                         "the settled stake is terminal: the second flush "
+                         "recovers NOTHING: %r" % (rbody,))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_after,
+                         "the repeat flush leaves the delivery sidecar "
+                         "byte-identical")
+        self.assertEqual(self._journal_path.read_bytes(), journal_after,
+                         "the repeat flush leaves the journal byte-identical")
+
+        # The stake is terminal: a repeat retry refuses typed (the cause
+        # is not a stale CAS) and re-enqueues NOTHING.
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "the repeat retry must refuse typed after the rejection-side "
+            "settlement; got %d stdout=%r" % (again.returncode, again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIs(body.get("ok"), False)
+        error = str(body.get("error", ""))
+        self.assertIn("rejected", error,
+                      "the refusal names the quarantine cause: %r"
+                      % (error,))
+        self.assertIn("stale CAS", error,
+                      "the refusal names the recoverable-cause rule: %r"
+                      % (error,))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_after,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    def test_restart_recovery_cross_wired_op_refuses_to_guess(self):
+        """FB-017 stage B, the conservative guard: when a cas_stale intent
+        in a DIFFERENT slot also names the retry op (a cross-wired
+        sidecar), the receipt's owner is ambiguous — the recovery must
+        NOT guess.  The journal still advances off the authoritative
+        committed receipt, but the identity's cas_stale intent is left
+        UNTOUCHED (no settlement) rather than advanced on a guess."""
+        op_a = "kl-retry-crosswired-op"
+        op_o = "kl-original-capture-op"
+        digest = self._seed_crashed_retry_flush(
+            retry_op=op_a, intent_op=op_o,
+            receipt={"op_id": op_a, "target": _TARGET, "key": _KEY,
+                     "status": "committed", "link_status": None,
+                     "version": 1, "row_id": "row-" + op_a,
+                     "error": None,
+                     "received_at": "2026-01-03T00:00:00Z"})
+        # The cross-wired neighbor: a DIFFERENT logical key whose
+        # cas_stale intent names THIS retry's op.
+        other_digest = _digest("cross wired neighbor body")
+        delivery = self._delivery()
+        delivery["intents"]["%s|%s" % (
+            _NAMESPACE, "knowledge:%s:guides/other" % _TARGET)] = {
+            "target": _TARGET, "key": "guides/other",
+            "namespace": _NAMESPACE,
+            "digest": other_digest,
+            "locator": _locator("guides/other", other_digest),
+            "version": 1, "expected_row_id": None, "row_id": None,
+            "state": "cas_stale", "op_id": op_a, "staked": True,
+            "ref": "knowledge:%s:guides/other" % _TARGET,
+            "updated_at": "2026-01-03T00:00:00Z",
+        }
+        self._delivery_path.write_text(json.dumps(delivery, indent=1),
+                                       encoding="utf-8")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the committed receipt itself is not in doubt "
+                         "(exit 0): %r" % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the receipt: %r"
+                         % (fbody,))
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "applied",
+                         "the journal advances off the authoritative "
+                         "committed receipt: %r" % (entries[-1],))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "cas_stale",
+            "the AMBIGUOUS owner is refused: the identity's intent is "
+            "left untouched (never advanced on a guess): %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_o,
+                         "the untouched intent keeps its original op")
+        self.assertEqual(intent.get("digest"), digest)
+        neighbor = self._delivery()["intents"]["%s|%s" % (
+            _NAMESPACE, "knowledge:%s:guides/other" % _TARGET)]
+        self.assertEqual(neighbor.get("state"), "cas_stale",
+                         "the cross-wired neighbor is never advanced (a "
+                         "different logical key): %r" % (neighbor,))
+        self.assertEqual(neighbor.get("op_id"), op_a,
+                         "the neighbor keeps its (cross-wired) op id")
+
+    def test_restart_recovery_applied_journal_settles_final_crash_window(self):
+        """FB-017 FINAL crash window: a flush marked the retry's journal
+        entry ``applied`` and crashed BEFORE settling the stake — journal
+        ``applied`` + committed receipt + intent still ``cas_stale`` +
+        EMPTY queue.  The pointer_queued-only selection had spent its only
+        recovery key and could never resume, stranding the stale stake
+        selectable forever.  The applied RETRY entry itself (op_id +
+        retry_ref, exact identity + digest match) must resume the
+        settlement from the persisted committed receipt — IDEMPOTENTLY:
+        the terminal journal is never re-marked, a second flush neither
+        double-settles nor clobbers the settled row, the quarantined
+        original survives verbatim, and a repeat retry refuses typed."""
+        op_a = "kl-retry-finalwindow-op"
+        digest = self._seed_crashed_retry_flush(
+            retry_op=op_a, intent_op=op_a, retry_state="applied",
+            receipt={"op_id": op_a, "target": _TARGET, "key": _KEY,
+                     "status": "committed", "link_status": None,
+                     "version": 1, "row_id": "row-" + op_a,
+                     "error": None,
+                     "received_at": "2026-01-03T00:00:00Z"})
+        journal_before = self._journal()["entries"]
+        self.assertEqual(
+            [e for e in journal_before if e["seq"] == 2][0]["state"],
+            "applied",
+            "seed sanity: the retry's journal entry is ALREADY applied "
+            "(the crash happened after the applied mark)")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the final-window recovery flush exits 0: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertIs(fbody.get("ok"), True,
+                      "nothing pending, rejected or quarantined: %r"
+                      % (fbody,))
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the applied-entry selection resumes the "
+                         "settlement off the committed receipt: %r"
+                         % (fbody,))
+        self.assertEqual(self._journal()["entries"], journal_before,
+                         "the terminal journal is NOT re-marked (the "
+                         "applied retry entry and the quarantined "
+                         "original survive verbatim)")
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "applied",
+            "the FINAL window settles the cas_stale intent off the "
+            "applied retry entry + committed receipt (the stale stake is "
+            "no longer selectable): %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_a,
+                         "the settled intent names the durable retry op")
+        self.assertEqual(intent.get("row_id"), "row-" + op_a,
+                         "the settled intent carries the receipt's "
+                         "authoritative row_id: %r" % (intent,))
+        self.assertEqual(intent.get("digest"), digest,
+                         "the settled intent keeps the staked digest")
+
+        # IDEMPOTENT: a second flush re-selects NOTHING (the stake is
+        # settled; the terminal entry is skipped) — no double settle, no
+        # clobber of the settled row, no journal churn.
+        delivery_after_settle = self._delivery_path.read_bytes()
+        again = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(again.returncode, 0,
+                         "the repeat flush stays green: %r"
+                         % (again.stdout,))
+        abody = json.loads(again.stdout)
+        self.assertIs(abody.get("ok"), True)
+        self.assertEqual(abody.get("recovered_from_receipts"), 0,
+                         "the settled stake is never re-counted: %r"
+                         % (abody,))
+        self.assertEqual(self._delivery_path.read_bytes(),
+                         delivery_after_settle,
+                         "the repeat flush writes NOTHING to the sidecar "
+                         "(no double settle, no clobber)")
+        self.assertEqual(self._journal()["entries"], journal_before,
+                         "the repeat flush leaves the journal untouched")
+        intent = self._intent(_KEY)
+        self.assertEqual(intent.get("state"), "applied",
+                         "the settlement survives the repeat flush")
+        self.assertEqual(intent.get("row_id"), "row-" + op_a,
+                         "the settled row_id survives the repeat flush")
+
+        # The stake is spent: a repeat retry refuses typed and re-enqueues
+        # NOTHING (the latest journal entry is applied).
+        delivery_before = self._delivery_path.read_bytes()
+        refused = self._retry()
+        self.assertEqual(
+            refused.returncode, 1,
+            "the repeat retry must refuse typed after the final-window "
+            "settlement; got %d stdout=%r"
+            % (refused.returncode, refused.stdout))
+        body = json.loads(refused.stdout)
+        self.assertIs(body.get("ok"), False)
+        self.assertIn("already applied", str(body.get("error", "")),
+                      "the refusal names the applied state: %r"
+                      % (body.get("error"),))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    def test_restart_recovery_old_receipt_settles_only_exact_original_stake(self):
+        """FB-017 FINAL rework (stage B reviewer objection, ownership
+        binding): a historical COMMITTED retry receipt must settle ONLY
+        the intent for the SAME ORIGINAL STAKE — exact stake VERSION (and
+        row identity) — never a LATER stale stake of the same content.
+
+        The attack this pins: the old retry's committed receipt (version
+        2, row-old) survives in the bounded receipt map while the
+        identity's intent slot is RE-STAKED at version 5 after the
+        pointer moved on (an intervening newer stake for the same
+        key+digest, itself cas_stale).  The pre-fix matcher accepted any
+        cas_stale intent with the same target/key/namespace/digest —
+        regardless of stake version — and the settlement's live check
+        accepted that intent's OWN op id, so the old receipt settled the
+        NEWER stake applied with the OLD row.  Here: the receipt settles
+        the exact-version stake (arm 1), recovers NOTHING against the
+        newer stake (arm 2 — untouched, still cas_stale), and the newer
+        stake stays retryable (arm 3 — `knowledge retry` re-enqueues ITS
+        stake verbatim)."""
+        op_old = "kl-retry-stakebind-old-op"
+        op_orig = "kl-original-capture-op"
+        op_new = "kl-newer-stake-op"
+        # The post-crash FINAL-window sidecars with a NON-trivial stake
+        # (version 2 against row-live-1) and the receipt recording THAT
+        # stake's version; the intent names the ORIGINAL capture's op (the
+        # crash-before-re-point window).
+        digest = self._seed_crashed_retry_flush(
+            retry_op=op_old, intent_op=op_orig,
+            stake_version=2, stake_expected_row_id="row-live-1",
+            retry_state="applied",
+            receipt={"op_id": op_old, "target": _TARGET, "key": _KEY,
+                     "status": "committed", "link_status": None,
+                     "version": 2, "row_id": "row-old",
+                     "error": None,
+                     "received_at": "2026-01-03T00:00:00Z"})
+
+        # Arm 1 — the EXACT original stake (intent version 2 == the
+        # receipt's version 2, pre-repoint op window): the OLD receipt
+        # settles it and nothing else stands in the way.
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the exact-stake recovery flush exits 0: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the receipt recovers the EXACT-version stake: %r"
+                         % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(intent.get("state"), "applied",
+                         "arm 1: the exact-original-stake intent settles "
+                         "applied: %r" % (intent,))
+        self.assertEqual(intent.get("row_id"), "row-old",
+                         "arm 1: the settlement carries the receipt's "
+                         "authoritative row_id: %r" % (intent,))
+        self.assertEqual(intent.get("op_id"), op_old,
+                         "arm 1: the settled intent names the durable "
+                         "retry op: %r" % (intent,))
+
+        # Arm 2 — the INTERVENING NEWER STAKE: after the v2 settlement the
+        # identity re-captured the SAME content (same digest) once the
+        # pointer had moved on; the fresh stake (version 5 against
+        # row-live-4) went cas_stale again, and the OLD version-2 receipt
+        # is still retained in the bounded receipt map.  The old receipt
+        # must settle NOTHING here.
+        seeded = self._seed_stake(_KEY, "beta body", "row-live-4", 5,
+                                  state="cas_stale")
+        self.assertEqual(seeded["digest"], digest,
+                         "fixture sanity: the newer stake is the SAME "
+                         "content (digest) at a different version")
+        delivery = self._delivery()
+        delivery["intents"]["%s|%s" % (_NAMESPACE,
+                                       "knowledge:%s:%s" % (_TARGET,
+                                                            _KEY))]["op_id"] \
+            = op_new
+        self._delivery_path.write_text(json.dumps(delivery, indent=1),
+                                       encoding="utf-8")
+        # The newer stake's own journal cycle: the v2 retry entry is
+        # terminal applied (seq 2), so record_intent appended a fresh
+        # intent that staked (5, row-live-4) and quarantined cas_stale.
+        journal = self._journal()
+        journal["entries"].append({
+            "seq": 3, "target_id": _TARGET, "logical_key": _KEY,
+            "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+            "locator": seeded["locator"], "digest": digest,
+            "state": "quarantined",
+            "updated_at": "2026-01-05T00:00:00.000+00:00",
+            "namespace": _NAMESPACE,
+            "summary": _EXPLICIT_SUMMARY,
+            "staked_at": "2026-01-05T03:04:05Z",
+        })
+        self._journal_path.write_text(json.dumps(journal, indent=1),
+                                      encoding="utf-8")
+        journal_before = self._journal()["entries"]
+
+        flushed2 = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed2.returncode, 0,
+                         "nothing is pending or quarantined by the REFUSED "
+                         "recovery (exit 0): %r" % (flushed2.stdout,))
+        fbody2 = json.loads(flushed2.stdout)
+        self.assertIs(fbody2.get("ok"), True, fbody2)
+        self.assertEqual(fbody2.get("recovered_from_receipts"), 0,
+                         "the OLD version-2 receipt recovers NOTHING once "
+                         "the slot holds the version-5 stake: %r" % (fbody2,))
+        intent2 = self._intent(_KEY)
+        self.assertEqual(intent2.get("state"), "cas_stale",
+                         "arm 2: the NEWER stake is NOT settled by the old "
+                         "receipt (the pre-fix bug settled it applied with "
+                         "the OLD row): %r" % (intent2,))
+        self.assertEqual(intent2.get("version"), 5,
+                         "arm 2: the newer stake keeps ITS version: %r"
+                         % (intent2,))
+        self.assertEqual(intent2.get("expected_row_id"), "row-live-4",
+                         "arm 2: the newer stake keeps ITS row identity: %r"
+                         % (intent2,))
+        self.assertEqual(intent2.get("op_id"), op_new,
+                         "arm 2: the newer stake keeps ITS op: %r"
+                         % (intent2,))
+        self.assertIsNone(intent2.get("row_id"),
+                          "arm 2: no foreign row_id is stamped onto the "
+                          "newer stake: %r" % (intent2,))
+        self.assertEqual(self._journal()["entries"], journal_before,
+                         "arm 2: the journal is untouched (the terminal "
+                         "retry entry is not re-marked, the quarantined "
+                         "originals survive verbatim)")
+
+        # Arm 3 — the newer stake stays RETRYABLE: `knowledge retry`
+        # re-selects the quarantined seq-3 entry and re-enqueues ITS stake
+        # (version 5 + row-live-4) verbatim.
+        retried = self._retry()
+        self.assertEqual(retried.returncode, 0,
+                         "arm 3: the newer cas_stale stake is still "
+                         "retryable; stdout=%r stderr=%r"
+                         % (retried.stdout[-300:], retried.stderr[-300:]))
+        rbody = json.loads(retried.stdout)
+        self.assertIs(rbody.get("queued"), True,
+                      "arm 3: the retry re-enqueues (the recoverable "
+                      "cas_stale cause survived the refused old receipt): "
+                      "%r" % (rbody,))
+        entries = self._entries_for(_KEY)
+        queued_retry = [e for e in entries
+                        if e.get("state") == "pointer_queued"
+                        and e.get("retry_ref") == 3]
+        self.assertEqual(len(queued_retry), 1,
+                         "arm 3: exactly one pointer_queued retry entry "
+                         "re-enqueues the seq-3 stake: %r" % (entries,))
+        queue = [e for e in self._delivery()["queue"]
+                 if e.get("key") == _KEY]
+        self.assertEqual(len(queue), 1,
+                         "arm 3: exactly one queued op for the identity: %r"
+                         % (self._delivery()["queue"],))
+        self.assertEqual(queue[0].get("version"), 5,
+                         "arm 3: the re-enqueued op stakes the NEWER "
+                         "version verbatim: %r" % (queue[0],))
+        self.assertEqual(queue[0].get("expected_row_id"), "row-live-4",
+                         "arm 3: the re-enqueued op stakes the NEWER row "
+                         "identity verbatim: %r" % (queue[0],))
+
+    # -- FB-017 rework round 2: REAL receipts carry the stake row identity --
+
+    def _real_crashed_retry_flush(self, *, stake_row: str,
+                                  stake_version: int,
+                                  reject_error: str | None = None
+                                  ) -> tuple[str, str]:
+        """The REAL-receipt crash window (FB-017 round 2): a seeded
+        cas_stale stake (the documented crash-recovery sidecar format)
+        drives a REAL ``knowledge retry`` (the CLI enqueues a fresh
+        durable op carrying the ORIGINAL stake verbatim and re-points the
+        intent at it) and then a REAL delivery flush — ``flush_to_hub``
+        in-process, the exact lane ``workflow.flush`` drives — that
+        applies (or, with ``reject_error``, rejects) the op, persists its
+        receipt and empties the queue.  The reconciliation never runs
+        here (the flush "crashes" between the persisted receipt and it);
+        the NEXT CLI flush resumes it.
+
+        Returns ``(retry_op_id, digest)``.  Asserts the REAL receipt
+        persists the stake identity: version AND ``expected_row_id``."""
+        hub = _FakeHubServer()
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        seeded = self._seed_stake(_KEY, "beta body", stake_row,
+                                  stake_version, state="cas_stale")
+        # The quarantined ORIGINAL the REAL retry selects.
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_text(json.dumps({
+            "version": 1,
+            "entries": [
+                {"seq": 1, "target_id": _TARGET, "logical_key": _KEY,
+                 "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                 "locator": seeded["locator"], "digest": seeded["digest"],
+                 "state": "quarantined",
+                 "updated_at": "2026-01-01T00:00:00.000+00:00",
+                 "namespace": _NAMESPACE,
+                 "summary": _EXPLICIT_SUMMARY,
+                 "staked_at": "2026-01-02T03:04:05Z"},
+            ]}, indent=1), encoding="utf-8")
+
+        retried = self._retry()
+        self.assertEqual(
+            retried.returncode, 0,
+            "the REAL retry enqueues the recovery op: %s%s"
+            % (retried.stdout[-300:], retried.stderr[-300:]))
+        rbody = json.loads(retried.stdout)
+        self.assertIs(rbody.get("queued"), True,
+                      "the retry queues its op for the flush lane: %r"
+                      % (rbody,))
+        op_id = str(rbody.get("op_id"))
+        queue = [e for e in self._delivery()["queue"]
+                 if e.get("key") == _KEY]
+        self.assertEqual(len(queue), 1,
+                         "exactly one queued retry op: %r"
+                         % (self._delivery()["queue"],))
+        self.assertEqual(queue[0].get("version"), stake_version,
+                         "the queued retry op stakes the ORIGINAL version "
+                         "verbatim: %r" % (queue[0],))
+        self.assertEqual(queue[0].get("expected_row_id"), stake_row,
+                         "the queued retry op stakes the ORIGINAL row "
+                         "identity verbatim: %r" % (queue[0],))
+
+        # The REAL delivery flush: applies (or rejects) the op, persists
+        # the receipt, empties the queue — and stops before the
+        # reconciliation (that belongs to workflow.flush, which the NEXT
+        # CLI call resumes).
+        if reject_error is not None:
+            _FakeMCPHub.reject_error = reject_error
+        scripts = str(SCRIPTS_DIR)
+        sys.path.insert(0, scripts)
+        try:
+            from knowledge.delivery import (
+                KnowledgeDelivery, delivery_path_for_store, flush_to_hub)
+            from knowledge import workflow as _workflow
+
+            http = _workflow.build_hub_transport(self.env)
+            real_delivery = KnowledgeDelivery(
+                delivery_path_for_store(self.tmp))
+            raw = flush_to_hub(real_delivery, http)
+        finally:
+            sys.path.remove(scripts)
+        self.assertEqual(real_delivery.pending(), [],
+                         "the queue is empty (the crash window: receipt "
+                         "persisted, reconciliation skipped): %r" % (raw,))
+        receipt = self._delivery()["receipts"].get(op_id)
+        self.assertIsNotNone(receipt,
+                             "the REAL flush persisted the receipt")
+        if reject_error is not None:
+            self.assertEqual(
+                [r.get("op_id") for r in raw.get("rejected") or []],
+                [op_id],
+                "the REAL flush rejected exactly the retry op: %r" % (raw,))
+            self.assertEqual(receipt.get("status"), "rejected",
+                             "the hub rejected the op: %r" % (receipt,))
+            self.assertEqual(receipt.get("error"), reject_error,
+                             "the rejection receipt names the machine "
+                             "cause: %r" % (receipt,))
+        else:
+            self.assertEqual(raw.get("applied"), [op_id],
+                             "the REAL flush applied exactly the retry op: "
+                             "%r" % (raw,))
+            self.assertEqual(receipt.get("status"), "committed",
+                             "the fake hub commits the op: %r" % (receipt,))
+        self.assertEqual(receipt.get("version"), stake_version,
+                         "the REAL receipt persists the stake VERSION: %r"
+                         % (receipt,))
+        self.assertEqual(receipt.get("expected_row_id"), stake_row,
+                         "FB-017 round 2: the REAL receipt persists the "
+                         "stake's ROW identity — without it, recovery "
+                         "cannot tell same-version same-digest stakes "
+                         "apart: %r" % (receipt,))
+        return op_id, seeded["digest"]
+
+    def _intervene_same_version_stake(self, *, digest: str,
+                                      row: str, version: int,
+                                      op: str) -> None:
+        """The reviewer's intervening stake: the identity's live intent
+        slot is RE-STAKED at the SAME version and SAME digest against a
+        DIFFERENT predecessor row (the pointer row was replaced — only
+        the row identity tells the stakes apart), state cas_stale naming
+        its own op, plus the quarantined journal cycle that makes it the
+        selectable stake."""
+        seeded = self._seed_stake(_KEY, "beta body", row, version,
+                                  state="cas_stale")
+        self.assertEqual(seeded["digest"], digest,
+                         "fixture sanity: the intervening stake is the "
+                         "SAME content (digest) at the same version")
+        delivery = self._delivery()
+        delivery["intents"]["%s|%s" % (_NAMESPACE,
+                                       "knowledge:%s:%s" % (_TARGET,
+                                                            _KEY))]["op_id"] \
+            = op
+        self._delivery_path.write_text(json.dumps(delivery, indent=1),
+                                       encoding="utf-8")
+        journal = self._journal()
+        journal["entries"].append({
+            "seq": 3, "target_id": _TARGET, "logical_key": _KEY,
+            "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+            "locator": seeded["locator"], "digest": digest,
+            "state": "quarantined",
+            "updated_at": "2026-01-05T00:00:00.000+00:00",
+            "namespace": _NAMESPACE,
+            "summary": _EXPLICIT_SUMMARY,
+            "staked_at": "2026-01-05T03:04:05Z",
+        })
+        self._journal_path.write_text(json.dumps(journal, indent=1),
+                                      encoding="utf-8")
+
+    def test_real_flush_committed_receipt_never_settles_different_row_stake(self):
+        """FB-017 rework round 2, the reviewer's exact scenario driven
+        through the REAL remote flush path (no hand-seeded receipt): a
+        retry op staked with expected_row_id R1 is applied by a real
+        flush that crashes before its reconciliation (the FINAL window:
+        its journal mark landed, the stake settlement did not); an
+        INTERVENING stake — same version, same digest, DIFFERENT
+        expected row R2 — becomes the active cas_stale intent.  The
+        retry's committed receipt must NOT settle R2: the row identity
+        is required, never guessed from version+digest alone.  The
+        receipt itself stays authoritative for the retry's JOURNAL entry
+        (applied), the R2 stake stays untouched and retryable, and a
+        repeat flush neither re-settles nor clobbers anything."""
+        op_a, digest = self._real_crashed_retry_flush(
+            stake_row="row-live-1", stake_version=2)
+        # The FINAL crash window: the crashed flush DID mark the retry's
+        # journal entry applied before dying (the persisted-receipt shape
+        # the applied-entry recovery leg resumes from) — the interleaving
+        # where a NEWER quarantined cycle (the intervening stake below)
+        # already owns the latest slot, so the recovery runs entirely off
+        # the applied retry entry + the committed receipt.
+        journal = self._journal()
+        retry_entries = [e for e in journal["entries"]
+                         if e.get("op_id") == op_a]
+        self.assertEqual(
+            len(retry_entries), 1,
+            "seed sanity: the retry's pointer_queued journal entry exists")
+        retry_entries[0]["state"] = "applied"
+        self._journal_path.write_text(json.dumps(journal, indent=1),
+                                      encoding="utf-8")
+        self._intervene_same_version_stake(
+            digest=digest, row="row-live-2", version=2,
+            op="kl-intervening-stake-op")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the REFUSED recovery is a clean flush (nothing "
+                         "pending, rejected or quarantined): %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertIs(fbody.get("ok"), True, fbody)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 0,
+                         "the receipt recovers NOTHING against the "
+                         "intervening stake: %r" % (fbody,))
+        entries = self._entries_for(_KEY)
+        self.assertEqual(
+            [e for e in entries if e.get("op_id") == op_a][0]["state"],
+            "applied",
+            "the committed receipt itself is not in doubt (the retry's "
+            "journal entry stays applied): %r" % (entries,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "cas_stale",
+            "the SAME-version SAME-digest stake with a DIFFERENT "
+            "expected row is NOT settled by the retry's receipt (the "
+            "pre-fix matcher — row check dead for real receipts that "
+            "never carried the field — settled it applied with the OLD "
+            "receipt's row): %r" % (intent,))
+        self.assertEqual(intent.get("expected_row_id"), "row-live-2",
+                         "the intervening stake keeps ITS row identity: %r"
+                         % (intent,))
+        self.assertEqual(intent.get("version"), 2,
+                         "the intervening stake keeps ITS version: %r"
+                         % (intent,))
+        self.assertIsNone(intent.get("row_id"),
+                          "no foreign row_id is stamped onto the "
+                          "intervening stake: %r" % (intent,))
+        self.assertEqual(
+            [e for e in self._journal()["entries"]
+             if e.get("seq") == 3][0]["state"], "quarantined",
+            "the intervening stake's own quarantined cycle survives "
+            "untouched")
+
+        # IDEMPOTENT refusal: a repeat flush re-settles NOTHING (the
+        # settled-looking terminal entry is never re-selected off a
+        # foreign stake) and writes NOTHING.
+        delivery_after = self._delivery_path.read_bytes()
+        journal_after = self._journal()["entries"]
+        again = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(again.returncode, 0,
+                         "the repeat flush stays green: %r"
+                         % (again.stdout,))
+        abody = json.loads(again.stdout)
+        self.assertEqual(abody.get("recovered_from_receipts"), 0,
+                         "the refused stake is never re-counted: %r"
+                         % (abody,))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_after,
+                         "the repeat flush writes NOTHING to the sidecar")
+        self.assertEqual(self._journal()["entries"], journal_after,
+                         "the repeat flush leaves the journal untouched")
+
+        # The intervening stake stays RETRYABLE: `knowledge retry`
+        # re-selects its quarantined cycle and re-enqueues ITS stake
+        # (version 2 + row-live-2) verbatim.
+        retried = self._retry()
+        self.assertEqual(retried.returncode, 0,
+                         "the intervening cas_stale stake is still "
+                         "retryable; stdout=%r stderr=%r"
+                         % (retried.stdout[-300:], retried.stderr[-300:]))
+        rbody = json.loads(retried.stdout)
+        self.assertIs(rbody.get("queued"), True,
+                      "the retry re-enqueues (the stake survived the "
+                      "refused old receipt): %r" % (rbody,))
+        queue = [e for e in self._delivery()["queue"]
+                 if e.get("key") == _KEY]
+        self.assertEqual(len(queue), 1,
+                         "exactly one queued op for the identity: %r"
+                         % (self._delivery()["queue"],))
+        self.assertEqual(queue[0].get("expected_row_id"), "row-live-2",
+                         "the re-enqueued op stakes the intervening row "
+                         "identity verbatim: %r" % (queue[0],))
+
+    def test_real_flush_rejected_receipt_never_settles_different_row_stake(self):
+        """FB-017 rework round 2, the REJECTION window on the REAL remote
+        flush path: the hub rejects the retry op (non-CAS machine cause),
+        the real flush persists the rejected receipt — carrying the
+        stake's row identity — and crashes before reconciliation; an
+        intervening same-version/same-digest stake with a DIFFERENT
+        expected row is the active cas_stale intent.  The rejected
+        receipt must NOT settle R2: the matcher refuses to bind it, the
+        retry's journal entry takes the CONSERVATIVE quarantine, the
+        intervening stake stays untouched and retryable."""
+        op_a, digest = self._real_crashed_retry_flush(
+            stake_row="row-live-1", stake_version=2,
+            reject_error="namespace_not_allowed")
+        self._intervene_same_version_stake(
+            digest=digest, row="row-live-2", version=2,
+            op="kl-intervening-stake-op")
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 1,
+                         "the conservative-quarantine flush exits 1 "
+                         "(the receipt itself is a rejection): %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the restart leg reconciles the persisted "
+                         "rejected retry receipt: %r" % (fbody,))
+        self.assertIn(op_a, fbody.get("journal_quarantined") or [],
+                      "the retry's journal entry takes the conservative "
+                      "quarantine (the matcher refused to bind the "
+                      "intervening stake): %r" % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "cas_stale",
+            "the SAME-version SAME-digest stake with a DIFFERENT "
+            "expected row is NOT settled by the retry's REJECTED receipt "
+            "(the pre-fix matcher — row check dead for real receipts — "
+            "settled it terminal rejected): %r" % (intent,))
+        self.assertEqual(intent.get("expected_row_id"), "row-live-2",
+                         "the intervening stake keeps ITS row identity: %r"
+                         % (intent,))
+        self.assertEqual(intent.get("op_id"), "kl-intervening-stake-op",
+                         "the intervening stake keeps ITS op: %r"
+                         % (intent,))
+        entries = self._entries_for(_KEY)
+        self.assertEqual(entries[-1]["state"], "quarantined",
+                         "the intervening stake's quarantined cycle is "
+                         "the selectable latest entry: %r" % (entries,))
+
+        # The intervening stake stays RETRYABLE: `knowledge retry`
+        # re-enqueues ITS stake (version 2 + row-live-2) verbatim.
+        retried = self._retry()
+        self.assertEqual(retried.returncode, 0,
+                         "the intervening cas_stale stake is still "
+                         "retryable; stdout=%r stderr=%r"
+                         % (retried.stdout[-300:], retried.stderr[-300:]))
+        rbody = json.loads(retried.stdout)
+        self.assertIs(rbody.get("queued"), True,
+                      "the retry re-enqueues (the stake survived the "
+                      "refused rejected receipt): %r" % (rbody,))
+        queue = [e for e in self._delivery()["queue"]
+                 if e.get("key") == _KEY]
+        self.assertEqual(len(queue), 1,
+                         "exactly one queued op for the identity: %r"
+                         % (self._delivery()["queue"],))
+        self.assertEqual(queue[0].get("expected_row_id"), "row-live-2",
+                         "the re-enqueued op stakes the intervening row "
+                         "identity verbatim: %r" % (queue[0],))
+
+    def test_real_flush_committed_receipt_settles_exact_row_stake(self):
+        """FB-017 rework round 2, the exact-stake POSITIVE path on the
+        REAL remote flush path: the committed receipt a real flush
+        persisted for the retry op settles the ONE stake whose row
+        identity it carries — the intent lands ``applied`` with the
+        receipt's authoritative row_id while preserving the staked
+        expected_row_id — and the stake is spent (a repeat retry refuses
+        typed without re-enqueueing)."""
+        op_a, digest = self._real_crashed_retry_flush(
+            stake_row="row-live-1", stake_version=2)
+
+        flushed = self._cli("knowledge", "flush", "--json")
+        self.assertEqual(flushed.returncode, 0,
+                         "the exact-stake recovery flush exits 0: %r"
+                         % (flushed.stdout,))
+        fbody = json.loads(flushed.stdout)
+        self.assertIs(fbody.get("ok"), True, fbody)
+        self.assertEqual(fbody.get("recovered_from_receipts"), 1,
+                         "the receipt recovers the EXACT-row stake: %r"
+                         % (fbody,))
+        intent = self._intent(_KEY)
+        self.assertEqual(intent.get("state"), "applied",
+                         "the exact-original-stake intent settles applied: "
+                         "%r" % (intent,))
+        self.assertEqual(intent.get("row_id"), "row-" + op_a,
+                         "the settlement carries the receipt's "
+                         "authoritative row_id: %r" % (intent,))
+        self.assertEqual(intent.get("expected_row_id"), "row-live-1",
+                         "the settlement preserves the staked row "
+                         "identity verbatim: %r" % (intent,))
+        self.assertEqual(intent.get("version"), 2,
+                         "the settlement keeps the staked version: %r"
+                         % (intent,))
+        self.assertEqual(intent.get("digest"), digest,
+                         "the settlement keeps the staked digest")
+        entries = self._entries_for(_KEY)
+        self.assertEqual(
+            [e for e in entries if e.get("op_id") == op_a][0]["state"],
+            "applied",
+            "the retry's journal entry advances to applied: %r"
+             % (entries,))
+
+        # The stake is spent: a repeat retry refuses typed and re-enqueues
+        # NOTHING (the latest journal entry is applied).
+        delivery_before = self._delivery_path.read_bytes()
+        again = self._retry()
+        self.assertEqual(
+            again.returncode, 1,
+            "the repeat retry must refuse typed after the exact-stake "
+            "settlement; got %d stdout=%r"
+            % (again.returncode, again.stdout))
+        body = json.loads(again.stdout)
+        self.assertIs(body.get("ok"), False)
+        self.assertIn("already applied", str(body.get("error", "")),
+                      "the refusal names the applied state: %r"
+                      % (body.get("error"),))
+        self.assertEqual(self._delivery_path.read_bytes(), delivery_before,
+                         "the refused repeat retry re-enqueues NOTHING")
+
+    def test_remote_non_cas_rejection_still_refuses_retry_typed(self):
+        """NEGATIVE: a hub rejection whose cause is NOT a stale CAS keeps
+        the unrecoverable ``rejected`` intent state; the retry refuses
+        typed naming the cause."""
+        hub = _FakeHubServer(reject_error="namespace_not_allowed")
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        r = self._cli("knowledge", "capture", "--target", _TARGET,
+                      "--key", _KEY, "--namespace", _NAMESPACE,
+                      "--content", "beta body", "--summary",
+                      _EXPLICIT_SUMMARY, "--json")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        intent = self._intent(_KEY)
+        self.assertEqual(
+            intent.get("state"), "rejected",
+            "a non-CAS hub rejection keeps the plain 'rejected' intent "
+            "state (never retryable as cas_stale): %r" % (intent,))
+
+        rr = self._retry()
+        self.assertEqual(
+            rr.returncode, 1,
+            "the non-CAS rejection must refuse the retry typed; got %d "
+            "stdout=%r" % (rr.returncode, rr.stdout))
+        body = json.loads(rr.stdout)
+        self.assertIs(body.get("ok"), False)
+        error = str(body.get("error", ""))
+        self.assertIn("rejected", error,
+                      "the refusal names the quarantine cause: %r" % (error,))
+        self.assertIn("stale CAS", error,
+                      "the refusal names the recoverable-cause rule: %r"
+                      % (error,))
+
+    # -- FB-004: retry exit codes / human output --------------------------------
+
+    def test_remote_typed_refusal_exits_1_with_json_envelope(self):
+        """A REMOTE typed retry refusal (selection-time; no hub contact)
+        must exit 1 with the JSON envelope on stdout — never the _fail
+        exit-2 usage path."""
+        self._env(remote=True)   # unreachable URL is fine: selection first
+        r = self._retry()
+        self.assertEqual(
+            r.returncode, 1,
+            "a remote typed refusal must exit EXACTLY 1 (the _fail "
+            "exit-2 usage path is for config/usage errors only); got %d "
+            "stdout=%r" % (r.returncode, r.stdout))
+        body = json.loads(r.stdout)
+        self.assertIs(body.get("ok"), False)
+        self.assertIn("no journal entry", str(body.get("error", "")))
+
+    def test_human_mode_retry_success_and_refusal_produce_output(self):
+        """Human mode (no --json): success prints a one-line stderr
+        status (stdout stays empty), refusal prints the reason on stderr
+        with exit 1 — never a silent success."""
+        fx = self._fixture_initial_create_quarantine()
+        self._tombstone_competitor(fx["competitor_row"])
+        ok = self._cli("knowledge", "retry", "--target", _TARGET,
+                       "--key", _KEY, "--namespace", _NAMESPACE)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertFalse(ok.stdout.lstrip().startswith("{"),
+                         "human mode stdout carries no JSON envelope: %r"
+                         % (ok.stdout,))
+        self.assertIn("[zmem] knowledge retry:", ok.stderr,
+                      "a one-line human status lands on stderr: %r"
+                      % (ok.stderr,))
+
+        # Refusal in human mode: the reason on stderr, exit 1, no JSON
+        # envelope on stdout (idempotence-by-state: the second retry
+        # refuses).
+        second = self._cli("knowledge", "retry", "--target", _TARGET,
+                           "--key", _KEY, "--namespace", _NAMESPACE)
+        self.assertEqual(second.returncode, 1)
+        self.assertFalse(second.stdout.lstrip().startswith("{"),
+                         "the human refusal prints no JSON envelope: %r"
+                         % (second.stdout,))
+        self.assertTrue(second.stderr.strip(),
+                        "the refusal reason lands on stderr")
+        self.assertIn("[zmem] knowledge:", second.stderr)
+
+        # REMOTE human-mode success: the enqueued op is reported on
+        # stderr, exit 0, empty stdout.
+        hub = _FakeHubServer()
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        seeded = self._seed_stake(_KEY, "beta body", None, 1,
+                                  state="cas_stale")
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_text(json.dumps({
+            "version": 1,
+            "entries": [{
+                "seq": 1, "target_id": _TARGET, "logical_key": _KEY,
+                "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                "locator": seeded["locator"], "digest": seeded["digest"],
+                "state": "quarantined",
+                "updated_at": "2026-01-01T00:00:00.000+00:00",
+                "namespace": _NAMESPACE,
+                "summary": _EXPLICIT_SUMMARY,
+                "staked_at": "2026-01-02T03:04:05Z",
+            }]}, indent=1), encoding="utf-8")
+        remote_ok = self._cli("knowledge", "retry", "--target", _TARGET,
+                              "--key", _KEY, "--namespace", _NAMESPACE)
+        self.assertEqual(remote_ok.returncode, 0,
+                         remote_ok.stdout + remote_ok.stderr)
+        self.assertEqual(remote_ok.stdout, "")
+        self.assertIn("[zmem] knowledge retry:", remote_ok.stderr,
+                      "the remote human success reports the queued op: %r"
+                      % (remote_ok.stderr,))
+
+    # -- FB-001 remote: the default summary from a LEGACY (summaryless) entry --
+
+    def test_remote_retry_legacy_entry_without_summary_enqueues_default(self):
+        """The remote twin of the FB-001 probe: a LEGACY journal entry
+        (nine base fields, NO summary key) selects fine, and the
+        enqueued retry op carries the FIXED default summary
+        ``knowledge note <logical_key>``."""
+        hub = _FakeHubServer()
+        self.addCleanup(hub.close)
+        self._env(remote=True, remote_url=hub.url)
+        seeded = self._seed_stake(_KEY, "beta body", None, 1,
+                                  state="cas_stale")
+        self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self._journal_path.write_text(json.dumps({
+            "version": 1,
+            "entries": [{
+                "seq": 1, "target_id": _TARGET, "logical_key": _KEY,
+                "ref": "knowledge:%s:%s" % (_TARGET, _KEY),
+                "locator": seeded["locator"], "digest": seeded["digest"],
+                "state": "quarantined",
+                "updated_at": "2026-01-01T00:00:00.000+00:00",
+                "namespace": _NAMESPACE}]}, indent=1),
+            encoding="utf-8")   # LEGACY shape: no summary/staked_at keys
+
+        r = self._retry()
+        self.assertEqual(r.returncode, 0,
+                         "a legacy summaryless entry still selects and "
+                         "enqueues: %r %r" % (r.stdout[-200:],
+                                              r.stderr[-200:]))
+        body = json.loads(r.stdout)
+        self.assertIs(body.get("ok"), True)
+        after = self._delivery()
+        ours = [e for e in after["queue"] if e.get("key") == _KEY]
+        self.assertEqual(len(ours), 1)
+        self.assertEqual(
+            ours[0].get("summary"), "knowledge note %s" % _KEY,
+            "the enqueued op carries the FIXED default summary "
+            "(knowledge note <logical_key>): %r"
+            % (ours[0].get("summary"),))
 
 
 if __name__ == "__main__":

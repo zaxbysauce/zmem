@@ -863,7 +863,11 @@ _STUB_CAPTURE_ENTRY_PY = '''\
 import json, time
 # Hold the capture in flight long enough to still be pending at dispose.
 time.sleep(0.6)
-print(json.dumps({"ok": True, "deduped": False, "text": "dispose-drain-probe"}))
+# FB-016a: the queued entry text is the capture entry's RETURN value (the
+# redacted form), so the stub returns a redacted-shaped echo carrying the
+# drain probe's needle — never the raw error message.
+print(json.dumps({"ok": True, "deduped": False,
+                  "text": "dispose drain probe: [REDACTED]"}))
 '''
 
 _STUB_DSH_LLM_MJS = '''\
@@ -976,6 +980,117 @@ class DshDisposeDrainTest(_NodeLeg, unittest.TestCase):
         self.assertEqual(observed.get("disposeDrained"), 1,
                          "the drain is disclosed in state (disposeDrained)")
         self.assertIs(observed.get("persistsAcrossDispose"), True)
+
+
+# -- FB-016a failure-capture redaction: the tools/result failure path must
+# queue the capture entry's REDACTED text, never the raw error message.
+# The stub entry mirrors the real hooks/lib/zmem-capture-entry.py SK-*
+# redaction (secret-shaped runs become [REDACTED_SECRET]) and returns the
+# redacted form as r.result.text, so the plugin's queue choice is
+# observable end to end through the REAL backend.runCapture seam.
+_FB016A_CAPTURE_ENTRY_PY = '''\
+import json, re, sys
+payload = json.loads(sys.stdin.read() or "{}")
+text = str(payload.get("text") or "")
+redacted = re.sub(r"(?<![0-9A-Za-z])SK-[0-9A-Za-z]{16,}(?![0-9A-Za-z])",
+                  "[REDACTED_SECRET]", text)
+print(json.dumps({"ok": True, "deduped": False, "text": redacted[:120]}))
+'''
+
+_FB016A_SECRET = "SK-fb016arawsecret01"  # secret-shaped: SK- + 17 alnum
+_FB016A_RAW_MESSAGE = ("flange tool failed: unauthorized key "
+                       + _FB016A_SECRET + " rejected")
+_FB016A_REDACTED_MESSAGE = ("flange tool failed: unauthorized key "
+                            "[REDACTED_SECRET] rejected")
+
+_FB016A_PROBE = """
+import fs from "node:fs";
+const handlers = {};
+const ctx = {
+  on: (name, fn) => { (handlers[name] ??= []).push(fn); },
+  tools: { register: () => {} },
+};
+const mod = await import(process.env.PLUGIN_URL);
+await mod.plugin(ctx);
+// An eligible FINAL tool failure whose RAW error message carries a
+// secret-shaped token (classifyToolOutcome gates on isError + message).
+handlers["tools/result"][0](
+  { agent: { id: "ds-fb016a" } },
+  { isError: true, error: { message: %r } });
+// Deterministic drain: agent/disposed awaits this process's in-flight
+// captures (the bounded allSettled drain) and writes state afterwards.
+await handlers["agent/disposed"][0]();
+const raw = fs.readFileSync(process.env.ZMEM_DEEPSEEK_STATE, "utf8");
+const state = JSON.parse(raw);
+process.stdout.write(JSON.stringify({
+  captureQueue: state.captureQueue || [],
+  stateFileText: raw,
+}) + "\\n");
+""" % (_FB016A_RAW_MESSAGE,)
+
+
+class DshFailureCaptureRedactionTest(_NodeLeg, unittest.TestCase):
+    """FB-016a: the failure capture queue entry must carry the REDACTED
+    text the shared capture entry returns (r.result.text), never the RAW
+    error message the entry just neutralized — the entry is labelled
+    ``redacted: true``, and the raw message can hold secret-shaped tokens.
+    RED against the pre-fix expression ``text: text.slice(0, 120)`` (which
+    queued the raw message under the redacted label)."""
+
+    def setUp(self):
+        if not (self.node_on_path() and self.python_on_path()):
+            self.skipTest("node/python not on PATH for the redaction leg")
+        import tempfile
+        self._tmp = Path(tempfile.mkdtemp(prefix="zmem-fb016a-"))
+        import shutil
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+
+    def test_failure_capture_queues_redacted_text_never_raw(self):
+        root = self._tmp / "root"
+        for rel, text in (
+            ("dshstub/index.mjs", _STUB_DSH_LLM_MJS),
+            ("reg/stub-resolve.mjs", _RESOLVE_HOOK_MJS),
+            ("reg/reghook.mjs", _REGISTER_HOOK_MJS),
+            ("root/hooks/lib/zmem-capture-entry.py", _FB016A_CAPTURE_ENTRY_PY),
+            ("root/skills/memory/scripts/store.py", "raise SystemExit(0)\n"),
+        ):
+            target = self._tmp / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        state_path = self._tmp / "state.json"
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("ZMEM_")
+               and k not in ("CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA",
+                             "NODE_OPTIONS")}
+        env.update({
+            "ZMEM_DEEPSEEK_STATE": str(state_path),
+            "ZMEM_ROOT": str(root),
+            "DSH_LLM_STUB_URL": (self._tmp / "dshstub" / "index.mjs").as_uri(),
+            "PLUGIN_URL": (REPO_ROOT / "deepseek-plugin" / "index.mjs").as_uri(),
+            "NODE_OPTIONS": "--import=" + (self._tmp / "reg"
+                                           / "reghook.mjs").as_uri(),
+            "PYTHONIOENCODING": "utf-8",
+        })
+        observed = self.run_node(_FB016A_PROBE, env, timeout_s=60.0)
+        self.assertTrue(state_path.is_file(),
+                        "the drained state file must exist after dispose")
+        queue = observed.get("captureQueue") or []
+        failures = [e for e in queue
+                    if isinstance(e, dict) and e.get("kind") == "failure"]
+        self.assertTrue(failures,
+                        "the eligible failure must be queued: %r" % (observed,))
+        for entry in failures:
+            self.assertNotIn(
+                _FB016A_SECRET, str(entry.get("text") or ""),
+                "FB-016a: the queued failure entry must carry the capture "
+                "entry's REDACTED text, never the raw error message")
+        self.assertEqual(failures[0].get("text"), _FB016A_REDACTED_MESSAGE,
+                         "the queued text is exactly the redacted return "
+                         "value of the capture entry")
+        self.assertNotIn(
+            _FB016A_SECRET, str(observed.get("stateFileText") or ""),
+            "FB-016a: the raw secret-shaped token must never reach the "
+            "written state file")
 
 
 class DocsAndSkillsTruthTest(unittest.TestCase):
@@ -1226,16 +1341,36 @@ if (process.env.DRIVE_FAILURE === "1") {
 if (process.env.DRIVE_DISPOSE === "1") {
   await handlers["agent/disposed"][0]();
 }
+const out = {
+  sessions: null, topPolicyText: null, policyReason: null,
+  policyVersion: null, disposeDrained: null, pendingAtDispose: null,
+};
+if (process.env.DRIVE_DISPOSE === "unawaited") {
+  // FB-007: the REAL dsh dispatch shape — the handler is invoked but
+  // NOT awaited (emit mode).  While the capture child is still sleeping
+  // (0.6s), the PRE-DRAIN writeState must already have made the
+  // disclosure fields durable in the state file; disposeDrained only
+  // lands after the drain settles.
+  const disposed = handlers["agent/disposed"][0]();
+  await new Promise((r) => setTimeout(r, 250));
+  const mid = JSON.parse(
+    fs.readFileSync(process.env.ZMEM_DEEPSEEK_STATE, "utf8"));
+  out.mid = {
+    pendingAtDispose: mid.pendingAtDispose ?? null,
+    persistsAcrossDispose: mid.persistsAcrossDispose ?? null,
+    disposeDrained: mid.disposeDrained ?? null,
+  };
+  await disposed;
+}
 const state = JSON.parse(
   fs.readFileSync(process.env.ZMEM_DEEPSEEK_STATE, "utf8"));
-process.stdout.write(JSON.stringify({
-  sessions: state.sessions || {},
-  topPolicyText: state.policyDeliveredText ?? null,
-  policyReason: state.policyReason ?? null,
-  policyVersion: state.policyVersion ?? null,
-  disposeDrained: state.disposeDrained ?? null,
-  pendingAtDispose: state.pendingAtDispose ?? null,
-}) + "\\n");
+out.sessions = state.sessions || {};
+out.topPolicyText = state.policyDeliveredText ?? null;
+out.policyReason = state.policyReason ?? null;
+out.policyVersion = state.policyVersion ?? null;
+out.disposeDrained = state.disposeDrained ?? null;
+out.pendingAtDispose = state.pendingAtDispose ?? null;
+process.stdout.write(JSON.stringify(out) + "\\n");
 """
 
 
@@ -1335,6 +1470,28 @@ class SupplementaryStatePinsTest(_NodeLeg, unittest.TestCase):
         self.assertEqual(succeeded["disposeDrained"], 1,
                          "a drained-and-completed capture counts 1: %r"
                          % (succeeded,))
+
+    # pin 2b (FB-007): the UN-AWAITED dispose (the pinned dsh runtime
+    # dispatches agent/disposed in emit mode and never awaits the
+    # listener).  While the capture child is still sleeping (0.6s), the
+    # PRE-DRAIN writeState must already have made the disclosure fields
+    # durable in the state file — pendingAtDispose and
+    # persistsAcrossDispose — while disposeDrained only lands after the
+    # drain settles.
+    def test_unawaited_dispose_discloses_before_drain(self):
+        out = self._drive(DRIVE_FAILURE="1", DRIVE_DISPOSE="unawaited",
+                          ZMEM_TEST_CAPTURE_OUTCOME="ok")
+        mid = out["mid"]
+        self.assertEqual(mid["pendingAtDispose"], 1,
+                         "the pre-drain write state must disclose "
+                         "pendingAtDispose while the capture is still "
+                         "in flight: %r" % (mid,))
+        self.assertIs(mid["persistsAcrossDispose"], True,
+                      "the pre-drain write state must disclose "
+                      "persistsAcrossDispose durably: %r" % (mid,))
+        self.assertEqual(out["disposeDrained"], 1,
+                         "after the awaited drain, disposeDrained counts "
+                         "the settled-ok capture: %r" % (out,))
 
     # pin 3 (r4 retarget): the residual is that policyDeliveredText
     # PERSISTS the rendered policy to the state file WITHOUT a retention
@@ -1482,6 +1639,7 @@ def main(argv=None) -> int:
     for cls in (HermesPolicyAppendTest, HermesRealHelperPolicyTest,
                 DshLauncherPolicyTest,
                 DshPreStepPolicyTest, DshDisposeDrainTest,
+                DshFailureCaptureRedactionTest,
                 RealHelperSeamTest,
                 DocsAndSkillsTruthTest,
                 SupplementaryStatePinsTest):
