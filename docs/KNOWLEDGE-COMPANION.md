@@ -133,7 +133,7 @@ config error, exit 2 — never silently half-enabled):
 |--------|----------|---------|
 | `kind` | yes | the literal `markdown` |
 | `root` | yes | ONE absolute path to the vault root (no `..` components) |
-| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.160.0 clients under the strict unknown-key law |
+| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.161.0 clients under the strict unknown-key law |
 
 The root must **already exist and be a real directory** — the companion
 never creates the vault root, only note files (and the locator's
@@ -155,7 +155,7 @@ portable across operating systems (CMP-011).
 | `token_file` | (see above) | absolute path to a file holding the bearer token (≤ 4096 bytes) |
 | `timeout_s` | no | timeout per individual socket operation, 0.1..120 s (default 10) — NOT an overall request deadline: one create or read is a multi-step exchange (connect, send, receive), so a single exchange can legitimately take longer than one `timeout_s` |
 | `max_response_bytes` | no | response body cap, 256..16777216 (default 1048576) |
-| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.160.0 clients under the strict unknown-key law |
+| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.161.0 clients under the strict unknown-key law |
 
 Credentials are explicit by design: exactly one named location per target,
 and the token **value** is read only at request time — it is never written
@@ -315,14 +315,14 @@ The journal lives at `<store_dir>/knowledge/journal.json` (remote mode:
 the data dir). It records identity, locator, digest, and a state — **never
 the note body** — bounded to 1000 entries / 4 MiB, written atomically
 (tmp + fsync + replace) under a cross-process OS byte lock. The journal
-format version stays 1; entries written by 0.160.0+ carry retry
+format version stays 1; entries written by 0.161.0+ carry retry
 provenance (op_id/retry_ref/summary/staked_at) as OPTIONAL fields, so
-a pre-0.160.0 client accepts the journal — but its writer does not
+a pre-0.161.0 client accepts the journal — but its writer does not
 know the fields, so any rewrite silently strips them. The consequence:
 an in-flight `pointer_queued` retry loses its recovery identity
 (retry_ref), and a repeat `knowledge retry` refuses with "(not
 quarantined)" until an operator re-queues the work. No note content or
-pointer row is lost. A pre-0.160.0 client also rejects a
+pointer row is lost. A pre-0.161.0 client also rejects a
 config carrying description at load (strict unknown-key refusal); do
 not mix client versions on one store.
 

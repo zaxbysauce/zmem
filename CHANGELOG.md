@@ -32,7 +32,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   policy roster line and in `knowledge status` (human + JSON); strict
   refusal for invalid forms on both validators; aggregate rendering
   uses a deterministic downward-search truncation so a valid config
-  never renders an empty policy. Mixed-version note: pre-0.160.0
+  never renders an empty policy. Mixed-version note: pre-0.161.0
   clients reject a config carrying description (strict unknown-key
   refusal — remove the key to run an older client) and silently strip
   the new journal provenance fields on rewrite (an in-flight
