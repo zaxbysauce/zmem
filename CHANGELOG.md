@@ -56,7 +56,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   realizable hit rate 58.3%.
 - **Mutation generation + store incarnation** (issue #474): a monotonic
   generation counter maintained inside the existing write transactions
-  (59 census sites across write/consolidate/organize/sync/purge/links/
+  (64 census sites across write/consolidate/organize/sync/purge/links/
   episodes/entity/evidence/beliefs/rekey/knowledge/dataset + the reembed
   apply; telemetry deliberately excluded) and a store incarnation rotated
   on the staged copy before atomic install on wholesale replacement paths
