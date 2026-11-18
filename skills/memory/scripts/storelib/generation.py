@@ -92,6 +92,16 @@ def rotate_incarnation_on_staging(staging_path) -> str:
     new_value = uuid.uuid4().hex
     conn = sqlite3.connect(os.fspath(staging_path))
     try:
+        # A staged copy may not yet carry the meta table (import lanes can
+        # stage from a subset schema before the destination schema is
+        # completed); create it idempotently with the canonical DDL so the
+        # rotation never depends on the staging pipeline's intermediate
+        # shape. (Found by tests/test_import_ns_control.py: the sqlite
+        # import lane's staging lacked meta at rotation time.)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS meta ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
         conn.execute(
             "INSERT INTO meta(key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
