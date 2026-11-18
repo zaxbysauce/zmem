@@ -836,6 +836,11 @@ jobs:
           python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_metadata_integrity
           python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_compatibility_and_cost
           python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_held_out_evaluation
+          # Issue #473 byte-parity hard gate: the bounded ONNX resource
+          # policy must not change vector bytes or ranking order (the
+          # fake-profile lanes cannot prove this; only the provisioned
+          # real model can).
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_real_model_byte_parity.py
 
   # Issue #139: C6 is the native Hermes provenance lane. It is separate from
   # the generic Python 3.11 loop because this acceptance fixture must use the

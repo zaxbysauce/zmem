@@ -106,6 +106,144 @@ def current_profile_name(environ=None) -> str:
 _fake_warned_once = False
 
 
+# --- ONNX runtime resource policy (issue #473) -------------------------------
+# Both ONNX sessions in this repo (the minilm embedder here and the
+# cross-encoder in storelib) construct explicit SessionOptions from ONE
+# resolver so intra/inter-op thread pools and execution-spin behavior are
+# bounded and inspectable instead of falling to onnxruntime defaults
+# (observed: unbounded pools ≈27 threads per recall process).
+#
+# Env overrides (validated; invalid values fall back to the documented
+# defaults and are REPORTED, never crashed on, never silently unbounded):
+#   ZMEM_ORT_INTRA_THREADS  int >= 1 and <= 64   (default min(4, cpu_count))
+#   ZMEM_ORT_INTER_THREADS  int >= 1 and <= 64   (default 1)
+#   ZMEM_ORT_DISABLE_SPIN   0 | 1                (default 1 — spin disabled)
+#
+# Execution mode defaults to sequential where the installed runtime supports
+# it; BOTH spin keys (intra-op and inter-op allow_spinning) are disabled when
+# the runtime accepts session-config entries, each guarded individually per
+# installed-runtime support (an unsupported key is recorded in the
+# diagnostic, never fatal).
+_RESOURCE_MAX_THREADS = 64
+_RESOURCE_DEFAULT_INTRA = 4
+_RESOURCE_DEFAULT_INTER = 1
+# Last options object handed to InferenceSession (inspection seam for
+# tests/diagnostics; None until a session is constructed).
+_last_session_options = None
+# [[env_name, raw_value], ...] recorded by the most recent policy resolution.
+_last_invalid_resource_overrides: list[list[str]] = []
+
+
+def _default_intra_threads() -> int:
+    try:
+        cpus = os.cpu_count() or 1
+    except Exception:
+        cpus = 1
+    return max(1, min(_RESOURCE_DEFAULT_INTRA, cpus))
+
+
+def resolve_resource_policy(environ=None) -> dict:
+    """Resolve the effective ONNX resource policy from defaults + env.
+
+    Pure and side-effect-free apart from recording invalid overrides for the
+    availability diagnostic. Returns a dict with keys ``intra_threads``,
+    ``inter_threads``, ``sequential``, ``disable_spin`` and ``invalid``
+    (list of [env_name, raw_value] pairs).
+    """
+    env = os.environ if environ is None else environ
+    invalid: list[list[str]] = []
+
+    def _int_env(name: str, default: int) -> int:
+        raw = env.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            invalid.append([name, str(raw)])
+            return default
+        if value < 1 or value > _RESOURCE_MAX_THREADS:
+            invalid.append([name, str(raw)])
+            return default
+        return value
+
+    intra = _int_env("ZMEM_ORT_INTRA_THREADS", _default_intra_threads())
+    inter = _int_env("ZMEM_ORT_INTER_THREADS", _RESOURCE_DEFAULT_INTER)
+    spin_raw = env.get("ZMEM_ORT_DISABLE_SPIN")
+    disable_spin = True
+    if spin_raw is not None and spin_raw != "":
+        if spin_raw in ("0", "1"):
+            disable_spin = spin_raw == "1"
+        else:
+            invalid.append(["ZMEM_ORT_DISABLE_SPIN", str(spin_raw)])
+    global _last_invalid_resource_overrides
+    _last_invalid_resource_overrides = [list(pair) for pair in invalid]
+    return {
+        "intra_threads": intra,
+        "inter_threads": inter,
+        "sequential": True,
+        "disable_spin": disable_spin,
+        "invalid": invalid,
+    }
+
+
+def _resource_options(ort):
+    """Build an ``ort.SessionOptions`` from the resolved resource policy.
+
+    Returns None when the installed runtime (or a test stub) exposes no
+    ``SessionOptions`` surface — callers then construct their session exactly
+    as before (recorded in the diagnostic, never fatal). Unsupported
+    execution-mode or spin-key surfaces degrade per-field the same way.
+    """
+    policy = resolve_resource_policy()
+    opts_cls = getattr(ort, "SessionOptions", None)
+    if opts_cls is None:
+        return None
+    try:
+        opts = opts_cls()
+    except Exception:
+        return None
+    try:
+        opts.intra_op_num_threads = policy["intra_threads"]
+    except Exception:
+        pass
+    try:
+        opts.inter_op_num_threads = policy["inter_threads"]
+    except Exception:
+        pass
+    if policy["sequential"]:
+        mode = getattr(getattr(ort, "ExecutionMode", None), "ORT_SEQUENTIAL", None)
+        if mode is not None:
+            try:
+                opts.execution_mode = mode
+            except Exception:
+                pass
+    if policy["disable_spin"]:
+        for key in ("session.intra_op.allow_spinning",
+                    "session.inter_op.allow_spinning"):
+            try:
+                opts.add_session_config_entry(key, "0")
+            except Exception:
+                pass
+    global _last_session_options
+    _last_session_options = opts
+    return opts
+
+
+def resource_policy_status() -> dict:
+    """Effective + invalid resource policy for availability_status()."""
+    policy = resolve_resource_policy()
+    return {
+        "intra_op_num_threads": policy["intra_threads"],
+        "inter_op_num_threads": policy["inter_threads"],
+        "execution_mode": "sequential" if policy["sequential"] else "default",
+        "intra_op_allow_spinning": (not policy["disable_spin"]),
+        "inter_op_allow_spinning": (not policy["disable_spin"]),
+        "invalid_overrides": [list(p) for p in policy["invalid"]],
+        "session_constructed": _last_session_options is not None,
+    }
+
+
 def warn_fake_active(profile_name: str | None = None) -> None:
     """One-time-per-process operator guard for the `fake` profile.
 
@@ -495,7 +633,11 @@ def _ensure_loaded():
     # hybrid-search hard-failing). This mirrors the checksum-mismatch
     # fail-open above (cubic-1/2, #36 M15 residual).
     try:
-        _session = ort.InferenceSession(model_bytes)
+        _sess_opts = _resource_options(ort)
+        if _sess_opts is None:
+            _session = ort.InferenceSession(model_bytes)
+        else:
+            _session = ort.InferenceSession(model_bytes, sess_options=_sess_opts)
         _tokenizer = Tokenizer.from_buffer(tok_bytes)
         _tokenizer.enable_padding(length=128)
         _tokenizer.enable_truncation(max_length=128)
@@ -577,6 +719,19 @@ def is_available() -> bool:
 
 
 def availability_status() -> dict:
+    """Public availability diagnostic (issue #473): the base report plus the
+    effective ONNX resource policy (`resource_options` key — caps, spin
+    policy, and any invalid env overrides recorded by the last policy
+    resolution)."""
+    base = _availability_status_impl()
+    try:
+        base["resource_options"] = resource_policy_status()
+    except Exception:
+        base["resource_options"] = {"error": "unavailable"}
+    return base
+
+
+def _availability_status_impl() -> dict:
     """Structured, shallow availability diagnostic for stats/doctor/warnings.
 
     Returns a dict describing WHY embeddings are (un)available, computed fresh
