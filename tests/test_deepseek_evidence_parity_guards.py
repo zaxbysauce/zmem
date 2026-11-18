@@ -46,6 +46,7 @@ Run: python -X utf8 tests/test_deepseek_evidence_parity_guards.py
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -70,8 +71,13 @@ SHA40_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 
 
 def _git(args, timeout: int = 60):
+    # GIT_TERMINAL_PROMPT=0 — the test_git_hygiene network ratchet: a
+    # variable-argv git call cannot be statically proven local, so it must
+    # carry the effective noninteractive guard.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     return subprocess.run(["git"] + list(args), cwd=str(REPO_ROOT),
-                          capture_output=True, text=True, timeout=timeout)
+                          capture_output=True, text=True, timeout=timeout,
+                          env=env)
 
 
 def _load(path: Path) -> dict:

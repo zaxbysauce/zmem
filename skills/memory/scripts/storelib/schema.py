@@ -1185,12 +1185,19 @@ def init_db(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
     if "content_norm" not in cols:
         conn.execute("ALTER TABLE memory ADD COLUMN content_norm TEXT")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
-        "ON memory(namespace, content_norm) "
-        "WHERE superseded_at IS NULL "
-        "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
-    )
+    # Issue #489 adds source_ref to the predicate; a hand-built legacy store
+    # (e.g. the v11 migration fixture) can carry content_norm WITHOUT
+    # source_ref, and this unconditional CREATE would fail "no such column"
+    # before migrate() ever runs — create only when both columns exist
+    # (fresh stores always do); pre-v9 stores get the index from the v8/v9
+    # migration blocks or the migrate-tail ensure instead.
+    if "source_ref" in cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
+            "ON memory(namespace, content_norm) "
+            "WHERE superseded_at IS NULL "
+            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
+        )
     # v11 (issue #61, 6.1): trust_score column probe — same trap/pattern as
     # content_norm above. On a fresh store the CREATE TABLE already added it;
     # on a legacy pre-v11 store init_db()'s CREATE TABLE is a no-op and the v11
@@ -1966,9 +1973,12 @@ def _ensure_content_norm_index(conn: sqlite3.Connection) -> None:
     disclosed, bounded by live-row count.
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
-    if "content_norm" not in cols:
-        # Pre-v8 store whose column arrives with the v8 block below/above in
-        # the migrate walk; nothing for this ensure to index yet.
+    if "content_norm" not in cols or "source_ref" not in cols:
+        # Pre-v8/pre-v9 store whose columns arrive with the versioned blocks
+        # in the migrate walk (or never, on a hand-built fixture whose stamp
+        # skips them); the index's predicate references BOTH columns, so
+        # there is nothing for this ensure to index yet — the index stays
+        # absent exactly as it was before this PR on such stores.
         return
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' "
