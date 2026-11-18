@@ -357,8 +357,13 @@ class CurrentSegmentDerivationTest(unittest.TestCase):
         self.assertEqual(expected.returncode, 0, expected.stderr)
         # a DIFFERENT resolvable commit's full sha (still a commit, so the
         # AC8 resolvability law alone cannot catch it — only the
-        # derivation comparison can)
-        other = _git(["rev-parse", "HEAD~5"])
+        # derivation comparison can). The canary's own PARENT is used
+        # instead of a stack-depth-relative pick like HEAD~N: at release
+        # time the canary commit sits exactly N deep and a HEAD~5-class
+        # choice can COLLAPSE onto the canary itself, failing this control
+        # on a healthy tree (ancestry-deterministic; caught by the
+        # implementation reviewer at the 6-commit stack).
+        other = _git(["rev-parse", str(canary["git_sha"]) + "~1"])
         self.assertEqual(other.returncode, 0, other.stderr)
         other_full = other.stdout.strip().lower()
         self.assertNotEqual(other_full, expected.stdout.strip().lower())
