@@ -107,6 +107,11 @@ CONFIG_KNOBS: tuple[tuple[str, str], ...] = (
     ("ZMEM_CAPTURE", "inject"),
     # cross-encoder lane
     ("ZMEM_CROSS_ENCODER_MODEL", "cross_encoder"),
+    ("ZMEM_CROSS_ENCODER", "cross_encoder"),
+    # injection detail surfaces (evidence lookup bounds shape the
+    # for-injection details output)
+    ("ZMEM_EVIDENCE_CAP", "inject"),
+    ("ZMEM_EVIDENCE_DAYS", "inject"),
     ("ZMEM_CROSS_ENCODER_PASSIVE", "cross_encoder"),
     ("ZMEM_CROSS_ENCODER_BUDGET_MS", "cross_encoder"),
 )
@@ -360,7 +365,7 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
         _counters["hits"] += 1
         _timing_reuse.append((time.monotonic() - t0) * 1000.0)
         if observe_sidecar:
-            _observe(conn, components, None, "hit", ok=True, so="hit")
+            _observe(conn, components, None, None, ok=True, so="hit")
         return copy.deepcopy(entry.result)
 
     # MISS: coalesce or compute.
@@ -383,7 +388,7 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             _counters["coalesced"] += 1
             _apply_effects(conn, cached, capture_dict)
             if observe_sidecar:
-                _observe(conn, components, None, "coalesced", ok=True,
+                _observe(conn, components, None, None, ok=True,
                          so="coalesced")
             return copy.deepcopy(cached.result)
         if slot["error"] is not None:
@@ -440,7 +445,7 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
         slot["event"].set()
         _reuse_inflight.pop(key, None)
     if observe_sidecar:
-        _observe(conn, components, None, "miss", ok=True, so="miss",
+        _observe(conn, components, None, None, ok=True, so="miss",
                  ms=compute_ms)
     return result
 
