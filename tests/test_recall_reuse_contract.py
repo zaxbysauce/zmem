@@ -41,6 +41,22 @@ sys.path.insert(0, str(SCRIPTS))
 
 import storelib.recall as recall_mod  # noqa: E402
 import storelib.recall_reuse as rr  # noqa: E402
+
+def _reset_reuse_state():
+    """Local test seam (the storelib module deliberately ships no reset
+    helper — the stranded-function census requires production callers
+    for every storelib def)."""
+    import collections
+
+    import storelib.recall_reuse as rr
+    with rr._reuse_lock:
+        rr._reuse_cache.clear()
+        rr._reuse_inflight.clear()
+        rr._counters.clear()
+        rr._counters["invalidation_reasons"] = collections.defaultdict(int)
+        rr._timing_compute.clear()
+        rr._timing_reuse.clear()
+
 import storelib.schema as schema  # noqa: E402
 import storelib.write as write_mod  # noqa: E402
 from storelib.recall import recall_memory  # noqa: E402
@@ -64,8 +80,8 @@ class _ReuseBase(unittest.TestCase):
         os.environ.pop(rr.REFRESH_ENV, None)
         os.environ.pop(rr.TTL_ENV, None)
         self.addCleanup(self._restore)
-        rr.reset_reuse_state()
-        self.addCleanup(rr.reset_reuse_state)
+        _reset_reuse_state()
+        self.addCleanup(_reset_reuse_state)
         self.conn = sqlite3.connect(os.environ["ZMEM_STORE"])
         self.conn.row_factory = sqlite3.Row
         self.addCleanup(self.conn.close)
@@ -431,7 +447,7 @@ class ABPins(_ReuseBase):
 
     def test_ab_identical_output_off_vs_on(self):
         rows_off, out_off = self._recall()
-        rr.reset_reuse_state()
+        _reset_reuse_state()
         self._serving()
         rows_on, out_on = self._recall()
         self.assertEqual(rows_off, rows_on)

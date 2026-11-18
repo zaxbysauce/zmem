@@ -31,6 +31,22 @@ SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import storelib.recall_reuse as rr  # noqa: E402
+
+def _reset_reuse_state():
+    """Local test seam (the storelib module deliberately ships no reset
+    helper — the stranded-function census requires production callers
+    for every storelib def)."""
+    import collections
+
+    import storelib.recall_reuse as rr
+    with rr._reuse_lock:
+        rr._reuse_cache.clear()
+        rr._reuse_inflight.clear()
+        rr._counters.clear()
+        rr._counters["invalidation_reasons"] = collections.defaultdict(int)
+        rr._timing_compute.clear()
+        rr._timing_reuse.clear()
+
 import storelib.schema as schema  # noqa: E402
 
 ENV_NAMES = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODEL_AUTODOWNLOAD",
@@ -59,8 +75,8 @@ class _MetricsBase(unittest.TestCase):
         for n in (rr.SERVE_ENV, rr.TTL_ENV, rr.REFRESH_ENV, rr.OBSERVE_ENV):
             os.environ.pop(n, None)
         self.addCleanup(self._restore)
-        rr.reset_reuse_state()
-        self.addCleanup(rr.reset_reuse_state)
+        _reset_reuse_state()
+        self.addCleanup(_reset_reuse_state)
         self.conn = sqlite3.connect(os.environ["ZMEM_STORE"])
         self.conn.row_factory = sqlite3.Row
         self.addCleanup(self.conn.close)

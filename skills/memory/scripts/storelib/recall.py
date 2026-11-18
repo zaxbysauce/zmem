@@ -6267,6 +6267,20 @@ def stats(conn):
         recency = _format_recency(ts)
         print(f"  {label}: {recency}" + (f" ({ts})" if ts else ""))
 
+    # Issue #474: recall reuse surfaces in the stats report (additive;
+    # observation sidecar surfaced only when present).
+    try:
+        from storelib import recall_reuse as _rr
+        report = _rr.observation_report(conn)
+        if report.get("present"):
+            print("[zmem] recall-reuse observation: complete=%s "
+                  "observed=%s dup_rate=%s"
+                  % (report.get("complete"),
+                     report.get("coverage", {}).get("observed_n"),
+                     report.get("hook_potential", {}).get("rate")))
+    except Exception:
+        pass
+
 def get_memory(conn, mid) -> bool:
     """Print a memory as JSON. Returns True if found, False if not — so the CLI
     dispatch can exit non-zero on a miss (fail-closed, matching `supersede`),
@@ -6612,6 +6626,13 @@ def reembed_embeddings(
 
     if not need_embed and not vec_ids and not _has_any_embedding(conn):
         print("[zmem] all live memories already have embeddings and vec0 entries")
+        # Issue #474: vectors were rebuilt — free the cached recall
+        # envelopes immediately (the generation bump already invalidates
+        # them; this reclaims the entries rather than waiting out the TTL).
+        try:
+            _reuse_mod.clear_recall_reuse_cache()
+        except Exception:
+            pass
         return 0
 
     embed_count = 0

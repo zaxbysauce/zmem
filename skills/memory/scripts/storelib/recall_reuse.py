@@ -256,7 +256,7 @@ def _refresh_requested() -> bool:
     return os.environ.get(REFRESH_ENV, "") == "1"
 
 
-class _Tee(io.TextIOBase):
+class _Tee:
     """Write-through stdout tee: the real stream still receives every write
     (first-call output unchanged); the text is recorded for replay."""
 
@@ -271,19 +271,18 @@ class _Tee(io.TextIOBase):
     def flush(self):
         return self._real.flush()
 
-    @property
-    def encoding(self):
-        return getattr(self._real, "encoding", "utf-8")
-
-    @property
-    def errors(self):
-        return getattr(self._real, "errors", "replace")
-
     def isatty(self):
         try:
             return self._real.isatty()
         except Exception:
             return False
+
+    def __getattr__(self, name):
+        # Delegate every other stream attribute (encoding, errors, ...)
+        # to the real stream dynamically. _Tee deliberately does NOT
+        # subclass io.TextIOBase: the base class DEFINES encoding/errors
+        # as None, which would shadow this delegation.
+        return getattr(self._real, name)
 
 
 class _TelemetryRecorder:
@@ -465,7 +464,9 @@ def _apply_effects(conn, entry: _ReuseEntry, capture_dict) -> None:
 
 
 def clear_recall_reuse_cache() -> None:
-    """Programmatic explicit-refresh surface."""
+    """Programmatic explicit-refresh surface (called by the reembed
+    completion path — vectors rebuilt under a new profile free the
+    cached envelopes immediately instead of waiting out the TTL)."""
     with _reuse_lock:
         _reuse_cache.clear()
 
@@ -479,17 +480,6 @@ def reuse_stats() -> dict:
         stats["timing_samples_compute"] = len(_timing_compute)
         stats["timing_samples_reuse"] = len(_timing_reuse)
     return stats
-
-
-def reset_reuse_state() -> None:
-    """Test seam: clear cache, counters, and timing."""
-    with _reuse_lock:
-        _reuse_cache.clear()
-        _reuse_inflight.clear()
-        _counters.clear()
-        _counters["invalidation_reasons"] = collections.defaultdict(int)
-        _timing_compute.clear()
-        _timing_reuse.clear()
 
 
 # --- Observation sidecar (approved plan rev 5) --------------------------------
