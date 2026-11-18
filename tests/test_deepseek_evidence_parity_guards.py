@@ -12,9 +12,12 @@ reports (green on the corrected baseline this file lands against) and
 (ii) NEGATIVE-CONTROL legs that copy a report to a scratch dir, mutate it
 into the named defect shape, and assert the guard helper flags it:
 
-- AC8 NotesShaResolutionTest: every 40-hex token in either report's notes
-  resolves via ``git cat-file -t`` as a commit; a fabricated token (real
-  12-char prefix, invented tail) is named in the failure.
+- AC8 NotesShaResolutionTest: every 40-hex token in the CURRENT release
+  segment of either report's notes resolves via ``git cat-file -t`` as a
+  commit (the fabrication catch); unresolvable HISTORICAL-segment tokens
+  degrade with a visible PROVENANCE-TOKEN-SKIPPED line, not a failure. A
+  fabricated token (real 12-char prefix, invented tail) appended to the
+  current segment is named in the failure.
 - AC9 CurrentSegmentDerivationTest: the current release segment's recorded
   runtime SHA equals ``git rev-parse`` of the canary report's git_sha
   (derivation, not string equality of hand-typed text).
@@ -40,17 +43,30 @@ release sections must PASS unchanged (issue #490 AC5, owned by the
 existing five tests in test_deepseek_evidence_version_parity.py).
 
 Two-mode provenance contract (shallow CI checkouts and squash-merged
-main): CI checks out only 2 commits deep (.github/workflows/ci.yml
-fetch-depth 2) and a squash-merged main drops feature-branch commits
-entirely, so the git objects these guards resolve — notes SHAs, the
-canary git_sha, carrying commits — do not exist there, and strict
-enforcement would mint false defect reports. At import the file resolves
-the LIVE canary report's git_sha via ``git cat-file -t``
-(_provenance_reachable): STRICT mode (the sha resolves — full clones, the
-frozen replays, PR authoring/review) runs every assertion below at full
-strength, unchanged; SKIP mode (the sha is absent) still runs the
-git-object-dependent positive legs but asserts only their non-git
-invariants, each printing a visible ``PROVENANCE-GUARDS-SKIPPED:
+main). The mode is selected from the CHECKOUT SHAPE alone, never from
+the evidence under test: SKIP iff (a) ``git rev-parse
+--is-shallow-repository`` prints true — a depth-2 CI checkout of ANY
+head (the branch head included: the canary sits at HEAD~1 but the
+historical notes shas and canary~1 do not exist in the window) cannot
+see the objects the strict laws dereference — or (b) the commit
+carrying the live canary report (``git log -1 --format=%H -- <canary
+path>``) is already an ANCESTOR of origin/main — post-squash/shipped
+evidence, where unreachable feature-branch objects are the expected
+state (a missing origin/main counts as not-ancestor). Otherwise STRICT
+(full clones where the canary's carrying commit is not yet on the
+default branch — PR authoring/review, the frozen replays) runs every
+assertion at full strength, and FAILS CLOSED when the live canary
+git_sha does not resolve as a commit (strict_canary_resolution_problem,
+final-critic round 2 finding 2): a typo'd or fabricated canary sha is
+the #490 hand-edited-evidence shape and must not be able to select SKIP
+for itself. In STRICT, notes-token resolvability is segment-scoped:
+tokens in the CURRENT release segment must resolve (the AC9 derivation
+governs that segment — the fabrication catch); unresolvable
+HISTORICAL-segment tokens (old squash-merged-away branches) each print
+a visible ``PROVENANCE-TOKEN-SKIPPED: <short-token>: <reason>`` line
+and are recorded in the assertion counts, not failed. SKIP mode still
+runs the git-object-dependent positive legs but asserts only their
+non-git invariants, each printing a visible ``PROVENANCE-GUARDS-SKIPPED:
 <reason>`` line — deliberately NOT unittest.skip, so a CI log shows the
 marker and the file stays exit-0 rather than reporting 'OK (skipped=N)'.
 The scratch-based negative controls keep running and passing in skip mode
@@ -111,30 +127,87 @@ def _parse_iso(raw):
     return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
 
 
-def _provenance_reachable() -> tuple[bool, str]:
-    """(True, "") when the LIVE canary report's git_sha resolves as a
-    commit in this checkout; (False, one-line reason naming the sha) when
-    it does not — a shallow CI checkout (fetch-depth 2) or a squash-merged
-    main cannot see the feature-branch objects the provenance laws cite."""
-    try:
-        sha = str((_load(CANARY_PATH) or {}).get("git_sha") or "")
-    except (OSError, ValueError) as exc:
-        return False, f"canary report unreadable ({exc})"
-    if not sha:
-        return False, "canary report carries no git_sha"
-    r = _git(["cat-file", "-t", sha])
-    if r.returncode == 0 and r.stdout.strip() == "commit":
-        return True, ""
-    return (False,
-            f"canary git_sha {sha} does not resolve as a commit in this "
-            f"checkout (git cat-file -t rc={r.returncode}; shallow clone "
-            "or squash-merged history)")
+def _repo_is_shallow() -> bool:
+    """True when ``git rev-parse --is-shallow-repository`` prints true —
+    a CI depth-2 checkout of ANY head: the canary sha itself may sit at
+    HEAD~1 inside the window, but the historical notes shas and the
+    canary's parent do not exist there, so strict resolvability would
+    mint false defect reports (final-critic round 2, finding 1)."""
+    r = _git(["rev-parse", "--is-shallow-repository"])
+    return r.returncode == 0 and r.stdout.strip().lower() == "true"
 
 
-# Mode for this run, evaluated once at import: STRICT when the canary
-# git_sha resolves (full clones — the frozen replays, PR authoring and
-# review), SKIP when it does not (shallow CI checkout / post-squash main).
-_PROVENANCE_OK, _PROVENANCE_REASON = _provenance_reachable()
+def _canary_carrying_commit() -> str:
+    """Full sha of the last commit touching the live canary report ('' on
+    failure). The CARRYING COMMIT — a property of the checkout, never of
+    the report's contents — anchors the mode: once the evidence ships on
+    the default branch, the feature-branch objects it cites are gone by
+    design (squash merge), and that is not a defect."""
+    r = _git(["log", "-1", "--format=%H", "--", str(CANARY_PATH)])
+    return r.stdout.strip().lower() if r.returncode == 0 else ""
+
+
+def _is_ancestor_of_origin_main(commit: str) -> bool:
+    """True when ``git merge-base --is-ancestor commit origin/main``
+    succeeds. A MISSING origin/main (no remote configured) is treated as
+    not-ancestor — the authoring-context default, which fails closed."""
+    if not commit:
+        return False
+    r = _git(["rev-parse", "--verify", "--quiet", "origin/main"])
+    if r.returncode != 0:
+        return False
+    m = _git(["merge-base", "--is-ancestor", commit, "origin/main"])
+    return m.returncode == 0
+
+
+def _select_provenance_mode(is_shallow: bool,
+                            carrying_on_main: bool) -> tuple[str, str]:
+    """PURE two-input mode selector (never reads the evidence under test):
+    SKIP iff (a) the repository is shallow or (b) the canary report's
+    carrying commit is already an ancestor of origin/main
+    (post-squash/shipped evidence). Otherwise STRICT. Returns
+    ("strict"|"skip", reason)."""
+    if is_shallow:
+        return ("skip",
+                "shallow repository (git rev-parse --is-shallow-repository "
+                "true): provenance objects outside the fetched window do "
+                "not exist in this checkout")
+    if carrying_on_main:
+        return ("skip",
+                "the commit carrying canary-report.json is an ancestor of "
+                "origin/main (shipped/squash-merged evidence): the cited "
+                "feature-branch objects are expected to be unreachable "
+                "here")
+    return "strict", ""
+
+
+# Mode for this run, evaluated once at import from the CHECKOUT SHAPE
+# alone: STRICT in full checkouts whose canary-carrying commit is not yet
+# on the default branch (PR authoring/review, the frozen replays), SKIP
+# in shallow CI checkouts and on post-squash main.
+_MODE, _MODE_REASON = _select_provenance_mode(
+    _repo_is_shallow(),
+    _is_ancestor_of_origin_main(_canary_carrying_commit()))
+_PROVENANCE_OK = _MODE == "strict"
+_PROVENANCE_REASON = _MODE_REASON
+
+
+def strict_canary_resolution_problem(mode: str, sha: str,
+                                     resolves_as_commit: bool):
+    """STRICT-mode root-of-trust gate (final-critic round 2, finding 2):
+    the canary git_sha anchors AC9's derivation and AC11's disclosure
+    predicate, and the mode selector no longer reads it — so in STRICT
+    mode a value that resolves NOWHERE (typo or fabrication, the #490
+    hand-edited-evidence threat) FAILS CLOSED with a problem naming the
+    sha. Pure function of (mode, sha-resolution result) so the negative
+    control can exercise the strict branch in BOTH modes without
+    mutating the live report. None when there is no strict-mode
+    complaint."""
+    if mode != "strict" or resolves_as_commit:
+        return None
+    return (f"strict mode: canary git_sha {sha} does not resolve as a "
+            "commit via git cat-file -t (typo'd or fabricated canary sha "
+            "— the #490 hand-edited-evidence shape; fail closed)")
 
 
 def _skip_marker(leg: str) -> None:
@@ -171,20 +244,42 @@ def _past_commit_iso() -> tuple[bool, str]:
 # --- AC8: every notes 40-hex token resolves as a commit ----------------------
 
 
-def notes_sha_problems(report: dict, label: str) -> list:
-    """Every 40-hex token in `report`'s notes must resolve via
-    ``git cat-file -t`` as a commit (no label heuristic). Returns one
-    problem string per offending token, naming the token."""
+def notes_sha_problems(report: dict, label: str):
+    """Segment-scoped resolvability law (final-critic round 2, finding 1):
+    every 40-hex token in the CURRENT release segment of `report`'s
+    notes — the segment the AC9 derivation governs — must resolve via
+    ``git cat-file -t`` as a commit; that is the fabrication catch.
+    Tokens in HISTORICAL segments name commits from old
+    squash-merged-away feature branches: an unresolvable one prints a
+    visible ``PROVENANCE-TOKEN-SKIPPED: <short-token>: <reason>`` line
+    and is NOT a failure. Fail-closed default: when no current segment
+    can be identified, EVERY token is strict-scope. Returns
+    (problems, skipped) — one problem string per offending strict-scope
+    token (naming the token) plus the skipped historical tokens."""
     notes = (report or {}).get("notes") or ""
+    tokens = sorted(set(SHA40_RE.findall(notes)))
+    seg, _how = current_segment(notes, _release_version())
+    strict_scope = (set(SHA40_RE.findall(seg)) if seg is not None
+                    else set(tokens))
     problems = []
-    for tok in sorted(set(SHA40_RE.findall(notes))):
+    skipped = []
+    for tok in tokens:
         r = _git(["cat-file", "-t", tok])
-        if r.returncode != 0 or r.stdout.strip() != "commit":
+        if r.returncode == 0 and r.stdout.strip() == "commit":
+            continue
+        if tok in strict_scope:
             problems.append(
                 f"{label} notes 40-hex token {tok} does not resolve as a "
                 f"commit via git cat-file -t (rc={r.returncode}, "
                 f"type={r.stdout.strip()!r}, err={r.stderr.strip()[-120:]!r})")
-    return problems
+        else:
+            reason = (f"git cat-file -t rc={r.returncode}, "
+                      f"err={r.stderr.strip()[-100:]!r}")
+            skipped.append(tok)
+            print(f"PROVENANCE-TOKEN-SKIPPED: {tok[:12]}: historical "
+                  f"segment token unresolvable in this checkout "
+                  f"({reason})", flush=True)
+    return problems, skipped
 
 
 # --- current-segment identification (AC9 / AC11) -----------------------------
@@ -343,8 +438,10 @@ def _mutated_support_copy(testcase, mutator):
 
 
 class NotesShaResolutionTest(unittest.TestCase):
-    """AC8: every 40-hex token in either report's notes resolves as a
-    commit; a fabricated token is named in the failure."""
+    """AC8: every 40-hex token in the CURRENT release segment of either
+    report's notes resolves as a commit; a fabricated token appended to
+    that segment is named in the failure. Unresolvable HISTORICAL-segment
+    tokens degrade with a printed PROVENANCE-TOKEN-SKIPPED line."""
 
     def test_real_reports_notes_tokens_all_resolve(self):
         for path, label in ((SUPPORT_PATH, "support-report"),
@@ -360,17 +457,21 @@ class NotesShaResolutionTest(unittest.TestCase):
                     len(tokens), 1,
                     "the support notes are expected to carry the "
                     "historical 40-hex provenance tokens")
-            problems = notes_sha_problems(report, label)
             if not _PROVENANCE_OK:
                 # skip mode: the historical objects the resolvability law
                 # cites do not exist in this checkout; assert only the
                 # non-git invariants and mark the degraded leg.
                 _skip_marker(f"AC8 real-notes resolvability ({label})")
                 continue
+            problems, skipped = notes_sha_problems(report, label)
             self.assertEqual(
                 problems, [],
                 f"{label}: unresolved notes sha token(s): {problems} "
-                f"(checked {len(tokens)} unique 40-hex token(s))")
+                f"(strict scope: the current release segment's tokens; "
+                f"{len(tokens)} unique 40-hex token(s) in the notes, "
+                f"{len(skipped)} historical-segment token(s) skipped as "
+                "unreachable — see the PROVENANCE-TOKEN-SKIPPED lines, "
+                "not silent)")
 
     def test_fabricated_sha_negative_control_flagged(self):
         # The PR #487 pre-correction shape: real 12-char prefix
@@ -391,7 +492,14 @@ class NotesShaResolutionTest(unittest.TestCase):
                 "the truth)")
 
             def _mutate(notes):
-                return notes + " fabricated evidence sha " + fabricated
+                # append INTO the current release segment: strict
+                # resolvability is scoped to that segment, so the control
+                # must land inside it to keep exercising the fabrication
+                # catch (historical-segment tokens only degrade).
+                seg, _how = current_segment(notes, _release_version())
+                assert seg is not None, "precondition: current segment found"
+                return notes.replace(
+                    seg, seg + " fabricated evidence sha " + fabricated, 1)
         else:
             # skip mode degeneration guard, no git objects: the fabricated
             # token must differ from the RECORDED current-segment sha
@@ -409,7 +517,7 @@ class NotesShaResolutionTest(unittest.TestCase):
             def _mutate(notes):
                 return "fabricated evidence sha " + fabricated
         report, _scratch = _mutated_support_copy(self, _mutate)
-        problems = notes_sha_problems(report, "scratch-support")
+        problems, _skipped = notes_sha_problems(report, "scratch-support")
         self.assertTrue(
             problems,
             "the fabricated notes sha token must be flagged; got no "
@@ -429,15 +537,21 @@ class NotesShaResolutionTest(unittest.TestCase):
         self.assertEqual(len(uppercase), 40)
         self.assertTrue(SHA40_RE.fullmatch(uppercase))
         if _PROVENANCE_OK:
-            report, _scratch = _mutated_support_copy(
-                self, lambda notes: notes + " fabricated evidence sha "
-                    + uppercase)
+            # appended INTO the current release segment (strict scope) so
+            # the widened-extractor discrimination keeps exercising the
+            # fabrication catch under the segment-scoped law.
+            def _mutate(notes):
+                seg, _how = current_segment(notes, _release_version())
+                assert seg is not None, "precondition: current segment found"
+                return notes.replace(
+                    seg, seg + " fabricated evidence sha " + uppercase, 1)
+            report, _scratch = _mutated_support_copy(self, _mutate)
         else:
             # skip mode: the scratch notes carry ONLY the uppercase token
             # so the single problem entry deterministically names it.
             report, _scratch = _mutated_support_copy(
                 self, lambda notes: "fabricated evidence sha " + uppercase)
-        problems = notes_sha_problems(report, "scratch-support")
+        problems, _skipped = notes_sha_problems(report, "scratch-support")
         self.assertTrue(
             problems,
             "the uppercase fabricated notes sha token must be flagged; "
@@ -538,6 +652,61 @@ class CurrentSegmentDerivationTest(unittest.TestCase):
         self.assertIn(expected_full, problem,
                       "the failure must name the expected derived sha")
 
+    def test_unresolvable_canary_sha_fails_closed(self):
+        # Final-critic round 2, finding 2: the canary git_sha is the root
+        # of trust for AC9's derivation and AC11's disclosure predicate,
+        # and the mode selector no longer reads it — so STRICT must FAIL
+        # CLOSED on a value that resolves nowhere (typo/fabrication, the
+        # exact hand-edited-evidence threat #490 guards). The control
+        # loads a SCRATCH COPY of the canary report with git_sha set to a
+        # syntactically valid 12-hex prefix that resolves nowhere and
+        # exercises the helper's STRICT branch as a pure function of
+        # (mode, sha-resolution result) — passing in BOTH modes, without
+        # mutating the live file. The trailing live gate is the strict-run
+        # instance of the same law against the REAL canary report.
+        fabricated = "0000000decaf"
+        self.assertEqual(len(fabricated), 12)
+        self.assertRegex(fabricated, r"^[0-9a-f]{12}$")
+        scratch = Path(tempfile.mkdtemp(prefix="zmem-490guard-"))
+        self.addCleanup(shutil.rmtree, str(scratch), True)
+        data = dict(_load(CANARY_PATH))
+        data["git_sha"] = fabricated
+        out = scratch / "canary-report.json"
+        out.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        scratch_sha = str((_load(out) or {}).get("git_sha") or "")
+        self.assertEqual(scratch_sha, fabricated)
+        r = _git(["cat-file", "-t", scratch_sha])
+        resolves = r.returncode == 0 and r.stdout.strip() == "commit"
+        self.assertFalse(
+            resolves,
+            "control precondition: the scratch canary sha must resolve "
+            "nowhere in this checkout")
+        strict_problem = strict_canary_resolution_problem(
+            "strict", scratch_sha, resolves)
+        self.assertTrue(
+            strict_problem,
+            "the strict-mode canary-resolution branch must FAIL CLOSED on "
+            "an unresolvable canary git_sha (the #490 threat)")
+        self.assertIn(
+            scratch_sha, strict_problem,
+            f"the failure must name the offending sha; got: "
+            f"{strict_problem}")
+        self.assertIsNone(
+            strict_canary_resolution_problem("skip", scratch_sha, resolves),
+            "the skip-mode branch must stay quiet (mode-scoped helper)")
+        # LIVE gate, bites in strict runs only: the real canary git_sha
+        # must resolve as a commit via git cat-file -t.
+        live_sha = str((_load(CANARY_PATH) or {}).get("git_sha") or "")
+        live = _git(["cat-file", "-t", live_sha])
+        live_resolves = (live.returncode == 0
+                         and live.stdout.strip() == "commit")
+        self.assertIsNone(
+            strict_canary_resolution_problem(_MODE, live_sha, live_resolves),
+            "in strict mode the LIVE canary git_sha must resolve as a "
+            "commit via git cat-file -t (a typo'd or fabricated canary "
+            "sha fails closed — it must not be able to select SKIP for "
+            "itself)")
+
 
 class StampCarryingCommitTest(unittest.TestCase):
     """AC10: generated_at strictly after the canary's AND no later than
@@ -594,8 +763,6 @@ class StampCarryingCommitTest(unittest.TestCase):
             _skip_marker("AC10 canary carrying-commit upper bound")
             return
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(
-            carrying, "no carrying commit found for the canary report")
         self.assertTrue(
             carrying, "no carrying commit found for the canary report")
         self.assertTrue(
