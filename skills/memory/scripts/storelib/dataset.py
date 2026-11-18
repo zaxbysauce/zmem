@@ -1188,12 +1188,22 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
         init_db(conn)
         migrate(conn)
         try:
+            # Issue #489: MEMORY_COLUMNS (the export projection) deliberately
+            # omits the derived store-local content_norm, but the materialized
+            # snapshot is a REAL store — every content_norm-keyed consumer
+            # (the add/update/ingest exact windows, the degraded lexical
+            # lane's Jaccard token sets) silently degrades to no-ops when the
+            # column is NULL, so compute it per row at INSERT from the same
+            # normalizer the write path uses.
+            from storelib.schema import _normalize_content  # noqa: PLC0415
+            _insert_cols = _MEMORY_STORE_COLUMNS + ("content_norm",)
             for row in kept:
                 conn.execute(
-                    "INSERT INTO memory (" + ", ".join(_MEMORY_STORE_COLUMNS)
+                    "INSERT INTO memory (" + ", ".join(_insert_cols)
                     + ") VALUES ("
-                    + ", ".join("?" * len(_MEMORY_STORE_COLUMNS)) + ")",
-                    tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
+                    + ", ".join("?" * len(_insert_cols)) + ")",
+                    tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS)
+                    + (_normalize_content(row.get("content") or ""),))
                 _store_generation.bump_mutation_generation(conn)  # issue #474 census
             kept_ids = {row["id"] for row in kept}
             # Issue #414 (#324 parent-outcome-aware rule): expiry records

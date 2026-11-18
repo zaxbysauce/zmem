@@ -2217,13 +2217,21 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
                     # whose normalized content already exists live in the
                     # destination folds into the keeper and never lands
                     # under its own id, so its expiry record must project
-                    # as an orphan skip, not a would-copy.
+                    # as an orphan skip, not a would-copy. Issue #489: the
+                    # prediction mirrors the detector's exact-match case —
+                    # pointer rows are excluded from every dedup lane, so a
+                    # source row whose only equal match is a knowledge-ref
+                    # pointer does NOT fold and lands under its own id (the
+                    # pre-#489 shape predicted an orphan skip while the
+                    # real promote added the row).
                     _norm = _normalize_content(validated["content"])
                     _fold = None
                     if _norm:
                         _fold = conn.execute(
                             "SELECT 1 FROM memory WHERE namespace=? "
-                            "AND content_norm=? AND superseded_at IS NULL",
+                            "AND content_norm=? AND superseded_at IS NULL "
+                            "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                            "'knowledge:%')",
                             (validated["namespace"], _norm)).fetchone()
                     if _fold is None:
                         dry_live_state_ids.add(validated["id"])

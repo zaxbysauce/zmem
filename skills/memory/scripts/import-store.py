@@ -566,6 +566,36 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
                 staged_conn.execute("BEGIN IMMEDIATE")
                 counts, pending = _sanitize_staged_store(staged_conn,
                                                          source_conn)
+                # Issue #489: the sqlite lane copies the source schema
+                # verbatim (online backup; no migrate on the staged store),
+                # so a source with NULL content_norm — or a true pre-v8
+                # source whose memory table lacks the column entirely —
+                # leaves the destination equally hollow and every
+                # content_norm-keyed consumer silently degrades. Repair the
+                # derived column HERE, inside the sanitize transaction and
+                # before the FTS optimize / journal-mode / VACUUM block
+                # below (VACUUM cannot run inside a transaction, and a
+                # failure after acceptance's os.replace would strand a
+                # half-repaired destination): probe-and-add the column when
+                # absent (the v8 probe-and-add shape), then batch-backfill
+                # NULLs from each row's own content.
+                _staged_cols = {row[1] for row in staged_conn.execute(
+                    "PRAGMA table_info(memory)")}
+                if "content_norm" not in _staged_cols:
+                    staged_conn.execute(
+                        "ALTER TABLE memory ADD COLUMN content_norm TEXT")
+                _bf_batch = 500
+                while True:
+                    _bf_rows = staged_conn.execute(
+                        "SELECT rowid, content FROM memory "
+                        "WHERE content_norm IS NULL LIMIT ?",
+                        (_bf_batch,)).fetchall()
+                    if not _bf_rows:
+                        break
+                    staged_conn.executemany(
+                        "UPDATE memory SET content_norm=? WHERE rowid=?",
+                        [(_normalize_content(r["content"] or ""),
+                          r["rowid"]) for r in _bf_rows])
                 staged_conn.commit()
                 print(f"[import] staged rows: added={counts['added']} "
                       f"redacted={counts['redacted']} "

@@ -1187,7 +1187,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE memory ADD COLUMN content_norm TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
-        "ON memory(namespace, content_norm) WHERE superseded_at IS NULL"
+        "ON memory(namespace, content_norm) "
+        "WHERE superseded_at IS NULL "
+        "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
     )
     # v11 (issue #61, 6.1): trust_score column probe — same trap/pattern as
     # content_norm above. On a fresh store the CREATE TABLE already added it;
@@ -1938,6 +1940,69 @@ def _ensure_evidence_lookup_index(conn: sqlite3.Connection) -> None:
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
 
+
+# Issue #489: the content_norm partial index WITH the knowledge-ref exclusion
+# in the index predicate, so the four re-rank window queries' source_ref
+# filter is index-served instead of a per-row post-fetch walk. Three literal
+# sites (init_db fresh-store CREATE, the v8 migration block, and the ensure
+# below) spell the DDL textually identically — keep them in lockstep (tests
+# extract every literal CREATE statement schema.py ships).
+
+
+def _ensure_content_norm_index(conn: sqlite3.Connection) -> None:
+    """Rebuild idx_memory_content_norm when it lacks the knowledge-ref
+    exclusion (issue #489).
+
+    Version-independent on purpose (the _ensure_evidence_lookup_index
+    discipline): stores created after this predicate carry it from birth via
+    init_db / the v8 block; stores created before carry the narrower
+    ``WHERE superseded_at IS NULL`` shape under a schema stamp that must not
+    move, so this ensure probes sqlite_master on every open and rebuilds
+    ONLY the old (or missing) shape. Steady state is one sqlite_master read;
+    the rebuild itself is DROP + CREATE inside a savepoint, so a failure
+    (e.g. SQLITE_BUSY from a concurrent writer) rolls back atomically and
+    leaves the previous index serving reads. The one-time rebuild on a large
+    store reads and sorts the qualifying live rows under the schema lock —
+    disclosed, bounded by live-row count.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    if "content_norm" not in cols:
+        # Pre-v8 store whose column arrives with the v8 block below/above in
+        # the migrate walk; nothing for this ensure to index yet.
+        return
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_memory_content_norm'").fetchone()
+    current_sql = (row[0] or "") if row else ""
+    if "NOT LIKE" in current_sql:
+        return  # already carries the knowledge-ref exclusion
+    savepoint = "zmem_content_norm_index"
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    else:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_memory_content_norm")
+        conn.execute(
+            "CREATE INDEX idx_memory_content_norm "
+            "ON memory(namespace, content_norm) "
+            "WHERE superseded_at IS NULL "
+            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')")
+        if own_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if own_transaction:
+            conn.rollback()
+        else:
+            try:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            finally:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
 # Issue #137: additive belief-head side tables.  Like the v14 evidence
 # tables, this DDL is version-independent — it runs on every open from
 # migrate() (never init_db, so an existing store never pre-creates the
@@ -2538,7 +2603,9 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.commit()
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
-            "ON memory(namespace, content_norm) WHERE superseded_at IS NULL"
+            "ON memory(namespace, content_norm) "
+            "WHERE superseded_at IS NULL "
+            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
         )
         conn.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
         conn.commit()
@@ -2791,6 +2858,18 @@ def migrate(conn: sqlite3.Connection) -> None:
     # Version-independent evidence-first lookup index: this repairs existing
     # v14 stores without a version bump and is idempotent on every open.
     _ensure_evidence_lookup_index(conn)
+
+    # Version-INDEPENDENT (issue #489): the content_norm partial index's
+    # predicate must carry the knowledge-ref exclusion the four re-rank
+    # window queries filter on — without it the exclusion post-filters
+    # outside the index and a (namespace, content_norm) group dominated by
+    # knowledge-ref rows costs an O(group) row-fetch walk per query.
+    # Stores created before this predicate landed carry the narrower index
+    # under a schema stamp that must not move (SUPPORTED stays 19), so this
+    # ensure re-inspects sqlite_master on every open and rebuilds only the
+    # old shape — the _ensure_evidence_lookup_index discipline: idempotent
+    # steady state, savepoint-atomic, no version bump.
+    _ensure_content_norm_index(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.
     # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,
