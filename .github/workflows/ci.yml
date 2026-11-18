@@ -383,6 +383,15 @@ jobs:
               echo "=== $f (skipped here: dependency-enforcing smoke test runs in test-embeddings) ==="
               continue
             fi
+            # Issue #473 byte-parity gate: model-dependent by design — its
+            # class-level SkipTest on a model-absent runner reports "Ran 0
+            # tests", which this loop's zero-tests gate correctly treats as
+            # a no-op. The authoritative run is the test-real-model job
+            # (provisioned model), where the gate runs for real.
+            if [ "$f" = "tests/test_real_model_byte_parity.py" ]; then
+              echo "=== $f (skipped here: model-dependent parity gate runs in test-real-model) ==="
+              continue
+            fi
             # (Issue #256 gate removed: #180 landed, so the full
             # test_q02_passive_secret_withhold.py file — AC6 class included —
             # runs in this loop.)
