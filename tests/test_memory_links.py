@@ -634,9 +634,24 @@ class RecallExpansionTest(_Store):
         ]
         for call in calls:
             self.assertEqual(call(), [])
+        # Issue #474 seam disclosure: the recall reuse layer resolves the
+        # store identity BEFORE delegating (PRAGMA database_list + a
+        # read-only meta SELECT for the mutation generation/incarnation).
+        # The fail-closed contract this pin owns — invalid as_of never
+        # reaches selection/write SQL and every surface returns [] — is
+        # unchanged; the pin now asserts the issued SQL is EXACTLY the
+        # seam's read-only identity probes and nothing else.
+        allowed_prefixes = (
+            "PRAGMA database_list",
+            "SELECT value FROM meta",
+        )
+        leftover = [q for q in statements
+                    if not q.startswith(allowed_prefixes)]
         self.assertEqual(
-            statements, [],
-            "invalid as_of must fail closed before any SQL is issued",
+            leftover, [],
+            "invalid as_of must fail closed before any selection/write "
+            "SQL is issued (only the reuse seam's read-only identity "
+            "probes may run first); observed: %r" % (statements,),
         )
 
     def test_empty_programmatic_as_of_equals_absent(self):
