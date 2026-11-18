@@ -499,7 +499,6 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
                 "UPDATE memory SET content_norm=? WHERE rowid=?",
                 [(_normalize_content(r[1] or ""), r[0]) for r in _bf_rows])
         # Issue #414: restore the additive ``expiry`` family — the shipped
-        # Issue #414: restore the additive ``expiry`` family — the shipped
         # state rows' memory_expiry side records. Older hubs omit the key
         # (tolerated: every row stays live by the missing-side-row law);
         # a newer hub ships [memory_id, inject_until, expiry_class]
