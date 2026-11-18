@@ -481,12 +481,14 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             _reuse_cache.move_to_end(key)
             while len(_reuse_cache) > MAX_ENTRIES:
                 _reuse_cache.popitem(last=False)
-    except Exception:
+    except BaseException:
         # The computation SUCCEEDED but publication failed (e.g. a
         # non-copyable result). The slot must still complete or every
         # later identical recall blocks as a loser until the wait timeout
-        # (implementation-review finding 2): no entry is published and
-        # the failure propagates like a compute failure.
+        # (implementation-review finding 2; round-2 residual 2 hardened
+        # Exception -> BaseException for symmetry with the impl guard):
+        # no entry is published and the failure propagates like a compute
+        # failure.
         with _reuse_lock:
             slot["error"] = sys.exc_info()[1]
             slot["done"] = True
