@@ -478,20 +478,19 @@ class WorkingTreeDisclosureTest(unittest.TestCase):
 
     def test_silent_version_mismatch_flagged(self):
         version = _release_version()
-        canary = _load(CANARY_PATH)
-        # precondition: the live pair IS in the mismatch shape (tree
-        # manifest 0.159.0 vs canary zmem_version 0.160.0 at the freeze
-        # anchor) — otherwise this negative control no longer tests the
-        # disclosure branch.
+        # Build the mismatch shape from a CONTROLLED COPY of the canary so a
+        # future committed-tree canary (tree version == canary zmem_version)
+        # is a valid live pair rather than a precondition failure: when the
+        # live pair already mismatches (working-tree run) it is used as-is;
+        # otherwise the copy's zmem_version is forced to differ from the
+        # recorded tree version, which drives exactly the same helper branch.
+        canary = dict(_load(CANARY_PATH))
         show = _git(["show", f"{canary['git_sha']}:release-manifest.json"])
         self.assertEqual(show.returncode, 0, show.stderr)
         tree_version = re.search(
             r'"version"\s*:\s*"([^"]+)"', show.stdout).group(1)
-        self.assertNotEqual(
-            tree_version, canary.get("zmem_version"),
-            "precondition failed: the live pair is no longer in the "
-            "version-mismatch shape; update this negative control's "
-            "fixture strategy (mutate a copy of the canary report too)")
+        if canary.get("zmem_version") == tree_version:
+            canary["zmem_version"] = str(tree_version) + "-mismatch-control"
 
         def _scrub(notes):
             seg, _how = current_segment(notes, version)

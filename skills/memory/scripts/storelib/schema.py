@@ -1984,8 +1984,10 @@ def _ensure_content_norm_index(conn: sqlite3.Connection) -> None:
         "SELECT sql FROM sqlite_master WHERE type='index' "
         "AND name='idx_memory_content_norm'").fetchone()
     current_sql = (row[0] or "") if row else ""
-    if "NOT LIKE" in current_sql:
-        return  # already carries the knowledge-ref exclusion
+    if "NOT LIKE 'knowledge:%'" in current_sql:
+        return  # already carries the knowledge-ref exclusion (the exact
+        # predicate form this ensure creates — a bare NOT LIKE naming some
+        # other column would not match)
     savepoint = "zmem_content_norm_index"
     own_transaction = not conn.in_transaction
     if own_transaction:
