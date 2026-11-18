@@ -89,9 +89,15 @@ RECALL_PATH_MODULES = [
 
 class CensusGuardrails(unittest.TestCase):
     def test_p1_every_session_construction_passes_options(self):
+        # Whole-production-tree scan (review finding 4): the guardrail
+        # must fail on a NEW unbounded site ANYWHERE under skills/, not
+        # only in the two loader modules.
         hits = []
-        for mod in ("embeddings.py", "storelib/cross_encoder.py"):
-            text = (SCRIPTS / mod).read_text(encoding="utf-8")
+        for path in SCRIPTS.rglob("*.py"):
+            if "__pycache__" in str(path):
+                continue
+            rel = path.relative_to(SCRIPTS).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace")
             for m in re.finditer(r"InferenceSession\(", text):
                 line_no = text[:m.start()].count("\n") + 1
                 context = text[max(0, m.start() - 300):m.start()]
@@ -100,11 +106,10 @@ class CensusGuardrails(unittest.TestCase):
                 if "_sess_opts is None" in context or \
                         "_resource_options" in context:
                     continue  # the guarded fallback branch beside it
-                hits.append("%s:%d" % (mod, line_no))
+                hits.append("%s:%d" % (rel, line_no))
         self.assertEqual(hits, [],
                          "unbounded InferenceSession construction sites: "
                          "%s" % hits)
-
     def test_p3_recall_path_writers_map_to_census(self):
         # recall.py's own memory-table writes: telemetry-only (no bump, the
         # pinned pin) + the reembed apply (bumped).

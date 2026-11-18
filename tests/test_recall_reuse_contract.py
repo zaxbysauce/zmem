@@ -238,11 +238,20 @@ class HitPath(_ReuseBase):
 
 class EffectReplay(_ReuseBase):
     def test_capture_population_on_hit(self):
+        # The capture dict is populated ONLY on the injection lane
+        # (recall.py's plain path never fills _capture), so this test must
+        # drive for_injection=True — a plain-path drive compares two empty
+        # dicts and proves nothing (implementation-review finding 1).
         self._serving()
         cap1 = {}
-        self._recall(_capture=cap1)
+        self._recall(for_injection=True, _capture=cap1,
+                     no_bump=True)
         cap2 = {}
-        self._recall(_capture=cap2)
+        self._recall(for_injection=True, _capture=cap2,
+                     no_bump=True)
+        self.assertTrue(cap1,
+                        "the injection-lane capture must be non-empty "
+                        "(else this pin is vacuous)")
         self.assertEqual(cap1, cap2,
                          "the caller's _capture dict must be populated "
                          "identically on a hit")

@@ -156,9 +156,16 @@ def _session_token() -> str:
 
 def _canonical(value) -> str:
     """Stable repr for key components: dicts sorted, lists order-preserving
-    (order-insensitivity is only claimed where a test proves it)."""
+    (order-insensitivity is only claimed where a test proves it), and
+    SET-LIKE values (frozenset/set) as sorted lists — their repr iteration
+    order varies across processes, which would key identical logical calls
+    differently (review finding 6)."""
+    def _default(obj):
+        if isinstance(obj, (frozenset, set)):
+            return sorted(str(item) for item in obj)
+        return repr(obj)
     try:
-        return json.dumps(value, sort_keys=True, default=repr)
+        return json.dumps(value, sort_keys=True, default=_default)
     except (TypeError, ValueError):
         return repr(value)
 
@@ -277,6 +284,31 @@ class _Tee:
         except Exception:
             return False
 
+    @property
+    def buffer(self):
+        # A sys.stdout.buffer.write would bypass the text tee and never
+        # replay on a hit (review finding 7) — record it too. Today the
+        # recall path prints via print() only; this closes the latent gap.
+        real = getattr(self._real, "buffer", None)
+        if real is None:
+            return None
+        tee = self
+
+        class _BytesTee:
+            def write(self, data):
+                tee.chunks.append(data.decode(
+                    getattr(tee._real, "encoding", "utf-8") or "utf-8",
+                    "replace"))
+                return real.write(data)
+
+            def flush(self):
+                return real.flush()
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        return _BytesTee()
+
     def __getattr__(self, name):
         # Delegate every other stream attribute (encoding, errors, ...)
         # to the real stream dynamically. _Tee deliberately does NOT
@@ -385,7 +417,15 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             cached = _reuse_cache.get(key)
         if cached is not None:
             _counters["coalesced"] += 1
-            _apply_effects(conn, cached, capture_dict)
+            try:
+                _apply_effects(conn, cached, capture_dict)
+            except Exception:
+                # Same eviction contract as the hit path (review finding 5):
+                # a poisoned entry must not survive to the next caller.
+                with _reuse_lock:
+                    _reuse_cache.pop(key, None)
+                _counters["hit_effect_failures"] += 1
+                raise
             if observe_sidecar:
                 _observe(conn, components, None, None, ok=True,
                          so="coalesced")
@@ -432,14 +472,28 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
         except Exception:
             capture_snapshot = None
 
-    entry_obj = _ReuseEntry(
-        copy.deepcopy(result), "".join(tee.chunks), capture_snapshot,
-        list(recorder.calls), components)
+    try:
+        entry_obj = _ReuseEntry(
+            copy.deepcopy(result), "".join(tee.chunks), capture_snapshot,
+            list(recorder.calls), components)
+        with _reuse_lock:
+            _reuse_cache[key] = entry_obj
+            _reuse_cache.move_to_end(key)
+            while len(_reuse_cache) > MAX_ENTRIES:
+                _reuse_cache.popitem(last=False)
+    except Exception:
+        # The computation SUCCEEDED but publication failed (e.g. a
+        # non-copyable result). The slot must still complete or every
+        # later identical recall blocks as a loser until the wait timeout
+        # (implementation-review finding 2): no entry is published and
+        # the failure propagates like a compute failure.
+        with _reuse_lock:
+            slot["error"] = sys.exc_info()[1]
+            slot["done"] = True
+            slot["event"].set()
+            _reuse_inflight.pop(key, None)
+        raise
     with _reuse_lock:
-        _reuse_cache[key] = entry_obj
-        _reuse_cache.move_to_end(key)
-        while len(_reuse_cache) > MAX_ENTRIES:
-            _reuse_cache.popitem(last=False)
         slot["done"] = True
         slot["event"].set()
         _reuse_inflight.pop(key, None)
