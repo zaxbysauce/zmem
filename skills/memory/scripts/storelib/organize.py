@@ -78,6 +78,7 @@ import contextlib
 import os
 import re
 import sqlite3
+from storelib import generation as _store_generation
 import sys
 import time
 
@@ -632,6 +633,7 @@ def _copy_merged_from(conn: sqlite3.Connection, old_id: str, new_id: str) -> Non
     merged = old["merged_from"] if old and old["merged_from"] else ""
     if merged:
         conn.execute("UPDATE memory SET merged_from=? WHERE id=?", (merged, new_id))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
 
 # Issue #179: the entity-card cadence sweep's five counters, in the exact

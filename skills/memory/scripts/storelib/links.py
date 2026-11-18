@@ -39,6 +39,7 @@ import sys
 from datetime import datetime, timezone
 
 from storelib.schema import _env_float, _vec_knn_in_namespace, now_iso
+from storelib import generation as _store_generation
 
 # The closed relation enum. This is the schema CHECK's Python mirror: the
 # tuple, the CHECK in storelib/schema.py (init_db + the v11 migrate block),
@@ -138,6 +139,7 @@ def adjust_trust(conn: sqlite3.Connection, mid: str, delta: float) -> None:
         "ROUND(MIN(1.0, MAX(0.0, trust_score + ?)), 10) WHERE id=?",
         (delta, mid),
     )
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
 
 def _link_row(conn: sqlite3.Connection, mid: str) -> sqlite3.Row:
@@ -180,6 +182,7 @@ def add_link(
         "(src_id, dst_id, relation, score, created_at) VALUES (?,?,?,?,?)",
         (src_id, dst_id, relation, score, created_at or now_iso()),
     )
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
     return bool(cur.rowcount)
 
 
@@ -434,6 +437,7 @@ def generate_links_on_write(
                     conn.execute(
                         "UPDATE memory SET tags=? WHERE id=?", (merged, row["id"])
                     )
+                    _store_generation.bump_mutation_generation(conn)  # issue #474 census
                     relink_memory(conn, row["id"])
     if report["subject_suppressed"]:
         from storelib import subject as _veto_subject

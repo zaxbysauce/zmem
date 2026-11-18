@@ -30,6 +30,9 @@ from storelib.entity import (
 from storelib.evidence import evidence_ids_for_memories_bounded
 from storelib.links import expand_recall_links, graph_seed_ids
 from storelib import beliefs as _beliefs
+from storelib import generation as _store_generation
+from storelib import recall_reuse as _reuse
+import storelib.recall_reuse as _reuse_mod
 from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_of_temporal_predicate, _commit, _embeddings, _env_float, _format_recency, _normalize_content, _parse_iso_to_epoch, _vec0_create_sql, now_iso, set_meta
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
@@ -5747,6 +5750,102 @@ def recall_memory(
     _state_hazard_hint: str | None = None,
     exact: bool = False,
 ) -> list[dict]:
+    """Public recall seam with the correctness-preserving reuse layer
+    (issue #474). Signature and behavior are IDENTICAL to the uncached path
+    when reuse is off (the default): the call runs the unmodified
+    implementation — telemetry, capture population, and stdout land exactly
+    where they always did. With ``ZMEM_RECALL_REUSE=1``, identical
+    successful recall work within the TTL is served from the in-process
+    cache with the recorded effect script replayed per caller (telemetry on
+    the caller's connection, capture population, stdout bytes verbatim);
+    every invalidation dimension (store mutation generation, store
+    incarnation, resolved-config fingerprint, options, session/fence,
+    expired TTL, explicit refresh) forces a recompute. Failures are never
+    cached. See ``storelib.recall_reuse`` for the full contract and the
+    observation sidecar.
+    """
+    call_kwargs = dict(
+        query=query,
+        namespace=namespace,
+        scopes=scopes,
+        limit=limit,
+        as_json=as_json,
+        min_confidence=min_confidence,
+        hybrid=hybrid,
+        no_bump=no_bump,
+        include_global=include_global,
+        global_limit=global_limit,
+        as_of=as_of,
+        prompt_timestamp=prompt_timestamp,
+        no_mmr=no_mmr,
+        link_hops=link_hops,
+        link_budget=link_budget,
+        cross_rerank=cross_rerank,
+        weights=weights,
+        no_telemetry=no_telemetry,
+        no_unfold=no_unfold,
+        for_injection=for_injection,
+        exclude_ids=exclude_ids,
+        _capture=_capture,
+        _injection_budget_tokens=_injection_budget_tokens,
+        include_cross_project=include_cross_project,
+        _cross_moment=_cross_moment,
+        _cross_ops_tokens=_cross_ops_tokens,
+        _cross_explicit=_cross_explicit,
+        _fence_id=_fence_id,
+        moment=moment,
+        lane=lane,
+        _user_global_floor=_user_global_floor,
+        _authorized_namespaces=_authorized_namespaces,
+        _state_hazard_hint=_state_hazard_hint,
+        exact=exact,
+    )
+
+    def _impl():
+        return _recall_memory_uncached(conn, **call_kwargs)
+
+    return _reuse_mod.recall_with_reuse(
+        conn, call_kwargs, _impl, _capture)
+
+
+def _recall_memory_uncached(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    namespace: str | None = None,
+    scopes: dict[str, str] | None = None,
+    limit: int = 5,
+    as_json: bool = False,
+    min_confidence: float | None = None,
+    hybrid: bool | None = None,
+    no_bump: bool = False,
+    include_global: bool = False,
+    global_limit: int = 3,
+    as_of: str | None = None,
+    prompt_timestamp: str | None = None,
+    no_mmr: bool = False,
+    link_hops: int = 1,
+    link_budget: int = 2,
+    cross_rerank: bool = False,
+    weights: dict | None = None,
+    no_telemetry: bool = False,
+    no_unfold: bool = False,
+    for_injection: bool = False,
+    exclude_ids: list[str] | None = None,
+    _capture: dict | None = None,
+    _injection_budget_tokens: int | None = None,
+    include_cross_project: bool = False,
+    _cross_moment: str | None = None,
+    _cross_ops_tokens: list[str] | None = None,
+    _cross_explicit: bool = False,
+    _fence_id: str | None = None,
+    moment: str | None = None,
+    lane: str | None = None,
+    _user_global_floor: float | None = None,
+    _authorized_namespaces: frozenset | None = None,
+    _state_hazard_hint: str | None = None,
+    exact: bool = False,
+) -> list[dict]:
     """Explicit recall entry point (UserPromptSubmit, SubagentStart,
     and SessionStart hook surfaces share this path).
 
@@ -6417,6 +6516,12 @@ def reembed_embeddings(
         conn.isolation_level = None  # manual transaction control (DDL-safe)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # issue #474: reembed rewrites every vector under the new
+            # profile — a selection-changing mutation; bump so recall reuse
+            # keys invalidate (the reembed apply is recall.py's ONLY
+            # non-telemetry mutation; _bump_telemetry deliberately does NOT
+            # bump — telemetry is not a selection mutation).
+            _store_generation.bump_mutation_generation(conn)
             if vec_table_exists and declared_dim != target_dim:
                 conn.execute("DROP TABLE memory_vec")
                 conn.execute(_vec0_create_sql(target_dim))

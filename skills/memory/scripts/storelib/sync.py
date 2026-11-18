@@ -42,6 +42,7 @@ from storelib.evidence import (
     _SQLITE_INT_MAX,
     _validate_ts,
 )
+from storelib import generation as _store_generation
 
 EXPORT_PACK_DEFAULT_PROJECT_LIMIT = 50
 
@@ -1504,6 +1505,7 @@ def _apply_expiry_record(conn: sqlite3.Connection, obj: dict) -> None:
         "VALUES (?,?,?)",
         (mid, obj["inject_until"], obj["expiry_class"]),
     )
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
     return "applied"
 
 
@@ -1803,6 +1805,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                  ingestion_ts, merged_from, _normalize_content(content),
                  trust_score, applied_count, violated_count),
             )
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             # v10 (issue #60, sync decision): entities are NOT carried in the
             # JSONL (they are store-local derived data, like content_norm and
             # embeddings); ingest REBUILDS them by running the same
@@ -1957,6 +1960,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 "UPDATE memory SET taint=? WHERE id=?",
                 (worse_taint(ex_base, taint), existing["id"]),
             )
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             # v10 (issue #60): dedup merge unioned tags onto the local keeper
             # — re-derive its entity links (same rule as add/update).
             relink_memory(conn, existing["id"])
@@ -2009,6 +2013,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
              merged_from, _normalize_content(content), trust_score,
              applied_count, violated_count),
         )
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         if emb is not None:
             try:
                 conn.execute(
@@ -2582,6 +2587,7 @@ def _strict_ingest_staged(
                     (obj["id"], obj["namespace"], obj["started_at"],
                      obj["ended_at"], summary_id, obj["token_count"]),
                 )
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
         for table, obj in rows:
             if table == "episode_memory":
@@ -2598,6 +2604,7 @@ def _strict_ingest_staged(
                     "(episode_id, memory_id, added_at) VALUES (?, ?, ?)",
                     (obj["episode_id"], obj["memory_id"], obj.get("added_at", "")),
                 )
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
         # Issue #255: an evidence row whose only junctions point at a purged
         # memory would otherwise re-insert the purged row's excerpt text (the
@@ -2629,6 +2636,7 @@ def _strict_ingest_staged(
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (obj["id"], *values),
             )
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
         if pending_links:
             from storelib.links import add_link
@@ -2678,6 +2686,7 @@ def _strict_ingest_staged(
                     "(episode_id, evidence_id) VALUES (?, ?)",
                     (obj["episode_id"], obj["evidence_id"]),
                 )
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
             elif table == "memory_evidence":
                 if (obj["memory_id"] in purged_ids
                         or obj["evidence_id"] in purged_ids):
@@ -2695,6 +2704,7 @@ def _strict_ingest_staged(
                     "(memory_id, evidence_id) VALUES (?, ?)",
                     (obj["memory_id"], obj["evidence_id"]),
                 )
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
         # v15 (#173): apply the buffered memory_expiry records AFTER every
         # base memory row has landed, inside the SAME strict transaction — a
         # rejected apply (conflicting duplicate vs the store, non-state or
@@ -3517,6 +3527,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     (e["id"], e["namespace"], e["started_at"], e["ended_at"],
                      e["summary_memory_id"], e["token_count"]),
                 )
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
                 episodes_added += 1
             known_eps = {r[0] for r in conn.execute("SELECT id FROM episode")}
             known_mem = {r[0] for r in conn.execute("SELECT id FROM memory")}
@@ -3558,6 +3569,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                     "(episode_id, memory_id, added_at) VALUES (?,?,?)",
                     (m["episode_id"], m["memory_id"], m["added_at"]),
                 )
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
             # F12 (ingest side): never keep a summary_memory_id that does not
             # resolve locally, regardless of what the file said.
             conn.execute(
@@ -3565,6 +3577,7 @@ def cmd_ingest_jsonl(conn: sqlite3.Connection, *, in_path: str,
                 "WHERE summary_memory_id!='' AND summary_memory_id NOT IN "
                 "(SELECT id FROM memory)"
             )
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             _commit(conn)
         except sqlite3.OperationalError as e:
             # episode tables absent (pre-v13 store never migrated): every

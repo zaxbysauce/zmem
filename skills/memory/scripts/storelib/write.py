@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sqlite3
+from storelib import generation as _store_generation
 import struct
 import subprocess
 import sys
@@ -1578,6 +1579,7 @@ def rekey_namespace(
             if not conn.in_transaction:
                 conn.execute("BEGIN IMMEDIATE")
                 started_tx = True
+            _store_generation.bump_mutation_generation(conn)  # issue #474: mutation invalidates recall reuse
             # PR1 guard (shared authority, single implementation): refuse this
             # bulk move BEFORE any mutation when it would concentrate two live
             # VERIFIED knowledge pointer rows for one exact reserved ref into
@@ -1828,6 +1830,7 @@ def add_memory(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+        _store_generation.bump_mutation_generation(conn)  # issue #474: mutation invalidates recall reuse
 
         # Validate inside the transaction before dedup/model work. A missing
         # endpoint is an atomic input refusal, never a partial write.
@@ -2438,6 +2441,7 @@ def supersede_memory(
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+        _store_generation.bump_mutation_generation(conn)  # issue #474: mutation invalidates recall reuse
         row = conn.execute(
             "SELECT id, superseded_at, namespace, source_ref FROM memory WHERE id=?",
             (mid,),
@@ -2872,6 +2876,7 @@ def update_memory(
         # namespace — a concurrent rekey/delete in the read-to-write window
         # (the SELECT above runs before BEGIN IMMEDIATE) matches zero rows
         # and the backstop fails closed instead of tombstoning a foreign row.
+        _store_generation.bump_mutation_generation(conn)  # issue #474: mutation invalidates recall reuse
         ts = tx_now
         if expected_old_namespace is not None:
             cur = conn.execute(
@@ -3489,6 +3494,7 @@ def feedback_memory(conn: sqlite3.Connection, *, memory_id: str,
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+        _store_generation.bump_mutation_generation(conn)  # issue #474: mutation invalidates recall reuse
         cur = conn.execute(
             f"UPDATE memory SET {column} = {column} + 1 "
             "WHERE id = ? AND superseded_at IS NULL",

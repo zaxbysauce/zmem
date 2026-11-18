@@ -64,6 +64,7 @@ from storelib.write import (
     KnowledgePointerRefusal,  # noqa: F401  (re-export: sync/ops catch this)
 )
 from redaction import redact_secret_like_text
+from storelib import generation as _store_generation
 
 __all__ = [
     "KNOWLEDGE_SOURCE_REF_PREFIX",
@@ -600,6 +601,7 @@ def _tombstone_pointer_rows(
             "supersede_reason=? WHERE id=? AND superseded_at IS NULL",
             (tx_now, tx_now, reason, rid),
         )
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         n += cur.rowcount
         try:
             conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (rid,))

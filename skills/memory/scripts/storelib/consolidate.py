@@ -24,6 +24,7 @@ from storelib.entity import relink_memory
 from storelib.schema import _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
 from storelib.write import _clear_expiry, _merge_on_dedup, supersede_memory
+from storelib import generation as _store_generation
 
 CONSOLIDATE_DEFAULT_THRESHOLD = _env_float("ZMEM_CONSOLIDATE_THRESHOLD", 0.80)
 
@@ -447,6 +448,7 @@ def _absorb_into_keeper(
         new_content = keeper_content + separator + absorbed_content
         conn.execute("UPDATE memory SET content=?, content_norm=? WHERE id=?",
                      (new_content, _normalize_content(new_content), keeper_id))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
     # Record provenance: append the absorbed id to merged_from (comma-joined,
     # accumulates across runs). `:truncated` marks an id whose content could
@@ -467,6 +469,7 @@ def _absorb_into_keeper(
     # of UNIQUE ids (the pre-v11 writer plain-appended and could repeat one).
     merged_from = _dedupe_merged_from(f"{existing},{id_entry}" if existing else id_entry)
     conn.execute("UPDATE memory SET merged_from=? WHERE id=?", (merged_from, keeper_id))
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
     # Metadata upgrade (confidence/signal/tags + retrieval_count bump). Shared
     # with write-time dedup semantics; no content change here.
@@ -487,6 +490,7 @@ def _absorb_into_keeper(
     merged_taint = worse_taint(keeper_taint, absorbed["taint"])
     if merged_taint != keeper_taint:
         conn.execute("UPDATE memory SET taint=? WHERE id=?", (merged_taint, keeper_id))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
     # Tombstone the absorbed row (kept for history; removed from live recall).
     # valid_until closes the row's validity interval at the same instant as

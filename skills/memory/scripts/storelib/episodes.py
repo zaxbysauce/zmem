@@ -34,6 +34,7 @@ from storelib.inject import row_token_cost
 from storelib.promote import _first_sentence
 from storelib.schema import _commit, now_iso
 from storelib.write import _validate_namespace, add_memory
+from storelib import generation as _store_generation
 
 # Structural identity of an episode summary row, mirroring organize's
 # "summary,topic" convention (tags are a marker, merged_from is the key).
@@ -67,6 +68,7 @@ def episode_open(conn: sqlite3.Connection, *, namespace: str) -> dict:
             "INSERT INTO episode (id, namespace, started_at) VALUES (?,?,?)",
             (eid, ns, now_iso()),
         )
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         _commit(conn)
     except Exception:
         if started_tx and conn.in_transaction:
@@ -143,6 +145,7 @@ def episode_add(conn: sqlite3.Connection, *, episode_id: str, memory_id: str) ->
             # the JSONL ISO-8601 validator on round-trip.
             (episode_id, memory_id, now_iso()),
         )
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         _commit(conn)
     except Exception:
         if started_tx and conn.in_transaction:
@@ -272,6 +275,7 @@ def episode_close(
                             (_merge_tag_strings(row["tags"] or "", "episode-summary"),
                              summary_memory_id),
                         )
+                        _store_generation.bump_mutation_generation(conn)  # issue #474 census
                     print(
                         f"[zmem] episode summary: folded into member memory "
                         f"{res}; linked as this episode's summary"
@@ -301,12 +305,14 @@ def episode_close(
                         "UPDATE memory SET tags=?, merged_from=? WHERE id=?",
                         (pinned_tags, episode_id, summary_memory_id),
                     )
+                    _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
         conn.execute(
             "UPDATE episode SET ended_at=?, token_count=?, summary_memory_id=? "
             "WHERE id=?",
             (now_iso(), token_count, summary_memory_id, episode_id),
         )
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         _commit(conn)
     except Exception:
         if started_tx and conn.in_transaction:

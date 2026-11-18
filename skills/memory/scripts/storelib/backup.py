@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
 import sqlite3
 import struct
 import subprocess
@@ -1139,7 +1140,20 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             return 1
 
     try:
-        shutil.copy2(snap, dest)
+        # Issue #474 (R2-1): stage the snapshot, rotate the store INCARNATION
+        # on the staged copy, then atomically install it. The destination
+        # never exists on disk carrying the snapshot's stale incarnation, so
+        # reuse identities cached against the previous store incarnation can
+        # never alias the restored store; a crash before the install leaves
+        # the old destination (and its cached identities) intact.
+        fd_stage, stage_str = tempfile.mkstemp(
+            prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
+        os.close(fd_stage)
+        staged_restore = Path(stage_str)
+        shutil.copy2(snap, staged_restore)
+        from storelib.generation import rotate_incarnation_on_staging
+        rotate_incarnation_on_staging(staged_restore)
+        os.replace(staged_restore, dest)
         # A hand-supplied snapshot may carry its own sidecars; ours never do.
         for suffix in ("-wal", "-shm"):
             src_sib = Path(str(snap) + suffix)
