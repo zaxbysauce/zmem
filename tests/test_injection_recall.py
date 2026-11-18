@@ -34,20 +34,41 @@ class InjectionFilterSourceTests(unittest.TestCase):
 
     def test_recall_memory_filters_injection_on_no_bump(self):
         """recall_memory must filter injection-risk rows when
-        no_bump=True (the hook path)."""
+        no_bump=True (the hook path).
+
+        Issue #474 split the public seam: recall_memory now delegates
+        through the reuse layer to _recall_memory_uncached, which owns the
+        emit-time classification. The invariant binds at BOTH: the public
+        seam must forward no_bump (keyed and forwarded — never dropped),
+        and the implementation it runs must call _classify_injection."""
         import storelib.recall as recall_mod
-        src = inspect.getsource(recall_mod.recall_memory)
+        seam_src = inspect.getsource(recall_mod.recall_memory)
+        impl_src = inspect.getsource(recall_mod._recall_memory_uncached)
         # The filter must use both the per-item classification AND
         # the no_bump flag, dropping the row.
         self.assertIn(
             "_classify_injection",
-            src,
-            "recall_memory must call _classify_injection at emit time",
+            impl_src,
+            "the recall implementation must call _classify_injection at "
+            "emit time",
         )
         self.assertIn(
             "no_bump",
-            src,
-            "recall_memory must branch on no_bump to decide omit vs prefix",
+            impl_src,
+            "the recall implementation must branch on no_bump to decide "
+            "omit vs prefix",
+        )
+        self.assertIn(
+            "no_bump",
+            seam_src,
+            "the public seam must forward no_bump (it is part of the "
+            "reuse key AND the delegated call — dropping it would change "
+            "hook-path filtering)",
+        )
+        self.assertIn(
+            "_recall_memory_uncached",
+            seam_src,
+            "the public seam must delegate to the implementation",
         )
 
     def test_recent_memory_filters_injection_on_no_bump(self):
