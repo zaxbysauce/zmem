@@ -88,20 +88,61 @@ export function childEnv(extra = {}) {
 }
 
 function run(argv, opts = {}) {
+  // Settlement law (#481 AC1/AC9): the deadline timer resolves the promise
+  // IMMEDIATELY with the output collected so far — resolution never waits
+  // for the child.  After resolving, best-effort background cleanup: a
+  // graceful kill at the deadline, escalation to SIGKILL after
+  // opts.escalateGraceMs (default 2000) if the child still has not closed;
+  // every kill is wrapped so a throwing kill never crashes the plugin; all
+  // timers are cleared on any settlement and listeners detached so late
+  // error/close events no-op (one-shot settlement).  A child closing during
+  // the grace does not alter the already-resolved result.
+  const spawnFn = opts.spawn || spawn;
   return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), {
+    let settled = false;
+    let out = "";
+    let err = "";
+    let hardTimer = null;
+    const child = spawnFn(argv[0], argv.slice(1), {
       env: opts.env || childEnv(),
       cwd: opts.cwd || ROOT,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-    let out = "";
-    let err = "";
-    const timer = setTimeout(() => child.kill(), opts.timeoutMs || 20000);
-    child.stdout.on("data", (d) => { out += d; });
-    child.stderr.on("data", (d) => { err += d; });
-    child.on("error", () => { clearTimeout(timer); resolve({ code: 1, out, err }); });
-    child.on("close", (code) => { clearTimeout(timer); resolve({ code: code ?? 1, out, err }); });
+    // FB-016b: decode at the stream boundary, BEFORE the data handlers
+    // below. Without an encoding each chunk arrives as a Buffer and
+    // `out += d` stringifies it in isolation, so a multibyte UTF-8
+    // character split across chunk boundaries corrupts to U+FFFD.
+    // setEncoding("utf8") installs Node's StringDecoder, which buffers
+    // incomplete sequences across chunks and hands the handlers decoded
+    // strings instead.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    const killSafe = (signal) => {
+      try { return child.kill(signal); } catch { return false; }
+    };
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (hardTimer) clearTimeout(hardTimer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      // Deadline: resolve immediately with the collected output.
+      settle({ code: null, out, err, timedOut: true });
+      // Best-effort cleanup, never affecting the settled result.  Listeners
+      // stay attached — the settled guard makes late events no-op (removing
+      // the error listener would make a late child error THROW as an
+      // uncaught exception, which is its own crash class).
+      killSafe();
+      const grace = opts.escalateGraceMs ?? 2000;
+      hardTimer = setTimeout(() => { killSafe("SIGKILL"); }, grace);
+    }, opts.timeoutMs || 20000);
+    child.stdout.on("data", (d) => { if (!settled) out += d; });
+    child.stderr.on("data", (d) => { if (!settled) err += d; });
+    child.on("error", () => { if (hardTimer) clearTimeout(hardTimer); settle({ code: 1, out, err }); });
+    child.on("close", (code) => { if (hardTimer) clearTimeout(hardTimer); settle({ code: code ?? 1, out, err }); });
     if (opts.stdin) { child.stdin.write(opts.stdin); }
     child.stdin.end();
   });
@@ -118,7 +159,9 @@ function lastJson(text) {
 }
 
 // Passive moment through the T-05 CLI seam (both modes; remote_gate routes).
-export async function runMoment(moment, { query = "", session, namespace, cwd }) {
+// opts.env MERGES over the consumer's env defaults (caller keys win,
+// childEnv normalization + ZMEM_HOST still apply) — never replaces them.
+export async function runMoment(moment, { query = "", session, namespace, cwd, env: extraEnv, ...opts } = {}) {
   const args = [process.execPath.startsWith("python") ? process.execPath : "python",
     "-X", "utf8", STORE_PY, "prefetch", "--reserve", "--json",
     "--query", query || "", "--namespace", namespace || "user:global",
@@ -127,7 +170,7 @@ export async function runMoment(moment, { query = "", session, namespace, cwd })
   if (process.env.ZMEM_PRINCIPAL && !(process.env.ZMEM_REMOTE_URL || "").trim()) {
     args.push("--principal", process.env.ZMEM_PRINCIPAL, "--harness", "deepseek");
   }
-  const r = await run(args, { timeoutMs: 20000, env: childEnv({ ZMEM_NAMESPACE: namespace || "" }), cwd: cwd || ROOT });
+  const r = await run(args, { timeoutMs: 20000, env: childEnv({ ZMEM_NAMESPACE: namespace || "", ...(extraEnv || {}) }), cwd: cwd || ROOT, ...opts });
   return { envelope: lastJson(r.out), raw: r };
 }
 
@@ -147,39 +190,41 @@ export function ackReservationSync(reservationId, timeoutMs = 12000) {
 
 // Explicit tools: reads via the CLI (remote_gate routes), writes via the
 // typed queue (pending receipt remote; committed receipt local).
-export async function runTool(cliArgs) {
+export async function runTool(cliArgs, opts = {}) {
   const r = await run(["python", "-X", "utf8", STORE_PY, ...cliArgs],
-    { timeoutMs: 30000 });
+    { timeoutMs: 30000, ...opts });
   return { code: r.code, result: lastJson(r.out), raw: r };
 }
 
-export async function enqueueOp(op, argsJson, dedupKey) {
+export async function enqueueOp(op, argsJson, dedupKey, opts = {}) {
   const argv = ["python", "-X", "utf8", STORE_PY, "ops-enqueue",
     "--op", op, "--args", JSON.stringify(argsJson), "--json"];
   if (dedupKey) argv.push("--dedup-key", dedupKey);
-  const r = await run(argv, { timeoutMs: 15000 });
+  const r = await run(argv, { timeoutMs: 15000, ...opts });
   return { code: r.code, receipt: lastJson(r.out), raw: r };
 }
 
-export async function flushLocal() {
+export async function flushLocal(opts = {}) {
   const r = await run(["python", "-X", "utf8", STORE_PY, "ops-flush",
-    "--local", "--json"], { timeoutMs: 60000 });
+    "--local", "--json"], { timeoutMs: 60000, ...opts });
   return { code: r.code, receipts: lastJson(r.out), raw: r };
 }
 
 // Capture through the shared python entry (always-on redaction, dedup).
-export async function runCapture(kind, text, meta = {}) {
+export async function runCapture(kind, text, meta = {}, opts = {}) {
   const payload = JSON.stringify({ kind, text, ...meta });
   const r = await run(["python", "-X", "utf8", CAPTURE_PY],
-    { timeoutMs: 15000, stdin: payload });
+    { timeoutMs: 15000, stdin: payload, ...opts });
   return { code: r.code, result: lastJson(r.out), raw: r };
 }
 
 // The shared reflect hook (bounded nudge; its own eligibility governs).
-export async function runReflect(session, namespace) {
-  const env = childEnv({ ZMEM_NAMESPACE: namespace || "", ZMEM_SESSION: session || "" });
+// opts.env MERGES over the consumer's env defaults (caller keys win,
+// childEnv normalization + ZMEM_HOST still apply) — never replaces them.
+export async function runReflect(session, namespace, { env: extraEnv, ...opts } = {}) {
+  const env = childEnv({ ZMEM_NAMESPACE: namespace || "", ZMEM_SESSION: session || "", ...(extraEnv || {}) });
   const r = await run(["bash", path.join(ROOT, "hooks", "zmem-reflect.sh")],
-    { timeoutMs: 12000, env, stdin: JSON.stringify({ session_id: session || "" }) });
+    { timeoutMs: 12000, env, stdin: JSON.stringify({ session_id: session || "" }), ...opts });
   return { ok: r.code === 0, out: r.out, raw: r };
 }
 
@@ -193,14 +238,13 @@ export async function runReflect(session, namespace) {
 // to --no-capture so the helper renders read-routing WITHOUT a capture
 // invitation. The CALLER owns the ZMEM_INJECT=0 gate (no spawn at all
 // under it). Cheap by contract — no model, no store, no network, no root
-// stat — and time-bounded by the kill timer in run(); the bound is
-// best-effort, not a hard deadline: a helper that ignores its kill
-// signal can still stall the pre-step (base debt — the timer only
-// requests the kill; resolution rides the child's close event).
+// stat. run() enforces a HARD deadline (#481 F-008): the promise
+// resolves ON the timeout and escalates to SIGKILL after a grace, so a
+// helper that ignores the first kill can no longer stall the pre-step.
 // Fail-open everywhere: absent helper (checkouts without it), non-zero
 // exit, timeout, or empty output (the companion's default-off state) all
 // yield { text: "" } and the caller appends nothing.
-export async function runPolicy({ timeoutMs = 5000 } = {}) {
+export async function runPolicy({ timeoutMs = 5000, env: extraEnv, ...opts } = {}) {
   try {
     if (!fs.existsSync(POLICY_PY)) {
       return { text: "", reason: "helper-absent" };
@@ -211,7 +255,9 @@ export async function runPolicy({ timeoutMs = 5000 } = {}) {
   const captureOff = (process.env.ZMEM_CAPTURE || "").trim() === "0";
   const argv = ["python", "-X", "utf8", POLICY_PY, "--text"];
   if (captureOff) argv.push("--no-capture");
-  const r = await run(argv, { timeoutMs, env: policyEnv() });
+  // opts.env MERGES over the minimal resolver env (caller keys win;
+  // the policyEnv exclusions otherwise stay exact).
+  const r = await run(argv, { timeoutMs, env: { ...policyEnv(), ...(extraEnv || {}) }, ...opts });
   if (r.code !== 0) return { text: "", reason: "exit-" + r.code };
   const text = (r.out || "").trim();
   if (!text) return { text: "", reason: "disabled" };

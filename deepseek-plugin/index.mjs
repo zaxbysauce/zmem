@@ -12,6 +12,7 @@ import { identity, ledgerKey } from "./identity.mjs";
 import * as backend from "./launcher.mjs";
 import { registerTools, TOOL_SPECS } from "./tools.mjs";
 import { classifyUserCorrection, classifyToolOutcome } from "./capture.mjs";
+import { CAPS, boundReceipts, boundCaptureQueue } from "./state.mjs";
 
 const STATE_SCHEMA = "zmem-deepseek-state-v1";
 const COMPACTION_EVENTS = new Set(["compaction/start", "compaction/end",
@@ -76,8 +77,17 @@ export function plugin(ctx, config = {}) {
     // accessors; per-session policyResolved/policyDelivered entries are
     // authoritative). Empty string + "none" = no policy lane engaged.
     policyDeliveredText: "", policyReason: "none",
+    pendingAtDispose: 0, disposeDrained: 0,
   };
   const writeState = () => {
+    // AC13 pin 3 (#481), corrected (FB-008): the earlier wording
+    // "policyDeliveredText is retained per-session" overstated it —
+    // policyDeliveredText is the single TOP-LEVEL projection of the
+    // most recently delivered policy text, NOT a per-session value and
+    // NOT bounded with a session entry (the per-session state is the
+    // policyResolved/policyDelivered flags). It persists at top level
+    // in this state file until a later delivery replaces it —
+    // disclosed here at the state-file write site.
     if (!statePath()) return;
     try {
       fs.writeFileSync(statePath(), JSON.stringify(state, null, 1));
@@ -193,13 +203,14 @@ export function plugin(ctx, config = {}) {
             event_id: (m.source.captureEventId || null),
           })).then((r) => {
             if (r.result && r.result.ok && !r.result.deduped) {
-              state.captureQueue.push({
-                kind: "correction", redacted: true,
-                deduped: Boolean(r.result.deduped),
-                text: String(r.result.text || ctext.slice(0, 120)),
-                host: "deepseek", session: sid,
-                namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
-              });
+              state.captureQueue = boundCaptureQueue(
+                [...state.captureQueue, {
+                  kind: "correction", redacted: true,
+                  deduped: Boolean(r.result.deduped),
+                  text: String(r.result.text || ctext.slice(0, 120)),
+                  host: "deepseek", session: sid,
+                  namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
+                }], CAPS.captureQueue, sid);
               writeState();
             }
           }).catch(() => { /* fail-open */ });
@@ -234,6 +245,12 @@ export function plugin(ctx, config = {}) {
             source: { kind: POLICY_SOURCE_KIND, form: "knowledge-policy" },
           });
           entry.policyDelivered = true;
+          // FB-008 correction: policyDeliveredText is the single
+          // TOP-LEVEL projection of the most recently delivered policy
+          // text — NOT per-session and NOT bounded with the session
+          // entry (the per-session state is the
+          // policyResolved/policyDelivered flags above); each later
+          // delivery replaces it.
           state.policyDeliveredText = pol.text;
         }
         project(ident, entry);
@@ -365,15 +382,26 @@ export function plugin(ctx, config = {}) {
     if (CAPTURE_OFF() || !classifyToolOutcome(exec, result)) return;
     const text = String(result.error?.message || "").slice(0, 2000);
     if (!text) return;
+    const sid = String(exec?.agent?.id || "");
     trackCapture(backend.runCapture("failure", text, {
-      session: String(exec?.agent?.id || ""),
+      session: sid,
       namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
     })).then((r) => {
       if (r.result && r.result.ok) {
-        state.captureQueue.push({
-          kind: "failure", redacted: true, deduped: Boolean(r.result.deduped),
-          text: text.slice(0, 120),
-        });
+        state.captureQueue = boundCaptureQueue(
+          [...state.captureQueue, {
+            kind: "failure", redacted: true, deduped: Boolean(r.result.deduped),
+            // FB-016a: the queued text is the capture entry's REDACTED
+            // r.result.text (hooks/lib/zmem-capture-entry.py returns the
+            // redacted form for failure captures too, already bounded to
+            // 120 chars there) — NEVER the raw error message, which can
+            // carry secret-shaped tokens the entry just neutralized while
+            // this entry is labelled redacted: true. Falls back to an
+            // empty string, never to the raw text.
+            text: String(r.result.text || ""),
+            host: "deepseek", session: sid,
+            namespace: (process.env.ZMEM_NAMESPACE || "user:global"),
+          }], CAPS.captureQueue, sid);
         writeState();
       }
     }).catch(() => { /* fail-open */ });
@@ -451,25 +479,33 @@ export function plugin(ctx, config = {}) {
     // so the drain below can be cut short at teardown. No capture data
     // is lost by that (each capture's durable write happens in its own
     // Python child); the exposure is the delivery-ledger ack
-    // bookkeeping. The disclosure fields are written to state BEFORE
-    // the drain await so they land durably even when the drain is cut
-    // short. A capture still pending at dispose is DISCLOSED in
-    // state (disposeDrained) and its outcome preserved in
-    // captureQueue/state — never silently dropped; the pending state
-    // file itself is always preserved. Ordinary disposal is NOT
-    // persisted-session termination: per-session entries persist.
+    // bookkeeping. The disclosure fields (persistsAcrossDispose,
+    // pendingAtDispose) are written to the state file BEFORE the
+    // un-awaited drain so they land durably even when the drain is cut
+    // short at teardown; disposeDrained is added AFTER the drain from
+    // settled-ok outcomes (best effort — a cut-short drain undercounts
+    // it by design). A capture still pending at dispose is disclosed in
+    // pendingAtDispose, NOT in disposeDrained; its outcome is preserved
+    // in captureQueue/state — never silently dropped. Ordinary disposal
+    // is NOT persisted-session termination: per-session entries persist.
     state.persistsAcrossDispose = true;
+    // AC13 pin 2 (#481): disposeDrained DERIVES from actual drain outcomes
+    // (how many pending captures settled at this dispose), with the legacy
+    // pending-at-dispose count DISCLOSED in its own field.
     const pendingCount = pendingCaptures.size;
-    if (pendingCount > 0) {
-      state.disposeDrained =
-        (state.disposeDrained || 0) + pendingCount;
-    }
+    state.pendingAtDispose =
+      (state.pendingAtDispose || 0) + pendingCount;
     writeState();
     if (pendingCount > 0) {
       try {
-        await Promise.allSettled([...pendingCaptures]);
+        const settled = await Promise.allSettled([...pendingCaptures]);
+        const drained = settled.filter(
+          (s) => s.status === "fulfilled" && s.value
+            && s.value.result && s.value.result.ok).length;
+        state.disposeDrained = (state.disposeDrained || 0) + drained;
       } catch { /* fail-open */ }
     }
+    writeState();
   });
 
   try {
@@ -479,7 +515,22 @@ export function plugin(ctx, config = {}) {
         writeState();
       },
       onReceipt: (receipt) => {
-        state.receipts.push(receipt);
+        // FB-008 phantom-pending fix, scoped so the FROZEN write-time
+        // retention law below is not rewritten: enqueue and flush
+        // report the SAME op_id, and a TERMINAL (flush) receipt
+        // RETIRES only its own stale PENDING twin — the phantom a
+        // committed outcome would otherwise leave behind in
+        // pendingReceipts. Same-status twins and every other receipt
+        // flow through boundReceipts untouched, so the frozen
+        // terminal-first bound still governs the retained window.
+        const opId = receipt && receipt.op_id;
+        const base = (receipt && receipt.status !== "pending"
+          && opId != null && opId !== "")
+          ? state.receipts.filter(
+              (x) => !(x && x.op_id === opId && x.status === "pending"))
+          : state.receipts;
+        state.receipts = boundReceipts(
+          [...base, receipt], CAPS.receipts);
         state.pendingReceipts = state.receipts.filter(
           (x) => x.status === "pending").length;
         writeState();

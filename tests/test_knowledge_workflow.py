@@ -1035,7 +1035,9 @@ class RejectionTerminalTests(unittest.TestCase):
         self.assertEqual(env.delivery.pending(), [])
         intent = env.delivery.get_intent("knowledge:notes:run-notes",
                                          namespace="user:global")
-        self.assertEqual(intent["state"], "rejected")
+        # FB-017: a pointer_cas_stale rejection records the RETRYABLE
+        # cas_stale intent state (knowledge retry re-enqueues the stake).
+        self.assertEqual(intent["state"], "cas_stale")
         self.assertEqual(intent["op_id"], first["pointer"]["op_id"])
         # NEW content recovers once the hub accepts: fresh entry, applied.
         healed = _PointerHub(pointer=None)
@@ -1082,7 +1084,9 @@ class RejectionTerminalTests(unittest.TestCase):
                          [flush["rejected"][0]["op_id"]])
         intent = env.delivery.get_intent("knowledge:notes:run-notes",
                                          namespace="user:global")
-        self.assertEqual(intent["state"], "rejected")
+        # FB-017: a pointer_cas_stale rejection records the RETRYABLE
+        # cas_stale intent state (the stake is still kept verbatim).
+        self.assertEqual(intent["state"], "cas_stale")
         self.assertEqual(intent["op_id"], first["pointer"]["op_id"])
         self.assertIsNone(intent["expected_row_id"])  # stake kept verbatim
         # New content stakes the hub's LIVE row and advances.
@@ -1716,7 +1720,9 @@ class FlushRestartRecoveryTests(unittest.TestCase):
             "quarantined")
         intent = env.delivery.get_intent("knowledge:notes:run-notes",
                                          namespace="user:global")
-        self.assertEqual(intent["state"], "rejected")
+        # FB-017: the pointer_cas_stale rejection records the RETRYABLE
+        # cas_stale intent state in the restart-recovery lane too.
+        self.assertEqual(intent["state"], "cas_stale")
 
 
 class CreateFailureTests(unittest.TestCase):

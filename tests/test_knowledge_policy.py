@@ -814,8 +814,10 @@ class HygieneTest(unittest.TestCase):
                 if node.module:
                     imported.add(node.module.split(".")[0])
         self.assertEqual(imported, {"__future__", "glob", "json", "os",
-                                    "re", "sys"},
-                         "policy.py must keep its stdlib-only closed set")
+                                    "re", "sys", "unicodedata"},
+                         "policy.py must keep its stdlib-only closed set "
+                         "(unicodedata: the FB-005 description charset "
+                         "categories)")
 
     def test_file_opens_are_read_only(self):
         tree = ast.parse(POLICY.read_text(encoding="utf-8"))

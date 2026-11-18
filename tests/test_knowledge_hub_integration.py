@@ -63,17 +63,25 @@ Run (the ``mcp`` package is required — the interpreter must have it):
 
 from __future__ import annotations
 
-import _store_guard  # noqa: F401  (issue #244 isolation guard)
+import os
+import sys
+import tempfile
+
+# Scratch env pinned BEFORE the isolation guard (a developer box with a
+# real default store would otherwise be refused at import time; the pin
+# mirrors the tests/test_knowledge_documents.py header idiom and changes
+# no test behavior — every test builds its own env dicts).
+_GUARD_TMP = tempfile.mkdtemp(prefix="zmem-hubit-mod-")
+os.environ["ZMEM_STORE"] = os.path.join(_GUARD_TMP, "store.sqlite")
+os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
+import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 
 import importlib.util
 import io
 import json
-import os
 import socket
 import sqlite3
 import subprocess
-import sys
-import tempfile
 import time
 import unittest
 import uuid
@@ -1183,6 +1191,186 @@ class OldHubCapabilityNegativeTest(unittest.TestCase):
             f"http://127.0.0.1:{_free_port()}/mcp", "zmem-hub-it-dead")
         status, _detail = hub_capability_status(dead)
         self.assertEqual(status, "unreachable", status)
+
+
+# ---------------------------------------------------------------------------
+# C18 REFERENCE evidence (issue trace 480-481-482, r2): the REAL
+# `store.py knowledge capture` CLI against the IN-PROCESS reference KB
+# server (the conformance contract from
+# tests/test_kb_server_publication_contract.py).  Self-contained: no hub
+# subprocess — this pins the CLIENT side end-to-end against a conforming
+# server.  REFERENCE ONLY, not closure: issue #482's deployed-server ACs
+# (AC4-AC6) are split out of this PR and stay open on the issue (the
+# deployed fleet KB server does not conform today).
+
+import http.server  # noqa: E402  (C18 reference leg, appended)
+import shutil  # noqa: E402
+import threading  # noqa: E402
+import urllib.parse  # noqa: E402
+
+
+class _ReferenceKBHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal conforming vault server (create-only, grammar-gated,
+    bearer-auth) — the reference contract, in-process."""
+
+    vault: Path | None = None
+    token: str = "kb-c18-reference-token-0123456789"
+
+    def log_message(self, *args):  # silence
+        pass
+
+    @classmethod
+    def reset(cls, vault: Path) -> None:
+        _ReferenceKBHandler.vault = vault
+
+    def _authorized(self) -> bool:
+        return self.headers.get("Authorization") == \
+            "Bearer " + _ReferenceKBHandler.token
+
+    def _locator(self) -> str:
+        return urllib.parse.unquote(self.path[len("/api/notes/"):])
+
+    def _reply(self, status: int, obj: dict | None = None) -> None:
+        payload = b"" if obj is None else json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        if payload:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+
+    def _gate(self) -> str | None:
+        from knowledge.documents import parse_locator
+        locator = self._locator()
+        try:
+            parse_locator(locator)
+        except ValueError:
+            self._reply(400)
+            return None
+        return locator
+
+    def do_POST(self):  # noqa: N802 (http.server naming)
+        if not self._authorized():
+            self._reply(401)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        if (not isinstance(body, dict) or body.get("mode") != "create"
+                or not isinstance(body.get("content"), str)):
+            self._reply(400)
+            return
+        locator = self._gate()
+        if locator is None:
+            return
+        final = _ReferenceKBHandler.vault / locator
+        if final.exists():
+            self._reply(409)
+            return
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(body["content"].encode("utf-8"))
+        self._reply(201, {"locator": locator})
+
+    def do_GET(self):  # noqa: N802
+        if not self._authorized():
+            self._reply(401)
+            return
+        locator = self._gate()
+        if locator is None:
+            return
+        final = _ReferenceKBHandler.vault / locator
+        if not final.exists():
+            self._reply(404)
+            return
+        self._reply(200, {"content": final.read_bytes().decode("utf-8")})
+
+
+class KbHttpCaptureReferenceTest(unittest.TestCase):
+    """C18: real CLI capture -> 201 -> GET readback digest verified."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="zmem-c18-ref-")).resolve()
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.vault = self.tmp / "vault"
+        self.vault.mkdir()
+        _ReferenceKBHandler.reset(self.vault)
+        self.httpd = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _ReferenceKBHandler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                       daemon=True)
+        self.thread.start()
+        self.addCleanup(self.thread.join, 5)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.endpoint = "http://127.0.0.1:%d/api/notes" \
+            % self.httpd.server_address[1]
+        # A scratch LOCAL store (capture links the pointer locally).
+        self.env = dict(os.environ)
+        self.env["ZMEM_STORE"] = str(self.tmp / "store.sqlite")
+        self.env["ZMEM_DATA"] = str(self.tmp)
+        self.env["ZMEM_MODELS_DIR"] = str(self.tmp / "no-models")
+        self.env["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
+        self.env["ZMEM_KB_TEST_TOKEN"] = _ReferenceKBHandler.token
+        for key in ("ZMEM_REMOTE_URL", "ZMEM_MCP_URL", "ZMEM_MCP_TOKEN"):
+            self.env.pop(key, None)
+        proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo script
+            [sys.executable, "-X", "utf8", str(STORE_PY), "stats"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=self.env, cwd=str(REPO_ROOT), timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        (self.tmp / "config.json").write_text(json.dumps({
+            "knowledge": {"enabled": True, "targets": {
+                "notes": {"kind": "kb-http", "endpoint": self.endpoint,
+                          "allow_http": True,
+                          "credential_env": "ZMEM_KB_TEST_TOKEN"}}}
+        }), encoding="utf-8")
+
+    def test_real_cli_capture_against_reference_server(self):
+        # The REAL capture CLI, local mode, kb-http target.
+        proc = subprocess.run(  # noqa: S603 - fixed interpreter + repo script
+            [sys.executable, "-X", "utf8", str(STORE_PY), "knowledge",
+             "capture", "--target", "notes", "--key", "guides/deploy",
+             "--namespace", "project:reference", "--content",
+             "reference capture body", "--json"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=self.env, cwd=str(REPO_ROOT), timeout=180)
+        self.assertIn(proc.returncode, (0, 3),
+                      "capture must succeed (0) or pend published (3): "
+                      "%r %r" % (proc.stdout[-300:], proc.stderr[-300:]))
+        envelope = json.loads(proc.stdout)
+        self.assertTrue(envelope["doc_published"], envelope)
+        self.assertTrue((self.vault / envelope["locator"]).is_file(),
+                        "the reference server holds the document")
+        if proc.returncode == 0:
+            self.assertTrue(envelope["ok"], envelope)
+
+        # GET readback through the REAL KBClient, digest verified.
+        from knowledge.config import KBHTTPTarget
+        from knowledge.documents import (KBClient, content_digest,
+                                         prepare_document)
+
+        doc = prepare_document("notes", "guides/deploy",
+                               "reference capture body")
+        self.assertEqual(doc.locator, envelope["locator"])
+        client = KBClient(KBHTTPTarget(
+            id="notes", endpoint=self.endpoint, allow_http=True,
+            credential_env="ZMEM_KB_TEST_TOKEN", timeout_s=10.0,
+            max_response_bytes=65536),
+            env={"ZMEM_KB_TEST_TOKEN": _ReferenceKBHandler.token})
+        bytes_back = client.read(doc.locator)
+        self.assertEqual(content_digest(bytes_back), doc.digest,
+                         "the real client's GET readback digest-verifies "
+                         "the captured document")
+
+        # And the CLI's own verification surface agrees.
+        check = subprocess.run(  # noqa: S603 - fixed interpreter + repo script
+            [sys.executable, "-X", "utf8", str(STORE_PY), "knowledge",
+             "check", "--target", "notes", "--key", "guides/deploy",
+             "--namespace", "project:reference", "--json"],
+            capture_output=True, text=True, encoding="utf-8",
+            env=self.env, cwd=str(REPO_ROOT), timeout=180)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertTrue(json.loads(check.stdout)["matches"])
 
 
 if __name__ == "__main__":

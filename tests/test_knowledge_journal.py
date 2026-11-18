@@ -97,7 +97,10 @@ class JournalBasics(unittest.TestCase):
             self.assertNotIn(canary, raw)
         obj = json.loads(raw.decode("utf-8"))
         allowed = {"seq", "target_id", "logical_key", "ref", "locator",
-                   "digest", "state", "updated_at", "namespace"}
+                   "digest", "state", "updated_at", "namespace",
+                   # Optional retry-provenance fields (#480 FB-008):
+                   # present only when set; never note-body content.
+                   "op_id", "retry_ref", "summary", "staked_at"}
         self.assertTrue(set(obj["entries"][0]).issubset(allowed))
 
     def test_idempotent_same_version(self):

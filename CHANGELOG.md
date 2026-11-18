@@ -5,6 +5,73 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.161.0] - 2026-11-17
+
+### Added
+
+- `knowledge retry` (#480 FB-008): scoped recovery for stale-CAS
+  quarantined publications — retries the ORIGINAL CAS stake (never
+  refreshed; a still-stale stake refuses typed naming the original
+  version; a CAS-cause hub rejection is retry-eligible), refuses
+  typed naming the cause for non-CAS quarantine causes (operator
+  pull, a non-CAS hub rejection, a conflict), preserves the
+  quarantined entry verbatim, lands a fresh
+  entry with `retry_ref` linkage and a durable op id, completes
+  crash-left partials, and in remote mode enqueues the original stake on
+  a capable hub AND lands its own `pointer_queued` journal entry (the
+  reported op id is the durable queued identity; a repeat retry
+  re-selects idempotently). The flush lane advances the entry to
+  applied — including recovery from the persisted receipt alone after a
+  crash between the receipt and the journal mark (`flush()` reports the
+  new `journal_reconciled`/`recovered_from_receipts` result keys). An
+  unreachable hub exits 3 pending with nothing enqueued. Gated by
+  ZMEM_CAPTURE=0 like capture/flush; journal records carry
+  op_id/summary/staked_at provenance preserved through mark().
+- Optional `description` on markdown and kb-http knowledge targets
+  (#482 AC1-AC3): 1..200 codepoints, single-line only; rendered on the
+  policy roster line and in `knowledge status` (human + JSON); strict
+  refusal for invalid forms on both validators; aggregate rendering
+  uses a deterministic downward-search truncation so a valid config
+  never renders an empty policy. Mixed-version note: pre-0.161.0
+  clients reject a config carrying description (strict unknown-key
+  refusal — remove the key to run an older client) and silently strip
+  the new journal provenance fields on rewrite (an in-flight
+  pointer_queued retry loses its recovery identity — a repeat retry
+  then refuses "(not quarantined)" until an operator re-queues; no
+  note content or pointer row is lost).
+- Knowledge namespace-maintenance contract docs (#480 FB-031): the
+  drain-first ordered procedure, the dated (2026-11-15)
+  stranded-state-remediation ruling (explicit operator action only for
+  each named state), and the explicit does-not-see-remote boundary.
+- Server-side kb-http publication contract docs (#482): create-only
+  semantics, scoped auth, locator-grammar safety, and the corrected
+  fleet note (the deployed fleet KB server does NOT yet implement the
+  grammar; tracked on #482 AC4-AC6).
+
+### Fixed
+
+- deepseek launcher `run()` timeout is now a deadline (#481 F-008):
+  the promise resolves ON the timeout with the collected output
+  (`timedOut: true`) and escalates to SIGKILL after a grace; a child
+  closing during the grace no longer stalls the pre-step indefinitely.
+  All seven consumers (runMoment, runTool, enqueueOp, flushLocal,
+  runCapture, runReflect, runPolicy) accept a trailing options object;
+  runMoment, runReflect, and runPolicy MERGE a caller-supplied env
+  over their defaults (merged, never replacing — caller keys win,
+  childEnv normalization still applies), while the other four
+  (runTool, enqueueOp, flushLocal, runCapture) keep run()'s either-or
+  env handling unchanged — a caller-provided env is authoritative
+  there.
+- Bounded plugin state (#481 CS-010): `state.receipts` and
+  `state.captureQueue` are hard-bounded (32) with state-aware eviction
+  (terminal-first / non-current-first recency window); `disposeDrained`
+  is derived from actual drain outcomes with the legacy count disclosed
+  in `pendingAtDispose`; the policyDeliveredText retention and the
+  POLICY_VERSION deliberate-display-constant are disclosed at their
+  sites; the spawn pre-check evaluation (measured 0.2 s) is recorded as
+  a deliberately open option.
+
+
 ## [0.160.0] - 2026-11-16
 
 ### Fixed

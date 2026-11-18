@@ -133,6 +133,7 @@ config error, exit 2 — never silently half-enabled):
 |--------|----------|---------|
 | `kind` | yes | the literal `markdown` |
 | `root` | yes | ONE absolute path to the vault root (no `..` components) |
+| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.161.0 clients under the strict unknown-key law |
 
 The root must **already exist and be a real directory** — the companion
 never creates the vault root, only note files (and the locator's
@@ -154,6 +155,7 @@ portable across operating systems (CMP-011).
 | `token_file` | (see above) | absolute path to a file holding the bearer token (≤ 4096 bytes) |
 | `timeout_s` | no | timeout per individual socket operation, 0.1..120 s (default 10) — NOT an overall request deadline: one create or read is a multi-step exchange (connect, send, receive), so a single exchange can legitimately take longer than one `timeout_s` |
 | `max_response_bytes` | no | response body cap, 256..16777216 (default 1048576) |
+| `description` | no | optional operator note, 1..200 codepoints, single-line (no CR/LF/TAB/C0); shown on policy roster and knowledge status. Rejected by pre-0.161.0 clients under the strict unknown-key law |
 
 Credentials are explicit by design: exactly one named location per target,
 and the token **value** is read only at request time — it is never written
@@ -212,6 +214,9 @@ decides the mode.
 <interpreter> <store.py> knowledge status [--target notes] \
   [--key recipes/sourdough] [--namespace user:global] [--json]
 
+<interpreter> <store.py> knowledge retry --target <id> --key <key> \
+  [--namespace <ns>] [--json]
+
 <interpreter> <store.py> knowledge flush [--json]
 ```
 
@@ -257,7 +262,8 @@ Argument notes:
   mismatch (the refusal below), or a `status` that found pointer-store
   corruption (duplicate live verified rows: the JSON envelope carries
   `"ok": false` plus a per-identity, content-free `corruption` entry, and
-  no winner is silently picked).
+  no winner is silently picked), or a retry typed refusal (quarantine
+  cause not a stale CAS, or the original stake still stale).
 - `2` — a refusal: usage errors, an invalid `knowledge` config object, a
   disabled companion (this refuses `capture` AND `flush`, before any
   store or hub access, preserving pending queue entries), the
@@ -268,8 +274,9 @@ Argument notes:
   or undecodable target bytes on a digest-matching `read`.
 - `3` — pending: a `capture` whose immutable version IS published but
   whose pointer is `pending` or merely `queued`, or a `flush` that left
-  entries pending (including local-mode leftovers that need remote mode).
-  Distinct from both `0` and `1` on purpose.
+  entries pending (including local-mode leftovers that need remote mode),
+  or a retry in remote mode kept pending by an unreachable hub (nothing
+  enqueued). Distinct from both `0` and `1` on purpose.
 
 `queued` and `pending` are **states**, not success. When the distinction
 matters, read `pointer.status` (`created` / `advanced` / `noop` /
@@ -307,7 +314,17 @@ anything:
 The journal lives at `<store_dir>/knowledge/journal.json` (remote mode:
 the data dir). It records identity, locator, digest, and a state — **never
 the note body** — bounded to 1000 entries / 4 MiB, written atomically
-(tmp + fsync + replace) under a cross-process OS byte lock.
+(tmp + fsync + replace) under a cross-process OS byte lock. The journal
+format version stays 1; entries written by 0.161.0+ carry retry
+provenance (op_id/retry_ref/summary/staked_at) as OPTIONAL fields, so
+a pre-0.161.0 client accepts the journal — but its writer does not
+know the fields, so any rewrite silently strips them. The consequence:
+an in-flight `pointer_queued` retry loses its recovery identity
+(retry_ref), and a repeat `knowledge retry` refuses with "(not
+quarantined)" until an operator re-queues the work. No note content or
+pointer row is lost. A pre-0.161.0 client also rejects a
+config carrying description at load (strict unknown-key refusal); do
+not mix client versions on one store.
 
 Journal states:
 
@@ -330,12 +347,20 @@ create (drive it to a terminal state first); once the
 latest intent is terminal, a new digest records a fresh `doc_pending`
 entry — the next version of the same note.
 
-**Quarantine has no recovery command yet.** A quarantined entry is
-terminal: re-publishing the SAME digest under that identity is refused
-(there is no `clear`/`retry` command today — an explicit recovery
-surface is pending an owner decision), while publishing NEW content
-(different digest) records a fresh intent normally. The quarantined
-history is always retained for inspection via `knowledge status`.
+**Quarantine recovery is scoped by cause (#480 FB-008).** A
+quarantined entry is terminal, and the recovery surface is
+`knowledge retry`: a stale-CAS quarantine (the pointer moved after the
+stake) is recoverable — retry re-runs the ORIGINAL stake (a still-stale
+stake refuses typed, mutating nothing) and lands a fresh applied entry
+with the original preserved verbatim. Every other cause (an operator
+pull, a non-CAS hub rejection, a conflict) stays terminal: retry refuses with
+the cause named, and recovery is a deliberate operator action.
+Re-publishing the SAME digest under a quarantined identity is refused
+by capture (exit 2, pointing at retry); recovery of a stale-CAS
+quarantine routes through knowledge retry (0 applied / 1 typed
+refusal / 3 remote-pending), and publishing NEW content (different
+digest) records a fresh intent normally. The quarantined history is
+always retained for inspection via `knowledge status`.
 
 ## The pointer contract (namespace, payload, CAS)
 
@@ -593,8 +618,10 @@ the hub actually applied (`pointer_queued` → `applied`).
   a FLEET-WIDE CLIENT DRAIN is mandatory — every client must flush or
   quiesce its in-flight knowledge publications first; already-stranded
   FB-031 states (a quarantined old-namespace identity, an orphaned
-  first-create pointer, an eternal pending entry) require separately
-  designed remediation pending an explicit owner decision — not a rekey.
+  first-create pointer, an eternal pending entry) are governed by the
+  stranded state remediation ruling of 2026-11-15 (the section below):
+  remediation for each is explicit operator action only — not a rekey,
+  never automatic.
 
 ## Concurrency and known limitations
 
@@ -677,6 +704,79 @@ are content-free: `committed`/`duplicate` with `link_status` (`created`/
 `advanced`/`noop`), or rejected with `pointer_cas_stale`,
 `pointer_conflict`, `capability_denied`, `namespace_not_allowed`, or
 `bad_op`.
+
+## Namespace maintenance for knowledge pointers (drain-first)
+
+Before ANY namespace rekey that may touch a namespace holding knowledge
+pointers, run the drain-first procedure IN ORDER:
+
+1. Quiesce knowledge capture on every client that publishes into the
+   namespace (the explicit-command law means this is an operator pause,
+   not a flag).
+2. Drain the delivery queue: every client runs `knowledge flush` (remote
+   mode) or lets its local capture complete; the sidecars must show no
+   `queued` entries for the namespace.
+3. Confirm the journal is idle: no non-terminal (`doc_pending`,
+   `doc_verified`, `pointer_queued`) entry for the namespace, in every
+   client's journal.
+4. Rekey (`rekey-namespace --from/--near-miss-global`, `--map --confirm`,
+   or the automatic v5 migration lane — the guard covers all three and
+   refuses, before any mutation, while any in-flight publication remains).
+
+In short, the ordered procedure is: quiesce, then drain, then confirm
+the journal is idle, then rekey.
+
+The local guard **does not see remote** namespace moves: it coordinates
+only the sidecars on the machine performing the rekey, so a
+fleet-wide drain is mandatory before any rekey of a knowledge-bearing
+namespace — a remote client's in-flight publication is invisible to the
+guard until it strands.
+
+### Stranded-state remediation — owner ruling 2026-11-15
+
+The stranded-state remediation ruling is recorded for each known
+stranded state, and in every case the decision is remediation by
+explicit operator action only:
+
+- quarantined old-namespace identity: ruled 2026-11-15 — recovery is
+  `knowledge retry` on a stale-CAS quarantine (explicit operator
+  action); non-CAS causes stay quarantined until the operator clears
+  them deliberately.
+- orphaned first-create pointer: ruled 2026-11-15 — the orphan is left
+  as-is (dead rows never surface in recall); re-linking is an explicit
+  operator action (`knowledge capture` of the same content re-stakes),
+  never automatic.
+- eternal pending entry: ruled 2026-11-15 — the pending queue entry is
+  preserved for operator inspection; resolution is an
+  explicit operator action (`knowledge flush` against a capable hub, or
+  deliberate clearing), never a background reaper.
+
+No automatic remediation, remap, or tombstone of stranded pointers
+ships: a completed namespace move never silently rewrites them.
+
+## The server-side publication contract (kb-http targets)
+
+A server backing a `kb-http` target must implement exactly the wire
+contract above, with these server-side laws:
+
+- Create-only: `POST` of an existing locator answers 409 and leaves the
+  stored bytes untouched (including mtime); concurrent creators resolve
+  to exactly one winner via an atomic create (O_EXCL or equivalent).
+- Readback: `GET` answers the stored canonical bytes as the `content`
+  string.
+- Authorization: bearer-token scopes (read vs write); write required for
+  publication, read for `GET` (401 missing/invalid, 403 wrong scope).
+- Locator safety: the bounded note-locator grammar only (logical key +
+  four 8-hex digest groups + `.md`); traversal segments, encoded
+  variants, over-length segments/keys, and symlinks/junctions that
+  escape the vault are refused BEFORE any filesystem effect.
+
+CORRECTED fleet note (2026-11-16): the currently deployed fleet KB
+server does NOT yet implement the bounded locator grammar (its resolver
+accepts non-hex and over-deep locators). The deployed-server work is
+tracked in issue #482 (AC4-AC6) and stays open there; the in-repo
+reference suite (`tests/test_kb_server_publication_contract.py`) pins
+the contract a conforming server must satisfy.
 
 ## Not in this feature
 

@@ -157,3 +157,14 @@ policy is wired into the native adapter as future work.
   conversation leg itself still runs with knowledge disabled, so the
   enabled-config render is proven by the canary's helper leg and the
   repo's test suites, not by an end-to-end enabled pre-step delivery.
+
+## Policy helper spawn evaluation (spawn pre-check)
+
+The routing-policy helper spawns on every SessionStart BEFORE the
+enabled check (~0.2 s cold spawn, bounded at 2.0 s). The evaluation of a
+spawn pre check (checking the enabled flag before spawning the helper)
+is recorded as a deliberately open option: the measured cost is small
+and bounded, the spawn pre check adds a second config read on every
+session,
+and the helper itself is off by default (no config, no spawn output).
+Revisit if measured SessionStart latency regresses.

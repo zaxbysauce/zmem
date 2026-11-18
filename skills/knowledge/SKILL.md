@@ -193,3 +193,12 @@ actual user requested this session. Hosts with native wiring (Hermes
 provider system prompt, dsh once-per-session pre-step append) also
 surface a short routing policy; on any other host this skill being
 present is the whole surface.
+
+## Recovery
+
+`knowledge retry --target <id> --key <key> [--namespace <ns>]` recovers
+a stale-CAS quarantined publication by retrying the ORIGINAL stake
+(fresh typed refusal when still stale; nothing mutated on refusal; the
+explicit-operator law — no automatic retries). Quarantines from other
+causes (operator pulls, hub rejections) are not retryable: clear them
+deliberately.

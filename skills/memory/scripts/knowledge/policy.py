@@ -12,8 +12,11 @@ workflow lives.
 
 Hard boundaries (approved plan, 2026-11-13):
 - STDLIB ONLY, closed import set (``glob``, ``json``, ``os``, ``re``,
-  ``sys``): never imports ``storelib``/``host``, never opens SQLite, never
-  touches the network, never stats target roots, never writes anywhere.
+  ``sys``, ``unicodedata`` — the last for the description charset
+  judgment, refused category classes Cc/Cs/Zl/Zp, Cf deliberately
+  allowed): never imports ``storelib``/``host``, never opens SQLite,
+  never touches the network, never stats target roots, never writes
+  anywhere.
 - The config file is read BOUNDED (<= 64 KiB) and BOM-tolerant; decoding
   is STRICT UTF-8 - undecodable bytes refuse the whole render (display
   fail-closed; storelib.config's replace-decode is a store-lane behavior,
@@ -74,6 +77,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 __all__ = [
     "POLICY_VERSION",
@@ -88,6 +92,10 @@ __all__ = [
 ]
 
 POLICY_VERSION = 1
+# AC13 pin 4 (#481): the value above is a deliberate display constant, not
+# a content hash — the routing policy's contract does not version the
+# rendered text; bump it only when the policy FORMAT changes in a way
+# readers must distinguish.
 
 # Mirror storelib.config.MAX_CONFIG_BYTES: the store config.json itself is
 # bounded, so a larger file is a broken state, not a policy input.
@@ -120,9 +128,9 @@ _DIR_ENV_VARS = ("ZMEM_DATA", "CLAUDE_PLUGIN_DATA", "ZCODE_PLUGIN_DATA")
 # renders exactly as the real CLI would accept it.
 _KNOWLEDGE_KEYS = frozenset(("enabled", "targets"))
 _TARGET_KEYS = {
-    "markdown": frozenset(("kind", "root")),
-    "kb-http": frozenset(("kind", "endpoint", "allow_http", "credential_env",
-                          "token_file", "timeout_s", "max_response_bytes")),
+    "markdown": frozenset((("kind", "root", "description"))),
+    "kb-http": frozenset((("kind", "endpoint", "allow_http", "credential_env",
+                          "token_file", "timeout_s", "max_response_bytes", "description"))),
 }
 
 _HEADING = "# ZMem knowledge companion (operator-enabled external notes)"
@@ -336,6 +344,33 @@ def _nonempty_str(value):
     return isinstance(value, str) and bool(value.strip())
 
 
+# Display-lane charset judgment (FB-005, validator parity with
+# knowledge/config.py): refuse the Unicode category classes Cc (controls,
+# incl. NEL U+0085), Cs (lone surrogates), Zl (U+2028) and Zp (U+2029) —
+# category-based, so C1 controls beyond U+007F are refused too; Cf
+# (format: ZWSP, bidi controls, LRM...) is DELIBERATELY ALLOWED as
+# legitimate operator text.
+_REFUSED_CHAR_CATEGORIES = frozenset(("Cc", "Cs", "Zl", "Zp"))
+
+
+def _description_ok(value, *, present):
+    """Display mirror of the description grammar (validator parity):
+    ABSENT is fine; a PRESENT value must be a string of 1..200
+    codepoints, no control/separator/surrogate category codepoints
+    (Cc/Cs/Zl/Zp — Cf format characters are allowed), not
+    whitespace-only (an explicit JSON null is refused exactly like the
+    command validator refuses it).  Values are never rendered when this
+    returns False."""
+    if not present:
+        return True
+    if not isinstance(value, str):
+        return False
+    if len(value) > 200 or not value.strip():
+        return False
+    return not any(unicodedata.category(ch) in _REFUSED_CHAR_CATEGORIES
+                   for ch in value)
+
+
 def _target_spec_ok(spec):
     """Shape-only acceptance of one target spec (fail-closed display).
 
@@ -353,6 +388,9 @@ def _target_spec_ok(spec):
         return False
     keys = _TARGET_KEYS.get(kind)
     if keys is None or set(spec) - keys:
+        return False
+    if not _description_ok(spec.get("description"),
+                           present="description" in spec):
         return False
     if kind == "markdown":
         return _nonempty_str(spec.get("root"))
@@ -439,11 +477,61 @@ def load_policy_state(config_path=None, environ=None):
     state["enabled"] = True
     state["targets"] = safe_ids[:MAX_TARGET_IDS_DISPLAY]
     state["targets_omitted"] = len(safe_ids) - len(state["targets"])
+    state["descriptions"] = {
+        tid: (raw_targets[tid].get("description") or None)
+        for tid in state["targets"]
+    }
     state["reason"] = "enabled" if state["targets"] else "no-targets"
     return state
 
 
-def _compose(target_ids, targets_omitted, allow_capture):
+def _compose(target_ids, targets_omitted, allow_capture,
+             descriptions=None):
+    descriptions = descriptions or {}
+    # Deterministic aggregate allocation (#482 AC15): search the
+    # per-target display prefix downward from the longest description
+    # until the WHOLE policy stays under MAX_POLICY_WORDS - the
+    # truncated units end with the frozen marker '...'.  A valid
+    # config therefore never renders an empty policy from its
+    # descriptions: the prefix=0 floor appends the BARE target id (the
+    # descriptionless roster entry — no " — ..." residue), so the floor
+    # roster equals the plain roster and renders whenever the base does.
+    base = _compose_plain(target_ids, targets_omitted, allow_capture)
+    base_words = len(base.split())
+    present = [descriptions.get(tid) for tid in target_ids]
+    max_prefix = max(
+        (len(d.split()) for d in present if d), default=0)
+    for prefix in range(max_prefix, -1, -1):
+        entries = []
+        for tid, desc in zip(target_ids, present):
+            if desc is None:
+                entries.append(tid)
+                continue
+            words = desc.split()
+            if prefix == 0:
+                # The floor: the descriptions cannot contribute even one
+                # word under the budget — the bare target id, exactly the
+                # descriptionless roster entry (FB-011).
+                entries.append(tid)
+            elif prefix < len(words):
+                entries.append("%s — %s ..."
+                               % (tid, " ".join(words[:prefix])))
+            else:
+                entries.append("%s — %s" % (tid, desc))
+        roster = "Configured target ids: %s." % ", ".join(entries)
+        if targets_omitted > 0:
+            roster += " (+%d not shown)" % targets_omitted
+        body = (_READONLY_PARA if not allow_capture else _CAPTURE_PARA)
+        text = "\n\n".join(
+            [_HEADING, roster, _SHARED_PARA, body, _FOOTER])
+        if len(text.split()) < MAX_POLICY_WORDS:
+            return text
+    # Unreachable for any config whose descriptionless base fits (the
+    # base itself is the prefix=0 roster); kept as the honest floor.
+    return base
+
+
+def _compose_plain(target_ids, targets_omitted, allow_capture):
     roster = "Configured target ids: %s." % ", ".join(target_ids)
     if targets_omitted > 0:
         roster += " (+%d not shown)" % targets_omitted
@@ -465,7 +553,7 @@ def render_policy(config_path=None, environ=None, *, allow_capture=True):
     if not state["enabled"] or not state["targets"]:
         return ""
     text = _compose(state["targets"], state["targets_omitted"],
-                    allow_capture)
+                    allow_capture, state.get("descriptions"))
     if len(text.split()) >= MAX_POLICY_WORDS:
         return ""
     return text
@@ -477,10 +565,11 @@ def policy_status(config_path=None, environ=None, *, allow_capture=True):
     text = ""
     if state["enabled"] and state["targets"]:
         candidate = _compose(state["targets"], state["targets_omitted"],
-                             allow_capture)
+                             allow_capture, state.get("descriptions"))
         if len(candidate.split()) < MAX_POLICY_WORDS:
             text = candidate
     status = dict(state)
+    status.pop("descriptions", None)
     status["capture"] = bool(allow_capture)
     status["policy_version"] = POLICY_VERSION
     status["word_count"] = len(text.split())

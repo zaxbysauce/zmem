@@ -40,6 +40,10 @@ Contract (approved plan, 2026-11-13):
   only URL the client will ever touch.
 - Unknown keys are errors, not silently ignored: a typo'd field must fail
   loudly at load, not half-enable a target.
+- Stdlib only: ``re`` and ``unicodedata`` (the description charset
+  judgment — refused Unicode categories Cc/Cs/Zl/Zp; format characters
+  Cf such as ZWSP/bidi controls are deliberately ALLOWED as legitimate
+  operator text).
 - Error messages name the target id and the offending key, never a secret
   value, a token, or note content.
 """
@@ -47,6 +51,7 @@ Contract (approved plan, 2026-11-13):
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -103,6 +108,7 @@ class MarkdownTarget:
     id: str
     kind: str = "markdown"
     root: Path = Path()
+    description: str | None = None
 
     def __post_init__(self) -> None:
         validate_target_id(self.id)
@@ -126,6 +132,7 @@ class KBHTTPTarget:
     token_file: Path | None = None
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+    description: str | None = None
 
     def __post_init__(self) -> None:
         validate_target_id(self.id)
@@ -190,13 +197,47 @@ def _abs_path(value: str, where: str, key: str) -> Path:
     return path
 
 
+# Description bounds (#482 AC1/AC3): 1..200 codepoints, no line/paragraph
+# separators or control/format-surrogate codepoints (single-line safe),
+# not empty/whitespace-only.  The refused set is the Unicode CATEGORY
+# classes Cc (controls, incl. NEL U+0085), Cs (lone surrogates), Zl
+# (U+2028) and Zp (U+2029) — category-based, so C1 controls beyond
+# U+007F are refused too; Cf (format: ZWSP, bidi controls, LRM...) is
+# DELIBERATELY ALLOWED as legitimate operator text (FB-005).
+MAX_DESCRIPTION_CHARS = 200
+_REFUSED_CHAR_CATEGORIES = frozenset(("Cc", "Cs", "Zl", "Zp"))
+
+
+def _opt_description(obj: dict, where: str) -> str | None:
+    if "description" not in obj:
+        return None
+    value = obj["description"]
+    if not isinstance(value, str):
+        raise KnowledgeConfigError(
+            "%s: description must be a string" % where)
+    if len(value) > MAX_DESCRIPTION_CHARS:
+        raise KnowledgeConfigError(
+            "%s: description exceeds %d codepoints (got %d)"
+            % (where, MAX_DESCRIPTION_CHARS, len(value)))
+    if not value.strip():
+        raise KnowledgeConfigError(
+            "%s: description must not be empty or whitespace-only" % where)
+    if any(unicodedata.category(ch) in _REFUSED_CHAR_CATEGORIES
+           for ch in value):
+        raise KnowledgeConfigError(
+            "%s: description must not contain control characters "
+            "(single-line text only)" % where)
+    return value
+
+
 def _markdown_target(tid: str, obj: object) -> MarkdownTarget:
     where = "knowledge target %r (markdown)" % tid
     if not isinstance(obj, dict):
         raise KnowledgeConfigError("%s: must be an object" % where)
-    _no_extra_keys(obj, frozenset({"kind", "root"}), where)
+    _no_extra_keys(obj, frozenset({"kind", "root", "description"}), where)
     root = _abs_path(_req_str(obj, "root", where), where, "root")
-    return MarkdownTarget(id=tid, root=root)
+    description = _opt_description(obj, where)
+    return MarkdownTarget(id=tid, root=root, description=description)
 
 
 def _kbhttp_target(tid: str, obj: object) -> KBHTTPTarget:
@@ -208,8 +249,10 @@ def _kbhttp_target(tid: str, obj: object) -> KBHTTPTarget:
     _no_extra_keys(
         obj,
         frozenset({"kind", "endpoint", "allow_http", "credential_env",
-                   "token_file", "timeout_s", "max_response_bytes"}),
+                   "token_file", "timeout_s", "max_response_bytes",
+                   "description"}),
         where)
+    description = _opt_description(obj, where)
 
     endpoint = _req_str(obj, "endpoint", where)
     parts = urllib.parse.urlsplit(endpoint)
@@ -300,7 +343,7 @@ def _kbhttp_target(tid: str, obj: object) -> KBHTTPTarget:
         token_file=token_file,
         timeout_s=timeout,
         max_response_bytes=max_bytes,
-    )
+        description=description)
 
 
 def _validate_knowledge_object(obj: object) -> tuple[bool, dict]:

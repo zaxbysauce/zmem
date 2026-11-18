@@ -101,6 +101,17 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _opt_str(value):
+    return str(value) if value is not None else None
+
+
+def _opt_int(value):
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class JournalEntry:
     """One recorded intent's current recovery state (metadata only).
@@ -120,6 +131,15 @@ class JournalEntry:
     state: str
     updated_at: str
     namespace: str = ""
+    # Retry-provenance fields (#480): parsed via item.get() so legacy
+    # journals (and head-written entries under base readers) load
+    # unchanged; serialized with the entry (__dict__).  A pre-upgrade
+    # client that rewrites the journal drops them (its dataclass does not
+    # know them) - the disclosed mixed-version limitation.
+    op_id: str | None = None
+    retry_ref: int | None = None
+    summary: str | None = None
+    staked_at: str | None = None
 
 
 class KnowledgeJournal:
@@ -229,6 +249,10 @@ class KnowledgeJournal:
                 state=str(item["state"]),
                 updated_at=str(item["updated_at"]),
                 namespace=str(item.get("namespace", "")),
+                op_id=_opt_str(item.get("op_id")),
+                retry_ref=_opt_int(item.get("retry_ref")),
+                summary=_opt_str(item.get("summary")),
+                staked_at=_opt_str(item.get("staked_at")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JournalError("journal entry malformed") from exc
@@ -352,7 +376,10 @@ class KnowledgeJournal:
 
     def record_intent(self, *, target_id: str, logical_key: str,
                       locator: str, digest: str,
-                      namespace: str = "") -> JournalEntry:
+                      namespace: str = "",
+                      op_id: str | None = None,
+                      summary: str | None = None,
+                      staked_at: str | None = None) -> JournalEntry:
         """Durably record the intent to publish, BEFORE any create.
 
         ``namespace`` (optional, default ``""``) completes the identity:
@@ -399,8 +426,115 @@ class KnowledgeJournal:
                 state="doc_pending",
                 updated_at=_utc_now(),
                 namespace=namespace,
+                op_id=op_id,
+                summary=summary,
+                staked_at=staked_at,
             )
             entries.append(entry)
+            self._write_entries(entries)
+            return entry
+
+    def record_retry(self, *, target_id: str, logical_key: str,
+                     locator: str, digest: str,
+                     namespace: str = "",
+                     op_id: str | None = None,
+                     summary: str | None = None,
+                     staked_at: str | None = None,
+                     retry_ref: int | None = None,
+                     state: str = "applied") -> JournalEntry:
+        """Append the COMPLETING retry entry for a recovered attempt
+        (#480 FB-008).  ``state`` is the retry's own state after the
+        durable step (``pointer_queued`` in remote mode — the flush lane
+        advances it to ``applied``; ``applied`` for a completed local
+        retry).
+
+        record_intent is idempotent on (digest, locator) whatever the
+        state, so it returns the quarantined original forever; the retry
+        path instead appends a NEW higher-seq ``applied`` entry for the
+        SAME digest.  The original entry is preserved verbatim (this
+        method never touches it).  A crash-left ``doc_pending`` partial
+        for the same digest stays in history (bounded retention) — the
+        completing entry supersedes it as the identity's latest.
+
+        Only the retry command calls this (explicit-operator law): the
+        ordinary capture path never lands here.
+        """
+        ref, locator = self._validate_identity(target_id, logical_key,
+                                               locator, digest)
+        self._validate_namespace(namespace)
+        with self._locked():
+            entries = self._read_entries()
+            identity = [e for e in entries
+                        if e.target_id == target_id
+                        and e.logical_key == logical_key
+                        and e.namespace == namespace]
+            # A crash-left ACTIVE partial for THIS digest is COMPLETED by
+            # the retry (not appended past): the partial becomes THE
+            # applied retry entry — exactly one terminal retry entry after
+            # the original, no non-terminal remainder.  Older additional
+            # crash partials (repeated crashes) are terminalized
+            # quarantined newest-first while each is the latest ACTIVE.
+            active = sorted(
+                (e for e in identity
+                 if e.state not in TERMINAL_STATES
+                 and e.digest == digest),
+                key=lambda e: e.seq)
+            entry = None
+            while active:
+                partial = active.pop()
+                index = entries.index(partial)
+                if entry is None:
+                    # The newest partial completes.
+                    entry = JournalEntry(
+                        seq=partial.seq,
+                        target_id=partial.target_id,
+                        logical_key=partial.logical_key,
+                        ref=partial.ref,
+                        locator=partial.locator,
+                        digest=partial.digest,
+                        state=state,
+                        updated_at=_utc_now(),
+                        namespace=partial.namespace,
+                        op_id=op_id,
+                        retry_ref=retry_ref,
+                        summary=summary,
+                        staked_at=staked_at,
+                    )
+                    entries[index] = entry
+                else:
+                    entries[index] = JournalEntry(
+                        seq=partial.seq,
+                        target_id=partial.target_id,
+                        logical_key=partial.logical_key,
+                        ref=partial.ref,
+                        locator=partial.locator,
+                        digest=partial.digest,
+                        state="quarantined",
+                        updated_at=_utc_now(),
+                        namespace=partial.namespace,
+                        op_id=partial.op_id,
+                        retry_ref=partial.retry_ref,
+                        summary=partial.summary,
+                        staked_at=partial.staked_at,
+                    )
+            if entry is None:
+                seq = max((e.seq for e in entries), default=0) + 1
+                entry = JournalEntry(
+                    seq=seq,
+                    target_id=target_id,
+                    logical_key=logical_key,
+                    ref=ref,
+                    locator=locator,
+                    digest=digest,
+                    state=state,
+                    updated_at=_utc_now(),
+                    namespace=namespace,
+                    op_id=op_id,
+                    retry_ref=retry_ref,
+                    summary=summary,
+                    staked_at=staked_at,
+                )
+                entries.append(entry)
             self._write_entries(entries)
             return entry
 
@@ -446,6 +580,10 @@ class KnowledgeJournal:
                 state=state,
                 updated_at=_utc_now(),
                 namespace=latest.namespace,
+                op_id=latest.op_id,
+                retry_ref=latest.retry_ref,
+                summary=latest.summary,
+                staked_at=latest.staked_at,
             )
             entries[index] = updated
             self._write_entries(entries)

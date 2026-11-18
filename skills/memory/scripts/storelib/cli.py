@@ -825,7 +825,7 @@ def _cmd_knowledge(args) -> int:
     # open, target write, or hub call.  The read-only surfaces
     # (read/check/status) are NOT gated: verification stays available with
     # capture switched off.
-    if sub in ("capture", "flush") and \
+    if sub in ("capture", "flush", "retry") and \
             (os.environ.get("ZMEM_CAPTURE", "1") or "").strip() == "0":
         return _fail(
             "knowledge %s is disabled: ZMEM_CAPTURE=0 (the operator kill "
@@ -1033,6 +1033,87 @@ def _cmd_knowledge(args) -> int:
                   f"(source: {result['provenance']})")
             return 0 if result["ok"] else 1
 
+        if sub == "retry":
+            from knowledge.workflow import retry as _wf_retry  # noqa: PLC0415
+
+            if mode == "remote":
+                result = _wf_retry(
+                    target_id=args.target, logical_key=args.key,
+                    namespace=args.namespace, mode="remote",
+                    config=config, journal=journal,
+                    delivery=delivery, env=dict(os.environ))
+                if result.get("pending"):
+                    if args.json:
+                        return _emit(result, exit_code=3)
+                    print("[zmem] knowledge retry: hub unreachable; kept "
+                          "pending (nothing enqueued)", file=sys.stderr)
+                    return 3
+                if result.get("ok"):
+                    # FB-004: human mode gets a one-line stderr status
+                    # (stdout stays empty outside --json); exit 0.
+                    if not args.json:
+                        print(
+                            f"[zmem] knowledge retry: enqueued op "
+                            f"{result.get('op_id')} for the hub (run "
+                            f"'knowledge flush')", file=sys.stderr)
+                    return _emit(result, exit_code=0)
+                # FB-004: a typed retry refusal is a REPORTED OUTCOME,
+                # not a usage error — never _fail (exit 2 is reserved
+                # for config/usage errors); exit 1 with the envelope.
+                if not args.json:
+                    print(f"[zmem] knowledge: "
+                          f"{result.get('error') or 'retry refused'}",
+                          file=sys.stderr)
+                return _emit(result, exit_code=1)
+            # Local mode mirrors capture's discipline: maintenance wait,
+            # writer lease, schema gates, write-capable connection — and
+            # the --json stdout contract (the writer's [zmem] progress
+            # lines route to stderr so stdout stays one JSON object).
+            lease = None
+            _stdout = sys.stdout
+            if args.json:
+                sys.stdout = sys.stderr
+            try:
+                _wait_for_maintenance_clear("knowledge")
+                lease = _acquire_writer_lease("knowledge-retry")
+                _require_supported_schema_stamp()
+                conn = _connect_existing_store()
+                assert_store_schema_compatible(conn, STORE_PATH)
+                result = _wf_retry(
+                    target_id=args.target, logical_key=args.key,
+                    namespace=args.namespace, mode="local",
+                    conn=conn, config=config, journal=journal,
+                    delivery=delivery, env=dict(os.environ))
+            except (FileNotFoundError, RuntimeError, sqlite3.Error,
+                    OSError) as exc:
+                sys.stdout = _stdout
+                return _fail(str(exc))
+            finally:
+                sys.stdout = _stdout
+                if conn is not None:
+                    conn.close()
+                    conn = None
+                _release_writer_lease(lease)
+            if result.get("ok"):
+                # FB-004: human mode gets a one-line stderr result (the
+                # CLI itself emits no JSON envelope outside --json; the
+                # store writer's own [zmem] progress lines are unchanged);
+                # exit 0.
+                if not args.json:
+                    pointer = result.get("pointer") or {}
+                    print(f"[zmem] knowledge retry: {pointer.get('status')} "
+                          f"version {pointer.get('version')} at row "
+                          f"{pointer.get('row_id')}", file=sys.stderr)
+                return _emit(result, exit_code=0)
+            # Typed retry refusals are reported outcomes, not usage
+            # errors: exit 1 with the JSON envelope; human mode gets the
+            # reason on stderr (FB-004).
+            if not args.json:
+                print(f"[zmem] knowledge: "
+                      f"{result.get('error') or 'retry refused'}",
+                      file=sys.stderr)
+            return _emit(result, exit_code=1)
+
         # status
         result = _workflow.status(
             target_id=args.target, logical_key=args.key,
@@ -1041,9 +1122,15 @@ def _cmd_knowledge(args) -> int:
         if args.json:
             return _emit(result,
                          exit_code=0 if result.get("ok", True) else 1)
+        target_bits = []
+        for tid in sorted(result['targets']):
+            spec = result['targets'][tid] or {}
+            desc = spec.get('description')
+            target_bits.append(
+                f"{tid} — {desc}" if desc else tid)
         print(f"knowledge companion: enabled={result['enabled']} "
               f"mode={result['mode']} "
-              f"targets={','.join(sorted(result['targets'])) or 'none'}")
+              f"targets={','.join(target_bits) or 'none'}")
         for row in result["journal"]:
             print(f"  journal: {row['ref']} state={row['state']} "
                   f"version-locator={row['locator']}")
@@ -4303,6 +4390,14 @@ def main():
     k_check.add_argument("--locator", default=None)
     k_check.add_argument("--namespace", default="user:global")
     k_check.add_argument("--json", action="store_true")
+    k_retry = knowledge_sub.add_parser(
+        "retry",
+        help="recover one stale-CAS quarantined publication by retrying "
+             "the ORIGINAL stake (#480 FB-008; explicit-operator law)")
+    k_retry.add_argument("--target", required=True)
+    k_retry.add_argument("--key", required=True)
+    k_retry.add_argument("--namespace", default="user:global")
+    k_retry.add_argument("--json", action="store_true")
     k_status = knowledge_sub.add_parser(
         "status", help="config, journal, delivery queue and pointer state")
     k_status.add_argument("--target", default=None)
