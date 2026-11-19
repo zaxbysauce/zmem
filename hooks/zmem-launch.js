@@ -1401,6 +1401,11 @@ function snapshotTrainingDelivery(host, hookName, meta, env, payload,
 function buildCanonicalEnv(host, meta, hookName, options = {}) {
     const env = { ...process.env };
 
+    // The launcher exchanges UTF-8 JSON with hooks over redirected pipes.
+    if (process.platform === "win32") {
+        env.PYTHONIOENCODING = "utf-8";
+    }
+
     const project =
         process.env.CODEX_PROJECT_DIR ||
         process.env.CLAUDE_PROJECT_DIR ||
