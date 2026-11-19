@@ -1190,6 +1190,20 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     if _host is not None:
         _host.set_owner_only_perms(dest)
 
+    # Final-critic finding 3: refuse a failed post-copy integrity check
+    # BEFORE any migration work — never write migrations into a file
+    # already known to be bad, and keep the real cause (the integrity
+    # verdict) ahead of any migrate failure text.
+    if post_integrity != "ok":
+        print(f"[zmem] restore: destination {dest}")
+        print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
+        print(f"[zmem] restore FAILED: post-restore integrity_check={post_integrity}",
+              file=sys.stderr)
+        if prerestore_path:
+            print(f"[zmem] restore: roll back with "
+                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
+        return 1
+
     # --- 5. Reach the current client's migrated shape (issue #493 AC1).
     # The deliberate Windows file-handle bypass above means the restore
     # path never runs main()'s connect()/init_db()/migrate(); without this
@@ -1234,12 +1248,5 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
     print(f"[zmem] restore: restored rows total={total} live={live}")
     print(f"[zmem] restore: migrated shape schema_version={migrated_ver}")
-    if post_integrity != "ok":
-        print(f"[zmem] restore FAILED: post-restore integrity_check={post_integrity}",
-              file=sys.stderr)
-        if prerestore_path:
-            print(f"[zmem] restore: roll back with "
-                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
-        return 1
     print("[zmem] restore: OK")
     return 0

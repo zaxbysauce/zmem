@@ -102,43 +102,188 @@ class PrefixCaseSuppTest(unittest.TestCase):
             write.warn_reserved_source_ref("KNOWLEDGE:t:k")
         self.assertIn("knowledge:", buf.getvalue())
 
+    def _seed_uppercase_row(self, store: Path) -> str:
+        """Seed a live KNOWLEDGE:-prefixed row via raw SQL (the write path
+        refuses it — that is the fix), returning its id."""
+        r = _run_cli(store, "add", "--content", "uppercase carrier body",
+                     "--namespace", "project:supp", "--type", "fact")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            row = conn.execute(
+                "SELECT id FROM memory WHERE content="
+                "'uppercase carrier body'").fetchone()
+            self.assertIsNotNone(row)
+            conn.execute(
+                "UPDATE memory SET source_ref='KNOWLEDGE:target-1:key-1' "
+                "WHERE id=?", (row[0],))
+            conn.commit()
+        finally:
+            conn.close()
+        return row[0]
+
     def test_consumer_matrix_refuses_uppercase_refs(self):
-        """R2-4 + review-finding 3: the uppercase reserved ref is refused
-        across the real consumer surfaces (add / update / supersede /
-        ingest-jsonl), not just at the predicate."""
+        """R2-4 + final-critic finding 2: the uppercase reserved ref is
+        refused by add / update / supersede (the real write consumers), not
+        just at the predicate. A 3-site case-sensitive revert of
+        update/supersede/rescan made every earlier test pass — this leg is
+        what kills it."""
         store = _fresh_store("c4-consumers")
         r = _run_cli(store, "add", "--content", "consumer matrix body",
                      "--namespace", "project:supp", "--type", "fact",
                      "--source-ref", "KNOWLEDGE:t:k")
         self.assertNotEqual(r.returncode, 0,
                             "uppercase knowledge ref must be refused by add")
-        r2 = _run_cli(store, "add", "--content", "consumer matrix body",
-                      "--namespace", "project:supp", "--type", "fact")
-        self.assertEqual(r2.returncode, 0, r2.stderr)
+        mid = self._seed_uppercase_row(store)
+        r = _run_cli(store, "update", "--id", mid, "--content",
+                     "uppercase carrier body v2")
+        self.assertNotEqual(r.returncode, 0,
+                            "update must refuse a KNOWLEDGE:-prefixed row")
+        r = _run_cli(store, "supersede", "--id", mid, "--reason",
+                     "explicit correction")
+        self.assertNotEqual(r.returncode, 0,
+                            "supersede must refuse a KNOWLEDGE:-prefixed "
+                            "row")
+
+    def test_rescan_quarantines_uppercase_row(self):
+        """The write.py:3374 rescan classifier routes reserved rows
+        through the POINTER lane: a secret-suspect KNOWLEDGE:-ref row is
+        quarantined + tombstoned (never update_memory-remediated). A
+        case-sensitive revert routes it to the ordinary remediation lane
+        instead (redacted in place, row stays live) — the discriminator."""
+        store = _fresh_store("c4-rescan")
+        # Plant the secret URedacted via raw SQL — the write path redacts
+        # at admission (probed), leaving rescan nothing to change; the
+        # quarantine lane needs a policy-CHANGED payload under the
+        # reserved (uppercase) ref.
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('95000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact',?,'','KNOWLEDGE:target-1:key-1',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',?)",
+                ("token ghp_" + "a" * 36,
+                 _normalize_content("token ghp_" + "a" * 36)))
+            conn.commit()
+        finally:
+            conn.close()
+        mid = "95000000-0000-4000-8000-000000000001"
+        r = _run_cli(store, "rescan-secrets", "--apply")
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        conn = sqlite3.connect(str(store))
+        try:
+            state = conn.execute(
+                "SELECT superseded_at FROM memory WHERE id=?",
+                (mid,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(state)
+        self.assertIsNotNone(
+            state[0],
+            "a secret-suspect reserved-ref row must be tombstoned by the "
+            "pointer quarantine lane, not live-remediated")
+
+    def test_ingest_uppercase_ref_lands_demoted_not_authoritative(self):
+        store = _fresh_store("c4-ingest")
         with tempfile.TemporaryDirectory(prefix="zmem-c4-jsonl-") as td:
             jl = Path(td) / "in.jsonl"
-            jl.write_text(json.dumps({
-                "id": "70000000-0000-4000-8000-000000000001",
-                "namespace": "project:supp", "type": "fact",
-                "content": "sync uppercase ref row",
-                "tags": "", "source_ref": "KNOWLEDGE:t:k",
-                "confidence": 0.9, "signal": "test",
-                "valid_from": "2026-01-01T00:00:00Z",
-                "ingestion_ts": "2026-01-01T00:00:00Z",
-            }) + "\n", encoding="utf-8")
+            # a PARSEABLE pointer payload with verified=true — the shape
+            # demote_imported_payload actually re-emits (verified=false)
+            payload = knowledge.build_payload(
+                target="target-1", key="key-1", version=1,
+                full_sha256="0" * 64, summary="supp probe")
+            body = {"id": "70000000-0000-4000-8000-000000000001",
+                    "namespace": "project:supp", "type": "fact",
+                    "content": payload,
+                    "tags": "", "source_ref": "KNOWLEDGE:target-1:key-1",
+                    "confidence": 0.9, "signal": "test",
+                    "valid_from": "2026-01-01T00:00:00Z",
+                    "ingestion_ts": "2026-01-01T00:00:00Z"}
+            jl.write_text(json.dumps(body) + "\n", encoding="utf-8")
             r3 = _run_cli(store, "ingest-jsonl", "--in", str(jl))
-            # sync PRESERVES the reserved ref but never verifies it: the
-            # row lands unverified (demoted), never authoritative.
             self.assertEqual(r3.returncode, 0, r3.stderr)
         conn = sqlite3.connect(str(store))
         try:
             row = conn.execute(
-                "SELECT source_ref FROM memory WHERE content="
-                "'sync uppercase ref row'").fetchone()
+                "SELECT source_ref, content FROM memory WHERE id="
+                "'70000000-0000-4000-8000-000000000001'").fetchone()
         finally:
             conn.close()
         self.assertIsNotNone(row)
-        self.assertEqual(row[0], "KNOWLEDGE:t:k")
+        self.assertEqual(row[0], "KNOWLEDGE:target-1:key-1",
+                         "sync preserves the reserved ref verbatim")
+        self.assertIn(
+            '"verified":false', row[1].replace(" ", ""),
+            "the payload must land DEMOTED (verified false), never "
+            "authoritative")
+
+    def test_import_store_uppercase_ref_preserved_unverified(self):
+        """Import-store lane (R2-4 + reviewer round-4 finding): the CLI is
+        --source/--dest-dir; the row MUST land (no absence tolerance), the
+        uppercase ref MUST be preserved verbatim, and the payload MUST land
+        demoted (verified false) — a case-sensitive revert of
+        import-store.py's prefix site leaves verified true and goes RED."""
+        src_dir = _TMP / "c4-import"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        src = src_dir / "src.sqlite"
+        if src.exists():
+            src.unlink()
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = str(src)
+        env["ZMEM_DATA"] = str(src_dir / "data")
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8", str(SCRIPTS / "store.py"),
+             "init"], capture_output=True, text=True, env=env, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        payload = knowledge.build_payload(
+            target="target-1", key="key-1", version=1,
+            full_sha256="0" * 64, summary="import probe")
+        conn = sqlite3.connect(str(src))
+        try:
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('71000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact',?,'','KNOWLEDGE:target-1:key-1',0.9,"
+                "'test','2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',?)",
+                (payload, _normalize_content(payload)))
+            conn.commit()
+        finally:
+            conn.close()
+        dest_dir = _TMP / "c4-import-dest-dir"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / "store.sqlite"
+        if dest.exists():
+            dest.unlink()
+        r = subprocess.run(
+            [sys.executable, "-X", "utf8",
+             str(SCRIPTS / "import-store.py"),
+             "--source", str(src), "--dest-dir", str(dest_dir)],
+            capture_output=True, text=True, timeout=300, cwd=str(REPO))
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertTrue(dest.is_file(), "the destination store must exist")
+        conn = sqlite3.connect(str(dest))
+        try:
+            row = conn.execute(
+                "SELECT source_ref, content FROM memory WHERE id="
+                "'71000000-0000-4000-8000-000000000001'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(
+            row, "the uppercase-ref row MUST be imported (no absence "
+                 "tolerance)")
+        self.assertEqual(row[0], "KNOWLEDGE:target-1:key-1",
+                         "import-store preserves the reserved ref verbatim")
+        self.assertIn(
+            '"verified":false', row[1].replace(" ", ""),
+            "the imported payload must land DEMOTED (verified false), "
+            "never authoritative")
 
 
 class DryRunParitySuppTest(unittest.TestCase):
@@ -551,10 +696,10 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
     def test_single_mismatch_heals_and_stamps(self):
         """Round-2 finding 3b (honest name): drives the single-mismatch
         heal + stamp leg. The zero-row retry-then-abort leg requires a
-        concurrent write BETWEEN the batch read and update, which an
-        in-process test cannot interpose without monkeypatching the
-        production seam; its discipline is pinned by the savepoint-arm
-        rollback-scope test below and the reviewer's direct probe."""
+        concurrent write BETWEEN the batch read and update — driven
+        directly by test_raise_ignore_trigger_aborts_without_stamp below
+        (final-critic finding 1: a RAISE(IGNORE) trigger makes every
+        compare-and-update a zero-row miss)."""
         store = self._scratch("nv-miss")
         env = dict(os.environ)
         env["ZMEM_STORE"] = str(store)
@@ -664,6 +809,101 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
                              "the failed batch's writes must be rolled "
                              "back to the savepoint")
             conn.rollback()
+        finally:
+            conn.close()
+
+    def test_raise_ignore_trigger_aborts_without_stamp(self):
+        """Final-critic finding 1, leg (b): a RAISE(IGNORE) trigger makes
+        every compare-and-update a zero-row miss — the retry re-read still
+        mismatches, the pass aborts WITHOUT stamping, and on the
+        OWN-transaction arm the BEGIN IMMEDIATE write lock is RELEASED
+        (the connection must not stay in a transaction afterwards)."""
+        store = self._scratch("nv-raiseignore")
+        os.environ.update({"ZMEM_STORE": str(store),
+                           "ZMEM_DATA": str(store.parent)})
+        schema_mod = self._load_schema()
+        conn = schema_mod.connect()
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('93000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact','raise ignore body','','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z','STALE IGNORE NORM')")
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn.execute(
+                "CREATE TRIGGER zmem_493_ignore_probe BEFORE UPDATE OF "
+                "content_norm ON memory BEGIN SELECT RAISE(IGNORE); "
+                "END;")
+            conn.commit()
+            schema_mod._verify_content_norms_163(conn)
+            stamped = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNone(stamped,
+                              "an all-zero-row pass must NOT stamp")
+            self.assertFalse(
+                conn.in_transaction,
+                "the aborted own-transaction pass must release its BEGIN "
+                "IMMEDIATE write lock")
+        finally:
+            conn.close()
+
+    def test_caller_tx_success_keeps_caller_transaction_open(self):
+        """Final-critic finding 1, leg (c): when the pass runs inside a
+        caller transaction and SUCCEEDS, the stamp must ride the caller's
+        commit — the caller's transaction stays open afterwards and a
+        caller ROLLBACK undoes heals + stamp together (the pass never
+        closes a transaction it did not open)."""
+        store = self._scratch("nv-callertx-ok")
+        os.environ.update({"ZMEM_STORE": str(store),
+                           "ZMEM_DATA": str(store.parent)})
+        schema_mod = self._load_schema()
+        conn = schema_mod.connect()
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            conn.execute("BEGIN")
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES "
+                "('caller_marker', 'rides')")
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('94000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact','caller tx ok body','','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z','STALE CALLERTX NORM')")
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            schema_mod._verify_content_norms_163(conn)
+            self.assertTrue(
+                conn.in_transaction,
+                "a successful pass inside a caller transaction must leave "
+                "the caller's transaction OPEN")
+            stamp = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNotNone(stamp, "the stamp is written under the "
+                                        "caller's transaction")
+            norm = conn.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'94000000-0000-4000-8000-000000000001'").fetchone()
+            self.assertEqual(norm[0],
+                             _normalize_content("caller tx ok body"))
+            # the caller's ROLLBACK still owns everything
+            conn.rollback()
+            gone = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNone(gone,
+                               "caller rollback must undo the stamp too")
         finally:
             conn.close()
 

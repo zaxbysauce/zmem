@@ -2128,6 +2128,11 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
     batch_size = 200
     _bf_last = None
     examined = 0
+    # Final-critic finding 1: a caller transaction (if any) owns the commit
+    # decision — the stamp is written under the batch savepoint and the
+    # caller's transaction stays OPEN for the caller to commit or roll
+    # back; only when we opened our own transaction do we commit it.
+    caller_tx = conn.in_transaction
     while True:
         if _bf_last is None:
             rows = conn.execute(
@@ -2190,6 +2195,11 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
                     conn.execute(f"RELEASE SAVEPOINT {sp}")
                 except sqlite3.Error:
                     pass
+            elif conn.in_transaction:
+                # Final-critic finding 1: the own-transaction arm must not
+                # keep the BEGIN IMMEDIATE write lock when the pass aborts
+                # (same discipline as the sqlite3.Error arm below).
+                conn.rollback()
             return  # abort without stamping; a later open re-runs
         except sqlite3.Error as exc:
             # database-is-locked / SQLITE_BUSY_SNAPSHOT (OperationalError)
@@ -2217,7 +2227,12 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) "
             "VALUES ('content_norm_verify_163', 'done')")
-        conn.commit()
+        if not caller_tx:
+            conn.commit()
+        # Final-critic finding 1: with a caller transaction open, the stamp
+        # rides the caller's commit — the pass must never close a
+        # transaction it did not open (the caller keeps its rollback
+        # authority over heals + stamp together).
 
 
 class _NormVerifyConflict(Exception):
