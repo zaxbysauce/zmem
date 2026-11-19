@@ -410,7 +410,7 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
 
     try:
         from storelib.schema import (  # noqa: PLC0415 - lazy
-            STATE_EXPIRY_CLASSES, init_db, migrate)
+            STATE_EXPIRY_CLASSES, _normalize_content, init_db, migrate)
         from storelib.sync import _INGEST_ID_RE  # noqa: PLC0415 - lazy
         # init_db creates the base tables; migrate() brings the LATER
         # columns the selector reads (supersede_reason, embedding, …) —
@@ -479,6 +479,32 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
             raise ValueError(
                 "fleet snapshot payload row value is out of range for "
                 f"the store schema: {exc}") from exc
+        # Issue #489: _SNAPSHOT_COLUMNS deliberately omits the derived
+        # store-local content_norm (the payload wire shape is positional —
+        # ncols/embedding index — and duplicated hub-side), so the restored
+        # rows land with NULL norms that silently inertize every
+        # content_norm-keyed consumer. Backfill from the restored content in
+        # the same batched shape as the v8 migration, still inside the
+        # ValueError degrade: a failure here keeps the previous pair.
+        _bf_batch = 500
+        _bf_last = 0
+        while True:
+            # PR #491 review (RP-001): keyset pagination — resuming from the
+            # last repaired rowid keeps each batch a bounded prefix scan
+            # instead of re-walking the repaired head of the table every
+            # round (measured 2.78s -> 1.50s at 30k rows).
+            _bf_rows = out.execute(
+                "SELECT rowid, content FROM memory "
+                "WHERE content_norm IS NULL AND rowid > ? "
+                "ORDER BY rowid LIMIT ?", (_bf_last, _bf_batch)).fetchall()
+            if not _bf_rows:
+                break
+            # `out` keeps sqlite3's default tuple rows (no Row factory on
+            # this private scratch connection) — index positionally.
+            out.executemany(
+                "UPDATE memory SET content_norm=? WHERE rowid=?",
+                [(_normalize_content(r[1] or ""), r[0]) for r in _bf_rows])
+            _bf_last = _bf_rows[-1][0]
         # Issue #414: restore the additive ``expiry`` family — the shipped
         # state rows' memory_expiry side records. Older hubs omit the key
         # (tolerated: every row stays live by the missing-side-row law);

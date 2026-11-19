@@ -1141,6 +1141,23 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     f"namespace {ns_value!r} contains a control character; "
                     "the writer path refuses the same class")
 
+    # Stage-B v5 (UR-001, critic-adjudicated FIX-NOW): the writer path's
+    # MAX_CONTENT_CHARS admission cap is a store invariant — a dataset row
+    # over the cap would land LIVE in a real store. This refusal is
+    # consistent with the dataset lane's own whole-snapshot refusal law
+    # (the #353 class); the sqlite import lane handles its over-cap rows by
+    # per-row quarantine instead. Disclosed limitation: the EXPORT side has
+    # no matching cap, so a store already holding an over-cap row can
+    # export a dataset this import refuses.
+    from schema_meta import MAX_CONTENT_CHARS
+    for row in families["memories"]:
+        _row_text = row.get("content")
+        if isinstance(_row_text, str) and len(_row_text) > MAX_CONTENT_CHARS:
+            raise DatasetError(
+                f"dataset refused: memory id {row.get('id')!r} carries "
+                f"content over the writer admission cap ({len(_row_text)} > "
+                f"{MAX_CONTENT_CHARS} MAX_CONTENT_CHARS); import refused")
+
     memories = families["memories"]
     available = {row["namespace"] for row in memories}
     if namespace is not None and namespace not in available:
@@ -1178,6 +1195,12 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
     final_path = dest / "snapshot.sqlite"
     if tmp_path.exists():
         tmp_path.unlink()
+    # PR #491 Stage-B v3 review: the cleanup flag must exist BEFORE the try
+    # whose finally reads it — an init_db/migrate failure must surface as
+    # the ORIGINAL error (never an UnboundLocalError from the finally), and
+    # a half-built staged snapshot must not litter the destination on ANY
+    # failure inside the connection lifetime.
+    _staged_failed = False
     conn = sqlite3.connect(tmp_path)
     try:
         # init_db + migrate — the full current schema (including migrated
@@ -1188,12 +1211,33 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
         init_db(conn)
         migrate(conn)
         try:
+            # Issue #489: MEMORY_COLUMNS (the export projection) deliberately
+            # omits the derived store-local content_norm, but the materialized
+            # snapshot is a REAL store — every content_norm-keyed consumer
+            # (the add/update/ingest exact windows, the degraded lexical
+            # lane's Jaccard token sets) silently degrades to no-ops when the
+            # column is NULL, so compute it per row at INSERT from the same
+            # normalizer the write path uses.
+            from storelib.schema import _normalize_content  # noqa: PLC0415
+            _insert_cols = _MEMORY_STORE_COLUMNS + ("content_norm",)
             for row in kept:
+                _row_content = row.get("content")
+                # PR #491 review (N-05): a crafted dataset row with non-text
+                # content must fail as a DatasetError (clean CLI refusal,
+                # temp file cleaned by the caller) instead of an
+                # AttributeError from the normalizer.
+                if _row_content is not None and not isinstance(
+                        _row_content, str):
+                    raise DatasetError(
+                        f"dataset row {row.get('id')!r} "
+                        "carries non-text content "
+                        f"({type(_row_content).__name__}); import refused")
                 conn.execute(
-                    "INSERT INTO memory (" + ", ".join(_MEMORY_STORE_COLUMNS)
+                    "INSERT INTO memory (" + ", ".join(_insert_cols)
                     + ") VALUES ("
-                    + ", ".join("?" * len(_MEMORY_STORE_COLUMNS)) + ")",
-                    tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
+                    + ", ".join("?" * len(_insert_cols)) + ")",
+                    tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS)
+                    + (_normalize_content(_row_content or ""),))
                 _store_generation.bump_mutation_generation(conn)  # issue #474 census
             kept_ids = {row["id"] for row in kept}
             # Issue #414 (#324 parent-outcome-aware rule): expiry records
@@ -1276,11 +1320,32 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     _store_generation.bump_mutation_generation(conn)  # issue #474 census
             conn.commit()
         except sqlite3.IntegrityError as exc:
+            _staged_failed = True
             raise DatasetError(
                 f"crafted dataset rejected (duplicate/inconsistent ids): "
                 f"{exc}") from exc
+        except DatasetError:
+            # PR #491 feedback (FB-N05): a refusal inside materialization
+            # (e.g. non-text content) must not leave the staged temp file
+            # behind. The unlink itself runs AFTER conn.close() in the
+            # finally below (Stage-B review: unlinking an open SQLite file
+            # raises a Windows sharing violation), so this handler only
+            # records the failure — the finally performs the cleanup and
+            # the exception continues to propagate past it.
+            _staged_failed = True
+            raise
+    except BaseException:
+        # Stage-B v3: every OTHER failure inside the connection lifetime
+        # (init_db/migrate included) marks cleanup too, so a half-built
+        # staged snapshot never litters the destination and the original
+        # error — not a finally-side UnboundLocalError — is what the
+        # caller sees.
+        _staged_failed = True
+        raise
     finally:
         conn.close()
+        if _staged_failed and tmp_path.exists():
+            tmp_path.unlink()
     os.replace(tmp_path, final_path)
 
     summary = {
