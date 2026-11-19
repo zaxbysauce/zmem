@@ -2191,6 +2191,7 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
     # without a content_norm match) and the #61 polarity guard are not
     # modeled — the projection can under-predict folds for those rows.
     dry_live_model: dict[str, dict] = {}
+    dry_tombstoned: set[str] = set()
     if dry_run:
         try:
             dry_skip_ids = {
@@ -2227,6 +2228,8 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
             except sqlite3.Error:
                 _rows = []
             for _r in _rows:
+                if _r["id"] in dry_tombstoned:
+                    continue  # projected tombstone removed this keeper
                 if not _subject.incompatible(
                         validated.get("tags"), validated.get("type"),
                         _r["tags"], _r["type"]):
@@ -2276,6 +2279,7 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
                         tallies["would_tombstoned"] = \
                             tallies.get("would_tombstoned", 0) + 1
                         del dry_live_model[_rid]
+                        dry_tombstoned.add(_rid)
                 else:
                     tallies["would_skip"] = \
                         tallies.get("would_skip", 0) + 1
@@ -2403,16 +2407,17 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
                     # in the destination, or is a state row this dry run
                     # tallied would_promote (dedup/tombstone exclusions
                     # carried by construction of the projected set).
-                    live = conn.execute(
-                        "SELECT 1 FROM memory WHERE id=? AND type='state' "
-                        "AND superseded_at IS NULL", (src_mid,)).fetchone()
-                    # #493 AC2(d): project liveness against the POST-PASS
-                    # live model (destination originals + simulated
-                    # landings, minus projected tombstones) — exactly the
-                    # ids a real promote leaves live for the side pass.
-                    projected = live is not None or (
-                        src_mid in dry_live_model
-                        and dry_live_model[src_mid]["type"] == "state")
+                    # #493 AC2(d) + review-finding 4: project liveness
+                    # against the POST-PASS live model ONLY (destination
+                    # originals + simulated landings, minus projected
+                    # tombstones) — exactly the ids a real promote leaves
+                    # live for the side pass. No pre-pass destination
+                    # re-read: a destination-original state row this pass
+                    # projected as tombstoned must NOT count as a
+                    # would-copy.
+                    projected = (src_mid in dry_live_model
+                                 and dry_live_model[src_mid]["type"]
+                                 == "state")
                     if not projected:
                         tallies["memory_expiry_orphan_skipped"] = \
                             tallies.get("memory_expiry_orphan_skipped", 0) + 1

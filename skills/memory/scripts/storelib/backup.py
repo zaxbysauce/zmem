@@ -1201,16 +1201,27 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     # creates); _prepare_store is NOT used because cmd_restore already
     # holds the schema/maintenance locks for this whole body. A snapshot
     # NEWER than this client never reaches here (the pre-copy schema
-    # preflight refused it above with the destination untouched). ---
+    # preflight refused it above with the destination untouched).
+    # Review-finding 1: this MUST be the LAST database action on the
+    # destination — the version is read INSIDE the migration connection
+    # and that read-write close checkpoints the WAL, so no read-only
+    # follow-up probe can leave orphan -wal/-shm sidecars at a freshly
+    # restored store (the stale-sidecar contracts in tests/test_backup.py
+    # pin exactly that). ---
     try:
         from storelib import schema as _schema
+        from schema_meta import SCHEMA_VERSION_KEY
         mconn = _schema.connect()
         try:
             _schema.init_db(mconn)
             _schema.migrate(mconn)
+            migrated_ver = mconn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (SCHEMA_VERSION_KEY,)).fetchone()
+            migrated_ver = migrated_ver[0] if migrated_ver else "?"
+            _schema._commit(mconn)
         finally:
             mconn.close()
-        migrated_ver = _read_schema_version(dest)
     except Exception as e:
         print(f"[zmem] restore FAILED: post-restore open/migrate failed: {e}",
               file=sys.stderr)

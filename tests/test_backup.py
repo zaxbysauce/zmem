@@ -1591,27 +1591,57 @@ class RestoreReachesInitDbShapeTest(unittest.TestCase):
             conn.close()
 
     def _snapshot_and_restore(self):
+        """Snapshot the DEGRADED store through the real backup body
+        (storelib.backup.create_snapshot) WITHOUT the CLI's
+        _prepare_store heal — the review's M1 probe showed the CLI path
+        re-heals the fixture before the page copy, so the snapshot would
+        never carry the degraded shape this test needs."""
         env = dict(os.environ)
         env["ZMEM_STORE"] = str(self.store)
         env["ZMEM_DATA"] = str(self._tmp / "data")
         backup_dir = self._tmp / "backups"
+        snap = backup_dir / "store-493supp.sqlite"
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        driver = (
+            "import sys; from pathlib import Path; "
+            "sys.path.insert(0, r'%s'); "
+            "from storelib.backup import create_snapshot; "
+            "info = create_snapshot(Path(r'%s'), Path(r'%s')); "
+            "print(info['integrity_check'])" % (
+                str(SCRIPTS_DIR), str(self.store), str(snap)))
         r = subprocess.run(
-            [PYTHON, "-X", "utf8", str(STORE_PY), "backup",
-             "--out", str(backup_dir)],
+            [PYTHON, "-X", "utf8", "-c", driver],
             capture_output=True, text=True, env=env, timeout=300)
         self.assertEqual(r.returncode, 0, r.stderr)
-        snaps = sorted(p for p in backup_dir.rglob("store-*.sqlite"))
-        self.assertTrue(snaps, r.stdout)
+        self.assertEqual(r.stdout.strip(), "ok")
+        self.assertTrue(snap.is_file())
+        # The snapshot must carry the degraded shape (no re-heal).
+        conn = sqlite3.connect(str(snap))
+        try:
+            idx = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_memory_namespace'").fetchone()
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNone(idx, "fixture self-check: snapshot must lack the "
+                               "init_db-owned index")
+        self.assertEqual(ver[0], "18")
         # Restore into a FRESH destination: move the live store aside so
         # the destination does not exist (no --force needed).
         self.store.rename(self.store.with_suffix(".pre-restore"))
         env["ZMEM_STORE"] = str(self.store)
         r = subprocess.run(
             [PYTHON, "-X", "utf8", str(STORE_PY), "restore",
-             "--from", str(snaps[-1])],
+             "--from", str(snap)],
             capture_output=True, text=True, env=env, timeout=300)
         self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
-        self.assertIn("migrated shape schema_version=19", r.stdout)
+        from schema_meta import SUPPORTED_SCHEMA_VERSION
+        self.assertIn(
+            f"migrated shape schema_version={SUPPORTED_SCHEMA_VERSION}",
+            r.stdout)
 
     def test_restored_store_carries_init_db_owned_index(self):
         self._snapshot_and_restore()
@@ -1627,7 +1657,8 @@ class RestoreReachesInitDbShapeTest(unittest.TestCase):
             conn.close()
         self.assertIsNotNone(idx, "init_db-owned baseline index missing "
                                   "after restore (migrate-only step)")
-        self.assertEqual(ver[0], "19")
+        from schema_meta import SUPPORTED_SCHEMA_VERSION
+        self.assertEqual(ver[0], str(SUPPORTED_SCHEMA_VERSION))
 
 
 if __name__ == "__main__":

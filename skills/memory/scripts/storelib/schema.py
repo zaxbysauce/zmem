@@ -2191,11 +2191,13 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
                 except sqlite3.Error:
                     pass
             return  # abort without stamping; a later open re-runs
-        except sqlite3.OperationalError as exc:
-            # database-is-locked / SQLITE_BUSY_SNAPSHOT on the
-            # caller-transaction path: bound the undo to this batch and
-            # abort without stamping — never misclassify as a zero-row
-            # compare miss.
+        except sqlite3.Error as exc:
+            # database-is-locked / SQLITE_BUSY_SNAPSHOT (OperationalError)
+            # or any other mid-batch database failure (review round 2: a
+            # constraint-style failure must not strand the batch
+            # savepoint): bound the undo to this batch on the
+            # caller-transaction path and abort without stamping — never
+            # misclassify as a zero-row compare miss.
             if not own_tx:
                 try:
                     conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
