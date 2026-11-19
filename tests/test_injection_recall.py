@@ -34,21 +34,72 @@ class InjectionFilterSourceTests(unittest.TestCase):
 
     def test_recall_memory_filters_injection_on_no_bump(self):
         """recall_memory must filter injection-risk rows when
-        no_bump=True (the hook path)."""
+        no_bump=True (the hook path).
+
+        Issue #474 split the public seam: recall_memory now delegates
+        through the reuse layer to _recall_memory_uncached, which owns the
+        emit-time classification. The invariant binds at BOTH: the public
+        seam must forward no_bump (keyed and forwarded — never dropped),
+        and the implementation it runs must call _classify_injection."""
         import storelib.recall as recall_mod
-        src = inspect.getsource(recall_mod.recall_memory)
+        seam_src = inspect.getsource(recall_mod.recall_memory)
+        impl_src = inspect.getsource(recall_mod._recall_memory_uncached)
         # The filter must use both the per-item classification AND
         # the no_bump flag, dropping the row.
         self.assertIn(
             "_classify_injection",
-            src,
-            "recall_memory must call _classify_injection at emit time",
+            impl_src,
+            "the recall implementation must call _classify_injection at "
+            "emit time",
         )
         self.assertIn(
             "no_bump",
-            src,
-            "recall_memory must branch on no_bump to decide omit vs prefix",
+            impl_src,
+            "the recall implementation must branch on no_bump to decide "
+            "omit vs prefix",
         )
+        self.assertIn(
+            "no_bump",
+            seam_src,
+            "the public seam must forward no_bump (it is part of the "
+            "reuse key AND the delegated call — dropping it would change "
+            "hook-path filtering)",
+        )
+        self.assertIn(
+            "_recall_memory_uncached",
+            seam_src,
+            "the public seam must delegate to the implementation",
+        )
+
+    def test_seam_forwards_no_bump_behaviorally(self):
+        # review TF-007: source-token pins do not prove forwarding. This
+        # behavioral probe monkeypatches the implementation and asserts the
+        # seam forwards no_bump/no_telemetry through the reuse layer.
+        import sqlite3
+        import unittest.mock as _mock
+        import storelib.schema as schema
+        import storelib.recall as recall_mod
+        c = sqlite3.connect(":memory:")
+        c.row_factory = sqlite3.Row
+        schema.init_db(c)
+        schema.migrate(c)
+        self.addCleanup(c.close)
+        with _mock.patch.object(
+                recall_mod, "_recall_memory_uncached",
+                return_value=[]) as impl_mock:
+            recall_mod.recall_memory(
+                c, query="forwarding probe", namespace="project:inj",
+                limit=2, no_bump=True, no_telemetry=True,
+                for_injection=False)
+        impl_mock.assert_called_once()
+        kwargs = impl_mock.call_args.kwargs
+        self.assertTrue(kwargs.get("no_bump"),
+                        "the seam must forward no_bump=True to the "
+                        "implementation (dropping it would change "
+                        "hook-path filtering)")
+        self.assertTrue(kwargs.get("no_telemetry"),
+                        "the seam must forward no_telemetry to the "
+                        "implementation")
 
     def test_recent_memory_filters_injection_on_no_bump(self):
         """recent_memory must follow the same contract."""

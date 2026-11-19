@@ -383,14 +383,26 @@ jobs:
               echo "=== $f (skipped here: dependency-enforcing smoke test runs in test-embeddings) ==="
               continue
             fi
+            # Issue #473 byte-parity gate: model-dependent by design — its
+            # class-level SkipTest on a model-absent runner reports "Ran 0
+            # tests", which this loop's zero-tests gate correctly treats as
+            # a no-op. The authoritative run is the test-real-model job
+            # (provisioned model), where the gate runs for real.
+            if [ "$f" = "tests/test_real_model_byte_parity.py" ]; then
+              echo "=== $f (skipped here: model-dependent parity gate runs in test-real-model) ==="
+              continue
+            fi
             # (Issue #256 gate removed: #180 landed, so the full
             # test_q02_passive_secret_withhold.py file — AC6 class included —
             # runs in this loop.)
             echo "=== $f ==="
             log="$(mktemp)"
             if python "$f" 2>&1 | tee "$log"; then
-              # Executed-count gate: a suite that reports "Ran 0 tests" is a
-              # collection bomb or a silent no-op, not a green run.
+              # Executed-count gate (fail-closed): a suite that reports
+              # "Ran 0 tests" — a collection bomb, a silent no-op, or a
+              # class-level SkipTest — is an ERROR, not a green run.
+              # Dependency-dependent suites must be skipped by path (see the
+              # exclusions above) or provisioned, never left to skip silently.
               if grep -Eq '^Ran 0 tests' "$log"; then
                 echo "::error::$f ran zero tests (collection failure or no-op)"
                 failed=1; failed_list="$failed_list $f(zero-tests)"
@@ -836,6 +848,11 @@ jobs:
           python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_metadata_integrity
           python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_compatibility_and_cost
           python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_subject_dedup_contract.py::test_held_out_evaluation
+          # Issue #473 byte-parity hard gate: the bounded ONNX resource
+          # policy must not change vector bytes or ranking order (the
+          # fake-profile lanes cannot prove this; only the provisioned
+          # real model can).
+          python -X utf8 -m pytest --disable-plugin-autoload --noconftest -p no:cacheprovider -q tests/test_real_model_byte_parity.py
 
   # Issue #139: C6 is the native Hermes provenance lane. It is separate from
   # the generic Python 3.11 loop because this acceptance fixture must use the

@@ -79,6 +79,7 @@ from storelib.schema import (
     _normalize_content,
     now_iso,
 )
+from storelib import generation as _store_generation
 
 # The single link role shipped in v10. The column exists so phase 6 (links)
 # can enrich relationships without another migration; every v10 link row
@@ -1018,6 +1019,7 @@ def _upsert_entity(conn: sqlite3.Connection, kind: str, name: str) -> str | None
         # Concurrent writer minted the alias first: adopt its entity, drop
         # the shell row we just created (fail-closed to the shared identity).
         conn.execute("DELETE FROM entity WHERE id=?", (eid,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         row = conn.execute(
             "SELECT entity_id FROM entity_alias WHERE alias_norm=?", (alias,)
         ).fetchone()
@@ -1067,6 +1069,7 @@ def relink_memory(conn: sqlite3.Connection, memory_id: str) -> int:
     if row is None:
         return 0
     conn.execute("DELETE FROM memory_entity WHERE memory_id=?", (memory_id,))
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
     return link_memory_entities(
         conn, memory_id,
         content=row["content"], tags=row["tags"], namespace=row["namespace"],
@@ -1474,6 +1477,7 @@ def cmd_entity_merge(
         # aliases FIRST, then re-insert them on the target from the
         # collected list (collisions with the target are skipped + counted).
         conn.execute("DELETE FROM entity_alias WHERE entity_id=?", (from_id,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         conn.executemany(
             "INSERT OR IGNORE INTO entity_alias(entity_id, alias_norm) "
             "VALUES (?,?)",
@@ -1489,8 +1493,11 @@ def cmd_entity_merge(
             (to_id, from_id),
         )
         conn.execute("DELETE FROM memory_entity WHERE entity_id=?", (from_id,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         conn.execute("DELETE FROM entity WHERE id=?", (from_id,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         conn.execute("UPDATE entity SET updated_at=? WHERE id=?", (now_iso(), to_id))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         if started_tx:
             conn.commit()
     except Exception:
@@ -1772,6 +1779,7 @@ def reconcile_entity_aliases(
                 (orphan_id,)).fetchall()
             conn.execute("DELETE FROM entity_alias WHERE entity_id=?",
                          (orphan_id,))
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             for alias in aliases:
                 conn.execute(
                     "INSERT OR IGNORE INTO entity_alias(entity_id,alias_norm)"
@@ -1783,7 +1791,9 @@ def reconcile_entity_aliases(
                     (link["memory_id"], terminal, link["role"]))
             conn.execute("DELETE FROM memory_entity WHERE entity_id=?",
                          (orphan_id,))
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             conn.execute("DELETE FROM entity WHERE id=?", (orphan_id,))
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             # Review PRR-004 (PR #454): the merge must not strand the
             # orphan's live entity_card — a live card whose source_ref names
             # a dead entity keeps rendering (its recall suppression relied on
@@ -2252,6 +2262,7 @@ def refresh_entity_card(
                 conn.execute(
                     "DELETE FROM entity_alias WHERE entity_id=?", (eid,))
                 conn.execute("DELETE FROM entity WHERE id=?", (eid,))
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
         conn.execute(
             "INSERT OR IGNORE INTO memory_entity(memory_id, entity_id, role) "
             "VALUES (?,?,?)",

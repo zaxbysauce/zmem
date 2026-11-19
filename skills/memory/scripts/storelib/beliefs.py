@@ -28,6 +28,7 @@ from storelib.schema import now_iso
 from storelib.write import _SIGNAL_RANK
 
 import schema_meta
+from storelib import generation as _store_generation
 
 # Bumped only when head-derivation semantics change; stored on every head so
 # a future revision can tell which rows need a rebuild.
@@ -89,7 +90,9 @@ def _delete_head_children(conn: sqlite3.Connection, head_id: str) -> None:
     transaction — the side tables have no ON DELETE CASCADE by contract, so
     this helper is the single cleanup path every writer shares."""
     conn.execute("DELETE FROM belief_head_evidence WHERE head_id=?", (head_id,))
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
     conn.execute("DELETE FROM belief_head_source WHERE head_id=?", (head_id,))
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
 
 def _record_retracted(conn: sqlite3.Connection, head_id: str,
@@ -262,6 +265,7 @@ def _refresh_one_topic(conn: sqlite3.Connection, members: list[dict],
 
     _delete_head_children(conn, head_id)
     conn.execute("DELETE FROM belief_head WHERE id=?", (head_id,))
+    _store_generation.bump_mutation_generation(conn)  # issue #474 census
     conn.execute(
         """INSERT INTO belief_head (id, namespace, topic_identity, content,
            head_state, head_source_id, support_count, refresh_watermark,
@@ -428,6 +432,7 @@ def refresh_belief_heads(conn: sqlite3.Connection, *,
                 for hid in intersecting[1:]:
                     _delete_head_children(conn, hid)
                     conn.execute("DELETE FROM belief_head WHERE id=?", (hid,))
+                    _store_generation.bump_mutation_generation(conn)  # issue #474 census
                     covered.pop(hid, None)
                 summary = _refresh_one_topic(
                     conn, live_rows, _newest_updates_dst(conn, live_rows),
@@ -769,6 +774,7 @@ def _apply_one_action(conn: sqlite3.Connection, hid: str, state: str,
                 raise BeliefActionError("unresolved evidence citation: %s" % eid)
         conn.execute("UPDATE belief_head SET content=? WHERE id=?",
                      (text or "", hid))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         return state
     if op == "add_source":
         for sid in source_ids:
@@ -804,6 +810,7 @@ def _apply_one_action(conn: sqlite3.Connection, hid: str, state: str,
             raise BeliefActionError("invalid transition %s -> contested" % state)
         conn.execute("UPDATE belief_head SET head_state='contested' WHERE id=?",
                      (hid,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         return "contested"
     # retract_source
     if not source_ids:
@@ -814,8 +821,10 @@ def _apply_one_action(conn: sqlite3.Connection, hid: str, state: str,
     for sid in source_ids:
         conn.execute("DELETE FROM belief_head_evidence WHERE head_id=? AND "
                      "source_id=?", (hid, sid))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         conn.execute("DELETE FROM belief_head_source WHERE head_id=? AND "
                      "source_id=?", (hid, sid))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
     _record_retracted(conn, hid, source_ids)
     remaining = conn.execute(
         "SELECT COUNT(*) FROM belief_head_source WHERE head_id=?",
@@ -827,6 +836,7 @@ def _apply_one_action(conn: sqlite3.Connection, hid: str, state: str,
             raise BeliefActionError("invalid transition %s -> retracted" % state)
         conn.execute("UPDATE belief_head SET head_state='retracted' WHERE id=?",
                      (hid,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         return "retracted"
     return state
 

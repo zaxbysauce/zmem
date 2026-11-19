@@ -5,6 +5,74 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.162.0] - 2026-11-18
+
+### Added
+
+- **Bounded ONNX resource policy** (issue #473): both ONNX sessions (the
+  minilm embedder and the cross-encoder) construct explicit
+  `SessionOptions` — intra-op threads capped at `min(4, cpu_count)`,
+  inter-op 1, sequential execution, both spin keys disabled per installed
+  runtime support. Env overrides `ZMEM_ORT_INTRA_THREADS`,
+  `ZMEM_ORT_INTER_THREADS`, `ZMEM_ORT_DISABLE_SPIN` (invalid values fall
+  back to the documented defaults and are reported in
+  `availability_status().resource_options`). Vector bytes are
+  byte-identical under the policy (real-model parity gate in the
+  test-real-model CI lane).
+- **Phase-cost measurement mode** (issue #473):
+  `scripts/bench_hook_latency.py --phase-report <path>` reports six
+  disjoint additive buckets (interpreter/imports, sqlite_vec, model/
+  tokenizer read+hash, session construction, inference, SQL) against a
+  fresh fixture store — fail-closed refusal to open an existing store,
+  forced `ZMEM_MODEL_AUTODOWNLOAD=0`, mutually exclusive with
+  `--compare-baseline`, legacy deterministic output unchanged. Reference
+  measurement (3 runs, Python 3.11.9 / onnxruntime 1.27.0): session
+  construction 233-323 ms and sqlite_vec import 237-277 ms dominate a
+  cold recall; inference 27-36 ms; SQL 0.2 ms — the go/no-go evidence for
+  the Workstream V worker gate.
+- **Recall reuse (in-process, default OFF)** (issue #474):
+  `ZMEM_RECALL_REUSE=1` serves identical successful recall work within a
+  TTL (`ZMEM_RECALL_REUSE_TTL_S`, default 30 s) behind a correctness-first
+  key (store identity, query, session/fence, complete option set,
+  resolved-config fingerprint, store mutation generation, store
+  incarnation). Coalescing of identical in-flight recalls; failures never
+  cached; hit-side effect failures evict; explicit refresh via
+  `ZMEM_RECALL_REUSE_REFRESH`. Telemetry, `_capture` population, and
+  stdout replay identically on hits. Scope: an in-process layer — hook
+  subprocess-per-prompt paths stay cold by construction; it serves
+  long-lived recall callers (the Workstream V worker, in-process selector
+  consumers, eval harnesses).
+- **Mixed-version note for recall reuse:** writers older than 0.162.0 do not
+  advance the mutation generation that invalidates reuse keys. If a pre-0.162.0
+  client writes to a store shared with an opted-in long-lived 0.162.0+ process
+  (`ZMEM_RECALL_REUSE=1`), that process serves cached results until
+  `ZMEM_RECALL_REUSE_TTL_S` expires. Upgrade all writers sharing the store, or
+  shorten the TTL. (Reused results are also invalidated by wholesale store
+  replacement via the store incarnation, which all replacement lanes rotate.)
+- **Observation sidecar** (issue #474):
+  `ZMEM_RECALL_REUSE_OBSERVE=1` records anonymized per-key observations
+  (`ops/reuse-observe.jsonl`, digests + counters only — never query text)
+  with append-time classification (duplicate-equivalent /
+  retry-after-failure / TTL-expired / component-attributed invalidations /
+  refresh / novel), locked read-modify-write, a hard 4096-record bound
+  with count-preserving compaction and overflow accounting, a drops
+  journal, and a fail-closed report. Reference workload (240 attempts,
+  60 queries, one mid-run mutation): duplicate-equivalent rate 58.3%
+  in-process (reconciles 240/240) and 37.5% across hook-process
+  boundaries under the 30 s TTL (reconciles 240/240); serving-mode
+  realizable hit rate 58.3%.
+- **Mutation generation + store incarnation** (issue #474): a monotonic
+  generation counter maintained inside the existing write transactions
+  (64 census sites across write/consolidate/organize/sync/purge/links/
+  episodes/entity/evidence/beliefs/rekey/knowledge/dataset + the reembed
+  apply; telemetry deliberately excluded) and a store incarnation rotated
+  on the staged copy before atomic install on wholesale replacement paths
+  (backup restore, import-store).
+
+### Changed
+
+- README: bounded-resource-policy and reuse/observation env documentation.
+
 ## [0.161.0] - 2026-11-17
 
 ### Added

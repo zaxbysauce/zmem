@@ -756,9 +756,18 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             meta_after = conn.execute(
                 "SELECT key, value FROM meta ORDER BY key").fetchall()
             conn.close()
-            self.assertEqual(meta_before, meta_after,
+            # Issue #474 disclosure: the mutation-generation counter is
+            # the documented, in-transaction accounting of selection-
+            # changing writes (issue #474) — the reflect CAPTURES in this
+            # test legitimately advance it. The pin's contract (delivery
+            # writes no NEW meta rows and no delivery-bookkeeping values)
+            # is preserved by comparing every row EXCEPT that counter.
+            strip = lambda rows: [r for r in rows
+                                  if r[0] != "mutation_generation"]
+            self.assertEqual(strip(meta_before), strip(meta_after),
                              "query-context delivery must not write the "
-                             "store's meta table (sidecar-only persistence)")
+                             "store beyond the mutation-generation "
+                             "counter")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 class RegistrationAndContractTest(unittest.TestCase):

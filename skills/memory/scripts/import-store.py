@@ -647,6 +647,15 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
         stashed: list[tuple[Path, Path]] = []
         try:
             stashed = _stash_dest_sidecars(dest_store)
+            # Issue #474 (R2-1): wholesale replacement bypasses writer
+            # transactions, so generation alone could alias a cached reuse
+            # identity with the PREVIOUS store incarnation. Rotate the store
+            # incarnation ON THE STAGED COPY before the atomic install: a
+            # crash before install discards the staging (old store + its
+            # cached identities stay valid); after the install the new store
+            # already answers with the fresh incarnation — no window.
+            from storelib.generation import rotate_incarnation_on_staging
+            rotate_incarnation_on_staging(staged_path)
             os.replace(staged_path, dest_store)
             store_replaced = True
             if staged_core is not None:
@@ -1026,6 +1035,13 @@ def run_hindsight_import(input_path: Path, dest_dir: Path,
         stashed: list[tuple[Path, Path]] = []
         try:
             stashed = _stash_dest_sidecars(dest_store)
+            # Issue #474 (R2-1, review finding 3): this lane ALSO replaces
+            # the store wholesale — rotate the incarnation on the staged
+            # copy before the atomic install, exactly like run_import and
+            # backup-restore, so cached reuse identities from the previous
+            # incarnation can never alias the hindsight-imported store.
+            from storelib.generation import rotate_incarnation_on_staging
+            rotate_incarnation_on_staging(staged_store)
             os.replace(staged_store, dest_store)
             store_replaced = True
             os.replace(staged_output, dest_output)

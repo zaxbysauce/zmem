@@ -352,6 +352,12 @@ def _local_scorer():
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
+        # Issue #473 AC3: the cross-encoder session applies the SAME bounded
+        # resource policy as the embedding session — ONE resolver (in
+        # embeddings.py) owns SessionOptions for both, so thread pools and
+        # spin behavior can never drift between the two ONNX sessions.
+        import embeddings as _embeddings
+
         # TOCTOU closure (#418): stat for cache freshness, then load ONE
         # buffer for each artifact and verify the digest of THAT buffer
         # before construction, so a swap between any two operations cannot
@@ -379,7 +385,11 @@ def _local_scorer():
             if _tok_sha != (profile.get("tokenizer_sha256") or "").lower():
                 _last_load_failure = "load-error"
                 return None
-        sess = ort.InferenceSession(model_bytes)
+        _sess_opts = _embeddings._resource_options(ort)
+        if _sess_opts is None:
+            sess = ort.InferenceSession(model_bytes)
+        else:
+            sess = ort.InferenceSession(model_bytes, sess_options=_sess_opts)
         tok = Tokenizer.from_buffer(tok_bytes)
         tok.enable_padding(length=128)
         tok.enable_truncation(max_length=128)

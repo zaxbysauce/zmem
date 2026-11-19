@@ -19,6 +19,7 @@ from storelib.backup import (_ensure_backup_dir, _new_snapshot_path,
                              create_snapshot)
 from storelib.entity import relink_memory
 from storelib.schema import SCHEMA_VERSION_KEY, _commit, _schema_compat
+from storelib import generation as _store_generation
 
 
 _MAP_LINE = re.compile(r'^"([^"\\]+)": "([^"\\]+)"$')
@@ -804,6 +805,7 @@ def apply_namespace_map(conn: sqlite3.Connection, *, store_path: Path,
                             "AND superseded_at IS NULL AND namespace<>?",
                             (target, row["id"], target),
                         )
+                        _store_generation.bump_mutation_generation(conn)  # issue #474 census
                         if cur.rowcount:
                             mapped_counts[index]["moved"] += 1
                             relink_memory(conn, row["id"])

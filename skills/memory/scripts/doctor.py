@@ -987,6 +987,7 @@ def _check_embeddings() -> dict:
         dim=st.get("dim"),
         checksum_ok=st.get("checksum_ok"),
         checksum_artifact=st.get("checksum_artifact"),
+        resource_options=st.get("resource_options"),
         **({"note": st["note"]} if st.get("note") else {}),
     )
 

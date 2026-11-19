@@ -149,7 +149,17 @@ class ScopedTierIntegrationTests(unittest.TestCase):
                     no_bump=True,
                     no_telemetry=True,
                 )
-        self.assertEqual(statements, [])
+        # Issue #474 seam disclosure: the reuse layer resolves store
+        # identity (PRAGMA database_list + a read-only meta SELECT) BEFORE
+        # delegating; the refusal contract this pin owns (no selection or
+        # telemetry SQL, ValueError raised) is unchanged — whitelist
+        # exactly those two read-only probe shapes.
+        allowed = ("PRAGMA database_list", "SELECT value FROM meta")
+        leftover = [q for q in statements if not q.startswith(allowed)]
+        self.assertEqual(
+            leftover, [],
+            "invalid input must fail closed before any selection/write "
+            "SQL; observed: %r" % (statements,))
         bump.assert_not_called()
 
     def test_scoped_injection_refusal_does_not_enter_collector(self):
@@ -186,7 +196,17 @@ class ScopedTierIntegrationTests(unittest.TestCase):
                 self.conn, scopes=SCOPES, include_cross_project=True,
                 no_bump=True,
             )
-        self.assertEqual(statements, [])
+        # Issue #474 seam disclosure: the reuse layer resolves store
+        # identity (PRAGMA database_list + a read-only meta SELECT) BEFORE
+        # delegating; the refusal contract this pin owns (no selection or
+        # telemetry SQL, ValueError raised) is unchanged — whitelist
+        # exactly those two read-only probe shapes.
+        allowed = ("PRAGMA database_list", "SELECT value FROM meta")
+        leftover = [q for q in statements if not q.startswith(allowed)]
+        self.assertEqual(
+            leftover, [],
+            "invalid input must fail closed before any selection/write "
+            "SQL; observed: %r" % (statements,))
 
     def test_duplicate_ids_do_not_consume_a_later_tier_slot(self):
         tiers = {

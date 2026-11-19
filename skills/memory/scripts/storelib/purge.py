@@ -62,6 +62,7 @@ from storelib.backup import (
     _acquire_lock,
     _release_lock,
 )
+from storelib import generation as _store_generation
 
 # Tokens shorter than this are ignored when deciding whether a derived row
 # still quotes the purged text and when computing byte-verify needles: short
@@ -427,9 +428,11 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
         conn.execute("BEGIN IMMEDIATE")
 
         conn.execute("DELETE FROM memory WHERE id IN (%s)" % ph, chain)
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
         if summary_ids:
             conn.execute("DELETE FROM memory WHERE id IN (%s)"
                          % _placeholders(summary_ids), summary_ids)
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
         if has_vec:
             conn.execute(
                 "DELETE FROM memory_vec WHERE memory_id IN (%s)" % dph,
@@ -464,6 +467,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                     (ev,)).fetchone() is not None:
                 continue
             conn.execute("DELETE FROM evidence WHERE id=?", (ev,))
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
             if _table_exists(conn, "episode_evidence"):
                 conn.execute(
                     "DELETE FROM episode_evidence WHERE evidence_id=?", (ev,))
@@ -487,6 +491,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
         # Belief heads: rebuild survivors, delete the sourceless.
         for hid in head_deletes:
             conn.execute("DELETE FROM belief_head WHERE id=?", (hid,))
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
         for hid in head_rebuilds:
             src = _head_surviving_source(conn, hid, chain)
             conn.execute(
@@ -497,10 +502,12 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
         for sd in res["summary_deletes"]:
             conn.execute("UPDATE episode SET summary_memory_id='' WHERE id=?",
                          (sd["episode_id"],))
+            _store_generation.bump_mutation_generation(conn)  # issue #474 census
         for s in res["successor_updates"]:
             if s["id"] not in chain_set:
                 conn.execute("UPDATE memory SET update_of='' WHERE id=?",
                              (s["id"],))
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
         for key, value in meta_scrubs:
             if value == "[]":
                 conn.execute("DELETE FROM meta WHERE key=?", (key,))
@@ -523,6 +530,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                     % _placeholders(gone_entities), gone_entities)
             for entity_id in gone_entities:
                 conn.execute("DELETE FROM entity WHERE id=?", (entity_id,))
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
         if _table_exists(conn, "purged_id"):
             # Every id deleted by this purge joins the deny-list, not just the

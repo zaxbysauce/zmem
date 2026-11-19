@@ -50,6 +50,7 @@ from pathlib import Path
 
 from .schema import GLOBAL_NAMESPACE, init_db, migrate
 from .schema import _host
+from storelib import generation as _store_generation
 
 DATASET_SCHEMA_VERSION = 1
 GENERATOR_REVISION = "zmem-dataset-v1"
@@ -1193,6 +1194,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     + ") VALUES ("
                     + ", ".join("?" * len(_MEMORY_STORE_COLUMNS)) + ")",
                     tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS))
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
             kept_ids = {row["id"] for row in kept}
             # Issue #414 (#324 parent-outcome-aware rule): expiry records
             # restore onto LIVE STATE parents only — a tombstoned or
@@ -1239,6 +1241,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     "(memory_id, inject_until, expiry_class) "
                     "VALUES (?, ?, ?)",
                     (emid, inject_until, expiry_class))
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
             episodes = [e for e in families["episodes"]
                         if namespace is None or e["namespace"] == namespace]
             # Endpoint validation after filtering: a summary reference to a
@@ -1254,6 +1257,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     "summary_memory_id, token_count) VALUES (?, ?, ?, ?, ?, ?)",
                     (e["id"], e["namespace"], e["started_at"], e["ended_at"],
                      e["summary_memory_id"], e["token_count"]))
+                _store_generation.bump_mutation_generation(conn)  # issue #474 census
             for m in families["episode_members"]:
                 if m["episode_id"] in {e["id"] for e in episodes} and \
                         m["memory_id"] in kept_ids:
@@ -1261,6 +1265,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                         "INSERT OR IGNORE INTO episode_memory (episode_id, "
                         "memory_id, added_at) VALUES (?, ?, ?)",
                         (m["episode_id"], m["memory_id"], m["added_at"]))
+                    _store_generation.bump_mutation_generation(conn)  # issue #474 census
             for l in families["links"]:
                 if l["src"] in kept_ids and l["dst"] in kept_ids:
                     conn.execute(
@@ -1268,6 +1273,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                         "relation, score, created_at) VALUES (?, ?, ?, ?, ?)",
                         (l["src"], l["dst"], l["relation"], l["score"],
                          l["created_at"]))
+                    _store_generation.bump_mutation_generation(conn)  # issue #474 census
             conn.commit()
         except sqlite3.IntegrityError as exc:
             raise DatasetError(

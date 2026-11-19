@@ -1924,6 +1924,65 @@ supported — `recall`, `consolidate`, and all writes keep working — but seman
 dedup and vector recall are off, and unembedded rows are skipped as consolidation
 seeds.
 
+#### Bounded ONNX resource policy (issue #473)
+
+Both ONNX sessions (the embedding model and the cross-encoder) are constructed
+with an explicit, bounded `SessionOptions` policy instead of onnxruntime's
+unbounded defaults: intra-op threads capped at `min(4, cpu_count)`, inter-op
+threads 1, sequential execution, and both spin keys
+(`session.intra_op.allow_spinning` / `session.inter_op.allow_spinning`)
+disabled where the installed runtime supports them. Override with:
+
+- `ZMEM_ORT_INTRA_THREADS` (int 1..64) — intra-op thread cap
+- `ZMEM_ORT_INTER_THREADS` (int 1..64) — inter-op thread cap
+- `ZMEM_ORT_DISABLE_SPIN` (0/1, default 1) — disable thread spinning
+
+Invalid values fall back to the documented defaults and are reported in
+`availability_status()["resource_options"]["invalid_overrides"]` (also visible
+via `zmem doctor`) — never a crash, never silently unbounded. Vector bytes are
+byte-identical under the policy (pinned by the real-model parity gate in CI).
+`scripts/bench_hook_latency.py --phase-report <path>` measures the per-phase
+cost of a recall (interpreter/imports, sqlite_vec, model/tokenizer read+hash,
+session construction, inference, SQL) against a fresh fixture store; it refuses
+to open an existing store and forces `ZMEM_MODEL_AUTODOWNLOAD=0`.
+
+#### Recall reuse (issue #474, default OFF)
+
+Identical successful recall work can be reused in-process instead of
+recomputed. DEFAULT OFF — opt in per process:
+
+- `ZMEM_RECALL_REUSE=1` — serve cached results for identical recall keys
+  (identity + session/fence + options + resolved-config fingerprint + store
+  mutation generation + store incarnation) within the TTL
+- `ZMEM_RECALL_REUSE_TTL_S` (float seconds, default 30, 0 disables)
+- `ZMEM_RECALL_REUSE_REFRESH=1` — force one call to recompute-and-replace
+- `ZMEM_RECALL_REUSE_OBSERVE=1` — shadow observation WITHOUT serving:
+  records anonymized per-key observations to `ops/reuse-observe.jsonl`
+  beside the store (digests and counters only — never query text) so the
+  duplicate-equivalent recall rate of a REAL workload can be measured across
+  hook process boundaries. The observation writer holds
+  `ops/reuse-observe.lock` for its bounded rewrite window; a writer killed
+  mid-rewrite leaves the lock behind and observation pauses (fail-visible:
+  the report marks itself incomplete with drops) until the operator removes
+  the lock file. The report names a suspect lock via
+  `stale_lock_suspected` (lock path + remedy) when drops coexist with a
+  present lock file; the journal grows only on lock incidents, and the
+  report's `coverage.dropped` line-count stays cheap to re-read.
+
+Every 0.162.0-and-later store mutation that changes recall selection invalidates
+cached keys (mutation generation, maintained inside the existing write
+transactions); wholesale store replacement (backup restore, import-store)
+rotates the store incarnation so a restored store can never alias the previous
+incarnation's cached identities. **Mixed-version note:** writers older than
+0.162.0 do not advance the mutation generation — if a pre-0.162 client writes
+to a store shared with an opted-in long-lived 0.162.0+ process, that process
+serves cached results until the TTL expires; upgrade all writers sharing the
+store, or shorten `ZMEM_RECALL_REUSE_TTL_S`. Scope: this is an in-process
+layer — hook subprocess-per-prompt paths are cold by construction; it serves
+long-lived recall callers (the Workstream V embedding worker, in-process
+selector consumers, eval harnesses). Telemetry (retrieval/surfaced counters),
+`_capture` population, and stdout output are replayed identically on hits.
+
 **To enable embeddings:**
 
 1. Make sure the embedding + vector-recall runtime is installed in the Python

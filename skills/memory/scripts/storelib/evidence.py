@@ -21,6 +21,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 from storelib.write import redact_text
+from storelib import generation as _store_generation
 
 
 EVIDENCE_MAX_EXCERPT_CHARS = 400
@@ -284,6 +285,7 @@ def sweep_evidence(
             "(SELECT id FROM evidence WHERE ts < ?)", (cutoff,)
         ).rowcount
         conn.execute("DELETE FROM evidence WHERE ts < ?", (cutoff,))
+        _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
         # Keep newest rows by ts DESC, id DESC; the subquery avoids a host
         # parameter list and remains safe above SQLite's variable limit.
