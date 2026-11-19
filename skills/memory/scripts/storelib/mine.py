@@ -2171,26 +2171,78 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
     # Lazy import avoids a module-level cycle (sync imports write; mine is
     # imported by cli alongside both).
     from storelib.schema import _normalize_content
-    from storelib.sync import _ingest_row, _validate_sync_row
+    from storelib.sync import _ingest_row, _validate_sync_row, _is_purged
 
     tallies: dict[str, int] = {}
     defaulted: dict[str, int] = {}
     malformed = 0
     # Review-minor fix: project the existing-id short-circuit in dry-run too
-    # (the destination's live id set), so the dry-run summary accounts for
-    # EVERY source row: would_promote + would_skip + malformed == total.
+    # (the destination's id set), so the dry-run summary accounts for EVERY
+    # source row.
     dry_skip_ids: set[str] = set()
-    # #324: dry-run projection of the post-memory-pass live state ids — the
-    # expiry side pass below counts would-copies against this projected set,
-    # because dry-run never inserts the parents (the CURRENT destination
-    # alone would count zero on a fresh destination).
-    dry_live_state_ids: set[str] = set()
+    # #324 + #493 AC2: the dry-run projection models the POST-PASS live
+    # destination, mirroring _ingest_row's decision order (existing-id /
+    # tombstone -> purged denial -> pointer bypass -> history insert ->
+    # exact-candidate fold with subject veto -> own-id landing), so the
+    # operator-planning tallies match a real promote. Simulated keepers
+    # carry the fields the fold rules read; the model is pass-local and
+    # never written (dry purity unchanged). Known projection limits,
+    # disclosed: the semantic-similarity fold lane (near-neighbor folds
+    # without a content_norm match) and the #61 polarity guard are not
+    # modeled — the projection can under-predict folds for those rows.
+    dry_live_model: dict[str, dict] = {}
     if dry_run:
         try:
             dry_skip_ids = {
                 r[0] for r in conn.execute("SELECT id FROM memory")}
+            for _r in conn.execute(
+                    "SELECT id, namespace, content_norm, tags, type, "
+                    "source_ref FROM memory WHERE superseded_at IS NULL"):
+                dry_live_model[_r["id"]] = {
+                    "namespace": _r["namespace"],
+                    "content_norm": _r["content_norm"],
+                    "tags": _r["tags"], "type": _r["type"],
+                    "source_ref": _r["source_ref"], "simulated": False}
         except sqlite3.Error:
-            dry_skip_ids = set()
+            dry_skip_ids = set(dry_live_model)
+
+        def _dry_exact_keeper(validated: dict, norm: str) -> str | None:
+            """First compatible exact keeper, mirroring the real detector's
+            order: destination-original rows (rowid-ascending, bounded by
+            SUBJECT_MAX_EXACT_CANDIDATES, pointer-excluded, #376 subject
+            fall-through) before earlier simulated landings (insertion
+            order). Pointer-rows never fold (identity-bearing)."""
+            from storelib import subject as _subject
+            from storelib.write import (SUBJECT_MAX_EXACT_CANDIDATES,
+                                        _has_knowledge_prefix)
+            try:
+                _rows = conn.execute(
+                    "SELECT id, tags, type FROM memory "
+                    "WHERE namespace=? AND content_norm=? "
+                    "AND superseded_at IS NULL "
+                    "AND (source_ref IS NULL OR source_ref NOT LIKE "
+                    "'knowledge:%') ORDER BY rowid LIMIT ?",
+                    (validated["namespace"], norm,
+                     SUBJECT_MAX_EXACT_CANDIDATES)).fetchall()
+            except sqlite3.Error:
+                _rows = []
+            for _r in _rows:
+                if not _subject.incompatible(
+                        validated.get("tags"), validated.get("type"),
+                        _r["tags"], _r["type"]):
+                    return _r["id"]
+            for _kid, _k in dry_live_model.items():
+                if not _k.get("simulated"):
+                    continue
+                if (_k["namespace"] != validated["namespace"]
+                        or _k["content_norm"] != norm
+                        or _has_knowledge_prefix(_k["source_ref"])):
+                    continue
+                if not _subject.incompatible(
+                        validated.get("tags"), validated.get("type"),
+                        _k["tags"], _k["type"]):
+                    return _kid
+            return None
     for row in rows:
         obj = {c: row[c] for c in cols if row[c] is not None}
         try:
@@ -2207,34 +2259,56 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
             if key not in obj and validated.get(key):
                 defaulted[key] = defaulted.get(key, 0) + 1
         if dry_run:
-            if validated["id"] in dry_skip_ids:
-                tallies["would_skip"] = tallies.get("would_skip", 0) + 1
-            else:
-                tallies["would_promote"] = tallies.get("would_promote", 0) + 1
-                if (validated.get("type") == "state"
-                        and not validated.get("superseded_at")):
-                    # PRR-005: predict the content-dedup fold — a source row
-                    # whose normalized content already exists live in the
-                    # destination folds into the keeper and never lands
-                    # under its own id, so its expiry record must project
-                    # as an orphan skip, not a would-copy. Issue #489: the
-                    # prediction mirrors the detector's exact-match case —
-                    # pointer rows are excluded from every dedup lane, so a
-                    # source row whose only equal match is a knowledge-ref
-                    # pointer does NOT fold and lands under its own id (the
-                    # pre-#489 shape predicted an orphan skip while the
-                    # real promote added the row).
-                    _norm = _normalize_content(validated["content"])
-                    _fold = None
-                    if _norm:
-                        _fold = conn.execute(
-                            "SELECT 1 FROM memory WHERE namespace=? "
-                            "AND content_norm=? AND superseded_at IS NULL "
-                            "AND (source_ref IS NULL OR source_ref NOT LIKE "
-                            "'knowledge:%')",
-                            (validated["namespace"], _norm)).fetchone()
-                    if _fold is None:
-                        dry_live_state_ids.add(validated["id"])
+            _rid = validated["id"]
+            if _rid in dry_skip_ids:
+                # existing-id branch: local content is never overwritten;
+                # the only projected mutation is a tombstone (a real
+                # promote passes allow_tombstones=True, so the unpermitted
+                # arm here is only the PR1 pointer refusal).
+                if (validated.get("superseded_at")
+                        and _rid in dry_live_model):
+                    from storelib.write import _has_knowledge_prefix
+                    if _has_knowledge_prefix(
+                            dry_live_model[_rid]["source_ref"]):
+                        tallies["would_tombstone_refused"] = \
+                            tallies.get("would_tombstone_refused", 0) + 1
+                    else:
+                        tallies["would_tombstoned"] = \
+                            tallies.get("would_tombstoned", 0) + 1
+                        del dry_live_model[_rid]
+                else:
+                    tallies["would_skip"] = \
+                        tallies.get("would_skip", 0) + 1
+                continue
+            if _is_purged(conn, _rid):
+                tallies["would_purged_denied"] = \
+                    tallies.get("would_purged_denied", 0) + 1
+                continue
+            from storelib.write import _has_knowledge_prefix
+            _is_ptr = _has_knowledge_prefix(validated.get("source_ref"))
+            if validated.get("superseded_at"):
+                # history insert: the real ingest returns 'added' but the
+                # row is superseded — it never joins the live model.
+                tallies["would_promote"] = \
+                    tallies.get("would_promote", 0) + 1
+                continue
+            _norm = _normalize_content(validated["content"])
+            _fold = None
+            if _norm and not _is_ptr:
+                _fold = _dry_exact_keeper(validated, _norm)
+            if _fold is not None:
+                tallies["would_dedup"] = \
+                    tallies.get("would_dedup", 0) + 1
+                continue
+            tallies["would_promote"] = \
+                tallies.get("would_promote", 0) + 1
+            dry_live_model[_rid] = {
+                "namespace": validated["namespace"],
+                "content_norm": _norm,
+                "tags": validated.get("tags"),
+                "type": validated.get("type"),
+                "source_ref": validated.get("source_ref"),
+                "simulated": True}
             continue
         try:
             outcome = _ingest_row(conn, validated, allow_tombstones=True,
@@ -2332,7 +2406,13 @@ def cmd_promote_store(conn: sqlite3.Connection, *, from_path: str,
                     live = conn.execute(
                         "SELECT 1 FROM memory WHERE id=? AND type='state' "
                         "AND superseded_at IS NULL", (src_mid,)).fetchone()
-                    projected = live is not None or src_mid in dry_live_state_ids
+                    # #493 AC2(d): project liveness against the POST-PASS
+                    # live model (destination originals + simulated
+                    # landings, minus projected tombstones) — exactly the
+                    # ids a real promote leaves live for the side pass.
+                    projected = live is not None or (
+                        src_mid in dry_live_model
+                        and dry_live_model[src_mid]["type"] == "state")
                     if not projected:
                         tallies["memory_expiry_orphan_skipped"] = \
                             tallies.get("memory_expiry_orphan_skipped", 0) + 1

@@ -2083,6 +2083,145 @@ def _repair_null_content_norm_162(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
+    """One-time VERIFICATION of every retained content_norm value (issue
+    #493 AC6; issue #489's repair closed only the admission-time half).
+
+    ``_repair_null_content_norm_162`` selects NULL rows only and stamps
+    ``content_norm_repair_162``; a store polluted by a PRE-#491 sqlite
+    import can carry a source-supplied STALE NON-NULL norm the NULL-only
+    pass never reaches. This pass verifies ALL retained norms (non-NULL
+    included) against the canonical ``_normalize_content`` of each row's
+    own content, under a NEW one-time stamp of its own
+    (``content_norm_verify_163``) so stores already stamped by #491's
+    repair are still verified.
+
+    Concurrency (plan-critic rounds 2-4): each batch takes the write lock
+    up front — top-level ``BEGIN IMMEDIATE`` when no caller transaction
+    exists (a deferred read snapshot could upgrade into
+    SQLITE_BUSY_SNAPSHOT instead of reaching the compare-and-update), and a
+    uniquely named SAVEPOINT when one does (a savepoint is not a nested
+    BEGIN, and ``ROLLBACK TO`` needs one on the stack to bound the undo to
+    this batch). The UPDATE is a compare-and-update on
+    (rowid, content, content_norm): a zero-row update means the row changed
+    under us — re-read immediately, recompute, retry once; a second
+    unresolved mismatch, or a locked/busy OperationalError on the
+    caller-transaction path, aborts the pass WITHOUT stamping (forward-only
+    keyset pagination never revisits a row, so the next open re-runs the
+    whole pass; stamping after an unresolved mismatch would make the stale
+    value permanent).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    if "content_norm" not in cols or "content" not in cols:
+        return
+    stamped = conn.execute(
+        "SELECT value FROM meta WHERE key='content_norm_verify_163'"
+    ).fetchone()
+    if stamped is not None:
+        return
+    # Trigger-safety guard, same discipline as _repair_null_content_norm_162:
+    # a hand-planted tags-less store must be skipped AND stay unstamped (a
+    # stamp would permanently exempt a shape a later full-schema store
+    # could still migrate into the verified set).
+    if "tags" not in cols:
+        return
+    batch_size = 200
+    _bf_last = None
+    examined = 0
+    while True:
+        if _bf_last is None:
+            rows = conn.execute(
+                "SELECT rowid, content, content_norm FROM memory "
+                "ORDER BY rowid LIMIT ?",
+                (batch_size,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT rowid, content, content_norm FROM memory "
+                "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (_bf_last, batch_size,)).fetchall()
+        if not rows:
+            break
+        examined += len(rows)
+        own_tx = not conn.in_transaction
+        sp = "zmem_norm_verify_163"
+        try:
+            if own_tx:
+                conn.execute("BEGIN IMMEDIATE")
+            else:
+                conn.execute(f"SAVEPOINT {sp}")
+            for r in rows:
+                _bf_last = max(_bf_last or r["rowid"], r["rowid"])
+                canonical = _normalize_content(r["content"] or "")
+                if r["content_norm"] == canonical:
+                    continue
+                cur = conn.execute(
+                    "UPDATE memory SET content_norm=? WHERE rowid=? "
+                    "AND content IS ? AND content_norm IS ?",
+                    (canonical, r["rowid"], r["content"],
+                     r["content_norm"]))
+                if cur.rowcount:
+                    continue
+                # Zero-row compare-and-update: the row changed under us.
+                fresh = conn.execute(
+                    "SELECT rowid, content, content_norm FROM memory "
+                    "WHERE rowid=?", (r["rowid"],)).fetchone()
+                if fresh is None:
+                    continue  # row deleted under us — nothing to verify
+                canonical = _normalize_content(fresh["content"] or "")
+                if fresh["content_norm"] == canonical:
+                    continue  # the concurrent writer already fixed it
+                retry = conn.execute(
+                    "UPDATE memory SET content_norm=? WHERE rowid=? "
+                    "AND content IS ? AND content_norm IS ?",
+                    (canonical, fresh["rowid"], fresh["content"],
+                     fresh["content_norm"]))
+                if not retry.rowcount:
+                    raise _NormVerifyConflict(
+                        f"rowid {r['rowid']} kept changing during the "
+                        "norm-verification pass")
+            if own_tx:
+                conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+        except _NormVerifyConflict:
+            if not own_tx:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except sqlite3.Error:
+                    pass
+            return  # abort without stamping; a later open re-runs
+        except sqlite3.OperationalError as exc:
+            # database-is-locked / SQLITE_BUSY_SNAPSHOT on the
+            # caller-transaction path: bound the undo to this batch and
+            # abort without stamping — never misclassify as a zero-row
+            # compare miss.
+            if not own_tx:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except sqlite3.Error:
+                    pass
+            elif conn.in_transaction:
+                conn.rollback()
+            return
+    # Stamp ONLY when the pass examined at least one row: a store whose
+    # memory table was empty at open (e.g. fresh `init`) stays unstamped,
+    # so the first open that actually holds rows still verifies them —
+    # a stale norm planted before any non-empty open heals on that open
+    # (the frozen C6 scenario), while a verified non-empty store pays the
+    # scan exactly once.
+    if examined > 0:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) "
+            "VALUES ('content_norm_verify_163', 'done')")
+        conn.commit()
+
+
+class _NormVerifyConflict(Exception):
+    """Internal: a row kept changing under the norm-verification pass."""
+
+
 # Issue #137: additive belief-head side tables.  Like the v14 evidence
 # tables, this DDL is version-independent — it runs on every open from
 # migrate() (never init_db, so an existing store never pre-creates the
@@ -2965,6 +3104,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     # repair (the v8 batch shape) so an upgraded store heals on its next
     # open; the meta stamp keeps the steady state a single meta read.
     _repair_null_content_norm_162(conn)
+
+    # Version-INDEPENDENT (issue #493 AC6): the NULL-only repair above
+    # cannot reach a STALE NON-NULL norm a PRE-#491 sqlite import wrote from
+    # a source store (the admission-time verify leg shipped with #491
+    # covers new imports only). This verification pass checks EVERY
+    # retained norm against the canonical normalize of its own row's
+    # content under its own one-time stamp, with compare-and-update
+    # batching so a concurrent writer can never receive a stale-computed
+    # norm (see the function docstring for the transaction discipline).
+    _verify_content_norms_163(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.
     # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,

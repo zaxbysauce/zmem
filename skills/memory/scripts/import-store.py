@@ -123,6 +123,7 @@ from storelib.write import (  # noqa: E402
     apply_capture_policy,
     quarantine_import_rows,
     KNOWLEDGE_SOURCE_REF_PREFIX,
+    _has_knowledge_prefix,
 )
 # PR1 (knowledge companion): imported knowledge: refs are preserved but
 # never newly verified — the payload demotion helper is shared with the
@@ -396,7 +397,7 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
         # content_norm/vec/entity recomputation below covers the demoted
         # bytes; unparseable payloads are left as-is (they can never be
         # authoritative: get_pointer requires a parsed, verified payload).
-        if (new_source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+        if _has_knowledge_prefix(new_source_ref):
             demoted = demote_imported_payload(new_content)
             if demoted is not None and demoted != new_content:
                 new_content = demoted

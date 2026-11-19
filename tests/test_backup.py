@@ -1559,5 +1559,76 @@ class SingleFlightCliTest(_StoreCase):
         self.assertEqual(len(self.snapshots()), 1)
 
 
+class RestoreReachesInitDbShapeTest(unittest.TestCase):
+    """Issue #493 AC1 supplementary (plan-critic CR-1): the post-restore
+    production open must run init_db BEFORE migrate — a restored old shape
+    missing an init_db-OWNED object (baseline index) must come back with
+    it, which a migrate-only step never creates."""
+
+    def setUp(self):
+        self._tmp = Path(tempfile.mkdtemp(prefix="zmem-493-ac1-supp-"))
+        self.addCleanup(shutil.rmtree, str(self._tmp), True)
+        self.store = self._tmp / "store" / "store.sqlite"
+        self.store.parent.mkdir(parents=True)
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = str(self.store)
+        env["ZMEM_DATA"] = str(self._tmp / "data")
+        r = subprocess.run(
+            [PYTHON, "-X", "utf8", str(STORE_PY), "init"],
+            capture_output=True, text=True, env=env, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Degrade to an old shape: drop an init_db-owned baseline index and
+        # stamp the previous schema version (v18) so the restore has real
+        # migration work.
+        conn = sqlite3.connect(str(self.store))
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_memory_namespace")
+            conn.execute(
+                "UPDATE meta SET value='18' "
+                "WHERE key='schema_version'")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_and_restore(self):
+        env = dict(os.environ)
+        env["ZMEM_STORE"] = str(self.store)
+        env["ZMEM_DATA"] = str(self._tmp / "data")
+        backup_dir = self._tmp / "backups"
+        r = subprocess.run(
+            [PYTHON, "-X", "utf8", str(STORE_PY), "backup",
+             "--out", str(backup_dir)],
+            capture_output=True, text=True, env=env, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        snaps = sorted(p for p in backup_dir.rglob("store-*.sqlite"))
+        self.assertTrue(snaps, r.stdout)
+        # Restore into a FRESH destination: move the live store aside so
+        # the destination does not exist (no --force needed).
+        self.store.rename(self.store.with_suffix(".pre-restore"))
+        env["ZMEM_STORE"] = str(self.store)
+        r = subprocess.run(
+            [PYTHON, "-X", "utf8", str(STORE_PY), "restore",
+             "--from", str(snaps[-1])],
+            capture_output=True, text=True, env=env, timeout=300)
+        self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
+        self.assertIn("migrated shape schema_version=19", r.stdout)
+
+    def test_restored_store_carries_init_db_owned_index(self):
+        self._snapshot_and_restore()
+        conn = sqlite3.connect(str(self.store))
+        try:
+            idx = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name='idx_memory_namespace'").fetchone()
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(idx, "init_db-owned baseline index missing "
+                                  "after restore (migrate-only step)")
+        self.assertEqual(ver[0], "19")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

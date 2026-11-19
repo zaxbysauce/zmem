@@ -102,7 +102,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the sanctioned amendment of
   `tests/test_session_end_closeout_nudge.py::test_closeout_ack_writes_marker_without_store`
   to the new refuse-then-pass contract.
+### Changed
 - Closeout now saves focused corrections and verifies that a natural query retrieves each correction in the default top five. User-requested closeouts also save qualifying audit findings and fix plans together in the enabled knowledge companion and verify the note by readback.
+
+- fix(memory): restore reaches migrated shape — `store.py restore` finishes with a production open (init_db + migrate under the held locks), so a snapshot whose schema predates the current client no longer leaves the destination at the old shape until some later open migrates it (issue #493)
+- fix(memory): promote-store --dry-run lane parity — the projection models the post-pass destination (existing-id/tombstone outcomes, purged denial, pointer bypass, exact-candidate folds with subject veto across every eligible type), reporting `would_dedup`/`would_tombstoned`/`would_tombstone_refused`/`would_purged_denied` so tallies match a real promote; disclosed limits: the semantic-similarity fold lane and the polarity guard are not modeled (issue #493)
+- fix(memory): dataset family reader streams JSONL line-by-line instead of materializing the whole family file (issue #493)
+- fix(memory): knowledge prefix agreement — the Python-side `knowledge:` prefix guards are now ASCII-case-insensitive (write._has_knowledge_prefix, mirroring SQLite LIKE, which folds ASCII only), so a `KNOWLEDGE:`-prefixed source_ref is refused by the same write-path admission gates that refuse the lowercase form instead of passing admission while every SQL window excludes it (issue #493)
+- fix(memory): non-dict dataset rows refuse through the central reader gate (DatasetError/PublishError per consumer) instead of a raw TypeError from the membership path (issue #493)
+- fix(memory): one-time content_norm verification (`content_norm_verify_163` stamp) — opening a store verifies every retained norm (non-NULL included) against the canonical normalize of its own content with compare-and-update batching, healing stale non-NULL norms pre-#491 imports left behind that the NULL-only repair never reached (issue #493)
+- test(memory): the detached-observation fake capture script emits an interpreter-entry marker (via the observation log, before stdin is read) so the next CI recurrence of issue #432's Node-22 failure separates startup absence from an input/read failure; no runtime change (owner ruling: no speculative fix)
 
 ## [0.163.0] - 2026-11-19
 

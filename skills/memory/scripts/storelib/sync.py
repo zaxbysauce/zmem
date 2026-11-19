@@ -26,7 +26,7 @@ from storelib.entity import link_memory_entities, relink_memory, split_tag_token
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
 from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.state_expiry import validate_inject_until
-from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref, KNOWLEDGE_SOURCE_REF_PREFIX
+from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref, KNOWLEDGE_SOURCE_REF_PREFIX, _has_knowledge_prefix
 # PR1 (knowledge companion): the ingest-side demotion of imported pointer
 # payloads. storelib.knowledge imports storelib.write only, so this import
 # introduces no cycle.
@@ -1650,7 +1650,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                 # rollback/DoS shape the reserved-ref law closes. Counted as
                 # tombstone_refused (the same fate as an unpermitted
                 # tombstone), never a crash and never a skip-that-lands.
-                if (local["source_ref"] or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+                if _has_knowledge_prefix(local["source_ref"]):
                     print(
                         f"[zmem] ingest-jsonl: refused tombstone for {mid}: "
                         "knowledge pointer rows advance only through the "
@@ -1770,7 +1770,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         # to demote and nothing to gain by refusing the row. Both INSERT
         # sites below (history + live) consume the demoted bytes; the
         # closed-set warning above already fired for the reserved prefix.
-        if (source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+        if _has_knowledge_prefix(source_ref):
             demoted = demote_imported_payload(content)
             if demoted is not None:
                 if demoted != content:
@@ -1829,7 +1829,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
         except Exception:
             pass  # banner must never break ingest (mirror write.py guard)
         if (preserve_ids or obj.get("_peer_no_dedup")
-                or (source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)):
+                or _has_knowledge_prefix(source_ref)):
             # Strict evidence transfers are identity-preserving.  Content
             # dedup is a useful legacy best-effort policy, but it would drop a
             # supplied memory UUID that an evidence association references.
