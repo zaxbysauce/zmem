@@ -42,6 +42,19 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "closeout-request"
+            ],
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -100,6 +113,19 @@
             "args": [
               "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
               "reflect"
+            ],
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/zmem-launch.js",
+              "closeout-gate"
             ],
             "timeout": 15
           }

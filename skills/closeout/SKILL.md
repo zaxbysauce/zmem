@@ -461,6 +461,69 @@ State plainly:
 That last line matters most: it is the evidence the bar was actually applied,
 not skipped.
 
+## Step 6.5 — Record step receipts and ack (fail-closed gate)
+
+The closeout is now a **fail-closed gate**: `store.py closeout-ack`
+REFUSES (exit 2, no marker) unless every required step has a fresh
+receipt and every session-attributed memory row carries a recorded
+verdict. The receipts make a partial run mechanically undetectable-from-
+complete — the exact failure observed on 2026-11-19 (an agent captured
+ad-hoc rows, wrote "closeout DONE", and never ran this skill).
+
+After completing Steps 0.5–5.5, record one receipt per executed step
+(all commands take `--session-id "<your session id>"`; `$SID` below):
+
+```bash
+"$P" "$S" closeout-step --session-id "$SID" --step review-queue        # Step 0.5
+"$P" "$S" closeout-step --session-id "$SID" --step recall-before-write # Step 1
+"$P" "$S" closeout-step --session-id "$SID" --step consolidate         # Step 4
+"$P" "$S" closeout-step --session-id "$SID" --step promote             # Step 5
+"$P" "$S" closeout-step --session-id "$SID" --step knowledge-status    # Step 5.5
+```
+
+Required steps: `review-queue`, `recall-before-write`, `consolidate`,
+`promote`, `knowledge-status`. Write-legs (`capture`, `supersede`,
+`update`, `review`) may also be recorded but are not required — the ack
+binds them through the last-write stamp instead.
+
+A step that genuinely could not run takes a DELIBERATE skip (never a
+silent omission):
+
+```bash
+"$P" "$S" closeout-skip --session-id "$SID" --step consolidate \
+  --reason "cadence gate declined; no new rows since the last pass"
+```
+
+Then check the gate before acking:
+
+```bash
+"$P" "$S" closeout-status --session-id "$SID"
+```
+
+`ack_valid: false` reports exactly what is missing: `missing_steps`
+(never recorded), `stale_steps` (a store write happened AFTER the
+receipt — re-run the step and re-receipt it), and `unreviewed_rows`
+(session-attributed memory rows written since the previous ack with no
+verdict). Discharge each unreviewed row with a verdict:
+
+```bash
+"$P" "$S" closeout-review --session-id "$SID" \
+  --memory-id <full-uuid> --verdict keep|resignal|invalidate
+```
+
+Only then ack:
+
+```bash
+"$P" "$S" closeout-ack --session-id "$SID"
+```
+
+When the USER requested this closeout, the Stop hook gate
+(`zmem-closeout-gate.sh`) blocks turn-end while `closeout-status`
+reports `ack_valid: false` — the ack above is what disarms it. The ack
+fails closed on purpose: a refusal (exit 2) is the gate working, not a
+bug. Fix the reported gaps and re-ack; do not look for an override
+(there is none).
+
 ## Step 7 — Acknowledge the closeout
 
 The write-attribution flow stamps a `<sha256(session-id)[:32]>.wrote` marker

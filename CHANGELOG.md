@@ -5,6 +5,52 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.164.0] - 2026-11-19
+
+### Changed
+
+- **Closeout is now a fail-closed gate** (closeout receipts): the issue-#398
+  `closeout-ack` was a bare file touch — an agent could capture ad-hoc rows,
+  write "closeout DONE", and never run any closeout step, with every marker
+  and reminder path satisfied (observed live on zaxbygraph PR #81's feedback
+  session, 2026-11-19; the operator flagged the class as recurring). Now:
+  each closeout step records a receipt (`closeout-step --session-id --step`,
+  `closeout-skip --step --reason` for deliberate skips), `closeout-ack`
+  REFUSES (exit 2, no marker) unless every required step
+  (review-queue / recall-before-write / consolidate / promote /
+  knowledge-status) has a receipt stamped at or after the session's last
+  store write AND every session-attributed row since the previous ack
+  carries a `closeout-review` verdict; `closeout-status` reports the gap
+  (missing/stale steps, unreviewed rows) as JSON. `.wrote` now carries a
+  monotonic epoch-seconds last-write line (the ack freshness anchor) and
+  every write REMOVES the once-per-session `.nudged` marker so the
+  SessionStart closeout reminder rearms after every write batch. Both
+  reminder surfaces no longer offer `closeout-ack` as a no-work
+  alternative.
+
+### Added
+
+- `closeout-step` / `closeout-skip` / `closeout-review` / `closeout-status`
+  subcommands backing the receipts contract; `closeout-status` is the
+  read-only gate report consumed by the new Stop-hook gate.
+- `zmem-closeout-request.sh` (UserPromptSubmit): arms the per-session
+  `.closeout-requested` marker when the user's prompt asks for a closeout
+  AND the session has store writes; a non-closeout prompt disarms.
+- `zmem-closeout-gate.sh` (Stop): blocks turn-end (exit 2 + stderr reason
+  naming the missing steps / stale receipts / unreviewed rows) while the
+  request is armed and the gate is unmet; a 5-block loop budget degrades to
+  a loud advisory (an infinite block helps nobody). Registered in all three
+  host hook manifests; fail-open on infrastructure errors (the fail-closed
+  property lives in closeout-ack itself). Deliberate tampering with the
+  counter is visible and out of band.
+- Frozen-check spec `tests/test_closeout_fail_closed_gate.py` (19 checks:
+  receipts, fail-closed ack, stale-refusal, unreviewed-row discharge +
+  control, `.wrote` ts content + nudge rearm, reminder-text contract,
+  request-arm phrasing discrimination, gate rc semantics, loop budget) plus
+  the sanctioned amendment of
+  `tests/test_session_end_closeout_nudge.py::test_closeout_ack_writes_marker_without_store`
+  to the new refuse-then-pass contract.
+
 ## [0.163.0] - 2026-11-19
 
 

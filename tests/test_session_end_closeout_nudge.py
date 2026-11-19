@@ -319,6 +319,9 @@ class SessionEndCloseoutNudgeTest(unittest.TestCase):
 
     # -- AMENDMENT 2b: closeout-ack (store-independent) ----------------
     def test_closeout_ack_writes_marker_without_store(self):
+        # AMENDMENT (closeout fail-closed gate): the ack is now fail-closed
+        # — without step receipts it REFUSES (rc 2, no marker), and even a
+        # passing ack must not create store.sqlite under ZMEM_DATA.
         env = _clean_env(self._tmp, self._sid)
         r = subprocess.run(
             [sys.executable, "-X", "utf8", str(STORE_PY), "closeout-ack",
@@ -326,9 +329,35 @@ class SessionEndCloseoutNudgeTest(unittest.TestCase):
             capture_output=True, text=True, env=env, timeout=180,
         )
         self.assertEqual(
-            r.returncode, 0,
-            "`store.py closeout-ack --session-id <sid>` must succeed, got "
-            f"{r.returncode}: {r.stderr[-400:]!r}")
+            r.returncode, 2,
+            "the fail-closed ack must refuse (rc 2) without step receipts, "
+            f"got {r.returncode}: {r.stdout[-400:]!r}")
+        body = json.loads(r.stdout)
+        self.assertFalse(body.get("ok"))
+        self.assertTrue(body.get("missing_steps"),
+                        "the refusal names the missing steps")
+        self.assertFalse(
+            _marker(self._tmp, self._sid, ".closeout").exists(),
+            "a refused ack writes NO .closeout marker")
+
+        # With fresh receipts (store still absent → no session rows to
+        # review), the ack passes and STILL creates no store.sqlite.
+        for step in ("review-queue", "recall-before-write", "consolidate",
+                     "promote", "knowledge-status"):
+            s = subprocess.run(
+                [sys.executable, "-X", "utf8", str(STORE_PY), "closeout-step",
+                 "--session-id", self._sid, "--step", step],
+                capture_output=True, text=True, env=env, timeout=180)
+            self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+        r2 = subprocess.run(
+            [sys.executable, "-X", "utf8", str(STORE_PY), "closeout-ack",
+             "--session-id", self._sid],
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+        self.assertEqual(
+            r2.returncode, 0,
+            "the ack passes with all receipts, got "
+            f"{r2.returncode}: {r2.stdout[-400:]!r}")
         self.assertTrue(
             _marker(self._tmp, self._sid, ".closeout").exists(),
             "closeout-ack must write the <sha256(sid)[:32]>.closeout "
