@@ -238,9 +238,13 @@ _reuse_inflight: dict[str, dict] = {}
 # Issue #474 (review RP-002): the winner's effect recorders swap the
 # PROCESS-GLOBAL telemetry hook and sys.stdout — two distinct-key winners
 # computing concurrently would nest/restore them out of order, corrupting
-# recorded effects and the restored globals. This lock serializes only the
-# record→compute→restore window per process (held during inference; hits
-# and effect replay never take it).
+# recorded effects and the restored globals. Concurrency contract: EVERY
+# seam-level impl() execution (winner compute, bypass, observe-only) and
+# every hit/loser effect replay serializes on this lock, so no recall-seam
+# effects can enter a winner's recorded script. Code outside this seam
+# (unrelated process threads writing sys.stdout or bumping telemetry while
+# a winner records) is outside the seam's control; supported consumers
+# (CLI, hooks) invoke the seam from a single thread per process.
 _COMPUTE_LOCK = threading.RLock()
 
 _counters: dict = collections.defaultdict(int)
@@ -371,7 +375,14 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             _observe(conn, None, None, "bypass-unresolvable", ok=None)
         with _reuse_lock:
             _counters["bypass"] += 1
-        return impl()
+        # review closeout (RP-002 residual): while a winner records, its
+        # recorders own the process-global telemetry hook and sys.stdout.
+        # Every seam-level impl() execution — including bypass and
+        # observe-only — must serialize under _COMPUTE_LOCK, or its effects
+        # land inside the winner's recorded script and are replayed on
+        # later hits of that key.
+        with _COMPUTE_LOCK:
+            return impl()
 
     key = full_digest(components)
     observe_sidecar = observing
@@ -379,7 +390,8 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
     if not serving:
         if observe_sidecar:
             _observe(conn, components, None, None, ok=True, pre=True)
-        return impl()
+        with _COMPUTE_LOCK:
+            return impl()
 
     ttl = _ttl_s()
     refresh = _refresh_requested()

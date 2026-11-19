@@ -515,7 +515,16 @@ class ABPins(_ReuseBase):
         rows_off, out_off = self._recall()
         _reset_reuse_state()
         self._serving()
+        # Closeout review (TF-003 residual): a miss replays the UNMODIFIED
+        # implementation, so comparing off vs a cold call proves nothing
+        # about replay. Warm the cache, prove the compared reuse-on leg is
+        # a HIT, then pin the hit's envelope against the disabled oracle.
+        self._recall()  # miss: populates the cache
+        hits_before = rr.reuse_stats().get("hits", 0)
         rows_on, out_on = self._recall()
+        self.assertEqual(rr.reuse_stats().get("hits", 0), hits_before + 1,
+                         "the compared reuse-on leg must be a proven HIT, "
+                         "not another miss")
         self.assertEqual(rows_off, rows_on)
         self.assertEqual(out_off, out_on)
 
