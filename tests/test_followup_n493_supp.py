@@ -126,7 +126,7 @@ class PrefixCaseSuppTest(unittest.TestCase):
                 "valid_from": "2026-01-01T00:00:00Z",
                 "ingestion_ts": "2026-01-01T00:00:00Z",
             }) + "\n", encoding="utf-8")
-            r3 = _run_cli(store, "ingest-jsonl", str(jl))
+            r3 = _run_cli(store, "ingest-jsonl", "--in", str(jl))
             # sync PRESERVES the reserved ref but never verifies it: the
             # row lands unverified (demoted), never authoritative.
             self.assertEqual(r3.returncode, 0, r3.stderr)
@@ -548,7 +548,13 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         return root / "store.sqlite"
 
-    def test_forced_compare_miss_retries_then_aborts_without_stamp(self):
+    def test_single_mismatch_heals_and_stamps(self):
+        """Round-2 finding 3b (honest name): drives the single-mismatch
+        heal + stamp leg. The zero-row retry-then-abort leg requires a
+        concurrent write BETWEEN the batch read and update, which an
+        in-process test cannot interpose without monkeypatching the
+        production seam; its discipline is pinned by the savepoint-arm
+        rollback-scope test below and the reviewer's direct probe."""
         store = self._scratch("nv-miss")
         env = dict(os.environ)
         env["ZMEM_STORE"] = str(store)
@@ -633,7 +639,10 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
                 "content_norm ON memory WHEN NEW.id="
                 "'91000000-0000-4000-8000-000000000001' "
                 "BEGIN SELECT RAISE(ABORT, 'scope probe'); END;")
-            conn.commit()
+            # Round-2 finding 3a: DO NOT commit — the pass must run INSIDE
+            # the open caller transaction, driving the true SAVEPOINT arm
+            # (conn.in_transaction True), exactly the production shape a
+            # migrate()-under-caller-tx caller would present.
             schema_mod._verify_content_norms_163(conn)
             stamped = conn.execute(
                 "SELECT value FROM meta WHERE "
@@ -717,10 +726,12 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             blocker.execute("ROLLBACK")
             blocker.close()
 
-    def test_wal_stale_snapshot_shape_aborts_without_stale_write(self):
-        """R3-1(d): the critic's probe SHAPE — a stale read snapshot with a
-        concurrent commit must end with the row canonical or the pass
-        aborted; never a stale-computed norm written."""
+    def test_wal_store_stale_norm_heals_or_aborts_never_stale_writes(self):
+        """Round-2 finding 3c (honest name): a WAL store with a stale norm
+        heals under the pass and stamps; the never-a-stale-write property
+        is pinned by the busy-top-level test (locked pass writes nothing)
+        and the savepoint rollback-scope test (failed batch writes
+        rollback)."""
         store = self._scratch("nv-wal")
         os.environ.update({"ZMEM_STORE": str(store),
                            "ZMEM_DATA": str(store.parent)})
@@ -795,10 +806,6 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
                       else _normalize_content(content))))
             conn.commit()
             schema_mod._verify_content_norms_163(conn)
-            bad = conn.execute(
-                "SELECT COUNT(*) FROM memory WHERE content_norm != "
-                "content_norm AND content_norm IS NOT NULL AND "
-                "content_norm != ''").fetchone()
             rows_out = conn.execute(
                 "SELECT content, content_norm, superseded_at FROM memory"
             ).fetchall()
