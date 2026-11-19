@@ -209,21 +209,38 @@ class SidecarContract(_MetricsBase):
             self.assertIn(key, row)
         self.assertEqual(row["v"], 2)
         self.assertEqual(row["n"], 1)
-        # privacy (review TF-006): no raw query text in the sidecar row,
-        # the drops journal, or the in-process counters (a long distinctive
-        # marker — hex digests can contain any short substring)
-        marker = rr._sha("SECRET-QUERY-MARKER-9d17f3")
-        self.assertNotIn("SECRET-QUERY-MARKER", json.dumps(row))
-        self.assertNotIn(marker, json.dumps(row))
+        # privacy (issue #494, reworking the TF-006 vacuous scan): the RAW
+        # query flows through the REAL pipeline — key_components digests it
+        # at ingestion, the row carries the digest (positive control), and
+        # the raw string is absent from every artifact, scanned WITHOUT
+        # existence guards (the journal and lock are forced to exist via
+        # the real lock-timeout drop path).
+        raw = "SECRET-QUERY-MARKER-9d17f3"
+        comps = rr.key_components(self.conn, {"query": raw})
+        self.assertIsNotNone(comps)
+        self.assertEqual(comps["query"], rr._sha(raw))  # ingestion pin
+        rr._observe(self.conn, comps, None, None, ok=True, so="hit")
+        text2 = self._sidecar_text()
+        row2 = json.loads([l for l in text2.splitlines()
+                           if l and not l.startswith("#")][-1])
+        self.assertIn(rr._sha(raw), json.dumps(row2))  # positive control
+        self.assertNotIn(raw, json.dumps(row2))
+        # force the drops journal + lock to exist via the REAL drop path:
+        # a leftover lock makes _observe wait 150 ms, journal the drop, and
+        # return without appending a row.
         ops = self.tmp / "ops"
-        for artifact in ("reuse-observe.drops", "reuse-observe.lock"):
-            f = ops / artifact
-            if f.exists():
-                self.assertNotIn("SECRET-QUERY-MARKER",
-                                 f.read_text(encoding="utf-8",
-                                             errors="replace"))
-        self.assertNotIn("SECRET-QUERY-MARKER",
-                         json.dumps(rr.reuse_stats()))
+        lock = ops / "reuse-observe.lock"
+        lock.write_text("{}", encoding="utf-8", newline="\n")
+        rr._observe(self.conn, _comps(), None, None, ok=True, so="miss")
+        drops = ops / "reuse-observe.drops"
+        self.assertTrue(drops.exists(), "the lock-timeout drop must have "
+                        "journaled")
+        for f in (drops, lock):
+            artifact_text = f.read_text(encoding="utf-8", errors="replace")
+            self.assertNotIn(raw, artifact_text)
+            self.assertNotIn(rr._sha(raw), artifact_text)
+        self.assertNotIn(raw, json.dumps(rr.reuse_stats()))
+        self.assertNotIn(rr._sha(raw), json.dumps(rr.reuse_stats()))
 
     def test_stale_lock_hint_in_report(self):
         # closeout review (RP-003 operational residual): drops + a present
