@@ -5013,8 +5013,6 @@ README.
 - SKILL.md pre-tool rows refreshed in place with the supersession pointer
   (ceiling-pinned by presence needles in `tests/test_doc_drift.py`).
 
-## [Unreleased]
-
 ## [0.26.0] - 2026-09-08
 
 ### Added

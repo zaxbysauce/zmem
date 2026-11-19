@@ -53,6 +53,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import _store_guard  # noqa: F401  (issue #244 isolation guard)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 STORE_PY = SCRIPTS / "store.py"

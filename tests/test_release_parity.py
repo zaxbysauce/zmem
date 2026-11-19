@@ -452,7 +452,14 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
                       f"drift mode crashed on the live repo:\n{r.stdout}")
         self.assertTrue(
             ("no unreleased drift" in r.stdout)
-            or ("::error::unreleased drift" in r.stdout),
+            or ("::error::unreleased drift" in r.stdout)
+            # PR #483 serialized-release ownership: a no-bump work merge
+            # accumulating ## [Unreleased] notes is the EXPECTED state, and
+            # the gate names it. This work PR (zaxbysauce/zmem#496) is the
+            # first to carry Unreleased content since that verdict landed,
+            # so the stale two-verdict pin failed exactly the PRs the test
+            # comment above promised not to break.
+            or ("work merge" in r.stdout),
             f"neither documented verdict emitted:\n{r.stdout}")
         # The default mode never gained drift output (release.yml contract).
         d = subprocess.run(
