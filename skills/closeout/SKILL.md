@@ -290,7 +290,7 @@ a future session.
 
 Before writing, phrase one natural question a future user would ask about the symptom or decision. Keep that question for the readback. A correction should stand on its own: state the trigger, the corrected behavior and the evidence or scope that distinguishes it from the old claim.
 
-For a single-topic memory, use the replacement row from `update` as the focused correction. If the false claim sits inside a multi-topic history, correct that history while preserving its other facts. Reuse an accurate focused row if one exists, otherwise save the correction as its own memory in the same namespace with its actual signal and provenance. Inspect the write result for its live ID and confirm deduplication kept the correction focused.
+For a single-topic memory, use the replacement row from `update` as the focused correction. If the false claim sits inside a multi-topic history, correct that history while preserving its other facts. Reuse an accurate focused row if one exists, otherwise save the correction as its own memory in the same namespace with its actual signal and provenance. Read the id and result fields from add --json. If result is deduped, inspect the returned row with get --id. When it is the broad history, add the focused correction with --no-dedup and use the returned id. Reuse a matching focused row.
 
 Run ordinary recall after the write, using the saved question and the same namespace:
 
@@ -298,7 +298,7 @@ Run ordinary recall after the write, using the saved question and the same names
 "$P" "$S" recall --query "<natural question>" --namespace "<namespace>" --no-bump --json
 ~~~
 
-Check the first five result IDs for the focused live ID. Keep the default ranking and limit. An ID lookup, an exact quotation, or a hit on the historical summary cannot verify this step. If the focused row misses, inspect its content, namespace and embedding status, repair the cause, and retry the same question. Report the question and observed rank, or report the unresolved miss. Reuse the focused memory across retries to avoid duplicates.
+Check the first five results[].id values for the focused live ID. Keep the default ranking and limit. An ID lookup, an exact quotation, or a hit on the historical summary cannot verify this step. If the focused row misses, inspect its content and namespace and run reembed --check to check store-wide embedding and vector coverage. After a repair with update --json, use the new live id. Retry the same question once at default settings; --no-bump can still record a surface. Report the question and observed rank, or report the unresolved miss. Reuse the focused memory across retries to avoid duplicates.
 
 ## Step 4 — Consolidate near-duplicates
 
