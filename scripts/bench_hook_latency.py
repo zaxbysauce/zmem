@@ -179,7 +179,14 @@ def _subprocess_ms(argv: list[str]) -> float:
     import subprocess as _sp
     import time as _time
     t0 = _time.perf_counter()
-    proc = _sp.run(argv, capture_output=True)
+    # review SP-001: bounded execution + stdin isolation — a hung child
+    # (or one inheriting a wait-worthy stdin pipe) must fail the leg, not
+    # hang the benchmark.
+    try:
+        proc = _sp.run(argv, capture_output=True, timeout=120,
+                       stdin=_sp.DEVNULL)
+    except _sp.TimeoutExpired:
+        raise RuntimeError("phase leg timed out after 120s: %s" % argv[0])
     elapsed_ms = (_time.perf_counter() - t0) * 1000.0
     if proc.returncode != 0:
         raise RuntimeError(

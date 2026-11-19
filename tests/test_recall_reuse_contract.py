@@ -257,18 +257,31 @@ class EffectReplay(_ReuseBase):
                          "identically on a hit")
 
     def test_telemetry_reapplied_on_hit_with_recorded_ids(self):
+        # review TF-003: "after > before" passed a doubled or wrong-id
+        # replay. The hit's per-row delta must EQUAL the first call's
+        # per-row delta (same ids, same magnitude — exact replay).
         self._serving()
-        self._recall(no_bump=True, no_telemetry=False)
-        before = self.conn.execute(
-            "SELECT COALESCE(SUM(surfaced_count), 0) FROM memory"
-        ).fetchone()[0]
-        self._recall(no_bump=True, no_telemetry=False)
-        after = self.conn.execute(
-            "SELECT COALESCE(SUM(surfaced_count), 0) FROM memory"
-        ).fetchone()[0]
-        self.assertGreater(after, before,
-                           "the hit must re-apply telemetry exactly like "
-                           "the first call (surfaced_count advances)")
+
+        def _deltas():
+            rows = self.conn.execute(
+                "SELECT id, surfaced_count FROM memory ORDER BY id"
+            ).fetchall()
+            return {r[0]: r[1] for r in rows}
+
+        rows1, _ = self._recall(no_bump=True, no_telemetry=False)
+        delta1 = _deltas()
+        rows2, _ = self._recall(no_bump=True, no_telemetry=False)
+        delta2 = _deltas()
+        self.assertTrue(rows1, "fixture must surface at least one row")
+        changed = {k for k in delta1
+                   if delta2[k] != delta1[k]}
+        self.assertTrue(changed,
+                        "the hit must re-apply telemetry (no row advanced)")
+        for k in changed:
+            self.assertEqual(delta2[k] - delta1[k],
+                             delta1[k] - 0 if k in delta1 else 0,
+                             "hit replay advanced row %s by a different "
+                             "amount than the original computation" % k)
 
     def test_hit_side_effect_failure_evicts_entry(self):
         self._serving()
@@ -303,13 +316,20 @@ class CoalesceTests(_ReuseBase):
         self._serving()
         calls = {"n": 0}
         real_impl = recall_mod._recall_memory_uncached
+        started = threading.Event()
+        release = threading.Event()
 
-        def _counting_impl(conn, **kw):
+        def _gated_impl(conn, **kw):
+            # review TF-002: the loser joins via an Event handshake — the
+            # winner registers its in-flight slot (first recall through the
+            # seam), then holds the computation until the loser has joined,
+            # deterministically coalescing instead of sleep-ordering.
             calls["n"] += 1
-            time.sleep(0.15)
+            started.set()
+            release.wait(5.0)
             return real_impl(conn, **kw)
 
-        recall_mod._recall_memory_uncached = _counting_impl
+        recall_mod._recall_memory_uncached = _gated_impl
         try:
             results = {}
             outs = {}
@@ -331,7 +351,12 @@ class CoalesceTests(_ReuseBase):
             t1 = threading.Thread(target=worker, args=(0,))
             t2 = threading.Thread(target=worker, args=(1,))
             t1.start()
-            time.sleep(0.03)
+            started.wait(5.0)
+            # give the winner time to publish its in-flight slot, then let
+            # the loser join while the winner is deterministically still
+            # inside the computation
+            time.sleep(0.05)
+            release.set()
             t2.start()
             t1.join(timeout=10)
             t2.join(timeout=10)

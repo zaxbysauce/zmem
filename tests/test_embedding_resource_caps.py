@@ -151,7 +151,14 @@ class InvalidValues(unittest.TestCase):
 
     def setUp(self):
         self._saved = {k: os.environ.get(k) for k in self.ENV_NAMES}
+        # review TI-001: save/restore the lazy module flag (a sibling suite
+        # sharing this process must not inherit our reset)
+        self._saved_model_available = embeddings._model_available
         embeddings._model_available = None
+        self.addCleanup(self._restore_module_state)
+
+    def _restore_module_state(self):
+        embeddings._model_available = self._saved_model_available
 
     def tearDown(self):
         for k, v in self._saved.items():

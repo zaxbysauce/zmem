@@ -1962,15 +1962,19 @@ recomputed. DEFAULT OFF — opt in per process:
   duplicate-equivalent recall rate of a REAL workload can be measured across
   hook process boundaries
 
-Every store mutation that changes recall selection invalidates cached keys
-(mutation generation, maintained inside the existing write transactions);
-wholesale store replacement (backup restore, import-store) rotates the store
-incarnation so a restored store can never alias the previous incarnation's
-cached identities. Scope: this is an in-process layer — hook
-subprocess-per-prompt paths are cold by construction; it serves long-lived
-recall callers (the Workstream V embedding worker, in-process selector
-consumers, eval harnesses). Telemetry (retrieval/surfaced counters), `_capture`
-population, and stdout output are replayed identically on hits.
+Every 0.162.0-and-later store mutation that changes recall selection invalidates
+cached keys (mutation generation, maintained inside the existing write
+transactions); wholesale store replacement (backup restore, import-store)
+rotates the store incarnation so a restored store can never alias the previous
+incarnation's cached identities. **Mixed-version note:** writers older than
+0.162.0 do not advance the mutation generation — if a pre-0.162 client writes
+to a store shared with an opted-in long-lived 0.162.0+ process, that process
+serves cached results until the TTL expires; upgrade all writers sharing the
+store, or shorten `ZMEM_RECALL_REUSE_TTL_S`. Scope: this is an in-process
+layer — hook subprocess-per-prompt paths are cold by construction; it serves
+long-lived recall callers (the Workstream V embedding worker, in-process
+selector consumers, eval harnesses). Telemetry (retrieval/surfaced counters),
+`_capture` population, and stdout output are replayed identically on hits.
 
 **To enable embeddings:**
 

@@ -209,11 +209,21 @@ class SidecarContract(_MetricsBase):
             self.assertIn(key, row)
         self.assertEqual(row["v"], 2)
         self.assertEqual(row["n"], 1)
-        # privacy: no raw query text anywhere in the sidecar (a long
-        # distinctive marker — hex digests can contain any short substring)
+        # privacy (review TF-006): no raw query text in the sidecar row,
+        # the drops journal, or the in-process counters (a long distinctive
+        # marker — hex digests can contain any short substring)
         marker = rr._sha("SECRET-QUERY-MARKER-9d17f3")
         self.assertNotIn("SECRET-QUERY-MARKER", json.dumps(row))
         self.assertNotIn(marker, json.dumps(row))
+        ops = self.tmp / "ops"
+        for artifact in ("reuse-observe.drops", "reuse-observe.lock"):
+            f = ops / artifact
+            if f.exists():
+                self.assertNotIn("SECRET-QUERY-MARKER",
+                                 f.read_text(encoding="utf-8",
+                                             errors="replace"))
+        self.assertNotIn("SECRET-QUERY-MARKER",
+                         json.dumps(rr.reuse_stats()))
 
     def test_two_process_duplicate_classification(self):
         # two separate PROCESSES observing the same key: the second

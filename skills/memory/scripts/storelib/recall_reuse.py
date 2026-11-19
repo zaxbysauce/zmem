@@ -143,7 +143,10 @@ def _store_path(conn: sqlite3.Connection) -> str | None:
         return None
     if not row or len(row) < 3 or not row[2]:
         return None
-    return str(row[2])
+    # review SP-003: normalize case/separators so Windows spelling
+    # variants of one store (C:/x vs c:\x) hash to one reuse key instead
+    # of fragmenting the cache; normcase is a no-op on POSIX.
+    return os.path.normcase(str(row[2]))
 
 
 def _session_token() -> str:
@@ -232,6 +235,13 @@ _reuse_cache: "collections.OrderedDict[str, _ReuseEntry]" = \
     collections.OrderedDict()
 _reuse_lock = threading.RLock()
 _reuse_inflight: dict[str, dict] = {}
+# Issue #474 (review RP-002): the winner's effect recorders swap the
+# PROCESS-GLOBAL telemetry hook and sys.stdout — two distinct-key winners
+# computing concurrently would nest/restore them out of order, corrupting
+# recorded effects and the restored globals. This lock serializes only the
+# record→compute→restore window per process (held during inference; hits
+# and effect replay never take it).
+_COMPUTE_LOCK = threading.RLock()
 
 _counters: dict = collections.defaultdict(int)
 _counters["invalidation_reasons"] = collections.defaultdict(int)
@@ -346,17 +356,27 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
     UNMODIFIED implementation (effects land where they always did);
     ``capture_dict`` is the caller's ``_capture`` dict (identity excluded
     from the key; content recorded for replay)."""
+    # Issue #474 (review RP-001): when neither serving nor observation is
+    # on, no consumer of the reuse key exists — short-circuit BEFORE the
+    # PRAGMA/meta reads and the ~34-digest fingerprint so the default-off
+    # path pays nothing beyond two cheap env checks.
+    serving = _serving_on()
+    observing = _observing()
+    if not serving and not observing:
+        return impl()
+
     components = key_components(conn, call_kwargs)
     if components is None:
-        if _observing():
+        if observing:
             _observe(conn, None, None, "bypass-unresolvable", ok=None)
-        _counters["bypass"] += 1
+        with _reuse_lock:
+            _counters["bypass"] += 1
         return impl()
 
     key = full_digest(components)
-    observe_sidecar = _observing()
+    observe_sidecar = observing
 
-    if not _serving_on():
+    if not serving:
         if observe_sidecar:
             _observe(conn, components, None, None, ok=True, pre=True)
         return impl()
@@ -391,9 +411,10 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
         except Exception:
             with _reuse_lock:
                 _reuse_cache.pop(key, None)
-            _counters["hit_effect_failures"] += 1
+                _counters["hit_effect_failures"] += 1
             raise
-        _counters["hits"] += 1
+        with _reuse_lock:
+            _counters["hits"] += 1
         _timing_reuse.append((time.monotonic() - t0) * 1000.0)
         if observe_sidecar:
             _observe(conn, components, None, None, ok=True, so="hit")
@@ -411,12 +432,17 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             winner = False
 
     if not winner:
-        slot["event"].wait(timeout=ttl + 30.0)
+        timed_out = not slot["event"].wait(timeout=ttl + 30.0)
         with _reuse_lock:
-            _reuse_inflight.pop(key, None)
+            # Issue #474 (review CS-001/RP-005): pop only the slot we
+            # actually waited on — a timed-out waiter or a waiter waking
+            # after a winner failure must never delete a successor's slot.
+            if _reuse_inflight.get(key) is slot:
+                _reuse_inflight.pop(key, None)
             cached = _reuse_cache.get(key)
         if cached is not None:
-            _counters["coalesced"] += 1
+            with _reuse_lock:
+                _counters["coalesced"] += 1
             try:
                 _apply_effects(conn, cached, capture_dict)
             except Exception:
@@ -424,44 +450,57 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
                 # a poisoned entry must not survive to the next caller.
                 with _reuse_lock:
                     _reuse_cache.pop(key, None)
-                _counters["hit_effect_failures"] += 1
+                    _counters["hit_effect_failures"] += 1
                 raise
             if observe_sidecar:
                 _observe(conn, components, None, None, ok=True,
                          so="coalesced")
             return copy.deepcopy(cached.result)
         if slot["error"] is not None:
-            _counters["coalesced"] += 1
+            with _reuse_lock:
+                _counters["coalesced"] += 1
             raise slot["error"]
-        # Winner finished between our checks without publishing (evicted or
-        # effect-failed): recompute rather than synthesize anything.
-        _counters["misses"] += 1
+        # Winner finished between our checks without publishing (evicted,
+        # effect-failed, or — review RP-005 — our wait timed out and the
+        # slot was already reclaimed): recompute rather than synthesize
+        # anything.
+        with _reuse_lock:
+            _counters["misses"] += 1
         return recall_with_reuse(conn, call_kwargs, impl, capture_dict)
 
     # Winner: run the UNMODIFIED implementation under the recorders.
-    _counters["misses"] += 1
-    t0 = time.monotonic()
-    import storelib.recall as _recall_mod
-    recorder = _TelemetryRecorder(_recall_mod)
-    tee = _Tee(sys.stdout)
-    saved_stdout = sys.stdout
-    try:
-        recorder.install()
-        sys.stdout = tee
-        result = impl()
-    except BaseException as exc:
-        _counters["failures_not_cached"] += 1
-        slot["error"] = exc
-        slot["done"] = True
-        slot["event"].set()
+    # Issue #474 (review RP-002): the telemetry recorder and stdout tee are
+    # PROCESS-GLOBAL swaps — two distinct-key winners computing
+    # concurrently would nest/restores them out of order, corrupting both
+    # callers' recorded effects and the restored globals. Serialize the
+    # record→compute→restore window per process (the lock is released
+    # before effect replay/publication, so hits never block on it).
+    with _COMPUTE_LOCK:
         with _reuse_lock:
-            _reuse_inflight.pop(key, None)
-        if observe_sidecar:
-            _observe(conn, components, None, None, ok=False)
-        raise
-    finally:
-        sys.stdout = saved_stdout
-        recorder.restore()
+            _counters["misses"] += 1
+        t0 = time.monotonic()
+        import storelib.recall as _recall_mod
+        recorder = _TelemetryRecorder(_recall_mod)
+        tee = _Tee(sys.stdout)
+        saved_stdout = sys.stdout
+        try:
+            recorder.install()
+            sys.stdout = tee
+            result = impl()
+        except BaseException as exc:
+            _counters["failures_not_cached"] += 1
+            slot["error"] = exc
+            slot["done"] = True
+            slot["event"].set()
+            with _reuse_lock:
+                if _reuse_inflight.get(key) is slot:
+                    _reuse_inflight.pop(key, None)
+            if observe_sidecar:
+                _observe(conn, components, None, None, ok=False)
+            raise
+        finally:
+            sys.stdout = saved_stdout
+            recorder.restore()
     compute_ms = (time.monotonic() - t0) * 1000.0
     _timing_compute.append(compute_ms)
 
@@ -493,12 +532,14 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             slot["error"] = sys.exc_info()[1]
             slot["done"] = True
             slot["event"].set()
-            _reuse_inflight.pop(key, None)
+            if _reuse_inflight.get(key) is slot:
+                _reuse_inflight.pop(key, None)
         raise
     with _reuse_lock:
         slot["done"] = True
         slot["event"].set()
-        _reuse_inflight.pop(key, None)
+        if _reuse_inflight.get(key) is slot:
+            _reuse_inflight.pop(key, None)
     if observe_sidecar:
         _observe(conn, components, None, None, ok=True, so="miss",
                  ms=compute_ms)
@@ -619,14 +660,39 @@ def _append_observation(sidecar: Path, drops: Path, record: dict) -> None:
             lock_fd = os.open(str(lock_path),
                               os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            # bounded wait, then record a durable drop and fail open
+            # Issue #474 (review RP-003): a holder killed before its
+            # finally-cleanup leaves the lock pathname behind forever —
+            # every later observation would spin the full wait and journal
+            # a drop, and hook processes ARE killed on timeout. A live
+            # holder's read-modify-write is bounded well under the stale
+            # threshold (it is an in-memory parse plus one bounded file
+            # rewrite), so an old-enough lock is stale: reclaim it once
+            # and retry; otherwise bounded-wait, then record a durable
+            # drop and fail open.
             deadline = time.monotonic() + 2.0
+            reclaimed = False
             while time.monotonic() < deadline:
+                try:
+                    lock_age = time.time() - os.path.getmtime(str(lock_path))
+                except OSError:
+                    lock_age = 0.0  # vanished — try to acquire
+                if lock_age > 10.0 and not reclaimed:
+                    try:
+                        os.unlink(str(lock_path))
+                    except OSError:
+                        pass
+                    reclaimed = True
+                    continue
                 try:
                     lock_fd = os.open(str(lock_path),
                                       os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                     break
                 except FileExistsError:
+                    if reclaimed:
+                        # one reclaim attempt is enough — do not loop
+                        # deleting a freshly created holder's lock
+                        time.sleep(0.05)
+                        continue
                     time.sleep(0.05)
             else:
                 try:
@@ -668,6 +734,13 @@ def _append_observation(sidecar: Path, drops: Path, record: dict) -> None:
                                 aggregate["corrupt"] = \
                                     aggregate.get("corrupt", 0) + 1
                                 continue
+                            if not isinstance(row, dict):
+                                # review UI-002: a valid-JSON scalar/array
+                                # line must count as corrupt, not crash
+                                # row.get below
+                                aggregate["corrupt"] = \
+                                    aggregate.get("corrupt", 0) + 1
+                                continue
                             kf = row.get("kf")
                             if not kf:
                                 continue
@@ -703,7 +776,18 @@ def _append_observation(sidecar: Path, drops: Path, record: dict) -> None:
                     if kf in records:
                         fh.write(json.dumps(records[kf], sort_keys=True)
                                  + "\n")
-            os.replace(tmp, sidecar)
+            try:
+                os.replace(tmp, sidecar)
+            except OSError:
+                # review SP-002: a failed install (e.g. Windows destination
+                # held open) must not orphan the staging temp — the
+                # observation is dropped (fail-open by contract) but the
+                # file is cleaned.
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
         finally:
             os.close(lock_fd)
             try:
@@ -862,6 +946,9 @@ def observation_report(conn) -> dict:
             try:
                 row = json.loads(line)
             except ValueError:
+                aggregate["corrupt"] += 1
+                continue
+            if not isinstance(row, dict):
                 aggregate["corrupt"] += 1
                 continue
             if row.get("kf"):

@@ -398,8 +398,11 @@ jobs:
             echo "=== $f ==="
             log="$(mktemp)"
             if python "$f" 2>&1 | tee "$log"; then
-              # Executed-count gate: a suite that reports "Ran 0 tests" is a
-              # collection bomb or a silent no-op, not a green run.
+              # Executed-count gate (fail-closed): a suite that reports
+              # "Ran 0 tests" — a collection bomb, a silent no-op, or a
+              # class-level SkipTest — is an ERROR, not a green run.
+              # Dependency-dependent suites must be skipped by path (see the
+              # exclusions above) or provisioned, never left to skip silently.
               if grep -Eq '^Ran 0 tests' "$log"; then
                 echo "::error::$f ran zero tests (collection failure or no-op)"
                 failed=1; failed_list="$failed_list $f(zero-tests)"

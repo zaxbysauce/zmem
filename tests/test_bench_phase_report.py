@@ -99,13 +99,19 @@ class PhaseReportMode(unittest.TestCase):
                          "the existing store must be byte-untouched")
 
     def test_ambient_sentinel_untouched(self):
-        # M-ISOLATE: an AMBIENT production-shaped store outside the fixture
-        # path stays byte-identical during a phase run.
+        # M-ISOLATE (review TF-001): the AMBIENT production store is
+        # env-selected (ZMEM_STORE) so the phase run would genuinely open it
+        # if isolation broke; it must stay byte-identical while the fixture
+        # store is the one created and measured.
         ambient = self.tmp / "ambient-prod.sqlite"
         ambient.write_bytes(b"ambient-prod-sentinel-bytes")
-        proc, report = self._phase_run()
+        proc, report = self._phase_run(env_extra={
+            "ZMEM_STORE": str(ambient),
+            "ZMEM_DATA": str(self.tmp)})
         self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
-        self.assertEqual(ambient.read_bytes(), b"ambient-prod-sentinel-bytes")
+        self.assertEqual(ambient.read_bytes(), b"ambient-prod-sentinel-bytes",
+                         "the ambient store selected via ZMEM_STORE was "
+                         "opened or modified by the phase run")
         # the fixture store WAS created (phase mode builds its own)
         fixture = self.tmp / "fixture.sqlite"
         self.assertTrue(fixture.exists(), "fresh fixture store created")

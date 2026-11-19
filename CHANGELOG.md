@@ -42,6 +42,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   subprocess-per-prompt paths stay cold by construction; it serves
   long-lived recall callers (the Workstream V worker, in-process selector
   consumers, eval harnesses).
+- **Mixed-version note for recall reuse:** writers older than 0.162.0 do not
+  advance the mutation generation that invalidates reuse keys. If a pre-0.162.0
+  client writes to a store shared with an opted-in long-lived 0.162.0+ process
+  (`ZMEM_RECALL_REUSE=1`), that process serves cached results until
+  `ZMEM_RECALL_REUSE_TTL_S` expires. Upgrade all writers sharing the store, or
+  shorten the TTL. (Reused results are also invalidated by wholesale store
+  replacement via the store incarnation, which all replacement lanes rotate.)
 - **Observation sidecar** (issue #474):
   `ZMEM_RECALL_REUSE_OBSERVE=1` records anonymized per-key observations
   (`ops/reuse-observe.jsonl`, digests + counters only — never query text)

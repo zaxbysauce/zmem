@@ -6626,13 +6626,6 @@ def reembed_embeddings(
 
     if not need_embed and not vec_ids and not _has_any_embedding(conn):
         print("[zmem] all live memories already have embeddings and vec0 entries")
-        # Issue #474: vectors were rebuilt — free the cached recall
-        # envelopes immediately (the generation bump already invalidates
-        # them; this reclaims the entries rather than waiting out the TTL).
-        try:
-            _reuse_mod.clear_recall_reuse_cache()
-        except Exception:
-            pass
         return 0
 
     embed_count = 0
@@ -6675,6 +6668,17 @@ def reembed_embeddings(
             )
             vec_count += 1
         except sqlite3.OperationalError:
+            pass
+
+    if embed_count or vec_count:
+        # Issue #474 (review UR-002): the flagless backfill changes recall
+        # selection (rows enter vector search) — advance the mutation
+        # generation inside the same commit and free cached envelopes now
+        # rather than serving pre-backfill results until the TTL.
+        _store_generation.bump_mutation_generation(conn)
+        try:
+            _reuse_mod.clear_recall_reuse_cache()
+        except Exception:
             pass
 
     conn.commit()

@@ -111,26 +111,62 @@ class CensusGuardrails(unittest.TestCase):
                          "unbounded InferenceSession construction sites: "
                          "%s" % hits)
     def test_p3_recall_path_writers_map_to_census(self):
-        # recall.py's own memory-table writes: telemetry-only (no bump, the
-        # pinned pin) + the reembed apply (bumped).
-        text = (SCRIPTS / "storelib/recall.py").read_text(encoding="utf-8")
-        write_sites = [
-            text[:m.start()].count("\n") + 1
-            for m in re.finditer(
-                r"(INSERT INTO memory\b|UPDATE memory\b|DELETE FROM memory\b)",
-                text)]
-        self.assertEqual(len(write_sites), 4,
-                         "recall.py memory-write census drift: %s"
-                         % write_sites)
-        in_telemetry = [ln for ln in write_sites
-                        if 2740 <= ln <= 2800]  # _bump_telemetry body
-        self.assertEqual(len(in_telemetry), 2,
+        # recall.py's own memory-table writes, classified by the FUNCTION
+        # each site lives in (review TF-005: line-range predicates accepted
+        # the unbumped flagless backfill as covered). The behavioral law:
+        # every non-telemetry write site's enclosing function must call
+        # bump_mutation_generation before its commit; the telemetry writes
+        # must stay inside _bump_telemetry (no-bump disposition).
+        import ast as _ast
+        path = SCRIPTS / "storelib/recall.py"
+        text = path.read_text(encoding="utf-8")
+        tree = _ast.parse(text)
+        lines = text.split("\n")
+        write_pat = re.compile(
+            r"(INSERT INTO memory\b|UPDATE memory\b|DELETE FROM memory\b)")
+
+        # enclosing top-level function for a 1-based line number
+        func_spans = []  # (name, start, end)
+        for node in tree.body:
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                func_spans.append((node.name, node.lineno, node.end_lineno))
+
+        def enclosing(lineno):
+            for name, start, end in func_spans:
+                if start <= lineno <= end:
+                    return name
+            return "<module>"
+
+        sites = []
+        for i, line in enumerate(lines):
+            if write_pat.search(line):
+                sites.append((i + 1, enclosing(i + 1)))
+
+        telemetry = [s for s in sites if s[1] == "_bump_telemetry"]
+        self.assertEqual(len(telemetry), 2,
                          "the telemetry writes must stay inside "
-                         "_bump_telemetry (no-bump disposition)")
-        in_reembed = [ln for ln in write_sites if ln > 6400]
-        self.assertEqual(len(in_reembed), 2,
-                         "the reembed-apply writes must sit inside the "
-                         "bumped transaction")
+                         "_bump_telemetry (no-bump disposition): %s" % sites)
+        non_telemetry = [s for s in sites if s[1] != "_bump_telemetry"]
+        self.assertTrue(non_telemetry,
+                        "expected the reembed-apply write sites")
+        for lineno, fname in non_telemetry:
+            body = "\n".join(lines)
+            fn_start = next(start for name, start, _ in func_spans
+                            if name == fname)
+            fn_text = "\n".join(lines[fn_start - 1:])
+            # the function's text up to and including the write site must
+            # contain a generation bump (before the write or its commit)
+            fn_m = re.search(
+                r"^def %s\b" % re.escape(fname), body, flags=re.M)
+            self.assertIsNotNone(fn_m, fname)
+            # find the function body span from the AST end_lineno
+            end = next(end for name, _s, end in func_spans if name == fname)
+            fn_body = "\n".join(lines[fn_start - 1:end])
+            self.assertIn(
+                "_store_generation.bump_mutation_generation(conn)", fn_body,
+                "recall.py:%d writes inside %s but the function never "
+                "bumps the mutation generation (review TF-005/UR-002)"
+                % (lineno, fname))
 
     def test_p5_env_reads_covered_by_fingerprint_or_disposition(self):
         knobs = {name for name, _lane in rr.CONFIG_KNOBS}
