@@ -1960,7 +1960,14 @@ recomputed. DEFAULT OFF — opt in per process:
   records anonymized per-key observations to `ops/reuse-observe.jsonl`
   beside the store (digests and counters only — never query text) so the
   duplicate-equivalent recall rate of a REAL workload can be measured across
-  hook process boundaries
+  hook process boundaries. The observation writer holds
+  `ops/reuse-observe.lock` for its bounded rewrite window; a writer killed
+  mid-rewrite leaves the lock behind and observation pauses (fail-visible:
+  the report marks itself incomplete with drops) until the operator removes
+  the lock file. The report names a suspect lock via
+  `stale_lock_suspected` (lock path + remedy) when drops coexist with a
+  present lock file; the journal grows only on lock incidents, and the
+  report's `coverage.dropped` line-count stays cheap to re-read.
 
 Every 0.162.0-and-later store mutation that changes recall selection invalidates
 cached keys (mutation generation, maintained inside the existing write

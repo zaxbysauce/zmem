@@ -941,14 +941,37 @@ def observation_report(conn) -> dict:
                 "coverage": {"observed_n": 0, "ineligible": 0,
                              "dropped": 0, "corrupt": 0, "ovf": 0}}
     sidecar, drops = paths
+
+    def _stale_lock_hint() -> dict | None:
+        """Closeout review (RP-003 operational residual): drops + a lock
+        file present at report time is the signature of a holder killed
+        before cleanup — no automatic reclaim can remove it (deliberate,
+        review RP-003), so the report names the suspect lock and the
+        operator remedy instead of leaving complete=false unexplained."""
+        lock = sidecar.with_suffix(".lock")
+        if not lock.exists():
+            return None
+        if ((dropped or 0) > 0
+                or _counters.get("drop_journal_failures", 0) > 0):
+            return {
+                "lock_path": str(lock),
+                "remedy": "remove the lock file if no observation writer "
+                          "is running; drops exist and a holder may have "
+                          "died before cleanup",
+            }
+        return None
     if not sidecar.exists():
         dropped = _dropped_count(drops)
-        return {"schema_version": 2, "present": False,
-                "complete": False,
-                "reason": ("sidecar-absent" if dropped == 0
-                           else "sidecar-absent-with-drops"),
-                "coverage": {"observed_n": 0, "ineligible": 0,
-                             "dropped": dropped, "corrupt": 0, "ovf": 0}}
+        out = {"schema_version": 2, "present": False,
+               "complete": False,
+               "reason": ("sidecar-absent" if dropped == 0
+                          else "sidecar-absent-with-drops"),
+               "coverage": {"observed_n": 0, "ineligible": 0,
+                            "dropped": dropped, "corrupt": 0, "ovf": 0}}
+        hint = _stale_lock_hint()
+        if hint is not None:
+            out["stale_lock_suspected"] = hint
+        return out
     aggregate = {"n": 0, "dup": 0, "rt": 0, "ttl": 0, "rf": 0, "ovf": 0,
                  "inv": {}, "keys": 0, "corrupt": 0}
     per_key = {}
@@ -977,10 +1000,14 @@ def observation_report(conn) -> dict:
     if dropped is None:
         # review Stage-B r2 FIX-4: an unreadable drops journal is an
         # incomplete-evidence condition, never silently zero drops.
-        return {"schema_version": 2, "present": True, "complete": False,
-                "reason": "drops-journal-unreadable",
-                "coverage": {"observed_n": 0, "ineligible": 0,
-                             "dropped": 0, "corrupt": 0, "ovf": 0}}
+        out = {"schema_version": 2, "present": True, "complete": False,
+               "reason": "drops-journal-unreadable",
+               "coverage": {"observed_n": 0, "ineligible": 0,
+                            "dropped": 0, "corrupt": 0, "ovf": 0}}
+        hint = _stale_lock_hint()
+        if hint is not None:
+            out["stale_lock_suspected"] = hint
+        return out
     # The aggregate header carries COMPACTED windows; live per-key rows
     # carry the open ones. Totals = aggregate + live rows.
     live = {"n": 0, "dup": 0, "rt": 0, "ttl": 0, "rf": 0}
@@ -1003,7 +1030,7 @@ def observation_report(conn) -> dict:
     invalidations = dict(aggregate.get("inv") or {})
     for reason, count in live_inv.items():
         invalidations[reason] = invalidations.get(reason, 0) + count
-    return {
+    out = {
         "schema_version": 2,
         "present": True,
         "complete": complete,
@@ -1023,3 +1050,7 @@ def observation_report(conn) -> dict:
         "refreshes": aggregate.get("rf", 0) + live["rf"],
         "keys": len(per_key),
     }
+    hint = _stale_lock_hint()
+    if hint is not None:
+        out["stale_lock_suspected"] = hint
+    return out

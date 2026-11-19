@@ -225,6 +225,35 @@ class SidecarContract(_MetricsBase):
         self.assertNotIn("SECRET-QUERY-MARKER",
                          json.dumps(rr.reuse_stats()))
 
+    def test_stale_lock_hint_in_report(self):
+        # closeout review (RP-003 operational residual): drops + a present
+        # lock file must name the suspect lock + remedy in the report, so
+        # complete=false is never left unexplained for the operator.
+        rr._observe(self.conn, _comps(), None, None, ok=True, so="miss")
+        sidecar = self.tmp / "ops" / "reuse-observe.jsonl"
+        lock = sidecar.with_suffix(".lock")
+        drops = sidecar.with_suffix(".drops")
+        # simulate the killed-holder signature: a leftover lock + a
+        # lock-timeout drop
+        lock.write_text("{}", encoding="utf-8", newline="\n")
+        with open(drops, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"t": "2026-01-01T00:00:00Z",
+                                 "reason": "lock-timeout"}) + "\n")
+        rep = rr.observation_report(self.conn)
+        self.assertFalse(rep["complete"])
+        self.assertGreaterEqual(rep["coverage"]["dropped"], 1)
+        hint = rep.get("stale_lock_suspected")
+        self.assertIsInstance(hint, dict)
+        # the lock path is derived from the store path, which SP-003
+        # normalizes (normcase) — compare in the same form
+        self.assertEqual(hint["lock_path"], os.path.normcase(str(lock)))
+        self.assertIn("remove the lock file", hint["remedy"])
+        # negative leg: drops WITHOUT a lock file → no hint
+        lock.unlink()
+        rep2 = rr.observation_report(self.conn)
+        self.assertFalse(rep2["complete"])
+        self.assertNotIn("stale_lock_suspected", rep2)
+
     def test_two_process_duplicate_classification(self):
         # two separate PROCESSES observing the same key: the second
         # appends through the locked RMW and classifies as duplicate.
