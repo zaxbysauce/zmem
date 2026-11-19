@@ -410,6 +410,17 @@ off state, not a finding.
      evidence-cited, curated, no transcripts/credentials) applies in full;
      the bar decides, not a quota. Most closeouts capture nothing, and
      that is a good outcome.
+     When the session produced evidence-backed audit findings and a fix plan
+     that meet this bar, save them together as a curated companion note. Record
+     the findings and their evidence, how they informed the repair sequence,
+     and any qualification criteria or unresolved decisions. Link the source
+     issues or report and distinguish planned work from verified outcomes.
+     Existing issue links and focused memory rows provide citations for the
+     synthesis. Use a stable project-scoped key in the appropriate configured
+     target. After capture, apply the pointer and readback checks below: compare
+     the returned content with the authored note and verify digest agreement
+     before reporting success. Reuse an identical verified note on repeat
+     closeouts. The capture-off and draft-only rules still apply.
   2. **Pending pointers — read the JSON, do not blind-flush.**
      `knowledge flush` (and capture's own inner flush) drains the WHOLE
      knowledge queue; there is no own-key filter. Re-run `knowledge

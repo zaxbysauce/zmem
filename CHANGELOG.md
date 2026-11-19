@@ -9,7 +9,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
-- Closeout now saves focused corrections and verifies that a natural query retrieves each correction in the default top five.
+- Closeout now saves focused corrections and verifies that a natural query retrieves each correction in the default top five. User-requested closeouts also save qualifying audit findings and fix plans together in the enabled knowledge companion and verify the note by readback.
 
 ## [0.163.0] - 2026-11-19
 
