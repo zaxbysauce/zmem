@@ -268,20 +268,26 @@ class EffectReplay(_ReuseBase):
             ).fetchall()
             return {r[0]: r[1] for r in rows}
 
+        baseline = _deltas()
         rows1, _ = self._recall(no_bump=True, no_telemetry=False)
         delta1 = _deltas()
         rows2, _ = self._recall(no_bump=True, no_telemetry=False)
         delta2 = _deltas()
         self.assertTrue(rows1, "fixture must surface at least one row")
-        changed = {k for k in delta1
-                   if delta2[k] != delta1[k]}
-        self.assertTrue(changed,
-                        "the hit must re-apply telemetry (no row advanced)")
-        for k in changed:
-            self.assertEqual(delta2[k] - delta1[k],
-                             delta1[k] - 0 if k in delta1 else 0,
-                             "hit replay advanced row %s by a different "
-                             "amount than the original computation" % k)
+        # review Stage-B FIX-8: compare EVERY row's hit delta against the
+        # first-call delta (measured baseline, not an assumed zero) — a
+        # partial replay (one row incremented on the miss but skipped on
+        # the hit) or a doubled/wrong-id replay fails.
+        for k, base in baseline.items():
+            miss_delta = delta1[k] - base
+            hit_delta = delta2[k] - delta1[k]
+            self.assertEqual(
+                hit_delta, miss_delta,
+                "row %s: hit telemetry delta %s != original delta %s "
+                "(partial or doubled replay)" % (k, hit_delta, miss_delta))
+        self.assertGreater(
+            sum(delta1[k] - baseline[k] for k in baseline), 0,
+            "the miss must have applied telemetry (fixture sanity)")
 
     def test_hit_side_effect_failure_evicts_entry(self):
         self._serving()
@@ -364,7 +370,9 @@ class CoalesceTests(_ReuseBase):
             recall_mod._recall_memory_uncached = real_impl
         self.assertEqual(calls["n"], 1,
                          "identical in-flight recalls must coalesce into "
-                         "ONE computation")
+                         "ONE computation (review TF-002: the Event "
+                         "handshake — not sleep timing — makes this "
+                         "deterministic)")
         self.assertEqual(results[0], results[1])
         # NOTE: cross-thread stdout is NOT asserted here — redirect_stdout
         # is process-global, so two concurrently capturing threads swap the
@@ -373,7 +381,14 @@ class CoalesceTests(_ReuseBase):
         # empty when the loser's redirect lands mid-window). Stdout replay
         # is pinned byte-exactly by the single-threaded hit-path test.
         stats = rr.reuse_stats()
-        self.assertEqual(stats.get("coalesced", 0), 1)
+        # review TF-002/Stage-B: scheduling-independent invariant — the
+        # second caller was served from the single shared computation (as a
+        # coalesced waiter OR a cache hit if the winner published first),
+        # never a second computation.
+        self.assertEqual(stats.get("coalesced", 0)
+                         + stats.get("hits", 0), 1,
+                         "the second caller must be served from the first "
+                         "computation, not recompute")
 
     def test_coalesce_losers_get_winners_failure(self):
         self._serving()

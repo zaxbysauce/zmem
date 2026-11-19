@@ -149,24 +149,35 @@ class CensusGuardrails(unittest.TestCase):
         non_telemetry = [s for s in sites if s[1] != "_bump_telemetry"]
         self.assertTrue(non_telemetry,
                         "expected the reembed-apply write sites")
+        # review Stage-B FIX-2: the whole-function check was satisfied by
+        # the rebuild_all branch's bump even with the flagless bump removed.
+        # The BUMP FOLLOWING THE FLAGLESS GUARD must exist on its own: the
+        # text between "if embed_count or vec_count:" and that function's
+        # commit must contain the generation bump.
+        fn_end = next(end for name, _s, end in func_spans
+                      if name == "reembed_embeddings")
+        fn_body = "\n".join(lines[:fn_end])
+        guard = fn_body.find("if embed_count or vec_count:")
+        self.assertGreater(guard, 0, "flagless bump guard missing")
+        commit = fn_body.find("conn.commit()", guard)
+        self.assertGreater(commit, guard, "flagless commit missing after guard")
+        flagless_window = fn_body[guard:commit]
+        self.assertIn(
+            "_store_generation.bump_mutation_generation(conn)",
+            flagless_window,
+            "the FLAGLESS backfill branch must advance the mutation "
+            "generation before its commit — the rebuild branch's bump does "
+            "not cover it (review TF-005/UR-002)")
+        # and the per-function law still holds for every writer function
         for lineno, fname in non_telemetry:
-            body = "\n".join(lines)
             fn_start = next(start for name, start, _ in func_spans
                             if name == fname)
-            fn_text = "\n".join(lines[fn_start - 1:])
-            # the function's text up to and including the write site must
-            # contain a generation bump (before the write or its commit)
-            fn_m = re.search(
-                r"^def %s\b" % re.escape(fname), body, flags=re.M)
-            self.assertIsNotNone(fn_m, fname)
-            # find the function body span from the AST end_lineno
-            end = next(end for name, _s, end in func_spans if name == fname)
-            fn_body = "\n".join(lines[fn_start - 1:end])
+            f_end = next(end for name, _s, end in func_spans if name == fname)
+            fn_body2 = "\n".join(lines[fn_start - 1:f_end])
             self.assertIn(
-                "_store_generation.bump_mutation_generation(conn)", fn_body,
+                "_store_generation.bump_mutation_generation(conn)", fn_body2,
                 "recall.py:%d writes inside %s but the function never "
-                "bumps the mutation generation (review TF-005/UR-002)"
-                % (lineno, fname))
+                "bumps the mutation generation" % (lineno, fname))
 
     def test_p5_env_reads_covered_by_fingerprint_or_disposition(self):
         knobs = {name for name, _lane in rr.CONFIG_KNOBS}

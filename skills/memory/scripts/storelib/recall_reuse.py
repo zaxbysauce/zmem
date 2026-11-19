@@ -384,7 +384,8 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
     ttl = _ttl_s()
     refresh = _refresh_requested()
     if refresh:
-        _counters["refresh"] += 1
+        with _reuse_lock:
+            _counters["refresh"] += 1
 
     with _reuse_lock:
         entry = _reuse_cache.get(key)
@@ -488,7 +489,8 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             sys.stdout = tee
             result = impl()
         except BaseException as exc:
-            _counters["failures_not_cached"] += 1
+            with _reuse_lock:
+                _counters["failures_not_cached"] += 1
             slot["error"] = exc
             slot["done"] = True
             slot["event"].set()
@@ -549,15 +551,24 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
 def _apply_effects(conn, entry: _ReuseEntry, capture_dict) -> None:
     """Replay the recorded effect script for THIS caller: telemetry on this
     caller's connection with the recorded ids/kwargs, capture population,
-    and the recorded stdout bytes verbatim."""
+    and the recorded stdout bytes verbatim.
+
+    Review Stage-B FIX-3: effect replay writes through the PROCESS-GLOBAL
+    telemetry hook and sys.stdout — the same globals a concurrent winner's
+    recorder has swapped. Taking _COMPUTE_LOCK here means a hit that lands
+    during a winner's record window waits for the winner to restore the
+    globals first, so its telemetry/stdout can never enter (or be corrupted
+    by) the winner's recorded script. Hit replay is fast (bounded telemetry
+    writes + one stdout write), so the serialization costs nothing."""
     import storelib.recall as _recall_mod
-    for ids, kwargs in entry.telemetry_calls:
-        _recall_mod._bump_telemetry(conn, ids, **kwargs)
-    if capture_dict is not None and entry.capture_snapshot is not None:
-        capture_dict.update(copy.deepcopy(entry.capture_snapshot))
-    if entry.stdout_text:
-        sys.stdout.write(entry.stdout_text)
-        sys.stdout.flush()
+    with _COMPUTE_LOCK:
+        for ids, kwargs in entry.telemetry_calls:
+            _recall_mod._bump_telemetry(conn, ids, **kwargs)
+        if capture_dict is not None and entry.capture_snapshot is not None:
+            capture_dict.update(copy.deepcopy(entry.capture_snapshot))
+        if entry.stdout_text:
+            sys.stdout.write(entry.stdout_text)
+            sys.stdout.flush()
 
 
 def clear_recall_reuse_cache() -> None:
@@ -660,40 +671,25 @@ def _append_observation(sidecar: Path, drops: Path, record: dict) -> None:
             lock_fd = os.open(str(lock_path),
                               os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            # Issue #474 (review RP-003): a holder killed before its
-            # finally-cleanup leaves the lock pathname behind forever —
-            # every later observation would spin the full wait and journal
-            # a drop, and hook processes ARE killed on timeout. A live
-            # holder's read-modify-write is bounded well under the stale
-            # threshold (it is an in-memory parse plus one bounded file
-            # rewrite), so an old-enough lock is stale: reclaim it once
-            # and retry; otherwise bounded-wait, then record a durable
-            # drop and fail open.
-            deadline = time.monotonic() + 2.0
-            reclaimed = False
+            # Issue #474 (review RP-003 + Stage-B FIX-4): a holder killed
+            # before its finally-cleanup leaves the lock pathname behind.
+            # Age-based reclaim was rejected — a suspended live holder or a
+            # check-then-unlink race can delete a live/successor lock, and
+            # concurrent RMW loses observations. Instead: bounded short
+            # wait (150 ms — a live holder's RMW is an in-memory parse plus
+            # one bounded rewrite, far under this), then journal a durable
+            # drop and fail open. A dead holder suppresses observation
+            # (fail-VISIBLE via drops in the report) until the operator
+            # removes ops/reuse-observe.lock; no automatic reclaim can
+            # delete a live holder's lock.
+            deadline = time.monotonic() + 0.15
             while time.monotonic() < deadline:
-                try:
-                    lock_age = time.time() - os.path.getmtime(str(lock_path))
-                except OSError:
-                    lock_age = 0.0  # vanished — try to acquire
-                if lock_age > 10.0 and not reclaimed:
-                    try:
-                        os.unlink(str(lock_path))
-                    except OSError:
-                        pass
-                    reclaimed = True
-                    continue
                 try:
                     lock_fd = os.open(str(lock_path),
                                       os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                     break
                 except FileExistsError:
-                    if reclaimed:
-                        # one reclaim attempt is enough — do not loop
-                        # deleting a freshly created holder's lock
-                        time.sleep(0.05)
-                        continue
-                    time.sleep(0.05)
+                    time.sleep(0.02)
             else:
                 try:
                     with open(drops, "a", encoding="utf-8") as fh:
