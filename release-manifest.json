@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "765da6b8f079a7d46304f7a8557d13666db4e772261f3bbcd81b6faa4b742e99",
+  "digest": "e4dd1dfdb928d8b4a3279c170cb9514c76c0dd8c01ac08c440b2a6661682dd8a",
   "files": {
     ".agents/plugins/marketplace.json": "a365ecfde6e74a163131ac2b45b042283045c3fcd2b481e43e059915cdcbcb4f",
     ".claude-plugin/marketplace.json": "e54c58fc0ecbff2491409ce4370b8410814d28c71546ae908b1887a5fd729d6a",
@@ -87,7 +87,7 @@
     "scripts/refresh_hosts.py": "217b07990b3b40481bc598647bbd4edcee557c5467f5c36a07999d77a777fc1c",
     "scripts/release_gate.py": "3a2fed7cad4c2c5c654ffb5b376d04e7efc725cf8f54175d0d150b6c249383d4",
     "skills/closeout-remote/SKILL.md": "448390f2a139e3e2b0f1ff8041915f74e9236e73f3c41f61bf5fd8fb634a974c",
-    "skills/closeout/SKILL.md": "1af4a9c27babd756d718a422df3607aa91f9f343e127ab6f2ef13393e4b0c481",
+    "skills/closeout/SKILL.md": "f287f47a85ad102a4b3c37c1b6baa621cd5c468bd874b4956abf7b5067b41585",
     "skills/knowledge/SKILL.md": "3555c2ef68de03bb5880ea5359b5535dd4488c7b55834f745d79930b4c4493a6",
     "skills/memory/SKILL.md": "bbb647b9a72c99720409b1879dfc1d93e92b6a3bd0b636b35783062d014938df",
     "skills/memory/scripts/capture_quality.py": "144952fd06464e4164c6e0ea80cc32a90eb77a3d632934528a5b04842cefe19c",
