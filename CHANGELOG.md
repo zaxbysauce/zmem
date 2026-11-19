@@ -5,6 +5,14 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.163.0] - 2026-11-19
+
+
+- fix(memory): content_norm materialization integrity — dataset import, fleet-snapshot payload restore, and import-store now populate the derived content_norm column (probe-and-add for pre-v8 sources), so normalized-equal adds fold onto restored/imported rows and the ingest re-rank contract (issue #486) holds on every store class; stores already holding NULL content_norm rows written by pre-0.162.0 writers are repaired by a one-time stamped backfill on their first open with this release (issue #489). Dataset import now refuses whole-snapshot when a memory row's content exceeds the writer MAX_CONTENT_CHARS admission cap (previously such rows landed live, breaking the store invariant); disclosed: the export side has no matching cap, so a store already holding an over-cap row can export a dataset this import refuses
+- fix(memory): the idx_memory_content_norm partial index now carries the knowledge-ref exclusion in its predicate (version-independent, savepoint-atomic ensure rebuilds existing stores; one-time rebuild reads and sorts qualifying live rows under the schema lock); the four re-rank window queries are index-served instead of per-row post-filter walks (issue #489)
+- fix(memory): promote-store --dry-run fold prediction excludes knowledge pointer rows, mirroring the detector (previously mispredicted own-id landings as orphan skips) (issue #489)
+- test(memory): evidence provenance guards — every 40-hex notes token in the current and trailing segments resolves (case-insensitive; historical-segment tokens print visible skip markers where their commits are pruned), the current-segment sha is derived from the canary git_sha, stamps are bounded by the carrying commit (both reports), and dirty-tree runs require the working-tree disclosure (issue #490)
+
 ## [0.162.0] - 2026-11-18
 
 ### Added
