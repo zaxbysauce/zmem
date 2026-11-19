@@ -697,7 +697,11 @@ def _append_observation(sidecar: Path, drops: Path, record: dict) -> None:
                             {"t": _now_utc(), "reason": "lock-timeout"}
                         ) + "\n")
                 except Exception:
-                    pass
+                    # review Stage-B r2 FIX-4: an unwritable journal must
+                    # not silently zero the drop count — surface it in the
+                    # in-process stats so reuse_stats/report can flag it.
+                    with _reuse_lock:
+                        _counters["drop_journal_failures"] += 1
                 try:
                     tmp.unlink()
                 except OSError:
@@ -902,14 +906,17 @@ def observation_report(conn) -> dict:
     observed + ineligible + dropped + corrupt + ovf)."""
     paths = _sidecar_paths(conn)
 
-    def _dropped_count(drops_path) -> int:
+    def _dropped_count(drops_path) -> int | None:
+        """None = the journal exists but is unreadable — the report must
+        treat that as INCOMPLETE (review Stage-B r2 FIX-4), never as zero
+        drops."""
         if not drops_path.exists():
             return 0
         try:
             with open(drops_path, "r", encoding="utf-8") as fh:
                 return sum(1 for line in fh if line.strip())
         except OSError:
-            return 0
+            return None
 
     if paths is None:
         return {"schema_version": 2, "present": False, "complete": False,
@@ -950,6 +957,13 @@ def observation_report(conn) -> dict:
             if row.get("kf"):
                 per_key[row["kf"]] = row
     dropped = _dropped_count(drops)
+    if dropped is None:
+        # review Stage-B r2 FIX-4: an unreadable drops journal is an
+        # incomplete-evidence condition, never silently zero drops.
+        return {"schema_version": 2, "present": True, "complete": False,
+                "reason": "drops-journal-unreadable",
+                "coverage": {"observed_n": 0, "ineligible": 0,
+                             "dropped": 0, "corrupt": 0, "ovf": 0}}
     # The aggregate header carries COMPACTED windows; live per-key rows
     # carry the open ones. Totals = aggregate + live rows.
     live = {"n": 0, "dup": 0, "rt": 0, "ttl": 0, "rf": 0}

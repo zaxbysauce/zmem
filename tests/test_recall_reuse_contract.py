@@ -358,12 +358,27 @@ class CoalesceTests(_ReuseBase):
             t2 = threading.Thread(target=worker, args=(1,))
             t1.start()
             started.wait(5.0)
-            # give the winner time to publish its in-flight slot, then let
-            # the loser join while the winner is deterministically still
-            # inside the computation
-            time.sleep(0.05)
-            release.set()
+            # review Stage-B r2: start the loser while the winner is
+            # deterministically still inside its computation, then PROVE the
+            # loser joined the in-flight waiter before releasing. While
+            # `release` is unset the loser can only be (a) blocked in the
+            # waiter branch, (b) recomputing (would raise calls to 2), or
+            # (c) finished as a cache hit (would land in results). Requiring
+            # t2 alive + not finished + calls==1 for a settled window
+            # excludes (b) and (c) — an in-flight waiter, deterministically.
             t2.start()
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if (t2.is_alive() and 1 not in results
+                        and calls["n"] == 1):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(
+                t2.is_alive() and 1 not in results and calls["n"] == 1,
+                "the loser did not deterministically join the in-flight "
+                "waiter (calls=%r results=%r alive=%s)"
+                % (calls, sorted(results), t2.is_alive()))
+            release.set()
             t1.join(timeout=10)
             t2.join(timeout=10)
         finally:
