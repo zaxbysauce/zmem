@@ -39,6 +39,13 @@ export ZMEM_CLOSEOUT_PAYLOAD="$PAYLOAD"
 python - <<'PYEOF'
 import hashlib, json, os, subprocess, sys
 
+# The passthrough envelope: every exit-0 path from this gate emits `{}`
+# (+ LF) so the #187 manifest fixture contract (stdout byte-identical to
+# the committed `{}` fixture) holds on the inert path. The BLOCK path
+# (exit 2) carries its reason on stderr; its stdout is the same inert
+# envelope, which the host ignores on a blocking exit.
+sys.stdout.buffer.write(b"{}\n")  # byte-exact: no win32 \r translation
+
 try:
     payload = json.loads(os.environ.get("ZMEM_CLOSEOUT_PAYLOAD") or "{}")
 except Exception:

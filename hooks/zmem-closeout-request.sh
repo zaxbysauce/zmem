@@ -63,4 +63,5 @@ with open(os.path.join(ops, stem + ".closeout-requested"), "w",
           encoding="utf-8") as fh:
     fh.write("armed\n")
 PYEOF
+printf '{}\n'
 exit 0

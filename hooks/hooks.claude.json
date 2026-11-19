@@ -45,7 +45,7 @@
       {
         "hooks": [
           {
-            "type": "process",
+            "type": "command",
             "command": "node",
             "args": [
               "${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js",
@@ -135,7 +135,7 @@
       {
         "hooks": [
           {
-            "type": "process",
+            "type": "command",
             "command": "node",
             "args": [
               "${CLAUDE_PLUGIN_ROOT}/hooks/zmem-launch.js",

@@ -113,10 +113,12 @@ class CodexManifestContractTest(unittest.TestCase):
         "session-start",
         "recall",
         "capture-correction",
+        "closeout-request",
         "pretool-recall",
         "convention-capture",
         "capture-failure",
         "reflect",
+        "closeout-gate",
         "subagent-recall",
         "subagent-reflect",
         "precompact",
@@ -138,8 +140,8 @@ class CodexManifestContractTest(unittest.TestCase):
     def test_codex_entries_have_windows_commands_and_context_limits(self):
         entries = self._codex_entries()
         self.assertEqual(
-            len(entries), 11,
-            "hooks.codex.json must declare exactly eleven hook entries, got %d"
+            len(entries), 13,
+            "hooks.codex.json must declare exactly thirteen hook entries, got %d"
             % len(entries),
         )
         verbs = []
@@ -169,7 +171,7 @@ class CodexManifestContractTest(unittest.TestCase):
                     )
         self.assertEqual(
             verbs, self.EXPECTED_VERBS,
-            "the eleven entries must keep their existing verbs in manifest order",
+            "the thirteen entries must keep their existing verbs in manifest order",
         )
 
         session_end = [entry for event, entry in entries if event == "SessionEnd"]
@@ -256,8 +258,8 @@ class ZcodeManifestProcessTest(unittest.TestCase):
     def test_zcode_entries_are_process_hooks_with_args(self):
         entries = _zcode_nested_entries()
         self.assertEqual(
-            len(entries), 7,
-            "hooks.zcode.json must declare exactly seven nested hook entries, "
+            len(entries), 9,
+            "hooks.zcode.json must declare exactly nine nested hook entries, "
             "got %d" % len(entries),
         )
         for event, _group, hook in entries:
@@ -315,13 +317,18 @@ class ZcodeManifestProcessTest(unittest.TestCase):
             if event == "UserPromptSubmit"
         ]
         self.assertEqual(
-            user_prompt_verbs, ["recall", "capture-correction"],
-            "UserPromptSubmit entries must keep recall + capture-correction",
+            user_prompt_verbs,
+            ["recall", "capture-correction", "closeout-request"],
+            "UserPromptSubmit entries must keep recall + capture-correction "
+            "+ closeout-request",
         )
         self.assertEqual(
             sorted(events_seen),
-            sorted(list(ZCODE_VERB_BY_EVENT) + ["UserPromptSubmit"]),
-            "the seven entries must bind one-to-one to the existing events",
+            sorted(list(ZCODE_VERB_BY_EVENT)
+                   + ["UserPromptSubmit", "UserPromptSubmit", "Stop"]),
+            "the nine entries must bind one-to-one to the existing events "
+            "(UserPromptSubmit carries recall + capture-correction + "
+            "closeout-request; Stop carries reflect + closeout-gate)",
         )
         # Matchers survive the conversion unchanged.
         for event, group, _hook in _zcode_nested_entries():
