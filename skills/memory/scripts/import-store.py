@@ -431,6 +431,20 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
             relink_memory(staged, mid)
             _rebuild_belief_heads(staged, mid, new_content)
             counters["redacted"] += 1
+        elif "content_norm" in cols and "content_norm" in row.keys():
+            # Stage-B v4 (ST-001/UI-002): sanitization leaving content/tags
+            # byte-identical does NOT certify a source-borne non-NULL
+            # content_norm — a stale or crafted derived value would survive
+            # the import unchanged (violating this file's header invariant:
+            # derived carriers are recomputed from post-redaction content),
+            # and the NULL-only backfill below cannot reach it. Verify
+            # against the canonical normalize of the accepted content and
+            # overwrite mismatches.
+            _expected_norm = _normalize_content(new_content)
+            if row["content_norm"] != _expected_norm:
+                staged.execute(
+                    "UPDATE memory SET content_norm=? WHERE id=?",
+                    (_expected_norm, mid))
         counters["added"] += 1
 
     # Issue #353 completeness (PR-review round): the closed id set covers
@@ -585,17 +599,34 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
                     staged_conn.execute(
                         "ALTER TABLE memory ADD COLUMN content_norm TEXT")
                 _bf_batch = 500
+                _bf_last = None
                 while True:
-                    _bf_rows = staged_conn.execute(
-                        "SELECT rowid, content FROM memory "
-                        "WHERE content_norm IS NULL LIMIT ?",
-                        (_bf_batch,)).fetchall()
+                    # PR #491 review (RP-001): keyset pagination — resume
+                    # from the last repaired rowid so each batch stays a
+                    # bounded seek instead of re-walking the repaired head
+                    # of the table every round. The first batch runs without
+                    # the rowid predicate: the sqlite lane preserves SOURCE
+                    # rowids via online backup, and SQLite permits zero and
+                    # negative rowids, so an unconditional `rowid > 0` start
+                    # would silently skip them (Stage-B review).
+                    if _bf_last is None:
+                        _bf_rows = staged_conn.execute(
+                            "SELECT rowid, content FROM memory "
+                            "WHERE content_norm IS NULL ORDER BY rowid "
+                            "LIMIT ?", (_bf_batch,)).fetchall()
+                    else:
+                        _bf_rows = staged_conn.execute(
+                            "SELECT rowid, content FROM memory "
+                            "WHERE content_norm IS NULL AND rowid > ? "
+                            "ORDER BY rowid LIMIT ?", (_bf_last, _bf_batch)
+                        ).fetchall()
                     if not _bf_rows:
                         break
                     staged_conn.executemany(
                         "UPDATE memory SET content_norm=? WHERE rowid=?",
                         [(_normalize_content(r["content"] or ""),
                           r["rowid"]) for r in _bf_rows])
+                    _bf_last = _bf_rows[-1]["rowid"]
                 staged_conn.commit()
                 print(f"[import] staged rows: added={counts['added']} "
                       f"redacted={counts['redacted']} "

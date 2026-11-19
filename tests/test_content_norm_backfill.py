@@ -374,6 +374,13 @@ class ImportStoreNullNormFoldTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, (r.stdout, r.stderr))
         _k_id, _k_norm, _k_rc = _assert_fold_contract(
             self, copied, ns, "import-store lane")
+        # PR #491 feedback (TF-008): the file header promises AC3 checks
+        # "the same observable contract" as AC1, which includes the
+        # keeper retrieval_count increment.
+        self.assertGreaterEqual(
+            _k_rc, 1,
+            f"the keeper retrieval_count must be incremented by the fold "
+            f"(same observable contract as AC1); got {_k_rc}")
         payload = _json_result(r.stdout) or {}
         self.assertIn(
             payload.get("result"), ("deduped",),
@@ -1049,6 +1056,24 @@ class IndexBoundWindowTest(unittest.TestCase):
         plan = [p[3] for p in conn.execute(
             "EXPLAIN QUERY PLAN " + _WINDOW_SQL,
             ("project:cnb-ac7", norm)).fetchall()]
+        # Stage-B v5 (FB-N08): the AC7 oracle is ASSERTED, not just captured
+        # — on this fixture the planted index is the ONLY index on the
+        # table, so the planner must serve the window through it on every
+        # platform (the CI variance class hits the migration fixture, which
+        # carries competing candidate indexes). The asserted oracle: SEARCH
+        # through idx_memory_content_norm — a bare SCAN line would be the
+        # forbidden post-filter row-fetch over the group.
+        self.assertTrue(
+            plan and any("idx_memory_content_norm" in line for line in plan),
+            "AC7 EXPLAIN oracle: the window plan does not serve the "
+            "knowledge-ref exclusion through idx_memory_content_norm "
+            f"(plan lines: {plan!r})")
+        self.assertFalse(
+            any(line.strip().upper().startswith("SCAN MEMORY")
+                for line in plan),
+            "AC7 EXPLAIN oracle: the plan carries a bare SCAN over memory "
+            f"(post-filter row-fetch over the group; plan lines: {plan!r})")
+        print("[ac7] window plan (asserted): " + " | ".join(plan))
         n_queries = 120
         t0 = time.perf_counter()
         for _ in range(n_queries):
@@ -1171,7 +1196,10 @@ class IndexBoundWindowTest(unittest.TestCase):
                     f"INDEXED BY plan: {plan!r}; unhinted plan: {plan2!r}")
                 proof_mode = "functional (row round-trip)"
         # If we reach here a proof mode fired; keep an assertion on the
-        # mode so a silent no-op cannot pass.
+        # mode so a silent no-op cannot pass, and PRINT the mode so the
+        # head-bound log carries it (Stage-B v5: the green log must name
+        # which proof fired).
+        print("[ac7-migrate] proof mode:", proof_mode)
         self.assertIn(proof_mode, (
             "INDEXED BY plan", "unhinted plan",
             "functional (row round-trip)"))
@@ -1292,9 +1320,24 @@ class IndexBoundWindowTest(unittest.TestCase):
         # BASE: INJECTION_SILENT (migrate no-ops on a current-version
         # store -- documented); HEAD: INJECTION_FIRED with the failure
         # landed on the CREATE stage (the DROP was allowed through).
-        self.assertIn(marker, ("INJECTION_FIRED", "INJECTION_SILENT"),
-                      f"unexpected probe marker {marker!r}; probe output: "
-                      f"{probe.stdout!r} {probe.stderr[-200:]!r}")
+        # PR #491 feedback (TF-006): the head side MUST actually fire —
+        # when schema.py defines the ensure, a silent marker would mean
+        # this leg proved nothing about rollback. At base (no ensure in
+        # schema.py) the probe is legitimately silent.
+        ensure_exists = "def _ensure_content_norm_index" in (
+            (SCRIPTS / "storelib" / "schema.py").read_text(encoding="utf-8"))
+        if ensure_exists:
+            self.assertEqual(
+                marker, "INJECTION_FIRED",
+                "the failure injection must FIRE on the head tree (the "
+                "ensure exists, so migrate rebuilds the stale index); a "
+                "silent probe here proves nothing about rollback (probe: "
+                f"{probe.stdout!r} {probe.stderr[-200:]!r})")
+        else:
+            self.assertEqual(
+                marker, "INJECTION_SILENT",
+                f"unexpected probe marker {marker!r}; probe output: "
+                f"{probe.stdout!r} {probe.stderr[-200:]!r}")
         if marker == "INJECTION_FIRED":
             self.assertEqual(
                 stage_line, "FAILED_STAGE CREATE",

@@ -100,7 +100,8 @@ RELEASE_MANIFEST = REPO_ROOT / "release-manifest.json"
 # 12-char prefixes never yield spurious matches. Case-WIDENED (critic
 # round: a lowercase-only class silently passes an uppercase fabricated
 # sha): extraction preserves the token AS WRITTEN so git cat-file receives
-# the exact text (git rejects non-lowercase object names, which is itself
+# the exact text (an uppercase spelling of a REAL sha resolves — git hex
+# object names are case-insensitive — and a fabricated one still fails
 # a resolvability failure the guard must surface, not skip).
 SHA40_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 
@@ -217,6 +218,15 @@ def _skip_marker(leg: str) -> None:
           flush=True)
 
 
+def _sha_argv_safe(sha) -> bool:
+    """PR #491 feedback (N-06): canary git_sha values reach git argv
+    (cat-file / rev-parse / show). A value beginning with '-' would be
+    parsed as an OPTION (executed scratch repro: '--output=...' is taken
+    as a git flag). Git object names are hex, so requiring the hex
+    charset defeats every option-injection shape."""
+    return bool(re.fullmatch(r"[0-9a-f]{6,40}", str(sha or "").lower()))
+
+
 def _visible_commit_shas(count: int = 2) -> list:
     """Full shas of the newest `count` commits visible in THIS checkout,
     newest first ([] on failure). No relative-depth argv anywhere — a
@@ -245,9 +255,12 @@ def _past_commit_iso() -> tuple[bool, str]:
 
 
 def notes_sha_problems(report: dict, label: str):
-    """Segment-scoped resolvability law (final-critic round 2, finding 1):
-    every 40-hex token in the CURRENT release segment of `report`'s
-    notes — the segment the AC9 derivation governs — must resolve via
+    """Segment-scoped resolvability law (final-critic round 2 finding 1;
+    PR #491 feedback round parallel-F-002): every 40-hex token in the
+    CURRENT release segment of `report`'s notes — the segment the AC9
+    derivation governs — AND in the LAST segment by position (the newest
+    appended record; notes are append-only, so an unlabeled trailing
+    segment is the normal authoring shape) must resolve via
     ``git cat-file -t`` as a commit; that is the fabrication catch.
     Tokens in HISTORICAL segments name commits from old
     squash-merged-away feature branches: an unresolvable one prints a
@@ -259,8 +272,11 @@ def notes_sha_problems(report: dict, label: str):
     notes = (report or {}).get("notes") or ""
     tokens = sorted(set(SHA40_RE.findall(notes)))
     seg, _how = current_segment(notes, _release_version())
+    segs = [s for s in str(notes or "").split(" | ") if s.strip()]
     strict_scope = (set(SHA40_RE.findall(seg)) if seg is not None
                     else set(tokens))
+    if segs:
+        strict_scope |= set(SHA40_RE.findall(segs[-1]))
     problems = []
     skipped = []
     for tok in tokens:
@@ -316,6 +332,11 @@ def current_segment_derivation_problem(support_report: dict,
     canary_sha = (canary_report or {}).get("git_sha")
     if not canary_sha:
         return "canary report carries no git_sha (fail closed)"
+    if not _sha_argv_safe(canary_sha):
+        # PR #491 feedback (N-06): option-injection guard (see
+        # working_tree_disclosure_problem).
+        return (f"canary git_sha {canary_sha!r} is not a hex object name "
+                "(option-injection guard; fail closed)")
     r = _git(["rev-parse", str(canary_sha)])
     if r.returncode != 0:
         return (f"git rev-parse {canary_sha} failed "
@@ -392,6 +413,11 @@ def working_tree_disclosure_problem(support_report: dict,
     gs = (canary_report or {}).get("git_sha")
     if not gs:
         return "canary report carries no git_sha (fail closed)"
+    if not _sha_argv_safe(gs):
+        # PR #491 feedback (N-06): a non-hex value reaching git argv could
+        # be parsed as an option — refuse instead of executing it.
+        return (f"canary git_sha {gs!r} is not a hex object name "
+                "(option-injection guard; fail closed)")
     r = _git(["show", f"{gs}:release-manifest.json"])
     if r.returncode != 0:
         return (f"git show {gs}:release-manifest.json failed "
@@ -482,8 +508,12 @@ class NotesShaResolutionTest(unittest.TestCase):
         fabricated = "217836598699a953351960c37134a898f415ffff"
         self.assertEqual(len(fabricated), 40)
         if _PROVENANCE_OK:
-            real_full = _git(
-                ["rev-parse", str(_load(CANARY_PATH)["git_sha"])])
+            _live_sha = str(_load(CANARY_PATH)["git_sha"])
+            self.assertTrue(
+                _sha_argv_safe(_live_sha),
+                "the canary manifest's git_sha must be a bare 40-hex "
+                "object name before it reaches any Git argv")
+            real_full = _git(["rev-parse", _live_sha])
             self.assertEqual(real_full.returncode, 0, real_full.stderr)
             self.assertNotEqual(
                 fabricated, real_full.stdout.strip().lower(),
@@ -526,11 +556,33 @@ class NotesShaResolutionTest(unittest.TestCase):
             fabricated, problems[0],
             f"the failure must name the offending token; got: {problems}")
 
+    def test_unlabeled_trailing_segment_fabricated_token_flagged(self):
+        # PR #491 feedback (parallel-F-002): notes are append-only and an
+        # UNLABELED trailing segment is the normal authoring shape — the
+        # strict scope must cover the LAST segment by position, not only
+        # the version-labeled one, or a fabricated token appended after
+        # the release segment escapes.
+        _fab = "6de4ba2a7501" + "b" * 28  # 40 hex, does not resolve
+        self.assertEqual(len(_fab), 40, "control must be 40 hex")
+
+        def _append_fab(notes):
+            return (notes + " | Feedback round 1 (0.162.0): canary re-run "
+                    "at " + _fab)
+        report, _scratch = _mutated_support_copy(self, _append_fab)
+        problems, skipped = notes_sha_problems(report, "support-report")
+        self.assertTrue(
+            any(_fab in prob
+                for prob in problems),
+            f"a fabricated token in an unlabeled trailing segment must be "
+            f"strict-scope flagged; problems={problems!r} "
+            f"skipped={skipped!r}") if False else any(_fab in p for p in problems) or self.fail(f"not flagged; problems={problems!r} skipped={skipped!r}")
+
     def test_uppercase_fabricated_sha_negative_control_flagged(self):
         # Critic round: a case-narrow [0-9a-f]{40} extractor never matches
         # an all-uppercase 40-hex fabrication, so it would pass silently.
         # The widened extractor must surface it, and the problem must name
-        # the token AS WRITTEN (git rejects non-lowercase object names —
+        # the token AS WRITTEN (an uppercase spelling of a real sha still
+        # resolves — git hex names are case-insensitive — a fabricated one
         # itself a resolvability failure). Runs at full strength in BOTH
         # modes.
         uppercase = "A1B2C3D4E5" * 4
@@ -599,6 +651,9 @@ class CurrentSegmentDerivationTest(unittest.TestCase):
         version = _release_version()
         canary = _load(CANARY_PATH)
         if _PROVENANCE_OK:
+            self.assertTrue(_sha_argv_safe(canary["git_sha"]),
+                            "canary git_sha must be a hex object name "
+                            "(N-06 option-injection guard)")
             expected = _git(["rev-parse", str(canary["git_sha"])])
             self.assertEqual(expected.returncode, 0, expected.stderr)
             # a DIFFERENT resolvable commit's full sha (still a commit, so
@@ -697,6 +752,9 @@ class CurrentSegmentDerivationTest(unittest.TestCase):
         # LIVE gate, bites in strict runs only: the real canary git_sha
         # must resolve as a commit via git cat-file -t.
         live_sha = str((_load(CANARY_PATH) or {}).get("git_sha") or "")
+        self.assertTrue(_sha_argv_safe(live_sha),
+                        "canary git_sha must be a hex object name "
+                        "(N-06 option-injection guard)")
         live = _git(["cat-file", "-t", live_sha])
         live_resolves = (live.returncode == 0
                          and live.stdout.strip() == "commit")
@@ -862,6 +920,10 @@ class WorkingTreeDisclosureTest(unittest.TestCase):
         # mismatch drives the same helper branch.
         canary = dict(_load(CANARY_PATH))
         if _PROVENANCE_OK:
+            self.assertTrue(
+                _sha_argv_safe(str(canary["git_sha"])),
+                "the canary manifest's git_sha must be a bare 40-hex "
+                "object name before it reaches any Git argv")
             show = _git(
                 ["show", f"{canary['git_sha']}:release-manifest.json"])
         else:
@@ -869,6 +931,10 @@ class WorkingTreeDisclosureTest(unittest.TestCase):
             self.assertTrue(
                 visible, "no visible commit resolves in this checkout")
             canary["git_sha"] = visible[0]
+            self.assertTrue(
+                _sha_argv_safe(str(canary["git_sha"])),
+                "report-derived commit shas are validated before their "
+                "first Git invocation, in both modes")
             show = _git(
                 ["show", f"{canary['git_sha']}:release-manifest.json"])
         self.assertEqual(show.returncode, 0, show.stderr)

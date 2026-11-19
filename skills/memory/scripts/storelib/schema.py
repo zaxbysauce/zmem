@@ -2017,6 +2017,72 @@ def _ensure_content_norm_index(conn: sqlite3.Connection) -> None:
                 conn.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
 
+
+def _repair_null_content_norm_162(conn: sqlite3.Connection) -> None:
+    """One-time repair of NULL content_norm rows left by pre-0.162.0
+    materialization writers (issue #489, PR #491 review parallel-F-003).
+
+    The v8 backfill is gated on ``ver < 8`` and never re-runs, so a store
+    whose rows were written by the old dataset-import / import-store /
+    snapshot-restore paths keeps NULL norms forever. This repair runs ONCE
+    (meta stamp ``content_norm_repair_162``) on the next open after
+    upgrade, using the same batched shape as the v8 backfill so a large
+    store does not hold one giant write transaction. Pre-v8 stores are
+    skipped here: their rows are backfilled by the v8 block (or the column
+    does not exist yet, in which case there is nothing to key on).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    if "content_norm" not in cols or "content" not in cols:
+        return
+    stamped = conn.execute(
+        "SELECT value FROM meta WHERE key='content_norm_repair_162'"
+    ).fetchone()
+    if stamped is not None:
+        return
+    # CI round 1 (windows): the repair's UPDATE fires the FTS triggers
+    # (memory_ai/ad/au), whose bodies reference old.tags/new.tags — a
+    # hand-planted pre-tags store (the tests/test_feedback_promote.py v11
+    # fixture class: init_db installs the triggers against the tags-less
+    # table, no migration ever adds the column) fails with 'no such
+    # column: old.tags' when the repair's UPDATE fires memory_au. Skip
+    # stores whose memory table lacks any trigger-referenced column: real
+    # pre-0.162.0 stores carry tags (root-commit column), so this only
+    # gates degenerate hand-planted shapes (the same guard discipline as
+    # the v8 block's source_ref guard).
+    if "tags" not in cols:
+        return
+    batch_size = 500
+    # Stage-B v4 (FB-N04-dup): keyset-paginated like the v8 backfill and the
+    # import-store loop — the first batch is unbounded (source stores can
+    # carry zero/negative rowids, which a bare `rowid > ?` seed would skip)
+    # and later batches resume from the last seen rowid, so the scan cost
+    # stays linear and deterministic on any rowid domain.
+    _bf_last = None
+    while True:
+        if _bf_last is None:
+            rows = conn.execute(
+                "SELECT rowid, content FROM memory "
+                "WHERE content_norm IS NULL ORDER BY rowid LIMIT ?",
+                (batch_size,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT rowid, content FROM memory "
+                "WHERE content_norm IS NULL AND rowid > ? "
+                "ORDER BY rowid LIMIT ?", (_bf_last, batch_size)).fetchall()
+        if not rows:
+            break
+        conn.executemany(
+            "UPDATE memory SET content_norm=? WHERE rowid=?",
+            [(_normalize_content(r["content"] or ""), r["rowid"])
+             for r in rows])
+        _bf_last = rows[-1]["rowid"]
+        conn.commit()
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) "
+        "VALUES ('content_norm_repair_162', 'done')")
+    conn.commit()
+
+
 # Issue #137: additive belief-head side tables.  Like the v14 evidence
 # tables, this DDL is version-independent — it runs on every open from
 # migrate() (never init_db, so an existing store never pre-creates the
@@ -2615,12 +2681,18 @@ def migrate(conn: sqlite3.Connection) -> None:
                 [(_normalize_content(r["content"]), r["rowid"]) for r in rows],
             )
             conn.commit()
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
-            "ON memory(namespace, content_norm) "
-            "WHERE superseded_at IS NULL "
-            "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
-        )
+        # PR #491 review (N-02): the predicate now references source_ref —
+        # a hand-built store can carry content_norm without source_ref, and
+        # an unconditional CREATE fails "no such column" mid-migrate. Skip
+        # the index here when source_ref is absent (the migrate-tail ensure
+        # creates it once both columns exist, mirroring the init_db guard).
+        if "source_ref" in cols:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_content_norm "
+                "ON memory(namespace, content_norm) "
+                "WHERE superseded_at IS NULL "
+                "AND (source_ref IS NULL OR source_ref NOT LIKE 'knowledge:%')"
+            )
         conn.execute("UPDATE meta SET value='8' WHERE key='schema_version'")
         conn.commit()
 
@@ -2884,6 +2956,15 @@ def migrate(conn: sqlite3.Connection) -> None:
     # old shape — the _ensure_evidence_lookup_index discipline: idempotent
     # steady state, savepoint-atomic, no version bump.
     _ensure_content_norm_index(conn)
+
+    # Version-INDEPENDENT (issue #489, PR #491 review parallel-F-003): the
+    # writer repairs cover NEW materializations, but stores already holding
+    # NULL content_norm rows written by the PRE-0.162.0 dataset-import /
+    # import-store / snapshot-restore paths were never repaired — the v8
+    # backfill is gated on ver < 8 and never re-runs. One-time stamped
+    # repair (the v8 batch shape) so an upgraded store heals on its next
+    # open; the meta stamp keeps the steady state a single meta read.
+    _repair_null_content_norm_162(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.
     # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,
