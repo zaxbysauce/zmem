@@ -369,15 +369,17 @@ class CoalesceTests(_ReuseBase):
             t2.start()
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
-                if (t2.is_alive() and 1 not in results
-                        and calls["n"] == 1):
+                # review Stage-B r3: waiters_joined is incremented INSIDE
+                # the loser's waiter branch — polling it is a deterministic
+                # observation that the loser entered the branch (thread
+                # liveness alone cannot prove it).
+                if rr.reuse_stats().get("waiters_joined", 0) >= 1:
                     break
                 time.sleep(0.01)
-            self.assertTrue(
-                t2.is_alive() and 1 not in results and calls["n"] == 1,
+            self.assertGreaterEqual(
+                rr.reuse_stats().get("waiters_joined", 0), 1,
                 "the loser did not deterministically join the in-flight "
-                "waiter (calls=%r results=%r alive=%s)"
-                % (calls, sorted(results), t2.is_alive()))
+                "waiter branch")
             release.set()
             t1.join(timeout=10)
             t2.join(timeout=10)

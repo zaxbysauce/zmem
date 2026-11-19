@@ -433,6 +433,11 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             winner = False
 
     if not winner:
+        # review Stage-B r3: an explicit waiter-entry counter — the AC2
+        # contract test polls it for deterministic proof the loser reached
+        # the waiter branch (thread scheduling alone cannot prove it).
+        with _reuse_lock:
+            _counters["waiters_joined"] += 1
         timed_out = not slot["event"].wait(timeout=ttl + 30.0)
         with _reuse_lock:
             # Issue #474 (review CS-001/RP-005): pop only the slot we
@@ -977,7 +982,11 @@ def observation_report(conn) -> dict:
     dup = aggregate.get("dup", 0) + live["dup"]
     ineligible = sum(1 for row in per_key.values() if row.get("el"))
     complete = (aggregate.get("ovf", 0) == 0 and dropped == 0
-                and aggregate.get("corrupt", 0) == 0)
+                and aggregate.get("corrupt", 0) == 0
+                # review Stage-B r3: a known in-process journal-write
+                # failure means an observation was lost — coverage is not
+                # complete even though the journal itself reads clean.
+                and _counters.get("drop_journal_failures", 0) == 0)
     eligible_n = observed - ineligible
     invalidations = dict(aggregate.get("inv") or {})
     for reason, count in live_inv.items():
