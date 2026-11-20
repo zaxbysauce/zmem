@@ -855,7 +855,12 @@ _PA_RELATIONS_Q = {
 _PA_UNSUPPORTED_FOCI = frozenset(("cost", "ownership", "duration"))
 
 _PA_NEGATION = re.compile(
-    r"\b(?:not|never|no\s+longer|isnt|is\s+not|are\s+not|does\s+not|doesnt|dont)\b",
+    r"\b(?:not|never|no\s+longer|is\s+not|are\s+not|does\s+not|"
+    # Apostrophe contractions (ASCII ' and U+2019) — implementation review
+    # round 1: "isn't sent to Pine Crossing" parsed as an AFFIRMATIVE
+    # assertion because the bare "isnt" form never matched the typed text.
+    r"isn.?t|aren.?t|wasn.?t|weren.?t|doesn.?t|don.?t|didn.?t|won.?t|"
+    r"wouldn.?t|couldn.?t|shouldn.?t|can.?t|cannot|hasn.?t|haven.?t)\b",
     re.IGNORECASE)
 _PA_HYPOTHETICAL = re.compile(
     r"\b(?:if|suppose|assuming|hypothetically|were\s+it|in\s+case)\b",

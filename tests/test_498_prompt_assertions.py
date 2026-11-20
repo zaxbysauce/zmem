@@ -107,6 +107,26 @@ class FrameParseTests(unittest.TestCase):
             inject.analyze_prompt(
                 "If the parcel were sent to Pine Crossing, who would "
                 "approve it?")["assertions"], [])
+        # Implementation-review round 1: apostrophe contractions must be
+        # negation too ("isn't/doesn't/won't ... sent to X"), or a denied
+        # destination parses as an affirmative assertion and conflict-drops
+        # a relevant stored fact.
+        for neg in ("isn't", "doesn't", "won't", "wasn't", "can't",
+                    "isn’t"):
+            self.assertEqual(
+                inject.analyze_prompt(
+                    "The Kennet parcel %s sent to Pine Crossing. "
+                    "Where does it go?" % neg)["assertions"], [],
+                "contraction %r parsed as an affirmation" % neg)
+        drops, _ = inject.partition_prompt_assertions(
+            inject.analyze_prompt(
+                "The Kennet parcel isn't sent to Pine Crossing. "
+                "Where does it go?"),
+            [{"id": "d", "type": "fact", "confidence": 0.9,
+              "signal": "test",
+              "content": "Kennet policy sends unsealed parcels to "
+                         "Rowan Dock."}])
+        self.assertNotIn("d", drops)
 
     def test_clause_bound_subject_affinity(self):
         frame = inject.analyze_prompt(
