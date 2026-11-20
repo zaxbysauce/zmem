@@ -2127,12 +2127,21 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
         return
     batch_size = 200
     _bf_last = None
-    examined = 0
+    healed = 0
     # Final-critic finding 1: a caller transaction (if any) owns the commit
     # decision — the stamp is written under the batch savepoint and the
     # caller's transaction stays OPEN for the caller to commit or roll
     # back; only when we opened our own transaction do we commit it.
     caller_tx = conn.in_transaction
+    # CI round (PR #525): the pass must be a ZERO-WRITE surface on clean
+    # stores — byte-identical contracts (explain zero-write, op-queue
+    # replay idempotence) snapshot stores seeded after `init` whose first
+    # production open is the assertion's own read. A clean scan therefore
+    # writes NOTHING (no stamp); the stamp rides an actual heal in the
+    # same transaction. NULL norms are _repair_null_content_norm_162's
+    # lane (its own stamp cadence); this pass skips them so raw-seeded
+    # NULL rows do not turn a read-only open into a write. Consequence:
+    # a clean store re-verifies on every open (read-only scan).
     while True:
         if _bf_last is None:
             rows = conn.execute(
@@ -2146,7 +2155,18 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
                 (_bf_last, batch_size,)).fetchall()
         if not rows:
             break
-        examined += len(rows)
+        # Index access (rowid=0, content=1, content_norm=2): the pass must
+        # run on connections without a Row factory too (raw sqlite3.connect
+        # callers; the busy-abort supp probe found the mapping access
+        # crashing there).
+        for r in rows:
+            if _bf_last is None or r[0] > _bf_last:
+                _bf_last = r[0]
+        stale = [r for r in rows
+                 if r[2] is not None
+                 and r[2] != _normalize_content(r[1] or "")]
+        if not stale:
+            continue
         own_tx = not conn.in_transaction
         sp = "zmem_norm_verify_163"
         try:
@@ -2154,36 +2174,39 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
                 conn.execute("BEGIN IMMEDIATE")
             else:
                 conn.execute(f"SAVEPOINT {sp}")
-            for r in rows:
-                _bf_last = max(_bf_last or r["rowid"], r["rowid"])
-                canonical = _normalize_content(r["content"] or "")
-                if r["content_norm"] == canonical:
-                    continue
+            for r in stale:
+                canonical = _normalize_content(r[1] or "")
                 cur = conn.execute(
                     "UPDATE memory SET content_norm=? WHERE rowid=? "
                     "AND content IS ? AND content_norm IS ?",
-                    (canonical, r["rowid"], r["content"],
-                     r["content_norm"]))
+                    (canonical, r[0], r[1], r[2]))
                 if cur.rowcount:
+                    healed += 1
                     continue
                 # Zero-row compare-and-update: the row changed under us.
                 fresh = conn.execute(
                     "SELECT rowid, content, content_norm FROM memory "
-                    "WHERE rowid=?", (r["rowid"],)).fetchone()
+                    "WHERE rowid=?", (r[0],)).fetchone()
                 if fresh is None:
                     continue  # row deleted under us — nothing to verify
-                canonical = _normalize_content(fresh["content"] or "")
-                if fresh["content_norm"] == canonical:
+                canonical = _normalize_content(fresh[1] or "")
+                if fresh[2] == canonical:
                     continue  # the concurrent writer already fixed it
                 retry = conn.execute(
                     "UPDATE memory SET content_norm=? WHERE rowid=? "
                     "AND content IS ? AND content_norm IS ?",
-                    (canonical, fresh["rowid"], fresh["content"],
-                     fresh["content_norm"]))
+                    (canonical, fresh[0], fresh[1], fresh[2]))
                 if not retry.rowcount:
                     raise _NormVerifyConflict(
-                        f"rowid {r['rowid']} kept changing during the "
+                        f"rowid {r[0]} kept changing during the "
                         "norm-verification pass")
+                healed += 1
+            # Stamp rides the heal batch (zero-write on clean stores —
+            # see the comment at the loop head): the stamp is written
+            # INSIDE the same transaction as the heals it certifies.
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES ('content_norm_verify_163', 'done')")
             if own_tx:
                 conn.commit()
             else:
@@ -2217,22 +2240,13 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
             elif conn.in_transaction:
                 conn.rollback()
             return
-    # Stamp ONLY when the pass examined at least one row: a store whose
-    # memory table was empty at open (e.g. fresh `init`) stays unstamped,
-    # so the first open that actually holds rows still verifies them —
-    # a stale norm planted before any non-empty open heals on that open
-    # (the frozen C6 scenario), while a verified non-empty store pays the
-    # scan exactly once.
-    if examined > 0:
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) "
-            "VALUES ('content_norm_verify_163', 'done')")
-        if not caller_tx:
-            conn.commit()
-        # Final-critic finding 1: with a caller transaction open, the stamp
-        # rides the caller's commit — the pass must never close a
-        # transaction it did not open (the caller keeps its rollback
-        # authority over heals + stamp together).
+    # No trailing stamp: a clean scan (and a scan of only-NULL rows —
+    # 162's lane) writes NOTHING. The stamp exists only inside a heal
+    # batch, so byte-identical contracts on read-only opens hold. The
+    # 'healed' counter is retained for callers/diagnostics; a clean store
+    # re-verifies on every open by design (read-only scan; the F6
+    # per-open-scan cost is accepted and disclosed in exchange for the
+    # zero-write contract).
 
 
 class _NormVerifyConflict(Exception):

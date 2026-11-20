@@ -412,14 +412,17 @@ class NormVerifySuppTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_stamp_written_and_second_open_skips(self):
+    def test_clean_store_is_zero_write_and_unstamped(self):
+        """CI round (PR #525): the pass is a ZERO-WRITE surface on clean
+        stores — byte-identical contracts (explain zero-write, op-queue
+        replay idempotence) snapshot stores whose first production open is
+        the assertion's own read. A clean scan writes NOTHING (no stamp);
+        the stamp rides an actual heal (frozen C6 + the heal tests)."""
         store = _fresh_store("nv-stamp")
         r = _run_cli(store, "add", "--content", "norm verify stamp body",
                      "--namespace", "project:supp", "--type", "fact")
         self.assertEqual(r.returncode, 0, r.stderr)
-        # The add command's own open saw an EMPTY table at migrate time
-        # (rows are written after migrate), so the first NON-EMPTY open is
-        # the next command's — that open verifies and stamps.
+        before = store.read_bytes()
         r = _run_cli(store, "stats")
         self.assertEqual(r.returncode, 0, r.stderr)
         conn = sqlite3.connect(str(store))
@@ -429,10 +432,43 @@ class NormVerifySuppTest(unittest.TestCase):
             ).fetchone()
         finally:
             conn.close()
-        self.assertIsNotNone(stamped, "non-empty verified store must stamp")
-        # Steady state: a second open stays green with the stamp present.
+        self.assertIsNone(stamped,
+                          "a clean (all-canonical) store must NOT be "
+                          "stamped by a read-only open")
+        self.assertEqual(store.read_bytes(), before,
+                         "a clean open must not change store bytes")
+        # Steady state: repeated opens stay green and byte-identical.
         r = _run_cli(store, "stats")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(store.read_bytes(), before)
+
+    def test_heal_writes_stamp_and_certifies(self):
+        store = _fresh_store("nv-heal-stamp")
+        r = _run_cli(store, "add", "--content", "norm heal stamp body",
+                     "--namespace", "project:supp", "--type", "fact")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute(
+                "UPDATE memory SET content_norm='STALE HEAL NORM'")
+            conn.commit()
+        finally:
+            conn.close()
+        r = _run_cli(store, "stats")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            stamped = conn.execute(
+                "SELECT value FROM meta WHERE key='content_norm_verify_163'"
+            ).fetchone()
+            norms = [row[0] for row in conn.execute(
+                "SELECT content_norm FROM memory")]
+        finally:
+            conn.close()
+        self.assertIsNotNone(stamped,
+                             "a heal batch must carry the stamp")
+        for n in norms:
+            self.assertEqual(n, _normalize_content("norm heal stamp body"))
 
     def test_large_store_heals_across_batches(self):
         store = _fresh_store("nv-batches")
