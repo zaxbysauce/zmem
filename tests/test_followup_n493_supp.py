@@ -27,6 +27,9 @@ os.environ["ZMEM_DATA"] = str(_TMP / "data")
 os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 os.environ["ZMEM_MODELS_DIR"] = str(_TMP / "models")  # nonexistent -> degraded
 
+import _store_guard  # noqa: F401,E402  (issue #244 isolation guard; the
+# env pins above precede it per the house rule)
+
 from storelib import knowledge, write  # noqa: E402
 from storelib.schema import _normalize_content  # noqa: E402
 
