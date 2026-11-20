@@ -1376,6 +1376,20 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         try:
             # commit #1 = the heal batch; commit #2 = the stamp -> raises
             schema_mod._verify_content_norms_163(probe)  # must not raise
+            # In-connection assertions BEFORE any close (round-9: close()
+            # itself rolls back an open transaction, so post-close checks
+            # cannot establish the verifier's own rollback ran).
+            self.assertFalse(
+                probe.in_transaction,
+                "the failed stamp commit leaves no verifier-owned "
+                "transaction stranded on the connection")
+            in_conn_stamp = probe.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNone(
+                in_conn_stamp,
+                "the verifier's rollback discarded the stamp the "
+                "failed commit left in the open transaction")
         finally:
             probe.close()
         check = s3.connect(str(store), timeout=5)
