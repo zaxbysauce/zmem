@@ -1249,6 +1249,151 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         self.assertEqual(norm3[0], _normalize_content("stamp probe body"),
                          "the drifted row heals canonically")
 
+    def test_stamp_fail_trigger_undoes_partial_insert_on_caller_tx(self):
+        """Round-8: SQLite RAISE(FAIL) does NOT undo the failing
+        statement's own changes, so an AFTER INSERT trigger firing FAIL
+        after the stamp row landed would leave the partial stamp pending
+        inside the CALLER-owned transaction. The stamp-local savepoint
+        must undo exactly that insert: no stamp in the caller's
+        transaction (before OR after its commit), caller tx stays open
+        with the heals intact, and the caller's commit persists the heals
+        but never the failed stamp."""
+        store = self._scratch("nv-stampfail-caller")
+        os.environ.update({"ZMEM_STORE": str(store),
+                           "ZMEM_DATA": str(store.parent)})
+        schema_mod = self._load_schema()
+        conn = schema_mod.connect()
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('94000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact','caller fail body','','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z','STALE CALLER NORM')")
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn.commit()
+        finally:
+            conn.close()
+        import sqlite3 as s3
+        setup = s3.connect(str(store), timeout=5)
+        try:
+            # FAIL (not ABORT): preserves the statement's own changes —
+            # the worst-case partial-insert shape. AFTER (not BEFORE):
+            # the row has already landed when the raise fires.
+            for ev in ("INSERT", "UPDATE"):
+                setup.execute(
+                    f"CREATE TRIGGER zmem_493_stamp_fail_{ev} AFTER "
+                    f"{ev} ON meta WHEN NEW.key='content_norm_verify_163' "
+                    "BEGIN SELECT RAISE(FAIL, 'stamp fail probe'); END")
+            setup.commit()
+        finally:
+            setup.close()
+        probe = s3.connect(str(store), timeout=5)
+        try:
+            probe.execute("BEGIN")  # caller-owned transaction
+            schema_mod._verify_content_norms_163(probe)  # must not raise
+            self.assertTrue(
+                probe.in_transaction,
+                "the caller's transaction stays open — the helper never "
+                "commits or rolls back caller-owned work")
+            in_tx_stamp = probe.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            in_tx_norm = probe.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'94000000-0000-4000-8000-000000000001'").fetchone()
+            self.assertIsNone(
+                in_tx_stamp,
+                "the savepoint undoes the FAIL-preserved partial stamp "
+                "inside the caller's transaction")
+            self.assertEqual(
+                in_tx_norm[0], _normalize_content("caller fail body"),
+                "the heals ride the caller transaction intact")
+            probe.commit()  # the caller commits its own work
+        finally:
+            probe.close()
+        check = s3.connect(str(store), timeout=5)
+        try:
+            stamped = check.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            norm = check.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'94000000-0000-4000-8000-000000000001'").fetchone()
+        finally:
+            check.close()
+        self.assertIsNone(stamped,
+                          "the caller's commit persists the heals but "
+                          "NEVER the failed stamp")
+        self.assertEqual(norm[0], _normalize_content("caller fail body"),
+                         "the caller's commit persists the heals")
+
+    def test_stamp_commit_failure_rolls_back_stamp_keeps_heals(self):
+        """Round-8 reviewer question: a commit() failure on the
+        verifier-owned stamp transaction must leave no stamp while the
+        already-committed heal batches stay durable. Driven with a
+        connection subclass whose commit() raises on the stamp commit
+        (the last commit of the pass: one heal batch + the stamp)."""
+        store = self._scratch("nv-stampcommitfail")
+        os.environ.update({"ZMEM_STORE": str(store),
+                           "ZMEM_DATA": str(store.parent)})
+        schema_mod = self._load_schema()
+        conn = schema_mod.connect()
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('95000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact','commit fail body','','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z','STALE COMMIT NORM')")
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn.commit()
+        finally:
+            conn.close()
+        import sqlite3 as s3
+
+        class _BoomCommit(s3.Connection):
+            commits = 0
+
+            def commit(self):
+                _BoomCommit.commits += 1
+                if _BoomCommit.commits == 2:
+                    raise s3.OperationalError(
+                        "simulated stamp commit failure")
+                super().commit()
+
+        probe = s3.connect(str(store), timeout=5, factory=_BoomCommit)
+        try:
+            # commit #1 = the heal batch; commit #2 = the stamp -> raises
+            schema_mod._verify_content_norms_163(probe)  # must not raise
+        finally:
+            probe.close()
+        check = s3.connect(str(store), timeout=5)
+        try:
+            stamped = check.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            norm = check.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'95000000-0000-4000-8000-000000000001'").fetchone()
+        finally:
+            check.close()
+        self.assertIsNone(stamped,
+                          "a failed stamp commit leaves no stamp")
+        self.assertEqual(norm[0], _normalize_content("commit fail body"),
+                         "the heal batch committed before the stamp "
+                         "stays durable")
+
     def test_wal_store_stale_norm_heals_or_aborts_never_stale_writes(self):
         """Round-2 finding 3c (honest name): a WAL store with a stale norm
         heals under the pass and stamps; the never-a-stale-write property

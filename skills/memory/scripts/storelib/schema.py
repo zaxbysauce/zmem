@@ -2268,15 +2268,37 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
         # this arm can only fire on exotic failures (e.g. disk full) —
         # swallow-and-return there too, never touching the caller's
         # transaction.
+        # Round-8 reviewer finding: SQLite's FAIL conflict resolution does
+        # NOT undo the failing statement's own changes, so an error AFTER
+        # the stamp row was inserted (e.g. an AFTER INSERT trigger) would
+        # leave the partial stamp pending inside a CALLER-owned
+        # transaction for the caller's commit to persist. A stamp-local
+        # SAVEPOINT bounds the undo to the stamp statement alone — the
+        # caller's transaction stays open with its prior work intact
+        # (heals already released), and no stamp survives any failure,
+        # including a commit() failure on the verifier-owned path (the
+        # rollback there discards the stamp the commit failed to land).
+        stamp_sp = "zmem_norm_verify_163_stamp"
         try:
+            if caller_tx:
+                conn.execute(f"SAVEPOINT {stamp_sp}")
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) "
                 "VALUES ('content_norm_verify_163', 'done')")
             if not caller_tx:
                 conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {stamp_sp}")
         except sqlite3.Error:
-            if not caller_tx and conn.in_transaction:
-                conn.rollback()
+            if not caller_tx:
+                if conn.in_transaction:
+                    conn.rollback()
+            else:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {stamp_sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {stamp_sp}")
+                except sqlite3.Error:
+                    pass
             return
 
 
