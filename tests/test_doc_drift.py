@@ -997,5 +997,16 @@ class ClaimsAuditPathTest(unittest.TestCase):
         )
 
 
+class CloseoutReadbackContractTest(unittest.TestCase):
+    def test_focused_correction_and_companion_readback(self):
+        text = (REPO_ROOT / "skills/closeout/SKILL.md").read_text(encoding="utf-8")
+        text = " ".join(text.split())
+        for instruction in ("Before writing, phrase one natural question", "result is deduped",
+                            "--no-dedup", "results[].id", "new live id",
+                            "compare the returned content with the authored note and verify digest agreement"):
+            with self.subTest(instruction=instruction):
+                self.assertIn(instruction, text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

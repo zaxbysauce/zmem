@@ -1401,6 +1401,12 @@ function snapshotTrainingDelivery(host, hookName, meta, env, payload,
 function buildCanonicalEnv(host, meta, hookName, options = {}) {
     const env = { ...process.env };
 
+    // On Windows, override the locale or caller setting for the UTF-8 pipe
+    // protocol, preserving Python's default stdin error handler.
+    if (process.platform === "win32") {
+        env.PYTHONIOENCODING = "utf-8:surrogateescape";
+    }
+
     const project =
         process.env.CODEX_PROJECT_DIR ||
         process.env.CLAUDE_PROJECT_DIR ||

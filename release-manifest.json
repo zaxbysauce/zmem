@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "80f340c71c4ca2e04bb2f7f1e7c9ebcb254ac0f3e7b9e49b6a1c66d525d8199e",
+  "digest": "ac1370d6fbf3d511e7f8273e8c097ab175b4f1dc0778e56a4e64a39e41b6b8ac",
   "files": {
     ".agents/plugins/marketplace.json": "a365ecfde6e74a163131ac2b45b042283045c3fcd2b481e43e059915cdcbcb4f",
     ".claude-plugin/marketplace.json": "e54c58fc0ecbff2491409ce4370b8410814d28c71546ae908b1887a5fd729d6a",
@@ -48,7 +48,7 @@
     "hooks/zmem-closeout-gate.sh": "e664b6fe74d50da257f5eb431a652b4dc436f156c987b5ea28d9a98ebd952cba",
     "hooks/zmem-closeout-request.sh": "d106d72c21e25a52734132178c431264b8f590a90f22cd9c52ca21de7b7ef593",
     "hooks/zmem-convention-capture.sh": "397f6c354331eac035bec62798eba5af4987ec89f25fffecf9893f47d14dbce5",
-    "hooks/zmem-launch.js": "61664cd9d3a0b2a44ea84b8f18cf38f726881915a67669b6abf2ab8a3997f09a",
+    "hooks/zmem-launch.js": "51a589904d1f7cb5dd85aa7362bb34849f743e9a59ec4582290530f007bdb888",
     "hooks/zmem-postcompact.sh": "7425f2937508fe3b526395abcb5610b7ac18c33a610a53455b58d984d8647542",
     "hooks/zmem-posttoolbatch-recall.sh": "7f99646d56deb620c21af6837d178973f9891dca008d941504bc588d6d14f129",
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",
@@ -92,7 +92,7 @@
     "scripts/release_gate.py": "3a2fed7cad4c2c5c654ffb5b376d04e7efc725cf8f54175d0d150b6c249383d4",
     "scripts/update_launcher_pins.py": "30d187036e71b7b1d8adb6422652d4d68f771b7616f313876a8a16335ea9554f",
     "skills/closeout-remote/SKILL.md": "448390f2a139e3e2b0f1ff8041915f74e9236e73f3c41f61bf5fd8fb634a974c",
-    "skills/closeout/SKILL.md": "c1b029942c233acca39597547316a8dbcbbd9e49ec1c205cb92bd7debf02e7be",
+    "skills/closeout/SKILL.md": "8bb99af16a76d7a41644f0d4b78f424d51fb1eedb1412402c06fcdfa26972c3b",
     "skills/knowledge/SKILL.md": "3555c2ef68de03bb5880ea5359b5535dd4488c7b55834f745d79930b4c4493a6",
     "skills/memory/SKILL.md": "bbb647b9a72c99720409b1879dfc1d93e92b6a3bd0b636b35783062d014938df",
     "skills/memory/scripts/capture_quality.py": "144952fd06464e4164c6e0ea80cc32a90eb77a3d632934528a5b04842cefe19c",
