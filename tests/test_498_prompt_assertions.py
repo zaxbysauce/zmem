@@ -164,6 +164,57 @@ class PartitionGuardTests(unittest.TestCase):
         self.assertEqual(drops.get("d"), "orthogonal")
 
 
+class DropLabelAndFloorTests(unittest.TestCase):
+    """M5/M6 mutation kills: the drop LABEL (redundant vs conflict) and the
+    rescue floor are load-bearing, not interchangeable."""
+
+    ROW = {"id": "d", "type": "fact", "confidence": 0.9, "signal": "test",
+           "content": "Kennet policy sends unsealed parcels to Rowan Dock."}
+
+    def test_same_value_is_redundant_different_value_is_conflict(self):
+        frame_same = inject.analyze_prompt(
+            "Kennet policy sends unsealed parcels to Rowan Dock today.")
+        drops, _ = inject.partition_prompt_assertions(frame_same, [dict(self.ROW)])
+        self.assertEqual(drops.get("d"), "redundant")
+        frame_diff = inject.analyze_prompt(
+            "This Kennet unsealed parcel is being sent to Pine Crossing.")
+        drops2, _ = inject.partition_prompt_assertions(frame_diff, [dict(self.ROW)])
+        self.assertEqual(drops2.get("d"), "conflict")
+
+    def test_rescue_refuses_weak_lane(self):
+        weak = {"id": "w", "type": "fact", "confidence": 0.9,
+                "signal": "test",
+                "content": "Harbor master Lyle approves every Kennet shipment.",
+                "_rel_cos": 0.15}
+        frame = inject.analyze_prompt(
+            "This Kennet unsealed parcel is being sent to Pine Crossing. "
+            "Who approves the job?")
+        nominees = inject.rescue_nominees(frame, [weak], [])
+        self.assertNotIn("w", nominees,
+                         "a 0.15 lane is below the 0.25 rescue floor")
+
+    def test_rescue_relation_gate_beats_higher_wrong_relation_lane(self):
+        # M4b kill: the wrong-relation row (badge, 0.45) OUTRANKS the right
+        # one (lyle, 0.30). The relation gate must keep badge out of the
+        # nominees even when it is the best-scoring row on the page.
+        rows = [
+            {"id": "lyle", "type": "fact", "confidence": 0.9,
+             "signal": "test",
+             "content": "Harbor master Lyle approves every Kennet shipment.",
+             "_rel_cos": 0.30},
+            {"id": "badge", "type": "fact", "confidence": 0.9,
+             "signal": "test",
+             "content": "Security badge replacements are issued at the "
+                        "Vantor desk.", "_rel_cos": 0.45},
+        ]
+        frame = inject.analyze_prompt(
+            "This Kennet unsealed parcel is being sent to Pine Crossing. "
+            "Who approves the job?")
+        nominees = inject.rescue_nominees(frame, rows, [])
+        self.assertEqual(set(nominees), {"lyle"},
+                         "relation-incompatible badge must not outrank lyle")
+
+
 class VerifierRepairTests(unittest.TestCase):
     """The eval-verifier independent derivation (plan R6/R12 option a)."""
 
@@ -173,10 +224,15 @@ class VerifierRepairTests(unittest.TestCase):
          "_rel_lex": 0.6},
         {"id": "lyle", "type": "fact", "confidence": 0.9, "signal": "test",
          "content": "Harbor master Lyle approves every Kennet shipment.",
-         "_rel_cos": 0.47},
+         "_rel_cos": 0.30},
+        # M4b discriminator: the WRONG-relation row outranks the right one
+        # (0.45 > 0.30) while staying BELOW the ordinary 0.50 cos floor —
+        # with the relation gate intact the rescue set is {lyle}; with
+        # relation+subject gates both removed, badge wins and this fixture
+        # goes red.
         {"id": "badge", "type": "fact", "confidence": 0.9, "signal": "test",
          "content": "Security badge replacements are issued at the Vantor "
-                    "desk.", "_rel_cos": 0.28},
+                    "desk.", "_rel_cos": 0.45},
     ]
 
     def _expected(self, query):
