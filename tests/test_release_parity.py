@@ -438,22 +438,15 @@ class UnreleasedDriftSyntheticRepoTest(unittest.TestCase):
             self.assertIn("no unreleased drift", r.stdout)
 
     def test_live_repo_drift_mode_reports_a_sane_verdict(self):
-        # X10: this runs in the every-PR CI loop, where the live repo MAY
-        # legitimately carry unreleased content (any feature PR mid-flight).
-        # The smoke value is "the mode runs and reports one of its two
-        # documented verdicts" — NOT a pinned rc (that would break every
-        # PR that accumulates [Unreleased] entries before its bump PR).
-        # The default mode's no-drift-text contract is still pinned.
+        # All legitimate release paths must pass on the live checkout.
         r = subprocess.run(
             [PYTHON, str(GATE_PY), "--check-unreleased-drift"],
             capture_output=True, text=True, timeout=120, cwd=str(REPO_ROOT),
         )
-        self.assertIn(r.returncode, (0, 1),
-                      f"drift mode crashed on the live repo:\n{r.stdout}")
-        self.assertTrue(
-            ("no unreleased drift" in r.stdout)
-            or ("::error::unreleased drift" in r.stdout),
-            f"neither documented verdict emitted:\n{r.stdout}")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        verdicts = ("no unreleased drift", "[skip release] in the merge subject",
+                    "HEAD carries a version bump", "work merge: ## [Unreleased] notes accumulate")
+        self.assertTrue(any(verdict in r.stdout for verdict in verdicts), r.stdout)
         # The default mode never gained drift output (release.yml contract).
         d = subprocess.run(
             [PYTHON, str(GATE_PY)], capture_output=True, text=True,

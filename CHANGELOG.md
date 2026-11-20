@@ -5,6 +5,12 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Closeout now saves focused corrections and verifies that a natural query retrieves each correction in the default top five. User-requested closeouts also save qualifying audit findings and fix plans together in the enabled knowledge companion and verify the note by readback.
+
 ## [0.163.0] - 2026-11-19
 
 
@@ -4966,8 +4972,6 @@ README.
   (`<sha256>.pending`), so N parked fences all survive and no id parks twice.
 - SKILL.md pre-tool rows refreshed in place with the supersession pointer
   (ceiling-pinned by presence needles in `tests/test_doc_drift.py`).
-
-## [Unreleased]
 
 ## [0.26.0] - 2026-09-08
 
