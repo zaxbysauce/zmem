@@ -2201,12 +2201,12 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
                         f"rowid {r[0]} kept changing during the "
                         "norm-verification pass")
                 healed += 1
-            # Stamp rides the heal batch (zero-write on clean stores —
-            # see the comment at the loop head): the stamp is written
-            # INSIDE the same transaction as the heals it certifies.
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) "
-                "VALUES ('content_norm_verify_163', 'done')")
+            # Heal batch commits WITHOUT the stamp (round-6 reviewer
+            # finding: a stamp committed with an EARLY batch would
+            # permanently certify a partial verification if a later batch
+            # fails or the process dies mid-scan — the early-return stamp
+            # check would then skip the unscanned rows forever). The stamp
+            # is written once, after the ENTIRE scan completes.
             if own_tx:
                 conn.commit()
             else:
@@ -2240,13 +2240,23 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
             elif conn.in_transaction:
                 conn.rollback()
             return
-    # No trailing stamp: a clean scan (and a scan of only-NULL rows —
-    # 162's lane) writes NOTHING. The stamp exists only inside a heal
-    # batch, so byte-identical contracts on read-only opens hold. The
-    # 'healed' counter is retained for callers/diagnostics; a clean store
-    # re-verifies on every open by design (read-only scan; the F6
-    # per-open-scan cost is accepted and disclosed in exchange for the
-    # zero-write contract).
+    # Post-scan stamp (round-6 reviewer finding): the completion stamp is
+    # written exactly once, AFTER the entire scan has finished with no
+    # abort — a persisted stamp therefore implies the whole verification
+    # completed. A heal batch that committed earlier stays durable (the
+    # rows are canonical now) but does NOT certify the pass; if a later
+    # batch aborted or the process died mid-scan, the stamp is absent and
+    # the next open re-scans (finding only the still-stale rows).
+    # Zero-write on clean stores (and on only-NULL scans — 162's lane)
+    # still holds: no heals -> no stamp -> no bytes. With a caller
+    # transaction open the stamp rides the caller's commit; otherwise it
+    # commits its own small transaction.
+    if healed > 0:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) "
+            "VALUES ('content_norm_verify_163', 'done')")
+        if not caller_tx:
+            conn.commit()
 
 
 class _NormVerifyConflict(Exception):

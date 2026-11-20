@@ -469,9 +469,94 @@ class NormVerifySuppTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertIsNotNone(stamped,
-                             "a heal batch must carry the stamp")
+                             "a completed heal pass must carry the stamp")
         for n in norms:
             self.assertEqual(n, _normalize_content("norm heal stamp body"))
+
+    def test_partial_pass_leaves_no_stamp_and_retries(self):
+        """Round-6 reviewer finding: a heal batch that COMMITS must NOT
+        certify the pass. 205 rows so the scan spans TWO batches
+        (batch_size=200): batch 1 heals rows 1-200 and COMMITS; batch 2
+        aborts on a RAISE(ABORT) trigger on row 205. Expect: no stamp
+        (an aborted pass is never certified), batch 1's heals durable and
+        canonical, row 205 still stale; drop the trigger, re-run — the
+        stale row heals and the completed pass stamps."""
+        store = _TMP / "nv-partial" / "store.sqlite"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        os.environ.update({"ZMEM_STORE": str(store),
+                           "ZMEM_DATA": str(store.parent)})
+        for key in [k for k in sys.modules
+                    if k == "storelib" or k.startswith("storelib.")]:
+            del sys.modules[key]
+        sys.path.insert(0, str(SCRIPTS))
+        from storelib import schema as schema_mod
+        conn = schema_mod.connect()
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            rows = [
+                ("96000000-0000-4000-8000-" + f"{i:012d}",
+                 f"partial pass body {i}")
+                for i in range(1, 206)]
+            # STALE NON-NULL norms (this pass's lane; NULLs are 162's)
+            conn.executemany(
+                "INSERT INTO memory (id, namespace, type, content, "
+                "tags, source_ref, confidence, signal, valid_from, "
+                "taint, ingestion_ts, content_norm) VALUES "
+                "(?,?,?,?,?,'session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',?)",
+                [(mid, "project:supp", "fact", content, "",
+                  "STALE " + content)
+                 for mid, content in rows])
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            # row 205 sits in batch 2; its UPDATE aborts via the trigger
+            conn.execute(
+                "CREATE TRIGGER zmem_493_partial_probe BEFORE UPDATE OF "
+                "content_norm ON memory WHEN NEW.id="
+                "'96000000-0000-4000-8000-000000000205' "
+                "BEGIN SELECT RAISE(ABORT, 'partial probe'); END;")
+            conn.commit()
+            schema_mod._verify_content_norms_163(conn)
+            stamped = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNone(stamped,
+                              "an aborted pass must NOT be certified")
+            n1 = conn.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'96000000-0000-4000-8000-000000000001'").fetchone()[0]
+            n205 = conn.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'96000000-0000-4000-8000-000000000205'").fetchone()[0]
+            stale_cnt = conn.execute(
+                "SELECT COUNT(*) FROM memory WHERE content_norm LIKE "
+                "'STALE %'").fetchone()[0]
+            self.assertEqual(
+                n1, _normalize_content("partial pass body 1"),
+                "batch 1's committed heal stays durable")
+            self.assertEqual(n205, "STALE partial pass body 205",
+                             "the unverified batch-2 row stays stale "
+                             "for retry")
+            self.assertEqual(stale_cnt, 5,
+                             "exactly batch 2's rows (201-205) remain "
+                             "unverified; batch 1's 200 healed")
+            # retry: drop the trigger, re-run — everything heals + stamps
+            conn.execute("DROP TRIGGER zmem_493_partial_probe")
+            conn.commit()
+            schema_mod._verify_content_norms_163(conn)
+            stamped2 = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNotNone(stamped2,
+                                 "the completed retry carries the stamp")
+            bad = conn.execute(
+                "SELECT COUNT(*) FROM memory WHERE content_norm LIKE "
+                "'STALE %'").fetchone()[0]
+            self.assertEqual(bad, 0, "the retry healed every row")
+        finally:
+            conn.close()
 
     def test_large_store_heals_across_batches(self):
         store = _fresh_store("nv-batches")
