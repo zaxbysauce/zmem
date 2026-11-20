@@ -5,6 +5,22 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.164.0] - 2026-11-20
+
+### Fixed
+
+- **Passive recall now respects explicit task details (issue #498, P0).** A
+  stored standing default whose value conflicts with an explicit value in the
+  prompt is no longer delivered, rendered or counted as surfaced; independent
+  attributes (e.g. the approver on a mixed prompt) survive; paraphrased
+  questions rescue their expected facts through a subject+relation-aware
+  fallback; self-answered prompts deliver nothing. The prompt-assertion
+  analysis is pure stdlib, facts-only (constraints/decisions/belief heads are
+  never dropped), and the fixed 0.25 question-rescue floor carries no new
+  environment knob. The explain replay, the eval injection verifier, and the
+  silent-reason classification all mirror the new admission semantics; the
+  closed reason vocabulary and envelope keys are unchanged.
+
 ## [Unreleased]
 
 ### Changed

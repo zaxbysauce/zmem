@@ -464,6 +464,21 @@ constants live in `schema_meta.py`.
 
 | Constant | Default | Env override | Used by |
 |---|---|---|---|
+### Prompt-assertion admission (issue #498)
+
+On the user-prompt injection lane, a lightweight clause parser extracts
+affirmative assignment assertions (destination/route, approver, frequency,
+cost, ownership, duration — negated, hypothetical and question clauses never
+assert) and subject-bound question foci. Before the relevance gate, a
+facts-only partition drops rows that duplicate a prompt assertion
+(PROMPT_DUPLICATE), conflict with it on the same subject+relation
+(CONFLICT), or answer a different attribute under a cost/ownership/duration
+question (ORTHOGONAL); constraints, decisions, preferences and belief heads
+are never dropped. After the ordinary gate, an unanswered
+subject+relation-compatible question may rescue exactly one best row whose
+strongest measured lane clears a fixed 0.25 floor (no environment knob).
+Constraints, decisions, and belief heads are never dropped by any rule.
+
 | `INJECT_FLOOR_PROMPT_DEFAULT` | 0.25 | `ZMEM_INJECT_FLOOR_PROMPT` | `recall` (UserPromptSubmit / PreCompact). Hard floor on FTS/vec results — anything below is dropped before scoring. |
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
 | `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |
