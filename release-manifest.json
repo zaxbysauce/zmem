@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "ac1370d6fbf3d511e7f8273e8c097ab175b4f1dc0778e56a4e64a39e41b6b8ac",
+  "digest": "1358aa6220ae82f515634575fa08cce4e6ae9f4f5220f5288fd03bd84bef82a7",
   "files": {
     ".agents/plugins/marketplace.json": "a365ecfde6e74a163131ac2b45b042283045c3fcd2b481e43e059915cdcbcb4f",
     ".claude-plugin/marketplace.json": "e54c58fc0ecbff2491409ce4370b8410814d28c71546ae908b1887a5fd729d6a",
@@ -92,9 +92,9 @@
     "scripts/release_gate.py": "3a2fed7cad4c2c5c654ffb5b376d04e7efc725cf8f54175d0d150b6c249383d4",
     "scripts/update_launcher_pins.py": "30d187036e71b7b1d8adb6422652d4d68f771b7616f313876a8a16335ea9554f",
     "skills/closeout-remote/SKILL.md": "448390f2a139e3e2b0f1ff8041915f74e9236e73f3c41f61bf5fd8fb634a974c",
-    "skills/closeout/SKILL.md": "8bb99af16a76d7a41644f0d4b78f424d51fb1eedb1412402c06fcdfa26972c3b",
+    "skills/closeout/SKILL.md": "9f4bb79fd2c20d05d34049862bad9f4ddbbfb0a28d29feda9d5947e6a00d8632",
     "skills/knowledge/SKILL.md": "3555c2ef68de03bb5880ea5359b5535dd4488c7b55834f745d79930b4c4493a6",
-    "skills/memory/SKILL.md": "bbb647b9a72c99720409b1879dfc1d93e92b6a3bd0b636b35783062d014938df",
+    "skills/memory/SKILL.md": "ad234dabf51058d7e8e0dead3b2df0ac07a332dd6ccab5e11017d42689e16f16",
     "skills/memory/scripts/capture_quality.py": "144952fd06464e4164c6e0ea80cc32a90eb77a3d632934528a5b04842cefe19c",
     "skills/memory/scripts/correction_queue.py": "cfeed1f228488fa926eefc7ad4b9c48ac8370f5ceb29340ed02921ef94c9dbfb",
     "skills/memory/scripts/corrections.py": "cf6ac131d092bb319cf9cfcf762b8384105588c8adb968349c804efb50bbaf7a",

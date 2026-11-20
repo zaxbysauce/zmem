@@ -829,8 +829,9 @@ replay evaluator at a 0.146 data dir.
   at session end, and (because SessionEnd output has no live model turn
   on most hosts) re-surfaced once at the NEXT SessionStart in
   model-visible context. A recorded closeout silences it:
-  `store.py closeout-ack --session-id <id>` (store-independent; the
-  closeout workflow's Step 7 runs it). The ops age sweep reaps
+  `store.py closeout-ack --session-id <id>` (it reads the store to check
+  the step receipts and refuses until they are complete; the closeout
+  workflow's Step 7 runs it). The ops age sweep reaps
   `.wrote`/`.closeout`/`.nudged` markers after
   `ZMEM_SENTINEL_SWEEP_DAYS`.
 - **Harvest-paste gate (#247)**: a user message over 400 chars whose

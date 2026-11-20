@@ -1,579 +1,328 @@
 ---
 name: closeout
 description: >
-  End-of-session knowledge closeout for the zmem store. Recall what is already
-  known, capture only generalizable lessons with honest signals, supersede
-  anything this session proved WRONG, consolidate near-duplicates, and review
-  skill-promotion candidates. Use when the user says "closeout", "wrap up",
-  "end of session", "capture what we learned", or after finishing a substantial
-  task whose lessons would otherwise be lost. Not for mid-task capture — the
-  PostToolUseFailure and Stop hooks already handle that.
+  Session closeout for the zmem memory store. Reviews queued user corrections,
+  saves the few lessons a future session would act on, retires memories this
+  session proved wrong, merges duplicates, and records the closeout. Use when
+  the user says "closeout", "wrap up", "end of session" or "capture what we
+  learned", or after finishing a substantial task whose lessons would otherwise
+  be lost. Do not run it to answer a question about closeout, or to close a
+  ticket or pull request. If store.py cannot be run, use closeout-remote.
 ---
 
-# Session Knowledge Closeout
+# Session closeout
 
-The store compounds only if what goes in is **true, general, and non-redundant**.
-A store that only grows becomes a store that lies. Capturing nothing is a
-perfectly good outcome; capturing five mediocre lessons is a bad one, because
-retrieved-wrong costs more than retrieved-nothing.
+Saving nothing is a good outcome. A wrong or vague memory costs every later
+session that retrieves it.
 
-## Step 0 — Locate the store and resolve the namespace
+The closeout is recorded only when `closeout-status` prints `"ack_valid":true`
+and you have then run `closeout-ack` (Step 7). If you lose your place after a
+context compaction, run `closeout-status`; for each missing step, do the
+matching step below, then record it.
 
-The SessionStart hook injects a ready-to-run store command into context
-each session (look for `# Memory skill: invoke ...`): the shell-quoted
-interpreter the hook resolved, then the `store.py` path. Set `P` to that
-interpreter token and `S` to the `store.py` path for the commands below —
-and prefer running the injected command verbatim. Fallback: resolve an
-interpreter explicitly (`py -3` on Windows) and set
-`S=${CLAUDE_PLUGIN_ROOT}/skills/memory/scripts/store.py` (Claude Code) or
-`${ZCODE_PLUGIN_ROOT}/...` (ZCode).
+## Step 0 — Setup
 
-**Never hand-write a namespace.** Keys are derived from the git remote, so a
-guessed `project:<foldername>` writes somewhere nothing ever queries. Derive it:
+1. **Store command.** The session-start memory header has a line
+   `Memory skill: invoke '<python>' '<store.py>' <subcommand>`, written with
+   POSIX quoting. In Bash run it as shown. In PowerShell put `& ` in front of
+   it. There is no `zmem` program: below, `<store>` means that interpreter and
+   `store.py` path together. If the header is missing, ask the user for the
+   `store.py` path (on Windows the interpreter is `py -3`).
+2. **Session id.** On Claude Code it is in your shell environment:
+   `$CLAUDE_CODE_SESSION_ID` in Bash, `$env:CLAUDE_CODE_SESSION_ID` in
+   PowerShell. On other hosts use the id shown in a zmem closeout reminder or
+   closeout-gate message. Never invent one. If you have no id, still do Steps
+   0.5 to 5.5 without `--source-ref`, skip Steps 6 and 7, and say in the report
+   that the closeout could not be recorded.
+3. **Namespace.** Never type a `project:` name by hand; derive it from the
+   project directory, with the folder that contains `store.py` written out:
 
-```bash
-python -c "import sys;sys.path.insert(0,r'$(dirname "$S")');import host;print(host.resolve_namespace('.'))"
-```
+   ```bash
+   '<python>' -c "import sys; sys.path.insert(0, r'<folder containing store.py>'); import host; print(host.resolve_namespace('.'))"
+   ```
 
-Choose the scope deliberately:
+   In PowerShell put `& ` in front. Outside a git repository this prints a
+   folder-based key; tell the user before saving project lessons under it.
+4. **Is this project-bound or box-wide?** Ask this for every lesson. True only
+   in this repository (its paths, build, policy) → the project namespace. True
+   anywhere (a tool's behaviour, a language trap, a working rule) →
+   `user:global`, chosen explicitly.
 
-| Scope | Use when |
-|---|---|
-| the derived `project:...` | the lesson is only true inside this repo (its build, its conventions, its gotchas) |
-| `user:global` | the lesson holds anywhere — a language footgun, a tool behaviour, a workflow rule |
+Every `add` and `update` below takes `--source-ref "session:<session id>" --json`.
+Commands are written on one line so they run in any shell.
 
-When in doubt prefer `user:global` for genuinely portable knowledge and the
-project key for anything that references this repo's structure. Worktrees and
-second clones of the same remote resolve to the same key automatically.
+Hazardous git operations are not closeout work, but if this session is about to
+run one, the memory skill's decision-point checkpoints apply first: recall
+before `git stash pop`, `git reset --soft`, `git push`, or editing a file named
+by a ratchet lesson, and treat a hit as blocking review.
 
-## Step 0.5 — Review captured correction candidates
-
-The live-capture hook (`capture-correction`, issue #47) queues corrections the
-user typed mid-session ("no, use X", "don't refactor unrelated code",
-"remember: ...") into a namespace-scoped sidecar queue — it NEVER writes the
-store (hooks only queue; this skill writes). If this session-start hook surface
-mentioned a pending count, or you want to check, review the queue now:
-
-```bash
-"$P" "$S" queue-list --namespace "<derived namespace>" --json
-```
-
-This skill can also AUTHOR a queue item itself: when a closeout wants to jot a
-cheap, low-ceremony note for a future closeout to review (something worth
-capturing but not worth the full `add` ceremony now), use `queue-add
---namespace "<derived namespace>" --message ... --type lesson` (issue #260). It
-writes the same sidecar queue via the same capture machinery (`source` is
-stamped `closeout-note`), never touches the store, and the note is reviewed
-under the rubric below exactly like any other item — no fast track.
-
-The `items[]` shape is a superset of transcript-mining (`corrections`) items, so
-the same review discipline applies. For each item, apply the adapted
-claude-reflect rubric — executed by YOU (the session's agent) reading this
-skill, never by shelling out to an LLM CLI:
-
-- **Keep only corrections reusable across sessions** — reject questions,
-  one-time task instructions, context-specific requests, and vague feedback
-  ("fix it", "wrong").
-- **`remember:` items are always presented, never silently dropped** — they are
-  explicit, highest-confidence capture requests.
-- **Trust user corrections as authoritative** for model names, API versions,
-  tool availability, and flag values — do not second-guess them against your
-  training data.
-- **Rewrite accepted items** as actionable imperative claims with trigger
-  conditions (Step 2 guidance below).
-
-Accepted items then flow through the existing pipeline unchanged: Step 1
-recall-before-write (dedupe/supersede check) → Step 2 `add` with
-`--signal user` (never higher — SIGNAL_CONFIDENCE maps `user` → 0.6) and
-`--source-ref "session:<id>"`.
-
-**Cold-start (bootstrap) candidates:** the `mine-history` command (issue #48)
-can also queue mined candidates with `source: "history-mine"` — salvaged from
-HISTORICAL Claude Code transcripts (`~/.claude/projects/**/*.jsonl`), not
-live-captured. They appear in `queue-list` exactly like live items; apply the
-same rubric. Two queue-item `kind`s exist:
-
-- `kind: "correction"` (`source: "history-mine"`) — a mined user correction.
-  Treat exactly like a live correction above. Its `occurrences` field says how
-  many transcripts contained the same (near-identical) message; corrections do
-  NOT carry `review_priority` (that flag is exclusive to `error_pattern` items),
-  so give the row its honest signal-derived confidence like any other correction.
-- `kind: "error_pattern"` (`source: "history-mine"`) — a recurring tool error
-  aggregated across sessions (grouped by `error_type` + `project_folder`, count
-  `N`). It is NOT a corrective claim yet. Rewrite its `suggested_guideline` as a
-  starting draft into a **`lesson`** with the ACTUAL trigger condition you
-  observed ("when X fails with `error_type`, do Y"), then write it via Step 2
-  `add --type lesson`. Signal honesty applies: repeated tool errors do NOT
-  automatically qualify as `test`/`compile` grounding — assign the signal the
-  evidence actually supports. `review_priority` (their ordering weight) must not
-  become the row's confidence; give the row the honest signal-derived one.
-
-Rejections mined into the report (not queued) are context for judging whether a
-feature/tool is being misused; they are a #46 report surface, not a queue
-candidate. `mine-history` never writes the store in any mode.
-
-**Secrets:** an item flagged `secret_warning: true` carried secret-like text at
-capture time. Render the warning to yourself, and write that item via
-`add --capture-mode auto` so any remaining secret-like text is redacted before
-it reaches the store (the default manual mode would keep the original wording).
-
-**Redaction operator feedback (issue #65, 10.6):** when an `add`/`update` in
-`--capture-mode auto` reports a redaction warning (the structured
-`{"type": "redacted", "count": N}` warning on `--json`, or the stderr NOTICE
-line), you MUST emit exactly one operator feedback line in your closeout
-summary, derived ONLY from the warning count — never from the captured value:
-
-```
-zmem: redacted <N> secret-like value(s) from the captured memory (value not shown).
-```
-
-The stored row shows `[REDACTED_SECRET]` markers where the values were; the raw
-value must never appear in your feedback, the store, or the transcript.
-
-**Convention-drift scan (issue #261):** after the per-item review above and
-BEFORE clearing the queue below, run the read-only drift scan once — it
-cross-references the queue you just reviewed against the namespace's LIVE
-`convention` rows and surfaces any convention a queued correction contradicts
-(polarity flip + shared content stem; false positives are acceptable, it only
-surfaces candidates):
+## Step 0.5 — Review the correction queue
 
 ```bash
-"$P" "$S" convention-drift --namespace "<derived namespace>" --json
+<store> queue-list --namespace "<namespace>" --json
 ```
 
-Run it BEFORE `queue-clear`: cleared items are gone from the sidecar, so a
-scan after clearing would only see deferred survivors. On an existing store
-the scan writes nothing — surfaced ids are update candidates for YOU to act
-on deliberately (Step 3's `invalidate --id <uuid> --reason ...` when the
-correction wins, or keep the convention and reject the item when it does
-not; a missing store is created by the ordinary open path, exactly like
-`list`). An empty `{"candidates": []}` is the normal outcome; the queue
-loader fails open, so a missing or corrupt queue file also reads as an empty
-result. A store-level failure exits before the scan with an error — report
-"drift scan unavailable" in that case, and never abort closeout over it.
+Items flagged `secret_warning: true` contain secret-like text. Do not repeat
+their messages in your reply.
 
-After processing, clear the processed items from the queue (leave explicitly
-deferred items in place), and prune stale low-confidence candidates:
+Decide each item:
+
+- **Save** a correction that would change behaviour in a later session. It
+  becomes a candidate lesson for Steps 1 and 2, saved with `--signal user`.
+  For a `secret_warning` item, save with `--capture-mode auto` and leave the
+  flagged value out of your wording.
+- **Reject** questions, one-off task instructions and vague feedback.
+- **`remember:` items are never dropped silently.** They have `type`
+  `explicit`. Save each one, or tell the user why not.
+- The user is the authority on names, versions and flags they corrected.
+
+Then check whether a saved correction contradicts a stored convention:
 
 ```bash
-# remove the specific processed item ids
-"$P" "$S" queue-clear --namespace "<derived namespace>" --id <id> --id <id>
-
-# prune stale (past decay) items with confidence < 0.6
-"$P" "$S" queue-clear --namespace "<derived namespace>" --drop-stale
+<store> convention-drift --namespace "<namespace>" --json
 ```
 
-## Step 1 — Recall before you write
+It returns ids only; read each with `<store> get --id <id>`. If the correction
+wins, retire or correct that convention in Step 3; if the convention stands,
+reject the queue item. If the command errors, say "drift scan unavailable" in
+the report and continue.
 
-For each candidate lesson, check what the store already believes:
+Clear rejected items now. Clear a saved item only after its `add` or `update`
+has returned in Step 2 or 3. Leave items you are deliberately deferring.
 
 ```bash
-"$P" "$S" recall --query "<the lesson in a few words>" --limit 5 --hybrid --no-bump
+<store> queue-clear --namespace "<namespace>" --id <id> --id <id>
+<store> queue-clear --namespace "<namespace>" --drop-stale
 ```
 
-Three outcomes, and they lead to different actions:
+Items with `source: "history-mine"` or `kind: "error_pattern"`: see
+[references/queue-items.md](references/queue-items.md).
 
-- **Already there, still true** → capture nothing. Redundancy dilutes recall.
-- **There, but this session proved it WRONG or outdated** → supersede it (Step 3).
-  This is the step most closeouts skip, and it is the one that keeps the store
-  honest.
-- **Not there** → capture it (Step 2).
+## Step 1 — Look before you write
 
-`--no-bump` keeps this audit from inflating retrieval counts (it records a passive
-*surface* on `surfaced_count`, not a retrieval — issue #21). `--hybrid` blends vector
-and keyword matching so you find near-misses phrased differently from your query.
-
-### Decision-point checkpoints (required, #85 direction E)
-
-Recall is not only a closeout step. When ANY workflow this skill feeds is
-about to run a hazardous git operation, run the matching explicit recall
-FIRST and treat a hit as blocking review (see the memory skill's
-"Decision-point checkpoints" section for the full contract):
-
-- before `git stash pop` (stash-consume) —
-  `"$P" "$S" recall --query "git stash pop foreign stash conflict"`
-- before `git reset --soft` (squash assembly) —
-  `"$P" "$S" recall --query "git reset soft origin main stale tree"`
-- before `git push` —
-  `"$P" "$S" recall --query "git push stale tree fetch rebase verify"`
-- before editing a file named by a stored citation/ratchet lesson —
-  `"$P" "$S" recall --query "<path basename> ratchet citation re-pin"`
-
-## Step 2 — Capture, with a hard bar
-
-Before choosing a namespace, ask exactly: **Is this project-bound or box-wide?**
-Project-bound knowledge names repository paths, build commands, or repository
-policy and uses the derived project namespace. Box-wide knowledge remains true
-outside the repository and requires an explicit `user:global` choice.
-The only reversal command is `store.py invalidate --id <uuid> --reason "<why the fact is no longer true>"`; `--reason` is required.
-
-A lesson earns a row only if **all** of these hold:
-
-1. A future session facing a *different but similar* task would act differently
-   because of it.
-2. It is not already discoverable in the repo (README, CLAUDE.md/AGENTS.md,
-   docstrings). Don't mirror documentation into memory.
-3. It is not a one-off — not a typo, a transient network failure, or a
-   now-fixed bug in code you already corrected.
-4. Getting it wrong again would cost real time.
-
-Good: *"vec0 KNN is namespace-blind; the recall path now over-fetches by
-`ZMEM_VEC_NS_OVERFETCH` (default 8) and post-filters by namespace in a single
-helper shared with the dedup window. The footgun is mitigated, still
-over-fetch; consolidate escalates `k` until a below-threshold row appears,
-capped at 500."*
-Bad: *"Fixed the consolidate bug."* (narrative, not reusable)
-Bad: *"Use pytest for tests."* (already in the repo docs)
-
-Write the content as an actionable claim, not a story. Include the trigger
-condition ("when X, do Y, because Z") so recall can match a future situation.
+For every candidate lesson, with the project namespace and `--include-global`,
+even for a `user:global` lesson:
 
 ```bash
-"$P" "$S" add \
-  --namespace "<derived namespace or user:global>" \
-  --type <lesson|convention|fact|preference|decision|constraint> \
-  --content "<specific, actionable, includes the trigger condition>" \
-  --tags "comma,separated" \
-  --signal <test|compile|lint|reviewer|user|none> \
-  --source-ref "session:<session-id>"
+<store> recall --query "<the lesson in a few words>" --namespace "<namespace>" --include-global --min-confidence 0 --limit 5 --no-bump --json
 ```
 
-**Signal honesty is load-bearing** — signal sets confidence, confidence gates
-recall, and only grounded signals are promotable. Never inflate:
+`--min-confidence 0` matters: without it, rows saved with signal `none` are
+hidden and you will store a duplicate.
 
-| Signal | Means | Only if |
-|---|---|---|
-| `test` / `compile` / `lint` | a tool verified it | that tool actually ran and passed/failed accordingly |
-| `reviewer` | an independent review confirmed it | a reviewer/critic actually said so |
-| `user` | the user stated it | they actually did |
-| `none` | your own inference | everything else — including "it seems right" |
+- **Already stored and still true** → save nothing.
+- **Stored but this session proved it wrong** → Step 3.
+- **Not stored** → Step 2.
 
-Re-running `add` with **identical** content in the same namespace refreshes the
-existing row rather than duplicating it. **Paraphrases** dedup at ≥0.85 cosine;
-the dedup window now uses the same shared `ZMEM_VEC_NS_OVERFETCH`-based
-helper as recall, so a same-namespace paraphrase cannot be crowded out by
-other namespaces on a busy multi-namespace store — the footgun is
-mitigated, still over-fetch. Step 4's `consolidate` is the backstop, which
-is why it is part of this routine and not optional.
+## Step 2 — Save lessons (usually 0 to 3)
 
-**Aim for 0–5 rows.** If you have more than five, you are probably capturing
-narrative or duplicating docs — re-apply the bar.
+A lesson earns a row only if all four hold:
 
-## Step 3 — Supersede what is now wrong
+1. A later session on a different but similar task would act differently.
+2. It cannot be found in the repository, its docs or its git history.
+3. It is not a one-off: not a typo, an outage, or a bug already fixed.
+4. You verified it or the user stated it, and getting it wrong again would
+   cost real time. A plan nobody adopted does not qualify.
 
-If this session disproved, replaced, or outdated a stored memory, tombstone it.
-This preserves history while removing it from recall (issue #59):
+Save what worked as well as what failed: a confirmed approach the user
+accepted is as useful as a correction. More than five candidates means
+re-apply the bar.
+
+Write the conclusion, not how you got there. Plain text, one lesson per row:
+
+> When **<situation you can recognise>**, **<do this>**, because **<reason>**.
+
+Add "Holds while <condition>; check with <command or file>" when the lesson
+depends on a version, platform, file or setting that can change.
+
+Bad: "Fixed the consolidate bug." (a story) Bad: "Use pytest for tests."
+(already in the repository docs)
 
 ```bash
-"$P" "$S" invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
+<store> add --namespace "<namespace or user:global>" --type <lesson|convention|fact|preference|decision|constraint> --content "<the lesson>" --tags "a,b" --signal <test|compile|lint|reviewer|user|none> --source-ref "session:<session id>" --json
 ```
 
-`invalidate` REQUIRES a reason — it is the preferred form for "this fact is no
-longer true" because the correction is auditable. For a revision that keeps the
-same topic (wrong details, now corrected) use `update` instead, which is
-append-only and preserves point-in-time recall:
+**Signal is evidence, not confidence.** `test`, `compile` or `lint` only if
+that tool ran in this session and its result supports the lesson; `reviewer`
+only if a separate reviewer said so; `user` only if the user said it;
+otherwise `none`. A `none` row is stored but passive recall will not surface
+it, so prefer saving nothing over saving a guess.
+
+**Read the result.**
+
+- If result is deduped, nothing new was stored. Read the returned row with
+  `<store> get --id <id>`. If it does not contain your lesson, save again with
+  `--no-dedup`.
+- A warning of type `redacted` means part of your text became
+  `[REDACTED_SECRET]`. The store masks any run of 32 or more hex characters
+  and any run of 40 or more letters, digits and slashes, so full commit
+  hashes, digests and deep paths are masked. Cite commits by 12 characters and
+  files by their last two path parts (`storelib/consolidate.py`). If the
+  masked value was not a secret, fix the row with `update` and do not print
+  the redaction line. Otherwise tell the user:
+  `zmem: redacted <N> secret-like value(s) (value not shown)`.
+- Notices about an allowlisted `session:` reference, a contradiction link or
+  a phrasing advisory are normal; read a contradiction link's other row before
+  moving on.
+- A stderr warning that the row was stored without an embedding means the
+  store is on keyword search only. Carry on; say so once in the report.
+
+Never put secrets, credentials or personal data in a memory.
+
+## Step 3 — Retire or correct what is now wrong
+
+Before writing, phrase one natural question a future user would ask about the
+symptom or decision. Keep it for the readback.
+
+The only reversal command is `store.py invalidate --id <uuid> --reason "<why the fact is no longer true>"`;
+`--reason` is required. Run it through `<store>`:
 
 ```bash
-"$P" "$S" update --id <full-uuid> --content "<the corrected lesson>"
+<store> invalidate --id <full-uuid> --reason "<why the fact is no longer true>"
+<store> update --id <full-uuid> --content "<corrected lesson>" --signal <signal> --source-ref "session:<session id>" --json
 ```
 
-`update` tombstones the old row, creates a NEW live row, and links the new row
-back via `update_of` — `--as-of` before the update still returns the OLD
-content, so the correction never destroys history. Plain `supersede` remains
-for general tombstones (consolidated/pruned rows) where no reason is required.
+Use `update` when the topic stays and the details change: it keeps the old row
+as history and returns a new live id. It copies the old row's signal unless
+you pass `--signal`, so pass the signal the corrected claim has earned. Read
+`result`; `update` can fold into another row unless you pass `--no-dedup`. Use
+`invalidate` when the claim is simply false now. A newer statement does not
+automatically beat an older one: if both can be true in different conditions
+(one platform, one branch), keep both and state the condition in each.
 
-Then capture the corrected lesson as a new row if `update` was not the right
-shape. A store whose wrong entries are never retired will confidently mislead
-a future session.
-
-### Make the correction retrievable
-
-Before writing, phrase one natural question a future user would ask about the symptom or decision. Keep that question for the readback. A correction should stand on its own: state the trigger, the corrected behavior and the evidence or scope that distinguishes it from the old claim.
-
-For a single-topic memory, use the replacement row from `update` as the focused correction. If the false claim sits inside a multi-topic history, correct that history while preserving its other facts. Reuse an accurate focused row if one exists, otherwise save the correction as its own memory in the same namespace with its actual signal and provenance. Read the id and result fields from add --json. If result is deduped, inspect the returned row with get --id. When it is the broad history, add the focused correction with --no-dedup and use the returned id. Reuse a matching focused row.
-
-Run ordinary recall after the write, using the saved question and the same namespace:
-
-~~~bash
-"$P" "$S" recall --query "<natural question>" --namespace "<namespace>" --no-bump --json
-~~~
-
-Check the first five results[].id values for the focused live ID. Keep the default ranking and limit. An ID lookup, an exact quotation, or a hit on the historical summary cannot verify this step. If the focused row misses, inspect its content and namespace and run reembed --check to check store-wide embedding and vector coverage. After a repair with update --json, use the new live id. Retry the same question once at default settings; --no-bump can still record a surface. Report the question and observed rank, or report the unresolved miss. Reuse the focused memory across retries to avoid duplicates.
-
-## Step 4 — Consolidate near-duplicates
+Readback, with the saved question:
 
 ```bash
-"$P" "$S" consolidate --dry-run
+<store> recall --query "<natural question>" --namespace "<namespace>" --include-global --min-confidence 0 --no-bump --json
 ```
 
-Review the proposed clusters. Merging is namespace-scoped — it will not fold one
-project's memory into another's — but the *keeper* choice still deserves a
-glance. The dry run models the cadence gate, so if it reports `would merge N`
-you can trust a real run will merge; if it reports `would skip by cadence gate`, the
-store was consolidated recently and has not grown enough to warrant another pass.
-If the clusters look right:
+The corrected row's id (after `update`, the new live id) should be among the
+first five `results[].id`. If it is not, report the miss with the question and
+the rank you saw. Do not add a second copy.
+
+## Step 4 — Merge duplicates
 
 ```bash
-"$P" "$S" consolidate
+<store> consolidate --namespace "<namespace>" --dry-run
 ```
 
-A real run that the cadence gate declines prints `[zmem] consolidate: skipped by
-cadence gate (...)` (it is never silent) and changes nothing. If you want to
-consolidate anyway — e.g. you just imported a large batch of near-duplicates —
-pass `--force`:
+"Would merge 0" means there is nothing to do. Otherwise the output lists each
+cluster with its keeper and absorbed rows. `consolidate` merges every proposed
+cluster at once; you cannot pick. Run
+`<store> consolidate --namespace "<namespace>"` only if every cluster says the
+same thing. Otherwise do not run it, and list the clusters in the report.
+Clusters marked contested hold opposite claims: resolve them with Step 3. On a
+keyword-only store the dry run can miss real duplicates; do not lower the
+threshold or use `--force` or `--prune` to compensate.
+
+## Step 5 — Promotion (rarely)
 
 ```bash
-"$P" "$S" consolidate --force
+<store> promote --dry-run
 ```
 
-**Contested clusters are never auto-merged — not even by `--force`.** Similarity
-alone cannot tell "always X" from "never X", so when a cluster's members differ
-in negation polarity (a negator like *never / don't / not / avoid* on one side
-only) consolidate reports it as a `CONTESTED cluster ... NOT merged` block and
-leaves every member live. Resolve a contested pair with Step 3 (`supersede` the
-wrong side, then recapture the corrected lesson) — do not merge contradictions;
-merging would absorb a memory's own refutation into the row it contradicts.
-Pass `--merge-contested` only when you have confirmed the contest is a heuristic
-false positive (both sides mean the same thing). For machine-readable output
-(including the contested list), pass `--json`: stdout then carries only the JSON
-run report, with human output moved to stderr.
+"No promotion candidates found" is the usual result: move on. Promotion turns
+a lesson into a skill file every later session loads. Consider it only for a
+reusable procedure grounded by `test`, `compile` or `lint` that has been
+repeatedly surfaced or retrieved (the dry run already applies this).
 
-Pruning low-value, never-surfaced, never-retrieved rows is opt-in and destructive-ish; inspect
-first and only proceed if they are genuinely noise:
+`<store> promote --id <id> --description "Use when ..." --confirm` writes a
+review candidate only. Installing it needs `--install-approved`. Add that flag
+only after the user has read the candidate and said, in this conversation, to
+install it.
+
+## Step 5.5 — Knowledge companion (enabled-gated)
 
 ```bash
-"$P" "$S" consolidate --prune --dry-run
+<store> knowledge status --json
 ```
 
-**`retrieval_count = 0` is NOT evidence a memory is unused.** Since hook-driven recall is
-passive (`--no-bump`) and records the surface on `surfaced_count` (issue #21), a memory
-surfaced into context on every prompt still shows `retrieval_count = 0`. `consolidate --prune`
-only retires rows with BOTH `retrieval_count = 0` AND `surfaced_count = 0` (plus low
-confidence, old age, `signal = none`) — do not hand-prune on `retrieval_count` alone, and do
-not read `retrieval_count = 0` as "dead weight".
-
-## Step 5 — Review promotion candidates
-
-```bash
-"$P" "$S" promote --dry-run
-```
-
-Promotion turns a lesson into a `SKILL.md` in **all four** skills directories:
-`~/.codex/skills`, `~/.claude/skills`, `~/.zcode/skills`, and
-`~/.config/opencode/skills`. Be selective — every promoted skill costs
-trigger-matching attention in every future session.
-
-Promote only when the lesson is (a) grounded (`test`/`compile`/`lint`),
-(b) repeatedly retrieved, and (c) genuinely a *reusable procedure* rather than a
-stored fact. **Promote at most 1–3 per closeout**, newest-highest-value first,
-even when the candidate list is long.
-
-The `description` is the entire trigger surface — a vague one means the skill
-never fires and the promotion was wasted. Always write it yourself:
-
-```bash
-"$P" "$S" promote --id <uuid> --description "Use when <explicit trigger context> — <what it prevents>" --confirm
-```
-
-`--confirm` is required to actually write; `--dry-run` alone changes nothing.
-
-## Step 5.5 — Optional knowledge-companion closeout (enabled-gated)
-
-The knowledge companion (PR1) is a separate, optional explicit-note
-workflow with its own `store.py knowledge ...` subcommands and its own
-pointer lane — it never rides the memory steps above. This step is
-**conditional**: run ONE bounded status check, and when the companion is
-not enabled say NOTHING about knowledge in the report — silence is the
-off state, not a finding.
-
-```bash
-"$P" "$S" knowledge status --json
-```
-
-- Exit 2 with the disabled hint (or `enabled=false`): skip this step
-  silently. Do not mention knowledge in the report.
-- Unavailable/error (status cannot say whether the companion is enabled):
-  never abort the closeout over it, but do NOT go silent either — say
-  "knowledge closeout unavailable, no capture performed" in the report,
-  and if the user asked for knowledge in this closeout, report it as not
-  performed/pending rather than dropped.
-- Enabled, and the ACTUAL USER asked for this closeout in THIS session
-  (their own request, any phrasing — "closeout", "wrap up", "capture what
-  we learned"): the standing opt-in authorizes evaluating this session's
-  knowledge candidates and capturing the worthwhile ones — no per-note
-  confirmation and no magic phrase needed. `ZMEM_CAPTURE=0` removes
-  capture from the table (report/verify only). Then do ONLY the
-  following, bounded to THIS session's own keys:
-  1. **Evaluate and capture worthwhile notes** through the `knowledge`
-     skill's workflow (`knowledge capture --target <target-id> --key <key>
-     --content - --namespace "<namespace>"`) — its capture bar (long-lived,
-     evidence-cited, curated, no transcripts/credentials) applies in full;
-     the bar decides, not a quota. Most closeouts capture nothing, and
-     that is a good outcome.
-     When the session produced evidence-backed audit findings and a fix plan
-     that meet this bar, save them together as a curated companion note. Record
-     the findings and their evidence, how they informed the repair sequence,
-     and any qualification criteria or unresolved decisions. Link the source
-     issues or report and distinguish planned work from verified outcomes.
-     Existing issue links and focused memory rows provide citations for the
-     synthesis. Use a stable project-scoped key in the appropriate configured
-     target. After capture, apply the pointer and readback checks below: compare
-     the returned content with the authored note and verify digest agreement
-     before reporting success. Reuse an identical verified note on repeat
-     closeouts. The capture-off and draft-only rules still apply.
-  2. **Pending pointers — read the JSON, do not blind-flush.**
-     `knowledge flush` (and capture's own inner flush) drains the WHOLE
-     knowledge queue; there is no own-key filter. Re-run `knowledge
-     status --json`: flush ONLY if this session's entries are the queued
-     ones AND no unrelated pending/queued entries exist — otherwise do
-     NOT flush; report this session's keys as pending. A pointer that is
-     `pending` without being enqueued is resolved by re-running the SAME
+- `enabled` is false: skip this step silently and do not mention knowledge.
+- The command fails: never abort the closeout over it. Put "knowledge closeout
+  unavailable, no capture performed" in the report.
+- Enabled, and the ACTUAL USER asked for this closeout in THIS session (any
+  phrasing): the standing opt-in authorizes evaluating this session's
+  knowledge candidates and capturing the worthwhile ones, with no per-note
+  confirmation and no magic phrase needed. `ZMEM_CAPTURE=0` removes capture
+  (report and verify only). Limit everything to this session's own keys:
+  1. Capture through the knowledge skill's workflow (`knowledge capture
+     --target <target-id> --key <key> --content - --namespace "<namespace>"`).
+     Its bar decides, not a quota; most closeouts capture nothing.
+  2. `knowledge flush` drains the WHOLE knowledge queue; there is no own-key
+     filter. Flush only if this session's entries are the only queued ones;
+     otherwise do NOT flush and report this session's keys as pending. A
+     pending pointer that was never queued is resolved by re-running the SAME
      capture (idempotent), not by a flush.
-  3. **Verify this session's notes** with
-     `"$P" "$S" knowledge read --target <target-id> --key <key>
-     --namespace "<namespace>" --json` (readback) for keys captured this
-     session only — never a sweep of the target. A digest question mark
-     goes to `knowledge check --target <target-id> --key <key>
-     --namespace "<namespace>"`.
-- Enabled, but this closeout was NOT user-requested — the agent initiated
-  it itself (the description's after-a-substantial-task path) or a session
-  hook reminder surfaced it: knowledge work is **DRAFT-ONLY**. Evaluate
-  candidates under the same bar and draft the worthwhile note texts in
-  your reply for the user to review; run NO `knowledge capture`, no
-  pointer writes, no flush against the target. Say the drafts await a
-  user-requested closeout (or an explicit save/publish request) before
-  anything is published.
+  3. Read back each note captured this session (`knowledge read --target
+     <target-id> --key <key> --namespace "<namespace>" --json`), compare the
+     returned content with the authored note and verify digest agreement
+     before reporting success. In the report, pending is not success.
+- Enabled, but this closeout was not user-requested (agent initiated after a
+  task, or surfaced by a session hook reminder): knowledge work is DRAFT-ONLY.
+  Draft the worthwhile notes in your reply; run no capture and no flush.
 
-No editor (Obsidian or otherwise) is required or implied by any target
-kind, and targets are the operator-configured local vault or private
-fleet endpoint only — never a channel to external public publishing.
+## Step 6 — Review this session's rows and record the steps
 
-## Step 6 — Report
-
-State plainly:
-
-- Lessons captured, with signal and namespace for each
-- Anything **superseded**, and what replaced it
-- Whether consolidation merged anything
-- Correction candidates reviewed (from Step 0.5's queue): reviewed N, captured M,
-  rejected K (and why)
-- Convention-drift candidates (from Step 0.5's drift scan): <candidate ids or
-  "none"> — live `convention` rows this session's queued corrections
-  contradict (issue #261); name each id and what you did (invalidated, kept
-  with the correction rejected, or deferred with why)
-- Skills promoted (and why those, not the others)
-- Knowledge companion (ONLY when Step 5.5's status check reported it
-  enabled — otherwise say nothing about knowledge, UNLESS Step 5.5 hit
-  the unavailable/error branch, in which case carry that unavailable
-  notice into the report instead of going silent): notes captured and
-  verified (key/target/namespace, readback matched), pendings flushed or
-  still pending (pending is not success), anything deliberately not
-  captured — or, for a closeout that was NOT user-requested, the
-  draft-only outcome: drafts delivered, nothing captured, awaiting the
-  user's explicit request
-- Subagent reflection filter count (issue #439): how many trivial read-only
-  search misses the subagent hand-off filter suppressed this session. Read
-  it from the per-session counter — resolve the ring EXACTLY as the
-  writer hook does (ZMEM_DATA, else ZCODE_PLUGIN_DATA, else ~/.zmem —
-  NOT host._resolve_data_dir, whose ZMEM_STORE-parent preference reads a
-  different directory than the writer under a ZMEM_STORE override;
-  PRR-010e), then read
-  `subagent-reflections/<sha256(session_id)[:32]>.filtered.json` for the
-  CURRENT session id and report its integer `filtered_trivial` value
-  (absent or corrupt file = 0; report the number only, never file text).
-- What you deliberately did **not** capture, and why
-
-That last line matters most: it is the evidence the bar was actually applied,
-not skipped.
-
-## Step 6.5 — Record step receipts and ack (fail-closed gate)
-
-The closeout is now a **fail-closed gate**: `store.py closeout-ack`
-REFUSES (exit 2, no marker) unless every required step has a fresh
-receipt and every session-attributed memory row carries a recorded
-verdict. The receipts make a partial run mechanically undetectable-from-
-complete — the exact failure observed on 2026-11-19 (an agent captured
-ad-hoc rows, wrote "closeout DONE", and never ran this skill).
-
-After completing Steps 0.5–5.5, record one receipt per executed step
-(all commands take `--session-id "<your session id>"`; `$SID` below):
+Make every change first (Steps 2 and 3). Then:
 
 ```bash
-"$P" "$S" closeout-step --session-id "$SID" --step review-queue        # Step 0.5
-"$P" "$S" closeout-step --session-id "$SID" --step recall-before-write # Step 1
-"$P" "$S" closeout-step --session-id "$SID" --step consolidate         # Step 4
-"$P" "$S" closeout-step --session-id "$SID" --step promote             # Step 5
-"$P" "$S" closeout-step --session-id "$SID" --step knowledge-status    # Step 5.5
+<store> closeout-status --session-id "<session id>"
 ```
 
-Required steps: `review-queue`, `recall-before-write`, `consolidate`,
-`promote`, `knowledge-status`. Write-legs (`capture`, `supersede`,
-`update`, `review`) may also be recorded but are not required — the ack
-binds them through the last-write stamp instead.
-
-A step that genuinely could not run takes a DELIBERATE skip (never a
-silent omission):
+For each id under `unreviewed_rows`, read the row with `get` and record a
+verdict: `keep` (right as stored), `resignal` (the claim is right but its
+signal was wrong) or `invalidate` (it should not stand). The verdict only
+records your decision. To change a row, use `update` or `invalidate` first,
+then run `closeout-status` again, because a write adds a new row to review.
 
 ```bash
-"$P" "$S" closeout-skip --session-id "$SID" --step consolidate \
-  --reason "cadence gate declined; no new rows since the last pass"
+<store> closeout-review --session-id "<session id>" --memory-id <full-uuid> --verdict <keep|resignal|invalidate>
 ```
 
-Then check the gate before acking:
+Record the receipts last, one for each step you actually carried out:
 
 ```bash
-"$P" "$S" closeout-status --session-id "$SID"
+<store> closeout-step --session-id "<session id>" --step review-queue
+<store> closeout-step --session-id "<session id>" --step recall-before-write
+<store> closeout-step --session-id "<session id>" --step consolidate
+<store> closeout-step --session-id "<session id>" --step promote
+<store> closeout-step --session-id "<session id>" --step knowledge-status
 ```
 
-`ack_valid: false` reports exactly what is missing: `missing_steps`
-(never recorded), `stale_steps` (a store write happened AFTER the
-receipt — re-run the step and re-receipt it), and `unreviewed_rows`
-(session-attributed memory rows written since the previous ack with no
-verdict). Discharge each unreviewed row with a verdict:
+A step that could not run gets a skip with the real reason, which you repeat
+in the report. Looking and finding nothing to do (no duplicates, no promotion
+candidates, clusters you declined to merge) counts as carrying the step out.
 
 ```bash
-"$P" "$S" closeout-review --session-id "$SID" \
-  --memory-id <full-uuid> --verdict keep|resignal|invalidate
+<store> closeout-skip --session-id "<session id>" --step <step> --reason "<what stopped it>"
 ```
 
-Only then ack:
+## Step 7 — Acknowledge and report
+
+Run `closeout-status` again. `missing_steps`: do the step, then record it.
+`stale_steps`: a write followed the receipt; record it again, and redo the
+step only if that write changed what it would find. When it prints
+`"ack_valid":true`:
 
 ```bash
-"$P" "$S" closeout-ack --session-id "$SID"
+<store> closeout-ack --session-id "<session id>"
 ```
 
-When the USER requested this closeout, the Stop hook gate
-(`zmem-closeout-gate.sh`) blocks turn-end while `closeout-status`
-reports `ack_valid: false` — the ack above is what disarms it. The ack
-fails closed on purpose: a refusal (exit 2) is the gate working, not a
-bug. Fix the reported gaps and re-ack; do not look for an override
-(there is none).
+Run `closeout-ack` once. If it refuses, it prints what is missing. If the
+store cannot be opened, stop and tell the user; do not retry in a loop.
 
-## Step 7 — Acknowledge the closeout
+Then tell the user, in this order:
 
-The write-attribution flow stamps a `<sha256(session-id)[:32]>.wrote` marker
-under `<data>/ops/` for every session that stored a row, and the session
-hooks surface exactly one bounded closeout reminder while that marker exists
-without a recorded closeout (issue #398). Running this workflow IS the
-closeout — record it so the reminder silences:
+1. Lessons saved: text, namespace and signal for each. Or "none".
+2. Memories retired or corrected, what replaced them, and the readback result.
+3. Queue: reviewed N, saved M, rejected K, with the reason for each
+   `remember:` item rejected. Convention-drift ids and what you did with each.
+4. Merges made, or the clusters you declined to merge.
+5. Promotion: candidates written and their paths; nothing is installed until
+   the user approves.
+6. Knowledge companion: only if enabled or unavailable (Step 5.5).
+7. Steps skipped and why; redactions; whether the store was on keyword search
+   only; whether the closeout was recorded.
+8. What you chose not to save, and why.
 
-```bash
-"$P" "$S" closeout-ack --session-id "<session-id>"
-```
-
-`closeout-ack` is store-independent (it writes only the `.closeout` marker,
-never `store.sqlite`). Skip it only when the session genuinely wrote nothing;
-in that case no `.wrote` marker exists and no reminder is armed.
-
-## Never
-
-- Never put secrets, credentials, tokens, or PII in the store — it is local
-  plaintext and the write-time scanner is advisory only.
-- Never inflate a signal to make a lesson look promotable.
-- Never treat `retrieval_count = 0` as evidence a memory is unused — hook-surfaced
-  memories carry their count on `surfaced_count`; base prune/rank decisions on both
-  (issue #21).
-- Never capture in-trajectory refinement ("first tried X, then Y") — capture
-  only the conclusion that would help next time.
-- Never write to `tasks/<slug>/*.md` or `issue-traces/<issue>/*.md` from here;
-  the memory store wraps durable session state, it does not replace it.
+Item 8 is the evidence that the bar was applied.

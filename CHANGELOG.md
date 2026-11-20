@@ -9,6 +9,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- **Closeout skill rewritten to match the CLI and to fit the Agent Skills
+  size guidance** (579 lines to 328; step numbers unchanged). Corrected
+  instructions that failed when followed literally: `promote --confirm`
+  writes a review candidate and installation needs `--install-approved`
+  after the user approves; the recall-before-write and readback commands now
+  pass `--namespace`, `--include-global` and `--min-confidence 0` (global rows
+  and `signal none` rows were missed); the session id source is stated
+  (`CLAUDE_CODE_SESSION_ID` on Claude Code) and a missing id no longer blocks
+  curation; `knowledge status` exits 0 when disabled; the redaction rule is
+  stated exactly, with a repair path for masked commit hashes and deep paths;
+  `consolidate` is scoped with `--namespace` and merges all clusters or none;
+  writes come before row review and receipts are recorded last, so the gate
+  is reached without a stale-receipt loop; commands are single-line and the
+  PowerShell call form is given. Added: saving confirmed approaches, an
+  optional "holds while / check with" clause, and scoped exceptions instead
+  of newest-wins. Mined-history and error-pattern queue guidance moved to
+  `skills/closeout/references/queue-items.md`. The memory skill no longer
+  calls `closeout-ack` store-independent.
+
 - **Closeout is now a fail-closed gate** (closeout receipts): the issue-#398
   `closeout-ack` was a bare file touch — an agent could capture ad-hoc rows,
   write "closeout DONE", and never run any closeout step, with every marker
