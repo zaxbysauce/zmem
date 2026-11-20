@@ -2357,12 +2357,12 @@ function testClaudeManifestUsesExecForm() {
     };
     const VERBS = {
         "SessionStart": ["session-start"],
-        "UserPromptSubmit": ["recall", "capture-correction"],
+        "UserPromptSubmit": ["recall", "capture-correction", "closeout-request"],
         "PreToolUse": ["pretool-recall"],
         "PostToolUse": ["convention-capture"],
         "PostToolBatch": ["posttoolbatch-recall"],
         "PostToolUseFailure": ["capture-failure"],
-        "Stop": ["reflect"],
+        "Stop": ["reflect", "closeout-gate"],
         "SubagentStart": ["subagent-recall"],
         "SubagentStop": ["subagent-reflect"],
         "PreCompact": ["precompact"],
@@ -2399,10 +2399,10 @@ function testClaudeManifestUsesExecForm() {
             }
         }
     }
-    eq("#186: manifest command entry count", count, 13);
+    eq("#186: manifest command entry count", count, 15);
 }
 
-// All 13 verbs run the REAL launcher + wrapper chain with every Git directory
+// All 15 verbs run the REAL launcher + wrapper chain with every Git directory
 // stripped from PATH (case-insensitive) and ZMEM_BASH_PATH unset — the host
 // shape the issue fixes. Each verb must emit exactly one JSON stdout record
 // byte-equal to its committed fixture, with no diagnostic bytes on stdout and
@@ -2411,11 +2411,13 @@ function testClaudeManifestUsesExecForm() {
 // asserting the in-process resolveShell() returns an on-disk bash under the
 // same stripped-PATH environment.
 function testClaudeVerbsRunWithoutGitOnPath() {
-    console.log("\n[#186] 13 verbs without Git on PATH");
+    console.log("\n[#186] 15 verbs without Git on PATH");
     const VERBS = [
-        "session-start", "recall", "capture-correction", "pretool-recall",
+        "session-start", "recall", "capture-correction", "closeout-request",
+        "pretool-recall",
         "convention-capture", "posttoolbatch-recall", "capture-failure",
-        "reflect", "subagent-recall", "subagent-reflect", "precompact",
+        "reflect", "closeout-gate", "subagent-recall",
+        "subagent-reflect", "precompact",
         "postcompact", "session-end",
     ];
     const FIXDIR = path.join(REPO, "tests", "fixtures", "launcher", "claude");
@@ -2603,7 +2605,7 @@ function testZcodeProcessEntriesRunFixtureContract() {
             }
         }
     }
-    eq("#187: manifest nested entry count", entries.length, 7);
+    eq("#187: manifest nested entry count", entries.length, 9);
 
     const FIXDIR = path.join(REPO, "tests", "fixtures", "launcher");
     const inputPath = path.join(FIXDIR, "zcode-input.json");

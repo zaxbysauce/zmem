@@ -2836,7 +2836,14 @@ def _session_write_marker(session_ref: str) -> None:
     `session:<sid>` or `session:<sid>:<detail>`, else the ambient
     ZMEM_SESSION. Fail-open by design: a marker failure can never fail the
     write itself. The stamp lives beside the delivery ledger's ops
-    sidecars and uses the same raw-id hashing convention."""
+    sidecars and uses the same raw-id hashing convention.
+
+    Closeout-fail-closed contract (PR: closeout receipts): every write
+    appends a monotonic epoch-seconds line to the marker (the closeout
+    ack compares step receipts against this last-write stamp), and the
+    once-per-session `.nudged` marker is REMOVED so the SessionStart
+    closeout reminder rearms after every new write batch. Writes after an
+    ack therefore re-arm the reminder instead of vanishing behind it."""
     sid = ""
     if session_ref and session_ref.startswith("session:"):
         sid = session_ref[len("session:"):].split(":", 1)[0]
@@ -2851,26 +2858,325 @@ def _session_write_marker(session_ref: str) -> None:
         os.makedirs(ops, exist_ok=True)
         name = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:32] + ".wrote"
         path = os.path.join(ops, name)
-        with open(path, "a", encoding="utf-8"):
-            pass  # touch: presence is the signal; content stays empty
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.time():.6f}\n")
+        nudged = os.path.join(
+            ops, hashlib.sha256(sid.encode("utf-8")).hexdigest()[:32]
+            + ".nudged")
+        try:
+            os.remove(nudged)
+        except OSError:
+            pass
     except OSError:
         pass
 
 
-def _cmd_closeout_ack(args) -> None:
-    """Store-independent closeout marker (issue #398): touches
-    `<sha256(sid)[:32]>.closeout` under the ops dir and never opens
-    SQLite — the session-end nudge consults the pair."""
+# --- Closeout fail-closed gate (PR: closeout receipts) -------------------
+#
+# The issue-#398 ack was a bare file touch: a session could claim the
+# closeout ran without any step having executed (observed in PR #81's
+# feedback session, 2026-11-19 — the agent captured ad-hoc rows, wrote
+# "closeout DONE", and never loaded the closeout skill; recurrence
+# flagged by the operator). The contract is now fail-closed:
+#
+#   * Each closeout step (and each deliberate skip) appends a receipt to
+#     `<sha256(sid)[:32]>.closeout-steps.jsonl` via `closeout-step` /
+#     `closeout-skip`.
+#   * `closeout-ack` refuses (exit 2, no marker) unless every required
+#     step has a receipt stamped at or after the session's last store
+#     write, and every live session-attributed row written since the
+#     previous ack carries a `closeout-review` verdict.
+#   * `.wrote` and `.closeout` now carry epoch-seconds content; the ack
+#     is valid only if its own stamp is at or after the last write.
+
+CLOSEOUT_REQUIRED_STEPS = (
+    "review-queue",         # Step 0.5: correction queue + convention drift
+    "recall-before-write",  # Step 1: recall/dedupe pass
+    "consolidate",          # Step 4: near-duplicate pass (dry-run minimum)
+    "promote",              # Step 5: promotion candidates pass
+    "knowledge-status",     # Step 5.5: companion status check
+)
+CLOSEOUT_ALLOWED_STEPS = CLOSEOUT_REQUIRED_STEPS + (
+    "capture", "supersede", "update", "review",  # write-leg attestations
+)
+
+
+def _closeout_ops_paths(session_id: str) -> dict:
+    """The per-session closeout marker/receipt paths (ops dir, same
+    raw-id stem convention as `.wrote`/`.nudged`/`.closeout`)."""
     import hashlib
     data_dir = _injection_data_dir(None)
     ops = os.path.join(data_dir, "ops")
-    os.makedirs(ops, exist_ok=True)
-    name = hashlib.sha256(args.session_id.encode("utf-8")
-                          ).hexdigest()[:32] + ".closeout"
-    with open(os.path.join(ops, name), "a", encoding="utf-8"):
-        pass
+    stem = hashlib.sha256(
+        session_id.encode("utf-8")).hexdigest()[:32]
+    return {
+        "ops": ops,
+        "stem": stem,
+        "wrote": os.path.join(ops, stem + ".wrote"),
+        "nudged": os.path.join(ops, stem + ".nudged"),
+        "closeout": os.path.join(ops, stem + ".closeout"),
+        "receipts": os.path.join(ops, stem + ".closeout-steps.jsonl"),
+        "requested": os.path.join(ops, stem + ".closeout-requested"),
+    }
+
+
+def _closeout_append_receipt(session_id: str, record: dict) -> None:
+    paths = _closeout_ops_paths(session_id)
+    os.makedirs(paths["ops"], exist_ok=True)
+    record = dict(record)
+    record["ts"] = time.time()
+    with open(paths["receipts"], "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def _closeout_read_receipts(session_id: str) -> list:
+    paths = _closeout_ops_paths(session_id)
+    if not os.path.isfile(paths["receipts"]):
+        return []
+    out = []
+    try:
+        with open(paths["receipts"], "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue  # a torn tail line never blocks the gate
+    except OSError:
+        return []
+    return out
+
+
+def _closeout_marker_ts(path: str) -> float:
+    """The max epoch-seconds line in a marker file (0 when absent or
+    unparsable). Falls back to the file mtime for legacy empty markers."""
+    try:
+        best = 0.0
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    best = max(best, float(line))
+                except ValueError:
+                    continue
+        if best > 0.0:
+            return best
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _closeout_unreviewed_rows(session_id: str, since_ts: float) -> list:
+    """Live memory rows attributed to this session (source_ref shaped
+    `session:<sid>` or `session:<sid>:…`) ingested after ``since_ts`` and
+    not superseded. Read-only against the store; a MISSING store file
+    means no rows (a store that exists but cannot be read is reported as
+    an error row — the gate fails closed on it)."""
+    if not os.path.isfile(STORE_PATH):
+        return []
+    like = f"session:{session_id}%"
+    try:
+        db = sqlite3.connect(
+            f"file:{STORE_PATH}?mode=ro", uri=True, timeout=10)
+        try:
+            cur = db.execute(
+                "SELECT id, namespace, substr(content, 1, 120), ingestion_ts"
+                " FROM memory WHERE source_ref LIKE ? AND superseded_at IS"
+                " NULL AND ingestion_ts > ? ORDER BY ingestion_ts",
+                (like, since_ts),
+            )
+            return [
+                {"id": r[0], "namespace": r[1], "content_head": r[2],
+                 "ingestion_ts": r[3]}
+                for r in cur.fetchall()
+            ]
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        return [{"id": None, "namespace": None, "content_head":
+                 f"store unreadable: {exc}", "ingestion_ts": None}]
+
+
+def _closeout_gate_report(session_id: str) -> dict:
+    """The shared gate computation for closeout-ack / closeout-status /
+    the Stop hook: what a valid closeout still needs, computed from the
+    ops markers, the receipts file, and (read-only) the store."""
+    paths = _closeout_ops_paths(session_id)
+    last_write = _closeout_marker_ts(paths["wrote"])
+    last_ack = _closeout_marker_ts(paths["closeout"])
+    receipts = _closeout_read_receipts(session_id)
+    missing: list[str] = []
+    stale: list[str] = []
+    for step in CLOSEOUT_REQUIRED_STEPS:
+        latest = 0.0
+        seen = False
+        for rec in receipts:
+            if rec.get("step") == step and rec.get("type") in ("step",
+                                                               "skip"):
+                seen = True
+                latest = max(latest, float(rec.get("ts") or 0.0))
+        if not seen:
+            missing.append(step)
+        elif latest < last_write:
+            stale.append(step)
+    reviewed_ids = {
+        rec.get("memory_id") for rec in receipts
+        if rec.get("type") == "review"
+    }
+    unreviewed = [
+        row for row in _closeout_unreviewed_rows(session_id, last_ack)
+        if row["id"] is None or str(row["id"]) not in reviewed_ids
+    ]
+    return {
+        "session_id": session_id,
+        "ack_valid": not missing and not stale and not unreviewed,
+        "last_write_ts": last_write,
+        "last_ack_ts": last_ack,
+        "missing_steps": missing,
+        "stale_steps": stale,
+        "unreviewed_rows": unreviewed,
+        "receipt_count": len(receipts),
+        "receipts_path": paths["receipts"],
+    }
+
+
+def _cmd_closeout_step(args) -> None:
+    if args.step not in CLOSEOUT_ALLOWED_STEPS:
+        print(json.dumps({
+            "ok": False,
+            "error": f"unknown closeout step: {args.step}",
+            "allowed": sorted(CLOSEOUT_ALLOWED_STEPS),
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    _closeout_append_receipt(args.session_id, {
+        "type": "step",
+        "step": args.step,
+        "detail": (args.detail or "")[:200],
+    })
+    print(json.dumps({"ok": True, "step": args.step,
+                      "recorded": True}, separators=(",", ":")) + "\n",
+          end="")
+
+
+def _cmd_closeout_skip(args) -> None:
+    if args.step not in CLOSEOUT_REQUIRED_STEPS:
+        print(json.dumps({
+            "ok": False,
+            "error": f"closeout-skip applies to required steps only",
+            "required": sorted(CLOSEOUT_REQUIRED_STEPS),
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    if not (args.reason or "").strip():
+        print(json.dumps({
+            "ok": False,
+            "error": "closeout-skip requires --reason (a skip without a "
+                     "recorded reason is the silent deferral this gate "
+                     "exists to prevent)",
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    _closeout_append_receipt(args.session_id, {
+        "type": "skip",
+        "step": args.step,
+        "reason": args.reason.strip()[:300],
+    })
+    print(json.dumps({"ok": True, "step": args.step, "skipped": True},
+                     separators=(",", ":")) + "\n", end="")
+
+
+def _cmd_closeout_review(args) -> None:
+    verdict = args.verdict
+    if verdict not in ("keep", "resignal", "invalidate"):
+        print(json.dumps({
+            "ok": False,
+            "error": "verdict must be keep|resignal|invalidate",
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    # The reviewed row must exist and belong to this session — a review
+    # receipt for a foreign or nonexistent id would discharge nothing and
+    # silently defeat the gate.
+    if not os.path.isfile(STORE_PATH):
+        print(json.dumps({
+            "ok": False,
+            "error": "store.sqlite not found; nothing to review",
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    like = f"session:{args.session_id}%"
+    try:
+        db = sqlite3.connect(
+            f"file:{STORE_PATH}?mode=ro", uri=True, timeout=10)
+        try:
+            cur = db.execute(
+                "SELECT source_ref FROM memory WHERE id = ? AND"
+                " source_ref LIKE ?",
+                (args.memory_id, like),
+            )
+            hit = cur.fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        print(json.dumps({
+            "ok": False,
+            "error": f"store unreadable: {exc}",
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    if hit is None:
+        print(json.dumps({
+            "ok": False,
+            "error": f"memory {args.memory_id} not found in session "
+                     f"{args.session_id} (id must belong to the session's "
+                     f"source_ref)",
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    _closeout_append_receipt(args.session_id, {
+        "type": "review",
+        "memory_id": args.memory_id,
+        "verdict": verdict,
+    })
+    print(json.dumps({"ok": True, "memory_id": args.memory_id,
+                      "verdict": verdict}, separators=(",", ":")) + "\n",
+          end="")
+
+
+def _cmd_closeout_status(args) -> None:
+    report = _closeout_gate_report(args.session_id)
+    report["ok"] = True
+    report["required_steps"] = sorted(CLOSEOUT_REQUIRED_STEPS)
+    print(json.dumps(report, separators=(",", ":")) + "\n", end="")
+
+
+def _cmd_closeout_ack(args) -> None:
+    """Fail-closed closeout marker (issue #398 follow-up): records
+    `<sha256(sid)[:32]>.closeout` ONLY when the gate passes — every
+    required step receipt is fresh against the session's last store
+    write, and every session-attributed row since the previous ack has a
+    review verdict. A refusal exits 2 with the machine-readable gap list
+    and writes NO marker (the session-end/SessionStart nudges stay
+    armed)."""
+    report = _closeout_gate_report(args.session_id)
+    if not report["ack_valid"]:
+        print(json.dumps({
+            "ok": False,
+            "closeout_recorded": False,
+            "missing_steps": report["missing_steps"],
+            "stale_steps": report["stale_steps"],
+            "unreviewed_rows": report["unreviewed_rows"],
+            "hint": "run the closeout skill steps with closeout-step "
+                    "receipts, discharge session rows with "
+                    "closeout-review, then re-ack",
+        }, separators=(",", ":")) + "\n", end="")
+        sys.exit(2)
+    paths = _closeout_ops_paths(args.session_id)
+    os.makedirs(paths["ops"], exist_ok=True)
+    now = time.time()
+    with open(paths["closeout"], "w", encoding="utf-8") as fh:
+        fh.write(f"{now:.6f}\n")
     print(json.dumps({"ok": True, "session_id": args.session_id,
-                      "closeout_recorded": True},
+                      "closeout_recorded": True,
+                      "acked_at": now},
                      separators=(",", ":")) + "\n", end="")
 
 
@@ -3387,9 +3693,57 @@ def main():
     p_delivery_clear.add_argument("--session-id", required=True,
                                   help="Session id whose delivery state will be cleared")
 
+    p_closeout_step = _add_parser(
+        "closeout-step", help="append a closeout step receipt (fail-closed "
+        "closeout contract: closeout-ack refuses without fresh receipts)")
+    p_closeout_step.add_argument("--session-id", required=True,
+                                 help="Session id whose closeout is recorded")
+    p_closeout_step.add_argument("--step", required=True,
+                                 help="Step name (review-queue, "
+                                      "recall-before-write, consolidate, "
+                                      "promote, knowledge-status, capture, "
+                                      "supersede, update, review)")
+    p_closeout_step.add_argument("--detail", default=None,
+                                 help="Optional bounded step detail")
+
+    p_closeout_skip = _add_parser(
+        "closeout-skip", help="record a DELIBERATE skip of a required "
+        "closeout step (requires --reason; satisfies closeout-ack for that "
+        "step)")
+    p_closeout_skip.add_argument("--session-id", required=True,
+                                 help="Session id whose closeout is recorded")
+    p_closeout_skip.add_argument("--step", required=True,
+                                 help="Required step being skipped")
+    p_closeout_skip.add_argument("--reason", required=True,
+                                 help="Why the step is skipped (required; a "
+                                      "skip without a reason is the silent "
+                                      "deferral this gate prevents)")
+
+    p_closeout_review = _add_parser(
+        "closeout-review", help="record a keep|resignal|invalidate verdict "
+        "for one session-attributed memory row (discharges it from "
+        "closeout-ack's unreviewed-row check)")
+    p_closeout_review.add_argument("--session-id", required=True,
+                                   help="Session id whose closeout is recorded")
+    p_closeout_review.add_argument("--memory-id", required=True,
+                                   help="Memory row id (must belong to this "
+                                        "session's source_ref)")
+    p_closeout_review.add_argument("--verdict", required=True,
+                                   choices=["keep", "resignal", "invalidate"],
+                                   help="Disposition of the row")
+
+    p_closeout_status = _add_parser(
+        "closeout-status", help="read-only gate report: what a valid "
+        "closeout still needs (missing/stale steps, unreviewed session rows)")
+    p_closeout_status.add_argument("--session-id", required=True,
+                                   help="Session id whose closeout is reported")
+
     p_closeout_ack = _add_parser(
         "closeout-ack", help="record that this session ran the closeout "
-        "skill (issue #398; store-independent marker only)")
+        "skill — FAIL-CLOSED: refuses (exit 2) unless every required step "
+        "has a receipt at or after the session's last store write and every "
+        "session-attributed row since the previous ack carries a "
+        "closeout-review verdict")
     p_closeout_ack.add_argument("--session-id", required=True,
                                 help="Session id whose closeout is recorded")
 
@@ -5358,11 +5712,25 @@ def main():
 
     # Delivery state is a sidecar concern.  Clear it before connect()/migrate()
     # so session lifecycle cleanup remains idempotent and SQLite-independent.
-    if args.cmd == "closeout-ack":
+    # The closeout family (fail-closed gate) stays in the same sidecar tier:
+    # these commands run before connect()/migrate() and sys.exit() on their
+    # own; closeout-ack's contract refusal exits 2 (machine-readable JSON on
+    # stdout), and only an OSError (marker I/O) exits 1.
+    if args.cmd in ("closeout-ack", "closeout-step", "closeout-skip",
+                    "closeout-review", "closeout-status"):
+        handler = {
+            "closeout-ack": _cmd_closeout_ack,
+            "closeout-step": _cmd_closeout_step,
+            "closeout-skip": _cmd_closeout_skip,
+            "closeout-review": _cmd_closeout_review,
+            "closeout-status": _cmd_closeout_status,
+        }[args.cmd]
         try:
-            _cmd_closeout_ack(args)
+            handler(args)
+        except SystemExit:
+            raise
         except OSError as exc:
-            print(f"[zmem] closeout-ack failed: {exc}", file=sys.stderr)
+            print(f"[zmem] {args.cmd} failed: {exc}", file=sys.stderr)
             sys.exit(1)
         sys.exit(0)
 

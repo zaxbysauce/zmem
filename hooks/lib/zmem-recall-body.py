@@ -953,9 +953,11 @@ def main() -> int:
                 os.path.join(_ops, _stem + ".closeout"))
             if _wrote and not _closed:
                 _emit("[zmem] this session wrote memories but no closeout "
-                      "was recorded - run the closeout skill (or "
-                      "`store.py closeout-ack --session-id <id>`) so the "
-                      "session's captures get their formal review.")
+                      "was recorded - run the closeout skill workflow so "
+                      "the session's captures get their formal review. The "
+                      "ack is fail-closed: `store.py closeout-status "
+                      "--session-id <id>` reports the missing step receipts "
+                      "and unreviewed session rows.")
                 return 0
         except Exception:
             pass

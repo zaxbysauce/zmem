@@ -69,6 +69,17 @@ OPENCUE_GAP = (
     "system-transform, session-compacting, and zmem_* tool surfaces; this "
     "row has no delivery path on OpenCode and must not block the host."
 )
+CLOSEOUT_REQUEST_DEGRADED = (
+    "Degrade, never block: arm or disarm the session's request marker from "
+    "the payload and the session's ops markers; an unreadable payload or "
+    "missing markers leave the marker state untouched and the hook exits 0."
+)
+CLOSEOUT_GATE_DEGRADED = (
+    "Degrade, never block: an infrastructure failure reading the session "
+    "state exits 0 — the gate blocks only on the closeout-completeness "
+    "policy (exit 2, stderr reason), bounded by the 5-block loop budget "
+    "after which it passes through with a loud advisory."
+)
 
 CL, HU = "client_local", "hub_authoritative"
 CODEX_DOUBLE_FIRE = (
@@ -203,6 +214,8 @@ VERB_EVENT = {
     "capture-failure": "PostToolUseFailure",
     "posttoolbatch-recall": "PostToolBatch",
     "reflect": "Stop",
+    "closeout-request": "UserPromptSubmit",
+    "closeout-gate": "Stop",
     "subagent-recall": "SubagentStart",
     "subagent-reflect": "SubagentStop",
     "precompact": "PreCompact",
@@ -261,6 +274,15 @@ MOMENT_SPEC = {
     "reflect": dict(event="Stop", degraded=REFLECT, hub_ops=["ingest"],
                     inputs=[inp("transcript", CL), inp("cwd", CL),
                             inp("rows", HU), inp("ledger", HU)]),
+    "closeout-request": dict(event="UserPromptSubmit",
+                             degraded=CLOSEOUT_REQUEST_DEGRADED,
+                             hub_ops=["select"],
+                             inputs=[inp("payload", CL),
+                                     inp("ops markers", CL)]),
+    "closeout-gate": dict(event="Stop", degraded=CLOSEOUT_GATE_DEGRADED,
+                          hub_ops=["select"],
+                          inputs=[inp("payload", CL),
+                                  inp("ops receipts", CL), inp("rows", HU)]),
     "subagent-recall": dict(event="SubagentStart", degraded=INJECT,
                             hub_ops=["select"],
                             inputs=[inp("agent transcript", CL),

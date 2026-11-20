@@ -69,6 +69,13 @@ EXTRA_INPUTS = {
     "tool_input": "client_local",
     "tool_output": "client_local",
     "memory payload": "client_local",
+    # zmem work PR zaxbysauce/zmem#496: the closeout moments' client-local
+    # inputs — the hook payload the request/gate verbs read, the ops
+    # markers the request verb arms/disarms, and the per-session receipts
+    # ledger the gate's status read consults.
+    "payload": "client_local",
+    "ops markers": "client_local",
+    "ops receipts": "client_local",
 }
 INPUT_VOCABULARY = dict(PINNED_LOCALITY, **EXTRA_INPUTS)
 INPUT_VOCABULARY["principal authorization"] = "hub_authoritative"
@@ -96,6 +103,7 @@ def _degraded_templates():
     templates = {
         module.INJECT, module.REFLECT, module.CAPTURE, module.SESSION_END,
         module.EXPLICIT_RECALL, module.OPENCUE_GAP,
+        module.CLOSEOUT_REQUEST_DEGRADED, module.CLOSEOUT_GATE_DEGRADED,
     }
     assert all(t.startswith(DEGRADED_PREFIX) for t in templates), (
         "every generator degraded template must open with the "
@@ -122,6 +130,8 @@ MOMENT_HUB_OPS = {
     "capture-failure": ["ingest"],
     "post-tool-call": ["ingest"],
     "reflect": ["ingest"],
+    "closeout-request": ["select"],
+    "closeout-gate": ["select"],
     "subagent-reflect": ["ingest"],
     "pre-verify": ["ingest"],
     "explicit-write": ["ingest"],

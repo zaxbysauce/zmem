@@ -309,9 +309,12 @@ def _closeout_reminder(data_dir, session_id):
             pass
         return ("# ZMem closeout reminder: the previous session with this id "
                 "wrote memory rows but no closeout was recorded. Run the "
-                "closeout workflow for session " + session_id + " (or "
-                "`store.py closeout-ack --session-id " + session_id + "` if "
-                "nothing needs capturing).")
+                "closeout skill workflow for session " + session_id + " — "
+                "the fail-closed `store.py closeout-ack --session-id "
+                + session_id + "` refuses until every required step has a "
+                "fresh closeout-step receipt and every session row carries "
+                "a closeout-review verdict (closeout-status reports the "
+                "gap).")
     except Exception:
         return ""
 
