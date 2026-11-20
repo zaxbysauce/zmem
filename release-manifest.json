@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "1edc9093d7a1058c2e78042078f8faa6dcdaea53fd277cda0adab64cc43be610",
+  "digest": "fce1c4a0b43f8b3329cd9a4824b61a448ca9d2676e2864a83dfcb8fe34e90265",
   "files": {
     ".agents/plugins/marketplace.json": "a365ecfde6e74a163131ac2b45b042283045c3fcd2b481e43e059915cdcbcb4f",
     ".claude-plugin/marketplace.json": "e54c58fc0ecbff2491409ce4370b8410814d28c71546ae908b1887a5fd729d6a",
@@ -46,7 +46,7 @@
     "hooks/zmem-capture-correction.sh": "769a70e2e995f8b38d83deb74869ad54bd0d6c5b68a76edc930cc86817534c30",
     "hooks/zmem-capture-failure.sh": "91c84b5e331cf00fe5117bd23ecbfa5d82b62716b74ce285f71c59bce1516678",
     "hooks/zmem-convention-capture.sh": "397f6c354331eac035bec62798eba5af4987ec89f25fffecf9893f47d14dbce5",
-    "hooks/zmem-launch.js": "6888d7fa7e3a979045ca02b67ca8b08ab46870156288cfea28e26d2d76566e70",
+    "hooks/zmem-launch.js": "51a589904d1f7cb5dd85aa7362bb34849f743e9a59ec4582290530f007bdb888",
     "hooks/zmem-postcompact.sh": "7425f2937508fe3b526395abcb5610b7ac18c33a610a53455b58d984d8647542",
     "hooks/zmem-posttoolbatch-recall.sh": "7f99646d56deb620c21af6837d178973f9891dca008d941504bc588d6d14f129",
     "hooks/zmem-precompact.sh": "0b935644aa4c291d67ddfb2e16b69a5578dee113d4512ccaca5677de6a5a6673",

@@ -51,16 +51,44 @@ class LauncherEnvironmentTest(unittest.TestCase):
         self.assertEqual(self._child_value(None), "1")
 
 
+    def test_python_pipe_encoding_is_overridden_only_on_windows(self):
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp1252"
+        script = (
+            "Object.defineProperty(process,'platform',{value:process.argv[2]});"
+            "const launch=require(process.argv[1]);"
+            "const out=launch.buildCanonicalEnv('codex',{},'session-start');"
+            "process.stdout.write(JSON.stringify(out.PYTHONIOENCODING));"
+        )
+        for platform, expected in (("win32", "utf-8:surrogateescape"), ("linux", "cp1252")):
+            with self.subTest(platform=platform):
+                result = subprocess.run(
+                    ["node", "-e", script, str(LAUNCHER), platform],
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=30,
+                )
+                self.assertEqual(json.loads(result.stdout), expected)
+
+
 @unittest.skipUnless(os.name == "nt", "Windows launcher encoding contract")
 class WindowsLauncherUtf8ContractTest(unittest.TestCase):
     def setUp(self):
-        scratch = tempfile.TemporaryDirectory(prefix="zmem-launcher-utf8-")
+        scratch = tempfile.TemporaryDirectory(
+            prefix="zmem-launcher-utf8-", ignore_cleanup_errors=True
+        )
         self.addCleanup(scratch.cleanup)
         self.project = Path(scratch.name)
         self.data = self.project / "data"
         self.data.mkdir()
         self.env = os.environ.copy()
-        for key in ("PYTHONUTF8", "PYTHONIOENCODING"):
+        for key in (
+            "PYTHONUTF8", "PYTHONIOENCODING", "ZMEM_REMOTE_URL", "ZMEM_MCP_URL",
+            "ZMEM_CAPTURE_MODE", "OPENCODE_PLUGIN_ROOT",
+        ):
             self.env.pop(key, None)
         self.env.update({
             "PLUGIN_ROOT": str(REPO_ROOT),
@@ -71,13 +99,15 @@ class WindowsLauncherUtf8ContractTest(unittest.TestCase):
             "ZMEM_INJECT": "1",
             "ZMEM_CAPTURE": "1",
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_SESSION_CADENCE": "0",
+            "ZMEM_BG_LOG": "0",
         })
 
     def _launch(self, hook, **payload):
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             result = subprocess.run(
                 ["node", str(LAUNCHER), hook],
-                cwd=self.project,
+                cwd=REPO_ROOT,
                 env=self.env,
                 input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 stdout=stdout,

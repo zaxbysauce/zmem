@@ -1401,9 +1401,10 @@ function snapshotTrainingDelivery(host, hookName, meta, env, payload,
 function buildCanonicalEnv(host, meta, hookName, options = {}) {
     const env = { ...process.env };
 
-    // The launcher exchanges UTF-8 JSON with hooks over redirected pipes.
+    // On Windows, override the locale or caller setting for the UTF-8 pipe
+    // protocol, preserving Python's default stdin error handler.
     if (process.platform === "win32") {
-        env.PYTHONIOENCODING = "utf-8";
+        env.PYTHONIOENCODING = "utf-8:surrogateescape";
     }
 
     const project =
