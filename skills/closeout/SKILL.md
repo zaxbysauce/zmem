@@ -286,6 +286,20 @@ Then capture the corrected lesson as a new row if `update` was not the right
 shape. A store whose wrong entries are never retired will confidently mislead
 a future session.
 
+### Make the correction retrievable
+
+Before writing, phrase one natural question a future user would ask about the symptom or decision. Keep that question for the readback. A correction should stand on its own: state the trigger, the corrected behavior and the evidence or scope that distinguishes it from the old claim.
+
+For a single-topic memory, use the replacement row from `update` as the focused correction. If the false claim sits inside a multi-topic history, correct that history while preserving its other facts. Reuse an accurate focused row if one exists, otherwise save the correction as its own memory in the same namespace with its actual signal and provenance. Read the id and result fields from add --json. If result is deduped, inspect the returned row with get --id. When it is the broad history, add the focused correction with --no-dedup and use the returned id. Reuse a matching focused row.
+
+Run ordinary recall after the write, using the saved question and the same namespace:
+
+~~~bash
+"$P" "$S" recall --query "<natural question>" --namespace "<namespace>" --no-bump --json
+~~~
+
+Check the first five results[].id values for the focused live ID. Keep the default ranking and limit. An ID lookup, an exact quotation, or a hit on the historical summary cannot verify this step. If the focused row misses, inspect its content and namespace and run reembed --check to check store-wide embedding and vector coverage. After a repair with update --json, use the new live id. Retry the same question once at default settings; --no-bump can still record a surface. Report the question and observed rank, or report the unresolved miss. Reuse the focused memory across retries to avoid duplicates.
+
 ## Step 4 — Consolidate near-duplicates
 
 ```bash
@@ -396,6 +410,17 @@ off state, not a finding.
      evidence-cited, curated, no transcripts/credentials) applies in full;
      the bar decides, not a quota. Most closeouts capture nothing, and
      that is a good outcome.
+     When the session produced evidence-backed audit findings and a fix plan
+     that meet this bar, save them together as a curated companion note. Record
+     the findings and their evidence, how they informed the repair sequence,
+     and any qualification criteria or unresolved decisions. Link the source
+     issues or report and distinguish planned work from verified outcomes.
+     Existing issue links and focused memory rows provide citations for the
+     synthesis. Use a stable project-scoped key in the appropriate configured
+     target. After capture, apply the pointer and readback checks below: compare
+     the returned content with the authored note and verify digest agreement
+     before reporting success. Reuse an identical verified note on repeat
+     closeouts. The capture-off and draft-only rules still apply.
   2. **Pending pointers — read the JSON, do not blind-flush.**
      `knowledge flush` (and capture's own inner flush) drains the WHOLE
      knowledge queue; there is no own-key filter. Re-run `knowledge
