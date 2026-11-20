@@ -79,16 +79,16 @@ class FrameParseTests(unittest.TestCase):
 
     def test_ownership_and_duration_parse(self):
         self.assertEqual(
-            inject.parse_row_assertion(
-                "The east gantry is owned by Marrow Lines.")["relation"],
+            inject.parse_row_assertions(
+                "The east gantry is owned by Marrow Lines.")[0]["relation"],
             "ownership")
         self.assertEqual(
-            inject.parse_row_assertion(
-                "The east gantry is owned by Marrow Lines.")["value"],
+            inject.parse_row_assertions(
+                "The east gantry is owned by Marrow Lines.")[0]["value"],
             "Marrow Lines")
         self.assertEqual(
-            inject.parse_row_assertion(
-                "Coastal surveys take four hours.")["relation"], "duration")
+            inject.parse_row_assertions(
+                "Coastal surveys take four hours.")[0]["relation"], "duration")
 
     def test_multi_question_prompt_produces_multiple_foci(self):
         frame = inject.analyze_prompt(

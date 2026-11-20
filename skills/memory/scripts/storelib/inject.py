@@ -821,8 +821,11 @@ _PA_APPROVER_CUES = [
     # THING ... approved by PERSON  (subject = head, value = group 1)
     r"\b(?:is\s+)?approved\s+by\s+" + _PA_VALUE,
     # PERSON approves THING  (subject = tail, value = group 1 captured BEFORE
-    # the verb via the pattern below)
-    r"((?:[A-Z][A-Za-z0-9-]+(?:\s+[A-Z][A-Za-z0-9-]+){0,3}))\s+approves\b",
+    # the verb via the pattern below). The lookbehind prefix keeps the
+    # alternation anchored on word boundaries — without it, a long unbroken
+    # letter/digit run degrades toward quadratic backtracking (final-critic
+    # round 1: 13.2s on a 20K uppercase run; 0.0003s with the guard).
+    r"(?<![A-Za-z0-9-])((?:[A-Z][A-Za-z0-9-]+(?:\s+[A-Z][A-Za-z0-9-]+){0,3}))(?![A-Za-z0-9-])\s+approves\b",
     r"\bsigns?\s+off\s+(?:on\s+)?" + _PA_VALUE,
 ]
 _PA_APPROVER_Q = (r"\bwho\s+(?:approves|signs\s+off)|\bwho\s+should\b"
@@ -1008,17 +1011,14 @@ def analyze_prompt(query):
 def parse_row_assertions(content):
     """The row-side grammar: EVERY affirmative assertion parsed from a
     stored fact's content (a qualified fact can carry both a destination and
-    a cost). Order preserved; first assertion is the primary one."""
+    a cost). Order preserved; first assertion is the primary one.
+
+    (Final-critic round 1: the singular parse_row_assertion wrapper was
+    deleted — it was reachable only from tests, which the stranded-census
+    gate correctly flagged as unwired code.)"""
     if not content:
         return []
     return _pa_parse_clause(content)
-
-
-def parse_row_assertion(content):
-    """Primary (first) row assertion — kept for callers that only need the
-    dominant relation."""
-    found = parse_row_assertions(content)
-    return found[0] if found else None
 
 
 def _pa_values_overlap(v1, v2):
