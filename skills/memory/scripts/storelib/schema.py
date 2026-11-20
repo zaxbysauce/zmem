@@ -2129,9 +2129,10 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
     _bf_last = None
     healed = 0
     # Final-critic finding 1: a caller transaction (if any) owns the commit
-    # decision — the stamp is written under the batch savepoint and the
-    # caller's transaction stays OPEN for the caller to commit or roll
-    # back; only when we opened our own transaction do we commit it.
+    # decision — heal batches ride a savepoint inside it and the caller's
+    # transaction stays OPEN for the caller to commit or roll back; only
+    # when we opened our own transaction do we commit it (per batch, and
+    # once more for the post-scan stamp).
     caller_tx = conn.in_transaction
     # CI round (PR #525): the pass must be a ZERO-WRITE surface on clean
     # stores — byte-identical contracts (explain zero-write, op-queue
@@ -2252,11 +2253,31 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
     # transaction open the stamp rides the caller's commit; otherwise it
     # commits its own small transaction.
     if healed > 0:
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) "
-            "VALUES ('content_norm_verify_163', 'done')")
-        if not caller_tx:
-            conn.commit()
+        # Round-7 reviewer finding: on the own-transaction path the heal
+        # batches have committed and RELEASED the write lock by the time
+        # the stamp needs a fresh one, so a concurrent writer can hold it
+        # here. The stamp is an optimization (skip later re-scans), never
+        # a correctness requirement — a failure at stamp time must leave
+        # the pass unstamped and return, exactly like the batch abort
+        # arms, instead of aborting the caller's open. Residual,
+        # disclosed: heals that committed before the failed stamp leave
+        # nothing stale, so that store never stamps — it re-scans
+        # read-only on every open (the disclosed clean-store steady
+        # state); correctness is unaffected. On the caller-transaction
+        # path the heals already upgraded that transaction to write, so
+        # this arm can only fire on exotic failures (e.g. disk full) —
+        # swallow-and-return there too, never touching the caller's
+        # transaction.
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES ('content_norm_verify_163', 'done')")
+            if not caller_tx:
+                conn.commit()
+        except sqlite3.Error:
+            if not caller_tx and conn.in_transaction:
+                conn.rollback()
+            return
 
 
 class _NormVerifyConflict(Exception):

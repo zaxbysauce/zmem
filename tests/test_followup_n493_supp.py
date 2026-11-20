@@ -1117,6 +1117,138 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             blocker.execute("ROLLBACK")
             blocker.close()
 
+    def test_stamp_time_failure_never_aborts_the_open(self):
+        """Round-7: the post-scan stamp write sits AFTER the last heal
+        batch released the write lock, so a concurrent writer (or any
+        sqlite failure) at THAT seam must not abort the caller's open —
+        the pass returns unstamped, heals stay durable, and the
+        connection is released clean. A meta-table trigger raises ABORT
+        at exactly the stamp INSERT (the memory-table heals are
+        unaffected), deterministically driving the seam."""
+        store = self._scratch("nv-stampfail")
+        os.environ.update({"ZMEM_STORE": str(store),
+                           "ZMEM_DATA": str(store.parent)})
+        schema_mod = self._load_schema()
+        conn = schema_mod.connect()
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('93000000-0000-4000-8000-000000000001','project:supp',"
+                "'fact','stamp probe body','','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z','STALE STAMP NORM')")
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn.commit()
+        finally:
+            conn.close()
+        import sqlite3 as s3
+        setup = s3.connect(str(store), timeout=5)
+        try:
+            # SQLite triggers take ONE event each; the stamp write is
+            # INSERT OR REPLACE, so both shapes are probed.
+            for ev in ("INSERT", "UPDATE"):
+                setup.execute(
+                    f"CREATE TRIGGER zmem_493_stamp_probe_{ev} BEFORE "
+                    f"{ev} ON meta WHEN NEW.key='content_norm_verify_163' "
+                    "BEGIN SELECT RAISE(ABORT, 'stamp lock probe'); END")
+            setup.commit()
+        finally:
+            setup.close()
+        probe = s3.connect(str(store), timeout=5)
+        try:
+            # own-transaction path: the heal batch commits, the post-scan
+            # stamp hits the trigger — the call must RETURN, never raise.
+            schema_mod._verify_content_norms_163(probe)
+            self.assertFalse(
+                probe.in_transaction,
+                "a failed stamp must not strand a verifier-owned "
+                "transaction on the connection")
+        finally:
+            probe.close()
+        check = s3.connect(str(store), timeout=5)
+        try:
+            stamped = check.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            norm = check.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'93000000-0000-4000-8000-000000000001'").fetchone()
+        finally:
+            check.close()
+        self.assertIsNone(stamped,
+                          "a stamp-time failure must leave the pass "
+                          "unstamped for a later retry")
+        self.assertEqual(norm[0], _normalize_content("stamp probe body"),
+                         "the committed heal stays durable across the "
+                         "stamp-time failure")
+        # Retry after the simulated contention clears. DISCLOSED RESIDUAL
+        # (round-7 fix): the healed row leaves nothing stale, so the retry
+        # scan heals nothing (healed == 0) and the store stays unstamped —
+        # it re-scans read-only on every open (the disclosed clean-store
+        # steady state) until any future drift re-opens the stamp path.
+        retry_setup = s3.connect(str(store), timeout=5)
+        try:
+            for ev in ("INSERT", "UPDATE"):
+                retry_setup.execute(
+                    f"DROP TRIGGER zmem_493_stamp_probe_{ev}")
+            retry_setup.commit()
+        finally:
+            retry_setup.close()
+        retry = s3.connect(str(store), timeout=5)
+        try:
+            schema_mod._verify_content_norms_163(retry)  # must not raise
+        finally:
+            retry.close()
+        final = s3.connect(str(store), timeout=5)
+        try:
+            stamped2 = final.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            norm2 = final.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'93000000-0000-4000-8000-000000000001'").fetchone()
+        finally:
+            final.close()
+        self.assertIsNone(stamped2,
+                          "the residual: a fully-healed store re-scans "
+                          "clean and does not re-stamp")
+        self.assertEqual(norm2[0], _normalize_content("stamp probe body"),
+                         "the healed row stays canonical across retries")
+        # Self-healing property: any FUTURE drift re-opens the stamp path.
+        drift = s3.connect(str(store), timeout=5)
+        try:
+            drift.execute(
+                "UPDATE memory SET content_norm='STALE AGAIN' WHERE id="
+                "'93000000-0000-4000-8000-000000000001'")
+            drift.commit()
+        finally:
+            drift.close()
+        recovery = s3.connect(str(store), timeout=5)
+        try:
+            schema_mod._verify_content_norms_163(recovery)
+        finally:
+            recovery.close()
+        post = s3.connect(str(store), timeout=5)
+        try:
+            stamped3 = post.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            norm3 = post.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'93000000-0000-4000-8000-000000000001'").fetchone()
+        finally:
+            post.close()
+        self.assertIsNotNone(stamped3,
+                             "future drift re-heals AND re-opens the "
+                             "stamp path")
+        self.assertEqual(norm3[0], _normalize_content("stamp probe body"),
+                         "the drifted row heals canonically")
+
     def test_wal_store_stale_norm_heals_or_aborts_never_stale_writes(self):
         """Round-2 finding 3c (honest name): a WAL store with a stale norm
         heals under the pass and stamps; the never-a-stale-write property
