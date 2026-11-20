@@ -79,6 +79,54 @@
     {
       "harness": "claude",
       "min_version": "2.1.283",
+      "moment": "closeout-gate",
+      "hook_event": "Stop",
+      "status": "registered",
+      "launcher": "closeout-gate",
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops receipts",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: an infrastructure failure reading the session state exits 0 — the gate blocks only on the closeout-completeness policy (exit 2, stderr reason), bounded by the 5-block loop budget after which it passes through with a loud advisory."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
+      "moment": "closeout-request",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "closeout-request",
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops markers",
+          "locality": "client_local"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: arm or disarm the session's request marker from the payload and the session's ops markers; an unreadable payload or missing markers leave the marker state untouched and the hook exits 0."
+    },
+    {
+      "harness": "claude",
+      "min_version": "2.1.283",
       "moment": "convention-capture",
       "hook_event": "PostToolUse",
       "status": "registered",
@@ -723,6 +771,54 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "closeout-gate",
+      "hook_event": "Stop",
+      "status": "registered",
+      "launcher": "closeout-gate",
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops receipts",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: an infrastructure failure reading the session state exits 0 — the gate blocks only on the closeout-completeness policy (exit 2, stderr reason), bounded by the 5-block loop budget after which it passes through with a loud advisory."
+    },
+    {
+      "harness": "codex",
+      "min_version": "0.160.0",
+      "moment": "closeout-request",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "closeout-request",
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops markers",
+          "locality": "client_local"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: arm or disarm the session's request marker from the payload and the session's ops markers; an unreadable payload or missing markers leave the marker state untouched and the hook exits 0."
     },
     {
       "harness": "codex",
@@ -1415,6 +1511,54 @@
     {
       "harness": "zcode",
       "min_version": "3.15.3",
+      "moment": "closeout-gate",
+      "hook_event": "Stop",
+      "status": "registered",
+      "launcher": "closeout-gate",
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops receipts",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: an infrastructure failure reading the session state exits 0 — the gate blocks only on the closeout-completeness policy (exit 2, stderr reason), bounded by the 5-block loop budget after which it passes through with a loud advisory."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
+      "moment": "closeout-request",
+      "hook_event": "UserPromptSubmit",
+      "status": "registered",
+      "launcher": "closeout-request",
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops markers",
+          "locality": "client_local"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: arm or disarm the session's request marker from the payload and the session's ops markers; an unreadable payload or missing markers leave the marker state untouched and the hook exits 0."
+    },
+    {
+      "harness": "zcode",
+      "min_version": "3.15.3",
       "moment": "convention-capture",
       "hook_event": "PostToolUse",
       "status": "registered",
@@ -2058,6 +2202,54 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "closeout-gate",
+      "hook_event": "Stop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops receipts",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: an infrastructure failure reading the session state exits 0 — the gate blocks only on the closeout-completeness policy (exit 2, stderr reason), bounded by the 5-block loop budget after which it passes through with a loud advisory."
+    },
+    {
+      "harness": "hermes",
+      "min_version": "0.21.1",
+      "moment": "closeout-request",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops markers",
+          "locality": "client_local"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: arm or disarm the session's request marker from the payload and the session's ops markers; an unreadable payload or missing markers leave the marker state untouched and the hook exits 0."
     },
     {
       "harness": "hermes",
@@ -2706,6 +2898,56 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "closeout-gate",
+      "hook_event": "Stop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops receipts",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: an infrastructure failure reading the session state exits 0 — the gate blocks only on the closeout-completeness policy (exit 2, stderr reason), bounded by the 5-block loop budget after which it passes through with a loud advisory.",
+      "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
+    },
+    {
+      "harness": "opencode",
+      "min_version": "1.18.30",
+      "moment": "closeout-request",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops markers",
+          "locality": "client_local"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: arm or disarm the session's request marker from the payload and the session's ops markers; an unreadable payload or missing markers leave the marker state untouched and the hook exits 0.",
       "notes": "Degrade, never block: the OpenCode plugin (issue #66) wires only the system-transform, session-compacting, and zmem_* tool surfaces; this row has no delivery path on OpenCode and must not block the host."
     },
     {
@@ -3442,6 +3684,56 @@
         "ingest"
       ],
       "degraded": "Degrade, never block: capture locally and enqueue to the durable op queue (T-09); acknowledge locally and replay on reconnect.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "closeout-gate",
+      "hook_event": "Stop",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops receipts",
+          "locality": "client_local"
+        },
+        {
+          "name": "rows",
+          "locality": "hub_authoritative"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: an infrastructure failure reading the session state exits 0 — the gate blocks only on the closeout-completeness policy (exit 2, stderr reason), bounded by the 5-block loop budget after which it passes through with a loud advisory.",
+      "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
+    },
+    {
+      "harness": "deepseek",
+      "min_version": "0.2.1-rc.2",
+      "moment": "closeout-request",
+      "hook_event": "UserPromptSubmit",
+      "status": "capability_gap",
+      "launcher": null,
+      "inputs": [
+        {
+          "name": "payload",
+          "locality": "client_local"
+        },
+        {
+          "name": "ops markers",
+          "locality": "client_local"
+        }
+      ],
+      "hub_ops": [
+        "select"
+      ],
+      "degraded": "Degrade, never block: arm or disarm the session's request marker from the payload and the session's ops markers; an unreadable payload or missing markers leave the marker state untouched and the hook exits 0.",
       "notes": "Native dsh/Cordis plugin event (deepseek-plugin/index.mjs); no shell-hook manifest (#374)."
     },
     {
