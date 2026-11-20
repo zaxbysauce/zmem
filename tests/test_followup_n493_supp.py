@@ -147,10 +147,15 @@ class PrefixCaseSuppTest(unittest.TestCase):
 
     def test_rescan_quarantines_uppercase_row(self):
         """The write.py:3374 rescan classifier routes reserved rows
-        through the POINTER lane: a secret-suspect KNOWLEDGE:-ref row is
-        quarantined + tombstoned (never update_memory-remediated). A
-        case-sensitive revert routes it to the ordinary remediation lane
-        instead (redacted in place, row stays live) — the discriminator."""
+        through the POINTER quarantine lane: a secret-suspect
+        KNOWLEDGE:-ref row is tombstoned with the quarantine
+        supersede_reason and NO live successor carries the reserved ref.
+        Final-critic round-2 finding 2: a case-sensitive revert routes the
+        row to the ordinary update_memory remediation lane, which
+        supersedes with 'updated' and leaves a LIVE redacted successor
+        still carrying the uppercase ref — the discriminators asserted
+        here are the quarantine reason and the absence of a live
+        reserved-ref row."""
         store = _fresh_store("c4-rescan")
         # Plant the secret URedacted via raw SQL — the write path redacts
         # at admission (probed), leaving rescan nothing to change; the
@@ -177,15 +182,28 @@ class PrefixCaseSuppTest(unittest.TestCase):
         conn = sqlite3.connect(str(store))
         try:
             state = conn.execute(
-                "SELECT superseded_at FROM memory WHERE id=?",
-                (mid,)).fetchone()
+                "SELECT superseded_at, supersede_reason FROM memory "
+                "WHERE id=?", (mid,)).fetchone()
+            live_reserved = conn.execute(
+                "SELECT COUNT(*) FROM memory WHERE superseded_at IS NULL "
+                "AND (source_ref LIKE 'knowledge:%' ESCAPE '\\' "
+                "OR source_ref LIKE 'KNOWLEDGE:%')").fetchone()
         finally:
             conn.close()
         self.assertIsNotNone(state)
         self.assertIsNotNone(
             state[0],
             "a secret-suspect reserved-ref row must be tombstoned by the "
-            "pointer quarantine lane, not live-remediated")
+            "pointer quarantine lane, not left live")
+        self.assertTrue(
+            (state[1] or "").startswith(
+                "knowledge pointer quarantined (secret rescan)"),
+            f"the tombstone must carry the quarantine reason, got "
+            f"{state[1]!r}")
+        self.assertEqual(
+            live_reserved[0], 0,
+            "no live successor may carry the reserved ref (the ordinary "
+            "remediation lane would leave one)")
 
     def test_ingest_uppercase_ref_lands_demoted_not_authoritative(self):
         store = _fresh_store("c4-ingest")
@@ -222,11 +240,19 @@ class PrefixCaseSuppTest(unittest.TestCase):
             "authoritative")
 
     def test_import_store_uppercase_ref_preserved_unverified(self):
-        """Import-store lane (R2-4 + reviewer round-4 finding): the CLI is
-        --source/--dest-dir; the row MUST land (no absence tolerance), the
-        uppercase ref MUST be preserved verbatim, and the payload MUST land
-        demoted (verified false) — a case-sensitive revert of
-        import-store.py's prefix site leaves verified true and goes RED."""
+        """Import-store lane (R2-4 + reviewer round-4 finding + final-critic
+        round-2 finding 1): the CLI is --source/--dest-dir; the row MUST
+        land (no absence tolerance), the uppercase ref MUST be preserved
+        verbatim, and the payload MUST land demoted (verified false). The
+        source store is converted to DELETE journal mode FIRST because
+        import-store carries a PRE-EXISTING WAL bug (filed as its own
+        follow-up: `INSERT INTO memory_fts('optimize')` leaves an implicit
+        transaction open, so `PRAGMA journal_mode=DELETE` fails with
+        'cannot change out of wal mode from within a transaction' on any
+        WAL source whose rows do not trigger a demotion rewrite —
+        identical at base). With a DELETE-mode source the DEMOTION
+        ASSERTION is what catches a case-sensitive revert of the prefix
+        site, not that unrelated crash."""
         src_dir = _TMP / "c4-import"
         src_dir.mkdir(parents=True, exist_ok=True)
         src = src_dir / "src.sqlite"
@@ -244,6 +270,7 @@ class PrefixCaseSuppTest(unittest.TestCase):
             full_sha256="0" * 64, summary="import probe")
         conn = sqlite3.connect(str(src))
         try:
+            conn.execute("PRAGMA journal_mode=DELETE")
             conn.execute(
                 "INSERT INTO memory (id, namespace, type, content, tags, "
                 "source_ref, confidence, signal, valid_from, taint, "
