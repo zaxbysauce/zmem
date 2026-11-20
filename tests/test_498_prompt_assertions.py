@@ -37,6 +37,15 @@ for _k in ("ZCODE_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID",
 
 SCRIPTS = REPO_ROOT / "skills" / "memory" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+
+# Module-level scratch + env pin BEFORE any storelib/_store_guard import:
+# the #244 guard judges the ambient env at ITS import, and storelib freezes
+# STORE_PATH on first import (this file imports storelib in-process for the
+# parser/partition tests, so the pin MUST precede both).
+os.environ["ZMEM_STORE"] = os.environ.get("ZMEM_STORE") or str(
+    SCRATCH / "guard-pin.sqlite")
+os.environ["ZMEM_DATA"] = os.environ.get("ZMEM_DATA") or str(SCRATCH)
+import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 from storelib import inject  # noqa: E402  (env pinned above)
 
 STORE_PY = SCRIPTS / "store.py"
