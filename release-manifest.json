@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "e7761e5c0532b53f9fa1f20049785a2f8ff52392effa1de6643125d1cff2aabc",
+  "digest": "81060057882d28f1bd3328151c7e3e44f88639742c87ea59e2d99b817a018b8e",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -123,7 +123,7 @@
     "skills/memory/scripts/knowledge/workflow.py": "8f1bc9c22420680f1a6a9088a5515b5110257cff4a4d71f4c2227fc551bec261",
     "skills/memory/scripts/opencode_bridge.py": "97339deb84d242d5afea40fb7e4e6421f0c894defca27d12e5940501bea310bf",
     "skills/memory/scripts/protocol.py": "cfd9d84621864ef1d0144d235dc2e05df330552eb57d98cb8678e101df73ecb4",
-    "skills/memory/scripts/redaction.py": "4d9484d0465b40674888dd8c741a03492f321fc20a98c8044a4ad367e0bbf3ce",
+    "skills/memory/scripts/redaction.py": "3e3a4fca8328cb62218511db7e24bbfcf1b8f793251ba8f88833648e28f87e7d",
     "skills/memory/scripts/requirements-training.txt": "87e2a26eba83329b6be02d566fea3feab9e887296d67b7bae4b34a4b60445c88",
     "skills/memory/scripts/schema_meta.py": "526f25aaaf91ce24475599cfccd219796a1c68c4278b8d36ecb68b43742d2f0f",
     "skills/memory/scripts/store.py": "5492a0026aea6ce74d7a88bdcfa702a602465c0969ff810fdb64b81a35f49176",
