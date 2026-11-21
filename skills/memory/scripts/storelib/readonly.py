@@ -43,6 +43,7 @@ anything survives (decision_report's ``_discard_stage`` contract).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sqlite3
@@ -53,6 +54,15 @@ from pathlib import Path
 
 class ReadOnlyStoreError(RuntimeError):
     """A read-only open refused the store (unreadable or torn copy)."""
+
+
+def _snapshot_digest(path: Path) -> bytes:
+    """Fingerprint a staged main file with memory independent of its size."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.digest()
 
 
 def _is_wal_store(store: Path) -> bool:
@@ -311,7 +321,7 @@ def open_readonly(store_path: Path | str,
                 if staged_residue.exists():
                     os.remove(str(staged_residue))
             shutil.copyfile(store, staged_store)
-            main_first = staged_store.read_bytes()
+            first_digest = _snapshot_digest(staged_store)
             for residue in (wal, journal):
                 if residue.exists():
                     shutil.copyfile(
@@ -324,12 +334,12 @@ def open_readonly(store_path: Path | str,
                 # A fresh main copy is authoritative either way — but only
                 # if the main file itself stopped moving.
                 shutil.copyfile(store, staged_store)
-                if staged_store.read_bytes() == main_first:
+                if _snapshot_digest(staged_store) == first_digest:
                     break
                 continue
             verify_path = Path(str(staged_store) + ".verify")
             shutil.copyfile(store, verify_path)
-            moved = verify_path.read_bytes() != main_first
+            moved = _snapshot_digest(verify_path) != first_digest
             os.remove(str(verify_path))
             if not moved:
                 break
