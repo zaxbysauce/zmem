@@ -19,12 +19,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   now use explicit ASCII word-char boundaries — byte-identical for every
   ASCII neighbour, correct under non-ASCII adjacency, and parity with the
   JS lane. The email pattern is Unicode-tolerant in its local part
-  (composed and decomposed forms) with a linear-time boundary design;
-  ASCII behaviour is pinned exactly. Known gaps, pinned by tests: IDN
-  domains stay unredacted, the generic base64/hex boundaries keep `\b`
-  (benign-SHA preservation, #502 direction), and under `re.IGNORECASE` the
-  ASCII classes case-fold to also match U+0130/U+0131/U+017F/U+212A-class
-  codepoints.
+  (composed and decomposed forms) with a linear-time design on both pure
+  word runs AND punctuated adversarial input — the local part is bounded
+  to the RFC 5321 limit of 64 characters; the unbounded form was quadratic
+  on punctuated non-ASCII text (~5.9s at 32k chars, inside the 65,536-byte
+  capture cap). Local parts over 64 characters no longer match, and
+  trailing non-ASCII adjacency now redacts (`user@example.comé` →
+  `[REDACTED_EMAIL]é`). ASCII behaviour is pinned exactly. Known gaps,
+  pinned by tests: IDN domains stay unredacted, the generic base64/hex
+  boundaries keep `\b` (benign-SHA preservation, #502 direction), and
+  under `re.IGNORECASE` the ASCII classes case-fold to also match
+  U+0130/U+0131/U+017F/U+212A-class codepoints.
 - **`import-store` completes on WAL-journal source stores** (issue #524).
   The FTS optimize INSERT opened an implicit transaction that was never
   committed before the `journal_mode=DELETE` switch, so every WAL source

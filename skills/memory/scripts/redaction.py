@@ -225,12 +225,21 @@ def redact_secret_like_text(text: str) -> tuple[str, int]:
 # non-ASCII text LINEAR (a punctuation-allowed prefix made the engine retry at
 # every position — quadratic, measured ~2s at 16k chars) and it preserves
 # leading delimiters (``.joerg@…`` keeps its dot) while rejecting
-# punctuation-only local parts (``--@example.com``). Under re.IGNORECASE the
+# punctuation-only local parts (``--@example.com``). The local-part body is
+# BOUNDED to {0,63} (RFC 5321 local-part limit): the unbounded quantifier was
+# still QUADRATIC on punctuated adversarial input ("é."*N — a match could
+# start after every separator and scan the whole tail; final-critic probe:
+# 5.9s at 32k chars, inside the 65,536-byte capture cap). With the bound the
+# same inputs run ~0.02s (linear); local parts over 64 chars are not valid
+# addresses and no longer match (a >64-char dotted run gets only its valid
+# tail redacted). Behaviour change: trailing non-ASCII adjacency now redacts
+# (``user@example.comé`` → ``[REDACTED_EMAIL]é``). Under re.IGNORECASE the
 # ASCII classes case-fold to also match U+0130/U+0131/U+017F/U+212A-class
 # codepoints — a known, pinned gap. Verified ASCII-context-equal over 16,641
-# predecessor/successor contexts and linear at 8k/16k adversarial inputs.
+# predecessor/successor contexts and linear at 8k/16k/32k adversarial inputs
+# (pure word runs AND punctuated alternations).
 _EMAIL_RE = re.compile(
-    r"(?<![\w\u0300-\u036f])[\w\u0300-\u036f][\w\u0300-\u036f.%+-]*@"
+    r"(?<![\w\u0300-\u036f])[\w\u0300-\u036f][\w\u0300-\u036f.%+-]{0,63}@"
     r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )

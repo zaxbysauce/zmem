@@ -918,6 +918,30 @@ class NonAsciiBoundaryTest(unittest.TestCase):
                     f"email regex took {elapsed:.2f}s at 32k non-matching "
                     "chars — quadratic regression")
 
+    def test_email_pattern_linear_on_punctuated_non_ascii(self):
+        # Final-critic round 1: the UNBOUNDED local part was quadratic on
+        # punctuated adversarial input ('é.'*N — a match could start after
+        # every separator; 5.9s at 32k, inside the 65,536-byte capture
+        # cap). The {0,63} bound makes it linear. This probes _EMAIL_RE
+        # DIRECTLY: the full pipeline has a PRE-EXISTING quadratic on
+        # dot-alternating input (5.7s for 'a.'*16k at BASE too — separate
+        # issue), which would mask the email pattern's own behavior here.
+        import time
+        import redaction as _r
+        for shape in ("\u00e9.", "\u65e5\u672c-"):
+            for n in (8192, 32768):
+                text = shape * (n // len(shape))
+                start = time.perf_counter()
+                out = _r._EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+                elapsed = time.perf_counter() - start
+                self.assertEqual(out, text)
+                if n == 32768:
+                    self.assertLess(
+                        elapsed, 1.0,
+                        f"email pattern took {elapsed:.2f}s at 32k "
+                        f"punctuated {shape!r} chars — quadratic "
+                        "regression (the pre-{0,63} shape measured 5.9s)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
