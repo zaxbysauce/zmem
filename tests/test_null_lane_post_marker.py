@@ -25,8 +25,13 @@ Legs:
   BEGIN) — a RAISE(ABORT) trigger on the memory table aborts the batch,
   the diagnostic goes to stderr, and migrate() returns normally.
 - (g) second-compare-miss conflict (RAISE(IGNORE)-style): the CURRENT batch
-  rolls back, EARLIER committed batches stay healed (observed from a second
+  rolls back (its own earlier updates included — asserted on a same-batch
+  row), EARLIER committed batches stay healed (observed from a second
   connection), one diagnostic line on stderr, no raise out of migrate().
+- (h) caller-owned mid-batch failure (RAISE(ABORT) after ≥1 update inside
+  the failing batch): the lane's savepoint bounds the undo, the caller's
+  own pending work survives, migrate() returns, and the caller's rollback
+  still governs everything (implementation-review round 1).
 
 Hermetic discipline: ZMEM_STORE/ZMEM_DATA pinned BEFORE the first storelib
 import (setUpModule), restored in tearDownModule.
@@ -324,14 +329,13 @@ class NullLanePostMarkerTest(unittest.TestCase):
             conn = _connect(store)
             migrate(conn)
             conn.close()
-            # Seed two healable NULL rows in DIFFERENT batches: batch size
-            # is 500, so rowid spacing > 500 puts them in separate batches
-            # only if the batch is NULL-ordered — instead force multiple
-            # batches with >500 rows: 501 undecodable-free fillers with
-            # norms PLUS the targets... simpler: the lane batches NULL rows
-            # only; plant 600 NULL rows. Row 1..599 heal in batch 1..2;
-            # the trigger on the LAST row forces a zero-row compare miss,
-            # retried, second miss -> conflict.
+            # Seed 600 NULL rows -> the lane's batch size (500) makes TWO
+            # batches: rows 0-499 (batch 1) and rows 500-599 (batch 2). A
+            # RAISE(IGNORE) trigger on row 599 makes every UPDATE of that
+            # row a silent zero-row miss; the fresh-read retry hits the
+            # same IGNORE, and the second miss is the conflict path —
+            # which must roll back ONLY batch 2 (rows 500-598 that healed
+            # inside it before the trigger) while batch 1 stays healed.
             raw = sqlite3.connect(store)
             for i in range(600):
                 raw.execute(
@@ -343,11 +347,6 @@ class NullLanePostMarkerTest(unittest.TestCase):
                      f"row number {i} body"))
             raw.commit()
             raw.close()
-            # A RAISE(IGNORE) trigger on the last row's UPDATE makes every
-            # compare-and-update a silent zero-row miss (IGNORE skips the
-            # statement, no error; RAISE(IGNORE) takes no message) — the
-            # fresh-read retry then hits the same IGNORE, and the second
-            # miss is the conflict path.
             raw = sqlite3.connect(store)
             raw.execute(
                 "CREATE TRIGGER ignore_last_null BEFORE UPDATE ON memory "
@@ -366,17 +365,110 @@ class NullLanePostMarkerTest(unittest.TestCase):
             self.assertIn(
                 "NULL content_norm heal deferred", err.getvalue(),
                 "the conflict path emits its one-line diagnostic")
-            # Earlier batches (rowids <= 599's trigger-free peers) stay
-            # healed — observe from a fresh connection.
+            # Observe from a fresh connection: batch-1 rows stay healed
+            # (per-batch durability) AND the failing batch's own earlier
+            # updates were rolled back (implementation-review round 1:
+            # the oracle must discriminate, not just prove healed_early>0).
             check = _connect(store)
-            healed_early = check.execute(
+            batch1_first = check.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'5270007000-0000-4000-8000-000000000000'").fetchone()[0]
+            batch2_before_trigger = check.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'5270007500-0000-4000-8000-000000000000'").fetchone()[0]
+            trigger_row = check.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'5270007599-0000-4000-8000-000000000009'").fetchone()[0]
+            healed_total = check.execute(
                 "SELECT COUNT(*) FROM memory WHERE content_norm IS NOT "
                 "NULL AND id LIKE '527000%'").fetchone()[0]
             check.close()
+            self.assertEqual(
+                batch1_first, "row number 0 body",
+                "batch 1 stays healed (per-batch durability)")
+            self.assertIsNone(
+                batch2_before_trigger,
+                "the FAILING batch's own earlier updates roll back with it")
+            self.assertIsNone(
+                trigger_row, "the conflicted row itself stays NULL")
             self.assertGreater(
-                healed_early, 0,
-                "previously committed batches REMAIN healed after the "
-                "conflict abort (per-batch durability)")
+                healed_total, 0,
+                "earlier committed batches REMAIN healed after the "
+                "conflict abort")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_h_caller_tx_midbatch_failure_preserves_caller_work(self):
+        """Implementation-review round 1: under a CALLER-owned transaction,
+        a mid-batch lane failure (after at least one update INSIDE the
+        failing batch) must undo only the lane's batch savepoint while the
+        caller's own prior work stays pending and the caller's rollback
+        still governs everything."""
+        from storelib.schema import init_db, migrate
+        scratch = tempfile.mkdtemp(prefix="zw-527-h-")
+        try:
+            store = os.path.join(scratch, "s.sqlite")
+            conn = _connect(store)
+            init_db(conn)
+            conn.close()
+            conn = _connect(store)
+            migrate(conn)
+            conn.close()
+            raw = sqlite3.connect(store)
+            for i in range(3):
+                raw.execute(
+                    "INSERT INTO memory (id, namespace, type, content,"
+                    " tags, source_ref, confidence, signal, ingestion_ts,"
+                    " content_norm) VALUES (?, 'ns','lesson', ?, '[]',"
+                    " 'probe',0.5,'test','2026-01-01T00:00:00Z',NULL)",
+                    (f"5270008{i:01d}-0000-4000-8000-00000000000{i}",
+                     f"caller batch row {i} body"))
+            # Row 1 heals, then row 1's... no: trigger fires on row 2, so
+            # row 0 and row 1 update INSIDE the failing batch first.
+            raw.execute(
+                "CREATE TRIGGER abort_third_null BEFORE UPDATE ON memory "
+                "WHEN NEW.id = '52700082-0000-4000-8000-000000000002' "
+                "AND OLD.content_norm IS NULL BEGIN SELECT RAISE(ABORT,"
+                " 'boom'); END")
+            raw.commit()
+            raw.close()
+            conn = _connect(store)
+            err = io.StringIO()
+            try:
+                conn.execute("BEGIN")
+                # caller's OWN prior work inside its transaction
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES "
+                    "('caller_marker_527h', 'pending')")
+                with redirect_stderr(err):
+                    migrate(conn)  # must NOT raise
+                # caller work still pending and visible
+                marker = conn.execute(
+                    "SELECT value FROM meta WHERE key="
+                    "'caller_marker_527h'").fetchone()
+                self.assertEqual(marker[0], "pending")
+                # the failing batch's earlier updates were rolled back to
+                # the lane savepoint: rows 0/1 stay NULL
+                row0 = conn.execute(
+                    "SELECT content_norm FROM memory WHERE id="
+                    "'52700080-0000-4000-8000-000000000000'").fetchone()[0]
+                row1 = conn.execute(
+                    "SELECT content_norm FROM memory WHERE id="
+                    "'52700081-0000-4000-8000-000000000001'").fetchone()[0]
+                self.assertIsNone(row0)
+                self.assertIsNone(row1)
+                self.assertIn("NULL content_norm heal deferred",
+                              err.getvalue())
+                # caller rollback governs everything
+                conn.rollback()
+                gone = conn.execute(
+                    "SELECT value FROM meta WHERE key="
+                    "'caller_marker_527h'").fetchone()
+                self.assertIsNone(gone,
+                                  "caller rollback undoes the caller's own "
+                                  "work (untouched by the lane)")
+            finally:
+                conn.close()
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 

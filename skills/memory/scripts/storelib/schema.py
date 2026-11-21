@@ -2449,16 +2449,28 @@ def _heal_null_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
     verifiable text stay NULL (_norm_text -> None), matching both existing
     lanes' skip semantics.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
-    if "content_norm" not in cols or "content" not in cols:
+    # The lane's never-raise contract (implementation-review round 1)
+    # covers the guards and the existence probe too: a database error at
+    # ANY point is diagnosed and deferred, never propagated out of
+    # migrate(), and a caller's transaction is never touched here.
+    try:
+        cols = {row[1] for row in
+                conn.execute("PRAGMA table_info(memory)")}
+        if "content_norm" not in cols or "content" not in cols:
+            return
+        if "tags" not in cols:
+            # Trigger-safety guard shared with both existing lanes: a store
+            # without the tags column predates the rebound FTS triggers, and
+            # an UPDATE here could fire them unbounded. Skip entirely.
+            return
+        probe = conn.execute(
+            "SELECT 1 FROM memory WHERE content_norm IS NULL LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        sys.stderr.write(
+            "[zmem] NULL content_norm heal deferred (%s); the next "
+            "open re-runs it\n" % (exc,))
         return
-    if "tags" not in cols:
-        # Trigger-safety guard shared with both existing lanes: a store
-        # without the tags column predates the rebound FTS triggers, and an
-        # UPDATE here could fire them unbounded. Skip such stores entirely.
-        return
-    probe = conn.execute(
-        "SELECT 1 FROM memory WHERE content_norm IS NULL LIMIT 1").fetchone()
     if probe is None:
         return  # clean store: zero writes (byte-identical contracts)
 
