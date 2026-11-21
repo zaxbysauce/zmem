@@ -400,6 +400,7 @@ def _verify_real_lane(
     conn: sqlite3.Connection = None,
     candidate_ids: list[str] = None,
     candidate_lanes: dict | None = None,
+    executed_query: str = "",
 ) -> None:
     """Re-derive the lane's invariants from pure primitives (see
     BypassError). Raises BypassError naming the item on any violation.
@@ -539,18 +540,13 @@ def _verify_real_lane(
             # real gate judged; a lane map without the entry degrades to the
             # exempt 1.0 path inside _row_trust (legacy envelopes).
             r["trust_score"] = lanes.get("trust")
-        expected_gate = [
-            r
-            for r in cand_rows
-            if _gate_passes(
-                r,
-                floor,
-                gate_none_floor,
-                grounded,
-                lane_floors=_inject._lane_floors(),
-                trust_floor=_inject._trust_floor(),
-            )
-        ]
+        expected_gate = _expected_selection(
+            executed_query,
+            cand_rows,
+            floor=floor,
+            gate_none_floor=gate_none_floor,
+            grounded=grounded,
+        )
         expected_kept = _inject.apply_token_budget(expected_gate)[0]
         rendered_set = {r.get("id") for r in rows}
         expected_ids = {r["id"] for r in expected_kept}
@@ -586,6 +582,132 @@ def _mrr(pop: list[dict], denom: int) -> float:
         sum((1.0 / it["first_hit_rank"] if it["first_hit_rank"] else 0.0) for it in pop)
         / denom
     )
+
+
+def _expected_selection(executed_query, cand_rows, *, floor, gate_none_floor,
+                        grounded):
+    """Issue #498: reconstruct the expected admission
+    selection — ordinary gate over the prompt-assertion partition
+    survivors, plus question-focus rescue (at most one row per unanswered,
+    ordinarily-unsatisfied focus, trust/confidence-eligible, best lane >=
+    the rescue floor).
+
+    PR #526 feedback (FB-103): the SELECTION derivation (ordinary gate
+    pass + rescue loop) is independent, but this oracle SHARES the parser
+    (analyze_prompt / parse_row_assertions), the partition
+    (partition_prompt_assertions), the subject-compatibility predicate
+    (_pa_subject_compat), and reads QUESTION_RESCUE_FLOOR live — a mutation
+    inside those shared pieces moves production and this expectation
+    together and is caught by the unit PartitionGuardTests and the
+    mutation battery, not by this oracle.
+    """
+    import storelib.inject as _inject
+
+    frame = _inject.analyze_prompt(executed_query or "")
+    lane_floors = _inject._lane_floors()
+    trust_floor = _inject._trust_floor()
+
+    def _passes(r):
+        return _gate_passes(
+            r, floor, gate_none_floor, grounded,
+            lane_floors=lane_floors, trust_floor=trust_floor,
+        )
+
+    # Partition (facts-only, same type restriction).
+    drops, survivors = _inject.partition_prompt_assertions(frame, cand_rows)
+    ordinary = [r for r in survivors if _passes(r)]
+    if not frame["foci"]:
+        return ordinary
+
+    # Focus satisfaction from the ORDINARY result (subject+relation bound).
+    ordinary_by_rel = {}
+    for r in ordinary:
+        for ra in _inject.parse_row_assertions(r.get("content", "")):
+            ordinary_by_rel.setdefault(ra["relation"], []).append(ra["subject"])
+
+    def _compat(a, b):
+        return _inject._pa_subject_compat(a, b)
+
+    def _trust_conf(r):
+        if _inject._row_trust(r) < trust_floor:
+            return False
+        try:
+            conf = float(r.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf != conf or conf in (float("inf"), float("-inf")):
+            conf = 0.0
+        sig = (r.get("signal") or "none").lower()
+        if sig == "none":
+            return conf >= gate_none_floor
+        if sig not in grounded:
+            return False
+        return conf >= floor
+
+    def _best_lane(r):
+        best = None
+        for key in ("_rel_lex", "_rel_cos", "_rel_ent", "_rel_graph"):
+            val = r.get(key)
+            if val is None:
+                continue
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                continue
+            if val != val or val in (float("inf"), float("-inf")):
+                continue
+            best = val if best is None else max(best, val)
+        return best
+
+    rescue_ids = set()
+    ordinary_ids = {r["id"] for r in ordinary}
+    for focus in frame["foci"]:
+        if focus["answered"]:
+            continue
+        relation = focus["relation"]
+        if any(_compat(s, focus["subject"])
+               for s in ordinary_by_rel.get(relation, [])):
+            continue
+        def _nominee(subject_bound):
+            best = None
+            best_lane = None
+            for r in survivors:
+                # PR #526 feedback (FB-107): production rescue_nominees
+                # never nominates a row the ordinary gate already selected.
+                if r["id"] in rescue_ids or r["id"] in ordinary_ids \
+                        or not _trust_conf(r):
+                    continue
+                ras = _inject.parse_row_assertions(r.get("content", ""))
+                matching = [ra for ra in ras if ra["relation"] == relation]
+                if not matching:
+                    continue
+                lane = _best_lane(r)
+                if lane is None or lane < _inject.QUESTION_RESCUE_FLOOR:
+                    continue
+                # An EMPTY question subject (discourse ellipsis) is unbound;
+                # a named subject requires compatibility under the bound pass.
+                bound_ok = (not focus["subject"]) or any(
+                    _compat(ra["subject"], focus["subject"])
+                    for ra in matching)
+                if subject_bound and focus["subject"] and not bound_ok:
+                    continue
+                if best_lane is None or lane > best_lane:
+                    best, best_lane = r, lane
+            return best
+
+        best = _nominee(True)
+        if best is None and (not focus["subject"] or focus.get("bound")
+                             or len(focus["subject"]) <= 1):
+            # Same relation gate, no subject gate — restricted to GENERIC
+            # subjects exactly like production rescue_nominees (PR #526
+            # feedback P-F3: empty, anaphora/ellipsis-bound, or a single
+            # bare token; a multi-term subject names a specific item).
+            best = _nominee(False)
+        if best is not None:
+            rescue_ids.add(best["id"])
+    if not rescue_ids:
+        return ordinary
+    return [r for r in survivors if _passes(r) or r["id"] in rescue_ids]
 
 
 def _gate_passes(
@@ -771,6 +893,7 @@ def evaluate_injection_items(
             conn=conn,
             candidate_ids=envelope.get("candidate_ids"),
             candidate_lanes=envelope.get("candidate_lanes"),
+            executed_query=executed_query,
         )
         fence_ok = (
             _rendered_ids_in_fence(rows, fence)

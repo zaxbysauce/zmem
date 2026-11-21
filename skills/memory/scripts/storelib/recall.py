@@ -37,11 +37,14 @@ from storelib.schema import CONFIDENCE_FLOOR, GLOBAL_NAMESPACE, STORE_PATH, _as_
 from storelib.write import _has_injection_risk_tag, _has_prompt_injection_risk, _source_hash
 from storelib.inject import (_lane_floors, _row_trust, _trust_floor,
                              _indent_continuations,
-                             apply_score_margin, apply_token_budget, budget_note,
+                             analyze_prompt, apply_score_margin,
+                             apply_token_budget, budget_note,
                              classify_silent_reason, contested_marker,
                              estimate_tokens,
                              fence_row_cost, inject_score_margin,
                              inject_token_budget,
+                             partition_prompt_assertions,
+                             rescue_nominees,
                              selective_inject_filter)
 from schema_meta import (ALLOWED_TYPES, CROSS_PROJECT_ENV,
                          CROSS_PROJECT_HAZARD_VERBS_ENV, CROSS_PROJECT_MAX,
@@ -3151,8 +3154,33 @@ def _recall_injection_details(
                              if r["id"] in excluded_set)
         selected_rows = [r for r in selected_rows
                          if r["id"] not in excluded_set]
+    # Issue #498 (R2/R3/R11): subject-bound prompt-assertion partition runs
+    # AFTER the candidate_ids capture above (candidate_ids keeps its
+    # pre-exclusion, pre-partition meaning per the #117/#174 contract) and
+    # BEFORE the gate, so a conflicting/redundant/orthogonal row is never
+    # gated, rendered, or counted as surfaced. Constraints, decisions and
+    # belief-head types are never dropped (partition is facts-only).
+    pa_frame = analyze_prompt(query) if query else None
+    pa_drops: dict = {}
+    pa_rescue: dict = {}
+    pa_survivors: list = selected_rows
+    if pa_frame is not None:
+        pa_drops, pa_survivors = partition_prompt_assertions(
+            pa_frame, selected_rows)
+        selected_rows = pa_survivors
     selected_rows, _gate_status, gate_stats = selective_inject_filter(
         selected_rows, with_stats=True)
+    if pa_frame is not None:
+        # R11 two-phase: rescue AFTER the ordinary pass, drawing nominees from
+        # the PARTITION SURVIVORS (the pre-gate pool — rescue exists to lift
+        # floor-rejected rows), at most one row per unanswered, ordinarily-
+        # unsatisfied focus; the second filter pass carries admit_ids so
+        # rescued rows bypass ONLY the lane disjunction.
+        pa_rescue = rescue_nominees(pa_frame, pa_survivors, selected_rows)
+        if pa_rescue:
+            selected_rows, _gate_status, gate_stats = selective_inject_filter(
+                pa_survivors, with_stats=True,
+                admit_ids=frozenset(pa_rescue))
     margin_view = _stable_score_desc(selected_rows)
     _margin_retained, margin_observed, margin_pruned_rows = apply_score_margin(
         margin_view, margin=inject_score_margin())
@@ -3238,10 +3266,18 @@ def _recall_injection_details(
                             or r.get("taint") == "untrusted_web")]
             expiry_drained = bool(diag) and not gate_pool
         reason = classify_silent_reason(
-            gate_pool, omitted=omitted, budget_emptied=budget_emptied,
+            # PR #526 feedback (RI-1): the classifier's ``rows`` is the
+            # POST-partition pool — an all-dropped pool is empty here, so
+            # the attribute_dropped branch fires below-relevance instead of
+            # the wrong below-bar verdict. candidate_ids and
+            # post_ledger_rows keep their PRE-partition meaning (the
+            # #117/#174 already-delivered precedence is unchanged).
+            [r for r in gate_pool if r["id"] not in pa_drops],
+            omitted=omitted, budget_emptied=budget_emptied,
             lane_stats=gate_stats, candidate_ids=candidate_ids,
             post_ledger_rows=post_ledger_pool,
-            expiry_drained=expiry_drained)
+            expiry_drained=expiry_drained,
+            attribute_dropped=len(pa_drops))
 
     details = {
         "results": selected_rows,
@@ -3266,6 +3302,15 @@ def _recall_injection_details(
         "budget_dropped_protected": budget_dropped_protected,
         "budget_note": injection_budget_note,
     }
+    # Issue #498 diagnostics: keyed only when a drop or rescue happened.
+    # PR #526 feedback (FB-102): the SESSION selector path rebuilds a
+    # closed-key envelope (build_injection_envelope), so these keys reach
+    # only the direct no-session `--for-injection --json` wire — additive
+    # JSON keyed on occurrence, like secret_withheld/global_withheld.
+    if pa_drops or pa_rescue:
+        details["attribute_dropped"] = len(pa_drops)
+        details["attribute_drop_labels"] = dict(pa_drops)
+        details["attribute_rescued"] = len(pa_rescue)
     # Issue #256 (F-267-2): the no-session --for-injection envelope reports
     # the withhold too — keyed only when it happened, so every zero-withhold
     # envelope stays byte-identical (C5 freeze).
@@ -4768,6 +4813,10 @@ def explain_recall(
     injection_budget_stats: dict = {}
     injection_budget_emptied = False
     injection_reason: str | None = None
+    # Issue #498 explain mirror state (populated inside the for_injection
+    # replay; declared here so non-injection explain paths never touch an
+    # unbound name).
+    pa_rescue: dict = {}
     try:
         pipeline_result = _explain_run_pipeline(
             conn, query=query, ns_list=ns_list, global_ns_list=global_ns_list,
@@ -4818,12 +4867,47 @@ def explain_recall(
             # Retain the pre-gate rows and its aggregate stats. The maps below
             # let target verdicts explain a rejection instead of falling
             # through to below_limit/not_in_pool after the list is filtered.
+            # Issue #498 mirror: the SAME partition + two-phase rescue the
+            # live seam runs, from the same query — candidate_ids/
+            # candidate_lanes keep their PRE-partition identity (the maps
+            # below iterate the untouched injection_candidate_rows list).
+            _pa_frame = analyze_prompt(query) if query else None
+            pa_drops: dict = {}
+            pa_survivors = injection_candidate_rows
+            if _pa_frame is not None:
+                pa_drops, pa_survivors = partition_prompt_assertions(
+                    _pa_frame, injection_candidate_rows)
             selected_rows, _gate_status, injection_gate_stats = (
                 selective_inject_filter(
-                    injection_candidate_rows, with_stats=True))
+                    pa_survivors, with_stats=True))
+            if _pa_frame is not None:
+                pa_rescue = rescue_nominees(
+                    _pa_frame, pa_survivors, selected_rows)
+                if pa_rescue:
+                    selected_rows, _gate_status, injection_gate_stats = (
+                        selective_inject_filter(
+                            pa_survivors, with_stats=True,
+                            admit_ids=frozenset(pa_rescue)))
+            for rid, label in pa_drops.items():
+                # Partition drops explain with the EXISTING closed vocabulary
+                # ("not relevant given the prompt's explicit assertions");
+                # `stage` is free-form detail naming the specific rule.
+                row = next((r for r in injection_candidate_rows
+                            if r["id"] == rid), None)
+                if row is None:
+                    continue
+                selective_rejected_scores[rid] = row.get("_score")
+                selective_rejected_details[rid] = {
+                    "stage": "prompt_assertions",
+                    "reason": "below-relevance",
+                    "rejection_reason": "below-relevance",
+                    "attribute_rule": label,
+                }
             selected_ids = {r["id"] for r in selected_rows}
-            for row in injection_candidate_rows:
+            for row in pa_survivors:
                 if row["id"] in selected_ids:
+                    continue
+                if row["id"] in pa_drops:
                     continue
                 # The public selector deliberately returns aggregate stats.
                 # Replaying a single row is read-only and identifies whether
@@ -4900,9 +4984,16 @@ def explain_recall(
                 injection_reason = "injected"
             else:
                 injection_reason = classify_silent_reason(
-                    injection_candidate_rows, omitted=len(omitted),
+                    # PR #526 feedback (RI-1): same post-partition pool as
+                    # the live seam, so the explain reason matches it.
+                    [r for r in injection_candidate_rows
+                     if r["id"] not in pa_drops],
+                    omitted=len(omitted),
                     budget_emptied=injection_budget_emptied,
-                    lane_stats=injection_gate_stats)
+                    lane_stats=injection_gate_stats,
+                    candidate_ids=[r["id"] for r in injection_candidate_rows],
+                    post_ledger_rows=injection_candidate_rows,
+                    attribute_dropped=len(pa_drops))
         # PRR-001: mirror recall_memory's post-filter rerank stage so the
         # presented ranks the verdicts cite match a real recall when the
         # cross-encoder is CLI-enabled (the helper fails open to input order).
@@ -4944,9 +5035,14 @@ def explain_recall(
         else:
             # No target: report what the pipeline itself observed.
             for rank, r in enumerate(presented, start=1):
+                detail = {"lanes": _explain_lane_detail(r)}
+                if r["id"] in pa_rescue:
+                    # Issue #498: this row entered through the question-focus
+                    # rescue (admit_ids), not the ordinary floors.
+                    detail["attribute_rescue"] = pa_rescue[r["id"]]
                 verdicts.append({"id": r["id"], "reason": "found",
                                  "rank": rank, "score": r.get("_score"),
-                                 "detail": {"lanes": _explain_lane_detail(r)}})
+                                 "detail": detail})
             for mid, detail in selective_rejected_details.items():
                 verdicts.append({"id": mid, "reason": "selective_rejected",
                                  "rank": None,
