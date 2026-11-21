@@ -9,6 +9,7 @@ Hermetic: env pinned at module import (before any storelib import), lexical
 embeddings only, subprocess drives the real store.py CLI. CI runs this file
 as `python -X utf8 tests/test_498_prompt_assertions.py`.
 """
+import atexit
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = Path(tempfile.mkdtemp(prefix="zmem-pa498-"))
+atexit.register(shutil.rmtree, SCRATCH, True, None)
 os.environ["ZMEM_STORE"] = str(SCRATCH / "store.sqlite")
 os.environ["ZMEM_DATA"] = str(SCRATCH)
 os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
@@ -351,12 +353,11 @@ class ExactSetLaneTests(unittest.TestCase):
         contents = _contents(env)
         self.assertTrue(any("Lyle" in c for c in contents), env)
         self.assertFalse(any("Rowan Dock" in c for c in contents), env)
-        # PR #526 feedback (FB-104/TI-002): exact-set strength — an extra
-        # unrelated delivered fact must fail.
+        # PR #526 feedback (FB-104/TI-002): exact-set strength — the mixed
+        # prompt delivers EXACTLY ONE fact, the approval fact.
+        self.assertEqual(len(contents), 1, env)
+        self.assertIn("Lyle", contents[0])
         self.assertFalse(any("Vantor" in c for c in contents), env)
-        self.assertEqual(
-            [c for c in contents if "Lyle" in c], [contents[-1]],
-            "exactly one delivered fact: the approval fact")
 
     def test_self_answered_prompt_delivers_nothing(self):
         env = _recall(

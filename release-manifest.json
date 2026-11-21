@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "69af4bd6473c81be2247acb4f033682130254757f65a15610cfb8bdab4340e70",
+  "digest": "25a2e4918e1f73d8ca48cf85b04343d1f45f76d15857a394c2420d3f741b43f9",
   "files": {
     ".agents/plugins/marketplace.json": "5d7bdab58cc276d973d9755cdec4d2a9f03e97415f7cd41cdcc393965a73b0ea",
     ".claude-plugin/marketplace.json": "85f7d548d20c54b30aa6955289bf3799f942c424ad29c4f5f4f18a55d839d775",
@@ -139,13 +139,13 @@
     "skills/memory/scripts/storelib/delivery_ledger.py": "3c87501aaf729cc35df64e030b0ea879af0368e6ae1d4d1a774644db59e84e78",
     "skills/memory/scripts/storelib/entity.py": "25e7bdcfdbf7a8153277daad07d1f9be5ed62c2d7b408f26ee8e645c70e4ef18",
     "skills/memory/scripts/storelib/episodes.py": "93da1305decfb4a06cecf33ca2eb70f10ce569b29fc9ff2947165b8dff74fc43",
-    "skills/memory/scripts/storelib/eval_gold.py": "0ecc0fe6f7bc0f5fb007302a0605b48d0d8207c599776a7830e5fdfa7bf07ffc",
+    "skills/memory/scripts/storelib/eval_gold.py": "962a03108911e44ab470cbff41d441fb06aee17feb96280ad83c1636b3656663",
     "skills/memory/scripts/storelib/evidence.py": "aa4d13724200ecfa0fbd39e9bc2f523db773e70dea24c992e5585051253a461d",
     "skills/memory/scripts/storelib/false_inject.py": "dd99f3e6b17644d7c60fd7ffdf1a41e80173a6e45cd122a47710fe43eee28319",
     "skills/memory/scripts/storelib/feedback.py": "3e961f40f21bcca13420984020a818d80047588fa19b37fe1f384e438f83dc9e",
     "skills/memory/scripts/storelib/generation.py": "da059a54b16f8416051b1a7b626b1d6867fbf844dc194a1855beae9b2da05466",
     "skills/memory/scripts/storelib/hygiene.py": "50cb763f42bea675d0f57b5ca2d148ad5f534ac64ad13100670c6b340cc68f2e",
-    "skills/memory/scripts/storelib/inject.py": "9fd6c4a35e1f65cd5ca0a9921392801fb737013f16d9da64705f29d5fb69e4ad",
+    "skills/memory/scripts/storelib/inject.py": "d6d52d8d518420f7b413349dad196e42d7262f28a2d483c907b010e5f35926f1",
     "skills/memory/scripts/storelib/knowledge.py": "14a9dd1a5cfff112f6e9596c77bbd1d20d0f47fb60b0754e3116a5d944e10186",
     "skills/memory/scripts/storelib/links.py": "04db693ec0a488e44e3260fc2f43331ef2142af76d855e38b157718219d2abbd",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",

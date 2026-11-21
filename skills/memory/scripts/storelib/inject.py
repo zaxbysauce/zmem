@@ -2072,6 +2072,16 @@ def select_and_budget_for_injection(
             # restored), matching the suppression contract.
             page_rows = _page_rows_withhold_partition_overlaps(
                 page_rows, capture.get("attribute_drop_labels") or {})
+            if page_rows_pre and not page_rows:
+                # PR #526 feedback (Stage-B r1, FB-109 residual): EVERY page
+                # was withheld for partition overlap, so the combined
+                # real-budget admission below never runs — but the canonical
+                # pool arrived under the WIDENED budget. Re-admit it under
+                # the real budget now, exactly as the no-page path received
+                # it.
+                rows, _used, _dropped, _bstats = apply_token_budget(
+                    ordinary_rows, budget, with_stats=True,
+                    legacy_injection_wire=True)
             if page_rows:
                 # Recall retained its canonical pool with a widened budget so
                 # the final combined pass is the only admission decision.

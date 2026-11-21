@@ -660,6 +660,7 @@ def _expected_selection(executed_query, cand_rows, *, floor, gate_none_floor,
         return best
 
     rescue_ids = set()
+    ordinary_ids = {r["id"] for r in ordinary}
     for focus in frame["foci"]:
         if focus["answered"]:
             continue
@@ -671,7 +672,10 @@ def _expected_selection(executed_query, cand_rows, *, floor, gate_none_floor,
             best = None
             best_lane = None
             for r in survivors:
-                if r["id"] in rescue_ids or not _trust_conf(r):
+                # PR #526 feedback (FB-107): production rescue_nominees
+                # never nominates a row the ordinary gate already selected.
+                if r["id"] in rescue_ids or r["id"] in ordinary_ids \
+                        or not _trust_conf(r):
                     continue
                 ras = _inject.parse_row_assertions(r.get("content", ""))
                 matching = [ra for ra in ras if ra["relation"] == relation]
@@ -692,8 +696,12 @@ def _expected_selection(executed_query, cand_rows, *, floor, gate_none_floor,
             return best
 
         best = _nominee(True)
-        if best is None and focus["subject"]:
-            # Same relation gate, no subject gate (production fallback).
+        if best is None and (not focus["subject"] or focus.get("bound")
+                             or len(focus["subject"]) <= 1):
+            # Same relation gate, no subject gate — restricted to GENERIC
+            # subjects exactly like production rescue_nominees (PR #526
+            # feedback P-F3: empty, anaphora/ellipsis-bound, or a single
+            # bare token; a multi-term subject names a specific item).
             best = _nominee(False)
         if best is not None:
             rescue_ids.add(best["id"])
