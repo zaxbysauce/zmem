@@ -185,9 +185,14 @@ class OrganizeIntegrationTest(unittest.TestCase):
                 """INSERT INTO memory
                    (id, namespace, type, content, tags, source_ref, source_hash,
                     confidence, signal, valid_from, superseded_at, ingestion_ts,
-                    retrieval_count, last_retrieved)
-                   VALUES (?,?,?,?,?,?,'',0.5,'none',?,NULL,?,0,NULL)""",
-                (mid, namespace, "fact", content, tags, "", ts, ts))
+                    retrieval_count, last_retrieved, content_norm)
+                   VALUES (?,?,?,?,?,?,'',0.5,'none',?,NULL,?,0,NULL,?)""",
+                # content_norm: canonical normalize of content — issue #527
+                # fixture disclosure (seed as the supported writer would, so
+                # zero-write/dry-run assertions test organize, not the
+                # post-stamp NULL heal lane).
+                (mid, namespace, "fact", content, tags, "", ts, ts,
+                 " ".join(content.lower().split())))
             c.commit()
         finally:
             c.close()
@@ -1133,10 +1138,13 @@ class CosineOrganizeRestrictTest(unittest.TestCase):
             """INSERT INTO memory
                (id, namespace, type, content, tags, source_ref, source_hash,
                 confidence, signal, valid_from, superseded_at, ingestion_ts,
-                retrieval_count, last_retrieved, embedding, embedding_model)
-               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,'test-stub')""",
+                retrieval_count, last_retrieved, embedding, embedding_model,
+                content_norm)
+               VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,0,NULL,?,'test-stub',?)""",
+            # content_norm: issue #527 fixture disclosure (same as _seed).
             (mid, namespace, "fact", content, "", "", "",
-             0.5, "none", ts, ts, embedding))
+             0.5, "none", ts, ts, embedding,
+             " ".join(content.lower().split())))
         c.execute("INSERT INTO memory_vec(embedding, memory_id) VALUES (?, ?)",
                   (embedding, mid))
         c.commit()

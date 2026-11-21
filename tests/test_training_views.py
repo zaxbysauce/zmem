@@ -187,10 +187,14 @@ class TrainingViewsContractTests(unittest.TestCase):
         """
         conn = sqlite3.connect(self.store)
         try:
+            # content_norm seeded canonically — issue #527 fixture
+            # disclosure (seed as the supported writer would, so the
+            # domain-store snapshot equality below tests the view under
+            # test, not the post-stamp NULL heal lane).
             conn.execute(
                 "INSERT INTO memory (id, namespace, type, content, ingestion_ts, "
-                "trust_score, applied_count, violated_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "trust_score, applied_count, violated_count, content_norm) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     memory_id,
                     namespace,
@@ -200,6 +204,7 @@ class TrainingViewsContractTests(unittest.TestCase):
                     1.0,
                     3,
                     0,
+                    f"use the safe deploy command for {task_id}".lower(),
                 ),
             )
             episode_id = f"episode-{capture_id}"
