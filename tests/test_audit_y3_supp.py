@@ -290,5 +290,37 @@ class EscapeDiscriminationTests(unittest.TestCase):
                               "escaped form present for %r" % literal)
 
 
+class HostEvidenceGuardTokenTests(unittest.TestCase):
+    """#511 final-critic round-1 required revision: the guard's fence-OPEN
+    detection must fire on token-spelled renders (exact literals alone went
+    inert for every new render once fences carry per-render tokens)."""
+
+    def _load_guard(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'heg_supp', REPO / 'scripts' / 'host_evidence_guard.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_open_detection_covers_all_fence_families(self):
+        mod = self._load_guard()
+        cases = [
+            ('<<<ZMEM_UNTRUSTED_FENCE:abc123def456>>> raw body '
+             '<<<END_ZMEM_UNTRUSTED_FENCE:abc123def456>>>', True),
+            ('<<<ZMEM_UNTRUSTED_FENCE:abc123def456>>> [REDACTED: x] '
+             '<<<END_ZMEM_UNTRUSTED_FENCE:abc123def456>>>', False),
+            ('<<<ZMEM_UNTRUSTED_FENCE>>> raw body '
+             '<<<END_ZMEM_UNTRUSTED_FENCE>>>', True),
+            ('<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>> raw body '
+             '<<<END_ZMEM_UNTRUSTED_FENCE>>>', True),
+            ('no fences here', False),
+        ]
+        for text, expected in cases:
+            self.assertEqual(
+                mod._fence_body_unredacted(text), expected,
+                'wrong verdict for %r (want %s)' % (text[:48], expected))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

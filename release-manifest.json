@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "32a7cccb146d901d76d4079c32810ea0c8d40f6930226818c1940d99aa2d7e48",
+  "digest": "074080e20a86b2a578a290349c898cad81e7a7e7edea473e813f8c787f68f60a",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -81,7 +81,7 @@
     "scripts/fleet/serve-status-lib.ps1": "a3b2756754548a6673be830da7d8afd9b9e54cf92696decfa83175b0ef652f28",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
     "scripts/host_canary.py": "66001d53d10fb8f79426349877625f0982a0369331191abe304161b3f6f10e42",
-    "scripts/host_evidence_guard.py": "64c467e358ddc55e9078456fd20c735db528050db17bd679bec120e1037e4865",
+    "scripts/host_evidence_guard.py": "2335536eef1ea483874aa81591e0e52cd6152662badfb7be6c65c3b61122cd17",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
     "scripts/ingest_harvest.py": "830666cf0aa033ac6bbb03fdb5ba53831b70079c7677251f823ab5239e8121d3",
     "scripts/insert_closeout_launcher_fixtures.py": "28716dfdd7b97e91d485a2b26433deecc510b69e0f50ef75cb96f09b0b3eb6d4",
@@ -160,7 +160,7 @@
     "skills/memory/scripts/storelib/promote.py": "d6f7eb5b82c31761ef53ec5f07003d23ea23edfd439474f1ea7688377cfe3022",
     "skills/memory/scripts/storelib/purge.py": "370eba4acad82655ef441bce06393ec4aebc6b9e4465628ba9e153a0a639041a",
     "skills/memory/scripts/storelib/query_ambiguity.py": "7c22244534e72977a05de600b7601a0652a471c705f29fcde27b47dcc65aa325",
-    "skills/memory/scripts/storelib/readonly.py": "ec43ca8f432cccda68374abfd359426da0ab41997becb0add49056476ff425c3",
+    "skills/memory/scripts/storelib/readonly.py": "dc0c14ae1de6b482793a9f1e7ffa78ec0097e303ef585321f173c6b4220949b8",
     "skills/memory/scripts/storelib/recall.py": "5c6da0e3da9739fc005c6518db7eee79e452c099ac9532e9757ee513f7fbe264",
     "skills/memory/scripts/storelib/recall_reuse.py": "b3cea4841a6805b3c8f22c1834201e8359f04d659fa2002ab2cd8f51b486adad",
     "skills/memory/scripts/storelib/rekey.py": "eee63391a577cd4321c94b2004094283b4987a2e38af196a1c6ee80b11ece486",

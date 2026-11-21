@@ -9,16 +9,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-## [Unreleased]
-
-### Fixed
-
 - Read-only snapshots now compare database copies with streaming hashes so companion note reads use bounded comparison memory on large stores.
 - Memory-type admission on the typed operation lane: `apply-ops` add/capture/update ops with an out-of-vocabulary type are now refused per op with `error=invalid_type` (the batch continues); historical out-of-vocabulary rows can no longer blank the passive injection surfaces (recall and SessionStart skip them with a one-time warning while plain recall still serves them), and the scorer, pool filter, and admission now share one vocabulary (`schema_meta.allowed_types()`, the #172 gate) (issue #510).
 - Untrusted-content fence boundaries are now per-render token markers with renderer-side escaping of every fence-shaped token in stored text - stored delimiters can no longer alias or forge a delivery boundary on any lane (recall, prefetch, evidence over both transports, the degraded hermes renderer, and the session-start trim path) (issue #511). `ZMEM_FENCE_TOKEN` pins the token for deterministic fixtures and is keyed into the recall-reuse fingerprint.
 - Delivery acknowledgement now requires complete rows: a budget-clipped protected row renders (the #116 truncated-not-dropped contract) but is never recorded delivered and never suppressed, so a same-session retry with sufficient budget delivers the complete row exactly once (issue #501).
-
-3731cf95 (fix(memory): Y-slots 1-3 — type admission + pool resilience, per-render fence identity, complete-row delivery ack (issues #510 #511 #501))
 
 ## [0.165.0] - 2026-11-21
 
