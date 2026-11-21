@@ -25,7 +25,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   on punctuated non-ASCII text (~5.9s at 32k chars, inside the 65,536-byte
   capture cap). Local parts over 64 characters no longer match, and
   trailing non-ASCII adjacency now redacts (`user@example.comé` →
-  `[REDACTED_EMAIL]é`). ASCII behaviour is pinned exactly. Known gaps,
+  `[REDACTED_EMAIL]é`). ASCII behaviour is pinned exactly, for valid
+  (≤64-char local part) addresses — the over-64 trade-off above applies to
+  ASCII input too. Known gaps,
   pinned by tests: IDN domains stay unredacted, the generic base64/hex
   boundaries keep `\b` (benign-SHA preservation, #502 direction), and
   under `re.IGNORECASE` the ASCII classes case-fold to also match
