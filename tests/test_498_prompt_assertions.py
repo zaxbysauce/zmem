@@ -376,9 +376,16 @@ class ExactSetLaneTests(unittest.TestCase):
             "The current Morrowfield weekend scan goes to Rose Yard. "
             "What destination does Kennet policy use for unsealed parcels?")
         contents = _contents(env)
-        self.assertTrue(any("Rowan Dock" in c for c in contents), env)
+        # FB-104 (Stage-B r2): exact-set strength on the SUPPRESSED class —
+        # exactly ONE destination fact (the Kennet default Rowan Dock) and
+        # zero competing/irrelevant destination facts. Entity-lane context
+        # rows without a conflicting destination (the Lyle approver fact) are
+        # the ordinary gate's pre-existing disjunction, not a #498 violation.
+        self.assertEqual(
+            sum(1 for c in contents if "Rowan Dock" in c), 1, env)
         self.assertFalse(any("Rose Yard" in c for c in contents), env)
-        self.assertFalse(any("Vantor" in c for c in contents), env)
+        self.assertFalse(any("Vantor desk" in c for c in contents), env)
+        self.assertFalse(any("Pearl Register" in c for c in contents), env)
 
 
 class ItemIdentityTests(unittest.TestCase):

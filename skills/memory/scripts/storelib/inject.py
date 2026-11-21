@@ -2060,6 +2060,7 @@ def select_and_budget_for_injection(
         # and evidence membership; failures simply withhold the derived row.
         # This preserves the existing recall path for ordinary rows.
         ordinary_rows = list(rows)
+        rebudget_stats = None
         try:
             page_rows = list(page_rows_pre)
             candidate_ids = _ordered_unique(candidate_ids + page_candidate_ids_pre)
@@ -2078,8 +2079,10 @@ def select_and_budget_for_injection(
                 # real-budget admission below never runs — but the canonical
                 # pool arrived under the WIDENED budget. Re-admit it under
                 # the real budget now, exactly as the no-page path received
-                # it.
-                rows, _used, _dropped, _bstats = apply_token_budget(
+                # it, and keep the REAL-budget statistics for the envelope
+                # (Stage-B r2: the widened pass's counters describe a
+                # decision that no longer applies).
+                rows, _used, _dropped, rebudget_stats = apply_token_budget(
                     ordinary_rows, budget, with_stats=True,
                     legacy_injection_wire=True)
             if page_rows:
@@ -2327,10 +2330,17 @@ def select_and_budget_for_injection(
             rows, omitted=parsed.get("omitted", 0), reason=reason,
             excluded=excluded, candidate_ids=candidate_ids,
             tokens_used=parsed.get("tokens_used", 0), tokens_budget=budget,
-            budget_dropped=parsed.get("budget_dropped", 0),
-            budget_admission=parsed.get("budget_admission", 0),
-            budget_truncated=parsed.get("budget_truncated", 0),
-            budget_dropped_protected=parsed.get("budget_dropped_protected", 0),
+            # PR #526 feedback (Stage-B r2, FB-109): when the all-withheld
+            # path re-admitted the canonical pool under the REAL budget, the
+            # envelope counters describe THAT decision, not the widened
+            # pass's preliminary accounting.
+            budget_dropped=(rebudget_stats or parsed).get("budget_dropped", 0),
+            budget_admission=(rebudget_stats or parsed).get(
+                "budget_admission", 0),
+            budget_truncated=(rebudget_stats or parsed).get(
+                "budget_truncated", 0),
+            budget_dropped_protected=(rebudget_stats or parsed).get(
+                "budget_dropped_protected", 0),
             arms=parsed.get("arms", {}), rendered=rendered,
             effective_ops=list(effective_ops) if _capture_envelope_enabled() else None,
             injection_risk=parsed.get("injection_risk"),
