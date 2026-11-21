@@ -2508,6 +2508,15 @@ def _heal_null_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
             finally:
                 conn.text_factory = str
             rows = list(raw_rows)
+        except sqlite3.Error as exc:
+            # Implementation-review round 2: a non-decode database error
+            # from the FIRST fetch (any other sqlite3.Error subtype) is
+            # diagnosed and deferred too — the lane's never-raise contract
+            # covers every fetch path, not just the initial probe.
+            sys.stderr.write(
+                "[zmem] NULL content_norm heal deferred (%s); the next "
+                "open re-runs it\n" % (exc,))
+            return
         if not rows:
             break
         for r in rows:
