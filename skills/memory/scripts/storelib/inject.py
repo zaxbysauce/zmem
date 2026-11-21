@@ -505,6 +505,12 @@ def _truncate_protected_row(
     while allowed >= MIN_STUB_CHARS:
         clipped = row.copy()
         clipped["content"] = content[:allowed].rstrip() + marker
+        # Issue #501 (audit D02): a clipped row is an INCOMPLETE delivery —
+        # render it (the #116 truncated-not-dropped contract) but never let
+        # the delivery ledger acknowledge it (the ledger filter at the
+        # withheld_for_secret precedent drops this marker), so a same-session
+        # retry with enough budget re-selects and delivers the COMPLETE row.
+        clipped["_incomplete_delivery"] = True
         cost = _fence_row_cost_for_wire(
             clipped, legacy_injection_wire=legacy_injection_wire)
         if cost <= remaining:
@@ -2272,11 +2278,21 @@ def select_and_budget_for_injection(
         # the [WITHHELD: SECRET] prefix already fails rows_present_in's
         # marker whitelist, but that auto-drop depends on the fence shape; if
         # the marker ever matched, this filter is the sole bump/ledger guard
-        # (proven by the c-iso mutation probe). Applied FIRST so a single
-        # guard covers both consumers and bump_rows stays a subset of
-        # ledger_rows by construction.
+        # (proven by the c-iso mutation probe). Applied as the LAST filter on
+        # ledger_rows so a single guard covers both consumers and bump_rows
+        # stays a subset of ledger_rows by construction.
+        #
+        # Issue #501 (audit D02): a budget-clipped row is an incomplete
+        # delivery — the [id] marker surviving the clip must NOT count as
+        # delivery proof, so it rides the SAME final filter (never bumped,
+        # never ledgered; record/reserve/bump all derive from ledger_rows):
+        # render, never acknowledge; the complete-row retry re-selects.
+        # Never-fitting clipped rows re-render until the 6h window or the
+        # escalation release (disclosed behavior change, pinned in
+        # test_audit_y3_supp).
         ledger_rows = [row for row in ledger_rows
-                       if not row.get("withheld_for_secret")]
+                       if not row.get("withheld_for_secret")
+                       and not row.get("_incomplete_delivery")]
         # Expansion rows are rendered but deliberately NOT bumped —
         # popularity rewards query-MATCHED rows only (recall.py bump law).
         bump_rows = [row for row in ledger_rows

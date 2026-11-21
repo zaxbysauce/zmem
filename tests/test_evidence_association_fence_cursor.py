@@ -23,8 +23,10 @@ from test_evidence_association import (  # noqa: E402
 
 FENCE_OPEN = "<<<ZMEM_UNTRUSTED_FENCE>>>"
 FENCE_CLOSE = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
-FENCE_OPEN_NEUTRALIZED = "<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>"
-FENCE_CLOSE_NEUTRALIZED = "<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>"
+# Issue #511: the CLI render emits token-bearing outer markers; _run (from
+# test_evidence_association) pins ZMEM_FENCE_TOKEN=evtext in the child env.
+FENCE_OPEN_PINNED = "<<<ZMEM_UNTRUSTED_FENCE:evtext>>>"
+FENCE_CLOSE_PINNED = "<<<END_ZMEM_UNTRUSTED_FENCE:evtext>>>"
 
 
 class AssociationCursorHumanOutputTest(unittest.TestCase):
@@ -66,14 +68,20 @@ class AssociationCursorHumanOutputTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         rendered = result.stdout
-        self.assertEqual(rendered.count(FENCE_OPEN), 1)
-        self.assertEqual(rendered.count(FENCE_CLOSE), 1)
-        self.assertIn(FENCE_OPEN_NEUTRALIZED, rendered)
-        self.assertIn(FENCE_CLOSE_NEUTRALIZED, rendered)
+        # Issue #511: exactly one genuine boundary pair, now token-bearing;
+        # the canonical literals never ride raw anywhere in the render.
+        self.assertEqual(rendered.count(FENCE_OPEN_PINNED), 1)
+        self.assertEqual(rendered.count(FENCE_CLOSE_PINNED), 1)
+        self.assertNotIn(FENCE_OPEN, rendered)
+        self.assertNotIn(FENCE_CLOSE, rendered)
+        # Stored fence-shaped namespace text is ESCAPED at render (leading
+        # "<<<" broken to U+27E8 x3) so it cannot alias the boundary.
+        self.assertIn("\u27e8\u27e8\u27e8ZMEM_UNTRUSTED_FENCE>>>", rendered)
+        self.assertIn("\u27e8\u27e8\u27e8END_ZMEM_UNTRUSTED_FENCE>>>", rendered)
         self.assertNotIn(f"{FENCE_CLOSE}\n# injected outside fence", rendered)
         self.assertIn(r"\n# injected outside fence", rendered)
         self.assertNotIn("\n# injected outside fence", rendered)
-        self.assertTrue(rendered.rstrip().endswith(FENCE_CLOSE))
+        self.assertTrue(rendered.rstrip().endswith(FENCE_CLOSE_PINNED))
 
 
 if __name__ == "__main__":

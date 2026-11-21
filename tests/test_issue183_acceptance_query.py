@@ -324,7 +324,11 @@ class Issue183QueryAcceptance(unittest.TestCase):
                 fixture_store = tmp / "parity.sqlite"
                 gen = ROOT / "tests" / "fixtures" / "injection-parity" / "generate.py"
                 expected = tmp / "expected.json"
-                fixed_env = _env(tmp, ZMEM_TEST_NOW="2026-06-01T00:00:00Z")
+                # Issue #511: pin the render token so the live recall wire
+                # is byte-comparable to the committed fixtures (whose
+                # markers carry the same pinned token).
+                fixed_env = _env(tmp, ZMEM_TEST_NOW="2026-06-01T00:00:00Z",
+                                 ZMEM_FENCE_TOKEN="phase25")
                 proc = subprocess.run([sys.executable, str(gen), "--store", str(fixture_store), "--expected", str(expected)], env=fixed_env, capture_output=True, text=True, timeout=30)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(expected.read_bytes(), EXPECTED_NEGATIVE.read_bytes())

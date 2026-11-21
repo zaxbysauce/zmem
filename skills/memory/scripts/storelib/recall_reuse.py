@@ -87,6 +87,10 @@ CONFIG_KNOBS: tuple[tuple[str, str], ...] = (
     ("ZMEM_ENTITY_KIND_WEIGHTS", "recall"),
     ("ZMEM_FENCE_OPEN", "recall"),
     ("ZMEM_FENCE_CLOSE", "recall"),
+    # Issue #511: the per-render fence token changes rendered bytes exactly
+    # like the marker constants above; a caller flipping it under the reuse
+    # seam must MISS the cache, never replay a stale boundary.
+    ("ZMEM_FENCE_TOKEN", "recall"),
     ("ZMEM_CROSS_PROJECT", "recall"),
     ("ZMEM_CROSS_ENCODER_SHADOW", "recall"),
     ("ZMEM_UNTRUSTED_FENCE", "recall"),

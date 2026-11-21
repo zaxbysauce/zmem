@@ -42,6 +42,10 @@ class HookBehaviorSmokeTests(unittest.TestCase):
             # 12 s default outer watchdog flakes under self-load on
             # operator boxes (outer_timeout=1 omits the fence).
             "ZMEM_LAUNCHER_WATCHDOG_MS": "60000",
+            # Issue #511: fence renders carry a per-render token after the
+            # canonical prefix; pin it so the fence expectations below are
+            # byte-deterministic.
+            "ZMEM_FENCE_TOKEN": "hooksmoke",
         }
         # Issue #432 AC1 (hermeticity): ambient project-dir markers hijack
         # the launcher's namespace resolution over the driven cwd, and
@@ -96,7 +100,15 @@ class HookBehaviorSmokeTests(unittest.TestCase):
 
     @staticmethod
     def _decode_envelope(out: str) -> dict:
-        """Decode a hook sentinel envelope, restoring canonical fence markers."""
+        """Decode a hook sentinel envelope.
+
+        The JSON sentinels are still neutralized by the hooks, so those
+        replacements stay.  Issue #511: fence renders now carry per-render
+        token markers (pinned to "hooksmoke" in this class's env) that the
+        hooks do NOT neutralize — the delivered payload already contains
+        the raw ``<<<ZMEM_UNTRUSTED_FENCE:hooksmoke>>>`` boundary, so no
+        fence restoration is needed.
+        """
         import json
 
         end = out.rfind("<<<END>>>")
@@ -105,14 +117,6 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         payload = out[start + len("<<<ZMEM_JSON>>>"):end].strip()
         payload = payload.replace("<<<ZMEM_JSON_NEUTRALIZED>>>", "<<<ZMEM_JSON>>>")
         payload = payload.replace("<<<END_NEUTRALIZED>>>", "<<<END>>>")
-        payload = payload.replace(
-            "<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>",
-            "<<<ZMEM_UNTRUSTED_FENCE>>>",
-        )
-        payload = payload.replace(
-            "<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>",
-            "<<<END_ZMEM_UNTRUSTED_FENCE>>>",
-        )
         return json.loads(payload)
 
     def test_subagent_recall_produces_fence_behaviorally(self):
@@ -122,8 +126,8 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         )
         payload = self._decode_envelope(out)
         ctx = payload.get("additionalContext", "")
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
+        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
         self.assertIn("conf=0.9", ctx)
         self.assertIn("project:smoke", ctx)
 
@@ -131,8 +135,8 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         out = self._run_hook("zmem-session-start.sh", "{}")
         payload = self._decode_envelope(out)
         ctx = payload.get("additionalContext", "")
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
+        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
         self.assertIn("conf=0.9", ctx)
 
     def test_recall_hook_produces_fence_behaviorally(self):
@@ -142,8 +146,8 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         )
         payload = self._decode_envelope(out)
         ctx = payload.get("additionalContext", "")
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
+        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
         self.assertIn("conf=0.9", ctx)
 
     def test_injection_row_omitted_end_to_end(self):
@@ -166,8 +170,12 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         ):
             with self.subTest(script=script):
                 out = self._run_hook(script, stdin_data)
-                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>", out)
-                self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>", out)
+                # Issue #511: the delivered hook boundary is now the
+                # token-bearing marker (raw — the hooks' canonical-literal
+                # substitutions are inert backstops), never the canonical
+                # literal itself.
+                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", out)
+                self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", out)
                 self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", out)
                 self.assertIn("untrusted retrieved notes", out)
 
@@ -175,8 +183,8 @@ class HookBehaviorSmokeTests(unittest.TestCase):
         out = self._run_hook("zmem-precompact.sh", "{}")
         payload = self._decode_envelope(out)
         ctx = payload.get("additionalContext", "")
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
+        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:hooksmoke>>>", ctx)
         self.assertIn("conf=0.9", ctx)
 
 

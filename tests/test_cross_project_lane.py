@@ -109,6 +109,9 @@ def _clean_env(tmp: str, **extra: str) -> dict:
         "ZMEM_DATA": tmp,
         "ZMEM_MODELS_DIR": os.path.join(tmp, "missing-models"),
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        # Issue #511: fence renders carry a per-render token; pin it so
+        # the fence-boundary assertions are byte-deterministic.
+        "ZMEM_FENCE_TOKEN": "crosslane",
         "PYTHONUTF8": "1",
     })
     env.update(extra)
@@ -129,6 +132,11 @@ class CrossProjectLaneTest(unittest.TestCase):
             key: os.environ.pop(key, None)
             for key in ("ZMEM_CROSS_PROJECT", "ZMEM_CROSS_PROJECT_HAZARD_VERBS")
         }
+        # Issue #511: pin the render token for the IN-PROCESS selector
+        # renders (the subprocess cells pin it via _clean_env); saved so
+        # teardown restores the caller's env.
+        self._saved_fence_token = os.environ.pop("ZMEM_FENCE_TOKEN", None)
+        os.environ["ZMEM_FENCE_TOKEN"] = "crosslane"
 
     def tearDown(self):
         try:
@@ -141,6 +149,10 @@ class CrossProjectLaneTest(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        if self._saved_fence_token is None:
+            os.environ.pop("ZMEM_FENCE_TOKEN", None)
+        else:
+            os.environ["ZMEM_FENCE_TOKEN"] = self._saved_fence_token
         recall_mod._CROSS_POLICY_WARNED = False
 
     # ---- shared helpers ---------------------------------------------------
@@ -556,7 +568,9 @@ class CrossProjectLaneTest(unittest.TestCase):
                     ctx, rc, stderr = self._run_hook(
                         cell_tmp, mode, event_full, **extra)
                     self.assertEqual(rc, 0, stderr)
-                    self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+                    # Issue #511: the boundary carries the pinned render
+                    # token (see _clean_env).
+                    self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:crosslane>>>", ctx)
                     self.assertIn("current", ctx)
                     marker = f"[ns={FOREIGN_A}] [tier=cross]"
                     if cross_marker_expected:
@@ -635,7 +649,10 @@ class CrossProjectLaneTest(unittest.TestCase):
                           f"selector envelope must carry {key!r}")
         self.assertIn("[ns=project:foreign-a] [tier=cross]",
                       envelope["rendered"])
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", envelope["rendered"])
+        # Issue #511: the boundary carries the pinned render token (see
+        # setUp).
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:crosslane>>>",
+                      envelope["rendered"])
 
         rows = envelope["results"]
         self.assertGreaterEqual(len(rows), 1)

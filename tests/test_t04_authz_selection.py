@@ -81,6 +81,7 @@ _PIN_KEYS = (
     "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_DELIVER_WINDOW_S",
     "ZMEM_LEDGER_CAP", "ZMEM_NAMESPACE",
     "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE", "ZMEM_MCP_TOKENS_FILE",
+    "ZMEM_FENCE_TOKEN",
     # The pretool legs (AC3/AC4) need the documented cross-tier defaults:
     # unset surface env (pretool-only) and the default hazard-verb set.
     "ZMEM_CROSS_PROJECT", "ZMEM_CROSS_PROJECT_HAZARD_VERBS",
@@ -103,6 +104,9 @@ def _pinned_scratch(prefix: str):
         # Bare env token = UNSCOPED operator token (test_mcp_auth
         # convention); scoped tests overwrite with ZMEM_MCP_TOKEN_FILE.
         "ZMEM_MCP_TOKEN": "t04-unscoped-operator",
+        # Issue #511: fence renders carry a per-render token; pin it so
+        # the CLI and MCP parity legs render byte-identical fences.
+        "ZMEM_FENCE_TOKEN": "t04pin",
     })
     for key in ("ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
                 "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP", "ZMEM_NAMESPACE",

@@ -48,6 +48,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
 
+from schema_meta import allowed_types
 from storelib import write as writelib
 from storelib.write import CapturePolicyRefusal
 # PR1: the knowledge pointer CAS handler's exception taxonomy — imported
@@ -744,6 +745,24 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                         op_id, kind, "rejected",
                         error="namespace_not_allowed"))
                     continue
+
+            # Issue #510 (audit D03): admission validates the memory type
+            # against the effective vocabulary BEFORE any savepoint opens.
+            # An out-of-vocabulary type is a per-op refusal with a distinct
+            # code, never a committed row, and the batch continues with the
+            # sibling ops (add/capture default to "fact" exactly as the
+            # writer does; update only validates when a type rides the op).
+            if kind in ("add", "capture"):
+                _candidate_type = str(args.get("type") or "fact")
+            elif kind == "update" and args.get("type") is not None:
+                _candidate_type = str(args["type"])
+            else:
+                _candidate_type = None
+            if (_candidate_type is not None
+                    and _candidate_type not in allowed_types()):
+                receipts.append(_receipt(
+                    op_id, kind, "rejected", error="invalid_type"))
+                continue
 
             # 4. Apply under a per-op savepoint.
             savepoint = f"zmem_op_{index}"

@@ -98,6 +98,10 @@ def isolation_env(store_path: str) -> dict:
         "ZMEM_MODELS_DIR": os.path.join(data_dir, "missing-models"),
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
         "ZMEM_TEST_NOW": FIXTURE_TS,
+        # Issue #511: fence renders carry a per-render token; pin it so
+        # the frozen envelope's markers are deterministic (and match the
+        # consuming test's pinned env).
+        "ZMEM_FENCE_TOKEN": "prefetchpin",
         "PYTHONIOENCODING": "utf-8",
     })
     for key in _STRIP_ENV:

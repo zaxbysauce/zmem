@@ -756,9 +756,22 @@ class EmptyRenderFenceTest(unittest.TestCase):
             _format_fenced_recall,
         )
 
-        fence = _format_fenced_recall([], header="Relevant memories.")
-        self.assertTrue(fence.startswith(ZMEM_FENCE_OPEN))
-        self.assertIn(ZMEM_FENCE_CLOSE, fence)
+        # Issue #511: genuine renders carry a per-render token after the
+        # canonical prefix; pin it so the byte expectations are
+        # deterministic.
+        saved = os.environ.get("ZMEM_FENCE_TOKEN")
+        os.environ["ZMEM_FENCE_TOKEN"] = "evalpin"
+        try:
+            fence = _format_fenced_recall([], header="Relevant memories.")
+        finally:
+            if saved is None:
+                os.environ.pop("ZMEM_FENCE_TOKEN", None)
+            else:
+                os.environ["ZMEM_FENCE_TOKEN"] = saved
+        self.assertTrue(fence.startswith("<<<ZMEM_UNTRUSTED_FENCE:evalpin>>>"))
+        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:evalpin>>>", fence)
+        self.assertNotIn(ZMEM_FENCE_OPEN, fence)
+        self.assertNotIn(ZMEM_FENCE_CLOSE, fence)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ importing it).
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -430,6 +431,18 @@ def _verify_real_lane(
     import storelib.inject as _inject
     from storelib.recall import ZMEM_FENCE_CLOSE, ZMEM_FENCE_OPEN
 
+    # Issue #511: genuine render markers carry a per-render token; the
+    # verifier accepts the canonical legacy pair OR a matched token pair
+    # (the same token in the open and the close) — a mismatched pair fails.
+    _FENCE_PAIR_RE = re.compile(
+        r"(?ms)^<<<ZMEM_UNTRUSTED_FENCE:(?P<tok1>[0-9a-zA-Z]+)>>>"
+        r"[\s\S]*?^<<<END_ZMEM_UNTRUSTED_FENCE:(?P=tok1)>>>"
+        r"|^" + re.escape(ZMEM_FENCE_OPEN)
+        + r"[\s\S]*?" + re.escape(ZMEM_FENCE_CLOSE))
+
+    def _fence_markers_present(fence: str) -> bool:
+        return bool(_FENCE_PAIR_RE.search(fence))
+
     floor, gate_none_floor, grounded = _inject._gate_constants()
 
     def _conf(r) -> float:
@@ -490,7 +503,7 @@ def _verify_real_lane(
                 f"{item_id}: rendered row {r.get('id')} is absent from the "
                 "fence text — metrics must come off the rendered fence"
             )
-    if rows and not (fence.startswith(ZMEM_FENCE_OPEN) and ZMEM_FENCE_CLOSE in fence):
+    if rows and not _fence_markers_present(fence):
         raise BypassError(f"{item_id}: fence markers missing from the render")
     if envelope.get("tokens_budget") != budget:
         raise BypassError(

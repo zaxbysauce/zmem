@@ -221,11 +221,28 @@ def _read_file(path):
 def _soft_trim(text: str, budget: int) -> str:
     if not text or budget <= 0 or len(text) <= budget:
         return text
-    closer = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
-    if closer in text:
+    # Issue #511: genuine fence closers carry a per-render token, so a
+    # literal probe can no longer find them. Close the fence with the
+    # CURRENT render closer - structurally, the LAST fence-close marker
+    # in the text (canonical or token form) - so a trimmed payload never
+    # delivers an unclosed fence.
+    closer = _last_fence_closer(text)
+    if closer:
         head = max(0, budget - len(closer) - 28)
         return text[:head].rstrip() + "\n" + closer + "\n[recall truncated]"
     return text[:budget].rstrip() + "\n[context truncated]"
+
+
+_FENCE_CLOSER_RE = re.compile(
+    r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9a-f]+)?(_NEUTRALIZED)?>>>")
+
+
+def _last_fence_closer(text: str) -> str:
+    """The last fence-close marker in the text, canonical or token form."""
+    matches = list(_FENCE_CLOSER_RE.finditer(text))
+    if not matches:
+        return ""
+    return matches[-1].group(0)
 
 
 def build_tier0_context(core, agents, host):
