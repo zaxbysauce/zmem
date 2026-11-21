@@ -10,6 +10,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Fixed
 
 - Read-only snapshots now compare database copies with streaming hashes so companion note reads use bounded comparison memory on large stores.
+- **Redaction no longer misses secrets and emails on decoded Unicode text**
+  (issue #523). Python's `\b` is Unicode-aware, so a non-ASCII letter glued
+  to a token end removed the boundary and the secret survived — including
+  on the write path, where `redact_secret_like_text` left such secrets
+  persisted unredacted. The distinctive token patterns
+  (AKIA/AIza/gh_/xox/sk-/Bearer/eyJ, sshpass/ssh-mysql-psql/sudo/url-scheme)
+  now use explicit ASCII word-char boundaries — byte-identical for every
+  ASCII neighbour, correct under non-ASCII adjacency, and parity with the
+  JS lane. The email pattern is Unicode-tolerant in its local part
+  (composed and decomposed forms) with a linear-time boundary design;
+  ASCII behaviour is pinned exactly. Known gaps, pinned by tests: IDN
+  domains stay unredacted, the generic base64/hex boundaries keep `\b`
+  (benign-SHA preservation, #502 direction), and under `re.IGNORECASE` the
+  ASCII classes case-fold to also match U+0130/U+0131/U+017F/U+212A-class
+  codepoints.
+- **`import-store` completes on WAL-journal source stores** (issue #524).
+  The FTS optimize INSERT opened an implicit transaction that was never
+  committed before the `journal_mode=DELETE` switch, so every WAL source
+  (the zmem default) failed wholesale after successful staging with
+  "cannot change out of wal mode from within a transaction". The optimize
+  is now committed before the switch and the switch result is verified.
+  The issue's "demotion masks the bug" claim was disproved during the
+  trace: the failure was journal-mode-only, so both plain and
+  knowledge-prefixed row shapes are covered by tests.
+- **NULL `content_norm` rows written after the repair markers heal on the
+  next open** (issue #527). Both marker lanes (162 repair, 163
+  verification) are one-shot, so a NULL planted later by a raw external
+  sqlite3 writer was skipped forever — invisible to every
+  content_norm-keyed re-rank/fold window (the #486 ingest contract). A new
+  unmarked lane probes for NULLs on every open and heals them with the
+  163 lane's transaction discipline; clean stores stay byte-identical
+  (zero-write floor). Disclosed cost: the probe is a full-table scan
+  (~79 ms median at 50k rows / 87 MB vs ~1.8 ms for a stamped open).
+  Undecodable-content rows keep NULL (skip semantics unchanged).
 
 ## [0.165.0] - 2026-11-21
 

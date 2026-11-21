@@ -2195,10 +2195,11 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
     # replay idempotence) snapshot stores seeded after `init` whose first
     # production open is the assertion's own read. A clean scan therefore
     # writes NOTHING (no stamp); the stamp rides an actual heal in the
-    # same transaction. NULL norms are _repair_null_content_norm_162's
-    # lane (its own stamp cadence); this pass skips them so raw-seeded
-    # NULL rows do not turn a read-only open into a write. Consequence:
-    # a clean store re-verifies on every open (read-only scan).
+    # same transaction. NULL norms are the post-stamp NULL lane's
+    # (_heal_null_content_norms_post_stamp, issue #527); this pass skips
+    # them so raw-seeded NULL rows do not turn a read-only open into a
+    # write. Consequence: a clean store re-verifies on every open
+    # (read-only scan).
     while True:
         if _bf_last is None:
             fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
@@ -2350,10 +2351,10 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
     # rows are canonical now) but does NOT certify the pass; if a later
     # batch aborted or the process died mid-scan, the stamp is absent and
     # the next open re-scans (finding only the still-stale rows).
-    # Zero-write on clean stores (and on only-NULL scans — 162's lane)
-    # still holds: no heals -> no stamp -> no bytes. With a caller
-    # transaction open the stamp rides the caller's commit; otherwise it
-    # commits its own small transaction.
+    # Zero-write on clean stores (and on only-NULL scans — the post-stamp
+    # NULL lane owns NULLs now, issue #527) still holds: no heals -> no
+    # stamp -> no bytes. With a caller transaction open the stamp rides the
+    # caller's commit; otherwise it commits its own small transaction.
     if healed > 0:
         # Round-7 reviewer finding: on the own-transaction path the heal
         # batches have committed and RELEASED the write lock by the time
@@ -2412,6 +2413,167 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
 
 class _NormVerifyConflict(Exception):
     """Internal: a row kept changing under the norm-verification pass."""
+
+
+def _heal_null_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
+    """Heal NULL content_norm rows that arrived AFTER the repair markers
+    (issue #527).
+
+    The 162 repair and the 163 verification are one-shot marker lanes: once a
+    store carries their stamps, a NULL content_norm row planted later by a raw
+    external sqlite3 writer (the #491 writer class — every supported writer
+    materializes the norm at admission) is skipped by BOTH lanes forever, and
+    NULL rows are invisible to every content_norm-keyed re-rank/fold window
+    (the #486 ingest contract). This lane closes that gap with deliberately
+    NO marker of its own: a marker with a 162-style early return would
+    recreate the exact defect for NULLs arriving after ITS stamp.
+
+    Zero-write on clean stores: the lane opens with a LIMIT 1 existence probe
+    and writes nothing when no NULL row exists (the byte-identical contracts
+    in tests/test_zero_write_passive.py and tests/test_t09_op_queue.py pin
+    that). Disclosed cost: the probe is a full-table scan (no NULL index;
+    measured ~79 ms median on a 50k-row / 87 MB store vs a ~1.8 ms stamped
+    baseline) — an unstamped clean store already pays the 163 scan per open,
+    so the marginal steady-state cost is at most one additional scan.
+
+    Transaction discipline (mirrors _verify_content_norms_163): per-batch
+    BEGIN IMMEDIATE on the own-transaction path / a uniquely named savepoint
+    under a caller transaction (never committed or rolled back by this lane);
+    compare-and-update with one fresh-read retry; a second unresolved miss is
+    an internal conflict that undoes ONLY the current batch — previously
+    committed or savepoint-released batches stay healed, no marker exists to
+    strand, unresolved NULLs retry on the next open, and this lane never
+    raises out of migrate(). A write transaction is acquired only when a
+    batch holds decodable rows to heal; an all-undecodable batch advances the
+    keyset without taking the write lock. Rows whose content is not
+    verifiable text stay NULL (_norm_text -> None), matching both existing
+    lanes' skip semantics.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    if "content_norm" not in cols or "content" not in cols:
+        return
+    if "tags" not in cols:
+        # Trigger-safety guard shared with both existing lanes: a store
+        # without the tags column predates the rebound FTS triggers, and an
+        # UPDATE here could fire them unbounded. Skip such stores entirely.
+        return
+    probe = conn.execute(
+        "SELECT 1 FROM memory WHERE content_norm IS NULL LIMIT 1").fetchone()
+    if probe is None:
+        return  # clean store: zero writes (byte-identical contracts)
+
+    batch_size = 500
+    _bf_last = None
+    while True:
+        if _bf_last is None:
+            fetch_sql = ("SELECT rowid, content FROM memory "
+                         "WHERE content_norm IS NULL ORDER BY rowid LIMIT ?")
+        else:
+            fetch_sql = ("SELECT rowid, content FROM memory "
+                         "WHERE content_norm IS NULL AND rowid > ? "
+                         "ORDER BY rowid LIMIT ?")
+        try:
+            rows = conn.execute(
+                fetch_sql, (batch_size,) if _bf_last is None
+                else (_bf_last, batch_size)).fetchall()
+        except (UnicodeDecodeError, sqlite3.OperationalError) as decode_exc:
+            # Same decode-fallback contract as the 163 pass: a TEXT cell
+            # holding non-UTF-8 bytes raises inside the SELECT's own decode;
+            # refetch through the bytes factory and let _norm_text classify
+            # (None -> skip, never normalize). A genuine database error on
+            # the refetch aborts THIS LANE (diagnostic + return, never an
+            # exception out of migrate()) — the next open retries.
+            conn.text_factory = bytes
+            try:
+                raw_rows = conn.execute(
+                    fetch_sql, (batch_size,) if _bf_last is None
+                    else (_bf_last, batch_size)).fetchall()
+            except sqlite3.Error:
+                sys.stderr.write(
+                    "[zmem] NULL content_norm heal deferred (%s); the next "
+                    "open re-runs it\n" % (decode_exc,))
+                return
+            finally:
+                conn.text_factory = str
+            rows = list(raw_rows)
+        if not rows:
+            break
+        for r in rows:
+            if _bf_last is None or r[0] > _bf_last:
+                _bf_last = r[0]
+        # Heal candidates: only rows whose content is verifiable text.
+        candidates = [
+            (r[0], _norm_text(r[1]))
+            for r in rows
+            if _norm_text(r[1]) is not None]
+        if not candidates:
+            # All-undecodable batch: advance the keyset WITHOUT acquiring
+            # the write lock (163 advisory; skip semantics unchanged).
+            continue
+        own_tx = not conn.in_transaction
+        sp = "zmem_null_heal_164"
+        try:
+            if own_tx:
+                conn.execute("BEGIN IMMEDIATE")
+            else:
+                conn.execute(f"SAVEPOINT {sp}")
+            for rid, text in candidates:
+                canonical = _normalize_content(text)
+                cur = conn.execute(
+                    "UPDATE memory SET content_norm=? WHERE rowid=? "
+                    "AND content IS ? AND content_norm IS NULL",
+                    (canonical, rid, text))
+                if cur.rowcount:
+                    continue
+                # Zero-row compare-and-update: the row changed under us.
+                fresh = conn.execute(
+                    "SELECT rowid, content, content_norm FROM memory "
+                    "WHERE rowid=?", (rid,)).fetchone()
+                if fresh is None:
+                    continue  # row deleted under us — nothing to heal
+                fresh_text = _norm_text(fresh[1])
+                if fresh_text is None:
+                    continue  # changed into an unverifiable shape — skip
+                if fresh[2] is not None:
+                    continue  # the concurrent writer already materialized it
+                retry = conn.execute(
+                    "UPDATE memory SET content_norm=? WHERE rowid=? "
+                    "AND content IS ? AND content_norm IS NULL",
+                    (_normalize_content(fresh_text), fresh[0], fresh[1]))
+                if not retry.rowcount:
+                    raise _NormVerifyConflict(
+                        f"rowid {rid} kept changing during the NULL "
+                        "content_norm heal")
+            if own_tx:
+                conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+        except _NormVerifyConflict:
+            if not own_tx:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except sqlite3.Error:
+                    pass
+            elif conn.in_transaction:
+                conn.rollback()
+            sys.stderr.write(
+                "[zmem] NULL content_norm heal deferred (a row kept "
+                "changing under the pass); the next open re-runs it\n")
+            return
+        except sqlite3.Error as exc:
+            if not own_tx:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except sqlite3.Error:
+                    pass
+            elif conn.in_transaction:
+                conn.rollback()
+            sys.stderr.write(
+                "[zmem] NULL content_norm heal deferred (%s); the next "
+                "open re-runs it\n" % (exc,))
+            return
 
 
 # Issue #137: additive belief-head side tables.  Like the v14 evidence
@@ -3294,7 +3456,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     # import-store / snapshot-restore paths were never repaired — the v8
     # backfill is gated on ver < 8 and never re-runs. One-time stamped
     # repair (the v8 batch shape) so an upgraded store heals on its next
-    # open; the meta stamp keeps the steady state a single meta read.
+    # open; the meta stamp keeps the steady state a single meta read —
+    # EXCEPT the post-stamp NULL lane below (issue #527), which probes for
+    # NULLs on every open (full-table scan; see its docstring).
     _repair_null_content_norm_162(conn)
 
     # Version-INDEPENDENT (issue #493 AC6): the NULL-only repair above
@@ -3306,6 +3470,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     # batching so a concurrent writer can never receive a stale-computed
     # norm (see the function docstring for the transaction discipline).
     _verify_content_norms_163(conn)
+
+    # Version-INDEPENDENT (issue #527): both marker lanes above are one-shot,
+    # so a NULL content_norm row planted AFTER their stamps by a raw external
+    # sqlite3 writer was skipped by both forever (invisible to every
+    # content_norm-keyed re-rank/fold window). This UNMARKED lane probes for
+    # NULLs on every open and heals what it finds — no stamp can recreate the
+    # gap it closes. Steady-state cost disclosure: the probe is a full-table
+    # scan (~79 ms median at 50k rows / 87 MB, vs ~1.8 ms for a stamped
+    # open); zero writes on a clean store (byte-identical contracts).
+    _heal_null_content_norms_post_stamp(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.
     # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,
