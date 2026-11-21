@@ -704,6 +704,32 @@ class QualifiedFactOrderingTests(unittest.TestCase):
         ])
         self.assertEqual(drops.get("d"), "conflict")
 
+    def test_multi_focus_orthogonal_guard(self):
+        # TEST-009 (parallel review): the ORTHOGONAL drop requires EXACTLY
+        # ONE focus — a destination-only fact is NOT dropped under a
+        # two-question prompt (the single-focus arm drops it, pinning the
+        # len(foci)==1 guard at the partition).
+        two_focus = inject.analyze_prompt(
+            "What does the Kennet unsealed parcel cost? "
+            "How often is it audited?")
+        self.assertEqual(len(two_focus["foci"]), 2)
+        drops, _ = inject.partition_prompt_assertions(two_focus, [
+            {"id": "d2", "type": "fact",
+             "content": "Kennet policy sends unsealed parcels to Rowan "
+                        "Dock."},
+        ])
+        self.assertNotIn("d2", drops,
+                         "multi-focus ORTHOGONAL guard lost (len==1 pin)")
+        one_focus = inject.analyze_prompt(
+            "What does the Kennet unsealed parcel cost?")
+        drops1, _ = inject.partition_prompt_assertions(one_focus, [
+            {"id": "d1", "type": "fact",
+             "content": "Kennet policy sends unsealed parcels to Rowan "
+                        "Dock."},
+        ])
+        self.assertEqual(drops1.get("d1"), "orthogonal",
+                         "single-focus arm lost the ORTHOGONAL drop")
+
 
 class RescueCapTests(unittest.TestCase):
     """PR #526 feedback (parallel-review TEST-002): the one-row-per-focus

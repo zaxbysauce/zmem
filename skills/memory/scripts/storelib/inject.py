@@ -2326,20 +2326,31 @@ def select_and_budget_for_injection(
             # write failure is fail-open and must not discard that text.
             reservation_id = None
         from storelib.recall import build_injection_envelope
+        # PR #526 feedback (Stage-B r3, FB-109): apply_token_budget's RAW
+        # stats keys are dropped/admission_used/truncated/dropped_protected
+        # (this module's stats contract), while the captured envelope
+        # carries the mapped budget_* names (recall.py's details builder).
+        # Map the real-budget re-admission's counters explicitly so the
+        # envelope describes THAT decision.
+        if rebudget_stats is not None:
+            budget_counters = {
+                "budget_dropped": rebudget_stats.get("dropped", 0),
+                "budget_admission": rebudget_stats.get("admission_used", 0),
+                "budget_truncated": rebudget_stats.get("truncated", 0),
+                "budget_dropped_protected": rebudget_stats.get(
+                    "dropped_protected", 0),
+                "budget_note": budget_note(rebudget_stats),
+            }
+        else:
+            budget_counters = parsed
         return build_injection_envelope(
             rows, omitted=parsed.get("omitted", 0), reason=reason,
             excluded=excluded, candidate_ids=candidate_ids,
             tokens_used=parsed.get("tokens_used", 0), tokens_budget=budget,
-            # PR #526 feedback (Stage-B r2, FB-109): when the all-withheld
-            # path re-admitted the canonical pool under the REAL budget, the
-            # envelope counters describe THAT decision, not the widened
-            # pass's preliminary accounting.
-            budget_dropped=(rebudget_stats or parsed).get("budget_dropped", 0),
-            budget_admission=(rebudget_stats or parsed).get(
-                "budget_admission", 0),
-            budget_truncated=(rebudget_stats or parsed).get(
-                "budget_truncated", 0),
-            budget_dropped_protected=(rebudget_stats or parsed).get(
+            budget_dropped=budget_counters.get("budget_dropped", 0),
+            budget_admission=budget_counters.get("budget_admission", 0),
+            budget_truncated=budget_counters.get("budget_truncated", 0),
+            budget_dropped_protected=budget_counters.get(
                 "budget_dropped_protected", 0),
             arms=parsed.get("arms", {}), rendered=rendered,
             effective_ops=list(effective_ops) if _capture_envelope_enabled() else None,
@@ -2351,7 +2362,9 @@ def select_and_budget_for_injection(
             # withhold happened, mirroring secret_withheld).
             global_withheld=parsed.get("global_withheld"),
             candidate_lanes=parsed.get("candidate_lanes"),
-            budget_note=parsed.get("budget_note") if rows else None,
+            budget_note=(budget_counters.get("budget_note")
+                         if rebudget_stats is not None
+                         else parsed.get("budget_note")) if rows else None,
             # Issue #174 (R3-4): forward the live-expiry count keyed-only-
             # when-engaged — the store lane keys it only when it saw a
             # memory_expiry side row, and None keeps the wire unchanged.
