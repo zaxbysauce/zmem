@@ -190,8 +190,11 @@ def validate_pointer_components(*, target: str, key: str) -> tuple[str, str]:
 
 
 def is_pointer_ref(source_ref: str | None) -> bool:
-    """Cheap prefix test — the same predicate every write-path guard uses."""
-    return bool(source_ref) and source_ref.startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
+    """Cheap prefix test — the same predicate every write-path guard uses.
+    Delegates to write._has_knowledge_prefix (issue #493 AC4): the test is
+    ASCII-case-insensitive so the Python guards agree with the SQL windows
+    (``NOT LIKE 'knowledge:%'`` folds ASCII case)."""
+    return _write._has_knowledge_prefix(source_ref)
 
 
 def is_wellformed_pointer_ref(source_ref: str | None) -> bool:

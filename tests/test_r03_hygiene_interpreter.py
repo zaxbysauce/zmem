@@ -84,8 +84,9 @@ class OperatorCommandPrefixPin(unittest.TestCase):
         self.assertIn("command_prefix()", schema,
                       "schema reembed hint must use the opcmds prefix")
         backup = BACKUP.read_text(encoding="utf-8")
-        self.assertEqual(backup.count("command_prefix()"), 4,
-                         "all four backup rollback hints must use the prefix")
+        self.assertEqual(backup.count("command_prefix()"), 5,
+                         "all five backup rollback hints must use the prefix "
+                         "(4 original + the #493 post-restore-open arm)")
 
     def test_doctor_hints_use_the_prefix(self):
         doctor = DOCTOR.read_text(encoding="utf-8")

@@ -1190,15 +1190,63 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     if _host is not None:
         _host.set_owner_only_perms(dest)
 
-    print(f"[zmem] restore: destination {dest}")
-    print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
-    print(f"[zmem] restore: restored rows total={total} live={live}")
+    # Final-critic finding 3: refuse a failed post-copy integrity check
+    # BEFORE any migration work — never write migrations into a file
+    # already known to be bad, and keep the real cause (the integrity
+    # verdict) ahead of any migrate failure text.
     if post_integrity != "ok":
+        print(f"[zmem] restore: destination {dest}")
+        print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
         print(f"[zmem] restore FAILED: post-restore integrity_check={post_integrity}",
               file=sys.stderr)
         if prerestore_path:
             print(f"[zmem] restore: roll back with "
                   f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
         return 1
+
+    # --- 5. Reach the current client's migrated shape (issue #493 AC1).
+    # The deliberate Windows file-handle bypass above means the restore
+    # path never runs main()'s connect()/init_db()/migrate(); without this
+    # step a snapshot whose schema predates the current client leaves the
+    # destination at the OLD shape until some LATER open migrates it. Every
+    # prior connection is closed, so this fresh open cannot hold a handle
+    # against the overwrite. The full production open sequence runs
+    # (init_db THEN migrate — init_db owns baseline indexes migrate never
+    # creates); _prepare_store is NOT used because cmd_restore already
+    # holds the schema/maintenance locks for this whole body. A snapshot
+    # NEWER than this client never reaches here (the pre-copy schema
+    # preflight refused it above with the destination untouched).
+    # Review-finding 1: this MUST be the LAST database action on the
+    # destination — the version is read INSIDE the migration connection
+    # and that read-write close checkpoints the WAL, so no read-only
+    # follow-up probe can leave orphan -wal/-shm sidecars at a freshly
+    # restored store (the stale-sidecar contracts in tests/test_backup.py
+    # pin exactly that). ---
+    try:
+        from storelib import schema as _schema
+        from schema_meta import SCHEMA_VERSION_KEY
+        mconn = _schema.connect()
+        try:
+            _schema.init_db(mconn)
+            _schema.migrate(mconn)
+            migrated_ver = mconn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (SCHEMA_VERSION_KEY,)).fetchone()
+            migrated_ver = migrated_ver[0] if migrated_ver else "?"
+            _schema._commit(mconn)
+        finally:
+            mconn.close()
+    except Exception as e:
+        print(f"[zmem] restore FAILED: post-restore open/migrate failed: {e}",
+              file=sys.stderr)
+        if prerestore_path:
+            print(f"[zmem] restore: roll back with "
+                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
+        return 1
+
+    print(f"[zmem] restore: destination {dest}")
+    print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
+    print(f"[zmem] restore: restored rows total={total} live={live}")
+    print(f"[zmem] restore: migrated shape schema_version={migrated_ver}")
     print("[zmem] restore: OK")
     return 0

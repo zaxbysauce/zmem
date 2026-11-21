@@ -2060,27 +2060,358 @@ def _repair_null_content_norm_162(conn: sqlite3.Connection) -> None:
     _bf_last = None
     while True:
         if _bf_last is None:
-            rows = conn.execute(
-                "SELECT rowid, content FROM memory "
-                "WHERE content_norm IS NULL ORDER BY rowid LIMIT ?",
-                (batch_size,)).fetchall()
+            fetch_sql = ("SELECT rowid, content FROM memory "
+                         "WHERE content_norm IS NULL ORDER BY rowid "
+                         "LIMIT ?")
         else:
-            rows = conn.execute(
-                "SELECT rowid, content FROM memory "
-                "WHERE content_norm IS NULL AND rowid > ? "
-                "ORDER BY rowid LIMIT ?", (_bf_last, batch_size)).fetchall()
+            fetch_sql = ("SELECT rowid, content FROM memory "
+                         "WHERE content_norm IS NULL AND rowid > ? "
+                         "ORDER BY rowid LIMIT ?")
+        try:
+            rows = conn.execute(fetch_sql, (batch_size,) if _bf_last is None
+                                else (_bf_last, batch_size)).fetchall()
+        except (UnicodeDecodeError, sqlite3.OperationalError) as decode_exc:
+            # PR #525 feedback (round-1 F-2): a TEXT cell holding bytes
+            # that are not valid UTF-8 raises INSIDE the SELECT's own
+            # decode — UnicodeDecodeError on older stacks,
+            # OperationalError('Could not decode to UTF-8 column ...')
+            # on sqlite >= 3.45. A real database error re-raises from the
+            # bytes-factory refetch below.
+            conn.text_factory = bytes
+            try:
+                raw_rows = conn.execute(
+                    fetch_sql, (batch_size,) if _bf_last is None
+                    else (_bf_last, batch_size)).fetchall()
+            except sqlite3.OperationalError:
+                raise decode_exc
+            finally:
+                conn.text_factory = str
+            # keep the RAW bytes here — the single _norm_text in the
+            # update-rows comprehension classifies (stage-B reviewer:
+            # pre-decoding here turned an undecodable row into "" via
+            # the helper's None->"" branch, healing it to an empty norm
+            # instead of skipping it)
+            rows = [(r[0], r[1]) for r in raw_rows]
         if not rows:
             break
-        conn.executemany(
-            "UPDATE memory SET content_norm=? WHERE rowid=?",
-            [(_normalize_content(r["content"] or ""), r["rowid"])
-             for r in rows])
-        _bf_last = rows[-1]["rowid"]
+        # PR #525 feedback (round-1 F-2): rows whose content is not
+        # verifiable text (a BLOB in the TEXT column, or TEXT bytes that
+        # are not valid UTF-8 — _norm_text maps both shapes to a
+        # verifiable str or to None) are outside the content_norm
+        # contract and must be SKIPPED, not normalized: a raw external
+        # writer can plant them and, without this guard, the repair
+        # would crash every store open. Skipped rows keep their NULL
+        # norm — disclosed: they remain invisible to content_norm-keyed
+        # windows, the same shape issue #527 tracks.
+        update_rows = [
+            (_normalize_content(text), rid)
+            for rid, text in ((r[0], _norm_text(r[1])) for r in rows)
+            if text is not None]
+        if update_rows:
+            conn.executemany(
+                "UPDATE memory SET content_norm=? WHERE rowid=?",
+                update_rows)
+        _bf_last = rows[-1][0]
         conn.commit()
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) "
         "VALUES ('content_norm_repair_162', 'done')")
     conn.commit()
+
+
+def _norm_text(value):
+    """PR #525 feedback (round-1 F-2): normalize a stored `content` cell
+    to text for the verification passes. str passes through; bytes are
+    decoded as UTF-8 when valid (a BLOB holding text) and map to None
+    when undecodable — None means the row is OUTSIDE the content_norm
+    contract and must be skipped, never normalized (a raw external
+    writer can plant such rows; normalizing them crashed every store
+    open)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
+def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
+    """One-time VERIFICATION of every retained content_norm value (issue
+    #493 AC6; issue #489's repair closed only the admission-time half).
+
+    ``_repair_null_content_norm_162`` selects NULL rows only and stamps
+    ``content_norm_repair_162``; a store polluted by a PRE-#491 sqlite
+    import can carry a source-supplied STALE NON-NULL norm the NULL-only
+    pass never reaches. This pass verifies ALL retained norms (non-NULL
+    included) against the canonical ``_normalize_content`` of each row's
+    own content, under a NEW one-time stamp of its own
+    (``content_norm_verify_163``) so stores already stamped by #491's
+    repair are still verified.
+
+    Concurrency (plan-critic rounds 2-4): each batch takes the write lock
+    up front — top-level ``BEGIN IMMEDIATE`` when no caller transaction
+    exists (a deferred read snapshot could upgrade into
+    SQLITE_BUSY_SNAPSHOT instead of reaching the compare-and-update), and a
+    uniquely named SAVEPOINT when one does (a savepoint is not a nested
+    BEGIN, and ``ROLLBACK TO`` needs one on the stack to bound the undo to
+    this batch). The UPDATE is a compare-and-update on
+    (rowid, content, content_norm): a zero-row update means the row changed
+    under us — re-read immediately, recompute, retry once; a second
+    unresolved mismatch, or a locked/busy OperationalError on the
+    caller-transaction path, aborts the pass WITHOUT stamping (forward-only
+    keyset pagination never revisits a row, so the next open re-runs the
+    whole pass; stamping after an unresolved mismatch would make the stale
+    value permanent).
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+    if "content_norm" not in cols or "content" not in cols:
+        return
+    stamped = conn.execute(
+        "SELECT value FROM meta WHERE key='content_norm_verify_163'"
+    ).fetchone()
+    if stamped is not None:
+        return
+    # Trigger-safety guard, same discipline as _repair_null_content_norm_162:
+    # a hand-planted tags-less store must be skipped AND stay unstamped (a
+    # stamp would permanently exempt a shape a later full-schema store
+    # could still migrate into the verified set).
+    if "tags" not in cols:
+        return
+    batch_size = 200
+    _bf_last = None
+    healed = 0
+    # Final-critic finding 1: a caller transaction (if any) owns the commit
+    # decision — heal batches ride a savepoint inside it and the caller's
+    # transaction stays OPEN for the caller to commit or roll back; only
+    # when we opened our own transaction do we commit it (per batch, and
+    # once more for the post-scan stamp).
+    caller_tx = conn.in_transaction
+    # CI round (PR #525): the pass must be a ZERO-WRITE surface on clean
+    # stores — byte-identical contracts (explain zero-write, op-queue
+    # replay idempotence) snapshot stores seeded after `init` whose first
+    # production open is the assertion's own read. A clean scan therefore
+    # writes NOTHING (no stamp); the stamp rides an actual heal in the
+    # same transaction. NULL norms are _repair_null_content_norm_162's
+    # lane (its own stamp cadence); this pass skips them so raw-seeded
+    # NULL rows do not turn a read-only open into a write. Consequence:
+    # a clean store re-verifies on every open (read-only scan).
+    while True:
+        if _bf_last is None:
+            fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
+                         "ORDER BY rowid LIMIT ?")
+        else:
+            fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
+                         "WHERE rowid > ? ORDER BY rowid LIMIT ?")
+        try:
+            rows = conn.execute(fetch_sql, (batch_size,) if _bf_last is None
+                                else (_bf_last, batch_size)).fetchall()
+        except (UnicodeDecodeError, sqlite3.OperationalError) as decode_exc:
+            # PR #525 feedback (round-1 F-2): a TEXT cell holding bytes
+            # that are not valid UTF-8 raises INSIDE the SELECT's own
+            # decode — UnicodeDecodeError on older stacks,
+            # OperationalError('Could not decode to UTF-8 column ...')
+            # on sqlite >= 3.45. A real database error re-raises from the
+            # bytes-factory refetch below.
+            conn.text_factory = bytes
+            try:
+                raw_rows = conn.execute(
+                    fetch_sql, (batch_size,) if _bf_last is None
+                    else (_bf_last, batch_size)).fetchall()
+            except sqlite3.OperationalError:
+                raise decode_exc
+            finally:
+                conn.text_factory = str
+            # decode ONLY the norm column here and keep the raw content
+            # bytes — the stale filter's single _norm_text(r[1]) call
+            # classifies content (stage-B reviewer: pre-decoding turned
+            # an undecodable-content row into "" and healed it to an
+            # empty norm instead of skipping it). A genuine NULL norm
+            # stays None: _norm_text(None) maps to "" and would wrongly
+            # enter the stale set (stage-B reviewer round 2).
+            rows = [(r[0], r[1], None if r[2] is None else _norm_text(r[2]))
+                    for r in raw_rows]
+        if not rows:
+            break
+        # Index access (rowid=0, content=1, content_norm=2): the pass must
+        # run on connections without a Row factory too (raw sqlite3.connect
+        # callers; the busy-abort supp probe found the mapping access
+        # crashing there).
+        for r in rows:
+            if _bf_last is None or r[0] > _bf_last:
+                _bf_last = r[0]
+        # PR #525 feedback (round-1 F-2): rows whose content is not
+        # verifiable text (undecodable bytes; _norm_text maps them to
+        # None) are skipped — outside the norm contract, never
+        # normalized. With a bytes-factory batch the norm column is
+        # decoded through the same helper.
+        stale = [r for r in rows
+                 if r[2] is not None
+                 and _norm_text(r[1]) is not None
+                 and r[2] != _normalize_content(_norm_text(r[1]))]
+        if not stale:
+            continue
+        own_tx = not conn.in_transaction
+        sp = "zmem_norm_verify_163"
+        try:
+            if own_tx:
+                conn.execute("BEGIN IMMEDIATE")
+            else:
+                conn.execute(f"SAVEPOINT {sp}")
+            for r in stale:
+                canonical = _normalize_content(_norm_text(r[1]))
+                cur = conn.execute(
+                    "UPDATE memory SET content_norm=? WHERE rowid=? "
+                    "AND content IS ? AND content_norm IS ?",
+                    (canonical, r[0], r[1], r[2]))
+                if cur.rowcount:
+                    healed += 1
+                    continue
+                # Zero-row compare-and-update: the row changed under us.
+                fresh = conn.execute(
+                    "SELECT rowid, content, content_norm FROM memory "
+                    "WHERE rowid=?", (r[0],)).fetchone()
+                if fresh is None:
+                    continue  # row deleted under us — nothing to verify
+                fresh_text = _norm_text(fresh[1])
+                if fresh_text is None:
+                    # the row changed under us into an unverifiable shape
+                    continue
+                canonical = _normalize_content(fresh_text)
+                if fresh[2] == canonical:
+                    continue  # the concurrent writer already fixed it
+                retry = conn.execute(
+                    "UPDATE memory SET content_norm=? WHERE rowid=? "
+                    "AND content IS ? AND content_norm IS ?",
+                    (canonical, fresh[0], fresh[1], fresh[2]))
+                if not retry.rowcount:
+                    raise _NormVerifyConflict(
+                        f"rowid {r[0]} kept changing during the "
+                        "norm-verification pass")
+                healed += 1
+            # Heal batch commits WITHOUT the stamp (round-6 reviewer
+            # finding: a stamp committed with an EARLY batch would
+            # permanently certify a partial verification if a later batch
+            # fails or the process dies mid-scan — the early-return stamp
+            # check would then skip the unscanned rows forever). The stamp
+            # is written once, after the ENTIRE scan completes.
+            if own_tx:
+                conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+        except _NormVerifyConflict:
+            if not own_tx:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except sqlite3.Error:
+                    pass
+            elif conn.in_transaction:
+                # Final-critic finding 1: the own-transaction arm must not
+                # keep the BEGIN IMMEDIATE write lock when the pass aborts
+                # (same discipline as the sqlite3.Error arm below).
+                conn.rollback()
+            # PR #525 feedback (round-1 F-7): abort paths must not be
+            # fully silent — one stderr line, never stdout (hooks parse
+            # stdout envelopes).
+            sys.stderr.write(
+                "[zmem] content_norm verification deferred (a row kept "
+                "changing under the pass); the next open re-runs it\n")
+            return  # abort without stamping; a later open re-runs
+        except sqlite3.Error as exc:
+            # database-is-locked / SQLITE_BUSY_SNAPSHOT (OperationalError)
+            # or any other mid-batch database failure (review round 2: a
+            # constraint-style failure must not strand the batch
+            # savepoint): bound the undo to this batch on the
+            # caller-transaction path and abort without stamping — never
+            # misclassify as a zero-row compare miss.
+            if not own_tx:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                except sqlite3.Error:
+                    pass
+            elif conn.in_transaction:
+                conn.rollback()
+            # PR #525 feedback (round-1 F-7): one stderr line on the
+            # sqlite-failure abort (locked/busy, damaged FTS, ...) — the
+            # pass is deferred, not lost; the next open re-runs it.
+            sys.stderr.write(
+                "[zmem] content_norm verification deferred (%s); the "
+                "next open re-runs it\n" % (exc,))
+            return
+    # Post-scan stamp (round-6 reviewer finding): the completion stamp is
+    # written exactly once, AFTER the entire scan has finished with no
+    # abort — a persisted stamp therefore implies the whole verification
+    # completed. A heal batch that committed earlier stays durable (the
+    # rows are canonical now) but does NOT certify the pass; if a later
+    # batch aborted or the process died mid-scan, the stamp is absent and
+    # the next open re-scans (finding only the still-stale rows).
+    # Zero-write on clean stores (and on only-NULL scans — 162's lane)
+    # still holds: no heals -> no stamp -> no bytes. With a caller
+    # transaction open the stamp rides the caller's commit; otherwise it
+    # commits its own small transaction.
+    if healed > 0:
+        # Round-7 reviewer finding: on the own-transaction path the heal
+        # batches have committed and RELEASED the write lock by the time
+        # the stamp needs a fresh one, so a concurrent writer can hold it
+        # here. The stamp is an optimization (skip later re-scans), never
+        # a correctness requirement — a failure at stamp time must leave
+        # the pass unstamped and return, exactly like the batch abort
+        # arms, instead of aborting the caller's open. Residual,
+        # disclosed: heals that committed before the failed stamp leave
+        # nothing stale, so that store never stamps — it re-scans
+        # read-only on every open (the disclosed clean-store steady
+        # state); correctness is unaffected. On the caller-transaction
+        # path the heals already upgraded that transaction to write, so
+        # this arm can only fire on exotic failures (e.g. disk full) —
+        # swallow-and-return there too, never touching the caller's
+        # transaction.
+        # Round-8 reviewer finding: SQLite's FAIL conflict resolution does
+        # NOT undo the failing statement's own changes, so an error AFTER
+        # the stamp row was inserted (e.g. an AFTER INSERT trigger) would
+        # leave the partial stamp pending inside a CALLER-owned
+        # transaction for the caller's commit to persist. A stamp-local
+        # SAVEPOINT bounds the undo to the stamp statement alone — the
+        # caller's transaction stays open with its prior work intact
+        # (heals already released), and no stamp survives any failure,
+        # including a commit() failure on the verifier-owned path (the
+        # rollback there discards the stamp the commit failed to land).
+        stamp_sp = "zmem_norm_verify_163_stamp"
+        try:
+            if caller_tx:
+                conn.execute(f"SAVEPOINT {stamp_sp}")
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) "
+                "VALUES ('content_norm_verify_163', 'done')")
+            if not caller_tx:
+                conn.commit()
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {stamp_sp}")
+        except sqlite3.Error as exc:
+            if not caller_tx:
+                if conn.in_transaction:
+                    conn.rollback()
+            else:
+                try:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {stamp_sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {stamp_sp}")
+                except sqlite3.Error:
+                    pass
+            # PR #525 feedback (round-1 F-7): same one-line stderr
+            # discipline for the stamp-time failure.
+            sys.stderr.write(
+                "[zmem] content_norm verification completed but its "
+                "completion stamp could not be written (%s); the next "
+                "open re-scans\n" % (exc,))
+            return
+
+
+class _NormVerifyConflict(Exception):
+    """Internal: a row kept changing under the norm-verification pass."""
 
 
 # Issue #137: additive belief-head side tables.  Like the v14 evidence
@@ -2965,6 +3296,16 @@ def migrate(conn: sqlite3.Connection) -> None:
     # repair (the v8 batch shape) so an upgraded store heals on its next
     # open; the meta stamp keeps the steady state a single meta read.
     _repair_null_content_norm_162(conn)
+
+    # Version-INDEPENDENT (issue #493 AC6): the NULL-only repair above
+    # cannot reach a STALE NON-NULL norm a PRE-#491 sqlite import wrote from
+    # a source store (the admission-time verify leg shipped with #491
+    # covers new imports only). This verification pass checks EVERY
+    # retained norm against the canonical normalize of its own row's
+    # content under its own one-time stamp, with compare-and-update
+    # batching so a concurrent writer can never receive a stale-computed
+    # norm (see the function docstring for the transaction discipline).
+    _verify_content_norms_163(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.
     # Version-independent on purpose — SUPPORTED_SCHEMA_VERSION does not move,

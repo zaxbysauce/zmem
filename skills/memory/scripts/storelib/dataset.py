@@ -264,8 +264,14 @@ def _read_family(export_dir: Path, family: str, fmt: str) -> list[dict]:
         return table.to_pylist()
     path = export_dir / "data" / f"{stem}.jsonl"
     rows: list[dict] = []
+    # Issue #493 AC3: stream line-by-line — the reader never reads the
+    # whole family file into one buffer (binary iteration splits on
+    # b"\n" with identical semantics to the old read+split, including
+    # the blank-line skip for a trailing newline); disclosed: the
+    # consumer still accumulates the parsed rows, so peak memory remains
+    # O(family).
     with open(path, "rb") as fh:
-        for line in fh.read().split(b"\n"):
+        for line in fh:
             if line.strip():
                 rows.append(json.loads(line.decode("utf-8")))
     return rows
@@ -734,6 +740,17 @@ def _read_export_families(source: Path, fmt: str, err) -> dict[str, list]:
         # Absence is only tolerated for the ADDITIVE family; the original
         # four must always exist (their _read_family call above raises).
         _ = err  # the required-four errors surface from _read_family
+    # Issue #493 AC5: the dict-shape gate is CENTRAL — both consumers
+    # (import_dataset's required-key loop and the publish lane's
+    # _read_export_records) hit it before any membership/access, so every
+    # non-dict row shape (int/list/str/None/bool) refuses through the
+    # caller's own error contract instead of raising a raw TypeError.
+    for family, rows in families.items():
+        for row in rows:
+            if not isinstance(row, dict):
+                raise err(
+                    f"malformed {family} record: expected a JSON object, "
+                    f"got {type(row).__name__}")
     return families
 
 

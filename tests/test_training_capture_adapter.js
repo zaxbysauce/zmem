@@ -479,6 +479,16 @@ test("detached observations start only after the translated hook has produced it
         "utf8");
     fs.writeFileSync(capture,
         "import json, os, sys\n" +
+        "def log_observation(kind, action):\n" +
+        "    with open(os.environ['ZMEM_CAPTURE_TEST_LOG'], 'a', encoding='utf-8') as out:\n" +
+        "        out.write(kind + ':' + action + '\\n')\n" +
+        "# Issue #432 recurrence probe: interpreter entry is the FIRST act, BEFORE\n" +
+        "# stdin is read — the next CI recurrence of 'missing detached observation'\n" +
+        "# separates 'no interpreter entry observed by the deadline' (startup\n" +
+        "# absence) from an entry that started but lost the input/read, because\n" +
+        "# this line appears in the observation log exactly when the interpreter\n" +
+        "# has started executing this script (the action rides argv, not stdin).\n" +
+        'log_observation("interpreter-entry", sys.argv[sys.argv.index(\'--action\') + 1] if \'--action\' in sys.argv else \'unknown\')\n' +
         "payload = json.load(sys.stdin)\n" +
         "with open(os.environ['ZMEM_CAPTURE_TEST_LOG'], 'a', encoding='utf-8') as out:\n" +
         "    out.write('capture:' + payload['action'] + '\\n')\n" +
@@ -521,7 +531,13 @@ test("detached observations start only after the translated hook has produced it
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
         }
         const order = fs.readFileSync(log, "utf8").trim().split(/\r?\n/);
-        assert(order.includes("capture:observe"), `missing detached observation: ${order}`);
+        // Issue #432 probe diagnostics: the interpreter-entry marker is the
+        // FIRST act of the fake capture script. On a recurrence, an order
+        // list WITHOUT an interpreter-entry line means no interpreter entry
+        // was observed by the deadline (startup absence); one WITH the
+        // marker but without capture:observe means the entry started but
+        // lost the input/read — the two hypotheses the probe separates.
+        assert(order.includes("capture:observe"), `missing detached observation (no interpreter entry observed by the deadline if interpreter-entry is absent from the order, an input/read failure if it is present): ${order}`);
         assert(order.indexOf("child-finished") < order.indexOf("capture:observe"),
             `observation ran before child completion: ${order}`);
     } finally {

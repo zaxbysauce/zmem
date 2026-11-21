@@ -473,6 +473,23 @@ CARD_SOURCE_REF_WARNING = (
 # prefix literal (every guard site needs it cheaply, without importing the
 # knowledge module — which imports THIS one).
 KNOWLEDGE_SOURCE_REF_PREFIX = "knowledge:"
+
+
+def _has_knowledge_prefix(source_ref: str | None) -> bool:
+    """ASCII-case-insensitive ``knowledge:`` prefix test — the Python twin of
+    the SQL guards (``NOT LIKE 'knowledge:%'``), which fold ASCII case only
+    (issue #493 AC4): a ``KNOWLEDGE:``-prefixed ref must be refused by the
+    same write-path admission gates that refuse the lowercase form, exactly
+    as every SQL window already excludes it. Unicode case-folding
+    (str.lower) is deliberately NOT used: SQLite LIKE folds ASCII only, and
+    str.lower would wrongly accept lookalikes (e.g. the Kelvin sign K)."""
+    if not source_ref:
+        return False
+    head = source_ref[:len(KNOWLEDGE_SOURCE_REF_PREFIX)]
+    folded = "".join(c.lower() if "A" <= c <= "Z" else c for c in head)
+    return folded == KNOWLEDGE_SOURCE_REF_PREFIX
+
+
 KNOWLEDGE_SOURCE_REF_WARNING = (
     "[zmem] WARNING: source_ref prefix knowledge: is reserved for knowledge "
     "pointers (storelib.knowledge)"
@@ -523,7 +540,7 @@ def warn_reserved_source_ref(source_ref: str | None) -> None:
         print(RESERVED_SOURCE_REF_WARNING, file=sys.stderr)
     elif source_ref.startswith("card:"):
         print(CARD_SOURCE_REF_WARNING, file=sys.stderr)
-    elif source_ref.startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+    elif _has_knowledge_prefix(source_ref):
         print(KNOWLEDGE_SOURCE_REF_WARNING, file=sys.stderr)
 
 def _redact_secret_like_text(text: str) -> tuple[str, int]:
@@ -1747,7 +1764,7 @@ def add_memory(
     # an unregistered module (None — e.g. after a reload reset the global)
     # fails CLOSED for every caller including the None default, never
     # `None is not None`-open (review round).
-    if ((source_ref or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
+    if (_has_knowledge_prefix(source_ref)
             and (_KNOWLEDGE_CAPABILITY is None
                  or _knowledge_cap is not _KNOWLEDGE_CAPABILITY)):
         raise ValueError(
@@ -2475,7 +2492,7 @@ def supersede_memory(
         # later, an authenticated knowledge tombstone op) tombstones pointer
         # rows. Raised as KnowledgePointerRefusal so sync's ingest lane can
         # count it as tombstone_refused instead of a generic malformed row.
-        if (row["source_ref"] or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX):
+        if _has_knowledge_prefix(row["source_ref"]):
             if started_tx and conn.in_transaction:
                 conn.rollback()
             raise KnowledgePointerRefusal(
@@ -2705,8 +2722,8 @@ def update_memory(
     # it never routes through update_memory). The old-row check catches a
     # content-only edit that passes source_ref=None (which would otherwise
     # inherit the ref and slip past a source_ref_eff-only guard).
-    if ((source_ref_eff or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
-            or (old["source_ref"] or "").startswith(KNOWLEDGE_SOURCE_REF_PREFIX)):
+    if (_has_knowledge_prefix(source_ref_eff)
+            or _has_knowledge_prefix(old["source_ref"])):
         raise ValueError(
             "update refused: source_ref prefix knowledge: is reserved for "
             "knowledge pointers — an ordinary row cannot claim a knowledge "
@@ -3354,7 +3371,7 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
         content = row["content"] or ""
         tags = row["tags"] or ""
         source_ref = row["source_ref"] or ""
-        is_pointer = source_ref.startswith(KNOWLEDGE_SOURCE_REF_PREFIX)
+        is_pointer = _has_knowledge_prefix(source_ref)
         try:
             new_content, new_source_ref, new_tags, _warnings = (
                 apply_capture_policy(content=content, source_ref=source_ref,

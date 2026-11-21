@@ -2678,7 +2678,7 @@ scanned store stays byte-identical. `--apply` redacts each candidate via
 carrying `update_of`) in ONE transaction; any policy refusal or dedup fold
 rolls the whole batch back (exit 2, store untouched). The tombstoned
 predecessor keeps its plaintext (FTS-indexed, `--as-of` reachable) — run
-`purge` (below) on the reported ids for durable removal.
+`purge` (below) on the reported ids for durable removal. A stored row whose source_ref carries a case-variant `KNOWLEDGE:` prefix (`KNOWLEDGE:`/`Knowledge:`, mirrored by the write-path guards since the prefix-agreement fix) is quarantined as a pointer with no live redacted successor — the tombstoned predecessor keeps its plaintext, so `purge` on the reported ids is the durable-removal step for that shape too.
 
 ### embedding-health — print embedding lane health as JSON (issue #131)
 ```
