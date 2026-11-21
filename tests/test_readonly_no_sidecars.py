@@ -295,7 +295,9 @@ class ReadonlyNoSidecarsTest(unittest.TestCase):
                 "'2026-01-01T00:00:00Z')")
             writer.commit()
             self.assertTrue(Path(str(store) + "-wal").exists())
-            handle = readonly.open_readonly(store)
+            # Snapshot verification must never materialize the entire database.
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("whole-file read")):
+                handle = readonly.open_readonly(store)
             try:
                 rows = handle.conn.execute(
                     "SELECT count(*) FROM memory").fetchone()
