@@ -264,10 +264,12 @@ def _read_family(export_dir: Path, family: str, fmt: str) -> list[dict]:
         return table.to_pylist()
     path = export_dir / "data" / f"{stem}.jsonl"
     rows: list[dict] = []
-    # Issue #493 AC3: stream line-by-line — the reader must never
-    # materialize the whole family file into one buffer (binary iteration
-    # splits on b"\n" with identical semantics to the old read+split,
-    # including the blank-line skip for a trailing newline).
+    # Issue #493 AC3: stream line-by-line — the reader never reads the
+    # whole family file into one buffer (binary iteration splits on
+    # b"\n" with identical semantics to the old read+split, including
+    # the blank-line skip for a trailing newline); disclosed: the
+    # consumer still accumulates the parsed rows, so peak memory remains
+    # O(family).
     with open(path, "rb") as fh:
         for line in fh:
             if line.strip():

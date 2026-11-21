@@ -19,13 +19,25 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "skills" / "memory" / "scripts"
+_SYS_PATH_SAVED = list(sys.path)  # closeout critic: restore at teardown
 sys.path.insert(0, str(SCRIPTS))
 
 _TMP = Path(tempfile.mkdtemp(prefix="zmem-n493-supp-"))
+# closeout critic (ASK adjudication): snapshot ONLY the keys this module
+# pins — a full os.environ copy taken at COLLECTION time would later wipe
+# import-time env set by modules collected after this one (executed:
+# ZMEM_MCP_TOKEN_FILE from test_tasktext_hub_argv.py vanished -> auth
+# SystemExit in the canary co-run)
+_ENV_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODEL_AUTODOWNLOAD",
+             "ZMEM_MODELS_DIR")
+_ENV_ORIGINAL = {k: os.environ.get(k) for k in _ENV_KEYS}
 os.environ["ZMEM_STORE"] = str(_TMP / "store" / "store.sqlite")
 os.environ["ZMEM_DATA"] = str(_TMP / "data")
 os.environ.setdefault("ZMEM_MODEL_AUTODOWNLOAD", "0")
 os.environ["ZMEM_MODELS_DIR"] = str(_TMP / "models")  # nonexistent -> degraded
+_SY_MODULES_SAVED = {k: m for k, m in sys.modules.items()
+                     if k == "storelib" or k.startswith("storelib.")
+                     or k == "_store_guard"}
 
 import _store_guard  # noqa: F401,E402  (issue #244 isolation guard; the
 # env pins above precede it per the house rule)
@@ -38,27 +50,38 @@ def _fresh_store(name: str) -> Path:
     root = _TMP / name
     store = root / "store" / "store.sqlite"
     store.parent.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
+    env = _store_env(root / "data")
     env["ZMEM_STORE"] = str(store)
-    env["ZMEM_DATA"] = str(root / "data")
     r = subprocess.run(
         [sys.executable, "-X", "utf8", str(SCRIPTS / "store.py"), "init"],
-        capture_output=True, text=True, env=env, timeout=300, cwd=str(REPO))
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=env, timeout=300, cwd=str(REPO))
     assert r.returncode == 0, r.stderr
     return store
+
+
+_AMBIENT_MARKERS = (
+    "ZMEM_SESSION", "ZMEM_SESSION_ID", "ZMEM_NAMESPACE", "ZMEM_PROJECT",
+    "ZCODE_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "CODEX_PROJECT_DIR")
 
 
 def _store_env(store: Path) -> dict:
     env = dict(os.environ)
     env["ZMEM_STORE"] = str(store)
     env["ZMEM_DATA"] = str(store.parent)
+    # round-1 F-8 (subprocess-platform-04): ambient session/namespace/
+    # project-dir markers leak into child process envs and skew the
+    # launcher's namespace resolution; strip them for every driver.
+    for key in _AMBIENT_MARKERS:
+        env.pop(key, None)
     return env
 
 
 def _run_cli(store: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-X", "utf8", str(SCRIPTS / "store.py"), *args],
-        capture_output=True, text=True, env=_store_env(store),
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", env=_store_env(store),
         timeout=600, cwd=str(REPO))
 
 
@@ -533,6 +556,24 @@ class NormVerifySuppTest(unittest.TestCase):
             stale_cnt = conn.execute(
                 "SELECT COUNT(*) FROM memory WHERE content_norm LIKE "
                 "'STALE %'").fetchone()[0]
+            self.assertFalse(
+                conn.in_transaction,
+                "the aborted pass leaves no verifier-owned transaction "
+                "open on the connection (round-2 F-2)")
+            # Durability must be observed from a SECOND connection: the
+            # later retry commits this connection's pending work, so
+            # same-connection reads cannot see a missing per-batch
+            # commit (round-2 F-2: the mutant survived the old shape).
+            check = sqlite3.connect(str(store), timeout=5)
+            try:
+                n1 = check.execute(
+                    "SELECT content_norm FROM memory WHERE id="
+                    "'96000000-0000-4000-8000-000000000001'").fetchone()[0]
+                stale_cnt = check.execute(
+                    "SELECT COUNT(*) FROM memory WHERE content_norm "
+                    "LIKE 'STALE %'").fetchone()[0]
+            finally:
+                check.close()
             self.assertEqual(
                 n1, _normalize_content("partial pass body 1"),
                 "batch 1's committed heal stays durable")
@@ -560,10 +601,27 @@ class NormVerifySuppTest(unittest.TestCase):
 
     def test_large_store_heals_across_batches(self):
         store = _fresh_store("nv-batches")
-        for i in range(505):
-            r = _run_cli(store, "add", "--content", f"batch body {i}",
-                         "--namespace", "project:supp", "--type", "fact")
-            self.assertEqual(r.returncode, 0, r.stderr)
+        # round-1 F-8 (tf-04/05): 505 serial CLI adds cost ~11 minutes;
+        # seed the rows directly — the coverage target is the pass's
+        # batch-boundary healing, not the CLI add path (exercised
+        # elsewhere in this file), so one CLI init + SQL seeds keep the
+        # leg inside the CI loop's runtime band.
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.executemany(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "(?,?,?,?,?,'session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',?)",
+                [("97000000-0000-4000-8000-" + f"{i:012d}",
+                  "project:supp", "fact", f"batch body {i}", "",
+                  _normalize_content(f"batch body {i}"))
+                 for i in range(505)])
+            conn.commit()
+        finally:
+            conn.close()
         conn = sqlite3.connect(str(store))
         try:
             conn.execute(
@@ -584,6 +642,178 @@ class NormVerifySuppTest(unittest.TestCase):
             conn.close()
         for content, norm in rows:
             self.assertEqual(norm, _normalize_content(content or ""))
+
+    def test_non_text_content_rows_skip_and_open_succeeds(self):
+        """round-1 F-2: rows whose content is not verifiable text — an
+        invalid-UTF-8 BLOB, a valid-UTF-8 BLOB, an invalid-UTF-8 TEXT
+        cell — must not crash the open. The 162 repair and the 163 pass
+        both SKIP the unverifiable shapes (norm stays NULL / stale stays)
+        and heal/verify the decodable ones; the open succeeds and the
+        stamps follow their normal cadence."""
+        store = _fresh_store("nv-nontext")
+        _run_cli(store, "add", "--content", "anchor body",
+                 "--namespace", "project:supp", "--type", "fact")
+        from storelib import schema as schema_mod  # env pinned at import
+        conn = sqlite3.connect(str(store))
+        try:
+            schema_mod.init_db(conn)
+            schema_mod.migrate(conn)
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_repair_162'")
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn.commit()
+        finally:
+            conn.close()
+        raw = sqlite3.connect(str(store))
+        try:
+            raw.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('96000000-0000-4000-8000-000000000901','project:supp',"
+                "'fact',CAST(X'41424300FF44' AS BLOB),'','session:x',"
+                "0.9,'test','2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',NULL)")  # invalid-UTF-8 BLOB
+            raw.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('96000000-0000-4000-8000-000000000902','project:supp',"
+                "'fact',CAST(X'7370616365' AS BLOB),'','session:x',"
+                "0.9,'test','2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',NULL)")  # valid-UTF-8 BLOB
+            # an invalid-UTF-8 TEXT cell: CAST keeps the TEXT storage
+            # class carrying non-UTF-8 bytes (a plain bytes bind would be
+            # stored as a BLOB — stage-B reviewer correction)
+            raw.execute(
+                "INSERT INTO memory (id, namespace, type, content, "
+                "tags, source_ref, confidence, signal, valid_from, "
+                "taint, ingestion_ts, content_norm) VALUES "
+                "('96000000-0000-4000-8000-000000000903','project:supp',"
+                "'fact',CAST(X'FFFE' AS TEXT),'','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',NULL)")
+            # an undecodable-content row WITH a stale non-NULL norm: the
+            # 163 pass must SKIP it (norm unchanged) — this row is the
+            # discriminator for the skip arm and for the reviewer's
+            # double-conversion bug (which healed it to an empty norm)
+            raw.execute(
+                "INSERT INTO memory (id, namespace, type, content, "
+                "tags, source_ref, confidence, signal, valid_from, "
+                "taint, ingestion_ts, content_norm) VALUES "
+                "('96000000-0000-4000-8000-000000000904','project:supp',"
+                "'fact',CAST(X'FFFE' AS TEXT),'','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z','WRONG UNDECODABLE NORM')")
+            raw.commit()
+        finally:
+            raw.close()
+        # reopen through the full migrate(): was the round-1 F-2 crash
+        conn2 = sqlite3.connect(str(store))
+        try:
+            schema_mod.migrate(conn2)  # must not raise
+            # typeof() instead of content: the undecodable TEXT cell
+            # would crash a plain SELECT's decode
+            rows = conn2.execute(
+                "SELECT id, typeof(content), content_norm FROM memory "
+                "WHERE id LIKE '96000000-0000-4000-8000-0000000009%' "
+                "ORDER BY id").fetchall()
+            by_id = {r[0][-3:]: (r[1], r[2]) for r in rows}
+            self.assertEqual(by_id["901"][0], "blob", "fixture shape")
+            self.assertEqual(by_id["903"][0], "text", "fixture shape")
+            self.assertIsNone(
+                by_id["901"][1],
+                "fixture: invalid-UTF-8 BLOB row keeps NULL norm")
+            self.assertIsNone(
+                by_id["903"][1],
+                "fixture: invalid-UTF-8 TEXT row keeps NULL norm")
+            self.assertEqual(
+                by_id["904"][1], "WRONG UNDECODABLE NORM",
+                "fixture setup: the undecodable row carries a stale "
+                "non-NULL norm")
+            self.assertEqual(
+                by_id["902"][1],
+                _normalize_content("space"),
+                "fixture: the valid-UTF-8 BLOB row was repaired")
+            stamped = conn2.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            # the 162 repair healed 902 (and the anchor row healed at the
+            # first migrate) so 163's scan finds nothing stale and stays
+            # unstamped (zero-write)
+            self.assertIsNone(stamped,
+                              "zero-write: nothing stale for 163 to heal")
+        finally:
+            conn2.close()
+        # mixed-batch discriminator (stage-B reviewer round 2): after the
+        # 162 repair has stamped, a NEW NULL-norm row that shares a
+        # decode-fallback batch with the undecodable rows must STAY NULL
+        # (163's lane split) — the pre-fix fallback converted the NULL to
+        # "" and healed it
+        raw2 = sqlite3.connect(str(store))
+        try:
+            raw2.execute(
+                "INSERT INTO memory (id, namespace, type, content, tags, "
+                "source_ref, confidence, signal, valid_from, taint, "
+                "ingestion_ts, content_norm) VALUES "
+                "('96000000-0000-4000-8000-000000000905','project:supp',"
+                "'fact','null lane mixed body','','session:x',0.9,'test',"
+                "'2026-01-01T00:00:00Z','trusted_internal',"
+                "'2026-01-01T00:00:00Z',NULL)")
+            raw2.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            raw2.commit()
+        finally:
+            raw2.close()
+        conn5 = sqlite3.connect(str(store))
+        try:
+            schema_mod.migrate(conn5)  # fallback batch: undecodable + NULL
+            n905 = conn5.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'96000000-0000-4000-8000-000000000905'").fetchone()[0]
+        finally:
+            conn5.close()
+        self.assertIsNone(
+            n905,
+            "a NULL norm in a decode-fallback batch stays NULL (162's "
+            "lane; not healed by the 163 pass)")
+        # and a stale NORM on a decodable row still heals next open even
+        # with the unverifiable rows present
+        conn3 = sqlite3.connect(str(store))
+        try:
+            conn3.execute(
+                "UPDATE memory SET content_norm='WRONG' "
+                "WHERE content='anchor body'")
+            conn3.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn3.commit()
+        finally:
+            conn3.close()
+        r = _run_cli(store, "stats")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        conn4 = sqlite3.connect(str(store))
+        try:
+            norm = conn4.execute(
+                "SELECT content_norm FROM memory WHERE "
+                "content='anchor body'").fetchone()
+            bad = conn4.execute(
+                "SELECT content_norm FROM memory WHERE id IN "
+                "('96000000-0000-4000-8000-000000000901',"
+                "'96000000-0000-4000-8000-000000000903')").fetchall()
+            n904 = conn4.execute(
+                "SELECT content_norm FROM memory WHERE id="
+                "'96000000-0000-4000-8000-000000000904'").fetchone()[0]
+        finally:
+            conn4.close()
+        self.assertEqual(norm[0], _normalize_content("anchor body"),
+                         "verifiable rows still heal alongside skips")
+        for (bnorm,) in bad:
+            self.assertIsNone(bnorm, "unverifiable rows stay untouched")
+        self.assertEqual(
+            n904, "WRONG UNDECODABLE NORM",
+            "the undecodable stale row is SKIPPED (not healed, not "
+            "emptied) by the verification pass")
 
     def test_external_writer_serializes_and_stays_canonical(self):
         store = _fresh_store("nv-extwriter")
@@ -1082,9 +1312,8 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             conn.execute(
                 "DELETE FROM meta WHERE key='content_norm_verify_163'")
             conn.commit()
-            conn.close()
         finally:
-            pass
+            conn.close()
         import sqlite3 as s3
         blocker = s3.connect(str(store), timeout=0.3,
                              isolation_level=None)
@@ -1503,34 +1732,103 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
             conn.close()
 
     def test_second_open_does_not_rescan(self):
-        """Steady state: with the stamp present, a second open performs no
-        memory-table scan (no additional stamp write; the stamp row's
-        presence alone short-circuits)."""
-        import time
+        """Steady state (round-2 F-3 behavioral rewrite): the stamped
+        early return SKIPS the scan — a stale norm planted AFTER the
+        stamp survives a later open untouched, while the same stale row
+        heals on an unstamped store. (The old shape timed an unstamped
+        re-scan: a clean store never stamps, so the wall-clock bound
+        passed regardless and the early return's deletion survived.)"""
         store = _fresh_store("nv-noscan")
         _run_cli(store, "add", "--content", "noscan body",
                  "--namespace", "project:supp", "--type", "fact")
-        _run_cli(store, "stats")  # first non-empty open verifies + stamps
+        _run_cli(store, "stats")  # clean scan: heals nothing, no stamp
+        # Give the store a heal so the post-scan stamp lands.
         conn = sqlite3.connect(str(store))
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES "
-                "('noscan_probe', 'before')")
+                "UPDATE memory SET content_norm='WRONG NOSCAN' "
+                "WHERE content='noscan body'")
             conn.commit()
         finally:
             conn.close()
-        t0 = time.monotonic()
+        _run_cli(store, "stats")  # heals + stamps
+        conn = sqlite3.connect(str(store))
+        try:
+            stamped = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
+            self.assertIsNotNone(stamped, "fixture: stamp must be present")
+            # Plant a stale norm AFTER the stamp; the stamped early return
+            # must leave it untouched on the next open.
+            conn.execute(
+                "UPDATE memory SET content_norm='STALE AFTER STAMP' "
+                "WHERE content='noscan body'")
+            conn.commit()
+        finally:
+            conn.close()
         r = _run_cli(store, "stats")
-        elapsed = time.monotonic() - t0
         self.assertEqual(r.returncode, 0, r.stderr)
-        # A stamped store's verify is one meta read; the command stays in
-        # the normal stats cost band (generous bound: 30s for a subprocess
-        # under load; the real protection is the frozen C6 + stamp tests).
-        self.assertLess(elapsed, 30.0)
+        conn = sqlite3.connect(str(store))
+        try:
+            norm = conn.execute(
+                "SELECT content_norm FROM memory WHERE "
+                "content='noscan body'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(
+            norm[0], "STALE AFTER STAMP",
+            "the stamped early return skipped the scan (no re-heal)")
+        # Discriminator: the SAME stale row heals on an unstamped store.
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.execute(
+                "DELETE FROM meta WHERE key='content_norm_verify_163'")
+            conn.commit()
+        finally:
+            conn.close()
+        _run_cli(store, "stats")
+        conn = sqlite3.connect(str(store))
+        try:
+            norm2 = conn.execute(
+                "SELECT content_norm FROM memory WHERE "
+                "content='noscan body'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(norm2[0], _normalize_content("noscan body"),
+                         "unstamped, the same stale row heals")
 
 
 def tearDownModule():
     shutil.rmtree(str(_TMP), ignore_errors=True)
+    # closeout critic: restore ONLY the keys this module pinned (never
+    # os.environ.clear() — it wiped later-collected modules' import-time
+    # env and deleted pytest's PYTEST_CURRENT_TEST). CAVEAT: pytest imports
+    # every module at collection BEFORE any test runs, so a later-collected
+    # module's import-time pin DOES sit in os.environ while our tests run
+    # — the compare-and-restore below leaves those values alone (they are
+    # not ours), which is the whole reason for the guard. sys.path and the
+    # purged storelib modules are restored to their import-time state too.
+    for key, value in _ENV_ORIGINAL.items():
+        current = os.environ.get(key)
+        ours = current is not None and (
+            current == value
+            or (current.startswith(str(_TMP))))
+        if ours:
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    for key in list(sys.modules):
+        if (key == "storelib" or key.startswith("storelib.")
+                or key == "_store_guard") and key not in _SY_MODULES_SAVED:
+            del sys.modules[key]
+    for key, mod in _SY_MODULES_SAVED.items():
+        sys.modules[key] = mod
+    # sys.path: pre-import entries in their original order, then any
+    # entries later modules added (order preserved) — never reorders or
+    # drops a sibling's insertions
+    sys.path[:] = _SYS_PATH_SAVED + [sp for sp in sys.path
+                                     if sp not in _SYS_PATH_SAVED]
 
 
 if __name__ == "__main__":

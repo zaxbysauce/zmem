@@ -45,6 +45,16 @@ TEMPORAL_MODULES = [
 ]
 
 ENV_WRITING_MODULES = [
+    # PR #525 (round-1 F-8 test-infrastructure-11): the store-integrity
+    # suites pin ZMEM_STORE/ZMEM_DATA at import — covered by the
+    # one-process isolation contract like the other env-writing modules.
+    # (An interim exclusion existed while the supp file's teardown wiped
+    # co-runners' import-time env via os.environ.clear(); the closeout
+    # critic diagnosed it to a two-file repro and the teardown now
+    # restores only the keys this module pins. ISOLATION-CANARY: PASS at
+    # 29 modules.)
+    "tests/test_followup_n11.py",
+    "tests/test_followup_n493_supp.py",
     "tests/test_hermes_config.py",
     "tests/test_hermes_config_feedback.py",
     "tests/test_hermes_convention_order.py",
