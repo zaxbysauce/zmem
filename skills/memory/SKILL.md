@@ -485,7 +485,8 @@ attribute_dropped/attribute_drop_labels/attribute_rescued on occurrence.
 Derived pages whose bullets embed a suppressed source are withheld from the
 combined admission. Disclosed limits: the cue grammar is English-only, and
 distinct generic-noun subjects without identifiers ("usage reports" vs
-"error reports") can still over-bind (fail-open toward delivery).
+"error reports") can still over-bind, withholding a relevant fact that the
+pre-#498 gate would have delivered.
 
 #### Confidence floors (issue #58, 3.8)
 
