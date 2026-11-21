@@ -771,8 +771,14 @@ def _row_trust(row: Any) -> float:
 # Issue #498: prompt-assertion analysis (subject-bound suppression +
 # question-focus rescue). Pure functions, stdlib only, deterministic. The
 # frame parser below is SHARED by the live admission seam, the explain
-# replay, and eval_gold's independent verifier (the verifier re-derives
-# selection; it does not import the selection helpers).
+# replay, and eval_gold's verifier. PR #526 feedback (FB-103): the eval
+# verifier re-derives the SELECTION (ordinary gate pass + rescue loop) but
+# shares the parser (analyze_prompt / parse_row_assertions), the partition
+# (partition_prompt_assertions), the subject-compatibility predicate
+# (_pa_subject_compat), and the QUESTION_RESCUE_FLOOR constant — a mutation
+# inside those shared pieces moves production and the verifier together;
+# partition/floor correctness is pinned by unit tests and the mutation
+# battery instead.
 # ---------------------------------------------------------------------------
 
 QUESTION_RESCUE_FLOOR = 0.25
@@ -793,6 +799,16 @@ _PA_STOPWORDS = frozenset((
     "destination", "register", "location", "cost", "price", "frequency",
     "ownership", "duration", "approval", "approver", "receive", "receives",
     "handled", "handle", "routed", "route", "routes",
+    # PR #526 feedback (P-F3 side-finding): relation VERBS in question
+    # clauses name the asked relation, never the subject — leaving them in
+    # made "Who approves the job?" carry subject ['approves'], which broke
+    # ellipsis binding and forced the unbound fallback for every explicit
+    # subject.
+    "approves", "approve", "approved", "signs",
+    # Filler/request verbs (PR #526 feedback, parallel-review INTA-002):
+    # they ask or request, they never name the subject.
+    "remember", "please", "tell", "let", "know", "want", "check", "see",
+    "look", "review",
 ))
 
 # Value spans are 1-4 word noun phrases after an optional article (issue
@@ -868,19 +884,52 @@ _PA_NEGATION = re.compile(
 _PA_HYPOTHETICAL = re.compile(
     r"\b(?:if|suppose|assuming|hypothetically|were\s+it|in\s+case)\b",
     re.IGNORECASE)
-_PA_SENTENCE_SPLIT = re.compile(r"[.!?;]\s+|\s+-\s+|\n+")
+
+
+def _pa_fold(text):
+    """Unicode-fold a clause for the negation/hypothetical DETECTION only
+    (parallel-review MX-UIB-005): NFKD + combining-mark strip + casefold so
+    a homoglyph inside 'not' ("no\u0301t") still reads as negation. The
+    folded copy never feeds term extraction (subjects keep their original
+    graphemes)."""
+    import unicodedata as _ud
+    folded = _ud.normalize("NFKD", text or "")
+    folded = "".join(ch for ch in folded
+                     if not _ud.combining(ch))
+    return folded.casefold()
+_PA_SENTENCE_SPLIT = re.compile(
+    r"[.!?;]\s+|\s+-\s+|\n+|[;?](?=[A-Za-z])")
 _PA_QUESTION_MARK = re.compile(r"\?")
 _PA_Q_STARTERS = re.compile(
     r"^(?:who|what|where|which|how|whose|why|when)\b", re.IGNORECASE)
+# PR #526 feedback (parallel-review P-F2): a clause OPENING with a
+# yes/no auxiliary (interrogative inversion) is a question — the wh-word
+# starter list alone missed "Does the CLI send errors to stderr?", whose
+# terminal '?' the splitter consumes before the next clause.
+_PA_Q_AUX = re.compile(
+    r"^(?:is|are|was|were|am|do|does|did|has|have|had|can|could|should|"
+    r"would|will|shall|may|might|must)\b", re.IGNORECASE)
+_PA_WHETHER = re.compile(r"\bwhether\b", re.IGNORECASE)
 _PA_ANAPHOR_WORDS = frozenset(("this", "that", "it", "these", "those", "such"))
 
 
 def _pa_terms(text):
-    """Content terms of a span: lowercase word tokens minus stopwords."""
+    """Content terms of a span: casefolded word tokens minus stopwords.
+
+    PR #526 feedback (parallel-review P-F1): digit-bearing tokens are KEPT
+    regardless of length ("invoice 42" vs "invoice 17" must not bind), and
+    NFC-normalized casefold widens matching past ASCII while a trailing
+    possessive "'s" is stripped so "Kennet's" and "Kennet" bind."""
+    import unicodedata as _ud
     out = []
-    for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text or ""):
-        low = tok.lower()
-        if low in _PA_STOPWORDS or len(low) < 3:
+    for tok in re.findall(r"[^\W\d_][\w'\u2019-]*|\d[\w-]*", text or "",
+                          re.UNICODE):
+        low = _ud.normalize("NFC", tok).casefold()
+        if low.endswith("'s") or low.endswith("\u2019s"):
+            low = low[:-2]
+        if low in _PA_STOPWORDS:
+            continue
+        if len(low) < 3 and not any(ch.isdigit() for ch in low):
             continue
         out.append(low)
     return out
@@ -888,10 +937,13 @@ def _pa_terms(text):
 
 def _pa_clause_is_question(clause):
     """A clause is a question when it still carries its terminal '?' (only
-    the FINAL clause of a split retains punctuation) OR starts with a
-    question word (covers non-final clauses whose delimiter was consumed)."""
+    the FINAL clause of a split retains punctuation), starts with a
+    question word, opens with a yes/no auxiliary (interrogative inversion),
+    or embeds 'whether' (hedged/indirect question frames)."""
     return bool(_PA_QUESTION_MARK.search(clause)
-                or _PA_Q_STARTERS.match(clause.strip()))
+                or _PA_Q_STARTERS.match(clause.strip())
+                or _PA_Q_AUX.match(clause.strip())
+                or _PA_WHETHER.search(clause))
 
 
 def _pa_match_value(m):
@@ -906,7 +958,8 @@ def _pa_parse_clause(clause):
     hypothetical clauses yield nothing. Each item is
     {subject (terms), relation, value, clause_index:-1}."""
     found = []
-    if _PA_NEGATION.search(clause) or _PA_HYPOTHETICAL.search(clause):
+    folded = _pa_fold(clause)
+    if _PA_NEGATION.search(folded) or _PA_HYPOTHETICAL.search(folded):
         return found
     for relation, (cues, _q) in _PA_RELATIONS.items():
         for cue in cues:
@@ -970,6 +1023,11 @@ def _pa_parse_foci(clauses, assertions):
             if not qm:
                 continue
             subj, is_anaphor = _pa_focus_subject(clause)
+            # PR #526 feedback (P-F3): a focus whose subject is anaphoric or
+            # empty (ellipsis) is discourse-BOUND when a preceding assertion
+            # supplies it; only such bound foci may use the subject-unbound
+            # rescue fallback later.
+            bound_ctx = False
             if is_anaphor or not subj:
                 # Anaphor OR ellipsis (the question names no subject at all —
                 # "What destination should be used?"): bind to the nearest
@@ -983,22 +1041,39 @@ def _pa_parse_foci(clauses, assertions):
                         bound = a
                 if bound is not None:
                     subj = list(bound["subject"])
+                    bound_ctx = True
             answered = any(
                 a["relation"] == relation
                 and _pa_subject_compat(subj, a["subject"])
                 for a in assertions)
             foci.append({"subject": subj, "relation": relation,
-                         "clause_index": idx, "answered": answered})
+                         "clause_index": idx, "answered": answered,
+                         "bound": bound_ctx})
             break
     return foci
 
 
 def _pa_subject_compat(a_terms, b_terms):
     """Drop-rule affinity: SHARED CLAUSE CONTENT TERMS ONLY (issue #498 R10 —
-    cosine never participates in drop affinity)."""
+    cosine never participates in drop affinity).
+
+    PR #526 feedback (parallel-review P-F1): item-identity guard — when
+    BOTH sides carry digit-bearing identifiers and those identifier sets are
+    disjoint ("invoice 42" vs "invoice 17", "batch 7" vs "batch 9"), the
+    shared generic word does NOT bind: these are different items, so the
+    conflicting-default drop must not fire. A one-sided reference ("where
+    does the invoice go?" after "Invoice 42 ...") still binds."""
     if not a_terms or not b_terms:
         return False
-    return bool(set(a_terms) & set(b_terms))
+    sa = set(a_terms)
+    sb = set(b_terms)
+    if not (sa & sb):
+        return False
+    da = {t for t in sa if any(ch.isdigit() for ch in t)}
+    db = {t for t in sb if any(ch.isdigit() for ch in t)}
+    if da and db and not (da & db):
+        return False
+    return True
 
 
 def analyze_prompt(query):
@@ -1043,6 +1118,15 @@ def _pa_row_drop_type(frame, row_asserts):
     """
     if not row_asserts:
         return None
+    # PR #526 feedback (parallel-review MX-UIB-006): the qualified-fact
+    # exemption is checked BEFORE the conflict loop — a row that positively
+    # asserts the asked (unsupported-focus) attribute survives even when it
+    # ALSO carries a destination the prompt's explicit destination would
+    # conflict-drop.
+    foci = frame["foci"]
+    if len(foci) == 1 and foci[0]["relation"] in _PA_UNSUPPORTED_FOCI:
+        if any(ra["relation"] == foci[0]["relation"] for ra in row_asserts):
+            return None  # qualified fact: the row answers the asked attribute
     for row_assert in row_asserts:
         r_subj = row_assert["subject"]
         r_rel = row_assert["relation"]
@@ -1058,9 +1142,6 @@ def _pa_row_drop_type(frame, row_asserts):
     foci = frame["foci"]
     if len(foci) == 1 and foci[0]["relation"] in _PA_UNSUPPORTED_FOCI:
         focus = foci[0]
-        focus_rel = focus["relation"]
-        if any(ra["relation"] == focus_rel for ra in row_asserts):
-            return None  # qualified fact: the row answers the asked attribute
         for ra in row_asserts:
             if _pa_subject_compat(focus["subject"], ra["subject"]):
                 return "orthogonal"
@@ -1156,9 +1237,14 @@ def _pa_rescue_candidates(survivors, relation, subject_terms, used_ids,
 def rescue_nominees(frame, survivors, ordinary_selected):
     """R3/R10/R11/R14 fallback rescue: at most ONE row per unanswered,
     ordinarily-unsatisfied focus. Ordinary satisfaction is subject+relation
-    bound; when the question subject binds to nothing (discourse ellipsis —
-    "who approves the job?"), a subject-unbound pass restricted to the same
-    relation gate admits the best floor-clearing row instead."""
+    bound; when the question subject binds to nothing AND the focus was
+    anaphora/ellipsis-BOUND (its subject arrived from discourse context, not
+    from the question text — "who approves the job?"), a subject-unbound
+    pass restricted to the same relation gate admits the best floor-clearing
+    row instead (PR #526 feedback P-F3: an explicit question subject that
+    simply fails compat must NOT fall back to an unrelated row — "who
+    approves the Ash Register shipment?" must not rescue "Dana Reyes
+    approves Crane Repair")."""
     if not frame["foci"]:
         return {}
     ordinary_by_relation = {}
@@ -1175,11 +1261,23 @@ def rescue_nominees(frame, survivors, ordinary_selected):
             for subj in ordinary_by_relation.get(relation, []))
         if satisfied:
             continue
-        used = set(nominees)
+        # FB-107 / parallel-review MX-PO-002/INTA-007: a row the ordinary
+        # gate already admitted is NEVER re-nominated (the rescue exists to
+        # lift floor-rejected rows; counting an ordinary delivery as a
+        # rescue overstates attribute_rescued).
+        used = set(nominees) | {r["id"] for r in ordinary_selected}
         ranked = _pa_rescue_candidates(
             survivors, relation, focus["subject"], used, subject_bound=True)
-        if not ranked and focus["subject"]:
-            # Discourse-ellipsis fallback: same relation gate, no subject gate.
+        if not ranked and (not focus["subject"] or focus.get("bound")
+                           or len(focus["subject"]) <= 1):
+            # Discourse-ellipsis fallback: same relation gate, no subject
+            # gate — restricted to GENERIC subjects: foci whose subject came
+            # from anaphora/ellipsis binding, is empty, or is a single bare
+            # token ("where does the extra go?"). A MULTI-TERM subject names
+            # a specific item and must not be overridden by an unrelated
+            # row (P-F3: "who approves the Ash Register shipment?" must not
+            # rescue "Dana Reyes approves Crane Repair"; "who approves the
+            # forklift inspection?" must not rescue Mallory Vance).
             ranked = _pa_rescue_candidates(
                 survivors, relation, focus["subject"], used, subject_bound=False)
         if ranked:
@@ -1441,6 +1539,28 @@ def _injection_data_dir(data_dir: str | None = None) -> str:
         return str(Path(data_dir).expanduser().resolve())
     from storelib.schema import _resolve_store_path  # type: ignore
     return str(_resolve_store_path().parent)
+
+
+def _page_rows_withhold_partition_overlaps(page_rows, dropped_ids):
+    """PR #526 feedback (FB-109 / parallel-review MX-UR-08): withhold derived
+    pages whose bullet embeds the content of a row the prompt-assertion
+    partition dropped — the page would re-deliver the suppressed fact
+    verbatim (admit_with_pages removes the page's represented canonical
+    sources AFTER the partition runs). ``dropped_ids`` maps the partition's
+    dropped row ids to their labels; a page is withheld when ANY of its
+    represented/source ids is in that map. Non-string source ids are
+    ignored."""
+    if not page_rows or not dropped_ids:
+        return page_rows
+    out = []
+    for page in page_rows:
+        sources = (page.get("represented_ids")
+                   or page.get("source_ids") or [])
+        overlap = any(isinstance(sid, str) and sid in dropped_ids
+                      for sid in sources)
+        if not overlap:
+            out.append(page)
+    return out
 
 
 def select_and_budget_for_injection(
@@ -1943,6 +2063,15 @@ def select_and_budget_for_injection(
         try:
             page_rows = list(page_rows_pre)
             candidate_ids = _ordered_unique(candidate_ids + page_candidate_ids_pre)
+            # PR #526 feedback (FB-109 / parallel-review MX-UR-08): a page
+            # whose bullet embeds the content of a row the prompt-assertion
+            # partition dropped would re-deliver the suppressed fact verbatim
+            # (admit_with_pages removes the page's represented canonical
+            # sources AFTER the partition). Withhold such pages here — their
+            # canonical sources stay partition-dropped (they are not
+            # restored), matching the suppression contract.
+            page_rows = _page_rows_withhold_partition_overlaps(
+                page_rows, capture.get("attribute_drop_labels") or {})
             if page_rows:
                 # Recall retained its canonical pool with a widened budget so
                 # the final combined pass is the only admission decision.

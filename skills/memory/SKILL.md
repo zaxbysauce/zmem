@@ -456,6 +456,37 @@ Hermes `_tool_search` — byte-identical; MCP `recall` unfolds for free).
 | `ZMEM_ZCODE_DB` | `~/.zcode/cli/db/db.sqlite` | ZCode episodic db the Stop-hook detector reads (empty/unset = default) |
 | `ZMEM_REFLECT` | enabled | set to exactly `0` to disable the Stop hook entirely |
 
+### Prompt-assertion admission (issue #498)
+
+On the user-prompt injection lane, a lightweight clause parser extracts
+affirmative assignment assertions (destination/route, approver, frequency,
+cost, ownership, duration — negated, hypothetical, hedged-"whether", and
+question clauses including yes/no auxiliary questions never assert) and
+question foci. Before the relevance gate, a facts-only partition drops rows
+that duplicate a prompt assertion (PROMPT_DUPLICATE), conflict with it on
+the same subject+relation (CONFLICT), or answer a different attribute under
+a cost/ownership/duration question (ORTHOGONAL); constraints, decisions,
+preferences and belief heads are never dropped, and a row that answers the
+asked attribute survives even when it carries another conflicting attribute.
+Subject binding is item-identity aware: digit-bearing identifiers
+("invoice 42" vs "invoice 17") distinguish items, filler/request words are
+never subject terms, tokens are NFC/casefold-normalized with possessive
+"'s" stripped, and a one-sided generic reference ("the invoice") still
+binds. After the ordinary gate, a question whose subject came from
+anaphora/ellipsis binding, is empty, or is a single bare generic token may
+rescue exactly one best relation-compatible row whose strongest measured
+lane clears a fixed 0.25 floor (no environment knob); a multi-term subject
+names a specific item and is never overridden by an unrelated row, and
+rows the ordinary gate already admitted are never re-counted as rescues.
+A pool fully suppressed
+by the prompt's assertions reports below-relevance, not below-bar; the
+explain replay mirrors the same semantics and keys
+attribute_dropped/attribute_drop_labels/attribute_rescued on occurrence.
+Derived pages whose bullets embed a suppressed source are withheld from the
+combined admission. Disclosed limits: the cue grammar is English-only, and
+distinct generic-noun subjects without identifiers ("usage reports" vs
+"error reports") can still over-bind (fail-open toward delivery).
+
 #### Confidence floors (issue #58, 3.8)
 
 Five distinct floors live on the recall path. Each reflects a different
@@ -464,21 +495,6 @@ constants live in `schema_meta.py`.
 
 | Constant | Default | Env override | Used by |
 |---|---|---|---|
-### Prompt-assertion admission (issue #498)
-
-On the user-prompt injection lane, a lightweight clause parser extracts
-affirmative assignment assertions (destination/route, approver, frequency,
-cost, ownership, duration — negated, hypothetical and question clauses never
-assert) and subject-bound question foci. Before the relevance gate, a
-facts-only partition drops rows that duplicate a prompt assertion
-(PROMPT_DUPLICATE), conflict with it on the same subject+relation
-(CONFLICT), or answer a different attribute under a cost/ownership/duration
-question (ORTHOGONAL); constraints, decisions, preferences and belief heads
-are never dropped. After the ordinary gate, an unanswered
-subject+relation-compatible question may rescue exactly one best row whose
-strongest measured lane clears a fixed 0.25 floor (no environment knob).
-Constraints, decisions, and belief heads are never dropped by any rule.
-
 | `INJECT_FLOOR_PROMPT_DEFAULT` | 0.25 | `ZMEM_INJECT_FLOOR_PROMPT` | `recall` (UserPromptSubmit / PreCompact). Hard floor on FTS/vec results — anything below is dropped before scoring. |
 | `INJECT_FLOOR_RECENT_DEFAULT` | 0.5 | `ZMEM_INJECT_FLOOR_RECENT` | `recent` (SessionStart / subagent recall). Tighter because the surface is high-confidence recent material, not query-best match. |
 | `INJECT_FLOOR_GATE_NONE_DEFAULT` | 0.4 | `ZMEM_INJECT_FLOOR_GATE_NONE` | Hook selective-inject gate. `signal=none` rows must clear this floor; grounded-signal rows (`test`/`compile`/`lint`/`reviewer`/`user`) keep the 0.25 floor. |

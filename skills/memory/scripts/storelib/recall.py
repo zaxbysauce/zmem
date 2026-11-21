@@ -3266,7 +3266,14 @@ def _recall_injection_details(
                             or r.get("taint") == "untrusted_web")]
             expiry_drained = bool(diag) and not gate_pool
         reason = classify_silent_reason(
-            gate_pool, omitted=omitted, budget_emptied=budget_emptied,
+            # PR #526 feedback (RI-1): the classifier's ``rows`` is the
+            # POST-partition pool — an all-dropped pool is empty here, so
+            # the attribute_dropped branch fires below-relevance instead of
+            # the wrong below-bar verdict. candidate_ids and
+            # post_ledger_rows keep their PRE-partition meaning (the
+            # #117/#174 already-delivered precedence is unchanged).
+            [r for r in gate_pool if r["id"] not in pa_drops],
+            omitted=omitted, budget_emptied=budget_emptied,
             lane_stats=gate_stats, candidate_ids=candidate_ids,
             post_ledger_rows=post_ledger_pool,
             expiry_drained=expiry_drained,
@@ -3295,9 +3302,11 @@ def _recall_injection_details(
         "budget_dropped_protected": budget_dropped_protected,
         "budget_note": injection_budget_note,
     }
-    # Issue #498 diagnostics: explain-only counters (the wire envelope's
-    # closed key set ignores them); the explain replay surfaces the same
-    # counts plus per-row labels.
+    # Issue #498 diagnostics: keyed only when a drop or rescue happened.
+    # PR #526 feedback (FB-102): the SESSION selector path rebuilds a
+    # closed-key envelope (build_injection_envelope), so these keys reach
+    # only the direct no-session `--for-injection --json` wire — additive
+    # JSON keyed on occurrence, like secret_withheld/global_withheld.
     if pa_drops or pa_rescue:
         details["attribute_dropped"] = len(pa_drops)
         details["attribute_drop_labels"] = dict(pa_drops)
@@ -4975,9 +4984,16 @@ def explain_recall(
                 injection_reason = "injected"
             else:
                 injection_reason = classify_silent_reason(
-                    injection_candidate_rows, omitted=len(omitted),
+                    # PR #526 feedback (RI-1): same post-partition pool as
+                    # the live seam, so the explain reason matches it.
+                    [r for r in injection_candidate_rows
+                     if r["id"] not in pa_drops],
+                    omitted=len(omitted),
                     budget_emptied=injection_budget_emptied,
-                    lane_stats=injection_gate_stats)
+                    lane_stats=injection_gate_stats,
+                    candidate_ids=[r["id"] for r in injection_candidate_rows],
+                    post_ledger_rows=injection_candidate_rows,
+                    attribute_dropped=len(pa_drops))
         # PRR-001: mirror recall_memory's post-filter rerank stage so the
         # presented ranks the verdicts cite match a real recall when the
         # cross-encoder is CLI-enabled (the helper fails open to input order).

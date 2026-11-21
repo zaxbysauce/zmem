@@ -5,6 +5,8 @@ All notable changes to the **zmem** plugin are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.164.0] - 2026-11-20
 
 ### Fixed
@@ -12,16 +14,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - **Passive recall now respects explicit task details (issue #498, P0).** A
   stored standing default whose value conflicts with an explicit value in the
   prompt is no longer delivered, rendered or counted as surfaced; independent
-  attributes (e.g. the approver on a mixed prompt) survive; paraphrased
-  questions rescue their expected facts through a subject+relation-aware
-  fallback; self-answered prompts deliver nothing. The prompt-assertion
-  analysis is pure stdlib, facts-only (constraints/decisions/belief heads are
-  never dropped), and the fixed 0.25 question-rescue floor carries no new
-  environment knob. The explain replay, the eval injection verifier, and the
-  silent-reason classification all mirror the new admission semantics; the
-  closed reason vocabulary and envelope keys are unchanged.
-
-## [Unreleased]
+  attributes (e.g. the approver on a mixed prompt) survive; a question whose
+  subject is anaphora/ellipsis-bound may rescue its expected fact through a
+  subject+relation-aware fallback at a fixed 0.25 floor (no environment
+  knob); a prompt that itself asserts the asked fact delivers nothing. The
+  prompt-assertion analysis is pure stdlib and facts-only: constraints,
+  decisions, preferences and belief heads are never dropped, and a row that
+  answers the asked cost/ownership/duration attribute survives even when it
+  carries another conflicting attribute. Subject binding is item-identity
+  aware (digit-bearing identifiers distinguish items; filler words are never
+  subject terms) and tokens are NFC/casefold-normalized; yes/no auxiliary
+  questions, hedged "whether" clauses, and negated clauses never assert.
+  The explain replay and the silent-reason classification mirror the
+  admission semantics: a pool fully suppressed by the prompt's explicit
+  assertions reports below-relevance, not below-bar. The session-selector
+  envelope key set is unchanged; the direct no-session `--for-injection
+  --json` wire adds `attribute_dropped` / `attribute_drop_labels` /
+  `attribute_rescued`, keyed only when a drop or rescue happened. Derived
+  pages whose bullets embed a suppressed source are withheld from the
+  combined admission. Review feedback fixed on the same release: unrelated
+  approver rows are no longer rescued for explicitly-named subjects, and
+  already-delivered rows are never re-counted as rescues. The English cue
+  grammar and ASCII-first value tokens remain disclosed limits (accents are
+  casefold/NFC-matched, but non-English cue verbs never parse).
 
 ### Changed
 

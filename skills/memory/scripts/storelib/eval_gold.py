@@ -586,14 +586,20 @@ def _mrr(pop: list[dict], denom: int) -> float:
 
 def _expected_selection(executed_query, cand_rows, *, floor, gate_none_floor,
                         grounded):
-    """Issue #498: independently reconstruct the expected admission
+    """Issue #498: reconstruct the expected admission
     selection — ordinary gate over the prompt-assertion partition
     survivors, plus question-focus rescue (at most one row per unanswered,
     ordinarily-unsatisfied focus, trust/confidence-eligible, best lane >=
-    the rescue floor). Shares only the PARSER (analyze_prompt /
-    parse_row_assertions) with production; the selection logic here is an
-    independent derivation (plan-critic R12 option a), so a mutation inside
-    the production rescue wiring cannot silently inflate this expectation.
+    the rescue floor).
+
+    PR #526 feedback (FB-103): the SELECTION derivation (ordinary gate
+    pass + rescue loop) is independent, but this oracle SHARES the parser
+    (analyze_prompt / parse_row_assertions), the partition
+    (partition_prompt_assertions), the subject-compatibility predicate
+    (_pa_subject_compat), and reads QUESTION_RESCUE_FLOOR live — a mutation
+    inside those shared pieces moves production and this expectation
+    together and is caught by the unit PartitionGuardTests and the
+    mutation battery, not by this oracle.
     """
     import storelib.inject as _inject
 
