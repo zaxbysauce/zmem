@@ -27,11 +27,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   trailing non-ASCII adjacency now redacts (`user@example.comé` →
   `[REDACTED_EMAIL]é`). ASCII behaviour is pinned exactly, for valid
   (≤64-char local part) addresses — the over-64 trade-off above applies to
-  ASCII input too. Known gaps,
+  ASCII input too.
+- **Email local part excludes non-Latin scripts** (review finding M-1,
+  issue #523). The local-part class is now ASCII word chars + U+0300-U+036F
+  combining marks + Latin Extended (U+00C0-U+024F), not a bare Unicode `\w`,
+  so a CJK/Thai/ideographic run glued before an address is surrounding user
+  text and survives rather than being consumed as the local part
+  (`連絡先はuser@example.comです` → `連絡先は[REDACTED_EMAIL]です`).
+  Known gaps,
   pinned by tests: IDN domains stay unredacted, the generic base64/hex
   boundaries keep `\b` (benign-SHA preservation, #502 direction), and
   under `re.IGNORECASE` the ASCII classes case-fold to also match
-  U+0130/U+0131/U+017F/U+212A-class codepoints.
+  U+0130/U+0131/U+017F/U+212A-class codepoints. The IDN and base64/hex
+  boundary gaps are disclosed but not separately pinned by a test.
 - **`import-store` completes on WAL-journal source stores** (issue #524).
   The FTS optimize INSERT opened an implicit transaction that was never
   committed before the `journal_mode=DELETE` switch, so every WAL source

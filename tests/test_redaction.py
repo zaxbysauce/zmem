@@ -943,5 +943,29 @@ class NonAsciiBoundaryTest(unittest.TestCase):
                         "regression (the pre-{0,63} shape measured 5.9s)")
 
 
+    def test_email_local_part_excludes_cjk_surrounding_text(self):
+        # Review finding M-1 (issue #523): the local-part class must NOT be a
+        # bare Unicode \w — a CJK/Thai/ideographic run glued before an address
+        # is surrounding user text and must survive, not be consumed as the
+        # local part. The earlier \w-based class over-redacted
+        # "連絡先はuser@example.comです" to "[REDACTED_EMAIL]です".
+        out, count = redact_training_text(
+            "連絡先はuser@example.comです")
+        self.assertEqual(
+            out, "連絡先は[REDACTED_EMAIL]です")
+        self.assertEqual(count, 1)
+        out, count = redact_training_text(
+            "联系support@example.com获取帮助")
+        self.assertEqual(
+            out, "联系[REDACTED_EMAIL]获取帮助")
+        self.assertEqual(count, 1)
+        # Latin Extended local parts still redact (real international
+        # addresses), and the é-adjacent secret boundary is unchanged.
+        out, count = redact_training_text("jörg@example.com")
+        self.assertEqual((out, count), ("[REDACTED_EMAIL]", 1))
+        out, count = redact_training_text("éAKIAIOSFODNN7EXAMPLE")
+        self.assertEqual((out, count), ("é[REDACTED_SECRET]", 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
