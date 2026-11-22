@@ -480,6 +480,7 @@ def _truncate_protected_row(
     row: dict[str, Any], remaining: int, *,
     legacy_injection_wire: bool = True,
     cost_cap: Optional[int] = None,
+    floor_ok: bool = False,
 ) -> Optional[Tuple[dict[str, Any], int]]:
     """Fit a protected row into ``remaining`` tokens by clipping its content
     (issue #116 scope 2). Returns ``(new_row, cost)`` with a SHALLOW COPY of
@@ -514,7 +515,14 @@ def _truncate_protected_row(
         allowed = min(allowed,
                       (cost_cap - overhead) * CHARS_PER_TOKEN)
     if allowed < MIN_STUB_CHARS:
-        return None
+        # Closeout CS-002: the flat estimate above carries a one-token
+        # safety margin, so at the EXACT measured minimal-stub cost it can
+        # undershoot MIN_STUB_CHARS even though the measured stub fits.
+        # The caller measured that floor as admissible (``floor_ok``), so
+        # retry from the minimum instead of dropping the row (#116).
+        if not floor_ok or remaining < 1:
+            return None
+        allowed = MIN_STUB_CHARS
     while allowed >= MIN_STUB_CHARS:
         clipped = row.copy()
         clipped["content"] = content[:allowed].rstrip() + marker
@@ -598,10 +606,10 @@ def apply_token_budget(
     the clipped row, and a recorded row that still cannot be delivered whole
     YIELDS the budget (``defer_ids``) on BOTH dispatch lanes -
     deprioritised, never suppressed. The yield is KEPT only when the settled
-    admission then contains at least one normal row: that is the whole
-    guarantee - the freed budget goes to whatever fits, so WHICH normal row
-    is admitted is not promised, and when none can use what is LEFT the stub
-    is still rendered.
+    admission then contains at least one normal row - that is the whole
+    guarantee. It does NOT promise that the freed space went to a row the
+    previous prompt did not already carry, and it does not promise WHICH
+    normal row; when none can use what is LEFT the stub is still rendered.
     Everything else is admitted in descending
     score order
     (``signal=none`` after grounded rows at the same score); the scan
@@ -688,14 +696,12 @@ def apply_token_budget(
         dropped_protected = 0
         clipped_used = 0
         deferred_protected = 0
-        # Review FB-01501: the ordering depends on THIS pass's set, so the
-        # undo pass (empty set) visits the protected rows in caller order
-        # exactly as a genuine empty-defer call would. A sort outside the
-        # helper made the undo pass inherit the defer ordering.
-        order = sorted(
-            protected_idx,
-            key=lambda i: str(rows[i].get("id") or "") in active_defer)
-        for i in order:
+        # Closeout CS-001: NO reordering. Protected rows are admitted in
+        # CALLER order, exactly as before this PR - a recorded row that
+        # fits must not lose its whole form to a larger protected row that
+        # merely happened to be unrecorded. The yield's correctness comes
+        # from the post-pass check below, never from the order.
+        for i in protected_idx:
             cost = _fence_row_cost_for_wire(
                 rows[i], legacy_injection_wire=legacy_injection_wire)
             if cost <= available - used:
@@ -740,7 +746,9 @@ def apply_token_budget(
             stub = _truncate_protected_row(
                 rows[i], remaining_now,
                 legacy_injection_wire=legacy_injection_wire,
-                cost_cap=slice_budget)
+                cost_cap=slice_budget,
+                # The caller measured the minimal stub as admissible.
+                floor_ok=slice_budget >= row_min and row_min <= remaining_now)
             if stub is not None:
                 admitted[i] = stub
                 used += stub[1]

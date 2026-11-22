@@ -1978,6 +1978,119 @@ class CrossPromptYieldTests(unittest.TestCase):
         self.assertEqual(deferred_stats["dropped_protected"],
                          plain_stats["dropped_protected"])
 
+    def test_a_recorded_row_keeps_its_whole_form_in_caller_order(self):
+        """Closeout CS-001: the yield may not cost a recorded row its WHOLE form.
+
+        A recorded (deferred) protected row that fits must be delivered whole.
+        Reordering the protected rows to put deferred ones last could push it
+        behind a larger unrecorded row, clip it, and then keep the loss because
+        a normal row was admitted. The admission therefore visits protected
+        rows in CALLER order - this leg puts the recorded row FIRST.
+        """
+        apply_token_budget = self._budget()
+        # Costs at budget 1500 (available 1372): recorded ~400 whole in
+        # caller order; the unrecorded row ~1000, which clips the recorded
+        # one ONLY if it is admitted first (the reorder bug).
+        small_recorded = {
+            "id": self.PROTECTED_ID, "type": "decision",
+            "namespace": "user:global", "content": "r" * 1600,
+            "score": 0.9, "source_ref": "", "tags": [], "confidence": 0.9,
+        }
+        big_plain = {
+            "id": "c0000000-0000-4000-8000-0000000000f0", "type": "constraint",
+            "namespace": "user:global", "content": "p" * 4000,
+            "score": 0.99, "source_ref": "", "tags": [], "confidence": 0.9,
+        }
+        normal = {
+            "id": "e0000000-0000-4000-8000-0000000000f1", "type": "fact",
+            "namespace": "user:global", "content": "n" * 400,
+            "score": 0.5, "source_ref": "", "tags": [], "confidence": 0.9,
+        }
+        kept, _used, _dropped, _stats = apply_token_budget(
+            [small_recorded, big_plain, normal], 1500, with_stats=True,
+            defer_ids=[self.PROTECTED_ID])
+        by_id = {r.get("id"): r for r in kept}
+        self.assertIn(self.PROTECTED_ID, by_id,
+                      "a recorded row that fits must still be delivered")
+        self.assertFalse(
+            by_id[self.PROTECTED_ID].get("_incomplete_delivery"),
+            "the recorded row fits in caller order and must keep its WHOLE "
+            "form - a defer-derived reordering is not allowed to clip it "
+            "(closeout CS-001)")
+
+    def test_the_exact_minimal_stub_floor_is_not_dropped(self):
+        """Closeout CS-002: at the measured floor the stub must be emitted.
+
+        The truncator's flat chars/4 estimate carries a one-token margin, so
+        with `remaining` set to EXACTLY the measured minimal-stub cost it
+        undershoots MIN_STUB_CHARS and used to drop the row - a #116
+        truncate-never-drop violation.
+        """
+        inject = self._inject()
+        row = {
+            "id": self.PROTECTED_ID, "type": "decision",
+            "namespace": "user:global", "content": "x " * 4000,
+            "score": 0.9, "source_ref": "", "tags": [], "confidence": 0.9,
+        }
+        row_min = inject._protected_row_min_cost(row)
+        self.assertGreater(row_min, 0)
+        budget = row_min + inject.FENCE_SHELL_ALLOWANCE
+        kept, _used, _dropped, stats = inject.apply_token_budget(
+            [row], budget, with_stats=True)
+        self.assertEqual(
+            stats["dropped_protected"], 0,
+            "the row must not be DROPPED when the measured minimal stub fits "
+            "exactly (row_min=%d, budget=%d, stats=%r)"
+            % (row_min, budget, stats))
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(kept[0].get("_incomplete_delivery"),
+                        "it is a stub, not a whole delivery")
+
+    def test_a_refreshed_id_moves_to_the_newest_end(self):
+        """Critic CC-004(a): refreshing an id must not keep its OLD position.
+
+        The 64-id bound is documented as "the newest ids win". A refreshed id
+        that kept its old slot would be evicted as if it were stale.
+        """
+        sys.path.insert(0, SYS_PATH)
+        try:
+            from storelib import delivery_ledger as ledger
+        finally:
+            if sys.path and sys.path[0] == SYS_PATH:
+                sys.path.pop(0)
+        with tempfile.TemporaryDirectory(prefix="zmem-supp-age2-") as scratch:
+            sid = "supp-age2-" + uuid.uuid4().hex[:8]
+            ledger.record_clipped(scratch, sid, ["X"])
+            ledger.record_clipped(scratch, sid, [str(i) for i in range(63)])
+            ledger.record_clipped(scratch, sid, ["X"])       # refresh X
+            ledger.record_clipped(scratch, sid, ["Y"])       # now 65 distinct
+            ids = ledger.read_clipped(scratch, sid)
+            self.assertEqual(len(ids), 64, "the bound holds")
+            self.assertIn("X", ids,
+                          "a just-refreshed id must not be evicted as if it "
+                          "were the oldest (CC-004a)")
+            self.assertIn("Y", ids)
+            self.assertNotIn("0", ids, "the genuine oldest id is evicted")
+
+    def test_a_future_stamp_is_not_live(self):
+        """Critic CC-004(b): a clock-skewed future stamp must not read as live."""
+        sys.path.insert(0, SYS_PATH)
+        try:
+            from storelib import delivery_ledger as ledger
+        finally:
+            if sys.path and sys.path[0] == SYS_PATH:
+                sys.path.pop(0)
+        import time as _time
+        with tempfile.TemporaryDirectory(prefix="zmem-supp-fut-") as scratch:
+            sid = "supp-fut-" + uuid.uuid4().hex[:8]
+            path = ledger.clipped_path(scratch, sid)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"ids": ["A"],
+                           "stamps": {"A": _time.time() + 1e9}}, handle)
+            self.assertEqual(ledger.read_clipped(scratch, sid), [],
+                             "a stamp far in the future has no valid age")
+
     def test_the_recall_admission_accepts_the_defer_seam(self):
         """The admission that ACTUALLY decides the passive pool owns the set.
 

@@ -407,8 +407,13 @@ def record_clipped(data_dir: str, session_id: str,
             # one clipped row must not extend another row's eligibility.
             for rid in ids:
                 stamps[rid] = now
-            merged = list(dict.fromkeys(
-                list(payload.get("ids") or []) + ids))[-64:]
+            # Review CC-004(a): a REFRESHED id moves to the END, so the
+            # 64-id bound evicts the genuinely oldest entries; keeping an
+            # old position would evict a just-refreshed row as if it were
+            # stale.
+            prior_ids = [str(i) for i in (payload.get("ids") or [])
+                         if isinstance(i, str) and i not in ids]
+            merged = (prior_ids + ids)[-64:]
             keep = {rid: stamps[rid] for rid in merged if rid in stamps}
             # An id with no usable stamp is dropped: it cannot expire on its
             # own and carrying it forward would let the fresh document stamp
@@ -464,7 +469,10 @@ def read_clipped(data_dir: str, session_id: str,
             continue
         # Review FB-01302: each id expires on ITS OWN age, so a stale row
         # cannot ride another row's refresh.
-        if math.isfinite(stamp) and (now - stamp) <= window:
+        # Review CC-004(b): a FUTURE stamp (clock skew) must not read as
+        # live forever - allow a minute of skew, then refuse.
+        age = now - stamp
+        if math.isfinite(stamp) and -60.0 <= age <= window:
             live.append(raw)
     return live
 
