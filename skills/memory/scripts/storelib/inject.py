@@ -574,6 +574,7 @@ def apply_token_budget(
     rows: list[dict[str, Any]], budget: Optional[int] = None,
     *, with_stats: bool = False, legacy_injection_wire: bool = True,
     defer_ids: Optional[Iterable[str]] = None,
+    _trace: Optional[list] = None,
 ) -> Any:
     """Admit rows under ``budget`` tokens as a MEASURED HARD CEILING
     (issue #116; original policy issue #65, 10.9).
@@ -760,11 +761,22 @@ def apply_token_budget(
 
     admitted, used, truncated, dropped_protected, deferred_protected = _admit(
         deferred_ids)
+    if _trace is not None:
+        # Test seam only (default None, zero behaviour change): the
+        # final result cannot show whether the undo ran, so the two-pass
+        # structure is observable here (PR #534 test-engineer TE-006).
+        _trace.append({"pass": 1, "deferred": deferred_protected,
+                       "normal_admitted": sum(
+                           1 for _k, i in normal if i in admitted)})
     if deferred_protected and not any(i in admitted for _key, i in normal):
         # The yield blanked a protected row and no normal row took the freed
         # space: undo it (#116 priority, review FB-01401).
         admitted, used, truncated, dropped_protected, deferred_protected = (
             _admit(set()))
+        if _trace is not None:
+            _trace.append({"pass": 2, "deferred": deferred_protected,
+                           "normal_admitted": sum(
+                               1 for _k, i in normal if i in admitted)})
     kept = [admitted[i][0] for i in sorted(admitted)]
     dropped = len(rows) - len(kept)
     if with_stats:

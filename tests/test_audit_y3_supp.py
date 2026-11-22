@@ -1469,6 +1469,191 @@ class CrossPromptYieldTests(unittest.TestCase):
         # …and the identity rides with it (review FB-01203).
         self.assertIn("principal=principal, harness=harness)", src)
 
+    # ------------------------------------------------ test-engineer round
+    def test_the_terminal_check_runs_inside_the_delivery_lock(self):
+        """TE-001: a check performed BEFORE acquiring the lock would pass the
+        sequential post-terminal test yet lose the in-flight-writer race."""
+        sys.path.insert(0, SYS_PATH)
+        try:
+            from storelib import delivery_ledger as ledger
+        finally:
+            if sys.path and sys.path[0] == SYS_PATH:
+                sys.path.pop(0)
+        held = {"value": False}
+        real_lock = ledger._delivery_state_lock
+        real_ended = ledger._delivery_state_ended
+
+        class _LockProbe:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __enter__(self):
+                held["value"] = True
+                return self._inner.__enter__()
+
+            def __exit__(self, *exc):
+                try:
+                    return self._inner.__exit__(*exc)
+                finally:
+                    held["value"] = False
+
+        seen = []
+
+        def _ended_probe(data_dir, session_id):
+            seen.append(held["value"])
+            return real_ended(data_dir, session_id)
+
+        ledger._delivery_state_lock = lambda d: _LockProbe(real_lock(d))
+        ledger._delivery_state_ended = _ended_probe
+        try:
+            with tempfile.TemporaryDirectory(
+                    prefix="zmem-supp-lock-") as scratch:
+                sid = "supp-lock-" + uuid.uuid4().hex[:8]
+                ledger.record_clipped(scratch, sid, ["a"])
+        finally:
+            ledger._delivery_state_lock = real_lock
+            ledger._delivery_state_ended = real_ended
+        self.assertEqual(seen, [True],
+                         "the terminal marker must be re-checked WHILE the "
+                         "delivery-state lock is held (review TE-001)")
+
+    def test_a_fresh_legacy_sidecar_is_read_and_upgraded(self):
+        """TE-002: a valid key-absent payload (numeric or numeric-string
+        stamp) must still yield, and the next write must upgrade it."""
+        sys.path.insert(0, SYS_PATH)
+        try:
+            from storelib import delivery_ledger as ledger
+        finally:
+            if sys.path and sys.path[0] == SYS_PATH:
+                sys.path.pop(0)
+        import time as _time
+        with tempfile.TemporaryDirectory(prefix="zmem-supp-legacy-") as scratch:
+            sid = "supp-legacy-" + uuid.uuid4().hex[:8]
+            path = ledger.clipped_path(scratch, sid)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            now = _time.time()
+            for stamp in (now, str(now)):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump({"ids": ["legacy"], "ts": stamp}, handle)
+                self.assertEqual(ledger.read_clipped(scratch, sid), ["legacy"],
+                                 "a fresh legacy stamp (%r) must still defer"
+                                 % (type(stamp).__name__,))
+                ledger.record_clipped(scratch, sid, ["new"])
+                self.assertEqual(ledger.read_clipped(scratch, sid),
+                                 ["legacy", "new"],
+                                 "the upgrade must keep the legacy id with its "
+                                 "own age and add the new one")
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+                self.assertIn("stamps", payload,
+                              "the write upgrades the payload to per-id stamps")
+                self.assertNotEqual(payload["stamps"]["legacy"],
+                                    payload["stamps"]["new"],
+                                    "the legacy id must keep its own stamp")
+
+    def test_the_writer_does_not_refresh_an_older_rows_stamp(self):
+        """TE-003: refreshing one clipped row must not extend another's age."""
+        sys.path.insert(0, SYS_PATH)
+        try:
+            from storelib import delivery_ledger as ledger
+        finally:
+            if sys.path and sys.path[0] == SYS_PATH:
+                sys.path.pop(0)
+        import time as _time
+        with tempfile.TemporaryDirectory(prefix="zmem-supp-age-") as scratch:
+            sid = "supp-age-" + uuid.uuid4().hex[:8]
+            now = _time.time()
+            window = ledger.WINDOW_DEFAULT_S
+            ledger.record_clipped(scratch, sid, ["old-row"], now=now - window - 60)
+            ledger.record_clipped(scratch, sid, ["new-row"], now=now)
+            self.assertEqual(ledger.read_clipped(scratch, sid), ["new-row"],
+                             "the older row must expire on its own stamp even "
+                             "though the file was just rewritten (TE-003)")
+
+    def test_the_write_and_clear_honour_the_identity_key(self):
+        """TE-004: identity must key the WRITE and the terminal clear too."""
+        sys.path.insert(0, SYS_PATH)
+        try:
+            from storelib import delivery_ledger as ledger
+        finally:
+            if sys.path and sys.path[0] == SYS_PATH:
+                sys.path.pop(0)
+        with tempfile.TemporaryDirectory(prefix="zmem-supp-ident-") as scratch:
+            sid = "supp-ident-" + uuid.uuid4().hex[:8]
+            ledger.record_clipped(scratch, sid, ["p1-row"], principal="p1")
+            self.assertEqual(ledger.read_clipped(scratch, sid, principal="p1"),
+                             ["p1-row"], "the writer must key by identity")
+            self.assertEqual(ledger.read_clipped(scratch, sid, principal="p2"),
+                             [], "another principal must not see the write")
+            self.assertEqual(ledger.read_clipped(scratch, sid), [],
+                             "the unkeyed session must not see it either")
+            ledger.record_clipped(scratch, sid, ["p2-row"], principal="p2")
+            ledger.end_delivery_state(scratch, sid, principal="p1")
+            self.assertEqual(ledger.read_clipped(scratch, sid, principal="p2"),
+                             ["p2-row"],
+                             "the terminal clear of p1 must not clear p2")
+
+    def test_the_query_lane_yields_too(self):
+        """TE-005: the query-bearing lane needs a behavioural cross-prompt
+        leg, not only source-text pins."""
+        markers = ["suppqueryword%d" % i for i in range(12)]
+        fact_body = ("suppqueryword0 grounded note " * 12)
+        decision = ("Decision standing order for suppqueryword0: "
+                    + ("suppqueryword0 " * 3000))
+        counters = {}
+        for arm, neutralise in (("yield", False), ("control", True)):
+            with tempfile.TemporaryDirectory(
+                    prefix="zmem-supp-query-%s-" % arm) as scratch:
+                base = _child_env(scratch)
+                _init_store(base)
+                conn = sqlite3.connect(base["ZMEM_STORE"])
+                conn.execute(
+                    "INSERT INTO memory (id, namespace, type, content,"
+                    " ingestion_ts, confidence) VALUES (?,?,?,?,?,?)",
+                    ("c2222222-2222-4222-8222-222222222222", "user:global",
+                     "decision", decision, "2026-11-01T00:00:00Z", 0.9))
+                for i, marker in enumerate(markers):
+                    conn.execute(
+                        "INSERT INTO memory (id, namespace, type, content,"
+                        " ingestion_ts, confidence) VALUES (?,?,?,?,?,?)",
+                        ("e222222%d-2222-4222-8222-22222222222%d" % (i, i),
+                         "user:global", "fact",
+                         "%s %s" % (marker, fact_body),
+                         "2026-11-01T00:00:00Z", 0.9))
+                conn.commit()
+                conn.close()
+                sid = "supp-query-" + uuid.uuid4().hex[:8]
+                new_counts = []
+                for prompt in (1, 2):
+                    if neutralise:
+                        ops = Path(scratch) / "ops"
+                        if ops.is_dir():
+                            for path in ops.glob("*.clipped"):
+                                path.unlink()
+                    r = _run(["recall", "--query", "suppqueryword0",
+                              "--namespace", "project:supp-query",
+                              "--limit", "20", "--include-global",
+                              "--global-limit", "20", "--no-bump",
+                              "--for-injection", "--json",
+                              "--session-id=" + sid, "--moment", "pretool",
+                              "--lane", "codex"], base)
+                    self.assertEqual(r.returncode, 0, r.stderr[:400])
+                    payload = json.loads(r.stdout)
+                    rendered = payload.get("rendered") or ""
+                    if prompt == 1:
+                        self.assertEqual(
+                            payload.get("budget_truncated"), 1,
+                            "prompt 1 must clip the protected row on the "
+                            "QUERY lane too, or nothing is demonstrated")
+                        ops = Path(scratch) / "ops"
+                        self.assertTrue(list(ops.glob("*.clipped")),
+                                        "prompt 1 must record the clipped row")
+                    new_counts.append(sum(1 for m in markers if m in rendered))
+                counters[arm] = new_counts[1]
+        self.assertGreater(
+            counters["yield"], counters["control"],
+            "the query lane must deliver MORE normal rows once a recorded row "
+            "yields (%r) - review TE-005" % (counters,))
+
     def test_both_dispatch_targets_accept_the_defer_seam(self):
         """The defer set must be legal for BOTH dispatch targets.
 
@@ -1689,10 +1874,23 @@ class CrossPromptYieldTests(unittest.TestCase):
         # allocation differs between the two orders, which is exactly what the
         # equality assertion below detects.
         defer_all = [r["id"] for r in rows[:2]]
+        trace = []
         deferred_kept, deferred_used, _d, deferred_stats = apply_token_budget(
-            list(rows), 1500, with_stats=True, defer_ids=defer_all)
+            list(rows), 1500, with_stats=True, defer_ids=defer_all,
+            _trace=trace)
         plain_kept, plain_used, _p, plain_stats = apply_token_budget(
             list(rows), 1500, with_stats=True)
+        # Review TE-006: the undo must be OBSERVED, not inferred - a first pass
+        # that deferred and admitted no normal row, followed by a second pass.
+        self.assertEqual([t["pass"] for t in trace], [1, 2],
+                         "the undo branch must actually run (trace=%r)"
+                         % (trace,))
+        self.assertGreater(trace[0]["deferred"], 0,
+                           "the first pass must have deferred (%r)" % (trace[0],))
+        self.assertEqual(trace[0]["normal_admitted"], 0,
+                         "the first pass must admit NO normal row - otherwise "
+                         "the undo would not be the reason (%r)" % (trace[0],))
+        self.assertEqual(trace[1]["deferred"], 0)
         self.assertEqual(deferred_stats["deferred_protected"], 0,
                          "this fixture must exercise the undo "
                          "(stats=%r)" % (deferred_stats,))
