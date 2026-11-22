@@ -226,15 +226,78 @@ def _soft_trim(text: str, budget: int) -> str:
     # CURRENT render closer - structurally, the LAST fence-close marker
     # in the text (canonical or token form) - so a trimmed payload never
     # delivers an unclosed fence.
-    closer = _last_fence_closer(text)
+    # PR #534 feedback H1/CS-04: the closer must belong to the OPENER
+    # that survives the cut (the per-render tokens differ, so the LAST
+    # closer in the text can belong to a DIFFERENT fence), and the trim
+    # must not cut INSIDE a fence: when the budget cannot hold the
+    # content AND the fence shell, the fence closure wins and the shell
+    # may exceed the budget (the shell is not content — the injection
+    # admission reserves FENCE_SHELL_ALLOWANCE for it).
+    tail = "\n[recall truncated]"
+    reserve = len(tail) + 1
+    head_budget = max(0, budget - reserve)
+    head = _head_never_splitting_an_opener(text, head_budget)
+    closer = _fence_closer_for(head)
     if closer:
-        head = max(0, budget - len(closer) - 28)
-        return text[:head].rstrip() + "\n" + closer + "\n[recall truncated]"
-    return text[:budget].rstrip() + "\n[context truncated]"
+        want = max(0, budget - reserve - len(closer))
+        if want < len(head):
+            smaller = _head_never_splitting_an_opener(text, want)
+            smaller_closer = _fence_closer_for(smaller)
+            if smaller_closer:
+                head, closer = smaller, smaller_closer
+            # else: the shrink left no complete opener — keep the head
+            # and the closer that matches IT (the fence stays closed).
+    if closer:
+        return head + "\n" + closer + tail
+    # No opener survived: keep the pre-#511 shape (the last closer in
+    # the text) so the payload still carries a fence close marker.
+    fallback = _last_fence_closer(text)
+    if fallback:
+        return head + "\n" + fallback + tail
+    ctx_tail = "\n[context truncated]"
+    return text[:max(0, budget - len(ctx_tail))].rstrip() + ctx_tail
 
 
 _FENCE_CLOSER_RE = re.compile(
-    r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9A-Za-z]+)?(_NEUTRALIZED)?>>>")
+    r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9A-Za-z]{1,32})?(_NEUTRALIZED)?>>>")
+
+_FENCE_OPEN_RE = re.compile(
+    r"<<<ZMEM_UNTRUSTED_FENCE(?::(?P<tok>[0-9A-Za-z]{1,32}))?(_NEUTRALIZED)?>>>")
+
+# The longest closer the renderer can mint: the literal plus the widest
+# token the mint accepts.
+_FENCE_CLOSER_MAX = len("<<<END_ZMEM_UNTRUSTED_FENCE:") + 32 + len(">>>")
+
+
+def _head_never_splitting_an_opener(text: str, head_budget: int) -> str:
+    """The head slice, extended to an opener's end when the cut landed
+    inside one — a trimmed payload must never deliver half an opener
+    (the fence could not be closed)."""
+    head = text[:max(0, head_budget)].rstrip()
+    cut = max(0, head_budget)
+    for m in _FENCE_OPEN_RE.finditer(text):
+        if m.start() < cut < m.end():
+            return text[:m.end()].rstrip()
+    return head
+
+
+def _fence_closer_for(head: str) -> str:
+    """The closer that belongs to the LAST opener surviving in ``head``.
+
+    The opener's token is carried into the closer, so an appended closer
+    always matches the opener that is still in the payload. A neutralized
+    opener gets the neutralized closer.
+    """
+    opens = list(_FENCE_OPEN_RE.finditer(head))
+    if not opens:
+        return ""
+    last = opens[-1]
+    token = last.group("tok")
+    if last.group(2):
+        return "<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>"
+    if token:
+        return "<<<END_ZMEM_UNTRUSTED_FENCE:%s>>>" % token
+    return "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 
 
 def _last_fence_closer(text: str) -> str:

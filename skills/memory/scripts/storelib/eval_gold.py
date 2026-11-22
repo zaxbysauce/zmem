@@ -435,7 +435,7 @@ def _verify_real_lane(
     # verifier accepts the canonical legacy pair OR a matched token pair
     # (the same token in the open and the close) — a mismatched pair fails.
     _FENCE_PAIR_RE = re.compile(
-        r"(?ms)^<<<ZMEM_UNTRUSTED_FENCE:(?P<tok1>[0-9a-zA-Z]+)>>>"
+        r"(?ms)^<<<ZMEM_UNTRUSTED_FENCE:(?P<tok1>[0-9a-zA-Z]{1,32})>>>"
         r"[\s\S]*?^<<<END_ZMEM_UNTRUSTED_FENCE:(?P=tok1)>>>"
         r"|^" + re.escape(ZMEM_FENCE_OPEN)
         + r"[\s\S]*?" + re.escape(ZMEM_FENCE_CLOSE))

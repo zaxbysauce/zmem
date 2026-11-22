@@ -468,6 +468,10 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
     receipts: list[dict[str, Any]] = []
     canonical: dict[str, str] = {}
     committed_ids: set[str] = set()
+    # The #172 observation gate is re-read by allowed_types() on every
+    # call (~428 us); one read per batch is enough — a gate change still
+    # takes effect on the next batch (PR #534 feedback F-07f).
+    _batch_types: tuple = allowed_types()
 
     own_transaction = not conn.in_transaction
     if own_transaction:
@@ -612,6 +616,29 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                         error="capability_denied"))
                     continue
 
+            # Issue #510 (audit D03): admission validates the memory type
+            # against the effective vocabulary BEFORE any savepoint opens
+            # and BEFORE the #363 identical-content replay fold — the fold
+            # would otherwise answer an out-of-vocabulary type with a
+            # "committed, deduped=True" receipt, which is not the AC1
+            # invalid_type refusal (PR #534 feedback F-07a). An
+            # out-of-vocabulary type is a per-op refusal with a distinct
+            # code, never a committed row, and the batch continues with
+            # the sibling ops (add/capture default to "fact" exactly as
+            # the writer does; update only validates when a type rides
+            # the op).
+            if kind in ("add", "capture"):
+                _candidate_type = str(args.get("type") or "fact")
+            elif kind == "update" and args.get("type") is not None:
+                _candidate_type = str(args["type"])
+            else:
+                _candidate_type = None
+            if (_candidate_type is not None
+                    and _candidate_type not in _batch_types):
+                receipts.append(_receipt(
+                    op_id, kind, "rejected", error="invalid_type"))
+                continue
+
             # 3b. Namespace scope for EVERY kind: the declared namespace
             # (add/capture) and the TARGET row's namespace (the mutation
             # kinds — a by-id op must not escape its row's scope). Checked
@@ -745,24 +772,6 @@ def apply_ops(conn: sqlite3.Connection, ops: list[dict[str, Any]],
                         op_id, kind, "rejected",
                         error="namespace_not_allowed"))
                     continue
-
-            # Issue #510 (audit D03): admission validates the memory type
-            # against the effective vocabulary BEFORE any savepoint opens.
-            # An out-of-vocabulary type is a per-op refusal with a distinct
-            # code, never a committed row, and the batch continues with the
-            # sibling ops (add/capture default to "fact" exactly as the
-            # writer does; update only validates when a type rides the op).
-            if kind in ("add", "capture"):
-                _candidate_type = str(args.get("type") or "fact")
-            elif kind == "update" and args.get("type") is not None:
-                _candidate_type = str(args["type"])
-            else:
-                _candidate_type = None
-            if (_candidate_type is not None
-                    and _candidate_type not in allowed_types()):
-                receipts.append(_receipt(
-                    op_id, kind, "rejected", error="invalid_type"))
-                continue
 
             # 4. Apply under a per-op savepoint.
             savepoint = f"zmem_op_{index}"

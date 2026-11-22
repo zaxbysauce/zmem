@@ -82,6 +82,10 @@ _STRIP_ENV = (
     "ZMEM_QUERY_CONTEXT", "ZMEM_TRANSCRIPT", "ZMEM_TIER0",
     "ZMEM_SKILLS_DIRS", "ZMEM_PYTHON", "ZMEM_CROSS_PROJECT",
     "ZMEM_REMOTE_URL", "ZMEM_CROSS_ENCODER",
+    # PR #534 feedback D1: an ambient ZMEM_FENCE_TOKEN pin is honored by
+    # the renderer, so an inherited pin makes both prefetch deliveries
+    # share one boundary and the AC3 fresh-boundary check fails.
+    "ZMEM_FENCE_TOKEN",
 )
 
 
