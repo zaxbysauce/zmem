@@ -2709,11 +2709,18 @@ def _format_fenced_recall(rows: list[dict], header: str,
         if r.get("type") == "page":
             for _key in ("version_id", "freshness_watermark", "page_checksum"):
                 if r.get(_key):
-                    lines.append(f"    {_key}: {r[_key]}")
+                    # Issue #511 (closeout CS2-002): EVERY rendered field
+                    # goes through the shared escape - a stored
+                    # marker-shaped value must not reach the fence.
+                    lines.append("    " + _key + ": "
+                                 + escape_fence_shaped_text(str(r[_key])))
             for _key in ("source_ids", "evidence_ids"):
                 _values = r.get(_key)
                 if isinstance(_values, (list, tuple)) and _values:
-                    lines.append("    " + _key + ": " + ", ".join(map(str, _values)))
+                    lines.append(
+                        "    " + _key + ": "
+                        + escape_fence_shaped_text(
+                            ", ".join(map(str, _values))))
         if r.get("tags"):
             lines.append("    tags: " + _indent_continuations(
                 escape_fence_shaped_text(r["tags"]))[4:])
@@ -2722,10 +2729,13 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # entities (e.g. every `recent` row) omit the line entirely.
         _ents = r.get("entities") or []
         if _ents:
+            # Issue #511 (closeout CS2-002): entity names are a rendered
+            # field too - escape them like every other one.
             lines.append(
-                "    entities: " + ", ".join(
-                    e.get("name", "?") for e in _ents[:3]
-                )
+                "    entities: " + escape_fence_shaped_text(
+                    ", ".join(
+                        str(e.get("name", "?")) for e in _ents[:3]
+                    ))
             )
     if budget_note:
         # Issue #116 addendum: byte-stable omission diagnostics inside the

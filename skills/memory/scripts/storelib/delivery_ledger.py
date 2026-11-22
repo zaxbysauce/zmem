@@ -407,13 +407,12 @@ def record_clipped(data_dir: str, session_id: str,
             # one clipped row must not extend another row's eligibility.
             for rid in ids:
                 stamps[rid] = now
-            # Review CC-004(a): a REFRESHED id moves to the END, so the
-            # 64-id bound evicts the genuinely oldest entries; keeping an
-            # old position would evict a just-refreshed row as if it were
-            # stale.
+            # Review CC-004(a)/CD-007: a REFRESHED id moves to the END (so the
+            # 64-id bound evicts the genuinely oldest), and duplicates are
+            # collapsed so repeats cannot waste the slots.
             prior_ids = [str(i) for i in (payload.get("ids") or [])
                          if isinstance(i, str) and i not in ids]
-            merged = (prior_ids + ids)[-64:]
+            merged = list(dict.fromkeys(prior_ids + ids))[-64:]
             keep = {rid: stamps[rid] for rid in merged if rid in stamps}
             # An id with no usable stamp is dropped: it cannot expire on its
             # own and carrying it forward would let the fresh document stamp

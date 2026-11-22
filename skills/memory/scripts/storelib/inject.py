@@ -552,6 +552,13 @@ def _truncate_protected_row(
         # re-measure until the stub fits or nothing is left — a protected
         # row is truncated, never dropped, while it can still carry
         # information (apply_token_budget's documented policy).
+        if (floor_ok and allowed > MIN_STUB_CHARS
+                and allowed - CHARS_PER_TOKEN < MIN_STUB_CHARS):
+            # Closeout CS2-001: the 4-char step would skip the MINIMAL
+            # stub altogether (35 -> 31 never measures 32). The caller
+            # measured that floor as admissible, so land exactly on it.
+            allowed = MIN_STUB_CHARS
+            continue
         allowed -= CHARS_PER_TOKEN
     # Fail-closed: even a minimal stub does not fit.
     return None
@@ -659,15 +666,14 @@ def apply_token_budget(
     # prompt and the rows that fit are starved for the session (the F-01
     # boundary).
     #
-    # Review FB-01401 (PR #534): the yield's validity is checked on the
-    # RESULT, never predicted. A deferral survives only when the admission
-    # that used it ALSO admitted a normal row; otherwise the pass is re-run
-    # with no defer set. Two earlier attempts failed here: reserving space by
-    # a cost estimate (FB-003/FB-01202), and deciding deferred rows last
-    # (FB-01301/FB-01401 - a SECOND deferred row that fits is admitted whole
-    # before the normal loop, so it can consume exactly the space the guard
-    # counted). Deferred rows are still decided last; that is a preference
-    # for the first pass, not the guarantee.
+    # Review FB-01401 / CD-001 (PR #534): the yield's validity is checked on
+    # the RESULT, never predicted. Two earlier attempts failed here:
+    # reserving space by a cost estimate (FB-003/FB-01202), and deciding
+    # deferred rows last (FB-01301/FB-01401). The surviving rule compares
+    # the two passes: a deferral survives only when it is a NET GAIN - every
+    # protected row the no-defer pass delivered WHOLE is still delivered,
+    # AND at least one normal row is admitted that the no-defer pass did
+    # not admit. Anything else falls back to the no-defer result.
     deferred_ids = {str(i) for i in (defer_ids or ()) if isinstance(i, str)}
     normal_costs = {
         i: _fence_row_cost_for_wire(
@@ -776,11 +782,27 @@ def apply_token_budget(
         _trace.append({"pass": 1, "deferred": deferred_protected,
                        "normal_admitted": sum(
                            1 for _k, i in normal if i in admitted)})
-    if deferred_protected and not any(i in admitted for _key, i in normal):
-        # The yield blanked a protected row and no normal row took the freed
-        # space: undo it (#116 priority, review FB-01401).
-        admitted, used, truncated, dropped_protected, deferred_protected = (
+    if deferred_protected:
+        plain_admitted, plain_used, plain_truncated, plain_dropped, _p = (
             _admit(set()))
+        # Review CD-001: the yield is kept only on a NET GAIN.
+        #   (a) every protected row the NO-DEFER pass delivered WHOLE must
+        #       still be delivered (whole or clipped), or deferring one row
+        #       cascaded into dropping another that fit;
+        #   (b) a normal row must be admitted that the no-defer pass did
+        #       NOT admit, or the freed space bought nothing the prompt was
+        #       not already carrying.
+        plain_whole = [
+            i for i in protected_idx
+            if i in plain_admitted
+            and not plain_admitted[i][0].get("_incomplete_delivery")]
+        keeps_protected = all(i in admitted for i in plain_whole)
+        new_normal = any(i in admitted and i not in plain_admitted
+                         for _k, i in normal)
+        if not (keeps_protected and new_normal):
+            admitted, used, truncated, dropped_protected = (
+                plain_admitted, plain_used, plain_truncated, plain_dropped)
+            deferred_protected = 0
         if _trace is not None:
             _trace.append({"pass": 2, "deferred": deferred_protected,
                            "normal_admitted": sum(
