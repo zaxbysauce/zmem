@@ -31,9 +31,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 # A token must be entirely allowlisted characters to be emitted.
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._/+-]+$")
@@ -396,6 +397,430 @@ _QUERY_CONTEXT_ENV = "ZMEM_QUERY_CONTEXT"
 def query_context_enabled() -> bool:
     """True unless ZMEM_QUERY_CONTEXT=0 (kill switch, #85 spec B)."""
     return os.environ.get(_QUERY_CONTEXT_ENV, "1").strip() != "0"
+
+
+# ---------------------------------------------------------------------------
+# Pre-tool query sanitation.  The pretool lane exists to surface hazard
+# lessons before an OPERATION; navigation, read-only inspection and inline
+# scripts name no operation, and their raw text (cd/ls/wc, path fragments,
+# heredoc Python source) only feeds unrelated lexical/vector/entity matches.
+# Pure, stdlib-only, LLM-free; never raises.
+# ---------------------------------------------------------------------------
+
+_PRETOOL_SANITIZE_ENV = "ZMEM_PRETOOL_SANITIZE"
+_PRETOOL_QUERY_CAP = 500
+
+# Closed vocabulary: navigation / read-only inspection utilities.  Search
+# tools (grep, rg) are deliberately NOT here (they are operations a lesson may
+# target), nor git or any runner, nor anything with a common write mode
+# (sort -o, date -s, tee).  The rule everywhere below is FAIL TOWARD KEEPING:
+# a segment is dropped only when it is positively recognised as read-only.
+_INSPECTION_HEADS = frozenset({
+    "cd", "pushd", "popd", "ls", "dir", "pwd", "cat", "head", "tail", "wc",
+    "echo", "printf", "true", "which", "type", "stat", "file",
+    "cut", "tr", "less", "more", "whoami",
+})
+# Interpreters whose argument can be inline SOURCE CODE (not a shell
+# command): interpreter -> the flags that say so.
+_INLINE_CODE_FLAGS = {
+    "python": ("-", "-c"),
+    "python3": ("-", "-c"),
+    "node": ("-", "-e", "--eval", "-p", "--print"),
+    "bun": ("-e", "--eval"),
+    "ruby": ("-", "-e"),
+    "perl": ("-", "-e"),
+}
+_INPLACE_INTERPRETERS = frozenset({"ruby", "perl"})
+# Shells: a ``-c`` string (or a heredoc body) is itself a shell command and
+# is sanitized recursively, never dropped, so ``bash -c "git push --force"``
+# still names its operation.
+_POSIX_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+_POWERSHELLS = frozenset({"pwsh", "powershell"})
+_SHELL_C_MAX_DEPTH = 2
+_FIND_MUTATORS = frozenset({
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0",
+    "-fprintf", "-fls",
+})
+# The ONLY sed script accepted as read-only: an optional numeric/``$``
+# address (or range) followed by ``p`` or ``=``.  Anything else (``w file``,
+# GNU ``e`` execute, ``s///e``, ``/re/p``) is kept rather than analysed.
+_SED_PRINT_ONLY_RE = re.compile(r"^[0-9,$~+!]*[p=]$")
+_NULL_SINKS = frozenset({"/dev/null", "nul", "$null"})
+_PUNCT_CHARS = frozenset("();<>|&")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_ABS_PATH_RE = re.compile(r"^(?:[/~\\]|[A-Za-z]:[\\/])")
+_SHORT_FLAGS_RE = re.compile(r"^-[A-Za-z]+$")
+_POSIX_C_FLAG_RE = re.compile(r"^-[A-Za-z]*c$")
+_HEREDOC_RE = re.compile(
+    r"<<(?!<)-?[ \t]*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# Commands that EXECUTE what they read on stdin: a heredoc fed to one of
+# these is a script (shell or SQL), so its body is sanitized and kept.
+_BODY_EXECUTORS = frozenset({
+    "ssh", "sudo", "doas", "psql", "mysql", "sqlite3", "docker", "podman",
+    "kubectl",
+})
+
+
+def pretool_sanitize_enabled() -> bool:
+    """True unless ZMEM_PRETOOL_SANITIZE=0 (kill switch)."""
+    return os.environ.get(_PRETOOL_SANITIZE_ENV, "1").strip() != "0"
+
+
+def _collapse(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _abs_basename(tok: str) -> str:
+    """Absolute path -> basename ("" when empty); anything else unchanged."""
+    if _ABS_PATH_RE.match(tok):
+        # A bare root (``/``, ``~``, ``C:\``) has no basename: keep it, so
+        # ``rm -rf /`` does not read like ``rm -rf``.
+        return tok.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or tok
+    return tok
+
+
+def _is_punct(tok: str) -> bool:
+    return bool(tok) and all(c in _PUNCT_CHARS for c in tok)
+
+
+def _strip_heredocs(command: str) -> tuple:
+    """Remove heredoc BODIES; return ``(text, bodies)``.
+
+    The line that opens a heredoc stays (operator and delimiter word
+    included) and so does every line after the terminator, so a command
+    that follows a heredoc is still seen.  A ``<<WORD`` with no terminator
+    line is not a heredoc (``a << b`` arithmetic, C++ streams): nothing is
+    removed for it.
+    """
+    lines = command.split("\n")
+    out: list = []
+    bodies: list = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for match in _HEREDOC_RE.finditer(line):
+            delim = match.group(2)
+            end = i
+            while end < len(lines) and lines[end].strip() != delim:
+                end += 1
+            if end >= len(lines):
+                continue
+            bodies.append("\n".join(lines[i:end]))
+            i = end + 1
+    return "\n".join(out), bodies
+
+
+def _split_segments(command: str):
+    """Return ``[{"t": tokens, "b": heredoc bodies, "w": writes}, ...]`` or
+    ``None`` when the text cannot be tokenized (unbalanced quotes)."""
+    text, bodies = _strip_heredocs(command.replace("\\\n", " "))
+    # A newline separates commands exactly like ``;`` (shlex would fold it
+    # into whitespace and glue two commands into one segment).
+    text = text.replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.escape = ""
+        toks = list(lex)
+    except ValueError:
+        return None
+    # The heredoc pre-pass is regex-only and blind to quoting.  Trust it
+    # only when the tokenizer sees exactly as many heredoc operators as
+    # bodies were removed; any disagreement (a ``<<`` inside a quoted
+    # string, an unusual delimiter form) means real commands may have been
+    # stripped as a "body", so the caller keeps the raw text instead.
+    heredoc_ops = sum(
+        1 for tok in toks
+        if _is_punct(tok) and "<<" in tok and not tok.startswith("<<<"))
+    if heredoc_ops != len(bodies):
+        return None
+    body_iter = iter(bodies)
+    segments: list = []
+    cur = {"t": [], "b": [], "w": False, "i": False, "p": False}
+    pending = ""
+    for tok in toks:
+        if _is_punct(tok):
+            pending = ""
+            if "(" in tok and ("<" in tok or ">" in tok):
+                # ``<(cmd)`` / ``>(cmd)`` process substitution feeds one
+                # command's output to another as a FILE; the link between
+                # the two is not tracked here, so the command is not judged.
+                return None
+            if "(" in tok:
+                # Subshell / ``$(``: what follows is a COMMAND.  Start a
+                # new segment so it is judged on its own.  A pipe INTO a
+                # subshell feeds every command inside it, a link Pass 2
+                # cannot follow: do not judge the command.
+                if "|" in tok or (not cur["t"] and not cur["b"]
+                                  and segments and segments[-1]["p"]):
+                    return None
+                if cur["t"] or cur["b"]:
+                    segments.append(cur)
+                cur = {"t": [], "b": [], "w": False, "i": False, "p": False}
+            elif tok.startswith("<<<"):
+                pending = "herestring"
+            elif "<<" in tok:
+                pending = "heredoc"
+            elif "<" in tok or ">" in tok:
+                if cur["t"] and cur["t"][-1].isdigit():
+                    cur["t"].pop()
+                # ``>``/``>>``/``&>`` write a file; ``>&`` duplicates an fd.
+                if ">" in tok and not tok.startswith(">&"):
+                    pending = "write"
+                else:
+                    pending = "skip"
+                    if "<" in tok:
+                        cur["i"] = True  # stdin read from a file
+            else:
+                # ``|`` / ``|&`` (not ``||``): this segment's output is the
+                # next segment's input.
+                cur["p"] = tok.startswith("|") and not tok.startswith("||")
+                if cur["t"] or cur["b"]:
+                    segments.append(cur)
+                cur = {"t": [], "b": [], "w": False, "i": False, "p": False}
+            continue
+        if pending == "heredoc":
+            cur["b"].append(next(body_iter, ""))
+        elif pending == "herestring":
+            cur["b"].append(tok)
+        elif pending == "write":
+            if tok.lower() not in _NULL_SINKS:
+                # Output redirected to a real file is a WRITE: the segment
+                # is kept whatever its head, and the target names the file.
+                cur["w"] = True
+                cur["t"].append(tok)
+        elif pending != "skip":
+            cur["t"].append(tok)
+        pending = ""
+    if cur["t"] or cur["b"]:
+        segments.append(cur)
+    return segments
+
+
+def _normalise_head(tok: str) -> str:
+    head = tok.strip().strip("\"'`").lower()
+    head = head.rsplit("\\", 1)[-1]
+    head = head.rsplit("/", 1)[-1] or head
+    for ext in (".exe", ".bat", ".cmd"):
+        if head.endswith(ext):
+            head = head[: -len(ext)]
+            break
+    return "python" if head == "py" else head
+
+
+def _segment_dropped(head: str, args: list, inline: bool) -> bool:
+    """True only for a segment positively recognised as naming no operation."""
+    if head in _INSPECTION_HEADS:
+        return True
+    if head == "sed":
+        in_place = any(
+            a.startswith("-i") or a.startswith("--in-place")
+            or (_SHORT_FLAGS_RE.match(a) and "i" in a)
+            for a in args)
+        has_n = any(_SHORT_FLAGS_RE.match(a) and "n" in a for a in args)
+        # ``sed -n 'w out.txt'`` writes a file through the script itself.
+        # Read-only only in its one plain form: ``sed -n <print-script>
+        # [files]``.  Any other flag (-e, -f, --expression: more scripts
+        # that would each need checking) keeps the command.
+        flags = [a for a in args if a.startswith("-")]
+        operands = [a for a in args if not a.startswith("-")]
+        print_only = bool(operands) and bool(
+            _SED_PRINT_ONLY_RE.match(operands[0]))
+        return (has_n and not in_place and flags == ["-n"] and print_only)
+    if head == "find":
+        return not any(a in _FIND_MUTATORS for a in args)
+    return False
+
+
+def _runs_opaque_code(head: str, args: list, inline: bool,
+                      has_inner: bool) -> bool:
+    """True when the segment executes code this module cannot read as a
+    shell command: interpreter inline source (``python -c``, ``python -
+    <<EOF``, ``node -e``, ``perl -e``) or a shell fed its script on stdin
+    (``... | bash``, ``bash < deploy.sh``).  Such code can do anything —
+    delete a tree, rewrite a store, force-push through subprocess — so the
+    sanitizer ABSTAINS for the whole command rather than judge it."""
+    flags = _INLINE_CODE_FLAGS.get(head)
+    if flags is not None:
+        if inline or any(a in flags for a in args):
+            return True
+        return any(_SHORT_FLAGS_RE.match(a) and "e" in a for a in args) \
+            and head in _INPLACE_INTERPRETERS
+    if head in _POSIX_SHELLS and not has_inner:
+        # No -c string, no heredoc body, and no script operand: it reads
+        # its commands from stdin.
+        return not any(not a.startswith("-") for a in args)
+    return False
+
+
+class _Abstain(Exception):
+    """Internal: the command runs code the sanitizer cannot classify."""
+
+
+def _shell_inner_source(head: str, args: list, bodies: list):
+    """The nested shell command a shell segment runs, or ``None``."""
+    if head in _POSIX_SHELLS:
+        for i, a in enumerate(args):
+            if _POSIX_C_FLAG_RE.match(a):
+                return args[i + 1] if i + 1 < len(args) else None
+        return "\n".join(bodies) if bodies else None
+    if head in _POWERSHELLS:
+        for i, a in enumerate(args):
+            if a.lower() in ("-c", "-command"):
+                return " ".join(args[i + 1:]) or None
+        return None
+    if head == "cmd":
+        for i, a in enumerate(args):
+            if a.lower() in ("/c", "/k"):
+                return " ".join(args[i + 1:]) or None
+    return None
+
+
+def sanitize_pretool_command(command: str, _depth: int = 0) -> str:
+    """Reduce a shell command to the text that names an OPERATION.
+
+    Navigation and read-only inspection segments are dropped, redirection
+    plumbing is removed, and absolute paths collapse to their basename
+    (relative paths are kept as written).  Everything not positively
+    recognised as read-only is KEPT: a segment that writes a file through
+    redirection, carries a command substitution, or runs a nested shell
+    command (``bash -c``, ``pwsh -Command``, ``cmd /c``, a shell heredoc —
+    sanitized recursively) survives.  A command that runs code this module
+    cannot read (interpreter inline source, a shell fed its script on
+    stdin) or that cannot be tokenized is not judged at all: it comes back
+    whitespace-collapsed and otherwise untouched.  A
+    command with no quotes, absolute paths, shell operators or dropped
+    segments comes back whitespace-collapsed only.  Never raises.
+    """
+    if not isinstance(command, str):
+        return ""
+    try:
+        segments = _split_segments(command)
+        if segments is None:
+            return _collapse(command)[:_PRETOOL_QUERY_CAP]
+        def _words(tokens: list, collapse: bool = True) -> list:
+            out = []
+            for tok in tokens:
+                if collapse:
+                    tok = _abs_basename(tok)
+                # Punctuation-only tokens are plumbing, except a bare path
+                # root, which is a real (and dangerous) operand.
+                if tok and (any(c.isalnum() for c in tok)
+                            or _ABS_PATH_RE.match(tok)):
+                    out.append(tok)
+            return out
+
+        # Pass 1: decide every segment.  ``None`` = dropped (read-only);
+        # a list (possibly empty) = kept.
+        decided: list = []
+        for seg in segments:
+            tokens = seg["t"]
+            i = 0
+            # Leading NAME=value assignments are plumbing, unless the value
+            # runs a command (``X=`kubectl delete ns prod```): keep those.
+            while (i < len(tokens) and _ENV_ASSIGN_RE.match(tokens[i])
+                   and "`" not in tokens[i] and "$(" not in tokens[i]):
+                i += 1
+            # The assignments are skipped only to FIND the command; they
+            # stay in a kept segment's text (``RAILS_ENV=production rake
+            # db:drop`` names its target).
+            assigns = tokens[:i]
+            tokens = tokens[i:]
+            if not tokens:
+                decided.append(None)
+                continue
+            head = _normalise_head(tokens[0])
+            args = tokens[1:]
+            if head in _BODY_EXECUTORS and seg["b"] and not seg["i"]:
+                # A heredoc fed to ssh/sudo/psql/... is a script it runs,
+                # in a language this module does not assume (shell, SQL,
+                # Python under sudo): the body is kept as written.
+                out = _words(assigns + tokens)
+                inner = _collapse("\n".join(seg["b"]))
+                if inner:
+                    out.append(inner)
+                decided.append(out)
+                continue
+            inner_src = _shell_inner_source(head, args, seg["b"])
+            if (inner_src is not None and not seg["i"]
+                    and _depth < _SHELL_C_MAX_DEPTH):
+                inner = sanitize_pretool_command(inner_src, _depth + 1)
+                decided.append([inner] if inner else [])
+                continue
+            if _runs_opaque_code(head, args, bool(seg["b"]),
+                                 inner_src is not None):
+                raise _Abstain()
+            substitution = any("$(" in t or "`" in t for t in tokens)
+            if (inner_src is None and not seg["w"] and not substitution
+                    and _segment_dropped(head, args, bool(seg["b"]))):
+                decided.append(None)
+                continue
+            # A KEPT command that reads a heredoc, here-string or file on
+            # stdin consumes (and may execute) text this module did not
+            # read: do not judge the command at all.  That includes
+            # ``cat > wipe.sh <<EOF`` -- the file it writes may be run by
+            # the very next command.
+            if seg["b"] or seg["i"]:
+                raise _Abstain()
+            # A sed/awk script such as ``/re/p`` looks like an absolute
+            # path: leave those commands' operands exactly as written.
+            decided.append(_words(assigns + tokens,
+                                  collapse=head not in ("sed", "awk")))
+        # Pass 2: a dropped segment whose output is piped into a kept one
+        # is that command's INPUT (``echo "rm -rf x" | sudo bash``,
+        # ``cat patch | git apply``): dropping it would drop the operation.
+        for n in range(len(segments) - 1):
+            if (decided[n] is None and segments[n]["p"]
+                    and decided[n + 1] is not None):
+                raise _Abstain()
+        kept = [word for out in decided if out for word in out]
+        return " ".join(kept)[:_PRETOOL_QUERY_CAP].strip()
+    except Exception:
+        # Includes _Abstain: the whole command is returned as it was.
+        return _collapse(command)[:_PRETOOL_QUERY_CAP]
+
+
+def pretool_query_text(tool_input: object) -> Optional[str]:
+    """Sanitised pretool query for ``tool_input``.
+
+    ``None``: not applicable (non-dict, no usable ``_PRETOOL_FIELDS`` string,
+    or kill switch off) -- the caller keeps its legacy query.  ``""``: the
+    call names no operation.  Never raises.
+    """
+    try:
+        if not pretool_sanitize_enabled() or not isinstance(tool_input, dict):
+            return None
+        parts: list = []
+        description = ""
+        any_field = False
+        has_command = False
+        command_kept = False
+        for key in _PRETOOL_FIELDS:
+            val = tool_input.get(key)
+            if not isinstance(val, str) or not val.strip():
+                continue
+            any_field = True
+            if key in ("command", "cmd"):
+                has_command = True
+                s = sanitize_pretool_command(val)
+                if s:
+                    command_kept = True
+                    parts.append(s)
+            elif key == "description":
+                description = _collapse(val)
+            else:
+                s = _abs_basename(_collapse(val))
+                if s:
+                    parts.append(s)
+        if not any_field:
+            return None
+        if description and (not has_command or command_kept):
+            parts.append(description)
+        return " ".join(parts)[:_PRETOOL_QUERY_CAP].strip()
+    except Exception:
+        return None
 
 
 def _sidecar_stem(session_id: str) -> str:

@@ -9,6 +9,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Pre-tool recall no longer injects unrelated lessons before plain
+  read-only commands.** The pre-tool query was the raw command text, so
+  `ls`, `cat`, `sed -n '1,40p'`, path fragments and heredoc bodies matched
+  stored lessons by accident. The local hook path now builds the query from
+  the operation only: read-only inspection segments are dropped, absolute
+  paths reduce to their basename, and a command with nothing left gets no
+  injection (reported as `empty-pool`). The filter keeps the whole command
+  whenever it cannot prove a segment is read-only: any data flowing into a
+  kept command (pipe, heredoc, here-string, stdin file), inline interpreter
+  code, process substitution, unbalanced quotes, or an unparsable shape. The
+  checkpoint detector still runs on the full command, so a `git push -f`,
+  `git reset` or `git stash` anywhere in it keeps its hazard recall.
+  `ZMEM_PRETOOL_SANITIZE=0` restores the raw query. Scope: the local hook
+  path only; the fleet broker and the OpenCode bridge do not pass the tool
+  input and are unchanged. Noise from `git status`, `grep`/`rg` and inline
+  scripts is deliberately not filtered.
 - Read-only snapshots now compare database copies with streaming hashes so companion note reads use bounded comparison memory on large stores.
 - **Redaction no longer misses secrets and emails on decoded Unicode text**
   (issue #523). Python's `\b` is Unicode-aware, so a non-ASCII letter glued

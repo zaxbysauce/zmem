@@ -721,6 +721,36 @@ the checkpoint phrase is never split, and the final query remains bounded to
 hook-to-store stdin channel and is neither logged nor persisted. The
 `ZMEM_QUERY_CONTEXT=0` kill switch disables both token and phrase enrichment.
 
+**Pre-tool query sanitation.** Before that composition, the store reduces the
+raw tool text to the part that names an operation
+(`ops_tokens.sanitize_pretool_command`): navigation and read-only inspection
+segments (`cd`, `ls`, `cat`, `head`, `tail`, `wc`, `echo`, `sed -n`, `find`
+without a mutating action, and similar) are dropped, redirection plumbing is
+removed, and absolute paths collapse to their basename. The rule is fail
+toward keeping: a segment that writes a file through redirection, carries a
+command substitution, or runs a nested shell command is kept (nested shell
+strings are sanitized recursively), and search tools such as `grep`/`rg` are
+kept. The sanitizer abstains, leaving the whole command's original text, in
+these structural cases: a segment it would drop pipes its output into a
+command it keeps (`echo "..." | python`, `cat patch | git apply`); a kept
+command reads a heredoc, here-string or file on stdin, including a file
+written by heredoc (`cat > run.sh <<EOF`), unless it is a shell whose heredoc
+is sanitized recursively or an executor such as `ssh`/`sudo`/`psql` whose
+heredoc body is kept verbatim; the command uses process substitution
+(`<(...)`, `>(...)`) or pipes into a subshell; the text cannot be tokenized;
+or a recognised
+interpreter is given inline source (`python -c`, `node -e`) or a shell is
+given no script operand. Recognition by command name is best-effort; the
+other cases do not depend on it. Leading `NAME=value` assignments stay with a
+kept command. When nothing operational is
+left, a checkpoint phrase selected from the command still forces the original
+query; otherwise a file-shaped operation token becomes the whole query; and
+with neither, the pre-tool call is silent (`empty-pool`) and the older session
+ring is not consulted for it. `ZMEM_PRETOOL_SANITIZE=0` restores the previous
+raw-text query; sanitation is also skipped whenever `ZMEM_QUERY_CONTEXT=0`.
+It applies only on hosts that send the private tool input (the local hook
+path); the fleet broker and the OpenCode bridge do not.
+
 This feature shipped under issue #155's published measurement decision (the
 2026-09-19 fail-closed INSUFFICIENT outcome); #155's predeclared measurement
 of record has since landed (`eval/real-corpus-2026-09-19.json` — an audit
