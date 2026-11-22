@@ -2679,7 +2679,8 @@ def _format_fenced_recall(rows: list[dict], header: str,
         # namespace. Escape them exactly like content/source_ref/tags so
         # the escape covers every rendered field (the CHANGELOG claim).
         lines.append(
-            f"{inj_prefix}- {_tier_prefix}[{r['id']}] "
+            f"{inj_prefix}- {_tier_prefix}"
+            f"[{escape_fence_shaped_text(str(r['id']))}] "
             f"[conf={escape_fence_shaped_text(str(r['confidence']))}] "
             f"[signal={escape_fence_shaped_text(str(r['signal']))}] "
             f"[ns={escape_fence_shaped_text(str(r['namespace']))}]"

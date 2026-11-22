@@ -611,12 +611,13 @@ def apply_token_budget(
     protected row keeps its stub on THAT prompt (issue #116 priority), so
     the normal row is skipped there. On a LATER prompt the selector records
     the clipped row, and a recorded row that still cannot be delivered whole
-    YIELDS the budget (``defer_ids``) on BOTH dispatch lanes -
-    deprioritised, never suppressed. The yield is KEPT only when the settled
-    admission then contains at least one normal row - that is the whole
-    guarantee. It does NOT promise that the freed space went to a row the
-    previous prompt did not already carry, and it does not promise WHICH
-    normal row; when none can use what is LEFT the stub is still rendered.
+    YIELDS the budget (``defer_ids``) on BOTH dispatch lanes. The yield is
+    KEPT only when it is a NET GAIN over the admission without it: every
+    protected row that pass delivered WHOLE is still delivered, and a normal
+    row is admitted that the other pass did not admit. Otherwise the no-defer
+    admission is used unchanged, so a yield can neither cascade into dropping
+    another protected row nor leave a stub as the only trace that a row
+    existed. A yield never guarantees WHICH normal row it frees space for.
     Everything else is admitted in descending
     score order
     (``signal=none`` after grounded rows at the same score); the scan
@@ -785,18 +786,19 @@ def apply_token_budget(
     if deferred_protected:
         plain_admitted, plain_used, plain_truncated, plain_dropped, _p = (
             _admit(set()))
-        # Review CD-001: the yield is kept only on a NET GAIN.
-        #   (a) every protected row the NO-DEFER pass delivered WHOLE must
-        #       still be delivered (whole or clipped), or deferring one row
-        #       cascaded into dropping another that fit;
+        # Review CD-001 / CE-003: the yield is kept only on a NET GAIN.
+        #   (a) every protected row the no-defer pass ADMITTED (whole OR as a
+        #       stub) that is not itself deferred must still be admitted -
+        #       otherwise deferring one row cascaded into dropping or blanking
+        #       a DIFFERENT protected row;
         #   (b) a normal row must be admitted that the no-defer pass did
         #       NOT admit, or the freed space bought nothing the prompt was
         #       not already carrying.
-        plain_whole = [
+        plain_protected = [
             i for i in protected_idx
             if i in plain_admitted
-            and not plain_admitted[i][0].get("_incomplete_delivery")]
-        keeps_protected = all(i in admitted for i in plain_whole)
+            and str(rows[i].get("id") or "") not in deferred_ids]
+        keeps_protected = all(i in admitted for i in plain_protected)
         new_normal = any(i in admitted and i not in plain_admitted
                          for _k, i in normal)
         if not (keeps_protected and new_normal):

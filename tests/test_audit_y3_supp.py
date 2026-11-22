@@ -2131,32 +2131,43 @@ class CrossPromptYieldTests(unittest.TestCase):
                              "a stamp far in the future has no valid age")
 
     def test_the_shave_loop_lands_on_the_minimal_stub(self):
-        """Closeout CS2-001: the 4-char shave must not skip the floor.
+        """Closeout CS2-001 / critic Y31: the 4-char shave must not skip 32.
 
-        Starting at 33-35 allowed characters and stepping down by four lands
-        on 29-31 without ever MEASURING the 32-char stub - so a row whose
-        measured floor fits was dropped. The loop must land exactly on
-        MIN_STUB_CHARS when the caller measured the floor as admissible.
+        The shave steps four characters, so a start of 33-35 allowed chars
+        lands on 29-31 without ever MEASURING the 32-char stub. Content whose
+        newlines sit at positions 33-34 makes the 34-char stub exceed the cap
+        while the 32-char one fits, so the un-clamped loop drops the row.
         """
         inject = self._inject()
-        # Content whose 33-35 char prefix carries a continuation newline, so
-        # the longer slice exceeds the cap while the measured floor fits.
-        content = ("x" * 30) + "\n\n" + ("y" * 2000)
+        # Newlines at positions 33-34: outside the 32-char floor slice.
+        content = ("x" * 32) + "\n\n" + ("y" * 2000)
         row = {
             "id": self.PROTECTED_ID, "type": "decision",
             "namespace": "user:global", "content": content,
             "score": 0.9, "source_ref": "", "tags": [], "confidence": 0.9,
         }
         row_min = inject._protected_row_min_cost(row)
-        # A budget that leaves exactly the measured floor.
-        budget = row_min + inject.FENCE_SHELL_ALLOWANCE
-        kept, _used, _dropped, stats = inject.apply_token_budget(
-            [row], budget, with_stats=True)
-        self.assertEqual(
-            stats["dropped_protected"], 0,
-            "the shave loop skipped the minimal stub (row_min=%d, budget=%d, "
-            "stats=%r)" % (row_min, budget, stats))
-        self.assertEqual(len(kept), 1)
+        self.assertGreater(row_min, 0)
+        floor_slice = inject._truncate_protected_row(
+            row, row_min, legacy_injection_wire=True,
+            cost_cap=row_min, floor_ok=True)
+        self.assertIsNotNone(
+            floor_slice,
+            "the measured minimal stub must be emitted at the exact floor "
+            "(row_min=%d) - the shave loop skipped it" % row_min)
+        # The relaxed slice just above the floor must also survive: the
+        # clamp is what lands the loop on MIN_STUB_CHARS there.
+        for extra in (1, 2, 3):
+            got = inject._truncate_protected_row(
+                row, row_min + extra, legacy_injection_wire=True,
+                cost_cap=row_min + extra, floor_ok=True)
+            if got is not None:
+                break
+        else:
+            got = None
+        self.assertIsNotNone(
+            got, "a slice one to three tokens above the floor dropped the row "
+            "instead of clamping onto the minimal stub")
 
     def test_a_yield_never_cascades_into_dropping_another_protected_row(self):
         """Critic CD-001: the critic's own 4-row cascade, pinned across budgets.
@@ -2217,13 +2228,15 @@ class CrossPromptYieldTests(unittest.TestCase):
                     "row the no-defer pass lacked (stats=%r)"
                     % (budget, dstats))
 
-    def test_a_cascade_that_drops_a_protected_row_is_reverted(self):
-        """Critic CD-001: the exact cascade the critic found, pinned.
+    def test_a_yield_never_loses_a_non_deferred_protected_row(self):
+        """Critic CE-002/CE-003: the fuzz-found cases, pinned exactly.
 
-        At budget 360 with A=900/B=600/C=200/D=300 chars and two normals, the
-        WEAK rule (keep any yield with some normal row) loses C - which the
-        no-defer pass still delivers - while keeping N2. The net-gain rule
-        reverts such a yield, so nothing the no-defer pass delivered vanishes.
+        Case 1 (CE-002): five rows at budget 360 - the WEAK rule keeps a yield
+        that loses p2, a protected row the no-defer pass delivered whole.
+        Case 2 (CE-003): six rows at budget 380 - the WEAK rule (and the
+        whole-only clause) keeps a yield that DROPS p4, a protected row the
+        no-defer pass delivered as a stub. Clause (a) now covers every
+        non-deferred protected admission, whole or clipped.
         """
         apply_token_budget = self._budget()
 
@@ -2232,28 +2245,69 @@ class CrossPromptYieldTests(unittest.TestCase):
                     "content": "w" * chars, "score": 0.9, "source_ref": "",
                     "tags": [], "confidence": 0.9}
 
-        ids = ["c0000000-0000-4000-8000-0000000000b%d" % i for i in range(1, 7)]
-        rows = [row(ids[0], "decision", 900),
-                row(ids[1], "constraint", 600),
-                row(ids[2], "decision", 200),
-                row(ids[3], "decision", 300),
-                row("e0000000-0000-4000-8000-0000000000b5", "fact", 80),
-                row("e0000000-0000-4000-8000-0000000000b6", "fact", 40)]
-        plain, _pu, _pd, pstats = apply_token_budget(list(rows), 360,
+        # ---------------- case 1 (CE-002) ----------------
+        ids1 = ["c0000000-0000-4000-8000-0000000000c%d" % i for i in range(5)]
+        rows1 = [row(ids1[0], "constraint", 1200),
+                 row(ids1[1], "decision", 600),
+                 row(ids1[2], "constraint", 200),
+                 row(ids1[3], "constraint", 900),
+                 row("e0000000-0000-4000-8000-0000000000c5", "fact", 20)]
+        plain1, _a, _b, pstats1 = apply_token_budget(list(rows1), 360,
                                                      with_stats=True)
-        defer, _du, _dd, dstats = apply_token_budget(
-            list(rows), 360, with_stats=True, defer_ids=ids[:3])
-        plain_ids = {r.get("id") for r in plain}
-        defer_ids = {r.get("id") for r in defer}
-        vanished = sorted(plain_ids - defer_ids)
+        defer1, _c, _d, dstats1 = apply_token_budget(
+            list(rows1), 360, with_stats=True, defer_ids=ids1[:3])
+        p1_ids = {r.get("id") for r in plain1}
+        d1_ids = {r.get("id") for r in defer1}
+        lost1 = sorted((p1_ids - d1_ids) - set(ids1[:3]))
         self.assertEqual(
-            vanished, [],
-            "a yield made delivered rows vanish: %r (defer stats=%r)"
-            % (vanished, dstats))
+            lost1, [],
+            "case 1: a yield lost NON-deferred rows the no-defer pass "
+            "delivered: %r (defer stats=%r)" % (lost1, dstats1))
+        self.assertEqual(dstats1["dropped_protected"],
+                         pstats1["dropped_protected"],
+                         "case 1: dropped_protected changed")
+
+        # ---------------- case 2 (CE-003, the "clipdrop") ----------------
+        ids2 = ["c0000000-0000-4000-8000-0000000000d%d" % i for i in range(5)]
+        rows2 = [row(ids2[0], "decision", 40),
+                 row(ids2[1], "decision", 900),
+                 row(ids2[2], "decision", 400),
+                 row(ids2[3], "constraint", 1600),
+                 row(ids2[4], "constraint", 200),
+                 row("e0000000-0000-4000-8000-0000000000d5", "fact", 40)]
+        plain2, _e, _f, pstats2 = apply_token_budget(list(rows2), 380,
+                                                     with_stats=True)
+        defer2, _g, _h, dstats2 = apply_token_budget(
+            list(rows2), 380, with_stats=True, defer_ids=[ids2[1]])
+        p2_ids = {r.get("id") for r in plain2}
+        d2_ids = {r.get("id") for r in defer2}
+        lost2 = sorted((p2_ids - d2_ids) - {ids2[1]})
         self.assertEqual(
-            dstats["dropped_protected"], pstats["dropped_protected"],
-            "a kept yield changed how many protected rows were dropped "
-            "(plain=%r defer=%r)" % (pstats, dstats))
+            lost2, [],
+            "case 2 (clipdrop): a yield dropped NON-deferred rows the "
+            "no-defer pass still delivered: %r (defer stats=%r)"
+            % (lost2, dstats2))
+        self.assertEqual(
+            dstats2["dropped_protected"], pstats2["dropped_protected"],
+            "case 2 (clipdrop): dropped_protected went %r -> %r"
+            % (pstats2["dropped_protected"], dstats2["dropped_protected"]))
+
+    def test_the_minimal_stub_clamp_is_present(self):
+        """Closeout CS2-001: the clamp that lands the shave loop on the floor.
+
+        A pure-behaviour discrimination for the clamp ALONE is not stable (the
+        4-char shave can land on 32 by coincidence for some slices, which is
+        why Y25 - which disables the floor gate - is the behavioural probe).
+        This pin keeps the clamp from being deleted: without it a 33-35-char
+        start that is over cap steps straight past the minimal stub.
+        """
+        src = (REPO / "skills/memory/scripts/storelib/inject.py").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "if (floor_ok and allowed > MIN_STUB_CHARS", src,
+            "the shave loop must clamp onto MIN_STUB_CHARS for a 33-35 char "
+            "start (CS2-001)")
+        self.assertIn("allowed = MIN_STUB_CHARS", src)
 
     def test_the_recall_admission_accepts_the_defer_seam(self):
         """The admission that ACTUALLY decides the passive pool owns the set.
