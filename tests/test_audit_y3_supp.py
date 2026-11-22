@@ -1392,7 +1392,18 @@ class CrossPromptYieldTests(unittest.TestCase):
             # old must not ride a fresh document stamp refreshed by another
             # row (the round-13 shape made it yield indefinitely).
             import time as _time
-            window = ledger.WINDOW_DEFAULT_S
+            # TE3-005: pin the ACTIVE window so the fixture's ages mean
+            # what they say, whatever the ambient env.
+            self.addCleanup(
+                lambda prior=os.environ.get("ZMEM_DELIVER_WINDOW_S"):
+                (os.environ.pop("ZMEM_DELIVER_WINDOW_S", None)
+                 if prior is None
+                 else os.environ.__setitem__(
+                     "ZMEM_DELIVER_WINDOW_S", prior)))
+            os.environ["ZMEM_DELIVER_WINDOW_S"] = "3600"
+            window = ledger._window_s()
+            self.assertEqual(window, 3600,
+                             "the pinned window must be the active one")
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump({"ids": ["old", "fresh"],
                            "stamps": {"old": _time.time() - (window * 4),
@@ -1560,10 +1571,20 @@ class CrossPromptYieldTests(unittest.TestCase):
             if sys.path and sys.path[0] == SYS_PATH:
                 sys.path.pop(0)
         import time as _time
+        # TE3-005: pin the ACTIVE window (read_clipped honours
+        # ZMEM_DELIVER_WINDOW_S), so "still fresh" is not env-dependent.
+        self.addCleanup(
+            lambda prior=os.environ.get("ZMEM_DELIVER_WINDOW_S"):
+            (os.environ.pop("ZMEM_DELIVER_WINDOW_S", None)
+             if prior is None
+             else os.environ.__setitem__(
+                 "ZMEM_DELIVER_WINDOW_S", prior)))
+        os.environ["ZMEM_DELIVER_WINDOW_S"] = "3600"
+        window = ledger._window_s()
+        assert window == 3600, window
         with tempfile.TemporaryDirectory(prefix="zmem-supp-age-") as scratch:
             sid = "supp-age-" + uuid.uuid4().hex[:8]
             now = _time.time()
-            window = ledger.WINDOW_DEFAULT_S
             # (a) an OLDER row that is still fresh: it must survive the second
             # write WITH ITS ORIGINAL STAMP (a writer that drops it, or that
             # re-stamps it, both fail here).
