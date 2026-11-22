@@ -1551,7 +1551,8 @@ class CrossPromptYieldTests(unittest.TestCase):
                                     "the legacy id must keep its own stamp")
 
     def test_the_writer_does_not_refresh_an_older_rows_stamp(self):
-        """TE-003: refreshing one clipped row must not extend another's age."""
+        """TE-003/TE2-003: refreshing one clipped row must neither extend nor
+        discard another row's record - before OR after it expires."""
         sys.path.insert(0, SYS_PATH)
         try:
             from storelib import delivery_ledger as ledger
@@ -1563,14 +1564,35 @@ class CrossPromptYieldTests(unittest.TestCase):
             sid = "supp-age-" + uuid.uuid4().hex[:8]
             now = _time.time()
             window = ledger.WINDOW_DEFAULT_S
-            ledger.record_clipped(scratch, sid, ["old-row"], now=now - window - 60)
+            # (a) an OLDER row that is still fresh: it must survive the second
+            # write WITH ITS ORIGINAL STAMP (a writer that drops it, or that
+            # re-stamps it, both fail here).
+            old_stamp = now - (window / 2)
+            ledger.record_clipped(scratch, sid, ["old-fresh"], now=old_stamp)
+            ledger.record_clipped(scratch, sid, ["new-row"], now=now)
+            self.assertEqual(ledger.read_clipped(scratch, sid),
+                             ["old-fresh", "new-row"],
+                             "a still-fresh older row must survive the write")
+            payload = json.loads(
+                Path(ledger.clipped_path(scratch, sid)).read_text(
+                    encoding="utf-8"))
+            self.assertAlmostEqual(payload["stamps"]["old-fresh"], old_stamp,
+                                   delta=1.0,
+                                   msg="the older row must keep its OWN stamp")
+            self.assertAlmostEqual(payload["stamps"]["new-row"], now, delta=1.0)
+            # (b) an EXPIRED row must not be resurrected by a later write.
+            path = ledger.clipped_path(scratch, sid)
+            os.unlink(path)
+            ledger.record_clipped(scratch, sid, ["old-row"],
+                                  now=now - window - 60)
             ledger.record_clipped(scratch, sid, ["new-row"], now=now)
             self.assertEqual(ledger.read_clipped(scratch, sid), ["new-row"],
-                             "the older row must expire on its own stamp even "
-                             "though the file was just rewritten (TE-003)")
+                             "the expired row must stay expired on its own "
+                             "stamp even though the file was just rewritten")
 
     def test_the_write_and_clear_honour_the_identity_key(self):
-        """TE-004: identity must key the WRITE and the terminal clear too."""
+        """TE-004/TE2-004: identity must key the WRITE and the terminal clear,
+        and the targeted clear must actually REMOVE that identity's sidecar."""
         sys.path.insert(0, SYS_PATH)
         try:
             from storelib import delivery_ledger as ledger
@@ -1587,7 +1609,16 @@ class CrossPromptYieldTests(unittest.TestCase):
             self.assertEqual(ledger.read_clipped(scratch, sid), [],
                              "the unkeyed session must not see it either")
             ledger.record_clipped(scratch, sid, ["p2-row"], principal="p2")
+            p1_path = ledger.clipped_path(scratch, sid, principal="p1")
+            self.assertTrue(os.path.exists(p1_path))
             ledger.end_delivery_state(scratch, sid, principal="p1")
+            # Positive removal of the TARGETED identity ...
+            self.assertEqual(ledger.read_clipped(scratch, sid, principal="p1"),
+                             [],
+                             "the keyed clear must REMOVE p1's sidecar")
+            self.assertFalse(os.path.exists(p1_path),
+                             "the keyed clear must unlink p1's sidecar file")
+            # ... and preservation of the other one.
             self.assertEqual(ledger.read_clipped(scratch, sid, principal="p2"),
                              ["p2-row"],
                              "the terminal clear of p1 must not clear p2")
