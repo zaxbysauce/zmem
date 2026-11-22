@@ -50,6 +50,9 @@ def _child_env(scratch, extra=None):
         "ZMEM_MODELS_DIR": str(Path(scratch) / "no-models"),
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
         "PYTHONIOENCODING": "utf-8",
+        # Review TE4-002: pin the delivery window for EVERY child, so a
+        # tiny ambient value cannot expire state a leg expects to be fresh.
+        "ZMEM_DELIVER_WINDOW_S": "3600",
     })
     for var in ("ZMEM_NAMESPACE", "ZMEM_PROJECT_DIR", "CLAUDE_PROJECT_DIR",
                 "ZCODE_PROJECT_DIR", "ZMEM_SESSION", "ZMEM_SESSION_ID",
@@ -1238,6 +1241,23 @@ class CrossPromptYieldTests(unittest.TestCase):
     DEPRIORITISATION, never a suppression: when nothing else could use the
     budget, the stub is still rendered (#116).
     """
+
+    def setUp(self):
+        # Review TE4-002: every leg here expects a clipped row to stay fresh
+        # for the duration of the test. ZMEM_DELIVER_WINDOW_S accepts 1s, so
+        # an ambient tiny value would make the class timing-sensitive; pin it
+        # and restore the caller's value afterwards.
+        prior = os.environ.get("ZMEM_DELIVER_WINDOW_S")
+        os.environ["ZMEM_DELIVER_WINDOW_S"] = "3600"
+
+        def _restore_window():
+            if prior is None:
+                os.environ.pop("ZMEM_DELIVER_WINDOW_S", None)
+            else:
+                os.environ["ZMEM_DELIVER_WINDOW_S"] = prior
+
+        self.addCleanup(_restore_window)
+
 
     PROTECTED_ID = "c0000000-0000-4000-8000-000000000001"
 
