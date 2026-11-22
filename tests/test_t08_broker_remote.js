@@ -139,8 +139,14 @@ function seedMarker() {
 // volatile id (the fixture README protocol).
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 const HEX32_RE = /\b[0-9a-f]{32}\b/g;
+// Issue #511: each leg renders its own fence, so the per-render token is as
+// volatile as a minted row id — mask it before the cross-leg comparison.
+const FENCE_TOKEN_RE = /(ZMEM_UNTRUSTED_FENCE(?::END)?):[0-9A-Za-z]{1,32}/g;
 function maskVolatile(text) {
-    return String(text).replace(UUID_RE, "<uuid>").replace(HEX32_RE, "<id>");
+    return String(text)
+        .replace(UUID_RE, "<uuid>")
+        .replace(HEX32_RE, "<id>")
+        .replace(FENCE_TOKEN_RE, "$1:<fence-token>");
 }
 
 // --- fixture payload --------------------------------------------------------
