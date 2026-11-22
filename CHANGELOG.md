@@ -20,20 +20,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   ASCII neighbour, correct under non-ASCII adjacency, and parity with the
   JS lane. The email pattern is Unicode-tolerant in its local part
   (composed and decomposed forms) with a linear-time design on both pure
-  word runs AND punctuated adversarial input — the local part is bounded
-  to the RFC 5321 limit of 64 characters; the unbounded form was quadratic
-  on punctuated non-ASCII text (~5.9s at 32k chars, inside the 65,536-byte
-  capture cap). Local parts over 64 characters no longer match, and
-  trailing non-ASCII adjacency now redacts (`user@example.comé` →
-  `[REDACTED_EMAIL]é`). ASCII behaviour is pinned exactly, for valid
-  (≤64-char local part) addresses — the over-64 trade-off above applies to
-  ASCII input too.
-- **Email local part excludes non-Latin scripts** (review finding M-1,
-  issue #523). The local-part class is now ASCII word chars + U+0300-U+036F
-  combining marks + Latin Extended (U+00C0-U+024F), not a bare Unicode `\w`,
-  so a CJK/Thai/ideographic run glued before an address is surrounding user
-  text and survives rather than being consumed as the local part
-  (`連絡先はuser@example.comです` → `連絡先は[REDACTED_EMAIL]です`).
+  word runs AND punctuated adversarial input. Trailing non-ASCII adjacency
+  now redacts (`user@example.comé` → `[REDACTED_EMAIL]é`). ASCII behaviour is
+  pinned exactly for valid addresses.
+- **Email local part excludes non-Latin scripts and is fail-closed on
+  over-length runs** (review findings M-1 and cand-privacy-1, issue #523).
+  The local-part class is now ASCII word chars + U+0300-U+036F combining
+  marks + Latin Extended (U+00C0-U+024F), not a bare Unicode `\w`, so a
+  CJK/Thai/ideographic run glued before an address is surrounding user text
+  and survives rather than being consumed as the local part
+  (`連絡先はuser@example.comです` → `連絡先は[REDACTED_EMAIL]です`). The
+  pattern uses a run-start boundary, a possessive quantifier, and a
+  word-char lookahead, so it is linear on punctuated adversarial input AND
+  fail-closed on over-length local parts: a >64-char run with separators
+  (`a_`×32`x@example.com`) is matched in full and redacted, matching the
+  pre-#523 base regex (a bounded `{0,63}` quantifier would have failed open
+  and leaked the address), while punctuation-only local parts (`--@example.com`)
+  are still rejected. One deliberate behaviour change vs the pre-review PR: a
+  leading delimiter is now consumed as part of the local part (`.joerg@…` →
+  `[REDACTED_EMAIL]`); the pre-review word-char-first form preserved it
+  (`.[REDACTED_EMAIL]`) but could not be made both linear and fail-closed.
   Known gaps,
   pinned by tests: IDN domains stay unredacted, the generic base64/hex
   boundaries keep `\b` (benign-SHA preservation, #502 direction), and

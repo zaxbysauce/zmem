@@ -226,27 +226,45 @@ def redact_secret_like_text(text: str) -> tuple[str, int]:
 # the local part: a CJK/Thai/ideographic run glued before an address is
 # surrounding user text and must survive, not be consumed as the local part
 # (review finding M-1: the earlier ``\w``-based class over-redacted
-# ``連絡先はuser@example.com`` → ``[REDACTED_EMAIL]``). The leading boundary
-# REQUIRES a local-part char first: this keeps non-matching non-ASCII text
-# LINEAR (a punctuation-allowed prefix made the engine retry at every
-# position — quadratic, measured ~2s at 16k chars) and preserves leading
-# delimiters (``.joerg@…`` keeps its dot) while rejecting punctuation-only
-# local parts (``--@example.com``). The local-part body is BOUNDED to {0,63}
-# (RFC 5321 local-part limit): the unbounded quantifier was still QUADRATIC
-# on punctuated adversarial input ("é."*N — a match could start after every
-# separator and scan the whole tail; final-critic probe: 5.9s at 32k chars,
-# inside the 65,536-byte capture cap). With the bound the same inputs run
-# ~0.02s (linear); local parts over 64 chars are not valid addresses and no
-# longer match (a >64-char dotted run gets only its valid tail redacted).
-# Behaviour change: trailing non-ASCII adjacency now redacts
-# (``user@example.comé`` → ``[REDACTED_EMAIL]é``). Under re.IGNORECASE the
-# ASCII classes case-fold to also match U+0130/U+0131/U+017F/U+212A-class
-# codepoints — a known, pinned gap. Verified ASCII-context-equal over 16,641
-# predecessor/successor contexts and linear at 8k/16k/32k adversarial inputs
-# (pure word runs AND punctuated alternations).
+# ``連絡先はuser@example.com`` → ``[REDACTED_EMAIL]``).
+#
+# Three structural properties make this pattern LINEAR, FAIL-CLOSED, and
+# punctuation-rejecting together:
+#   1. The leading boundary excludes the ENTIRE local-part char class
+#      (``(?<![...%+-])``), so a match can only START at the beginning of a
+#      maximal local-part run — the engine never retries inside a run. This is
+#      what keeps punctuated adversarial input (``a.``*N) linear: without it the
+#      engine restarts at every separator and scans the whole tail
+#      (measured ~2s at 16k chars pre-fix).
+#   2. The local-part quantifier is POSSESSIVE (``*+``): it consumes the whole
+#      maximal run and does NOT backtrack to a shorter length. This is what
+#      makes it FAIL-CLOSED on over-length local parts — a >64-char run with
+#      separators (``a_``*32 + ``x@example.com``) is matched in full and
+#      redacted, exactly as the pre-#523 base regex ``\b[A-Z0-9._%+-]+@…`` did.
+#      A bounded ``{0,63}`` quantifier stops before the ``@`` on such a run and
+#      FAILS OPEN (leaks the whole address); the possessive run-start form is
+#      linear AND fail-closed. The RFC 5321 64-char bound is not enforced
+#      character-wise — an over-length address is simply redacted in full
+#      (invalid either way).
+#   3. A word-char lookahead (``(?=[…]…[A-Za-z0-9_…])``) requires at least one
+#      word char in the run, so punctuation-only local parts (``--@example.com``,
+#      ``.@example.com``) are rejected — the PR's original intent, preserved.
+#
+# Behaviour: trailing non-ASCII adjacency now redacts
+# (``user@example.comé`` → ``[REDACTED_EMAIL]é``); a leading delimiter is
+# CONSUMED as part of the local part (``.joerg@…`` → ``[REDACTED_EMAIL]``),
+# unlike the PR's earlier word-char-first form which preserved it — this is the
+# one deliberate behaviour change vs the pre-review PR, and it matches the
+# pre-#523 base regex (which also consumed the delimiter); non-Latin runs before
+# an address survive (M-1). Under re.IGNORECASE the ASCII classes case-fold to
+# also match U+0130/U+0131/U+017F/U+212A-class codepoints — a known, pinned gap.
+# Verified linear at 8k/16k/32k adversarial inputs (pure word runs AND
+# punctuated alternations) and fail-closed on over-length runs.
 _EMAIL_RE = re.compile(
-    r"(?<![A-Za-z0-9_\u0300-\u036f\u00c0-\u024f])"
-    r"[A-Za-z0-9_\u0300-\u036f\u00c0-\u024f][A-Za-z0-9_\u0300-\u036f\u00c0-\u024f.%+-]{0,63}@"
+    r"(?<![A-Za-z0-9_\u0300-\u036f\u00c0-\u024f.%+-])"
+    r"(?=[A-Za-z0-9_\u0300-\u036f\u00c0-\u024f.%+-]*[A-Za-z0-9_\u0300-\u036f\u00c0-\u024f])"
+    r"[A-Za-z0-9_\u0300-\u036f\u00c0-\u024f.%+-]*+"
+    r"@"
     r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )

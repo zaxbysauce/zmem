@@ -873,13 +873,20 @@ class NonAsciiBoundaryTest(unittest.TestCase):
             out, count = redact_training_text(text)
             self.assertEqual((out, count), (text, 0), text)
 
-    def test_email_leading_delimiters_preserved(self):
-        # The widened email regex must not consume leading delimiters.
+    def test_email_leading_delimiters_consumed(self):
+        # The possessive run-start pattern consumes a leading delimiter as
+        # part of the local part (``.joerg@…`` → ``[REDACTED_EMAIL]``), matching
+        # the pre-#523 base regex ``\b[A-Z0-9._%+-]+@…``. This is the one
+        # deliberate behaviour change vs the pre-review PR (which preserved the
+        # delimiter); the run-start anchor that keeps the pattern linear cannot
+        # also preserve a leading delimiter without reintroducing quadratic
+        # backtracking, and the security property — the address is redacted —
+        # holds.
         for delim in (".", "-", "+", "%"):
             out, count = redact_training_text(f"{delim}joerg@example.com")
             self.assertEqual(
-                (out, count), (f"{delim}[REDACTED_EMAIL]", 1),
-                f"leading {delim!r} must survive")
+                (out, count), ("[REDACTED_EMAIL]", 1),
+                f"leading {delim!r} is consumed as the local part")
 
     def test_email_punctuation_only_local_part_rejected(self):
         for text in ("--@example.com", ".@example.com"):
@@ -919,13 +926,16 @@ class NonAsciiBoundaryTest(unittest.TestCase):
                     "chars — quadratic regression")
 
     def test_email_pattern_linear_on_punctuated_non_ascii(self):
-        # Final-critic round 1: the UNBOUNDED local part was quadratic on
-        # punctuated adversarial input ('é.'*N — a match could start after
-        # every separator; 5.9s at 32k, inside the 65,536-byte capture
-        # cap). The {0,63} bound makes it linear. This probes _EMAIL_RE
+        # The unbounded local part was quadratic on punctuated adversarial
+        # input ('é.'*N — a match could start after every separator; 5.9s at
+        # 32k). The shipped pattern is linear via the run-start boundary
+        # (a match can only begin at the start of a maximal local-part run)
+        # plus a possessive quantifier (no backtracking). This probes _EMAIL_RE
         # DIRECTLY: the full pipeline has a PRE-EXISTING quadratic on
         # dot-alternating input (5.7s for 'a.'*16k at BASE too — separate
-        # issue), which would mask the email pattern's own behavior here.
+        # issue, filed #535), which would mask the email pattern's own
+        # behavior here. 'é.'*N is a run of local-part chars, so the pattern
+        # matches the whole run once (no '@' → no redaction) and stays linear.
         import time
         import redaction as _r
         for shape in ("\u00e9.", "\u65e5\u672c-"):
@@ -940,7 +950,30 @@ class NonAsciiBoundaryTest(unittest.TestCase):
                         elapsed, 1.0,
                         f"email pattern took {elapsed:.2f}s at 32k "
                         f"punctuated {shape!r} chars — quadratic "
-                        "regression (the pre-{0,63} shape measured 5.9s)")
+                        "regression (the pre-fix shape measured 5.9s)")
+
+    def test_email_over_length_local_part_fail_closed(self):
+        # Review finding cand-privacy-1 (FIXED): the possessive run-start
+        # pattern consumes the whole maximal local-part run, so an over-length
+        # local part with separators (``a_``*32 + ``x@example.com``) is matched
+        # in full and redacted — the pre-#523 base regex behaviour. A bounded
+        # ``{0,63}`` quantifier stops before the ``@`` on such a run and FAILS
+        # OPEN (leaks the whole address); this pins the fail-closed behaviour.
+        for local in ("a_" * 32 + "x", "a-" * 32 + "x"):
+            text = local + "@example.com"
+            out, count = redact_training_text(text)
+            self.assertEqual(
+                (out, count), ("[REDACTED_EMAIL]", 1),
+                f"over-length local part {local!r} must be redacted, not leaked")
+        # A 65-char all-alnum local part is caught by the generic base64
+        # secret pattern first (the secret pass runs before the email pass),
+        # so it is classified as a secret and the domain is left — the same
+        # outcome as the pre-#523 base regex. The security property (the local
+        # part is redacted) holds; this case is not an email-classification
+        # regression.
+        out, count = redact_training_text("x" * 65 + "@example.com")
+        self.assertEqual(count, 1)
+        self.assertIn("[REDACTED_SECRET]", out)
 
 
     def test_email_local_part_excludes_cjk_surrounding_text(self):
