@@ -23,7 +23,15 @@ import unittest
 import uuid
 from pathlib import Path
 
-import _store_guard  # noqa: F401  (repo test-store isolation law)
+# Repo test-store isolation law: pin a module-level scratch store BEFORE the
+# _store_guard import (CI is exempt via GITHUB_ACTIONS; a developer box with
+# a real default store would otherwise refuse the bare `python tests/...`
+# run — the sibling audit suites pin the same way).
+_SCRATCH = tempfile.mkdtemp(prefix="zmem-y3-supp-pin-")
+os.environ["ZMEM_STORE"] = str(Path(_SCRATCH) / "store.sqlite")
+os.environ["ZMEM_DATA"] = _SCRATCH
+
+import _store_guard  # noqa: F401,E402  (runs under the pinned env above)
 
 REPO = Path(__file__).resolve().parents[1]
 STORE_PY = REPO / "skills" / "memory" / "scripts" / "store.py"
@@ -123,6 +131,12 @@ class ObservationGateTests(unittest.TestCase):
                         or k == "schema_meta"]:
                 del sys.modules[key]
             sys.path.insert(0, SYS_PATH)
+            _saved_env = {k: os.environ.get(k) for k in
+                          ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
+                           "ZMEM_MODEL_AUTODOWNLOAD")}
+            _saved_modules = {k: sys.modules.get(k) for k in list(sys.modules)
+                              if k == "storelib" or k.startswith("storelib.")
+                              or k == "schema_meta"}
             try:
                 from storelib.schema import connect
                 import storelib.recall as R
@@ -156,6 +170,18 @@ class ObservationGateTests(unittest.TestCase):
                 conn.close()
             finally:
                 sys.path.remove(SYS_PATH)
+                # Restore the process-global env and module cache the gate
+                # test mutated (swarm-review B5: no cross-suite pollution).
+                for key, val in _saved_env.items():
+                    if val is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = val
+                for key, mod in _saved_modules.items():
+                    if mod is None:
+                        sys.modules.pop(key, None)
+                    else:
+                        sys.modules[key] = mod
 
 
 class FenceTokenKnobTests(unittest.TestCase):

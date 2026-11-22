@@ -234,7 +234,7 @@ def _soft_trim(text: str, budget: int) -> str:
 
 
 _FENCE_CLOSER_RE = re.compile(
-    r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9a-f]+)?(_NEUTRALIZED)?>>>")
+    r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9A-Za-z]+)?(_NEUTRALIZED)?>>>")
 
 
 def _last_fence_closer(text: str) -> str:

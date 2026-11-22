@@ -67,6 +67,10 @@ def _pin_scratch_env(root: Path) -> None:
     # pin is exported by the bridge-parity leg of tests/test_opencode_
     # plugin.js; the host canary strips it ambiently (D2).
     os.environ["ZMEM_TEST_NOW"] = FIXED_TS
+    # Issue #511: pin the per-render fence token so the committed fixture
+    # bytes stay stable (the recall fence marker now embeds a token; same
+    # pin as the bridge-parity leg of tests/test_opencode_plugin.js).
+    os.environ["ZMEM_FENCE_TOKEN"] = "ocparity66"
 
 
 def _import_storelib():

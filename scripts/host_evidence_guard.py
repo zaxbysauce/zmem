@@ -93,7 +93,7 @@ _FENCE_OPEN_MARKERS = (
 # token-bearing), mirroring the END-side prefix match below and the
 # _FENCE_CLOSER_RE pattern in hooks/lib/zmem-session-start-payload.py.
 _FENCE_OPEN_RE = re.compile(
-    r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-f]+)?(_NEUTRALIZED)?>>>")
+    r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9A-Za-z]+)?(_NEUTRALIZED)?>>>")
 _FENCE_END_PREFIX = "<<<END_ZMEM_UNTRUSTED_FENCE"
 _REDACTION_NOTICE = "[REDACTED:"
 

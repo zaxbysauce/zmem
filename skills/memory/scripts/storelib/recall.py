@@ -2486,13 +2486,17 @@ ZMEM_FENCE_CLOSE = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 # changes rendered bytes); unset -> a fresh token per render.
 _FENCE_TOKEN_ENV = "ZMEM_FENCE_TOKEN"
 _FENCE_SHAPED_RE = re.compile(
-    r"<<<(END_)?ZMEM_UNTRUSTED_FENCE(:[0-9a-f]+)?(_NEUTRALIZED)?>>>")
+    r"<<<(END_)?ZMEM_UNTRUSTED_FENCE(:[0-9A-Za-z]+)?(_NEUTRALIZED)?>>>")
 
 
 def _fence_token() -> str:
     pinned = os.environ.get(_FENCE_TOKEN_ENV, "").strip()
-    if pinned:
-        return pinned[:32]
+    # Swarm-review A1 fix: the token grammar is [0-9A-Za-z]{1,32} everywhere
+    # (escape, guard, closer, verifier); a pin outside that grammar would
+    # mint genuine markers no consumer regex recognizes — ignore it and use
+    # a fresh random token instead.
+    if pinned and len(pinned) <= 32 and pinned.isalnum() and pinned.isascii():
+        return pinned
     return uuid.uuid4().hex[:12]
 
 

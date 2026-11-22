@@ -432,7 +432,12 @@ class SessionStartLaneTest(unittest.TestCase):
         # the local context exactly.
         self.assertIn("withheld", result.get("context", ""))
         self.assertEqual(result.get("rendered"), result.get("context"), result)
-        self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", result.get("context", ""))
+        # Issue #511: any fence grammar (canonical OR token-bearing) must be
+        # absent here — the bare-literal check could not see a token fence.
+        import re as _re
+        self.assertIsNone(
+            _re.search(r"<<<(END_)?ZMEM_UNTRUSTED_FENCE", result.get("context", "")),
+            result.get("context", "")[:200])
         self.assertEqual(result.get("reason"), "budget-drop", result)
 
     def test_session_start_fences_and_reports_tokens(self):
