@@ -746,11 +746,14 @@ class NormVerifySuppTest(unittest.TestCase):
                               "zero-write: nothing stale for 163 to heal")
         finally:
             conn2.close()
-        # mixed-batch discriminator (stage-B reviewer round 2): after the
-        # 162 repair has stamped, a NEW NULL-norm row that shares a
-        # decode-fallback batch with the undecodable rows must STAY NULL
-        # (163's lane split) — the pre-fix fallback converted the NULL to
-        # "" and healed it
+        # mixed-batch discriminator (stage-B reviewer round 2, INVERTED by
+        # issue #527's post-stamp NULL lane): after the 162 repair has
+        # stamped, a NEW NULL-norm row that shares a decode-fallback batch
+        # with the undecodable rows now HEALS on the next open — the NULL
+        # lane (_heal_null_content_norms_post_stamp) skips the undecodable
+        # rows and materializes the decodable row's canonical norm. The
+        # pre-#527 behavior (NULL stays NULL under both marker gates) was
+        # the bug #527 filed; the 163 lane itself still never touches NULL.
         raw2 = sqlite3.connect(str(store))
         try:
             raw2.execute(
@@ -774,10 +777,11 @@ class NormVerifySuppTest(unittest.TestCase):
                 "'96000000-0000-4000-8000-000000000905'").fetchone()[0]
         finally:
             conn5.close()
-        self.assertIsNone(
-            n905,
-            "a NULL norm in a decode-fallback batch stays NULL (162's "
-            "lane; not healed by the 163 pass)")
+        self.assertEqual(
+            n905, "null lane mixed body",
+            "a NULL norm in a decode-fallback batch heals to its canonical "
+            "normalize on the next open (issue #527's post-stamp NULL lane); "
+            "undecodable rows in the same batch stay NULL")
         # and a stale NORM on a decodable row still heals next open even
         # with the unverifiable rows present
         conn3 = sqlite3.connect(str(store))

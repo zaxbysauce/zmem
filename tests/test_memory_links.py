@@ -392,12 +392,18 @@ class RecallExpansionTest(_Store):
         self.assertEqual(r.returncode, 0, r.stderr)
         conn = self.db()
         conn.executemany(
+            # content_norm seeded canonically — issue #527 fixture
+            # disclosure (seed as the supported writer would, so the byte
+            # golden below reflects a clean store rather than rows the
+            # post-stamp NULL heal lane rewrites on first open).
             "INSERT INTO memory (id, namespace, type, content, tags, source_ref, "
-            "source_hash, confidence, signal, valid_from, ingestion_ts) "
-            "VALUES (?, ?, 'fact', ?, '', '', '', 0.9, 'test', ?, ?)",
+            "source_hash, confidence, signal, valid_from, ingestion_ts, "
+            "content_norm) "
+            "VALUES (?, ?, 'fact', ?, '', '', '', 0.9, 'test', ?, ?, ?)",
             [
                 (row["id"], fixture["namespace"], row["content"],
-                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+                 " ".join(row["content"].lower().split()))
                 for row in fixture["memories"]
             ],
         )
@@ -713,7 +719,13 @@ class RecallExpansionTest(_Store):
         # Proof chain: current wire minus _temporal_arrival_only equals the
         # round-2 pin 23825bdb... (reviewer strip-probe); that minus the arms
         # key deep-equals the pre-#178 envelope (round-2 dual-tree proof).
-            "77a3b0c1354f92da226a098f71946efc4ee895f25103ca0dc2d29e8bc79f9c8b",
+        # Issue #527 re-capture (2026-11-21): the fixture now seeds canonical
+        # content_norm (see the INSERT disclosure above) instead of leaving
+        # the column NULL, so the recall envelope's norm-derived score
+        # fields changed and the golden moved from 77a3b0c1... to the value
+        # below. The within-run reproducibility invariant above
+        # (first raw == second raw) still guards determinism.
+            "0bebbea9b00d86dc56e08ff152c06a30f2e6784264ab89b6a1117a119b77be1d",
         )
         # Issue #176: the explain envelope gained entity_kind_weights (the
         # effective per-kind entity-lane RRF weights), so the byte golden
