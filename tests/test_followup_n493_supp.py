@@ -749,11 +749,12 @@ class NormVerifySuppTest(unittest.TestCase):
         # mixed-batch discriminator (stage-B reviewer round 2, INVERTED by
         # issue #527's post-stamp NULL lane): after the 162 repair has
         # stamped, a NEW NULL-norm row that shares a decode-fallback batch
-        # with the undecodable rows now HEALS on the next open — the NULL
-        # lane (_heal_null_content_norms_post_stamp) skips the undecodable
-        # rows and materializes the decodable row's canonical norm. The
-        # pre-#527 behavior (NULL stays NULL under both marker gates) was
-        # the bug #527 filed; the 163 lane itself still never touches NULL.
+        # with the undecodable rows now HEALS on the next open — the
+        # combined post-stamp lane (_heal_content_norms_post_stamp) skips
+        # the undecodable rows and materializes the decodable row's
+        # canonical norm. The pre-#527 behavior (NULL stays NULL under both
+        # marker gates) was the bug #527 filed; the 163 lane itself still
+        # never touches NULL.
         raw2 = sqlite3.connect(str(store))
         try:
             raw2.execute(
