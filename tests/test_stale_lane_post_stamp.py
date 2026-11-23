@@ -277,28 +277,56 @@ class CombinedLaneInventoryTest(unittest.TestCase):
         name = "inv-undecodable.sqlite"
         self._seed(name)
         rid = "62700003-0000-4000-8000-000000000003"
+        rid_bad_norm = "62700004-0000-4000-8000-000000000004"
+        rid_repairable = "62700005-0000-4000-8000-000000000005"
         raw = sqlite3.connect(self._store_path(name))
         try:
             raw.execute(
                 "INSERT INTO memory (%s) VALUES (?,?,?,?,?,?,?,?,?,?)" % COLS,
                 (rid, "ns", "lesson", sqlite3.Binary(b"\xff\xfe bad"),
                  "[]", "p", 0.5, "t", "2026-01-01T00:00:00Z", "WRONG"))
+            # UNDECODABLE NON-NULL NORM (invalid UTF-8 TEXT) with valid
+            # content: implementation-review round 1 — this shape must not
+            # block repair of OTHER rows in the same batch.
+            raw.execute(
+                "INSERT INTO memory (%s) VALUES (?,?,?,?,?,?,?,?,?,cast(? as text))"
+                % COLS,
+                (rid_bad_norm, "ns", "lesson", "valid body",
+                 "[]", "p", 0.5, "t", "2026-01-01T00:00:00Z",
+                 sqlite3.Binary(b"\xff\xfe nope")))
+            # An ordinary STALE row in the SAME batch: must still heal.
+            raw.execute(
+                "INSERT INTO memory (%s) VALUES (?,?,?,?,?,?,?,?,?,?)" % COLS,
+                (rid_repairable, "ns", "lesson", "repair me",
+                 "[]", "p", 0.5, "t", "2026-01-01T00:00:00Z", "WRONG-NEIGHBOR"))
             raw.commit()
         finally:
             raw.close()
         conn = self._open(name)
         try:
             schema._heal_content_norms_post_stamp(conn)  # must not raise
-            val = conn.execute(
-                "SELECT content_norm FROM memory WHERE id=?", (rid,)
-            ).fetchone()[0]
+            # Verify through the bytes factory: one row's norm is invalid
+            # UTF-8 by construction, which the str factory cannot decode.
+            conn.text_factory = bytes
+            vals = {
+                r[0].decode(): r[1] for r in conn.execute(
+                    "SELECT id, content_norm FROM memory").fetchall()}
         finally:
             conn.close()
         self.assertEqual(
-            val, "WRONG",
+            vals[rid], b"WRONG",
             "a row whose content is not verifiable text stays outside the "
             "content_norm contract (skip semantics shared with the 163 and "
             "NULL lanes)")
+        self.assertEqual(
+            vals[rid_bad_norm], b"\xff\xfe nope",
+            "an undecodable NON-NULL norm stays outside the contract too — "
+            "skipped, never conflated with SQL NULL")
+        self.assertEqual(
+            vals[rid_repairable], normalize_content("repair me").encode(),
+            "the repairable stale row in the SAME batch still heals — an "
+            "undecodable norm elsewhere in the batch must not defer it "
+            "(implementation-review round 1 finding)")
 
     def test_caller_transaction_rollback_undoes_heal_batch(self):
         # Caller-owned transaction: the lane's savepoint rides inside it and

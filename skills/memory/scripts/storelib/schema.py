@@ -2506,11 +2506,14 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
                 return
             finally:
                 conn.text_factory = str
-            # Decode ONLY the norm column here and keep the raw content
-            # bytes (163-pass discipline: pre-decoding content turned an
-            # undecodable row into "" and healed it to an empty norm).
-            rows = [(r[0], r[1], None if r[2] is None else _norm_text(r[2]))
-                    for r in raw_rows]
+            # Keep the norm column as RAW BYTES here (content too): the
+            # classification below decodes it via _norm_text so an
+            # UNDECODABLE non-NULL norm stays distinguishable from SQL
+            # NULL (implementation-review round 1: conflating them made
+            # the IS NULL compare-and-update unmatchable and the fresh
+            # re-read raise, deferring the whole batch instead of just
+            # skipping that row).
+            rows = list(raw_rows)
         except sqlite3.Error as exc:
             # Implementation-review round 2: a non-decode database error
             # from the FIRST fetch (any other sqlite3.Error subtype) is
@@ -2528,15 +2531,22 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
         # Heal candidates (#527 NULL shape + #533 stale non-NULL shape):
         # only rows whose content is verifiable text; a NULL norm wants the
         # canonical value, a non-NULL norm that differs from the canonical
-        # normalize of its own content wants the same canonical value.
+        # normalize of its own content wants the same canonical value. An
+        # UNDECODABLE non-NULL norm is OUTSIDE the contract (163-pass skip
+        # semantics) — skipped, never conflated with SQL NULL.
         candidates = []
         for r in rows:
             text = _norm_text(r[1])
             if text is None:
                 continue
+            norm = r[2]
+            if isinstance(norm, bytes):
+                norm = _norm_text(norm)
+                if norm is None and r[2] is not None:
+                    continue  # undecodable non-NULL norm: skip the row
             canonical = _normalize_content(text)
-            if r[2] is None or r[2] != canonical:
-                candidates.append((r[0], text, canonical, r[2]))
+            if norm is None or norm != canonical:
+                candidates.append((r[0], text, canonical, norm))
         if not candidates:
             # Nothing healable in this batch: advance the keyset WITHOUT
             # acquiring the write lock (163 advisory; skip semantics
