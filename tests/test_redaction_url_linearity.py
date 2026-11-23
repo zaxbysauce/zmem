@@ -243,6 +243,21 @@ class LinearitySmokeTest(unittest.TestCase):
     def test_scheme_chain_no_at(self):
         self._assert_linear("x://u:" * 4096)
 
+    def test_scheme_chain_discriminates_the_barrier_memo(self):
+        # A memo-less scan (the barrier check disabled) measures ~2.2s at
+        # this size (measured on the M3 mutant, 2026-11-22: 852ms at 36k,
+        # 2173ms at 60k, 4032ms at 84k chars) while the memo'd scanner sits
+        # in single-digit milliseconds — the 1.0s bound sits between them
+        # with >2x margin on both sides.
+        start = time.perf_counter()
+        R.redact_secret_like_text("x://u:" * 10000)
+        elapsed = time.perf_counter() - start
+        self.assertLess(
+            elapsed, 1.0,
+            "barrier-memo regression: 60k-char scheme chain took %.3fs "
+            "(memo'd scanner is single-digit ms; the memo-less mutant "
+            "measures ~2.2s here)" % elapsed)
+
     def test_scheme_chain_terminal_at(self):
         self._assert_linear("x://u:" * 4096 + "@")
 
