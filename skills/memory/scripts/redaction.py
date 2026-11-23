@@ -82,6 +82,134 @@ SECRET_GENERIC_PATTERNS = [
 # accepted as fail-safe over-redaction and disclosed in SKILL.md; the case
 # scoping only guarantees ``-P``-shaped tokens never match. Group 1 captures
 # the value span in every entry.
+# Issue #535: the URL-scheme credential family is applied by a single-pass
+# scanner, not a compiled regex. The pre-fix pattern (kept verbatim as the
+# sentinel's display ``pattern`` so gate warnings stay byte-identical) was
+# QUADRATIC on punctuated and scheme-chain input (12.3s for 'a.'*32768 at
+# the 65,536-char capture cap): its unbounded scheme and password runs
+# backtrack/scan O(n) per start position. No single compiled regex is both
+# linear on chains and match-set-exact — a bounded password run fails open
+# on long passwords, excluding ':' from the password class fails open on
+# RFC-valid raw-colon passwords, and a class-mirroring run-start boundary
+# loses '.https://'-family matches (plan-critic rounds 1-3, probe-verified).
+# The scanner reproduces the regex's match decision EXACTLY (spans, outputs,
+# detection counts, and the scoped-IGNORECASE Unicode folds — membership is
+# delegated to the engine's own single-char patterns) and adds the memo a
+# backtracking engine cannot express: a failed password scan proves no '@'
+# exists before the next whitespace, so later attempts starting inside that
+# region fail in O(1) — worst case one forward scan per whitespace-delimited
+# region (linear; <=72ms worst observed at the cap vs 12.3s at base).
+_URL_CREDENTIAL_PATTERN_SOURCE = (
+    r"(?i:(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@"
+)
+_URL_SCHEME_CHAR = re.compile(r"(?i)[a-z0-9+.-]")
+_URL_LETTER = re.compile(r"(?i)[a-z]")
+_URL_PREV = re.compile(r"(?i)[A-Za-z0-9_]")
+_URL_USER_RUN = re.compile(r"[^\s:/@]+")
+_URL_PW_RUN = re.compile(r"[^\s@]*")
+
+
+class _URLCredentialMatch:
+    """Match-protocol adapter for the URL credential scanner (``group``/
+    ``span``/``start``/``end`` with the whole span = scheme start .. the
+    terminating ``@`` exclusive-end, group 1 = the password span)."""
+
+    __slots__ = ("_text", "_start", "_end", "_ps", "_pe")
+
+    def __init__(self, text, start, end, ps, pe):
+        self._text = text
+        self._start = start
+        self._end = end
+        self._ps = ps
+        self._pe = pe
+
+    def group(self, group=0):
+        if group == 0:
+            return self._text[self._start:self._end]
+        if group == 1:
+            return self._text[self._ps:self._pe]
+        raise IndexError("no such group")
+
+    def span(self, group=0):
+        if group == 0:
+            return (self._start, self._end)
+        if group == 1:
+            return (self._ps, self._pe)
+        raise IndexError("no such group")
+
+    def start(self, group=0):
+        return self.span(group)[0]
+
+    def end(self, group=0):
+        return self.span(group)[1]
+
+
+class _URLCredentialScannerPattern:
+    """Duck-typed pattern occupying the URL entry's registry slot. Every
+    consumer that iterates the secret registries — the redaction loop's
+    ``finditer`` + match protocol, write.py's capture gates and recall.py's
+    classifiers via ``search`` + the sliceable ``pattern`` display string —
+    gets scanner semantics at the exact sequence position, with no consumer
+    changes (issue #535 plan-critic round 3: keeping the regex for the gates
+    would preserve their quadratic DoS surface)."""
+
+    pattern = _URL_CREDENTIAL_PATTERN_SOURCE
+
+    def _matches(self, text):
+        text = text or ""
+        i = 0
+        n = len(text)
+        barrier = -1
+        while True:
+            q = text.find("://", i)
+            if q < 0:
+                break
+            s = q
+            while s > 0 and _URL_SCHEME_CHAR.fullmatch(text[s - 1]):
+                s -= 1
+            start = -1
+            for pos in range(s, q):
+                if (_URL_LETTER.fullmatch(text[pos])
+                        and (pos == 0
+                             or not _URL_PREV.fullmatch(text[pos - 1]))):
+                    start = pos
+                    break
+            if start < 0:
+                i = q + 3
+                continue
+            user = _URL_USER_RUN.match(text, q + 3)
+            if user is None:
+                i = q + 3
+                continue
+            colon = user.end()
+            if colon >= n or text[colon] != ":":
+                i = q + 3
+                continue
+            pw_start = colon + 1
+            if pw_start < barrier:
+                i = q + 3
+                continue
+            pw_end = _URL_PW_RUN.match(text, pw_start).end()
+            if pw_end < n and text[pw_end] == "@" and pw_end > pw_start:
+                yield (start, pw_end + 1, pw_start, pw_end)
+                i = pw_end + 1
+            else:
+                if pw_end > barrier:
+                    barrier = pw_end
+                i = q + 3
+
+    def finditer(self, text):
+        for start, end, ps, pe in self._matches(text):
+            yield _URLCredentialMatch(text, start, end, ps, pe)
+
+    def search(self, text):
+        for match in self.finditer(text):
+            return match
+        return None
+
+
+_URL_CREDENTIAL_SCANNER = _URLCredentialScannerPattern()
+
 SECRET_COMMAND_PATTERNS = [
     # sshpass -p <value> (standalone -p; any whitespace, incl. tabs)
     re.compile(r"(?i:(?<![A-Za-z0-9_])sshpass(?![A-Za-z0-9_]))\s+-p\s+(\S+)"),
@@ -90,8 +218,10 @@ SECRET_COMMAND_PATTERNS = [
     # ssh/mysql/psql -p<value> (attached form only, exactly these commands;
     # over-redacts ports for ssh/psql per the issue matrix)
     re.compile(r"(?i:(?<![A-Za-z0-9_])(?:ssh|mysql|psql)(?![A-Za-z0-9_]))[ \t]+-p(\S+)"),
-    # scheme://user:password@host — replace only the password
-    re.compile(r"(?i:(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@"),
+    # scheme://user:password@host — replace only the password (issue #535:
+    # scanner sentinel, exact old match semantics, linear on adversarial
+    # input; see _URLCredentialScannerPattern)
+    _URL_CREDENTIAL_SCANNER,
 ]
 
 # Refusal-only detector (issue #180): no safe value span exists — the password

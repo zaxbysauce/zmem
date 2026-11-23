@@ -749,11 +749,12 @@ class NormVerifySuppTest(unittest.TestCase):
         # mixed-batch discriminator (stage-B reviewer round 2, INVERTED by
         # issue #527's post-stamp NULL lane): after the 162 repair has
         # stamped, a NEW NULL-norm row that shares a decode-fallback batch
-        # with the undecodable rows now HEALS on the next open — the NULL
-        # lane (_heal_null_content_norms_post_stamp) skips the undecodable
-        # rows and materializes the decodable row's canonical norm. The
-        # pre-#527 behavior (NULL stays NULL under both marker gates) was
-        # the bug #527 filed; the 163 lane itself still never touches NULL.
+        # with the undecodable rows now HEALS on the next open — the
+        # combined post-stamp lane (_heal_content_norms_post_stamp) skips
+        # the undecodable rows and materializes the decodable row's
+        # canonical norm. The pre-#527 behavior (NULL stays NULL under both
+        # marker gates) was the bug #527 filed; the 163 lane itself still
+        # never touches NULL.
         raw2 = sqlite3.connect(str(store))
         try:
             raw2.execute(
@@ -1735,13 +1736,18 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_second_open_does_not_rescan(self):
-        """Steady state (round-2 F-3 behavioral rewrite): the stamped
-        early return SKIPS the scan — a stale norm planted AFTER the
-        stamp survives a later open untouched, while the same stale row
-        heals on an unstamped store. (The old shape timed an unstamped
-        re-scan: a clean store never stamps, so the wall-clock bound
-        passed regardless and the early return's deletion survived.)"""
+    def test_post_stamp_stale_heals_and_unstamped_163_recreates_stamp(self):
+        """Issue #533 rewrite of the round-2 F-3 pin: the combined
+        post-stamp lane (_heal_content_norms_post_stamp) now heals a stale
+        norm planted AFTER the stamp, and the unstamped-163 leg keeps a REAL
+        discriminator — after deleting the stamp and RE-PLANTING a fresh
+        stale norm, the reopen must both heal it AND re-create the
+        content_norm_verify_163 stamp. Only the 163 verification pass ever
+        writes that stamp (it rides an actual heal; the combined lane has no
+        marker), so the stamp assertion proves the 163 pass itself ran —
+        without it, the combined lane alone would green this test and a
+        deleted _verify_content_norms_163 would go unnoticed (plan-critic
+        round 2 masking finding)."""
         store = _fresh_store("nv-noscan")
         _run_cli(store, "add", "--content", "noscan body",
                  "--namespace", "project:supp", "--type", "fact")
@@ -1762,8 +1768,10 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
                 "SELECT value FROM meta WHERE "
                 "key='content_norm_verify_163'").fetchone()
             self.assertIsNotNone(stamped, "fixture: stamp must be present")
-            # Plant a stale norm AFTER the stamp; the stamped early return
-            # must leave it untouched on the next open.
+            # Plant a stale norm AFTER the stamp; the combined post-stamp
+            # lane must heal it on the next open (issue #533 — this is the
+            # deliberate inversion of the old pin, which asserted the stale
+            # value survived the stamped early return).
             conn.execute(
                 "UPDATE memory SET content_norm='STALE AFTER STAMP' "
                 "WHERE content='noscan body'")
@@ -1780,11 +1788,19 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(
-            norm[0], "STALE AFTER STAMP",
-            "the stamped early return skipped the scan (no re-heal)")
-        # Discriminator: the SAME stale row heals on an unstamped store.
+            norm[0], _normalize_content("noscan body"),
+            "post-stamp stale norm heals on the next open (issue #533 "
+            "combined lane)")
+        # Unstamped-163 leg with a REAL discriminator: RE-PLANT a fresh
+        # stale norm (the post-stamp leg just healed the row, so without
+        # re-planting the assertion below would pass on an already-canonical
+        # row), delete the stamp, reopen — the 163 pass must heal it AND
+        # re-create the stamp.
         conn = sqlite3.connect(str(store))
         try:
+            conn.execute(
+                "UPDATE memory SET content_norm='STALE UNSTAMPED' "
+                "WHERE content='noscan body'")
             conn.execute(
                 "DELETE FROM meta WHERE key='content_norm_verify_163'")
             conn.commit()
@@ -1796,10 +1812,19 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
             norm2 = conn.execute(
                 "SELECT content_norm FROM memory WHERE "
                 "content='noscan body'").fetchone()
+            restamped = conn.execute(
+                "SELECT value FROM meta WHERE "
+                "key='content_norm_verify_163'").fetchone()
         finally:
             conn.close()
         self.assertEqual(norm2[0], _normalize_content("noscan body"),
-                         "unstamped, the same stale row heals")
+                         "unstamped, the re-planted stale row heals")
+        self.assertIsNotNone(
+            restamped,
+            "the unstamped reopen RE-CREATES content_norm_verify_163 — "
+            "only the 163 verification pass writes that stamp (it rides an "
+            "actual heal); its absence would mean the combined lane healed "
+            "the row while the 163 pass itself is gone")
 
 
 def tearDownModule():
