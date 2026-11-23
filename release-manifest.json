@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "48f8e345311aa41096c0438f7fa96debb39ace4b8fdc0168379dc31aafe69884",
+  "digest": "8db27abb9b2d1d88a77fbd09ee71742bdf43715d8b0b429f322884474bc365b9",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -145,7 +145,7 @@
     "skills/memory/scripts/storelib/feedback.py": "3e961f40f21bcca13420984020a818d80047588fa19b37fe1f384e438f83dc9e",
     "skills/memory/scripts/storelib/generation.py": "da059a54b16f8416051b1a7b626b1d6867fbf844dc194a1855beae9b2da05466",
     "skills/memory/scripts/storelib/hygiene.py": "50cb763f42bea675d0f57b5ca2d148ad5f534ac64ad13100670c6b340cc68f2e",
-    "skills/memory/scripts/storelib/inject.py": "acf787fde27a87b7c062b49afbe2e29192c6a0a823a83a30feb7f9076c6f80f2",
+    "skills/memory/scripts/storelib/inject.py": "25718dba38a88ffd1366eba99839629334ab9d495d5b769d9cd63edb3e17a6c4",
     "skills/memory/scripts/storelib/knowledge.py": "728eec70cb993d172a22558acb6fbc344f4b6e133f5008130f344e7ba2b8f9bc",
     "skills/memory/scripts/storelib/links.py": "04db693ec0a488e44e3260fc2f43331ef2142af76d855e38b157718219d2abbd",
     "skills/memory/scripts/storelib/log_rotate.py": "829c83b48f02018efe0780a3fda47bb1d578735818cafe481eb9b07920d65055",

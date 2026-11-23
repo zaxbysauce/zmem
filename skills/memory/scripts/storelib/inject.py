@@ -613,8 +613,9 @@ def apply_token_budget(
     the clipped row, and a recorded row that still cannot be delivered whole
     YIELDS the budget (``defer_ids``) on BOTH dispatch lanes. The yield is
     KEPT only when it is a NET GAIN over the admission without it: every
-    protected row that pass delivered WHOLE is still delivered, and a normal
-    row is admitted that the other pass did not admit. Otherwise the no-defer
+    protected row that pass ADMITTED (whole or as a stub) is still admitted,
+    and a normal row is admitted that the other pass did not admit. Otherwise
+    the no-defer
     admission is used unchanged, so a yield can neither cascade into dropping
     another protected row nor leave a stub as the only trace that a row
     existed. A yield never guarantees WHICH normal row it frees space for.
@@ -672,9 +673,9 @@ def apply_token_budget(
     # reserving space by a cost estimate (FB-003/FB-01202), and deciding
     # deferred rows last (FB-01301/FB-01401). The surviving rule compares
     # the two passes: a deferral survives only when it is a NET GAIN - every
-    # protected row the no-defer pass delivered WHOLE is still delivered,
-    # AND at least one normal row is admitted that the no-defer pass did
-    # not admit. Anything else falls back to the no-defer result.
+    # protected row the no-defer pass ADMITTED (whole or as a stub) is still
+    # admitted, AND at least one normal row is admitted that the no-defer
+    # pass did not admit. Anything else falls back to the no-defer result.
     deferred_ids = {str(i) for i in (defer_ids or ()) if isinstance(i, str)}
     normal_costs = {
         i: _fence_row_cost_for_wire(
