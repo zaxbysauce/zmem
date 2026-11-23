@@ -1608,7 +1608,12 @@ class CrossPromptYieldTests(unittest.TestCase):
                 self.assertEqual(ledger.read_clipped(scratch, sid), ["legacy"],
                                  "a fresh legacy stamp (%r) must still defer"
                                  % (type(stamp).__name__,))
-                ledger.record_clipped(scratch, sid, ["new"])
+                # CI clock granularity: record_clipped would stamp
+                # time.time(), which can equal `now` on a coarse
+                # (or backwards-adjusted) clock, making the
+                # distinct-stamp assertion flaky. Pin a later value.
+                ledger.record_clipped(scratch, sid, ["new"],
+                                      now=now + 60)
                 self.assertEqual(ledger.read_clipped(scratch, sid),
                                  ["legacy", "new"],
                                  "the upgrade must keep the legacy id with its "

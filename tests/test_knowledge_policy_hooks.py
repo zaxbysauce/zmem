@@ -291,10 +291,15 @@ class KnowledgePolicyHookTest(unittest.TestCase):
         self.assertNotIn("knowledge companion", final_ctx,
                          "an unfitting policy is dropped, never truncated "
                          "mid-policy")
-        # The pre-knowledge trim behavior is unchanged: the base context
-        # still composes and truncates exactly as the base builder does.
-        baseline = self._stdout(self._run(self.base_payload, self._env(),
-                                          budget="60"))
+        # Zero added bytes means the SAME builder must produce the same
+        # output with the policy disabled: with no config, the knowledge
+        # lane adds nothing, so any byte the policy contributed would show
+        # up here. (Comparing against the frozen pre-#511 fixture instead
+        # would pin the OLD _soft_trim algorithm: PR #534's H1 fix closes
+        # the fence that survives the cut, which by design changes trimmed
+        # bytes - that is a trim-shape assertion, not this test's claim.)
+        (self.data / "config.json").write_text("{}", encoding="utf-8")
+        baseline = self._stdout(self._run(PAYLOAD, self._env(), budget="60"))
         self.assertEqual(out, baseline,
                          "an over-budget policy adds zero bytes")
 

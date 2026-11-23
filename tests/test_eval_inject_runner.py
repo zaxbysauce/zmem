@@ -558,7 +558,10 @@ class NoSilentBypassTest(unittest.TestCase):
         # omissions — an admitted-everything stub, the exact bypass this
         # test refuses). Costs use fence_row_cost, the estimator the real
         # admission charges.
-        def _identity(rows, budget=None, *, with_stats=False):
+        # PR #534: the admission seam gained `defer_ids` (and the
+        # selector-owned sites pass it), so an identity stub must
+        # tolerate the current keyword set.
+        def _identity(rows, budget=None, *, with_stats=False, **kwargs):
             from storelib.inject import fence_row_cost
 
             used = sum(fence_row_cost(r) for r in rows)
