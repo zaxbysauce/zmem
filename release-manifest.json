@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "6fe1909bfa8456b4109dd35b0ac30e7257fcb2a48f1fcc86cab49b37fa0f12f1",
+  "digest": "3817398ad88292cb673f33bf8e60885e2084d896352a97a5de0b0f85c94ad3df",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -123,7 +123,7 @@
     "skills/memory/scripts/knowledge/workflow.py": "8f1bc9c22420680f1a6a9088a5515b5110257cff4a4d71f4c2227fc551bec261",
     "skills/memory/scripts/opencode_bridge.py": "97339deb84d242d5afea40fb7e4e6421f0c894defca27d12e5940501bea310bf",
     "skills/memory/scripts/protocol.py": "cfd9d84621864ef1d0144d235dc2e05df330552eb57d98cb8678e101df73ecb4",
-    "skills/memory/scripts/redaction.py": "9b778ec098d5ef8be7d1aa092814d0c7dedfd7dd767398f2b6396827e1681dc2",
+    "skills/memory/scripts/redaction.py": "c4bca812410acc1010ccdc06ec454040aac791677f25976fbfeb6a6458296fdb",
     "skills/memory/scripts/requirements-training.txt": "87e2a26eba83329b6be02d566fea3feab9e887296d67b7bae4b34a4b60445c88",
     "skills/memory/scripts/schema_meta.py": "526f25aaaf91ce24475599cfccd219796a1c68c4278b8d36ecb68b43742d2f0f",
     "skills/memory/scripts/store.py": "5492a0026aea6ce74d7a88bdcfa702a602465c0969ff810fdb64b81a35f49176",
@@ -166,7 +166,7 @@
     "skills/memory/scripts/storelib/rekey.py": "eee63391a577cd4321c94b2004094283b4987a2e38af196a1c6ee80b11ece486",
     "skills/memory/scripts/storelib/remote_gate.py": "bc03c91c49eba99a750d61102afac8756fd81156612c5c0277aab0e7a37ef676",
     "skills/memory/scripts/storelib/retain.py": "f711bdf28a501af0d24a55bc04e97cbe3c568951d8d4ccbda39f6ebffd1aad36",
-    "skills/memory/scripts/storelib/schema.py": "f8be70025ebc880c06b54dc331ed51201c8c8994e47bfa4237987842c462d972",
+    "skills/memory/scripts/storelib/schema.py": "c4c8f8ff4511a28215a9522ea4e764287928ce3e5a029b011c1814b4b5ab1c58",
     "skills/memory/scripts/storelib/source.py": "72050fcc2ed63c3f99089ece204022038ccfeff13017cf2505ea3c288df5c3a2",
     "skills/memory/scripts/storelib/state.py": "f2236393c1b7a8f344a93b8ff1b89b6642db69d4aeb438b3000666f5c9595642",
     "skills/memory/scripts/storelib/state_expiry.py": "fb3f2286aa5d503cce9288e6f9382e177f22750079d311f1faa985084e43f9bf",

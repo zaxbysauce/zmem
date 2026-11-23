@@ -931,11 +931,13 @@ class NonAsciiBoundaryTest(unittest.TestCase):
         # 32k). The shipped pattern is linear via the run-start boundary
         # (a match can only begin at the start of a maximal local-part run)
         # plus a possessive quantifier (no backtracking). This probes _EMAIL_RE
-        # DIRECTLY: the full pipeline has a PRE-EXISTING quadratic on
-        # dot-alternating input (5.7s for 'a.'*16k at BASE too — separate
-        # issue, filed #535), which would mask the email pattern's own
-        # behavior here. 'é.'*N is a run of local-part chars, so the pattern
-        # matches the whole run once (no '@' → no redaction) and stays linear.
+        # DIRECTLY: at the time this test was written the full pipeline had
+        # a PRE-EXISTING quadratic on dot-alternating input (5.7s for
+        # 'a.'*16k — filed and FIXED as issue #535, whose URL-scheme
+        # scanner made the pipeline linear), which would mask the email
+        # pattern's own behavior here. 'é.'*N is a run of local-part chars,
+        # so the pattern matches the whole run once (no '@' → no redaction)
+        # and stays linear.
         import time
         import redaction as _r
         for shape in ("\u00e9.", "\u65e5\u672c-"):
