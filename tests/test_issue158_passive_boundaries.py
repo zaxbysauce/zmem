@@ -158,8 +158,12 @@ class PassiveEnvelopeBoundaryTest(unittest.TestCase):
                     data_dir=str(data_dir),
                 )
             self.assertTrue(payload["rendered"])
-            self.assertTrue(payload["rendered"].startswith("<<<ZMEM_UNTRUSTED_FENCE>>>"))
-            self.assertTrue(payload["rendered"].endswith("<<<END_ZMEM_UNTRUSTED_FENCE>>>\n"))
+            # Issue #511: the boundary carries the pinned per-render token
+            # (_clean_env pins ZMEM_FENCE_TOKEN=phase25).
+            self.assertTrue(payload["rendered"].startswith(
+                "<<<ZMEM_UNTRUSTED_FENCE:phase25>>>"))
+            self.assertTrue(payload["rendered"].endswith(
+                "<<<END_ZMEM_UNTRUSTED_FENCE:phase25>>>\n"))
             self.assertNotIn("<memory-context>", payload["rendered"])
             self.assertIn("stash pop recovery note", payload["rendered"])
             self.assertEqual(

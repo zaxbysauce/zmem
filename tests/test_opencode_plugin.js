@@ -58,6 +58,10 @@ function pinStore(dir) {
   // legs drift against the committed fixture as wall-clock time passes
   // (same pin as the envelope generator; the host canary strips it).
   process.env.ZMEM_TEST_NOW = "2026-09-10T00:00:00Z";
+  // Issue #511: the recall fence now carries a per-render token; pin it so
+  // the rendered bytes stay comparable against the committed fixture (same
+  // pin as the envelope generator).
+  process.env.ZMEM_FENCE_TOKEN = "ocparity66";
 }
 
 function seedFixtureRows() {

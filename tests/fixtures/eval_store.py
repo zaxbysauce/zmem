@@ -80,6 +80,10 @@ BASE_ENV = {
     # Auto link generation off (edges in the contested bucket are explicit);
     # entity derivation on add is NOT threshold-gated and still runs.
     "ZMEM_LINK_THRESHOLD": "1.01",
+    # Issue #511: fence renders carry a per-render token; pin it so two
+    # eval runs of the same store produce byte-identical renders (the
+    # determinism and baseline byte-comparison tests require it).
+    "ZMEM_FENCE_TOKEN": "evalpin",
     "PYTHONIOENCODING": "utf-8",
 }
 _STRIP = ("ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_BACKUP_INTERVAL_DAYS")

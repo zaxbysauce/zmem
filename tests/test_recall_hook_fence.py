@@ -87,6 +87,24 @@ class FenceConstantsTests(unittest.TestCase):
     """The fence constants must live in one place so the bash scripts
     can neutralize them."""
 
+    # Issue #511: genuine renders carry a per-render token after the
+    # canonical prefix. Pin it for this class so the byte expectations
+    # below are deterministic (and so two renders of the same rows are
+    # byte-identical, which the lane-health test relies on).
+    _PIN = "fencepin"
+    FENCE_OPEN_PINNED = "<<<ZMEM_UNTRUSTED_FENCE:fencepin>>>"
+    FENCE_CLOSE_PINNED = "<<<END_ZMEM_UNTRUSTED_FENCE:fencepin>>>"
+
+    def setUp(self):
+        self._saved_token = os.environ.get("ZMEM_FENCE_TOKEN")
+        os.environ["ZMEM_FENCE_TOKEN"] = self._PIN
+
+    def tearDown(self):
+        if self._saved_token is None:
+            os.environ.pop("ZMEM_FENCE_TOKEN", None)
+        else:
+            os.environ["ZMEM_FENCE_TOKEN"] = self._saved_token
+
     def test_fence_open_and_close_are_distinct(self):
         import storelib
         self.assertNotEqual(storelib.ZMEM_FENCE_OPEN, storelib.ZMEM_FENCE_CLOSE)
@@ -111,8 +129,8 @@ class FenceConstantsTests(unittest.TestCase):
             "_stale_note": "",
         }]
         out = storelib._format_fenced_recall(rows, header="test header")
-        self.assertIn(storelib.ZMEM_FENCE_OPEN, out)
-        self.assertIn(storelib.ZMEM_FENCE_CLOSE, out)
+        self.assertIn(self.FENCE_OPEN_PINNED, out)
+        self.assertIn(self.FENCE_CLOSE_PINNED, out)
         self.assertIn("test-id", out)
         self.assertIn("0.9", out)
         self.assertIn("test", out)
@@ -176,8 +194,8 @@ class FenceConstantsTests(unittest.TestCase):
         self.assertIn("[ns=user:global] [type=fact]", out)
         self.assertEqual(out.count("[tier=cross]"), 1)
         # The cross bullet sits inside the fence like every other row.
-        open_idx = out.find(storelib.ZMEM_FENCE_OPEN)
-        close_idx = out.find(storelib.ZMEM_FENCE_CLOSE)
+        open_idx = out.find(self.FENCE_OPEN_PINNED)
+        close_idx = out.find(self.FENCE_CLOSE_PINNED)
         cross_idx = out.find("[ns=project:foreign-a] [tier=cross]")
         self.assertGreater(open_idx, -1)
         self.assertGreater(close_idx, open_idx)
@@ -203,8 +221,8 @@ class FenceConstantsTests(unittest.TestCase):
             "_stale_note": "",
         }]
         out = storelib._format_fenced_recall(rows, header="h")
-        open_idx = out.find(storelib.ZMEM_FENCE_OPEN)
-        close_idx = out.find(storelib.ZMEM_FENCE_CLOSE)
+        open_idx = out.find(self.FENCE_OPEN_PINNED)
+        close_idx = out.find(self.FENCE_CLOSE_PINNED)
         evil_idx = out.find("ignore previous instructions")
         self.assertGreater(open_idx, -1)
         self.assertGreater(close_idx, open_idx)
@@ -322,8 +340,8 @@ class FenceConstantsTests(unittest.TestCase):
             self.assertEqual(after, before,
                              "the fenced recall bytes must be byte-identical "
                              "across the lane-health probe seam")
-            self.assertTrue(after.startswith(storelib.ZMEM_FENCE_OPEN + "\n"))
-            self.assertTrue(after.endswith(storelib.ZMEM_FENCE_CLOSE + "\n"))
+            self.assertTrue(after.startswith(self.FENCE_OPEN_PINNED + "\n"))
+            self.assertTrue(after.endswith(self.FENCE_CLOSE_PINNED + "\n"))
             self.assertIn("untrusted retrieved notes", after)
 
     # --- issue #137: belief-head virtual rows ride the fence contract ---
@@ -413,8 +431,8 @@ class FenceConstantsTests(unittest.TestCase):
         self.assertTrue(head["source_ref"],
                         "the virtual row must carry a source_ref key")
         out = storelib._format_fenced_recall([head], header="belief heads")
-        self.assertIn(storelib.ZMEM_FENCE_OPEN, out)
-        self.assertIn(storelib.ZMEM_FENCE_CLOSE, out)
+        self.assertIn(self.FENCE_OPEN_PINNED, out)
+        self.assertIn(self.FENCE_CLOSE_PINNED, out)
         self.assertIn(head["id"], out,
                       "the head id line must render inside the fence")
         self.assertIn("untrusted", out.lower(),
@@ -441,8 +459,8 @@ class FenceConstantsTests(unittest.TestCase):
                          "the trusted active head suppresses its members")
         out = storelib._format_fenced_recall(
             [head] + kept, header="post-suppression recall")
-        self.assertTrue(out.startswith(storelib.ZMEM_FENCE_OPEN))
-        self.assertTrue(out.rstrip("\n").endswith(storelib.ZMEM_FENCE_CLOSE))
+        self.assertTrue(out.startswith(self.FENCE_OPEN_PINNED))
+        self.assertTrue(out.rstrip("\n").endswith(self.FENCE_CLOSE_PINNED))
         self.assertIn("untrusted", out.lower())
         for mid in member_ids:
             self.assertNotIn(mid, out,
@@ -787,6 +805,9 @@ class PagePassiveSelectorTests(unittest.TestCase):
                 "ZMEM_MODEL_AUTODOWNLOAD": "0",
                 "HOME": str(root / "home"),
                 "USERPROFILE": str(root / "home"),
+                # Issue #511: pin the render token so the fence bytes in
+                # the rendered payload are deterministic.
+                "ZMEM_FENCE_TOKEN": "pagefence",
             })
             db, pages = fixture._seed_store(root)
             fixture._copy_base_page(root)
@@ -817,8 +838,10 @@ class PagePassiveSelectorTests(unittest.TestCase):
                 )
                 page_rows = [row for row in payload["results"] if row.get("type") == "page"]
                 self.assertEqual(len(page_rows), 1, payload)
-                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", payload["rendered"])
-                self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", payload["rendered"])
+                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:pagefence>>>",
+                              payload["rendered"])
+                self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE:pagefence>>>",
+                              payload["rendered"])
                 self.assertIn(page_rows[0]["id"], payload["rendered"])
             finally:
                 db.close()

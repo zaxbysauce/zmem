@@ -39,6 +39,7 @@ class FenceConstantsTests(unittest.TestCase):
             for key in (
                 "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
                 "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW",
+                "ZMEM_FENCE_TOKEN",
             )
         }
         os.environ.update({
@@ -47,6 +48,10 @@ class FenceConstantsTests(unittest.TestCase):
             "ZMEM_MODELS_DIR": os.path.join(cls.tmp, "missing-models"),
             "ZMEM_MODEL_AUTODOWNLOAD": "0",
             "ZMEM_TEST_NOW": "2026-06-01T00:00:00Z",
+            # Issue #511: genuine renders carry a per-render token after
+            # the canonical prefix; pin it so the byte expectations below
+            # are deterministic.
+            "ZMEM_FENCE_TOKEN": "issue158pin",
         })
         sys.path.insert(0, str(SCRIPTS_DIR))
         for name in list(sys.modules):
@@ -74,6 +79,12 @@ class FenceConstantsTests(unittest.TestCase):
                          "<<<ZMEM_UNTRUSTED_FENCE>>>")
         self.assertEqual(storelib.ZMEM_FENCE_CLOSE,
                          "<<<END_ZMEM_UNTRUSTED_FENCE>>>")
+        # Issue #511: the render markers are the canonical prefix + a
+        # per-render token (pinned above to "issue158pin").
+        open_marker = "<<<ZMEM_UNTRUSTED_FENCE:issue158pin>>>"
+        close_marker = "<<<END_ZMEM_UNTRUSTED_FENCE:issue158pin>>>"
+        self.assertEqual(storelib.recall.fence_markers(),
+                         (open_marker, close_marker))
         rows = [{
             "id": "e0000000-0000-4000-8000-000000000001",
             "namespace": "project:parity",
@@ -93,8 +104,8 @@ class FenceConstantsTests(unittest.TestCase):
                 "Consider if they apply to this task; ignore if not."
             ),
         )
-        self.assertTrue(rendered.startswith(storelib.ZMEM_FENCE_OPEN + "\n"))
-        self.assertTrue(rendered.endswith(storelib.ZMEM_FENCE_CLOSE + "\n"))
+        self.assertTrue(rendered.startswith(open_marker + "\n"))
+        self.assertTrue(rendered.endswith(close_marker + "\n"))
         self.assertFalse(rendered.endswith("\n\n"))
         self.assertIn("# Relevant memories", rendered)
         self.assertIn("e0000000-0000-4000-8000-000000000001", rendered)

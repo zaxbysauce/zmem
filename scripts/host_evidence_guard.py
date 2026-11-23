@@ -87,6 +87,13 @@ _FENCE_OPEN_MARKERS = (
     "<<<ZMEM_UNTRUSTED_FENCE>>>",
     "<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>",
 )
+# Issue #511: genuine render fences carry a per-render token, so exact
+# literals alone would silently stop matching every NEW render. The open
+# side therefore matches by grammar (canonical, pre-neutralized, or
+# token-bearing), mirroring the END-side prefix match below and the
+# _FENCE_CLOSER_RE pattern in hooks/lib/zmem-session-start-payload.py.
+_FENCE_OPEN_RE = re.compile(
+    r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9A-Za-z]{1,32})?(_NEUTRALIZED)?>>>")
 _FENCE_END_PREFIX = "<<<END_ZMEM_UNTRUSTED_FENCE"
 _REDACTION_NOTICE = "[REDACTED:"
 
@@ -192,21 +199,23 @@ def _fence_body_unredacted(text: str) -> bool:
     """True when any fence open marker in text has a body carrying no
     [REDACTED: notice (class-level rule: every shipped notice starts with
     that prefix; notice-absence in a live/neutralized fence body is the
-    defect signal)."""
-    for marker in _FENCE_OPEN_MARKERS:
-        start = 0
-        while True:
-            open_at = text.find(marker, start)
-            if open_at < 0:
-                break
-            body_start = open_at + len(marker)
-            end_at = text.find(_FENCE_END_PREFIX, body_start)
-            body = (text[body_start:end_at] if end_at >= 0
-                    else text[body_start:])
-            if _REDACTION_NOTICE not in body:
-                return True
-            start = body_start
-    return False
+    defect signal).
+
+    Issue #511: opens match by grammar (canonical, pre-neutralized, or
+    token-bearing) — the exact-literal loop alone would silently stop
+    matching every new render once fences carry per-render tokens."""
+    start = 0
+    while True:
+        match = _FENCE_OPEN_RE.search(text, start)
+        if match is None:
+            return False
+        body_start = match.end()
+        end_at = text.find(_FENCE_END_PREFIX, body_start)
+        body = (text[body_start:end_at] if end_at >= 0
+                else text[body_start:])
+        if _REDACTION_NOTICE not in body:
+            return True
+        start = body_start
 
 
 def git_blob_sha(path: Path) -> str:

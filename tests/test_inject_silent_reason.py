@@ -86,6 +86,9 @@ def _clean_env(tmp: str, **extra: str) -> dict:
         "ZMEM_STORE": os.path.join(tmp, "store.sqlite"),
         "ZMEM_DATA": tmp,
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
+        # Issue #511: fence renders carry a per-render token; pin it so the
+        # fence-boundary assertions below are byte-deterministic.
+        "ZMEM_FENCE_TOKEN": "silentpin",
         "PYTHONUTF8": "1",
     })
     env.update(extra)
@@ -241,7 +244,9 @@ class HookBodyReasonTest(unittest.TestCase):
         out = self._run_body("user_prompt", self.ns_happy,
                              "happycanary grounded")
         ctx = self._ctx(out)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        # Issue #511: the boundary carries the pinned render token (see
+        # _clean_env).
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:silentpin>>>", ctx)
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=injected reason=injected", line)
         self.assertRegex(line, r"tokens=\d+/\d+")
@@ -285,7 +290,9 @@ class HookBodyReasonTest(unittest.TestCase):
             "user_prompt", self.ns_omitted,
             "riskcanary instructions knowledge base")
         ctx = self._ctx(out)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        # Issue #511: the boundary carries the pinned render token (see
+        # _clean_env).
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:silentpin>>>", ctx)
         line = _read_last_hook_line(self._tmp)
         self.assertIn("status=injected reason=injected", line)
         self.assertIn("omitted=3", line)

@@ -21,8 +21,18 @@ FENCE_END = "<<<END_ZMEM_UNTRUSTED_FENCE>>>"
 MAX_DESCRIPTOR_CHARS = 80
 MAX_COMMAND_CHARS = 240
 
+# Issue #511: the renderer now emits a PER-RENDER TOKEN
+# (<<<ZMEM_UNTRUSTED_FENCE:<token>>>), so the strip must accept the
+# token grammar as well as the legacy canonical literal — otherwise a
+# token-form block survives the strip (PR #534 feedback F-04).
+_FENCE_BEGIN_PREFIX = "<<<ZMEM_UNTRUSTED_FENCE"
+_FENCE_END_PREFIX = "<<<END_ZMEM_UNTRUSTED_FENCE"
 _FENCE_BLOCK = re.compile(
-    re.escape(FENCE_BEGIN) + r".*?" + re.escape(FENCE_END),
+    re.escape(_FENCE_BEGIN_PREFIX) + r"(?::[0-9A-Za-z]{1,32})?"
+    + re.escape(">>>")
+    + r".*?"
+    + re.escape(_FENCE_END_PREFIX) + r"(?::[0-9A-Za-z]{1,32})?"
+    + re.escape(">>>"),
     flags=re.DOTALL,
 )
 

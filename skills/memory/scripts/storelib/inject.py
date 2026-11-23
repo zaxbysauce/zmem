@@ -479,6 +479,8 @@ def _fence_row_cost_for_wire(
 def _truncate_protected_row(
     row: dict[str, Any], remaining: int, *,
     legacy_injection_wire: bool = True,
+    cost_cap: Optional[int] = None,
+    floor_ok: bool = False,
 ) -> Optional[Tuple[dict[str, Any], int]]:
     """Fit a protected row into ``remaining`` tokens by clipping its content
     (issue #116 scope 2). Returns ``(new_row, cost)`` with a SHALLOW COPY of
@@ -500,14 +502,48 @@ def _truncate_protected_row(
     # remaining * 4; subtract the marker and a safety margin, then floor.
     allowed = (remaining * CHARS_PER_TOKEN) - len(marker) \
         - (overhead * CHARS_PER_TOKEN) - CHARS_PER_TOKEN
+    if cost_cap is not None:
+        # Bound how much the STUB may claim (issue #501 follow-up,
+        # PR #534 feedback FB-001): a clipped row is never acknowledged,
+        # so it re-renders on every prompt - an uncapped stub would
+        # swallow the whole remaining budget each time and starve the
+        # rows that fit. The content slice is derived from the cap, so
+        # the row is still TRUNCATED rather than silently dropped; when
+        # the cap cannot carry even a minimal stub the row is dropped
+        # and COUNTED (the caller gives the first clipped row the floor
+        # of one minimal stub - issue #116).
+        allowed = min(allowed,
+                      (cost_cap - overhead) * CHARS_PER_TOKEN)
     if allowed < MIN_STUB_CHARS:
-        return None
+        # Closeout CS-002: the flat estimate above carries a one-token
+        # safety margin, so at the EXACT measured minimal-stub cost it can
+        # undershoot MIN_STUB_CHARS even though the measured stub fits.
+        # The caller measured that floor as admissible (``floor_ok``), so
+        # retry from the minimum instead of dropping the row (#116).
+        if not floor_ok or remaining < 1:
+            return None
+        allowed = MIN_STUB_CHARS
     while allowed >= MIN_STUB_CHARS:
         clipped = row.copy()
         clipped["content"] = content[:allowed].rstrip() + marker
+        # Issue #501 (audit D02): a clipped row is an INCOMPLETE delivery —
+        # render it (the #116 truncated-not-dropped contract) but never let
+        # the delivery ledger acknowledge it (the ledger filter at the
+        # withheld_for_secret precedent drops this marker), so a same-session
+        # retry with enough budget re-selects and delivers the COMPLETE row.
+        clipped["_incomplete_delivery"] = True
         cost = _fence_row_cost_for_wire(
             clipped, legacy_injection_wire=legacy_injection_wire)
-        if cost <= remaining:
+        if cost > remaining:
+            # does not fit the remaining budget
+            pass
+        elif cost_cap is not None and cost > cost_cap:
+            # The MEASURED cost exceeds the reserved clipped-stub budget:
+            # shave more content (the cost is re-measured below) so the
+            # reservation is enforced on the real cost, not on the
+            # content slice alone.
+            pass
+        else:
             return clipped, cost
         # The flat chars/4 model above ignores the per-continuation-line
         # indent the renderer adds (issue #352 AC1): a clipped slice that
@@ -516,14 +552,44 @@ def _truncate_protected_row(
         # re-measure until the stub fits or nothing is left — a protected
         # row is truncated, never dropped, while it can still carry
         # information (apply_token_budget's documented policy).
+        if (floor_ok and allowed > MIN_STUB_CHARS
+                and allowed - CHARS_PER_TOKEN < MIN_STUB_CHARS):
+            # Closeout CS2-001: the 4-char step would skip the MINIMAL
+            # stub altogether (35 -> 31 never measures 32). The caller
+            # measured that floor as admissible, so land exactly on it.
+            allowed = MIN_STUB_CHARS
+            continue
         allowed -= CHARS_PER_TOKEN
     # Fail-closed: even a minimal stub does not fit.
     return None
 
 
+def _protected_row_min_cost(row: dict[str, Any], *,
+                            legacy_injection_wire: bool = True) -> int:
+    """The measured cost of the smallest stub a clipped protected row
+    can carry (issue #116: a protected row is truncated, never dropped,
+    while it can still carry information).
+
+    The cost is MEASURED from the real minimal slice: the renderer
+    indents every continuation line, so a flat chars/token estimate
+    under-counts a multi-line row — the truncation loop then could not
+    reach a stub within the cap and the row was dropped while room
+    remained (PR #534 critic FB-002).
+    """
+    content = row.get("content", "") or ""
+    probe = dict(row)
+    probe["content"] = (content[:MIN_STUB_CHARS].rstrip()
+                         + TRUNCATION_MARKER)
+    probe["_incomplete_delivery"] = True
+    return _fence_row_cost_for_wire(
+        probe, legacy_injection_wire=legacy_injection_wire)
+
+
 def apply_token_budget(
     rows: list[dict[str, Any]], budget: Optional[int] = None,
     *, with_stats: bool = False, legacy_injection_wire: bool = True,
+    defer_ids: Optional[Iterable[str]] = None,
+    _trace: Optional[list] = None,
 ) -> Any:
     """Admit rows under ``budget`` tokens as a MEASURED HARD CEILING
     (issue #116; original policy issue #65, 10.9).
@@ -531,9 +597,30 @@ def apply_token_budget(
     Policy: ``decision``/``constraint`` rows are PROTECTED — they are never
     dropped while they can still carry information: each is admitted whole
     when it fits the remaining budget, else TRUNCATED to fit with an explicit
-    ``…[budget-truncated]`` marker on its content, and only dropped (counted
-    in ``stats["dropped_protected"]``, never silently) when even a minimal
-    stub does not fit. Everything else is admitted in descending score order
+    ``…[budget-truncated]`` marker on its content, and dropped (counted in
+    ``stats["dropped_protected"]``, never silently) only when even a minimal
+    stub does not fit. A clipped row is never acknowledged (issue #501), so
+    it re-renders on every prompt: the FIRST clipped row's slice is
+    therefore bounded by half the free budget (each further clipped row is
+    held to a minimal stub, so the clipped aggregate is at most half the
+    free budget plus one minimal stub per additional clipped row), and the
+    clipped slice leaves room for the largest normal row, so a recurring
+    clipped row cannot starve the rows that fit (issue #501 follow-up,
+    PR #534). AT THE BOUNDARY - a protected stub and an individually
+    deliverable normal row that cannot both fit in one prompt - the
+    protected row keeps its stub on THAT prompt (issue #116 priority), so
+    the normal row is skipped there. On a LATER prompt the selector records
+    the clipped row, and a recorded row that still cannot be delivered whole
+    YIELDS the budget (``defer_ids``) on BOTH dispatch lanes. The yield is
+    KEPT only when it is a NET GAIN over the admission without it: every
+    protected row that pass ADMITTED (whole or as a stub) is still admitted,
+    and a normal row is admitted that the other pass did not admit. Otherwise
+    the no-defer
+    admission is used unchanged, so a yield can neither cascade into dropping
+    another protected row nor leave a stub as the only trace that a row
+    existed. A yield never guarantees WHICH normal row it frees space for.
+    Everything else is admitted in descending
+    score order
     (``signal=none`` after grounded rows at the same score); the scan
     CONTINUES past a row that does not fit, so a later smaller high-value row
     is still admitted. ``FENCE_SHELL_ALLOWANCE`` is reserved up front for the
@@ -565,36 +652,164 @@ def apply_token_budget(
             normal.append((_row_priority(row, i), i))
     normal.sort(key=lambda pair: pair[0])
 
-    admitted: dict[int, Tuple[dict[str, Any], int]] = {}
-    used = 0
-    truncated = 0
-    dropped_protected = 0
-    for i in protected_idx:
-        cost = _fence_row_cost_for_wire(
+    # The CLIPPED protected rows' aggregate budget is half of the free
+    # budget (issue #501 follow-up): a clipped protected row is never
+    # acknowledged, so it re-renders on every prompt, and an unbounded clip
+    # would starve the rows that fit (head delivered 0 of 10 facts on 6
+    # consecutive prompts where base delivered all 10 on prompt 2). The
+    # clipped slice additionally leaves room for the largest NORMAL row
+    # that could ever be admitted, so a recurring clipped row cannot take
+    # the whole envelope (PR #534 feedback F-01).
+    protected_cap = available // 2
+    # Issue #501 follow-up (PR #534): the fair CROSS-PROMPT selection.
+    # A protected row that was already rendered as a clipped stub in this
+    # session, and that still cannot be delivered whole, YIELDS the budget
+    # to the rows that fit - otherwise it re-claims the budget on every
+    # prompt and the rows that fit are starved for the session (the F-01
+    # boundary).
+    #
+    # Review FB-01401 / CD-001 (PR #534): the yield's validity is checked on
+    # the RESULT, never predicted. Two earlier attempts failed here:
+    # reserving space by a cost estimate (FB-003/FB-01202), and deciding
+    # deferred rows last (FB-01301/FB-01401). The surviving rule compares
+    # the two passes: a deferral survives only when it is a NET GAIN - every
+    # protected row the no-defer pass ADMITTED (whole or as a stub) is still
+    # admitted, AND at least one normal row is admitted that the no-defer
+    # pass did not admit. Anything else falls back to the no-defer result.
+    deferred_ids = {str(i) for i in (defer_ids or ()) if isinstance(i, str)}
+    normal_costs = {
+        i: _fence_row_cost_for_wire(
             rows[i], legacy_injection_wire=legacy_injection_wire)
-        if cost <= available - used:
+        for i in (idx for _key, idx in normal)
+    }
+    # Only rows that could EVER be admitted count: a normal row that
+    # costs more than the whole budget is skipped anyway, so counting
+    # it made the reservation 0 and pushed every clipped protected row
+    # down to its minimal stub (PR #534 critic FB-003).
+    max_normal_cost = max(
+        (cost for cost in normal_costs.values() if cost <= available),
+        default=0)
+
+    def _admit(active_defer):
+        """One admission pass under ``active_defer``.
+
+        Returns (admitted, used, truncated, dropped_protected,
+        deferred_protected). The caller runs it twice at most (review
+        FB-01401): a deferral survives only when the pass that used it also
+        admitted a normal row.
+        """
+        admitted: dict[int, Tuple[dict[str, Any], int]] = {}
+        used = 0
+        truncated = 0
+        dropped_protected = 0
+        clipped_used = 0
+        deferred_protected = 0
+        # Closeout CS-001: NO reordering. Protected rows are admitted in
+        # CALLER order, exactly as before this PR - a recorded row that
+        # fits must not lose its whole form to a larger protected row that
+        # merely happened to be unrecorded. The yield's correctness comes
+        # from the post-pass check below, never from the order.
+        for i in protected_idx:
+            cost = _fence_row_cost_for_wire(
+                rows[i], legacy_injection_wire=legacy_injection_wire)
+            if cost <= available - used:
+                # A protected row that FITS keeps its whole form (issue #116).
+                admitted[i] = (rows[i], cost)
+                used += cost
+                continue
+            # A clipped protected row keeps a MINIMAL stub whenever one fits
+            # the remaining budget (issue #116: truncated, never dropped while
+            # it can still carry information); it is dropped - and COUNTED -
+            # only when even a minimal stub does not fit. The FIRST clipped
+            # row is the recurring one (clipped on every prompt because it is
+            # never acknowledged), so its slice is bounded by the reserve;
+            # each further clipped row is held to a minimal stub - the clipped
+            # aggregate is therefore at most half the free budget plus one
+            # minimal stub per additional clipped row.
+            row_min = _protected_row_min_cost(
+                rows[i], legacy_injection_wire=legacy_injection_wire)
+            remaining_now = available - used
+            # Review FB-01202 (PR #534): the guard asks whether a normal row
+            # could use what is LEFT, not what the envelope started with.
+            # It is a FAST PATH, not the guarantee: if no normal row fits the
+            # remainder, `used` can only grow, so the post-pass check below
+            # would undo the deferral anyway. Mutation-proven redundant - the
+            # probe that drops it is equivalent by construction.
+            max_normal_now = max(
+                (c for c in normal_costs.values() if c <= available - used),
+                default=0)
+            if (max_normal_now > 0
+                    and str(rows[i].get("id") or "") in active_defer):
+                # This row already showed a clipped stub in this session and
+                # cannot be delivered whole on this prompt: let it yield the
+                # budget to the rows that fit. It is NOT dropped (it is
+                # re-selected, and delivered whole, as soon as it fits).
+                deferred_protected += 1
+                continue
+            clip_allowance = max(0, protected_cap - clipped_used)
+            room_for_normal = max(0, remaining_now - max_normal_cost)
+            slice_budget = min(remaining_now, clip_allowance, room_for_normal)
+            if slice_budget < row_min:
+                slice_budget = row_min if row_min <= remaining_now else 0
+            stub = _truncate_protected_row(
+                rows[i], remaining_now,
+                legacy_injection_wire=legacy_injection_wire,
+                cost_cap=slice_budget,
+                # The caller measured the minimal stub as admissible.
+                floor_ok=slice_budget >= row_min and row_min <= remaining_now)
+            if stub is not None:
+                admitted[i] = stub
+                used += stub[1]
+                clipped_used += stub[1]
+                truncated += 1
+            else:
+                dropped_protected += 1
+        for _key, i in normal:
+            cost = normal_costs[i]
+            if used + cost > available:
+                # Issue #116 scope 3: skip and keep scanning - a later smaller
+                # row must not be lost to an earlier oversized one.
+                continue
             admitted[i] = (rows[i], cost)
             used += cost
-            continue
-        stub = _truncate_protected_row(
-            rows[i], available - used,
-            legacy_injection_wire=legacy_injection_wire)
-        if stub is not None:
-            admitted[i] = stub
-            used += stub[1]
-            truncated += 1
-        else:
-            dropped_protected += 1
-    for _key, i in normal:
-        cost = _fence_row_cost_for_wire(
-            rows[i], legacy_injection_wire=legacy_injection_wire)
-        if used + cost > available:
-            # Issue #116 scope 3: skip and keep scanning — a later smaller
-            # row must not be lost to an earlier oversized one.
-            continue
-        admitted[i] = (rows[i], cost)
-        used += cost
+        return (admitted, used, truncated, dropped_protected,
+                deferred_protected)
 
+    admitted, used, truncated, dropped_protected, deferred_protected = _admit(
+        deferred_ids)
+    if _trace is not None:
+        # Test seam only (default None, zero behaviour change): the
+        # final result cannot show whether the undo ran, so the two-pass
+        # structure is observable here (PR #534 test-engineer TE-006).
+        _trace.append({"pass": 1, "deferred": deferred_protected,
+                       "normal_admitted": sum(
+                           1 for _k, i in normal if i in admitted)})
+    if deferred_protected:
+        plain_admitted, plain_used, plain_truncated, plain_dropped, _p = (
+            _admit(set()))
+        # Review CD-001 / CE-003: the yield is kept only on a NET GAIN.
+        #   (a) every protected row the no-defer pass ADMITTED (whole OR as a
+        #       stub) that is not itself deferred must still be admitted -
+        #       otherwise deferring one row cascaded into dropping or blanking
+        #       a DIFFERENT protected row;
+        #   (b) a normal row must be admitted that the no-defer pass did
+        #       NOT admit, or the freed space bought nothing the prompt was
+        #       not already carrying.
+        plain_protected = [
+            i for i in protected_idx
+            if i in plain_admitted
+            and str(rows[i].get("id") or "") not in deferred_ids]
+        keeps_protected = all(i in admitted for i in plain_protected)
+        new_normal = any(i in admitted and i not in plain_admitted
+                         for _k, i in normal)
+        if not (keeps_protected and new_normal):
+            admitted, used, truncated, dropped_protected = (
+                plain_admitted, plain_used, plain_truncated, plain_dropped)
+            deferred_protected = 0
+        if _trace is not None:
+            _trace.append({"pass": 2, "deferred": deferred_protected,
+                           "normal_admitted": sum(
+                               1 for _k, i in normal if i in admitted)})
     kept = [admitted[i][0] for i in sorted(admitted)]
     dropped = len(rows) - len(kept)
     if with_stats:
@@ -603,6 +818,7 @@ def apply_token_budget(
             "dropped": dropped,
             "truncated": truncated,
             "dropped_protected": dropped_protected,
+            "deferred_protected": deferred_protected,
             "budget": budget,
         }
         return kept, used, dropped, stats
@@ -1828,6 +2044,17 @@ def select_and_budget_for_injection(
     except Exception:
         return _selector_silent(budget_tokens=budget)
     delivered_ids = _ordered_unique(delivered_ids)
+    # Issue #501 follow-up (PR #534): the protected rows this session
+    # already rendered as BUDGET-CLIPPED stubs. A clipped row is never
+    # acknowledged, so without this the same row re-claims the budget on
+    # every prompt (the F-01 starvation). The admission lets a recorded
+    # row yield while it still cannot be delivered whole.
+    try:
+        clipped_ids = ledger.read_clipped(
+            resolved_data, session_id,
+            principal=principal, harness=harness)
+    except Exception:
+        clipped_ids = []
     delivered_by_id = {
         e.get("id"): e for e in delivered_entries
         if isinstance(e, dict) and isinstance(e.get("id"), str)
@@ -1998,6 +2225,13 @@ def select_and_budget_for_injection(
             # recent_memory normalize an invalid value to the env seam —
             # never an error); None keeps the ZMEM_TEST_NOW/now seam.
             prompt_timestamp=prompt_timestamp,
+            # Issue #501 follow-up (PR #534): the cross-prompt defer set
+            # rides the SHARED dict because BOTH dispatch targets own an
+            # admission that can clip a protected row (query -> recall,
+            # query-less -> recent). Both accept `_defer_ids` (review
+            # FB-01201: the query-less lane used to clip without it, so a
+            # recorded row never yielded on a prompt without a query).
+            _defer_ids=clipped_ids or None,
         )
         if effective_query.strip():
             kwargs["query"] = effective_query
@@ -2084,7 +2318,8 @@ def select_and_budget_for_injection(
                 # decision that no longer applies).
                 rows, _used, _dropped, rebudget_stats = apply_token_budget(
                     ordinary_rows, budget, with_stats=True,
-                    legacy_injection_wire=True)
+                    legacy_injection_wire=True,
+                    defer_ids=clipped_ids)
             if page_rows:
                 # Recall retained its canonical pool with a widened budget so
                 # the final combined pass is the only admission decision.
@@ -2138,7 +2373,9 @@ def select_and_budget_for_injection(
                     # and therefore never participate in suppression.
                     pool.extend(page_secret_markers)
                     admitted, used, dropped, stats = apply_token_budget(
-                        pool, budget, with_stats=True, legacy_injection_wire=True)
+                        pool, budget, with_stats=True,
+                        legacy_injection_wire=True,
+                        defer_ids=clipped_ids)
                     survivors = _ordered_unique([
                         str(row["id"]) for row in admitted
                         if row.get("type") == "page"
@@ -2182,7 +2419,8 @@ def select_and_budget_for_injection(
             # caller budget, never the temporary widened recall budget.
             rows, _used, _dropped, _stats = apply_token_budget(
                 ordinary_rows, budget, with_stats=True,
-                legacy_injection_wire=True)
+                legacy_injection_wire=True,
+                defer_ids=clipped_ids)
         # Issue #256: read-time credential re-scan on the passive lane —
         # the defense-in-depth twin of the prompt-injection re-scan. Every
         # selected row matching SECRET_CREDENTIAL_PATTERNS (content /
@@ -2250,6 +2488,18 @@ def select_and_budget_for_injection(
             rendered = recall_module._format_fenced_recall(
                 rows, header=header, budget_note=parsed.get("budget_note"),
                 legacy_injection_wire=True)
+        # Issue #501 follow-up (PR #534): record the protected rows this
+        # render clipped, so the NEXT prompt can let them yield the
+        # budget to the rows that fit (the fair cross-prompt selection).
+        # Fail-open: a lost write costs one extra stub render.
+        try:
+            ledger.record_clipped(
+                resolved_data, session_id,
+                [str(r.get("id")) for r in rows
+                 if isinstance(r, dict) and r.get("_incomplete_delivery")],
+                principal=principal, harness=harness)
+        except Exception:
+            pass
         # Two accounting sets, one source of truth for "was this rendered".
         #
         #   ledger_rows  DELIVERED (#114): every row proven present in the
@@ -2272,11 +2522,23 @@ def select_and_budget_for_injection(
         # the [WITHHELD: SECRET] prefix already fails rows_present_in's
         # marker whitelist, but that auto-drop depends on the fence shape; if
         # the marker ever matched, this filter is the sole bump/ledger guard
-        # (proven by the c-iso mutation probe). Applied FIRST so a single
-        # guard covers both consumers and bump_rows stays a subset of
-        # ledger_rows by construction.
+        # (proven by the c-iso mutation probe). Applied as the LAST filter on
+        # ledger_rows so a single guard covers both consumers and bump_rows
+        # stays a subset of ledger_rows by construction.
+        #
+        # Issue #501 (audit D02): a budget-clipped row is an incomplete
+        # delivery — the [id] marker surviving the clip must NOT count as
+        # delivery proof, so it rides the SAME final filter (never bumped,
+        # never ledgered; record/reserve/bump all derive from ledger_rows):
+        # render, never acknowledge; the complete-row retry re-selects.
+        # A clipped row is NEVER RECORDED, so the delivery window (which
+        # governs RECORDED rows) does not bound it: it re-renders on every
+        # prompt until a budget admits it whole. The admission cap in
+        # apply_token_budget keeps that repeat from starving the rows that
+        # DO fit (PR #534 feedback F-01).
         ledger_rows = [row for row in ledger_rows
-                       if not row.get("withheld_for_secret")]
+                       if not row.get("withheld_for_secret")
+                       and not row.get("_incomplete_delivery")]
         # Expansion rows are rendered but deliberately NOT bumped —
         # popularity rewards query-MATCHED rows only (recall.py bump law).
         bump_rows = [row for row in ledger_rows

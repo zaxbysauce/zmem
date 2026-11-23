@@ -432,7 +432,12 @@ class SessionStartLaneTest(unittest.TestCase):
         # the local context exactly.
         self.assertIn("withheld", result.get("context", ""))
         self.assertEqual(result.get("rendered"), result.get("context"), result)
-        self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", result.get("context", ""))
+        # Issue #511: any fence grammar (canonical OR token-bearing) must be
+        # absent here — the bare-literal check could not see a token fence.
+        import re as _re
+        self.assertIsNone(
+            _re.search(r"<<<(END_)?ZMEM_UNTRUSTED_FENCE", result.get("context", "")),
+            result.get("context", "")[:200])
         self.assertEqual(result.get("reason"), "budget-drop", result)
 
     def test_session_start_fences_and_reports_tokens(self):
@@ -441,8 +446,10 @@ class SessionStartLaneTest(unittest.TestCase):
         result = self._call("session_start", namespace=ns,
                             session_id="mcp-fence-probe")
         ctx = result.get("context", "")
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        # Issue #511: the fence boundary carries a per-render token after
+        # the canonical prefix (either shape accepted).
+        self.assertRegex(ctx, r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
+        self.assertRegex(ctx, r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
         # The additive rendered alias mirrors the emitted context exactly
         # (legacy local-render path: one render, two names for it).
         self.assertEqual(result.get("context"), result.get("rendered"), result)
@@ -564,7 +571,10 @@ class HermesSessionToolsTest(unittest.TestCase):
         raw = self.provider.handle_tool_call("zmem_session_start", {})
         d = json.loads(raw)
         self.assertEqual(d.get("result"), "session_started", d)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", d.get("context", ""))
+        # Issue #511: the fence boundary carries a per-render token after
+        # the canonical prefix (either shape accepted).
+        self.assertRegex(d.get("context", ""),
+                         r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
         after = _row_counts(self.store_path)
         for mid, (retr_b, _s, _lr) in before.items():
             self.assertEqual(after[mid][0], retr_b,
@@ -877,7 +887,7 @@ class ProviderEnvelopeTest(unittest.TestCase):
             for key in (
                 "ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODELS_DIR",
                 "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW", "ZMEM_NAMESPACE",
-                "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
+                "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_FENCE_TOKEN",
             )
         }
         os.environ.update({
@@ -889,6 +899,11 @@ class ProviderEnvelopeTest(unittest.TestCase):
             "ZMEM_TEST_NOW": "2026-06-01T00:00:00Z",
             "ZMEM_NAMESPACE": "project:parity",
             "ZMEM_INJECT_TOKEN_BUDGET": "1500",
+            # Issue #511: the store renderer emits a per-render fence
+            # token; pin it so the prefetch bytes match the committed
+            # expected-envelope fixture (whose markers carry the same
+            # pinned token).
+            "ZMEM_FENCE_TOKEN": "phase25",
         })
 
         import importlib.util

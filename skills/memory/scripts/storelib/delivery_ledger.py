@@ -317,6 +317,165 @@ def delivery_ended_path(data_dir: str, session_id: str) -> Optional[str]:
     return os.path.join(data_dir, "ops", name)
 
 
+def clipped_path(data_dir: str, session_id: str,
+                 principal: Optional[str] = None,
+                 harness: Optional[str] = None) -> Optional[str]:
+    """Path of the session's clipped-protected-row sidecar.
+
+    Issue #501 follow-up (PR #534): a protected row that the budget
+    clipped is rendered as a stub but NEVER acknowledged, so it
+    re-renders on every prompt. This sidecar records the ids of the
+    protected rows already shown as stubs in this session, so the next
+    prompt can let one yield the budget to the rows that fit (the
+    fair cross-prompt selection policy) while it still cannot be
+    delivered whole.
+
+    Review FB-01203: the key is the SAME composite identity the
+    delivery ledger uses (``_session_key``), so two principals or
+    harnesses presenting the same native session id never inherit each
+    other's yields. With no identity the key is exactly the session id
+    — the legacy, byte-identical shape."""
+    name = _hashed_name(_session_key(session_id, principal, harness),
+                        ".clipped")
+    if not name or not data_dir:
+        return None
+    return os.path.join(data_dir, "ops", name)
+
+
+def _load_clipped_payload(path: Optional[str]) -> dict:
+    """Read the sidecar's payload, fail-open to an empty mapping."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def record_clipped(data_dir: str, session_id: str,
+                  row_ids: Iterable[str],
+                  now: Optional[float] = None,
+                  principal: Optional[str] = None,
+                  harness: Optional[str] = None) -> None:
+    """Record the ids of protected rows rendered as clipped stubs.
+
+    Bounded (the newest 64 ids win) and fail-open: a lost write costs
+    one extra stub render, never a crash or a lost delivery.
+
+    Review FB-01205: the read-modify-write runs under the delivery-state
+    lock and re-checks the terminal marker INSIDE it, so an in-flight
+    writer cannot republish the sidecar after ``end_delivery_state``
+    cleared it. A lock failure stays fail-open (no write)."""
+    key = _session_key(session_id, principal, harness)
+    path = clipped_path(data_dir, session_id, principal, harness)
+    if not path:
+        return
+    ids = [str(i) for i in row_ids if isinstance(i, str) and i]
+    if not ids:
+        return
+    if now is None:
+        now = time.time()
+    try:
+        with _delivery_state_lock(data_dir):
+            if _delivery_state_ended(data_dir, key):
+                return
+            payload = _load_clipped_payload(path)
+            stamps = dict(payload.get("stamps") or {})
+            legacy_ts = payload.get("ts")
+            # Review FB-01601: the WRITE side needs the same rule as the
+            # read - only a payload with NO "stamps" key is legacy. An
+            # explicitly empty map means "per-id format, nothing stamped",
+            # so repopulating it from the document stamp would resurrect
+            # every orphan on the next write.
+            if "stamps" not in payload:
+                # A legacy stamp may be numeric or a numeric string; the
+                # reader accepts both, so the writer must too (round-17
+                # reviewer question - the asymmetry was real).
+                try:
+                    legacy_ts = float(legacy_ts)
+                except (TypeError, ValueError, OverflowError):
+                    legacy_ts = None
+            if ("stamps" not in payload
+                    and legacy_ts is not None):
+                # A payload written before per-id stamps: every listed id
+                # inherits the document stamp.
+                stamps = {str(i): legacy_ts for i in
+                          (payload.get("ids") or []) if isinstance(i, str)}
+            # Review FB-01302: the stamp is PER ID. Refreshing the file for
+            # one clipped row must not extend another row's eligibility.
+            for rid in ids:
+                stamps[rid] = now
+            # Review CC-004(a)/CD-007: a REFRESHED id moves to the END (so the
+            # 64-id bound evicts the genuinely oldest), and duplicates are
+            # collapsed so repeats cannot waste the slots.
+            prior_ids = [str(i) for i in (payload.get("ids") or [])
+                         if isinstance(i, str) and i not in ids]
+            merged = list(dict.fromkeys(prior_ids + ids))[-64:]
+            keep = {rid: stamps[rid] for rid in merged if rid in stamps}
+            # An id with no usable stamp is dropped: it cannot expire on its
+            # own and carrying it forward would let the fresh document stamp
+            # resurrect it (review FB-01302).
+            merged = [rid for rid in merged if rid in keep]
+            _atomic_write_json(path, {"ids": merged, "stamps": keep,
+                                      "ts": now})
+    except Exception:
+        return
+
+
+def read_clipped(data_dir: str, session_id: str,
+                 principal: Optional[str] = None,
+                 harness: Optional[str] = None) -> List[str]:
+    """The ids of the protected rows already shown as clipped stubs.
+
+    Fail-open ([] on any unreadable shape) and BOUNDED IN TIME (review
+    FB-01204): a sidecar whose stamp is older than the delivery window,
+    missing, or non-finite reads as the empty set, so an abandoned
+    session cannot leave persistent defer state behind."""
+    path = clipped_path(data_dir, session_id, principal, harness)
+    if not path:
+        return []
+    payload = _load_clipped_payload(path)
+    ids = payload.get("ids")
+    if not isinstance(ids, list):
+        return []
+    # Review FB-01502: PRESENCE of the key selects the per-id contract; an
+    # explicitly empty map means "per-id format, nothing stamped" and must
+    # NOT fall back to the document stamp (that resurrected orphans).
+    has_stamps_key = "stamps" in payload
+    stamps = payload.get("stamps")
+    if not isinstance(stamps, dict):
+        stamps = {}
+    try:
+        legacy = float(payload.get("ts"))
+    except (TypeError, ValueError, OverflowError):
+        legacy = None
+    # Review FB-01402: the document stamp is a LEGACY fallback only. Once a
+    # payload carries a per-id map, an id missing from that map is NOT
+    # inherited from the document stamp - it has no own age, so it is not
+    # eligible (carrying it forward was how a stale id got resurrected).
+    per_id = has_stamps_key
+    window = _window_s()
+    now = time.time()
+    live = []
+    for raw in ids:
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            stamp = float(stamps[raw] if per_id else legacy)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        # Review FB-01302: each id expires on ITS OWN age, so a stale row
+        # cannot ride another row's refresh.
+        # Review CC-004(b): a FUTURE stamp (clock skew) must not read as
+        # live forever - allow a minute of skew, then refuse.
+        age = now - stamp
+        if math.isfinite(stamp) and -60.0 <= age <= window:
+            live.append(raw)
+    return live
+
+
 def _delivery_lock_path(data_dir: str) -> str:
     return os.path.join(data_dir, "ops", ".delivery-state.lock")
 
@@ -468,6 +627,7 @@ def _unlink_delivery_path(path: Optional[str]) -> None:
 def _clear_delivery_sidecars_locked(data_dir: str, session_id: str) -> None:
     _unlink_delivery_path(ledger_path(data_dir, session_id))
     _unlink_delivery_path(pending_path(data_dir, session_id))
+    _unlink_delivery_path(clipped_path(data_dir, session_id))
     for p in _seg_paths(data_dir, session_id):
         _unlink_delivery_path(p)
 
