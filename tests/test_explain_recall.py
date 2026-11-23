@@ -156,6 +156,16 @@ class ExplainFixtureBase(unittest.TestCase):
                                                         "trusted_internal"),
                     "superseded_at": extra.get("superseded_at"),
                     "ingestion_ts": "2026-01-01T00:00:00Z",
+                    # Issue #527 fixture disclosure: seed the canonical
+                    # content_norm exactly as the SUPPORTED writer would.
+                    # The pre-#527 fixture left this column NULL (a raw-
+                    # writer shape); the post-stamp NULL lane now heals
+                    # such rows on open — #527's AC scopes the zero-write
+                    # guarantee to stores with no NULL rows — so a NULL-
+                    # seeded fixture would make every open a write and the
+                    # zero-write assertions would test the heal lane
+                    # instead of explain.
+                    "content_norm": " ".join(content.lower().split()),
                 }
                 cols.update({k: v for k, v in extra.items()
                              if k in ("namespace",)})
@@ -164,8 +174,8 @@ class ExplainFixtureBase(unittest.TestCase):
                         (id, namespace, type, content, tags, source_ref,
                          source_hash, confidence, signal, valid_from,
                          valid_until, update_of, taint, superseded_at,
-                         ingestion_ts)
-                        VALUES ({','.join('?' * 15)})""",
+                         ingestion_ts, content_norm)
+                        VALUES ({','.join('?' * 16)})""",
                     tuple(cols.values()),
                 )
             conn.commit()
@@ -289,11 +299,16 @@ class ExplainReasonCoverageTests(ExplainFixtureBase):
                        (id, namespace, type, content, tags, source_ref,
                         source_hash, confidence, signal, valid_from,
                         valid_until, update_of, taint, superseded_at,
-                        ingestion_ts)
+                        ingestion_ts, content_norm)
                        VALUES (?, ?, 'fact', 'margin', 'eval', '', '', ?, 'test',
                                '2026-01-01T00:00:00Z', '', '',
                                'trusted_internal', NULL,
-                               '2026-06-01T00:00:00Z')""",
+                               '2026-06-01T00:00:00Z', 'margin')""",
+                    # content_norm='margin': the canonical normalize of
+                    # 'margin' — same issue #527 fixture disclosure as
+                    # _seed above (seed as the supported writer would, so
+                    # the zero-write/hash assertions test explain, not the
+                    # post-stamp NULL heal lane).
                     (mid, NS, confidence),
                 )
             conn.commit()

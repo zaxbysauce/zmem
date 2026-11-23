@@ -14,6 +14,61 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Untrusted-content fence boundaries are now per-render token markers with renderer-side escaping of every fence-shaped token in stored text - stored delimiters can no longer alias or forge a delivery boundary on any lane (recall, prefetch, evidence over both transports, the degraded hermes renderer, and the session-start trim path) (issue #511). The escape covers EVERY rendered field (content, source_ref, tags, namespace, type, signal, confidence, and the header), and the session-start trim closes the fence that SURVIVES the cut - the appended closer carries the surviving opener's token. The canonical literal is no longer emitted: out-of-tree consumers must accept the `:<token>` form (the legacy canonical form still parses). `ZMEM_FENCE_TOKEN` pins the token for deterministic fixtures (a pin outside the shared `[0-9A-Za-z]{1,32}` grammar is ignored and a fresh token is minted), it is keyed into the recall-reuse fingerprint, and a replayed envelope re-mints it so two deliveries never share boundary bytes (unless the token is PINNED, which is the documented deterministic fixture seam).
 - Delivery acknowledgement now requires complete rows: a budget-clipped protected row renders (the #116 truncated-not-dropped contract) but is never recorded delivered and never suppressed, so a same-session retry with sufficient budget delivers the complete row exactly once (issue #501). A clipped row is never RECORDED, so it re-renders on every prompt - the admission now bounds the FIRST clipped protected row's slice (half the free budget; each further clipped row is held to a minimal stub, so the clipped aggregate is at most half the free budget plus one minimal stub per additional clipped row) and leaves room for the largest normal row, so a recurring clipped row cannot starve the rows that fit; a protected row that fits keeps its whole form, a clipped one keeps a maximal clip within that budget and never less than a minimal stub (the #116 truncate-never-drop contract), and it is dropped and counted only when even a minimal stub does not fit. At the boundary - a protected row's minimal stub and an individually deliverable normal row that cannot both fit in one prompt - the protected row keeps its stub (issue #116 priority) on that prompt, so the normal row is skipped on that prompt. The wait does not necessarily last the session: the selector records the clipped protected rows in a per-session, identity-keyed sidecar, and on a LATER prompt - on both the query and the query-less lane - a recorded row that still cannot be delivered whole yields the budget, and the yield is KEPT only when the settled admission then contains at least one normal row - otherwise the deferred rows keep their stubs and nothing is blanked (the cheap pre-check that a normal row fits the remainder is a fast path, not the guarantee). The rule is a NET GAIN: the yield survives only when every protected row the no-defer pass admitted (whole or as a stub) is still delivered and a normal row is admitted that the other pass did not admit - otherwise the no-defer admission is used unchanged. The sidecar stamps each id separately, so a row expires on its own age (an abandoned session's state reads as empty), the terminal path clears it, and the write re-checks the terminal marker under the delivery lock so it cannot be resurrected. The record is fail-open: a lost write costs one extra stub render, so the next prompt keeps the stub rather than losing a row. Before #501 the clipped row was acknowledged after one render, so the normal row arrived on the next prompt anyway; the yield restores that chance without the acknowledgement: the freed budget goes to the rows that fit, and the yield is kept only when a normal row is admitted on that prompt. That is the whole guarantee: which row is not promised, and neither is the freed space being spent on a row the previous prompt did not already carry; when no normal row can use it the deferred rows keep their stubs.
 - The hermes degraded renderer now neutralizes stored fence-shaped text with the shared escape (`<<<` broken to `⟨⟨⟨`) instead of rewriting the canonical pair, so stored pre-neutralized text can no longer be byte-identical to a genuine delimiter (issue #511).
+- **Redaction no longer misses secrets and emails on decoded Unicode text**
+  (issue #523). Python's `\b` is Unicode-aware, so a non-ASCII letter glued
+  to a token end removed the boundary and the secret survived — including
+  on the write path, where `redact_secret_like_text` left such secrets
+  persisted unredacted. The distinctive token patterns
+  (AKIA/AIza/gh_/xox/sk-/Bearer/eyJ, sshpass/ssh-mysql-psql/sudo/url-scheme)
+  now use explicit ASCII word-char boundaries — byte-identical for every
+  ASCII neighbour, correct under non-ASCII adjacency, and parity with the
+  JS lane. The email pattern is Unicode-tolerant in its local part
+  (composed and decomposed forms) with a linear-time design on both pure
+  word runs AND punctuated adversarial input. Trailing non-ASCII adjacency
+  now redacts (`user@example.comé` → `[REDACTED_EMAIL]é`). ASCII behaviour is
+  pinned exactly for valid addresses.
+- **Email local part excludes non-Latin scripts and is fail-closed on
+  over-length runs** (review findings M-1 and cand-privacy-1, issue #523).
+  The local-part class is now ASCII word chars + U+0300-U+036F combining
+  marks + Latin Extended (U+00C0-U+024F), not a bare Unicode `\w`, so a
+  CJK/Thai/ideographic run glued before an address is surrounding user text
+  and survives rather than being consumed as the local part
+  (`連絡先はuser@example.comです` → `連絡先は[REDACTED_EMAIL]です`). The
+  pattern uses a run-start boundary, a possessive quantifier, and a
+  word-char lookahead, so it is linear on punctuated adversarial input AND
+  fail-closed on over-length local parts: a >64-char run with separators
+  (`a_`×32`x@example.com`) is matched in full and redacted, matching the
+  pre-#523 base regex (a bounded `{0,63}` quantifier would have failed open
+  and leaked the address), while punctuation-only local parts (`--@example.com`)
+  are still rejected. One deliberate behaviour change vs the pre-review PR: a
+  leading delimiter is now consumed as part of the local part (`.joerg@…` →
+  `[REDACTED_EMAIL]`); the pre-review word-char-first form preserved it
+  (`.[REDACTED_EMAIL]`) but could not be made both linear and fail-closed.
+  Known gaps,
+  pinned by tests: IDN domains stay unredacted, the generic base64/hex
+  boundaries keep `\b` (benign-SHA preservation, #502 direction), and
+  under `re.IGNORECASE` the ASCII classes case-fold to also match
+  U+0130/U+0131/U+017F/U+212A-class codepoints. The IDN and base64/hex
+  boundary gaps are disclosed but not separately pinned by a test.
+- **`import-store` completes on WAL-journal source stores** (issue #524).
+  The FTS optimize INSERT opened an implicit transaction that was never
+  committed before the `journal_mode=DELETE` switch, so every WAL source
+  (the zmem default) failed wholesale after successful staging with
+  "cannot change out of wal mode from within a transaction". The optimize
+  is now committed before the switch and the switch result is verified.
+  The issue's "demotion masks the bug" claim was disproved during the
+  trace: the failure was journal-mode-only, so both plain and
+  knowledge-prefixed row shapes are covered by tests.
+- **NULL `content_norm` rows written after the repair markers heal on the
+  next open** (issue #527). Both marker lanes (162 repair, 163
+  verification) are one-shot, so a NULL planted later by a raw external
+  sqlite3 writer was skipped forever — invisible to every
+  content_norm-keyed re-rank/fold window (the #486 ingest contract). A new
+  unmarked lane probes for NULLs on every open and heals them with the
+  163 lane's transaction discipline; clean stores stay byte-identical
+  (zero-write floor). Disclosed cost: the probe is a full-table scan
+  (~79 ms median at 50k rows / 87 MB vs ~1.8 ms for a stamped open).
+  Undecodable-content rows keep NULL (skip semantics unchanged).
 
 ## [0.165.0] - 2026-11-21
 

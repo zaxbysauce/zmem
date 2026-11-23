@@ -808,5 +808,197 @@ class CloseoutFeedbackDocTest(unittest.TestCase):
         self.assertNotIn(SECRET, line)
 
 
+class NonAsciiBoundaryTest(unittest.TestCase):
+    """Issue #523: redaction must not miss secrets/emails because of
+    non-ASCII adjacency or content. Python ``re``'s ``\b`` is Unicode-aware
+    (a non-ASCII letter IS a word char), and the pre-#523 email class was
+    ASCII-only — both let the shapes below survive. The distinctive secret
+    patterns and the email regex now use explicit ASCII-word boundaries and
+    a Unicode-tolerant local part. Every ASCII outcome is pinned EXACTLY
+    (byte-equal (output, count) pairs) so the widening cannot drift."""
+
+    def test_ac1_non_ascii_email_redacted_exactly(self):
+        out, count = redact_training_text(
+            "contact j\u00f6rg@example.com today")
+        self.assertEqual(out, "contact [REDACTED_EMAIL] today")
+        self.assertEqual(count, 1)
+
+    def test_ac2_letter_adjacent_key_redacted_e_acute_survives(self):
+        # Only the TOKEN is redacted; the adjacent U+00E9 is surrounding
+        # user text and must survive (plan-critic round-2 correction).
+        out, count = redact_training_text(
+            "x \u00e9AKIAIOSFODNN7EXAMPLE y")
+        self.assertEqual(out, "x \u00e9[REDACTED_SECRET] y")
+        self.assertEqual(count, 1)
+
+    def test_ac2_secret_only_entry_point_too(self):
+        # The write path (storelib/write.py) uses the secret-only entry;
+        # the shared patterns must not miss there either.
+        import redaction as _r
+        out, count = _r.redact_secret_like_text(
+            "x \u00e9AKIAIOSFODNN7EXAMPLE y")
+        self.assertEqual(out, "x \u00e9[REDACTED_SECRET] y")
+        self.assertEqual(count, 1)
+
+    def test_ac3_ascii_floor_exact(self):
+        out, count = redact_training_text("contact joerg@example.com today")
+        self.assertEqual(out, "contact [REDACTED_EMAIL] today")
+        self.assertEqual(count, 1)
+        out, count = redact_training_text("x AKIAIOSFODNN7EXAMPLE y")
+        self.assertEqual(out, "x [REDACTED_SECRET] y")
+        self.assertEqual(count, 1)
+
+    def test_trailing_adjacency_redacts(self):
+        out, count = redact_training_text("AKIAIOSFODNN7EXAMPLE\u00e9")
+        self.assertEqual(out, "[REDACTED_SECRET]\u00e9")
+        self.assertEqual(count, 1)
+
+    def test_nfd_decomposed_forms(self):
+        # Decomposed (NFD) content: the combining mark U+0301 is NOT a
+        # word char, so the boundary exists — pre-#523 the ASCII-only email
+        # class still leaked the local-part head (partial redaction).
+        out, count = redact_training_text("jo\u0301rg@example.com")
+        self.assertEqual(out, "[REDACTED_EMAIL]")
+        self.assertEqual(count, 1)
+        out, count = redact_training_text("e\u0301AKIAIOSFODNN7EXAMPLE")
+        self.assertEqual(out, "e\u0301[REDACTED_SECRET]")
+        self.assertEqual(count, 1)
+
+    def test_ascii_identity_unchanged(self):
+        # ASCII neighbours keep the exact pre-#523 outcomes: a word-char
+        # neighbour (lowercase letter, underscore) blocks the match.
+        for text in ("xAKIAIOSFODNN7EXAMPLE",
+                     "AKIAIOSFODNN7EXAMPLE_",
+                     "myAKIAIOSFODNN7EXAMPLE"):
+            out, count = redact_training_text(text)
+            self.assertEqual((out, count), (text, 0), text)
+
+    def test_email_leading_delimiters_consumed(self):
+        # The possessive run-start pattern consumes a leading delimiter as
+        # part of the local part (``.joerg@…`` → ``[REDACTED_EMAIL]``), matching
+        # the pre-#523 base regex ``\b[A-Z0-9._%+-]+@…``. This is the one
+        # deliberate behaviour change vs the pre-review PR (which preserved the
+        # delimiter); the run-start anchor that keeps the pattern linear cannot
+        # also preserve a leading delimiter without reintroducing quadratic
+        # backtracking, and the security property — the address is redacted —
+        # holds.
+        for delim in (".", "-", "+", "%"):
+            out, count = redact_training_text(f"{delim}joerg@example.com")
+            self.assertEqual(
+                (out, count), ("[REDACTED_EMAIL]", 1),
+                f"leading {delim!r} is consumed as the local part")
+
+    def test_email_punctuation_only_local_part_rejected(self):
+        for text in ("--@example.com", ".@example.com"):
+            out, count = redact_training_text(text)
+            self.assertEqual((out, count), (text, 0), text)
+
+    def test_ignorecase_casefold_gap_is_known_and_pinned(self):
+        # DISCLOSED GAP (plan-critic): under re.IGNORECASE the ASCII
+        # classes case-fold to also match U+0130/U+0131/U+017F/U+212A, so a
+        # U+212A KELVIN SIGN glued before the IGNORECASE Bearer keyword
+        # still lacks a boundary. ASCII K is an ordinary negative and does
+        # NOT pin this gap. If this pin ever fails, the gap was closed —
+        # update the disclosure, do not "fix" the test silently.
+        for prefix in ("\u0130", "\u0131", "\u017f", "\u212a"):
+            token = "Bearer " + "AbCdEfGhIjKlMnOp"  # 16 chars of alphabet
+            out, count = redact_training_text(prefix + token)
+            self.assertEqual((out, count), (prefix + token, 0),
+                             f"case-fold gap pin for U+{ord(prefix):04X}")
+
+    def test_email_linear_on_adversarial_non_match(self):
+        # The round-1 email candidate was QUADRATIC on non-matching
+        # non-ASCII input (~2s at 16k chars, measured by the plan critic).
+        # The shipped candidate is linear; 32k chars must stay far under a
+        # generous bound that the quadratic shape would blow through even
+        # on a loaded box (quadratic extrapolates to ~8s at 32k).
+        import time
+        for size in (8192, 32768):
+            text = "\u00e9" * size  # non-ASCII, no '@', never matches
+            start = time.perf_counter()
+            out, count = redact_training_text(text)
+            elapsed = time.perf_counter() - start
+            self.assertEqual((out, count), (text, 0))
+            if size == 32768:
+                self.assertLess(
+                    elapsed, 5.0,
+                    f"email regex took {elapsed:.2f}s at 32k non-matching "
+                    "chars — quadratic regression")
+
+    def test_email_pattern_linear_on_punctuated_non_ascii(self):
+        # The unbounded local part was quadratic on punctuated adversarial
+        # input ('é.'*N — a match could start after every separator; 5.9s at
+        # 32k). The shipped pattern is linear via the run-start boundary
+        # (a match can only begin at the start of a maximal local-part run)
+        # plus a possessive quantifier (no backtracking). This probes _EMAIL_RE
+        # DIRECTLY: the full pipeline has a PRE-EXISTING quadratic on
+        # dot-alternating input (5.7s for 'a.'*16k at BASE too — separate
+        # issue, filed #535), which would mask the email pattern's own
+        # behavior here. 'é.'*N is a run of local-part chars, so the pattern
+        # matches the whole run once (no '@' → no redaction) and stays linear.
+        import time
+        import redaction as _r
+        for shape in ("\u00e9.", "\u65e5\u672c-"):
+            for n in (8192, 32768):
+                text = shape * (n // len(shape))
+                start = time.perf_counter()
+                out = _r._EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+                elapsed = time.perf_counter() - start
+                self.assertEqual(out, text)
+                if n == 32768:
+                    self.assertLess(
+                        elapsed, 1.0,
+                        f"email pattern took {elapsed:.2f}s at 32k "
+                        f"punctuated {shape!r} chars — quadratic "
+                        "regression (the pre-fix shape measured 5.9s)")
+
+    def test_email_over_length_local_part_fail_closed(self):
+        # Review finding cand-privacy-1 (FIXED): the possessive run-start
+        # pattern consumes the whole maximal local-part run, so an over-length
+        # local part with separators (``a_``*32 + ``x@example.com``) is matched
+        # in full and redacted — the pre-#523 base regex behaviour. A bounded
+        # ``{0,63}`` quantifier stops before the ``@`` on such a run and FAILS
+        # OPEN (leaks the whole address); this pins the fail-closed behaviour.
+        for local in ("a_" * 32 + "x", "a-" * 32 + "x"):
+            text = local + "@example.com"
+            out, count = redact_training_text(text)
+            self.assertEqual(
+                (out, count), ("[REDACTED_EMAIL]", 1),
+                f"over-length local part {local!r} must be redacted, not leaked")
+        # A 65-char all-alnum local part is caught by the generic base64
+        # secret pattern first (the secret pass runs before the email pass),
+        # so it is classified as a secret and the domain is left — the same
+        # outcome as the pre-#523 base regex. The security property (the local
+        # part is redacted) holds; this case is not an email-classification
+        # regression.
+        out, count = redact_training_text("x" * 65 + "@example.com")
+        self.assertEqual(count, 1)
+        self.assertIn("[REDACTED_SECRET]", out)
+
+
+    def test_email_local_part_excludes_cjk_surrounding_text(self):
+        # Review finding M-1 (issue #523): the local-part class must NOT be a
+        # bare Unicode \w — a CJK/Thai/ideographic run glued before an address
+        # is surrounding user text and must survive, not be consumed as the
+        # local part. The earlier \w-based class over-redacted
+        # "連絡先はuser@example.comです" to "[REDACTED_EMAIL]です".
+        out, count = redact_training_text(
+            "連絡先はuser@example.comです")
+        self.assertEqual(
+            out, "連絡先は[REDACTED_EMAIL]です")
+        self.assertEqual(count, 1)
+        out, count = redact_training_text(
+            "联系support@example.com获取帮助")
+        self.assertEqual(
+            out, "联系[REDACTED_EMAIL]获取帮助")
+        self.assertEqual(count, 1)
+        # Latin Extended local parts still redact (real international
+        # addresses), and the é-adjacent secret boundary is unchanged.
+        out, count = redact_training_text("jörg@example.com")
+        self.assertEqual((out, count), ("[REDACTED_EMAIL]", 1))
+        out, count = redact_training_text("éAKIAIOSFODNN7EXAMPLE")
+        self.assertEqual((out, count), ("é[REDACTED_SECRET]", 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -642,7 +642,28 @@ def run_import(source_store: Path, dest_dir: Path, force: bool = False) -> dict:
                 if _table_exists(staged_conn, "memory_fts"):
                     staged_conn.execute(
                         "INSERT INTO memory_fts(memory_fts) VALUES('optimize')")
-                staged_conn.execute("PRAGMA journal_mode=DELETE")
+                    # Issue #524: under Python sqlite3's legacy isolation the
+                    # optimize INSERT opens an IMPLICIT transaction, and SQLite
+                    # refuses `PRAGMA journal_mode` inside a transaction
+                    # ("cannot change out of wal mode from within a
+                    # transaction"). The staged copy inherits the source's WAL
+                    # mode from the online backup's page-1 copy, so without
+                    # this commit every WAL-journal source (the zmem default)
+                    # failed wholesale here. The optimize WANTS committing: its
+                    # whole purpose is merging FTS segments so VACUUM drops
+                    # tombstone segments that could retain pre-redaction
+                    # bytes (same idiom as storelib/purge.py's optimize lane).
+                    staged_conn.commit()
+                # Consume the PRAGMA result and verify: `fetchone()` on this
+                # connection returns a sqlite3.Row (never compare to a bare
+                # tuple), and a failed/no-op switch must not pass silently.
+                # An explicit check rather than `assert` so -O cannot drop it.
+                _mode_row = staged_conn.execute(
+                    "PRAGMA journal_mode=DELETE").fetchone()
+                if _mode_row is None or _mode_row[0] != "delete":
+                    raise RuntimeError(
+                        "failed to switch staging store to DELETE journal "
+                        f"mode: {_mode_row!r}")
                 staged_conn.commit()
                 staged_conn.execute("VACUUM")
                 integrity = staged_conn.execute(
