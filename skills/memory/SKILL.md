@@ -801,9 +801,10 @@ under `ZMEM_CAPTURE=0`, no capture subprocess or state mutation runs on those
 five surfaces. The pre-existing UserPromptSubmit correction queue and Hermes
 convention-compatibility cadence are separate legacy paths with their own
 capture-mode/interval controls. Complete
-`<<<ZMEM_UNTRUSTED_FENCE>>>` through `<<<END_ZMEM_UNTRUSTED_FENCE>>>` blocks
-are removed before transcript-derived content reaches deduplication, queue
-synthesis, or closeout review.
+`<<<ZMEM_UNTRUSTED_FENCE>>>` blocks - and the per-render token form
+`<<<ZMEM_UNTRUSTED_FENCE:<token>>>` - through
+`<<<END_ZMEM_UNTRUSTED_FENCE>>>` (or its matching token form) are removed before transcript-derived content reaches deduplication, queue
+synthesis, or closeout review. `ZMEM_FENCE_TOKEN` pins the token for deterministic fixtures; a pin outside the shared `[0-9A-Za-z]{1,32}` grammar is ignored.
 
 #### Pre-tool repository-state predicate — issue #397
 

@@ -484,7 +484,9 @@ class HookBodyBudgetTest(unittest.TestCase):
             self.fail("hook emitted nothing; stderr=" + r.stderr[-500:])
         out = json.loads(r.stdout)
         ctx = out["additionalContext"]
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        # Issue #511: the delivered fence boundary carries a per-render
+        # token after the canonical prefix (either shape accepted).
+        self.assertRegex(ctx, r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
         self.assertRegex(ctx, r"\[budget: dropped [1-9]\d* rows")
 
     def test_log_line_fields_absent_without_budget_keys(self):
@@ -581,8 +583,11 @@ class HookBodyBudgetTest(unittest.TestCase):
         header_lines = [ln for ln in fence.splitlines() if ln.startswith("# H")]
         self.assertEqual(len(header_lines), 1)
         self.assertLessEqual(len(header_lines[0]), 244)
-        self.assertTrue(
-            fence.strip().endswith("<<<END_ZMEM_UNTRUSTED_FENCE>>>"))
+        # Issue #511: the closing boundary carries a per-render token after
+        # the canonical prefix (either shape accepted).
+        self.assertRegex(
+            fence.strip(),
+            r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>$")
 
 
 class DegradedFenceFallbackTest(unittest.TestCase):

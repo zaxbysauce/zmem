@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import re
 import hashlib
 import io
 import json
@@ -87,6 +88,10 @@ CONFIG_KNOBS: tuple[tuple[str, str], ...] = (
     ("ZMEM_ENTITY_KIND_WEIGHTS", "recall"),
     ("ZMEM_FENCE_OPEN", "recall"),
     ("ZMEM_FENCE_CLOSE", "recall"),
+    # Issue #511: the per-render fence token changes rendered bytes exactly
+    # like the marker constants above; a caller flipping it under the reuse
+    # seam must MISS the cache, never replay a stale boundary.
+    ("ZMEM_FENCE_TOKEN", "recall"),
     ("ZMEM_CROSS_PROJECT", "recall"),
     ("ZMEM_CROSS_ENCODER_SHADOW", "recall"),
     ("ZMEM_UNTRUSTED_FENCE", "recall"),
@@ -419,8 +424,12 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
     if entry is not None:
         # HIT: replay this caller's effects from the recorded script.
         t0 = time.monotonic()
+        # One fence-token mapping for THIS replay: the replayed stdout
+        # and the replayed result must carry the same token (the
+        # additive `rendered` alias mirrors the emitted context).
+        fence_mapping: dict = {}
         try:
-            _apply_effects(conn, entry, capture_dict)
+            _apply_effects(conn, entry, capture_dict, fence_mapping)
         except Exception:
             with _reuse_lock:
                 _reuse_cache.pop(key, None)
@@ -431,7 +440,7 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
         _timing_reuse.append((time.monotonic() - t0) * 1000.0)
         if observe_sidecar:
             _observe(conn, components, None, None, ok=True, so="hit")
-        return copy.deepcopy(entry.result)
+        return _replay_result(entry, fence_mapping)
 
     # MISS: coalesce or compute.
     with _reuse_lock:
@@ -461,8 +470,9 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
         if cached is not None:
             with _reuse_lock:
                 _counters["coalesced"] += 1
+            fence_mapping = {}
             try:
-                _apply_effects(conn, cached, capture_dict)
+                _apply_effects(conn, cached, capture_dict, fence_mapping)
             except Exception:
                 # Same eviction contract as the hit path (review finding 5):
                 # a poisoned entry must not survive to the next caller.
@@ -473,7 +483,10 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
             if observe_sidecar:
                 _observe(conn, components, None, None, ok=True,
                          so="coalesced")
-            return copy.deepcopy(cached.result)
+            # Issue #511 (PR #534 feedback FB-015): the COALESCED path
+            # replays the winner's envelope too - it must carry a
+            # FRESH fence token, exactly like the ordinary hit path.
+            return _replay_result(cached, fence_mapping)
         if slot["error"] is not None:
             with _reuse_lock:
                 _counters["coalesced"] += 1
@@ -565,7 +578,8 @@ def recall_with_reuse(conn, call_kwargs: dict, impl, capture_dict):
     return result
 
 
-def _apply_effects(conn, entry: _ReuseEntry, capture_dict) -> None:
+def _apply_effects(conn, entry: _ReuseEntry, capture_dict,
+                   fence_mapping: dict | None = None) -> None:
     """Replay the recorded effect script for THIS caller: telemetry on this
     caller's connection with the recorded ids/kwargs, capture population,
     and the recorded stdout bytes verbatim.
@@ -584,8 +598,76 @@ def _apply_effects(conn, entry: _ReuseEntry, capture_dict) -> None:
         if capture_dict is not None and entry.capture_snapshot is not None:
             capture_dict.update(copy.deepcopy(entry.capture_snapshot))
         if entry.stdout_text:
-            sys.stdout.write(entry.stdout_text)
+            # Issue #511 (PR #534 feedback FB-015): a replayed envelope
+            # must carry a FRESH fence token — the renderer mints one per
+            # render, so replaying the recorded bytes would give two
+            # deliveries the same boundary (AC1). A PINNED token re-mints
+            # to itself, so the pinned path stays byte-identical.
+            sys.stdout.write(_remint_fence_tokens(
+                entry.stdout_text, fence_mapping))
             sys.stdout.flush()
+
+# Issue #511 (PR #534 feedback FB-015): only TOKEN-BEARING markers are
+# re-minted — the canonical and _NEUTRALIZED forms carry no token and are
+# left byte-identical.
+_FENCE_TOKEN_MARKER_RE = re.compile(
+    r"<<<(END_)?ZMEM_UNTRUSTED_FENCE:([0-9A-Za-z]{1,32})(_NEUTRALIZED)?>>>")
+
+
+def _remint_fence_tokens(text: str, mapping: dict | None = None) -> str:
+    """Give a replayed envelope a fresh fence token.
+
+    Each DISTINCT original token maps to its own fresh token, so a
+    multi-fence payload keeps distinct fences distinct. ``mapping`` is
+    the SHARED mapping of one replay: the replayed stdout and every
+    replayed result field must carry the SAME token, because the
+    additive ``rendered`` alias mirrors the emitted context exactly
+    (PR #534 feedback FB-015).
+    """
+    if not text or "ZMEM_UNTRUSTED_FENCE" not in text:
+        return text
+    from storelib.recall import _fence_token
+    if mapping is None:
+        mapping = {}
+
+    def _sub(m):
+        old = m.group(2)
+        new = mapping.get(old)
+        if new is None:
+            new = mapping[old] = _fence_token()
+        return "<<<%sZMEM_UNTRUSTED_FENCE:%s%s>>>" % (
+            "END_" if m.group(1) else "", new, m.group(3) or "")
+
+    return _FENCE_TOKEN_MARKER_RE.sub(_sub, text)
+
+
+def _remint_result_fences(result, mapping: dict | None = None):
+    """Re-mint the fence token in a replayed envelope result.
+
+    The SAME mapping is shared with the replayed stdout, so the
+    additive ``rendered`` alias mirrors the emitted context exactly
+    (PR #534 feedback FB-015).
+    """
+    if isinstance(result, dict):
+        if mapping is None:
+            mapping = {}
+        for key in ("rendered", "additionalContext", "context"):
+            value = result.get(key)
+            if isinstance(value, str):
+                result[key] = _remint_fence_tokens(value, mapping)
+    return result
+
+
+def _replay_result(entry, mapping: dict | None = None):
+    """The replayed RESULT of a cache entry (fresh fence token).
+
+    Issue #511 (PR #534 feedback FB-015): BOTH replay paths - the
+    ordinary hit and the coalesced hit - go through this ONE helper,
+    so neither can structurally skip the re-mint and hand a caller
+    the first render's boundary bytes. ``mapping`` is shared with the
+    replayed stdout so both carry the same token.
+    """
+    return _remint_result_fences(copy.deepcopy(entry.result), mapping)
 
 
 def clear_recall_reuse_cache() -> None:

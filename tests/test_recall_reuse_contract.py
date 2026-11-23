@@ -63,7 +63,7 @@ from storelib.recall import recall_memory  # noqa: E402
 
 ENV_NAMES = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_MODEL_AUTODOWNLOAD",
              "ZMEM_EMBED_PROFILE", rr.SERVE_ENV, rr.TTL_ENV,
-             rr.REFRESH_ENV, rr.OBSERVE_ENV)
+             rr.REFRESH_ENV, rr.OBSERVE_ENV, "ZMEM_FENCE_TOKEN")
 
 
 class _ReuseBase(unittest.TestCase):
@@ -75,6 +75,10 @@ class _ReuseBase(unittest.TestCase):
         os.environ["ZMEM_DATA"] = str(self.tmp)
         os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
         os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+        # Issue #511: fence renders carry a per-render token; pin it so
+        # two uncached recalls of the same rows stay byte-comparable (the
+        # determinism-sanity and A/B byte-parity assertions).
+        os.environ["ZMEM_FENCE_TOKEN"] = "reusepin"
         os.environ.pop(rr.SERVE_ENV, None)
         os.environ.pop(rr.OBSERVE_ENV, None)
         os.environ.pop(rr.REFRESH_ENV, None)

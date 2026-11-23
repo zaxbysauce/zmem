@@ -335,7 +335,9 @@ class PostToolBatchTest(unittest.TestCase):
         ctx = json.loads(out.strip())["additionalContext"]
         self.assertIn("postbatchcanary", ctx)
         self.assertIn("postbatchcarveout", ctx)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        # Issue #511: the fence boundary carries a per-render token after
+        # the canonical prefix (either shape accepted).
+        self.assertRegex(ctx, r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
         lines = _decision_lines(self._tmp)
         self.assertEqual(len(lines), 1)
         self.assertIn("status=injected", lines[0])

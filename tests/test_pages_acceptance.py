@@ -437,8 +437,14 @@ class PagesAcceptanceChecks(unittest.TestCase):
                 self.assertTrue(required.issubset(payload))
                 self.assertLessEqual(payload["tokens_used"], 1500)
                 self.assertEqual(payload["tokens_budget"], 1500)
-                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", payload["rendered"])
-                self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", payload["rendered"])
+                # Issue #511: the fence boundary carries a per-render token
+                # after the canonical prefix (either shape accepted).
+                self.assertRegex(
+                    payload["rendered"],
+                    r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
+                self.assertRegex(
+                    payload["rendered"],
+                    r"<<<END_ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
                 self.assertIn("untrusted", payload["rendered"].lower())
                 self.assertFalse(any(r.get("id") == "00000000-0000-4000-8000-000000000506"
                                      for r in payload["results"]),

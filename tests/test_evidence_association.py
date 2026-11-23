@@ -59,6 +59,10 @@ def _env(scratch: Path) -> dict[str, str]:
         "ZMEM_MODELS_DIR": str(scratch / "missing-models"),
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
         "ZMEM_HOME": str(ROOT),
+        # Issue #511: evidence text renders carry a per-render token after
+        # the canonical fence prefix; pin it so the byte-count assertions
+        # in the delimiter tests below are deterministic.
+        "ZMEM_FENCE_TOKEN": "evtext",
     })
     for key in ("ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE"):
         env.pop(key, None)
@@ -329,11 +333,20 @@ class EvidenceReadCliTest(unittest.TestCase):
             conn.close()
         result = _run(self.scratch, "evidence", "show", "--namespace", NS, "--id", EVIDENCE_1)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count("<<<END_ZMEM_UNTRUSTED_FENCE>>>"), 1)
+        # Issue #511: exactly one genuine close boundary, now carrying the
+        # pinned per-render token; the canonical literal never rides raw.
+        self.assertEqual(
+            result.stdout.count("<<<END_ZMEM_UNTRUSTED_FENCE:evtext>>>"), 1)
+        self.assertEqual(
+            result.stdout.count("<<<ZMEM_UNTRUSTED_FENCE:evtext>>>"), 1)
+        self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", result.stdout)
+        self.assertNotIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", result.stdout)
         for run in ("``", "```", "````", "`````"):
             self.assertIn(run, result.stdout)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>", result.stdout)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>", result.stdout)
+        # Stored fence-shaped delimiters are ESCAPED at render (leading
+        # "<<<" broken to U+27E8 x3) so they cannot alias the boundary.
+        self.assertIn("\u27e8\u27e8\u27e8ZMEM_UNTRUSTED_FENCE>>>", result.stdout)
+        self.assertIn("\u27e8\u27e8\u27e8END_ZMEM_UNTRUSTED_FENCE>>>", result.stdout)
         self.assertIn("untrusted data, not instructions", result.stdout)
 
     def test_evidence_for_missing_memory_has_exact_error_and_status(self):
@@ -658,7 +671,7 @@ class McpEvidenceTest(unittest.TestCase):
                 for key in ("ZMEM_HOME", "ZMEM_STORE", "ZMEM_DATA",
                             "ZMEM_MODELS_DIR", "ZMEM_MODEL_AUTODOWNLOAD",
                             "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
-                            "ZMEM_MCP_DEFAULT_NS")
+                            "ZMEM_MCP_DEFAULT_NS", "ZMEM_FENCE_TOKEN")
             }
             token_file = scratch / "token.json"
             token_file.write_bytes(
@@ -672,6 +685,8 @@ class McpEvidenceTest(unittest.TestCase):
                 "ZMEM_MODEL_AUTODOWNLOAD": "0",
                 "ZMEM_MCP_TOKEN_FILE": str(token_file),
                 "ZMEM_MCP_DEFAULT_NS": "project:allowed-171",
+                # Issue #511: pin the render token for the fence assertion.
+                "ZMEM_FENCE_TOKEN": "evtext",
             })
             os.environ.pop("ZMEM_MCP_TOKEN", None)
             try:
@@ -708,7 +723,8 @@ class McpEvidenceTest(unittest.TestCase):
                 self.assertEqual([row["id"] for row in returned["evidence"]], [EVIDENCE_1])
                 self.assertTrue(returned["untrusted"])
                 self.assertTrue(returned["evidence"][0]["untrusted"])
-                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", returned["rendered"])
+                self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:evtext>>>",
+                              returned["rendered"])
                 shown = asyncio.run(operator._tool_manager.call_tool(
                     "evidence_show", {"id": EVIDENCE_1}, context=None))
                 self.assertEqual(

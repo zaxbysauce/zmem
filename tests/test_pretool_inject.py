@@ -140,7 +140,9 @@ class PreToolModeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         ctx = _ctx(out)
         self.assertIn("pretoolcanary", ctx)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", ctx)
+        # Issue #511: the fence boundary carries a per-render token after
+        # the canonical prefix (either shape accepted).
+        self.assertRegex(ctx, r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
         line = [l for l in (Path(self._tmp) / "zmem-decisions.log")
                 .read_text(encoding="utf-8").splitlines()
                 if "zmem-hook" in l][-1]
@@ -630,7 +632,10 @@ class HermesReflectDeliveryTest(unittest.TestCase):
             )
             first = self._run_reflect(tmp)
             self.assertIn("pretoolcanary", first)
-            self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", first)
+            # Issue #511: the fence boundary carries a per-render token
+            # after the canonical prefix (either shape accepted).
+            self.assertRegex(first,
+                             r"<<<ZMEM_UNTRUSTED_FENCE(?::[0-9a-zA-Z]+)?>>>")
             # Same ring → silent (the ledger already delivered the row).
             second = self._run_reflect(tmp)
             self.assertEqual(second, "{}")

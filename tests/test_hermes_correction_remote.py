@@ -63,6 +63,10 @@ def _clean_env(tmp: str, **extra: str) -> dict:
         "ZMEM_DATA": tmp,
         "ZMEM_MODEL_AUTODOWNLOAD": "0",
         "ZMEM_MODELS_DIR": os.path.join(tmp, "no-models"),
+        # Issue #511: fence renders carry a per-render token; pin it so the
+        # fence-boundary assertion below is byte-deterministic (the spawned
+        # MCP server inherits this env, so its renders pin too).
+        "ZMEM_FENCE_TOKEN": "remotepin",
         "PYTHONUTF8": "1",
     })
     env.update(extra)
@@ -346,7 +350,10 @@ class HermesRemotePrefetchTest(unittest.TestCase):
         out, rc = _run_reflect(env, {"session_id": "r1"})
         self.assertEqual(rc, 0)
         self.assertIn("remotecanary", out)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE>>>", out)
+        # Issue #511: the delivered boundary carries the pinned render
+        # token (see _clean_env); the canonical literal never rides raw.
+        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE:remotepin>>>", out)
+        self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", out)
 
     def test_remote_prefetch_does_not_bump_retrieval_count(self):
         env = self._remote_env()

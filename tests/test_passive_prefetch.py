@@ -73,7 +73,7 @@ _PIN_ENV_KEYS = (
     "ZMEM_MODEL_AUTODOWNLOAD", "ZMEM_TEST_NOW", "PYTHONIOENCODING",
     "ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET", "ZMEM_DELIVER_WINDOW_S",
     "ZMEM_LEDGER_CAP", "ZMEM_NAMESPACE",
-    "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
+    "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE", "ZMEM_FENCE_TOKEN",
 )
 
 
@@ -98,6 +98,11 @@ def _pin_class_env(cls, prefix: str) -> str:
         # Bare env token = unscoped operator token (test_mcp_auth convention)
         # so the MCP legs run the store path rather than the scope guard.
         "ZMEM_MCP_TOKEN": "prefetch-test-token",
+        # Issue #511: fence renders carry a per-render token; pin it (same
+        # pin as the fixture generator's isolation_env) so the CLI/MCP/
+        # provider legs render byte-identical fences matching the frozen
+        # expected-envelope fixture.
+        "ZMEM_FENCE_TOKEN": "prefetchpin",
     })
     for key in ("ZMEM_INJECT", "ZMEM_INJECT_TOKEN_BUDGET",
                 "ZMEM_DELIVER_WINDOW_S", "ZMEM_LEDGER_CAP", "ZMEM_NAMESPACE",

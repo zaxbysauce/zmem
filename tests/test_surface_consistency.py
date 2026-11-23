@@ -476,11 +476,18 @@ class SurfaceTempStoreTest(unittest.TestCase):
         are #173/#174 surfaces), no score field leaks, and the fence keeps
         its single terminal LF."""
         import json
+        from unittest import mock as _mock
+
         from storelib.recall import _format_fenced_recall
 
         fixture = REPO_ROOT / "tests" / "fixtures" / "issue126"
         row = json.loads((fixture / "fence-input.json").read_text(encoding="utf-8"))
-        rendered = _format_fenced_recall([row], "Relevant memories.").encode("utf-8")
+        # Issue #511: the render boundary carries a per-render token; pin
+        # it so the byte comparison against the committed fixture (whose
+        # markers carry the same pinned token) is deterministic.
+        with _mock.patch.dict(os.environ, {"ZMEM_FENCE_TOKEN": "issue126"}):
+            rendered = _format_fenced_recall(
+                [row], "Relevant memories.").encode("utf-8")
         expected = (fixture / "fence-expected.txt").read_bytes()
         self.assertEqual(
             rendered, expected, "expiry-marker bytes must be unchanged"

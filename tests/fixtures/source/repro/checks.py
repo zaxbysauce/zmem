@@ -1115,7 +1115,12 @@ def check_c5(repo_root: Path) -> None:
         # byte-preserving default for passive callers.
         scripts = repo_root / "skills" / "memory" / "scripts"
         sys.path.insert(0, str(scripts))
-        with patch.dict(os.environ, env, clear=True):
+        # Issue #511: fence renders carry a per-render token; pin it so the
+        # two renders below differ only by the source_hint flag (a random
+        # token per render would break the byte-preservation comparison).
+        pinned_env = dict(env)
+        pinned_env["ZMEM_FENCE_TOKEN"] = "sourcec5"
+        with patch.dict(os.environ, pinned_env, clear=True):
             import storelib  # imported only after the temp env is installed
 
             row = {

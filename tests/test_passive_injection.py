@@ -69,6 +69,10 @@ def _clean_env(tmp: Path, *, data_dir: Path | None = None) -> dict[str, str]:
         "ZMEM_TEST_NOW": "2026-06-01T00:00:00Z",
         "ZMEM_INJECT_TOKEN_BUDGET": "1500",
         "ZMEM_QUERY_CONTEXT": "0",
+        # Issue #511: fence renders carry a per-render token; pin it so
+        # two renders of the same rows (hook vs provider parity, the sha
+        # match below) stay byte-comparable.
+        "ZMEM_FENCE_TOKEN": "phase25",
         "PYTHONUTF8": "1",
     })
     return env

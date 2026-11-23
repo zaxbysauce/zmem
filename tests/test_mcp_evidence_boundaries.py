@@ -26,6 +26,7 @@ class McpEvidenceBoundaryTest(unittest.TestCase):
             for key in (
                 "ZMEM_HOME", "ZMEM_MCP_TOKEN", "ZMEM_MCP_TOKEN_FILE",
                 "ZMEM_DEFAULT_NAMESPACE", "ZMEM_MCP_DEFAULT_NS",
+                "ZMEM_FENCE_TOKEN",
             )
         }
         os.environ["ZMEM_HOME"] = str(ROOT)
@@ -33,6 +34,9 @@ class McpEvidenceBoundaryTest(unittest.TestCase):
         os.environ.pop("ZMEM_MCP_TOKEN_FILE", None)
         os.environ.pop("ZMEM_DEFAULT_NAMESPACE", None)
         os.environ.pop("ZMEM_MCP_DEFAULT_NS", None)
+        # Issue #511: the outer evidence fence carries a per-render token;
+        # pin it so the boundary assertions below are byte-deterministic.
+        os.environ["ZMEM_FENCE_TOKEN"] = "evfence"
         import mcp_server
 
         cls.mcp_server = mcp_server
@@ -82,10 +86,19 @@ class McpEvidenceBoundaryTest(unittest.TestCase):
         rendered = result["rendered"]
         self.assertTrue(result["untrusted"])
         self.assertEqual(result["content_type"], "untrusted_evidence")
-        self.assertEqual(rendered.count("<<<ZMEM_UNTRUSTED_FENCE>>>"), 1)
-        self.assertEqual(rendered.count("<<<END_ZMEM_UNTRUSTED_FENCE>>>"), 1)
-        self.assertIn("<<<ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>", rendered)
-        self.assertIn("<<<END_ZMEM_UNTRUSTED_FENCE_NEUTRALIZED>>>", rendered)
+        # Issue #511: the outer boundary is the per-render token marker
+        # (pinned to "evfence" above) — exactly one genuine pair — and the
+        # canonical literal never appears raw anywhere in the render.
+        self.assertEqual(rendered.count("<<<ZMEM_UNTRUSTED_FENCE:evfence>>>"), 1)
+        self.assertEqual(rendered.count("<<<END_ZMEM_UNTRUSTED_FENCE:evfence>>>"), 1)
+        self.assertNotIn("<<<ZMEM_UNTRUSTED_FENCE>>>", rendered)
+        self.assertNotIn("<<<END_ZMEM_UNTRUSTED_FENCE>>>", rendered)
+        # Stored fence-shaped text is ESCAPED at render (issue #511): the
+        # stored canonical delimiters ride with a broken leading "<<<"
+        # (U+27E8 x3) so they cannot alias this or any other render's
+        # boundary.
+        self.assertIn("\u27e8\u27e8\u27e8ZMEM_UNTRUSTED_FENCE>>>", rendered)
+        self.assertIn("\u27e8\u27e8\u27e8END_ZMEM_UNTRUSTED_FENCE>>>", rendered)
         self.assertNotIn(
             '"excerpt": "stored <<<ZMEM_UNTRUSTED_FENCE>>>', rendered
         )

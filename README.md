@@ -1854,8 +1854,10 @@ and whitespace values are preserved by the launcher and remain enabled.
 Recognized test/compile/lint runners receive their honest signal; arbitrary
 failures use `none` and prompt only after recurrence. Convention prompts fire
 once on an exact non-amend `git commit`, while eligible tool events continue
-feeding the operation ring. Complete `<<<ZMEM_UNTRUSTED_FENCE>>>` through
-`<<<END_ZMEM_UNTRUSTED_FENCE>>>` blocks are stripped before history projection.
+feeding the operation ring. Complete `<<<ZMEM_UNTRUSTED_FENCE>>>` blocks - and the per-render token form `<<<ZMEM_UNTRUSTED_FENCE:<token>>>` - through
+`<<<END_ZMEM_UNTRUSTED_FENCE>>>` (or its matching token form) are stripped before history projection.
+
+`ZMEM_FENCE_TOKEN` pins the per-render boundary token so fixtures and byte-parity checks are deterministic; a pin outside the shared `[0-9A-Za-z]{1,32}` grammar is ignored and a fresh token is minted.
 
 The global switch covers those five named capture surfaces. The pre-existing
 UserPromptSubmit correction queue and Hermes convention-compatibility cadence
