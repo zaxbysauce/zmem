@@ -2196,7 +2196,7 @@ def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
     # production open is the assertion's own read. A clean scan therefore
     # writes NOTHING (no stamp); the stamp rides an actual heal in the
     # same transaction. NULL norms are the post-stamp NULL lane's
-    # (_heal_null_content_norms_post_stamp, issue #527); this pass skips
+    # (_heal_content_norms_post_stamp, issue #527); this pass skips
     # them so raw-seeded NULL rows do not turn a read-only open into a
     # write. Consequence: a clean store re-verifies on every open
     # (read-only scan).
@@ -2435,11 +2435,15 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
     (content fetch + normalize per row) and writes NOTHING when no NULL and
     no stale row exists (the byte-identical contracts in
     tests/test_zero_write_passive.py and tests/test_t09_op_queue.py pin
-    that). Disclosed cost (issue #533 DoD, measured on a synthetic
-    50,000-row / 32.8 MB store, repro/measure_50k_cost.py): the combined
-    scan is ~372 ms versus a ~383 ms whole-migrate() steady state at HEAD —
-    roughly doubling the per-open cost at that scale; it replaces (not
-    adds to) the #527 NULL-only probe's scan.
+    that). Disclosed cost (issue #533 DoD; 50,000-row store, base vs head,
+    median of 5 opens, repro/measure_50k_cost.py and the final-critic
+    probe): UNSTAMPED stores rise from ~250 ms to ~431 ms per open (~1.7x —
+    and they now run two full scan+normalize passes, the 163 verification
+    plus this lane, until the 163 stamp lands on an actual heal); STAMPED
+    stores — the steady state this lane targets — rise from ~17 ms to
+    ~219 ms per open (~13x, about +200 ms per open; the old stamped open
+    was a meta read plus the #527 NULL-only probe, which this scan
+    replaces).
 
     Transaction discipline (mirrors _verify_content_norms_163): per-batch
     BEGIN IMMEDIATE on the own-transaction path / a uniquely named savepoint
@@ -3511,8 +3515,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     # backfill is gated on ver < 8 and never re-runs. One-time stamped
     # repair (the v8 batch shape) so an upgraded store heals on its next
     # open; the meta stamp keeps the steady state a single meta read —
-    # EXCEPT the post-stamp NULL lane below (issue #527), which probes for
-    # NULLs on every open (full-table scan; see its docstring).
+    # EXCEPT the combined post-stamp lane below (issues #527/#533), which
+    # scans every open (see its docstring for the disclosed cost).
     _repair_null_content_norm_162(conn)
 
     # Version-INDEPENDENT (issue #493 AC6): the NULL-only repair above
@@ -3532,9 +3536,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     # content_norm-keyed re-rank/fold window). This UNMARKED combined lane
     # scans every open and heals both shapes — no stamp can recreate the
     # gaps it closes. Steady-state cost disclosure (issue #533 DoD): the
-    # single combined scan measures ~372 ms at 50k rows / 32.8 MB vs a
-    # ~383 ms whole-migrate() steady state at HEAD (roughly doubling the
-    # per-open cost at that scale); zero writes on a clean store
+    # combined scan measures ~219 ms per stamped open at 50k rows (vs
+    # ~17 ms at base, ~13x — the pre-fix stamped open was a meta read plus
+    # the NULL-only probe) and ~431 ms per unstamped open (vs ~250 ms at
+    # base, ~1.7x, paying both the 163 pass and this lane until its stamp
+    # lands on an actual heal); zero writes on a clean store
     # (byte-identical contracts).
     _heal_content_norms_post_stamp(conn)
 

@@ -16,10 +16,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   window). The unmarked post-stamp lane from #527 now heals BOTH shapes —
   NULL and stale non-NULL — in one batched keyset scan with the same
   never-raise, zero-write-on-clean-stores, compare-and-update discipline,
-  and no new marker. Disclosed cost: the combined scan measures ~372 ms on
-  a 50k-row / 32.8 MB store versus a ~383 ms whole-open steady state at
-  HEAD — roughly doubling the per-open cost at that scale (it replaces,
-  not adds to, the NULL-only probe).
+  and no new marker. Disclosed cost (50k-row store, base vs head, median
+  of 5 opens): stamped stores rise from ~17 ms to ~219 ms per open (~13x —
+  the pre-fix stamped open was a meta read plus the NULL-only probe, which
+  this scan replaces); unstamped stores rise from ~250 ms to ~431 ms
+  (~1.7x, paying both the one-shot 163 verification and this lane until
+  its stamp lands on an actual heal).
 - **URL-scheme credential redaction is now linear on adversarial input**
   (issue #535). The legacy pattern
   `(?i:(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@` was
