@@ -2440,9 +2440,9 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
     Disclosed cost (issue #533 DoD). This lane reads and normalizes every
     row's content on every open, so its cost is O(total content bytes) — it
     scales with store CONTENT SIZE, not row count. The figures below are a
-    50,000-row store of ~70-char content (~30 MB), median of 5 opens, this
-    host (CI runners are faster; the redaction.py scanner work is separate
-    and unchanged):
+    50,000-row store at three content sizes, median of 5 opens, this host
+    (CI runners are faster; the redaction.py scanner work is separate and
+    unchanged):
 
         content/row     stamped (1 pass)    unstamped (2 passes)
         ~70 chars       ~300 ms             ~620 ms
@@ -2456,12 +2456,14 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
     STAMPED stores run one pass (the old stamped open was a meta read plus
     the #527 NULL-only probe this scan replaces). At the ~1.1 KB/row shape
     an unstamped 50k-row open is ~3 s; every hook recall opens the store
-    under the cross-process schema lock (SCHEMA_LOCK_WAIT_SECONDS, 15 s)
-    with an ~8 s store budget (store_recall_ms), so a large unstamped store
-    or several concurrent opens can approach those limits. The
-    full-scan-every-open design is out of this issue's scope (its Out line);
-    a follow-up tracks bounding or prefiltering the scan. Cost probe: the
-    #533 trace repro/measure_50k_cost.py.
+    under the cross-process schema lock (SCHEMA_LOCK_WAIT_SECONDS, 15 s),
+    which is held for the whole open, so concurrent unstamped opens queue
+    behind it: three ~1.1 KB/row unstamped opens serialize to ~8.8 s, past
+    the ~8 s store budget (store_recall_ms). The full-scan-every-open design
+    is out of this issue's scope (its Out line); reducing this cost by
+    bounding or prefiltering the scan is a proposed improvement, not yet
+    tracked. Cost probe: the #533 issue-trace artifact
+    (.agents/issue-traces/533-535-pr532-followups/repro/measure_50k_cost.py).
 
     Transaction discipline (mirrors _verify_content_norms_163): per-batch
     BEGIN IMMEDIATE on the own-transaction path / a uniquely named savepoint
@@ -3557,13 +3559,10 @@ def migrate(conn: sqlite3.Connection) -> None:
     # (#533) — was skipped by both forever (invisible or wrong in every
     # content_norm-keyed re-rank/fold window). This UNMARKED combined lane
     # scans every open and heals both shapes — no stamp can recreate the
-    # gaps it closes. Steady-state cost disclosure (issue #533 DoD): the
-    # combined scan measures ~219 ms per stamped open at 50k rows (vs
-    # ~17 ms at base, ~13x — the pre-fix stamped open was a meta read plus
-    # the NULL-only probe) and ~431 ms per unstamped open (vs ~250 ms at
-    # base, ~1.7x, paying both the 163 pass and this lane until its stamp
-    # lands on an actual heal); zero writes on a clean store
-    # (byte-identical contracts).
+    # gaps it closes. Cost disclosure (issue #533 DoD): this lane is
+    # O(total content bytes) and runs every open — see the measured
+    # byte-proportional table in the function docstring above; zero writes
+    # on a clean store (byte-identical contracts).
     _heal_content_norms_post_stamp(conn)
 
     # Version-INDEPENDENT (issue #137): additive belief-head side tables.

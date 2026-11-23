@@ -24,10 +24,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   UNSTAMPED stores (which includes every CLEAN store — the 163 stamp only
   rides an actual heal) run two full passes per open until a heal lands the
   stamp; stamped stores run one. At the ~1.1 KB/row shape an unstamped
-  50k-row open is ~3 s, and every hook recall opens under the ~15 s schema
-  lock with an ~8 s store budget, so a large unstamped store or several
-  concurrent opens can approach those limits. The full-scan-every-open
-  design is out of scope for this issue; a follow-up tracks bounding it.
+  50k-row open is ~3 s, and the schema lock (~15 s) is held for the whole
+  open, so concurrent unstamped opens queue behind it — three ~1.1 KB/row
+  unstamped opens serialize to ~8.8 s, past the ~8 s store budget. The
+  full-scan-every-open design is out of scope for this issue; reducing the
+  cost by bounding or prefiltering the scan is a proposed improvement, not
+  yet tracked.
 - **URL-scheme credential redaction is now linear on adversarial input**
   (issue #535). The legacy pattern
   `(?i:(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@` was
