@@ -3,12 +3,13 @@ raw external sqlite3 writer AFTER the content_norm_verify_163 stamp must
 heal to the canonical normalize of its own content by the end of the next
 open.
 
-Model lane (issue #527, landed): _heal_null_content_norms_post_stamp heals
-the NULL shape on every open, with deliberately no marker of its own. The
-non-NULL sibling shape is NOT covered: _verify_content_norms_163
-early-returns once its one-time stamp exists, so a stale non-NULL norm
-inserted after the stamp survives every reopen — permanently wrong for
-every content_norm-keyed dedup/re-rank window (the #486 ingest contract).
+Combined lane (issues #527 + #533): _heal_content_norms_post_stamp heals
+BOTH the NULL shape (#527) and the STALE non-NULL shape (#533) on every
+open, with deliberately no marker of its own. The non-NULL shape was the
+gap this test pins: _verify_content_norms_163 early-returns once its
+one-time stamp exists, so a stale non-NULL norm inserted after the stamp
+would otherwise survive every reopen — permanently wrong for every
+content_norm-keyed dedup/re-rank window (the #486 ingest contract).
 
 Second pin (green at base, must stay green): a clean store's open writes
 NOTHING — after init_db+migrate has settled, one more migrate leaves the

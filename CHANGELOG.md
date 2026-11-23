@@ -16,12 +16,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   window). The unmarked post-stamp lane from #527 now heals BOTH shapes —
   NULL and stale non-NULL — in one batched keyset scan with the same
   never-raise, zero-write-on-clean-stores, compare-and-update discipline,
-  and no new marker. Disclosed cost (50k-row store, base vs head, median
-  of 5 opens): stamped stores rise from ~17 ms to ~219 ms per open (~13x —
-  the pre-fix stamped open was a meta read plus the NULL-only probe, which
-  this scan replaces); unstamped stores rise from ~250 ms to ~431 ms
-  (~1.7x, paying both the one-shot 163 verification and this lane until
-  its stamp lands on an actual heal).
+  and no new marker. Disclosed cost — the scan reads and normalizes every
+  row's content on every open, so it is O(total content bytes) and scales
+  with store CONTENT SIZE, not row count. At 50k rows, median of 5 opens
+  (this host; CI is faster): stamped ~300 ms / unstamped ~620 ms for ~70-char
+  content, ~760 ms / ~1.56 s for ~500-char, ~1.43 s / ~2.92 s for ~1.1 KB.
+  UNSTAMPED stores (which includes every CLEAN store — the 163 stamp only
+  rides an actual heal) run two full passes per open until a heal lands the
+  stamp; stamped stores run one. At the ~1.1 KB/row shape an unstamped
+  50k-row open is ~3 s, and every hook recall opens under the ~15 s schema
+  lock with an ~8 s store budget, so a large unstamped store or several
+  concurrent opens can approach those limits. The full-scan-every-open
+  design is out of scope for this issue; a follow-up tracks bounding it.
 - **URL-scheme credential redaction is now linear on adversarial input**
   (issue #535). The legacy pattern
   `(?i:(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@` was

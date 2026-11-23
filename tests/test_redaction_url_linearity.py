@@ -14,9 +14,12 @@ Coverage (plan-critic rounds 1-4 inventory):
 - positions mapping through _redact_secret_like_text_with_positions for
   prefix/password/suffix positions, multiple URLs, earlier-pattern length
   deltas, and already-marker no-ops;
-- a linearity smoke: adversarial shapes at reduced sizes with bounds a
-  quadratic regression would exceed by >10x while linear behavior sits
-  <1/10 of them (no flaky CI timing).
+- a linearity smoke: three adversarial no-terminating-`@` shapes sized so a
+  quadratic regression exceeds the bound by >=8x even on a fast CI runner,
+  while linear behavior sits <1/10 of the bound (no flaky CI timing). The
+  two `@`-terminated shapes were dropped — a trailing `@` ends the password
+  scan immediately, so the legacy quadratic regex clears them too and they
+  did not guard against a regression.
 
 Run: python -X utf8 tests/test_redaction_url_linearity.py  (no pytest required)
 """
@@ -221,9 +224,12 @@ class PositionsMappingTest(unittest.TestCase):
 
 class LinearitySmokeTest(unittest.TestCase):
     """Reduced-size timing smoke: bounds a quadratic regression would
-    exceed by >10x while linear behavior sits <1/10 of them. The frozen
-    C2 check drives the full-cap shapes; this guards the shipped pipeline
-    in CI without a flaky wall-clock."""
+    exceed by >=8x even on a fast CI runner while linear behavior sits
+    <1/10 of the bound. The frozen C2 check drives the full-cap shapes;
+    this guards the shipped pipeline in CI without a flaky wall-clock.
+    Only no-terminating-`@` shapes are included: an `@` ends the password
+    scan immediately, so `@`-terminated shapes do not exercise the
+    quadratic path and pass under the legacy regex too."""
 
     BOUND_S = 0.5
 
@@ -238,10 +244,10 @@ class LinearitySmokeTest(unittest.TestCase):
             % (len(text), elapsed))
 
     def test_dot_alternating(self):
-        self._assert_linear("a." * 8192)
+        self._assert_linear("a." * 16384)
 
     def test_scheme_chain_no_at(self):
-        self._assert_linear("x://u:" * 4096)
+        self._assert_linear("x://u:" * 8192)
 
     def test_scheme_chain_discriminates_the_barrier_memo(self):
         # A memo-less scan (the barrier check disabled) measures ~2.2s at
@@ -257,12 +263,6 @@ class LinearitySmokeTest(unittest.TestCase):
             "barrier-memo regression: 60k-char scheme chain took %.3fs "
             "(memo'd scanner is single-digit ms; the memo-less mutant "
             "measures ~2.2s here)" % elapsed)
-
-    def test_scheme_chain_terminal_at(self):
-        self._assert_linear("x://u:" * 4096 + "@")
-
-    def test_mixed_at(self):
-        self._assert_linear("x://u:" * 2048 + "@" + "x://u:" * 2048)
 
 
 def tearDownModule():

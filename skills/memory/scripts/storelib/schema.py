@@ -2435,15 +2435,33 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
     (content fetch + normalize per row) and writes NOTHING when no NULL and
     no stale row exists (the byte-identical contracts in
     tests/test_zero_write_passive.py and tests/test_t09_op_queue.py pin
-    that). Disclosed cost (issue #533 DoD; 50,000-row store, base vs head,
-    median of 5 opens, repro/measure_50k_cost.py and the final-critic
-    probe): UNSTAMPED stores rise from ~250 ms to ~431 ms per open (~1.7x —
-    and they now run two full scan+normalize passes, the 163 verification
-    plus this lane, until the 163 stamp lands on an actual heal); STAMPED
-    stores — the steady state this lane targets — rise from ~17 ms to
-    ~219 ms per open (~13x, about +200 ms per open; the old stamped open
-    was a meta read plus the #527 NULL-only probe, which this scan
-    replaces).
+    that).
+
+    Disclosed cost (issue #533 DoD). This lane reads and normalizes every
+    row's content on every open, so its cost is O(total content bytes) — it
+    scales with store CONTENT SIZE, not row count. The figures below are a
+    50,000-row store of ~70-char content (~30 MB), median of 5 opens, this
+    host (CI runners are faster; the redaction.py scanner work is separate
+    and unchanged):
+
+        content/row     stamped (1 pass)    unstamped (2 passes)
+        ~70 chars       ~300 ms             ~620 ms
+        ~500 chars      ~760 ms             ~1,560 ms
+        ~1,100 chars    ~1,430 ms           ~2,920 ms
+
+    UNSTAMPED stores run TWO full scan+normalize passes per open (the 163
+    verification plus this lane) — and every CLEAN store is unstamped,
+    because the 163 stamp only rides an actual heal, so the unstamped
+    two-pass case is the common steady state until a heal lands the stamp.
+    STAMPED stores run one pass (the old stamped open was a meta read plus
+    the #527 NULL-only probe this scan replaces). At the ~1.1 KB/row shape
+    an unstamped 50k-row open is ~3 s; every hook recall opens the store
+    under the cross-process schema lock (SCHEMA_LOCK_WAIT_SECONDS, 15 s)
+    with an ~8 s store budget (store_recall_ms), so a large unstamped store
+    or several concurrent opens can approach those limits. The
+    full-scan-every-open design is out of this issue's scope (its Out line);
+    a follow-up tracks bounding or prefiltering the scan. Cost probe: the
+    #533 trace repro/measure_50k_cost.py.
 
     Transaction discipline (mirrors _verify_content_norms_163): per-batch
     BEGIN IMMEDIATE on the own-transaction path / a uniquely named savepoint
@@ -2536,8 +2554,12 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
         # only rows whose content is verifiable text; a NULL norm wants the
         # canonical value, a non-NULL norm that differs from the canonical
         # normalize of its own content wants the same canonical value. An
-        # UNDECODABLE non-NULL norm is OUTSIDE the contract (163-pass skip
-        # semantics) — skipped, never conflated with SQL NULL.
+        # UNDECODABLE non-NULL norm (invalid UTF-8 bytes, e.g. a raw writer
+        # storing X'fffe') is SKIPPED here — never conflated with SQL NULL —
+        # as a known post-stamp gap: the 163 pass heals this shape on an
+        # UNSTAMPED store (it compares the content's canonical norm), but
+        # once the 163 stamp exists this lane is the only post-stamp healer
+        # and it cannot decode the norm. Tracked for a follow-up.
         candidates = []
         for r in rows:
             text = _norm_text(r[1])
