@@ -1187,6 +1187,93 @@ class RescueCountScopeTests(unittest.TestCase):
         self.assertNotIn("nightly", dest[0]["subject"])
         self.assertNotIn("barn", dest[0]["subject"])
 
+    def test_credential_withheld_rescued_row_not_counted(self):
+        # Issue #530 AC7 withheld leg (swarm-pr-review BL-B-sec-001 /
+        # ML2-privacy-observability-001, critic-prescribed): a rescued row
+        # that _withhold_credential_rows reduces to an id-preserving stub
+        # is NOT counted in attribute_rescued, while the same row without
+        # the credential shape counts 1. Drives the seam directly with the
+        # measured lane set to the rescue window (the seam consumes the
+        # caller-attached lanes exactly as the impl produces them).
+        import storelib.recall as recall_mod
+
+        def _row(content):
+            return {"id": "rc-" + uuid.uuid4().hex[:8], "type": "fact",
+                    "confidence": 0.9, "signal": "test", "namespace": NS,
+                    "content": content, "_rel_lex": 0.28}
+
+        clean = _row("Harbor master Lyle approves every Kennet shipment.")
+        cred = _row("Harbor master Lyle approves every Kennet shipment. "
+                    "token AKIAIOSFODNN7EXAMPLE in body")
+        env, _surface = recall_mod._recall_injection_details(
+            [dict(cred)], omitted=0, exclude_ids=None, arms={},
+            injection_risk=0, budget_tokens=1500,
+            namespace=NS, query="Who approves?", moment="user_prompt")
+        self.assertEqual(env.get("attribute_rescued"), 0,
+                         "a credential-withheld rescued stub was counted "
+                         "as delivered (AC7 delivered-only)")
+        stubs = [r for r in (env.get("results") or [])
+                 if r.get("withheld_for_secret")]
+        self.assertTrue(stubs, "the withheld stub did not survive to the "
+                               "delivered set (fixture drift)")
+        env_clean, _surface = recall_mod._recall_injection_details(
+            [dict(clean)], omitted=0, exclude_ids=None, arms={},
+            injection_risk=0, budget_tokens=1500,
+            namespace=NS, query="Who approves?", moment="user_prompt")
+        self.assertEqual(env_clean.get("attribute_rescued"), 1,
+                         "the non-credential control lost its rescue count")
+
+
+class ExplainMomentGateTests(unittest.TestCase):
+    """Issue #530 AC4 explain mirror (swarm-pr-review ML1-1, critic
+    upheld): explain_recall gains `moment` (programmatic callers only;
+    the CLI explain route cannot carry a moment and keeps its historic
+    user-prompt behavior), and its injection mirror applies the SAME
+    moment allow-list as the live seam — a declared pretool moment
+    produces no attribute drop."""
+
+    ROW = "The parcel goes to Rowan Dock."
+    CONFLICT = "This parcel goes to Pine Crossing."
+
+    def test_explain_pretool_moment_refuses_partition(self):
+        from storelib import connect
+        rid = _add(self.ROW, "parcel")
+        try:
+            conn = connect()
+            try:
+                env_pretool = recall_mod_explain(conn, self.CONFLICT,
+                                             "pretool")
+                env_user = recall_mod_explain(conn, self.CONFLICT,
+                                              "user_prompt")
+                env_default = recall_mod_explain(conn, self.CONFLICT, None)
+            finally:
+                conn.close()
+            # The explain envelope carries the partition through its
+            # verdict: with the pool partition-dropped the reason is
+            # below-relevance; with the parse refused the row delivers.
+            self.assertEqual(env_pretool.get("reason"), "injected",
+                             "pretool explain still parsed assertions")
+            self.assertEqual(env_user.get("reason"), "below-relevance",
+                             "user_prompt explain lost the documented drop")
+            self.assertEqual(env_default.get("reason"), "below-relevance",
+                             "the historic no-moment explain behavior "
+                             "changed")
+        finally:
+            _cli("update", "--id", rid, "--content", self.ROW, "--json")
+
+
+def recall_mod_explain(conn, query, moment):
+    import json as _json
+    import io as _io
+    import contextlib as _contextlib
+    from storelib import recall as recall_mod
+    buf = _io.StringIO()
+    with _contextlib.redirect_stdout(buf):
+        recall_mod.explain_recall(conn, query=query, namespace=NS,
+                                  as_json=True, for_injection=True,
+                                  moment=moment)
+    return _json.loads(buf.getvalue())
+
 
 class AnaphoraScopeTests(unittest.TestCase):
     """Issue #530 AC6: non-initial anaphor binds the focus; two questions

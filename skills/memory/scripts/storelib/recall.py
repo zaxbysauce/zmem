@@ -3476,8 +3476,9 @@ def _recall_injection_details(
     if pa_drops or pa_rescue:
         details["attribute_dropped"] = len(pa_drops)
         details["attribute_drop_labels"] = dict(pa_drops)
-        rescued_delivered = sum(1 for r in selected_rows
-                                if r.get("id") in pa_rescue)
+        rescued_delivered = sum(
+            1 for r in selected_rows
+            if r.get("id") in pa_rescue and not r.get("withheld_for_secret"))
         details["attribute_rescued"] = rescued_delivered
     # Issue #256 (F-267-2): the no-session --for-injection envelope reports
     # the withhold too — keyed only when it happened, so every zero-withhold
@@ -4884,6 +4885,7 @@ def explain_recall(
     weights: dict | None = None,
     cross_rerank: bool = False,
     for_injection: bool = False,
+    moment: str | None = None,
 ) -> list[dict]:
     """Read-only retrieval debugger behind `recall --explain` (issue #82).
 
@@ -5042,7 +5044,15 @@ def explain_recall(
             # live seam runs, from the same query — candidate_ids/
             # candidate_lanes keep their PRE-partition identity (the maps
             # below iterate the untouched injection_candidate_rows list).
-            _pa_frame = analyze_prompt(query) if query else None
+            # Issue #530 AC4: the mirror is moment-gated by the SAME
+            # allow-list as the live seam via the explicit `moment`
+            # parameter (programmatic callers only — the CLI explain route
+            # cannot carry a moment and keeps its historic user-prompt
+            # behavior, plan AC4).
+            _pa_frame = (analyze_prompt(query)
+                         if (query and moment in ("user_prompt", "subagent",
+                                                  None))
+                         else None)
             pa_drops: dict = {}
             pa_survivors = injection_candidate_rows
             if _pa_frame is not None:
