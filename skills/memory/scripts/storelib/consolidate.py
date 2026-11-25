@@ -1375,8 +1375,15 @@ def consolidate(
             fresh = _refresh_live_row(conn, nb["id"])
             if fresh is not None:
                 # Same stale-decision rule for neighbours, against the
-                # working-set row this run selected them from.
-                if any(fresh[f] != nb[f] for f in _DECISION_FIELDS):
+                # working-set row this run selected them from. The gathered
+                # row's projection varies by gather path (the lexical path
+                # projects the full working-set column list; the vec0 KNN
+                # path projects fewer), so compare the decision fields the
+                # gathered row CARRIES — the fields it does not carry cannot
+                # drift against their run-start values because this run
+                # never read them.
+                _nb_fields = tuple(f for f in _DECISION_FIELDS if f in nb.keys())
+                if any(fresh[f] != nb[f] for f in _nb_fields):
                     print(f"[zmem] consolidate: neighbour [{nb['id'][:8]}] "
                           f"changed on a decision field since this run's "
                           f"selection; absorb refused, row left as it is",

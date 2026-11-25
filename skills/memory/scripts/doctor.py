@@ -3822,8 +3822,11 @@ V9_COLUMNS = ("valid_until", "update_of", "taint")
 # fail) on purpose: every comparable derived-data check in doctor grades a
 # degraded store as warn, and only fail flips report.ok and the exit code.
 # When the probe itself cannot run (a shadow table missing, or a SQLite
-# error) the check is fail with the error and the repair, matching the fts
-# lane's existing error grade for that state.
+# error) the check reports the state with the repair hint and grades it
+# warn: every comparable derived-data check grades a degraded store as warn
+# (only fail flips report.ok and the exit code), so a hand-built or pre-FTS
+# store stays exit 0 — the schema-version check owns "this store is too
+# old".
 def _check_fts_index(resolved_store: Path) -> dict:
     """Compare memory rowids with memory_fts_docsize rowids (read-only)."""
     conn = _open_store_ro(resolved_store)
@@ -3845,7 +3848,7 @@ def _check_fts_index(resolved_store: Path) -> dict:
         if "memory_fts_docsize" not in names:
             return _check(
                 "fts-index",
-                "fail",
+                "warn",
                 "Full-text index is missing its memory_fts_docsize shadow "
                 "table; run `store.py rebuild-fts` (or open the store once "
                 "with any writable command) to rebuild it.",
@@ -3859,7 +3862,7 @@ def _check_fts_index(resolved_store: Path) -> dict:
     except Exception as exc:
         return _check(
             "fts-index",
-            "fail",
+            "warn",
             f"Could not compare memory rows with the full-text index: "
             f"{type(exc).__name__}: {exc}; run `store.py rebuild-fts`.",
             repair="rebuild-fts",

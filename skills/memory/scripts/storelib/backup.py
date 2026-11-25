@@ -1020,6 +1020,16 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
         v2 = _stamp_sidecar_free(Path(from_path).expanduser())
         if v2 is None:
             _read_schema_version(Path(from_path).expanduser())
+        # The stamp-policy half of the old preflight (issue #504 step 1):
+        # _read_schema_version also ran _schema_compat on every readable
+        # stamp — the newer-destination refusal (exit 2, destination
+        # untouched) lives there. The sidecar-free read must run the SAME
+        # gate on the stamps it read.
+        from storelib.schema import _schema_compat as _compat
+        if v is not None:
+            _compat(v, dest)
+        if v2 is not None:
+            _compat(v2, Path(from_path).expanduser())
     except RuntimeError as e:
         print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
         return 2

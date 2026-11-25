@@ -459,7 +459,13 @@ class CliJsonTest(unittest.TestCase):
         empty, and the exit code is nonzero (reviewer finding #3)."""
         conn = self.mod.connect()
         try:
-            conn.execute("DROP TABLE meta")  # cadence-gate query raises mid-run
+            # Issue #506 note: this test originally dropped `meta`, which
+            # raised only because the v3 migration then crashed on
+            # `duplicate column name` (the #506 defect itself). The column
+            # guards fix that crash, so the injection now drops a table the
+            # working-set query genuinely requires — the exception still
+            # fires inside consolidate(), after the JSON redirect is armed.
+            conn.execute("DROP TABLE memory")  # working-set query raises mid-run
             conn.commit()
         finally:
             conn.close()
