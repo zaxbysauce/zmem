@@ -82,10 +82,10 @@ def _cli(*args, timeout=180):
         env=env)
 
 
-def _add(content, tags, type_="fact"):
-    r = _cli("add", "--namespace", NS, "--type", type_, "--content", content,
-             "--tags", tags, "--signal", "test", "--confidence", "0.9",
-             "--json")
+def _add(content, tags, type_="fact", namespace=NS):
+    r = _cli("add", "--namespace", namespace, "--type", type_, "--content",
+             content, "--tags", tags, "--signal", "test", "--confidence",
+             "0.9", "--json")
     if r.returncode != 0:
         raise RuntimeError("seed failed: " + r.stderr[-200:])
     return json.loads(r.stdout).get("id")
@@ -705,10 +705,11 @@ class QualifiedFactOrderingTests(unittest.TestCase):
         self.assertEqual(drops.get("d"), "conflict")
 
     def test_multi_focus_orthogonal_guard(self):
-        # TEST-009 (parallel review): the ORTHOGONAL drop requires EXACTLY
-        # ONE focus — a destination-only fact is NOT dropped under a
-        # two-question prompt (the single-focus arm drops it, pinning the
-        # len(foci)==1 guard at the partition).
+        # Issue #530 AC1 (the NOTE authorizes revising TEST-009): the
+        # ORTHOGONAL drop no longer exempts multi-focus prompts — under a
+        # two-question prompt a destination-only fact (asserting none of the
+        # asked attributes) IS dropped orthogonal, exactly as under one
+        # focus.
         two_focus = inject.analyze_prompt(
             "What does the Kennet unsealed parcel cost? "
             "How often is it audited?")
@@ -718,8 +719,9 @@ class QualifiedFactOrderingTests(unittest.TestCase):
              "content": "Kennet policy sends unsealed parcels to Rowan "
                         "Dock."},
         ])
-        self.assertNotIn("d2", drops,
-                         "multi-focus ORTHOGONAL guard lost (len==1 pin)")
+        self.assertEqual(drops.get("d2"), "orthogonal",
+                         "multi-focus arm lost the ORTHOGONAL drop "
+                         "(issue #530 AC1 revises the len==1 pin)")
         one_focus = inject.analyze_prompt(
             "What does the Kennet unsealed parcel cost?")
         drops1, _ = inject.partition_prompt_assertions(one_focus, [
@@ -812,6 +814,421 @@ class VerifierRealLaneTests(unittest.TestCase):
                 conn=connect(), candidate_ids=env.get("candidate_ids"),
                 candidate_lanes=env.get("candidate_lanes"),
                 executed_query=self.QUERY)
+
+
+class MultiFocusPartitionTests(unittest.TestCase):
+    """Issue #530 AC1: the ORTHOGONAL drop applies under multi-focus prompts
+    (the len(foci)==1 exemption the issue deliberately revises). A
+    destination-only fact asserting none of the asked attributes drops
+    orthogonal under a two-question prompt, exactly as under one; a fact
+    answering an ASKED attribute is kept; the single-focus control stays."""
+
+    TWO_FOCUS = "What does the Kennet unsealed parcel cost? Who owns it?"
+
+    def test_destination_only_dropped_under_two_focus(self):
+        frame = inject.analyze_prompt(self.TWO_FOCUS)
+        self.assertEqual(len(frame["foci"]), 2)
+        drops, survivors = inject.partition_prompt_assertions(frame, [
+            {"id": "d", "type": "fact",
+             "content": "The Kennet unsealed parcel is sent to Rowan Dock."}])
+        self.assertEqual(drops.get("d"), "orthogonal")
+        self.assertNotIn("d", [r["id"] for r in survivors])
+
+    def test_asked_attribute_fact_kept_under_two_focus(self):
+        frame = inject.analyze_prompt(self.TWO_FOCUS)
+        drops, survivors = inject.partition_prompt_assertions(frame, [
+            {"id": "b", "type": "fact",
+             "content": "The Kennet unsealed parcel is owned by Dana "
+                        "Reyes."}])
+        self.assertNotIn("b", drops)
+        self.assertIn("b", [r["id"] for r in survivors])
+
+    def test_mixed_prompt_answering_row_survives(self):
+        # Final-critic round: "asked" is EVERY relation any question asks
+        # about — a mixed prompt (cost + destination) must not drop the
+        # fact that answers its destination question (base dropped nothing
+        # here; the len==1 guard spared mixed prompts).
+        frame = inject.analyze_prompt(
+            "What does the Kennet unsealed parcel cost? "
+            "Where is the Kennet unsealed parcel sent?")
+        self.assertEqual({f["relation"] for f in frame["foci"]},
+                         {"cost", "destination"})
+        drops, survivors = inject.partition_prompt_assertions(frame, [
+            {"id": "d", "type": "fact",
+             "content": "The Kennet unsealed parcel is sent to Rowan "
+                        "Dock."}])
+        self.assertNotIn("d", drops)
+        self.assertIn("d", [r["id"] for r in survivors])
+
+    def test_mixed_approver_cost_answering_row_survives(self):
+        # The AC6 two-foci prompt shape must not drop its approver answer.
+        frame = inject.analyze_prompt(
+            "Who approves the Kennet unsealed parcel and what does it "
+            "cost?")
+        drops, survivors = inject.partition_prompt_assertions(frame, [
+            {"id": "a", "type": "fact",
+             "content": "The Kennet unsealed parcel is approved by Mara "
+                        "Vale."}])
+        self.assertNotIn("a", drops)
+        self.assertIn("a", [r["id"] for r in survivors])
+
+    def test_mixed_prompt_unanswering_row_still_drops(self):
+        # A row that answers NEITHER question of a mixed unsupported+
+        # supported prompt still drops orthogonal (the subject-compatible
+        # unasked assertion under an unsupported focus).
+        frame = inject.analyze_prompt(
+            "Who approves the Kennet unsealed parcel and what does it "
+            "cost?")
+        drops, _ = inject.partition_prompt_assertions(frame, [
+            {"id": "d", "type": "fact",
+             "content": "The Kennet unsealed parcel is sent to Rowan "
+                        "Dock."}])
+        self.assertEqual(drops.get("d"), "orthogonal")
+
+    def test_single_focus_control_still_drops(self):
+        frame = inject.analyze_prompt(
+            "What does the Kennet unsealed parcel cost?")
+        drops, _ = inject.partition_prompt_assertions(frame, [
+            {"id": "d", "type": "fact",
+             "content": "The Kennet unsealed parcel is sent to Rowan Dock."}])
+        self.assertEqual(drops.get("d"), "orthogonal")
+
+
+class SentenceScopedNegationTests(unittest.TestCase):
+    """Issue #530 AC2: negation/hypothetical gating is scoped to the cue
+    match's own sentence under credible boundaries. A negator in one
+    sentence never erases another sentence's assertion; newlines,
+    semicolons and abbreviations never draw boundaries (the base parser's
+    behavior is preserved on every shape the boundary rules refuse)."""
+
+    PROMPT = "This Kennet unsealed parcel goes to Pine Crossing."
+
+    def test_unrelated_negator_still_conflict_drops(self):
+        frame = inject.analyze_prompt(self.PROMPT)
+        drops, survivors = inject.partition_prompt_assertions(frame, [
+            {"id": "a", "type": "fact",
+             "content": ("Do not ship on Fridays. Kennet policy sends "
+                         "unsealed parcels to Rowan Dock.")}])
+        self.assertEqual(drops.get("a"), "conflict")
+        self.assertNotIn("a", [r["id"] for r in survivors])
+
+    def test_in_sentence_negator_not_dropped(self):
+        frame = inject.analyze_prompt(self.PROMPT)
+        drops, survivors = inject.partition_prompt_assertions(frame, [
+            {"id": "b", "type": "fact",
+             "content": ("Kennet policy does not send unsealed parcels to "
+                         "Rowan Dock.")}])
+        self.assertNotIn("b", drops)
+        self.assertIn("b", [r["id"] for r in survivors])
+
+    def test_abbreviation_does_not_draw_boundary(self):
+        # T3/T2: "e.g." between a hypothetical marker and a cue never
+        # splits, so the hypothetical gate still covers the statement.
+        self.assertEqual(
+            inject.parse_row_assertions(
+                "If the harbor floods, e.g. Kennet parcels go to Rowan "
+                "Dock."),
+            [])
+
+    def test_newline_does_not_draw_boundary(self):
+        # A hard-wrapped statement is ONE statement: the subject keeps the
+        # pre-wrap terms, so the row still conflict-drops.
+        frame = inject.analyze_prompt(self.PROMPT)
+        drops, _ = inject.partition_prompt_assertions(frame, [
+            {"id": "n", "type": "fact",
+             "content": "Kennet unsealed parcels\ngo to Rowan Dock."}])
+        self.assertEqual(drops.get("n"), "conflict")
+
+    def test_semicolon_does_not_draw_boundary(self):
+        frame = inject.analyze_prompt(self.PROMPT)
+        drops, _ = inject.partition_prompt_assertions(frame, [
+            {"id": "s", "type": "fact",
+             "content": "Kennet unsealed parcels; they go to Rowan Dock."}])
+        self.assertEqual(drops.get("s"), "conflict")
+
+    def test_real_boundary_asserts_second_statement(self):
+        # The affirmative twin: after a REAL boundary (upper-case follower),
+        # the second statement asserts and conflict-drops on its own.
+        frame = inject.analyze_prompt(self.PROMPT)
+        drops, _ = inject.partition_prompt_assertions(frame, [
+            {"id": "r", "type": "fact",
+             "content": ("Do not ship on Fridays. Kennet policy sends "
+                         "unsealed parcels to Rowan Dock.")}])
+        self.assertEqual(drops.get("r"), "conflict")
+
+
+class _CliEnvWire:
+    """The no-session ``--for-injection --json`` CLI wire with per-call env
+    overrides (the wire on which the attribute_* diagnostics are emitted)."""
+
+    @staticmethod
+    def recall(query, moment=None, extra_env=None, session_suffix="",
+               lane="codex", direct=False, namespace=None):
+        """moment=None + direct=True gives the NO-SESSION direct wire (no
+        --session-id/--moment), the only wire that carries the attribute_*
+        diagnostics; the closed session selector envelope rebuilds the key
+        set without them."""
+        env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
+        env.update({
+            "ZMEM_STORE": os.environ["ZMEM_STORE"],
+            "ZMEM_DATA": os.environ["ZMEM_DATA"],
+            "ZMEM_INJECT": "1",
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_MODELS_DIR": str(_EMPTY),
+            "HOME": str(_HOME),
+            "USERPROFILE": str(_HOME),
+        })
+        env.update(extra_env or {})
+        sid = "pa530-" + uuid.uuid4().hex[:10] + session_suffix
+        argv = [sys.executable, str(STORE_PY), "recall", "--query", query,
+                "--namespace", namespace or NS, "--limit", "5",
+                "--include-global", "--global-limit", "3", "--no-bump",
+                "--for-injection", "--json"]
+        if not direct:
+            argv += ["--session-id=" + sid, "--moment", moment,
+                     "--lane", lane]
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=180, cwd=str(REPO_ROOT), env=env)
+        if r.returncode != 0:
+            raise RuntimeError("recall failed: " + r.stderr[-200:])
+        return json.loads(r.stdout)
+
+
+class ToolMomentGateTests(unittest.TestCase):
+    """Issue #530 AC4: the admission seam parses prompt assertions only on
+    the documented moments (user_prompt, subagent) and None (historic
+    callers); the pretool moment — whose query is agent-authored TOOL text —
+    is refused by the allow-list, so tool text cannot suppress a stored
+    fact; a user_prompt sentence still suppresses it."""
+
+    QUERY_TOOL = 'git commit -m "send the parcel to Pine Crossing"'
+    QUERY_CONFLICT = "This parcel goes to Pine Crossing."
+    QUERY_NEUTRAL = "the parcel lane"
+    ROW = "The parcel goes to Rowan Dock."
+
+    def test_pretool_tool_text_does_not_suppress(self):
+        rid = _add(self.ROW, "parcel")
+        try:
+            env_tool = _CliEnvWire.recall(self.QUERY_TOOL, "pretool",
+                                          session_suffix="-tool")
+            env_user = _CliEnvWire.recall(self.QUERY_CONFLICT, "user_prompt",
+                                          session_suffix="-user")
+            env_neutral = _CliEnvWire.recall(self.QUERY_NEUTRAL, "pretool",
+                                             session_suffix="-neutral")
+            ids_tool = [r["id"] for r in (env_tool.get("results") or [])]
+            ids_user = [r["id"] for r in (env_user.get("results") or [])]
+            ids_neutral = [r["id"] for r in (env_neutral.get("results") or [])]
+            self.assertIn(rid, ids_tool,
+                          "tool text on pretool suppressed the row")
+            self.assertNotIn(rid, ids_user,
+                             "user_prompt conflict sentence lost its drop")
+            self.assertIn(rid, ids_neutral,
+                          "neutral pretool query no longer delivers")
+        finally:
+            _cli("update", "--id", rid, "--content", self.ROW, "--json")
+
+    def test_user_prompt_conflict_suppresses(self):
+        rid = _add(self.ROW, "parcel")
+        try:
+            env = _CliEnvWire.recall(self.QUERY_CONFLICT, "user_prompt",
+                                     session_suffix="-user2")
+            ids = [r["id"] for r in (env.get("results") or [])]
+            self.assertNotIn(rid, ids)
+        finally:
+            _cli("update", "--id", rid, "--content", self.ROW, "--json")
+
+
+class FallbackLanePartitionTests(unittest.TestCase):
+    """Issue #530 AC3: the bridged zero-hit fallback applies the same
+    prompt-assertion partition as the query lane — a parked task text that
+    conflict-drops a stored fact on the query lane cannot resurface through
+    the recent-lane fallback; a non-conflicting parked text still delivers
+    through the same fallback."""
+
+    NS_FB = "project:pa530-fallback"
+    ROW = "Kennet policy sends unsealed parcels to Rowan Dock."
+    CONFLICT = "This Kennet unsealed parcel is being sent to Pine Crossing."
+    NEUTRAL = "Summarize the quarterly ledger reconciliation notes."
+
+    def _park_and_pull(self, task_text, sid):
+        # Run park + selector pull in a CHILD process with its own env pin:
+        # the in-process selector leg proved order-sensitive under the
+        # module's shared process state (empty-pool on a namespace that the
+        # CLI had just seeded), while the identical child-process drive
+        # delivers — the same shape the production hook uses.
+        child = r"""
+import json, os, sys
+from storelib import connect, inject
+import storelib.delivery_ledger as dl
+sid = sys.argv[1]
+task_text = sys.argv[2]
+ns = sys.argv[3]
+data_dir = inject._injection_data_dir(None)
+dl.park_task_text(data_dir, sid, task_text)
+conn = connect()
+try:
+    env = inject.select_and_budget_for_injection(
+        conn, query="", namespace=ns, moment="subagent",
+        session_id=sid, lane="zcode", limit=5, budget_tokens=1500,
+        no_telemetry=True, consume_tasktext=True)
+finally:
+    conn.close()
+print(json.dumps({"reason": env.get("reason"),
+                  "results": [r.get("id") for r in env.get("results") or []]}))
+"""
+        env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
+        env.update({
+            "ZMEM_STORE": os.environ["ZMEM_STORE"],
+            "ZMEM_DATA": os.environ["ZMEM_DATA"],
+            "ZMEM_MODEL_AUTODOWNLOAD": "0",
+            "ZMEM_MODELS_DIR": str(_EMPTY),
+            "HOME": str(_HOME),
+            "USERPROFILE": str(_HOME),
+            "PYTHONUTF8": "1",
+            "PYTHONPATH": str(SCRIPTS),
+        })
+        r = subprocess.run(
+            [sys.executable, "-c", child, sid, task_text, self.NS_FB],
+            capture_output=True, text=True, timeout=180, cwd=str(REPO_ROOT),
+            env=env)
+        if r.returncode != 0:
+            raise RuntimeError("selector pull failed: " + r.stderr[-200:])
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_partition_dropped_row_not_delivered_by_fallback(self):
+        rid = _add(self.ROW, "kennet", namespace=self.NS_FB)
+        try:
+            # Provenance: the query lane with this task text drops the row.
+            # Direct wire: the only wire that carries attribute_drop_labels.
+            wire = _CliEnvWire.recall(self.CONFLICT, direct=True,
+                                      namespace=self.NS_FB,
+                                      session_suffix="-prov")
+            self.assertIn(rid, wire.get("attribute_drop_labels") or {},
+                          "fixture drift: the query lane no longer drops")
+            env = self._park_and_pull(self.CONFLICT,
+                                      "pa530-fb-" + uuid.uuid4().hex[:8])
+            ids = env.get("results") or []   # child prints id strings
+            self.assertNotIn(rid, ids,
+                             "fallback delivered the partition-dropped row")
+            # Availability control, same namespace and store: a NEUTRAL
+            # parked text on a fresh session delivers the SAME row through
+            # the SAME fallback, proving the non-delivery above is the
+            # partition (not pool absence).
+            avail = self._park_and_pull(self.NEUTRAL,
+                                        "pa530-fb-" + uuid.uuid4().hex[:8])
+            avail_ids = avail.get("results") or []
+            self.assertIn(rid, avail_ids,
+                          "row was not available to the fallback pool "
+                          "(reason=%r, delivered=%r) — the conflict-leg "
+                          "assertion would be vacuous"
+                          % (avail.get("reason"), avail_ids))
+            # candidate_ids keeps its PRE-partition identity (#117/#174
+            # contract) — the drop must show in the delivered set, not the
+            # candidate capture.
+        finally:
+            _cli("update", "--id", rid, "--content", self.ROW, "--json")
+
+    def test_neutral_fallback_delivery_intact(self):
+        rid = _add(self.ROW, "kennet", namespace=self.NS_FB)
+        try:
+            env = self._park_and_pull(self.NEUTRAL,
+                                      "pa530-fb-" + uuid.uuid4().hex[:8])
+            ids = env.get("results") or []   # child prints id strings
+            if rid not in ids:
+                self.fail(
+                    "neutral fallback delivery regressed (reason=%r, "
+                    "delivered=%r)" % (env.get("reason"), ids))
+        finally:
+            _cli("update", "--id", rid, "--content", self.ROW, "--json")
+
+
+class RescueCountScopeTests(unittest.TestCase):
+    """Issue #530 AC7: attribute_rescued counts only rescued rows that are
+    actually delivered (budget-dropped rows are not counted), and a
+    multi-sentence row's subject terms come from the sentence carrying its
+    assertion."""
+
+    ROW = "Harbor master Lyle approves every Kennet shipment."
+    QUERY = ("Who approves? The nightly shipment report is sent to Pine "
+             "Crossing.")
+    MULTI = ("Nightly barn checks are sealed. "
+             "Kennet sends unsealed parcels to Rowan Dock.")
+
+    def test_budget_dropped_rescued_row_not_counted(self):
+        rid = _add(self.ROW, "kennet")
+        try:
+            # The NO-SESSION direct wire: the only wire that carries the
+            # attribute_* diagnostics (the closed session selector rebuilds
+            # the envelope key set without them).
+            env_tight = _CliEnvWire.recall(
+                self.QUERY, direct=True,
+                extra_env={"ZMEM_INJECT_TOKEN_BUDGET": "1"},
+                session_suffix="-tight")
+            env_wide = _CliEnvWire.recall(self.QUERY, direct=True,
+                                          session_suffix="-wide")
+            tight_ids = [r["id"] for r in (env_tight.get("results") or [])]
+            wide_ids = [r["id"] for r in (env_wide.get("results") or [])]
+            self.assertNotIn(rid, tight_ids,
+                             "budget=1 still delivered the rescued row")
+            self.assertEqual(
+                env_tight.get("attribute_rescued"), 0,
+                "a budget-dropped rescued row was still counted "
+                "(issue #530 AC7)")
+            self.assertIn(rid, wide_ids, "wide budget lost the rescue")
+            self.assertEqual(env_wide.get("attribute_rescued"), 1,
+                             "wide-budget rescue count wrong")
+        finally:
+            _cli("update", "--id", rid, "--content", self.ROW, "--json")
+
+    def test_multi_sentence_subject_from_own_sentence(self):
+        asserts = inject.parse_row_assertions(self.MULTI)
+        dest = [a for a in asserts if a["relation"] == "destination"]
+        self.assertTrue(dest)
+        self.assertNotIn("nightly", dest[0]["subject"])
+        self.assertNotIn("barn", dest[0]["subject"])
+
+
+class AnaphoraScopeTests(unittest.TestCase):
+    """Issue #530 AC6: non-initial anaphor binds the focus; two questions
+    in one clause give two foci; relation verbs do not leak into question
+    subjects; the anaphor-initial control stays bound; an explicit
+    multi-term subject is NOT rebound (P-F3 safeguard)."""
+
+    def test_non_initial_anaphor_binds(self):
+        foci = inject.analyze_prompt("Where should this parcel go?")["foci"]
+        self.assertTrue(
+            any(f["relation"] == "destination" and f["bound"] for f in foci))
+
+    def test_belong_excluded_from_subject(self):
+        foci = inject.analyze_prompt(
+            "To which register does it belong?")["foci"]
+        dest = [f for f in foci if f["relation"] == "destination"]
+        self.assertTrue(dest)
+        self.assertTrue(any(f["bound"] for f in dest))
+        for f in dest:
+            self.assertNotIn("belong", f["subject"])
+
+    def test_two_questions_two_foci(self):
+        foci = inject.analyze_prompt(
+            "Who approves the job and what does it cost?")["foci"]
+        rels = {f["relation"] for f in foci}
+        self.assertEqual(len(foci), 2)
+        self.assertEqual(rels, {"approver", "cost"})
+
+    def test_anaphor_initial_control_bound(self):
+        foci = inject.analyze_prompt("This goes to which register?")["foci"]
+        self.assertTrue(
+            any(f["relation"] == "destination" and f["bound"] for f in foci))
+
+    def test_explicit_multi_term_subject_not_rebound(self):
+        foci = inject.analyze_prompt(
+            "Who approves this Ash Register shipment?")["foci"]
+        appr = [f for f in foci if f["relation"] == "approver"]
+        self.assertTrue(appr)
+        for f in appr:
+            self.assertFalse(f["bound"],
+                             "explicit multi-term subject must stay unbound")
+            self.assertIn("ash", f["subject"])
 
 
 if __name__ == "__main__":

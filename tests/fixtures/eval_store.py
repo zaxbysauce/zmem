@@ -388,6 +388,36 @@ TYPEBOOST_DECISION_ROWS = (
      "no-op with an already-merged message", "eval,typeboost"),
 )
 
+# Prompt-assertion bucket (issue #530 AC5): rows written in the assertion
+# grammar the #498/#530 parser reads (today 0 of the pre-existing 82 rows
+# parse as an assertion), so the gold set can exercise the partition and the
+# question rescue. Seeded LAST (CLI rowids 83-88) so every pre-existing
+# rowid pin stays untouched; remapped to fixed ids the same way.
+NS_PA = "project:eval-pa"
+PA_ROWS = (
+    # Rescue candidates (approver assertions). Wording is tuned so BOTH
+    # rows' lexical lane lands in the [QUESTION_RESCUE_FLOOR=0.25, ordinary
+    # floor=0.30) window for the ig-pa-rescue-approver query (measured; see
+    # tests/test_eval_prompt_assertion_ratchet.py) — stock admits ONE best,
+    # the nominate-all mutant admits BOTH, which is what moves precision and
+    # false_injection.
+    (83, "Harbor master Lyle approves every Kennet shipment."),
+    (84, "Harbor master Crane approves the shipment schedule for Kennet."),
+    # Conflict leg: the stored default the Pine Crossing prompt must drop.
+    (85, "The Kennet unsealed parcel is sent to Rowan Dock."),
+    # Asked-attribute legs under the two-question prompt.
+    (86, "The Kennet unsealed parcel costs 40 marks."),
+    (87, "The Kennet unsealed parcel is owned by Dana Reyes."),
+    # Non-assertion control (parses to nothing; lexical filler).
+    (88, "The quarterly ledger reconciliation runs nightly."),
+)
+
+
+def _pa_adds():
+    """6 CLI rows in the assertion grammar, namespace project:eval-pa."""
+    return [(NS_PA, "fact", "test", content, "eval,pa")
+            for _rowid, content in PA_ROWS]
+
 
 # ------------------------------------------------------------------- EVAL_IDS
 
@@ -399,7 +429,7 @@ def _build_eval_ids() -> dict:
            "contested_winner": {}, "contested_loser": {},
            "entity": {}, "fts": {}, "retraction": {}, "polarity": {},
            "change_pred": {}, "change_head": {}, "decision": {},
-           "typeboost": {}}
+           "typeboost": {}, "pa": {}}
     for i in range(5):
         ids["asof_old"][ASOF_TOPICS[i]] = eval_id(2 * i + 1)
         ids["asof_new"][ASOF_TOPICS[i]] = eval_id(2 * i + 2)
@@ -422,6 +452,8 @@ def _build_eval_ids() -> dict:
         ids["decision"][content.split()[0]] = eval_id(rowid)
     ids["typeboost"]["constraint"] = eval_id(TYPEBOOST_CONSTRAINT_ROWS[0][0])
     ids["typeboost"]["decision"] = eval_id(TYPEBOOST_DECISION_ROWS[0][0])
+    for rowid, content in PA_ROWS:
+        ids["pa"][content] = eval_id(rowid)
     ids["all"] = [eval_id(n) for n in range(1, 83)]
     return ids
 
@@ -480,6 +512,11 @@ def build_eval_store(dest: str) -> str:
         _add(dest, NS_TYPEBOOST, type_, "test", content, tags,
              confidence=TYPEBOOST_LABELED_CONFIDENCE if labeled else None)
     _pin_typeboost_rows(dest)
+    # Issue #530 AC5: prompt-assertion bucket, seeded last (CLI rowids
+    # 83-88) at C7's rescue-eligible confidence.
+    for rowid, content in PA_ROWS:
+        _add(dest, NS_PA, "fact", "test", content, "eval,pa", confidence=0.9)
+    _pin_pa_rows(dest)
     _verify(dest)
     return str(dest_path)
 
@@ -726,6 +763,30 @@ def _pin_typeboost_rows(store: str) -> None:
         conn.close()
 
 
+def _pin_pa_rows(store: str) -> None:
+    """Issue #530: remap the prompt-assertion rows (seeded last, CLI rowids
+    83-88) to their fixed eval ids, remapping the derived tables the CLI
+    wrote (same contract as _pin_decision_rows)."""
+    conn = sqlite3.connect(store)
+    try:
+        rows = conn.execute(
+            "SELECT id, rowid FROM memory WHERE namespace=? ORDER BY rowid",
+            (NS_PA,)).fetchall()
+        if len(rows) != len(PA_ROWS):
+            raise AssertionError(
+                f"eval corpus: expected {len(PA_ROWS)} prompt-assertion "
+                f"rows, found {len(rows)}")
+        for (old_id, rowid), (want_rowid, _c) in zip(rows, PA_ROWS):
+            if rowid != want_rowid:
+                raise AssertionError(
+                    f"eval corpus: prompt-assertion row landed at rowid "
+                    f"{rowid}, expected {want_rowid} (seed order drifted)")
+            _remap_id(conn, old_id, eval_id(want_rowid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _verify(store: str) -> None:
     conn = sqlite3.connect(store)
     try:
@@ -770,12 +831,15 @@ def _verify(store: str) -> None:
             (NS_TYPEBOOST,)).fetchone()[0]
     finally:
         conn.close()
-    if n_total != 82:
-        raise AssertionError(f"eval corpus: expected 82 rows, got {n_total}")
+    if n_total != 82 + len(PA_ROWS):
+        raise AssertionError(
+            f"eval corpus: expected {82 + len(PA_ROWS)} rows, got {n_total}")
     # 5 as-of old + 5 contested losers + 2 retracted + 3 change predecessors
-    # are tombstoned; 82 - 15 = 67 live.
-    if n_live != 67:
-        raise AssertionError(f"eval corpus: expected 67 live rows, got {n_live}")
+    # are tombstoned; 82 - 15 + 6 = 73 live.
+    if n_live != 67 + len(PA_ROWS):
+        raise AssertionError(
+            f"eval corpus: expected {67 + len(PA_ROWS)} live rows, "
+            f"got {n_live}")
     if n_decision != len(DECISION_ROWS):
         raise AssertionError(
             f"eval corpus: expected {len(DECISION_ROWS)} live decision rows, "
