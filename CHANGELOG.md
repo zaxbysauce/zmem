@@ -63,6 +63,40 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   derives every inherited value, guard, capture-policy decision and derived
   field ONCE, from the row read under the write lock, after the existing
   drift refusals have compared that row with the pre-lock snapshot.
+- **Stale non-NULL content_norm rows now heal on every open** (issue #533).
+  The one-shot 163 verification lane's stamped early return left a STALE
+  non-NULL `content_norm` row planted by a raw external sqlite3 writer
+  unhealed forever (wrong for every content_norm-keyed dedup/re-rank
+  window). The unmarked post-stamp lane from #527 now heals BOTH shapes —
+  NULL and stale non-NULL — in one batched keyset scan with the same
+  never-raise, zero-write-on-clean-stores, compare-and-update discipline,
+  and no new marker. Disclosed cost — the scan reads and normalizes every
+  row's content on every open, so it is O(total content bytes) and scales
+  with store CONTENT SIZE, not row count. At 50k rows, median of 5 opens
+  (this host; CI is faster): stamped ~300 ms / unstamped ~620 ms for ~70-char
+  content, ~760 ms / ~1.56 s for ~500-char, ~1.43 s / ~2.92 s for ~1.1 KB.
+  UNSTAMPED stores (which includes every CLEAN store — the 163 stamp only
+  rides an actual heal) run two full passes per open until a heal lands the
+  stamp; stamped stores run one. At the ~1.1 KB/row shape an unstamped
+  50k-row open is ~3 s, and the schema lock (~15 s) is held for the whole
+  open, so concurrent unstamped opens queue behind it — three ~1.1 KB/row
+  unstamped opens serialize to ~8.8 s, past the ~8 s store budget. The
+  full-scan-every-open design is out of scope for this issue; reducing the
+  cost by bounding or prefiltering the scan is a proposed improvement, not
+  yet tracked.
+- **URL-scheme credential redaction is now linear on adversarial input**
+  (issue #535). The legacy pattern
+  `(?i:(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]*://)[^\s:/@]+:([^\s@]+)@` was
+  quadratic on punctuated and scheme-chain input (12.3 s for `'a.'*32768`
+  at the 65,536-char capture cap), reachable by untrusted CLI/ingest
+  content before the size cap. It is replaced by a single-pass scanner
+  occupying the same registry slot (exact legacy match set — spans,
+  outputs, detection counts, Unicode case-folds, raw-colon and long
+  passwords all redacted as before — with zero consumer changes), made
+  linear by a memo a backtracking engine cannot express: a failed
+  password scan proves no `@` exists before the next whitespace, so later
+  attempts inside that region fail in O(1). Worst observed at the cap:
+  72 ms (was 12.3 s).
 - Read-only snapshots now compare database copies with streaming hashes so companion note reads use bounded comparison memory on large stores.
 - Memory-type admission on the typed operation lane: `apply-ops` add/capture/update ops with an out-of-vocabulary type are now refused per op with `error=invalid_type` (the batch continues); historical out-of-vocabulary rows can no longer blank the passive injection surfaces (recall and SessionStart skip them with a one-time warning while plain recall still serves them), and the scorer, the pool filter, and the `apply-ops` admission gate now read ONE vocabulary (`schema_meta.allowed_types()`, the #172 gate - read once per tier, not once per scored row; the CLI and sync writers keep their static type list, unchanged). The admission gate runs BEFORE the identical-content replay fold, so an out-of-vocabulary type is refused even when the content is a replay (issue #510).
 - Untrusted-content fence boundaries are now per-render token markers with renderer-side escaping of every fence-shaped token in stored text - stored delimiters can no longer alias or forge a delivery boundary on any lane (recall, prefetch, evidence over both transports, the degraded hermes renderer, and the session-start trim path) (issue #511). The escape covers EVERY rendered field (content, source_ref, tags, namespace, type, signal, confidence, and the header), and the session-start trim closes the fence that SURVIVES the cut - the appended closer carries the surviving opener's token. The canonical literal is no longer emitted: out-of-tree consumers must accept the `:<token>` form (the legacy canonical form still parses). `ZMEM_FENCE_TOKEN` pins the token for deterministic fixtures (a pin outside the shared `[0-9A-Za-z]{1,32}` grammar is ignored and a fresh token is minted), it is keyed into the recall-reuse fingerprint, and a replayed envelope re-mints it so two deliveries never share boundary bytes (unless the token is PINNED, which is the documented deterministic fixture seam).
