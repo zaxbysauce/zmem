@@ -1102,9 +1102,33 @@ def _recover_search_index(conn: sqlite3.Connection) -> None:
     except (TypeError, ValueError):
         stamp = 1
     au = FTS_TRIGGER_AU_GUARDED_DDL if stamp >= 2 else FTS_TRIGGER_AU_DDL
+    # A vtable whose _data or _config shadow is gone cannot even be DROPPED
+    # ("vtable constructor failed": fts5 instantiates the module to destroy
+    # it — probed for every shadow). The plain drop below covers the
+    # recoverable cases; the constructor-failure cases need sqlite_master
+    # surgery on a SEPARATE connection (the schema cache of the connection
+    # that performed the writable_schema writes is not invalidated
+    # in-transaction — probed).
+    try:
+        conn.execute('DROP TABLE IF EXISTS "memory_fts"')
+    except sqlite3.DatabaseError as exc:
+        # OperationalError OR the bare DatabaseError the constructor raises
+        # for some missing shadows (probed) — DatabaseError is the common
+        # superclass, so both shapes reach the surgery.
+        if "vtable constructor" not in str(exc):
+            raise
+        # The surgery connection recreates the vtable, the triggers AND
+        # runs the rebuild, so this connection has nothing left to do:
+        # its schema cache still holds the BROKEN vtable instance (the
+        # failed DROP instantiated it), and any further memory_fts use on
+        # THIS connection re-raises the constructor error (probed). The
+        # schema-cookie bump makes every later statement reload the healthy
+        # schema; init_db's main script is all IF NOT EXISTS no-ops here.
+        _fts_schema_surgery(STORE_PATH)
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for name in ("memory_fts",) + _FTS_SHADOW_TABLES:
+        for name in _FTS_SHADOW_TABLES:
             conn.execute(f'DROP TABLE IF EXISTS "{name}"')
         conn.execute(FTS_VTAB_DDL)
         conn.execute(FTS_TRIGGER_AI_DDL)
@@ -1120,6 +1144,45 @@ def _recover_search_index(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def _fts_schema_surgery(store_path) -> None:
+    """Emergency removal of an unconstructible memory_fts vtable row.
+
+    Runs on its OWN connection to the same file and recreates the vtable,
+    the three triggers and the full index before returning, so the caller's
+    plain recovery transaction afterwards is a no-op. The schema-cookie
+    bump makes every other connection (including the caller's) reload its
+    schema on its next statement.
+    """
+    surgery = sqlite3.connect(str(store_path))
+    try:
+        surgery.execute("PRAGMA writable_schema=ON")
+        for name in ("memory_fts",) + _FTS_SHADOW_TABLES:
+            surgery.execute("DELETE FROM sqlite_master WHERE name=?", (name,))
+        ver = surgery.execute("PRAGMA schema_version").fetchone()[0]
+        surgery.execute(f"PRAGMA schema_version = {ver + 1}")
+        surgery.execute("PRAGMA writable_schema=OFF")
+        surgery.commit()
+    finally:
+        surgery.close()
+    rebuilt = sqlite3.connect(str(store_path))
+    try:
+        rebuilt.execute(FTS_VTAB_DDL)
+        rebuilt.execute(FTS_TRIGGER_AI_DDL)
+        rebuilt.execute(FTS_TRIGGER_AD_DDL)
+        stamp_row = rebuilt.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        try:
+            stamp = int(stamp_row[0]) if stamp_row else 1
+        except (TypeError, ValueError):
+            stamp = 1
+        rebuilt.execute(FTS_TRIGGER_AU_GUARDED_DDL if stamp >= 2
+                        else FTS_TRIGGER_AU_DDL)
+        rebuilt.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+        rebuilt.commit()
+    finally:
+        rebuilt.close()
 
 
 def _entity_ddl_sql() -> str:
