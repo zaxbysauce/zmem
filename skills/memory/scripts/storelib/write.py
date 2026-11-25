@@ -2663,73 +2663,28 @@ def update_memory(
             "and this row is no longer live"
         )
 
-    # Effective field values: caller-supplied wins, else inherit from `old`.
-    ns = namespace if namespace is not None else old["namespace"]
-    type_eff = type_ if type_ is not None else old["type"]
-    tags_eff = tags if tags is not None else old["tags"]
-    source_ref_eff = source_ref if source_ref is not None else old["source_ref"]
-    conf_eff = confidence if confidence is not None else old["confidence"]
-    sig_eff = signal if signal is not None else old["signal"]
+    # _validate_namespace validates a STRING (issue #507 keeps it before
+    # the lock; the frozen interleave point hooks it there). The string
+    # it sees is the caller-supplied namespace or the pre-lock row's —
+    # both shape-checks; the under-lock namespace-drift refusal then
+    # guarantees the locked row's namespace equals the validated one, so
+    # the derivation below never needs to re-validate.
+    ns = _validate_namespace(conn, namespace if namespace is not None else old["namespace"])
 
-    # PR #385 review F-2 (PRR-001, 2026-10-18): update-path parity with
-    # add_memory's two card guards. All three fire BEFORE any mutation (the
-    # first write below is the tombstone) so a refused update leaves the old
-    # row and the store bytes untouched.
-    if type_eff == "entity_card" and old["type"] != "entity_card":
-        # (a) Type conversion INTO the reserved type: `update --type
-        # entity_card` on an ordinary row would mint a forged card (executed
-        # at base: the forged card then suppressed the row's real facts at
-        # recall). The refresh path is the only card minter; it never routes
-        # through update_memory. A pre-existing card row updated WITHOUT a
-        # type override keeps type_eff == old type and stays allowed (the
-        # `state` content-only precedent).
-        raise ValueError(
-            "update refused: type 'entity_card' is card-refresh-only — an "
-            "ordinary row cannot be converted into a card (use entity-card "
-            "build|refresh / the organize cadence)"
-        )
-    if tags is not None:
-        # (b) An EXPLICITLY supplied tag carrying the reserved watermark
-        # prefix: only the refresh path mints watermarks. Inheritance is not
-        # incoming input — a content-only update of a pre-existing card row
-        # keeps the card's own watermark tag and stays allowed (the `state`
-        # precedent). A transient watermark desync introduced by such a
-        # content-only card edit self-heals at the next card refresh, which
-        # recomputes the digest over the new bytes (disclosed).
-        for _tok in tags.split(","):
-            if _tok.strip().startswith(ENTITY_CARD_WATERMARK_PREFIX):
-                raise ValueError(
-                    f"update refused: tag {_tok.strip()!r} carries the "
-                    f"reserved {ENTITY_CARD_WATERMARK_PREFIX}prefix: that "
-                    "watermark is minted only by the entity-card refresh path"
-                )
-    if ((source_ref_eff or "").startswith("card:")
-            and old["type"] != "entity_card"):
-        # (c) An ordinary row cannot CLAIM a card source_ref (reserved-prefix
-        # list above); a pre-existing card row's content-only edit keeps its
-        # own card: ref.
-        raise ValueError(
-            "update refused: source_ref prefix card: is reserved for entity "
-            "cards — an ordinary row cannot claim a card identity"
-        )
-    # PR1 (knowledge companion): update refuses knowledge: refs from BOTH
-    # directions, with no refresh-path exemption (unlike card:). (a) An
-    # ordinary row cannot CLAIM a knowledge ref — same masquerade class as
-    # the card guard. (b) A live POINTER row cannot be edited at all: its
-    # content IS the versioned pointer payload, so an in-place successor
-    # would advance/mutate authoritative pointer state outside the handler's
-    # compare-and-swap (storelib.knowledge.link_pointer is the only writer;
-    # it never routes through update_memory). The old-row check catches a
-    # content-only edit that passes source_ref=None (which would otherwise
-    # inherit the ref and slip past a source_ref_eff-only guard).
-    if (_has_knowledge_prefix(source_ref_eff)
-            or _has_knowledge_prefix(old["source_ref"])):
-        raise ValueError(
-            "update refused: source_ref prefix knowledge: is reserved for "
-            "knowledge pointers — an ordinary row cannot claim a knowledge "
-            "identity, and a pointer row's payload advances only through "
-            "the knowledge handler's CAS path (storelib.knowledge.link_pointer)"
-        )
+    # Issue #507: the effective values are derived ONCE, from the row read
+    # under the write lock (see the derivation block after the under-lock
+    # drift refusals). The pre-lock `old` row is kept only as the PRE-LOCK
+    # SNAPSHOT those refusals compare against. The card/knowledge guards,
+    # capture policy and the size cap all run on the locked-row-derived
+    # values below, so nothing derived can survive from a stale read.
+
+    # PR #385 review F-2 / PR1 (knowledge companion): the card and
+    # knowledge guards MOVED under the write lock (issue #507) — they
+    # run on the locked-row-derived values inside the transaction, so a
+    # row that concurrently became a card or a pointer is refused there
+    # rather than forged from the stale pre-lock read. A refused update
+    # still leaves the old row and the store bytes untouched (the
+    # transaction rolls back).
 
     # v15 (#173): one clock per transaction; the SAME `ts` stamps the old row's
     # tombstone, the new row's valid_from/ingestion_ts, and the side-table row
@@ -2740,41 +2695,6 @@ def update_memory(
     # pair); validation still runs before the tombstone is written, and the
     # surrounding try/except rolls the transaction back on any refusal.
     tx_now = now if now is not None else now_iso()
-
-    # Capture policy applies to the effective values (new content + any
-    # inherited-or-overridden tags/source_ref) exactly as add_memory does —
-    # and, as in add_memory, BEFORE the size check (PR-review PRR-C): in auto
-    # mode redaction can shrink secret-laden oversized content under the cap,
-    # and update must not reject content the add path would accept.
-    content_eff, source_ref_eff, tags_eff, warns = apply_capture_policy(
-        content=content,
-        source_ref=source_ref_eff,
-        tags=tags_eff,
-        capture_mode=capture_mode,
-    )
-    ns = _validate_namespace(conn, ns)
-    # Single content-size cap, identical to add_memory (M8b / #36 M17) and
-    # applied to the POST-capture content: an oversize update must be refused
-    # at the CLI boundary like an oversize add, not silently stored (an
-    # oversized row would then fail tier-3 export).
-    if len(content_eff) > MAX_CONTENT_CHARS:
-        raise ContentTooLarge(
-            f"content is {len(content_eff)} chars, over the {MAX_CONTENT_CHARS} limit"
-        )
-
-    # Taint lineage (issue #59, 4.7): the new content's provenance is the WORST
-    # of the caller-declared-or-derived origin and the row it replaces.
-    # Effective base = explicit taint if given, else the shared signal
-    # derivation; a provided taint is validated (unknown refused). The incoming
-    # lineage taint is computed ONCE and applied to whichever row survives
-    # (the new row, or the dedup target) so trust never depends on the path.
-    effective_base = (
-        validate_taint(taint) if taint is not None
-        else _default_taint_for_signal(sig_eff)
-    )
-    incoming_taint = worse_taint(old["taint"] or "trusted_internal", effective_base)
-
-    _emit_capture_policy_warnings(warns, capture_mode=capture_mode)
 
     started_tx = False
     try:
@@ -2832,6 +2752,82 @@ def update_memory(
                 "successor's trust lineage and namespace derive from the "
                 "pre-lock read; re-read and retry (issue #420)"
             )
+
+        # Issue #507: derive everything from the LOCKED row. An explicit
+        # caller value always wins; every inherited value, guard, policy
+        # decision and derived field below reads `locked` (re-read IN FULL),
+        # never the pre-lock snapshot.
+        locked = conn.execute(
+            "SELECT * FROM memory WHERE id=?", (mid,)).fetchone()
+        if locked is None:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                f"[zmem] no memory with id {mid}; cannot update "
+                "(the row vanished between read and write)")
+        ns = namespace if namespace is not None else locked["namespace"]
+        type_eff = type_ if type_ is not None else locked["type"]
+        tags_eff = tags if tags is not None else locked["tags"]
+        source_ref_eff = (
+            source_ref if source_ref is not None else locked["source_ref"])
+        conf_eff = confidence if confidence is not None else locked["confidence"]
+        sig_eff = signal if signal is not None else locked["signal"]
+
+        # The card guards re-run against the LOCKED row (an ordinary row
+        # that concurrently became a card, or a card whose watermark moved,
+        # is refused here rather than forged from the stale read).
+        if type_eff == "entity_card" and locked["type"] != "entity_card":
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                "update refused: type 'entity_card' is card-refresh-only — an "
+                "ordinary row cannot be converted into a card (use entity-card "
+                "build|refresh / the organize cadence)")
+        if tags is not None:
+            for _tok in tags.split(","):
+                if _tok.strip().startswith(ENTITY_CARD_WATERMARK_PREFIX):
+                    if started_tx and conn.in_transaction:
+                        conn.rollback()
+                    raise ValueError(
+                        f"update refused: tag {_tok.strip()!r} carries the "
+                        f"reserved {ENTITY_CARD_WATERMARK_PREFIX}prefix: that "
+                        "watermark is minted only by the entity-card refresh path")
+        if ((source_ref_eff or "").startswith("card:")
+                and locked["type"] != "entity_card"):
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                "update refused: source_ref prefix card: is reserved for entity "
+                "cards — an ordinary row cannot claim a card identity")
+        if (_has_knowledge_prefix(source_ref_eff)
+                or _has_knowledge_prefix(locked["source_ref"])):
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ValueError(
+                "update refused: source_ref prefix knowledge: is reserved for "
+                "knowledge pointers — an ordinary row cannot claim a knowledge "
+                "identity, and a pointer row's payload advances only through "
+                "the knowledge handler's CAS path (storelib.knowledge.link_pointer)")
+
+        # Capture policy, namespace validation and the size cap run on the
+        # locked-row-derived effective values (moved from the pre-lock block).
+        content_eff, source_ref_eff, tags_eff, warns = apply_capture_policy(
+            content=content,
+            source_ref=source_ref_eff,
+            tags=tags_eff,
+            capture_mode=capture_mode,
+        )
+        if len(content_eff) > MAX_CONTENT_CHARS:
+            if started_tx and conn.in_transaction:
+                conn.rollback()
+            raise ContentTooLarge(
+                f"content is {len(content_eff)} chars, over the {MAX_CONTENT_CHARS} limit")
+        effective_base = (
+            validate_taint(taint) if taint is not None
+            else _default_taint_for_signal(sig_eff))
+        incoming_taint = worse_taint(
+            locked["taint"] or "trusted_internal", effective_base)
+        _emit_capture_policy_warnings(warns, capture_mode=capture_mode)
 
         # v15 (#173 PR-review F21): resolve the side-table pair against a
         # snapshot taken UNDER the write lock, so a concurrent purge/supersede

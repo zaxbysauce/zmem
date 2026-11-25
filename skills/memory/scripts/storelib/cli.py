@@ -6607,7 +6607,16 @@ def main():
         or args.cmd == "session-cadence"
     ):
         if writer_lease is None:
-            writer_lease = _acquire_writer_lease(args.cmd)
+            # Issue #506: the lease acquisition runs the maintenance probe,
+            # and its errors used to escape as a traceback (a writer whose
+            # lease could not be created — e.g. an unusable lock directory —
+            # died mid-dispatch). Take the same handler shape as the open
+            # path: one [zmem] line and exit 2, never a traceback.
+            try:
+                writer_lease = _acquire_writer_lease(args.cmd)
+            except (RuntimeError, sqlite3.Error, OSError) as exc:
+                print(f"[zmem] {args.cmd}: {exc}", file=sys.stderr)
+                sys.exit(2)
 
     try:
         if args.cmd == "init":

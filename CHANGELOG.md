@@ -9,6 +9,60 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **An interrupted first open is now restartable, a lost search table is
+  rebuilt with every old row re-indexed, and 32 concurrent writers are no
+  longer refused with a restore-blaming message** (issue #506). The v3 and
+  v4 migration blocks guard each `ALTER TABLE` with the `table_info` probe
+  (the v6-v12 idiom), so a first open killed inside either block resumes on
+  the next open instead of dying on `duplicate column name`. The search-table
+  DDL moved to module constants and `init_db` now runs a restart-safe
+  recovery whenever `memory_fts` or any of its four shadow tables is missing
+  (whatever the row count): drop the remnants, create the table and its
+  triggers, run the FTS5 `rebuild`, all in ONE transaction with the mutation
+  generation bumped — a kill rolls it back and the next open redoes it.
+  `doctor` gains an `fts-index` check (graded `warn`, the derived-data
+  convention) that reports missing index rows and names `rebuild-fts`, and
+  the `fts` lane reports `degraded`/`fts-index-missing-rows`. The maintenance
+  probe returns immediately when no maintenance lock file exists (the old
+  probe acquired the exclusive lock, so concurrent writers serialized on it
+  and the slower ones timed out being blamed on a restore that was not
+  running), and a writer whose lease cannot be taken gets one clean
+  `[zmem]` line and exit 2 instead of a traceback.
+- **`restore --force` now rolls back automatically when it fails after
+  replacing the live store: the store is re-installed from the pre-restore
+  backup, which holds the store exactly as SQLite read it (including
+  committed `-wal` writes). The destination is no longer opened before the
+  swap. Sidecars are set aside instead of deleted, and their bytes, together
+  with the main file, are kept in `<backup dir>/restore-forensic-<stamp>/`.**
+  Note: if a stale `-wal` was beside the store, its rows are in that
+  rollback just as any open would have shown them; the forensic directory
+  holds the checkpoint-only file. (issue #504) The incoming snapshot is
+  staged on a private copy and PROVEN before the swap: integrity, identity,
+  migration to the running schema, and a semantic required-shape proof
+  against a fresh store built by the same code (objects including
+  `sqlite_autoindex_*`; every table compared element by element with
+  SQLite's ASCII-only identifier semantics and column keys cross-checked
+  against `PRAGMA table_xinfo`; the search table's declaration and the
+  search triggers exactly; extra indexes and triggers refused at or below
+  the supported stamp; the search index proven complete and usable —
+  rowid sets, a tokenizer-fed lexical probe, and a rolled-back round trip
+  through the triggers — with damaged derived index data healed by one
+  rebuild and wrong definitions refused). Any error after the swap rolls
+  back per the destination's prior state (non-empty: the safety copy is
+  re-installed and re-verified; missing: the destination is absent again;
+  empty: 0 bytes again); a rollback that itself fails prints the
+  manual-recovery lines and never the words `rolled back`.
+- **Consolidation and `update` no longer write from reads taken before
+  their write lock** (issue #507). The consolidation cluster transaction
+  opens with `BEGIN IMMEDIATE`, the keeper and every admitted neighbour are
+  re-read under the lock with a compare-and-set over every decision field
+  (namespace, content, tags, type, confidence, signal, taint, source_ref,
+  embedding, embedding_model, ingestion_ts — recall telemetry exempt), the
+  tombstone is conditional on the row still being live, and a cluster that
+  absorbed nothing rolls back with no `consolidated_at` stamp. `update`
+  derives every inherited value, guard, capture-policy decision and derived
+  field ONCE, from the row read under the write lock, after the existing
+  drift refusals have compared that row with the pre-lock snapshot.
 - Read-only snapshots now compare database copies with streaming hashes so companion note reads use bounded comparison memory on large stores.
 - Memory-type admission on the typed operation lane: `apply-ops` add/capture/update ops with an out-of-vocabulary type are now refused per op with `error=invalid_type` (the batch continues); historical out-of-vocabulary rows can no longer blank the passive injection surfaces (recall and SessionStart skip them with a one-time warning while plain recall still serves them), and the scorer, the pool filter, and the `apply-ops` admission gate now read ONE vocabulary (`schema_meta.allowed_types()`, the #172 gate - read once per tier, not once per scored row; the CLI and sync writers keep their static type list, unchanged). The admission gate runs BEFORE the identical-content replay fold, so an out-of-vocabulary type is refused even when the content is a replay (issue #510).
 - Untrusted-content fence boundaries are now per-render token markers with renderer-side escaping of every fence-shaped token in stored text - stored delimiters can no longer alias or forge a delivery boundary on any lane (recall, prefetch, evidence over both transports, the degraded hermes renderer, and the session-start trim path) (issue #511). The escape covers EVERY rendered field (content, source_ref, tags, namespace, type, signal, confidence, and the header), and the session-start trim closes the fence that SURVIVES the cut - the appended closer carries the surviving opener's token. The canonical literal is no longer emitted: out-of-tree consumers must accept the `:<token>` form (the legacy canonical form still parses). `ZMEM_FENCE_TOKEN` pins the token for deterministic fixtures (a pin outside the shared `[0-9A-Za-z]{1,32}` grammar is ignored and a fresh token is minted), it is keyed into the recall-reuse fingerprint, and a replayed envelope re-mints it so two deliveries never share boundary bytes (unless the token is PINNED, which is the documented deterministic fixture seam).

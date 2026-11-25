@@ -390,6 +390,37 @@ def _commit(conn: sqlite3.Connection) -> None:
     else:
         conn.commit()
 
+def connect_path(store_path: Path) -> sqlite3.Connection:
+    """Open an arbitrary store file the way connect() opens the live one.
+
+    Issue #504: restore stages a copy of the incoming snapshot and must run
+    the production open sequence on THE STAGED FILE (integrity, init_db,
+    migrate, the required-shape proof). connect() is hard-wired to the
+    module-level STORE_PATH, so the opening half lives here and connect()
+    calls it for the live path. The env-derived guards (assert_local_fs on
+    the LIVE store's parent, perms hardening right after WE created the live
+    dir/file) deliberately stay in connect(): the staged copy sits in the
+    already-guarded store directory.
+    """
+    dir_existed = store_path.parent.is_dir()
+    file_existed = store_path.exists()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(store_path), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    if _host is not None and (not dir_existed or not file_existed):
+        _host.set_owner_only_perms(store_path.parent)
+        if store_path.exists():
+            _host.set_owner_only_perms(store_path)
+    try:
+        _load_vec(conn)
+        conn.execute(_vec0_create_sql(_active_vec0_dim()))
+    except Exception:
+        pass
+    return conn
+
+
 def connect() -> sqlite3.Connection:
     _read_schema_version(STORE_PATH)
     if _host is not None:
@@ -867,11 +898,22 @@ def _wait_for_maintenance_clear(op: str) -> None:
 
     The probe classifies the lock by holder liveness (issue #262): a lock
     whose holder provably no longer exists — a killed process's token, or an
-    empty file past the grace window — is broken and the acquire retried, so
-    a dead holder can no longer park every command for the 1800 s stale
+    empty file past the grace window — is broken and the acquire retried, so a
+    dead holder can no longer park every command for the 1800 s stale
     window. A genuinely live holder behaves exactly as before.
+
+    Issue #506: the fast path. When no maintenance lock FILE exists there is
+    no holder, live or dead — the old probe still ACQUIRED the exclusive
+    lock (bounded only by the acquire wait), so 32 concurrent writers each
+    took and released it in turn and the slower ones timed out being blamed
+    on a restore that was not running. With the file absent the answer is
+    immediate; every stale/phantom/live-holder case keeps the full path
+    below. The fail-closed acquire error when the lock directory is unusable
+    still fires one step later, at the caller's own lease acquisition.
     """
     if _host is None:
+        return
+    if not (STORE_PATH.parent / ".zmem-maintenance.lock").exists():
         return
     deadline = time.time() + MAINTENANCE_WAIT_SECONDS
     while True:
@@ -964,6 +1006,122 @@ def _prepare_store(conn: sqlite3.Connection) -> None:
     finally:
         _release_named_lock("schema", token)
 
+# --- Issue #506: the search-table DDL as single-source module constants. ---
+# init_db's fresh DDL, the restart-safe recovery below, and the v2 migration
+# block all interpolate these, so a healed store carries exactly the trigger
+# set a fresh store has. The UPDATE trigger exists in two forms: the fresh v1
+# form (unguarded) and the v2+ form (fires only when indexed columns change,
+# so telemetry UPDATEs do not re-index the row).
+FTS_VTAB_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    content, tags, namespace,
+    content='memory', content_rowid='rowid',
+    tokenize='unicode61'
+);
+"""
+FTS_TRIGGER_AI_DDL = """
+CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
+    INSERT INTO memory_fts(rowid, content, tags, namespace)
+    VALUES (new.rowid, new.content, new.tags, new.namespace);
+END;
+"""
+FTS_TRIGGER_AD_DDL = """
+CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, content, tags, namespace)
+    VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+END;
+"""
+FTS_TRIGGER_AU_DDL = """
+CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, content, tags, namespace)
+    VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+    INSERT INTO memory_fts(rowid, content, tags, namespace)
+    VALUES (new.rowid, new.content, new.tags, new.namespace);
+END;
+"""
+FTS_TRIGGER_AU_GUARDED_DDL = """
+CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory
+WHEN old.content IS NOT new.content
+  OR old.tags IS NOT new.tags
+  OR old.namespace IS NOT new.namespace
+BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, content, tags, namespace)
+    VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
+    INSERT INTO memory_fts(rowid, content, tags, namespace)
+    VALUES (new.rowid, new.content, new.tags, new.namespace);
+END;
+"""
+_FTS_SHADOW_TABLES = ("memory_fts_config", "memory_fts_data",
+                      "memory_fts_docsize", "memory_fts_idx")
+
+
+def _recover_search_index(conn: sqlite3.Connection) -> None:
+    """Issue #506: restart-safe search-index recovery, run by init_db BEFORE
+    the main DDL script.
+
+    Fires when the store already has a ``memory`` table and ``memory_fts`` or
+    ANY of its four shadow tables is missing — whatever the row count. An
+    emptied store whose ``memory_fts_data`` was dropped still has the virtual
+    table, config, docsize and idx tables intact, and every later ``add``
+    fails with ``vtable constructor failed: memory_fts``; with zero rows the
+    rebuild is trivial, so the row count is not a condition. The whole step
+    is ONE transaction: drop the remnants, create the table and triggers,
+    run the FTS5 ``rebuild`` command, commit. A kill anywhere inside rolls
+    the transaction back and the next open sees an object missing again and
+    redoes it. A healthy store (all five objects present) costs one
+    sqlite_master lookup and writes nothing.
+
+    The recreated ``memory_au`` trigger takes the form the store's stamp
+    implies: the guarded text when the stamp is at least 2 (the v2 block then
+    replaces it with the identical text anyway), the unguarded text
+    otherwise. Both constants are shared with the v2 block, so a healed store
+    carries exactly the trigger set a fresh store has.
+
+    Skipped for a hand-shaped impostor ``memory`` lacking content/tags or
+    namespace (the rebuild needs those columns) and for a store with no
+    ``memory`` table at all (it is being created; the main script handles it).
+    """
+    row = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='memory'"
+    ).fetchone()
+    if not row or row[0] == 0:
+        return
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
+    if not {"content", "tags", "namespace"} <= cols:
+        return
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    fts_missing = "memory_fts" not in names or any(
+        t not in names for t in _FTS_SHADOW_TABLES)
+    if not fts_missing:
+        return
+    stamp_row = conn.execute(
+        "SELECT value FROM meta WHERE key='schema_version'"
+    ).fetchone() if "meta" in names else None
+    try:
+        stamp = int(stamp_row[0]) if stamp_row else 1
+    except (TypeError, ValueError):
+        stamp = 1
+    au = FTS_TRIGGER_AU_GUARDED_DDL if stamp >= 2 else FTS_TRIGGER_AU_DDL
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for name in ("memory_fts",) + _FTS_SHADOW_TABLES:
+            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+        conn.execute(FTS_VTAB_DDL)
+        conn.execute(FTS_TRIGGER_AI_DDL)
+        conn.execute(FTS_TRIGGER_AD_DDL)
+        conn.execute(au)
+        conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+        if "meta" in names:
+            # A recall result cached while the index was incomplete must not
+            # be reused after rows become findable again (the #474 census).
+            from storelib.generation import bump_mutation_generation
+            bump_mutation_generation(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def _entity_ddl_sql() -> str:
     """Render the entity-kind CHECK list from the single authority (issue #356).
 
@@ -978,6 +1136,7 @@ def _entity_ddl_sql() -> str:
 
 def init_db(conn: sqlite3.Connection) -> None:
     """Create schema if absent. Idempotent."""
+    _recover_search_index(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS memory (
@@ -1068,25 +1227,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         -- inside executescript would fail on a pre-v8 store where the column
         -- does not yet exist.
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-            content, tags, namespace,
-            content='memory', content_rowid='rowid',
-            tokenize='unicode61'
-        );
-        CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN
-            INSERT INTO memory_fts(rowid, content, tags, namespace)
-            VALUES (new.rowid, new.content, new.tags, new.namespace);
-        END;
-        CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN
-            INSERT INTO memory_fts(memory_fts, rowid, content, tags, namespace)
-            VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
-        END;
-        CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN
-            INSERT INTO memory_fts(memory_fts, rowid, content, tags, namespace)
-            VALUES ('delete', old.rowid, old.content, old.tags, old.namespace);
-            INSERT INTO memory_fts(rowid, content, tags, namespace)
-            VALUES (new.rowid, new.content, new.tags, new.namespace);
-        END;
+        """ + FTS_VTAB_DDL + FTS_TRIGGER_AI_DDL + FTS_TRIGGER_AD_DDL + FTS_TRIGGER_AU_DDL + """
 
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
@@ -3047,9 +3188,19 @@ def migrate(conn: sqlite3.Connection) -> None:
         # The vec0 table stores 384-dim float vectors keyed by memory_id.
         # Embeddings are optional — if onnxruntime/model is missing, the
         # embedding column stays NULL and recall degrades to FTS5-only.
-        conn.execute("ALTER TABLE memory ADD COLUMN embedding BLOB")
-        conn.execute("ALTER TABLE memory ADD COLUMN embedding_model TEXT DEFAULT ''")
-        conn.execute("ALTER TABLE memory ADD COLUMN embedded_at TEXT")
+        # Issue #506: a first open killed between these ALTERs and the stamp
+        # left the columns committed with the stamp still at 2, so every later
+        # open died on `duplicate column name: embedding`. Guard each add with
+        # the table_info probe (the v6-v12 idiom): an interrupted block then
+        # resumes on the next open instead of refusing forever. (An atomic
+        # block is equally valid; the probe accepts both shapes.)
+        _cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "embedding" not in _cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN embedding BLOB")
+        if "embedding_model" not in _cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN embedding_model TEXT DEFAULT ''")
+        if "embedded_at" not in _cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN embedded_at TEXT")
 
         # Try to create the vec0 virtual table. This requires sqlite-vec
         # to be loaded; if it fails, embedding features are disabled but
@@ -3069,8 +3220,12 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     if ver < 4:
         # v4: consolidation provenance + supersede reason persistence.
-        conn.execute("ALTER TABLE memory ADD COLUMN consolidated_at TEXT")
-        conn.execute("ALTER TABLE memory ADD COLUMN supersede_reason TEXT DEFAULT ''")
+        # Issue #506: same interrupted-block guard as v3 above.
+        _cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
+        if "consolidated_at" not in _cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN consolidated_at TEXT")
+        if "supersede_reason" not in _cols:
+            conn.execute("ALTER TABLE memory ADD COLUMN supersede_reason TEXT DEFAULT ''")
         conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
         conn.commit()
 

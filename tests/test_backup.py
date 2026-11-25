@@ -450,9 +450,9 @@ class RestoreTest(_StoreCase):
                          {"ALPHA original row", "BRAVO original row"})
 
     def test_stale_destination_wal_never_survives_a_restore(self):
-        """With a live store present, the pre-restore backup opens it first and
-        SQLite itself consumes/clears the sidecar; either way no `-wal` from the
-        previous store may still be sitting next to the restored file."""
+        """With a live store present, restore sets the sidecar aside before
+        installing; either way no `-wal` from the previous store may still be
+        sitting next to the restored file."""
         snap = self._seed_and_snapshot()
         stale = Path(self.store + "-wal")
         stale.write_bytes(b"stale wal frames from the previous store")
