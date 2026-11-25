@@ -1128,6 +1128,11 @@ _PA_Q_AUX = re.compile(
 _PA_WHETHER = re.compile(r"\bwhether\b", re.IGNORECASE)
 _PA_ANAPHOR_WORDS = frozenset(("this", "that", "it", "these", "those", "such"))
 
+_PA_QUESTION_WORDS = frozenset((
+    "belongs", "belong", "goes", "go", "owns", "own", "owned",
+    "takes", "take", "long", "often", "much",
+))
+
 
 def _pa_terms(text):
     """Content terms of a span: casefolded word tokens minus stopwords.
@@ -1224,7 +1229,21 @@ def _pa_focus_subject(clause):
     matched cue text emptied legitimate subjects — issue #498 probe)."""
     subj = _pa_terms(clause)
     raw = re.findall(r"[A-Za-z]+", clause)
-    if raw and raw[0].lower() in _PA_ANAPHOR_WORDS:
+    # An anaphor counts only when it fills the subject position — i.e.
+    # it appears before any content term (issue #530 AC6 fix for the
+    # critic's "that runs nightly" counter-example). A relative pronoun
+    # after a noun is NOT an anaphoric subject.
+    content_positions = [i for i, w in enumerate(raw)
+                         if w.lower() not in _PA_STOPWORDS
+                         and w.lower() not in _PA_ANAPHOR_WORDS]
+    anaphor_positions = [i for i, w in enumerate(raw)
+                         if w.lower() in _PA_ANAPHOR_WORDS]
+    if anaphor_positions and (not content_positions
+                              or anaphor_positions[0] < content_positions[0]):
+        is_anaphor = True
+    else:
+        is_anaphor = False
+    if is_anaphor:
         return subj, True
     return subj, False
 
@@ -1239,24 +1258,23 @@ def _pa_parse_foci(clauses, assertions):
             if not qm:
                 continue
             subj, is_anaphor = _pa_focus_subject(clause)
-            # PR #526 feedback (P-F3): a focus whose subject is anaphoric or
+            # Apply question-only word list to focus subjects (plan AC6).
+            subj = [t for t in subj if t not in _PA_QUESTION_WORDS]
             # empty (ellipsis) is discourse-BOUND when a preceding assertion
             # supplies it; only such bound foci may use the subject-unbound
             # rescue fallback later.
             bound_ctx = False
             if is_anaphor or not subj:
-                # Anaphor OR ellipsis (the question names no subject at all —
-                # "What destination should be used?"): bind to the nearest
-                # PRECEDING assertion's subject. The mixed prompt binds its
-                # approver focus to the destination assertion's subject, which
-                # carries no approver assertion — the focus stays unanswered,
-                # which is exactly the rescue case.
                 bound = None
                 for a in assertions:
                     if a["clause_index"] < idx:
                         bound = a
                 if bound is not None:
                     subj = list(bound["subject"])
+                # bound=True only when anaphoric AND subject has at most
+                # one term (P-F3 safeguard); ellipsis-only keeps base
+                # behavior (bound=False).
+                if is_anaphor and len(subj) <= 1:
                     bound_ctx = True
             answered = any(
                 a["relation"] == relation
@@ -1265,7 +1283,10 @@ def _pa_parse_foci(clauses, assertions):
             foci.append({"subject": subj, "relation": relation,
                          "clause_index": idx, "answered": answered,
                          "bound": bound_ctx})
-            break
+            # Note: do NOT break here — a single clause can carry multiple
+            # question foci (issue #530 AC6, e.g. "Who approves X and what
+            # does it cost?").
+        # (end relation loop)
     return foci
 
 
@@ -1309,7 +1330,23 @@ def parse_row_assertions(content):
     gate correctly flagged as unwired code.)"""
     if not content:
         return []
-    return _pa_parse_clause(content)
+    # Sentence-scoped negation: split only at credible sentence ends.
+    # A mark ends a sentence only when followed by an upper-case letter
+    # (or end of string). Newlines, semicolons and abbreviations do NOT
+    # split (approved plan rev 12: line breaks and semicolons are never
+    # sentence boundaries). This prevents the regressions found by the
+    # final critic: hypothetical/negated rows incorrectly conflict-dropped,
+    # newline-joined facts incorrectly delivered, semicolon subjects lost.
+    import re as _re
+    # Split at . ! or ? followed by whitespace + uppercase, or end of string
+    sentences = _re.split(r'(?<=[.!?])\s+(?=[A-Z])', content or "")
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        sentences = [content.strip()] if content.strip() else []
+    result = []
+    for sent in sentences:
+        result.extend(_pa_parse_clause(sent))
+    return result
 
 
 def _pa_values_overlap(v1, v2):
@@ -1356,11 +1393,17 @@ def _pa_row_drop_type(frame, row_asserts):
                 return "redundant"
             return "conflict"
     foci = frame["foci"]
-    if len(foci) == 1 and foci[0]["relation"] in _PA_UNSUPPORTED_FOCI:
-        focus = foci[0]
-        for ra in row_asserts:
-            if _pa_subject_compat(focus["subject"], ra["subject"]):
-                return "orthogonal"
+    if foci and any(f.get("relation") in _PA_UNSUPPORTED_FOCI for f in foci):
+        asked = {f.get("relation") for f in foci
+                if f.get("relation") in _PA_UNSUPPORTED_FOCI}
+        for focus in foci:
+            if focus.get("relation") not in _PA_UNSUPPORTED_FOCI:
+                continue
+            for ra in row_asserts:
+                if ra["relation"] in asked:
+                    continue
+                if _pa_subject_compat(focus["subject"], ra["subject"]):
+                    return "orthogonal"
     return None
 
 
@@ -2267,10 +2310,17 @@ def select_and_budget_for_injection(
                     kwargs.pop("query", None)
                     kwargs.pop("cross_rerank", None)
                     kwargs.pop("_state_hazard_hint", None)
+                    # Issue #530 AC3: the bridged zero-hit fallback must apply
+                    # the same prompt-assertion partition as the query lane.
+                    # Pass the bridged text as _pa_query so partition, gate,
+                    # rescue and diagnostics run in one place (not after
+                    # delivery).
+                    _bridged_text_saved = effective_query if effective_query.strip() else None
                     effective_query = ""
                     if effective_min_confidence is None:
                         effective_min_confidence = inject_recent_floor()
                     kwargs["min_confidence"] = effective_min_confidence
+                    kwargs["_pa_query"] = _bridged_text_saved
                     recall_module.recent_memory(conn, **kwargs)
         else:
             recall_module.recent_memory(conn, **kwargs)

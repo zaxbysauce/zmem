@@ -9,6 +9,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Prompt-assertion partition: sentence-scoped negation, multi-focus orthogonal drop, moment allow-list, rescue count after admission** (issue #530).
+  The partition now splits a stored row into sentences before applying
+  negation/hypothetical gating. Multi-focus prompts apply the orthogonal
+  drop per the documented rule. The partition runs only on documented
+  moments (`user_prompt`, `subagent`); `pretool` is refused by an allow-list.
+  The bridged zero-hit fallback applies the same partition. Rescue count
+  (`attribute_rescued`) is computed from delivered rows only.
+
+- **Post-stamp content_norm heal lane now heals undecodable non-NULL norms** (issue #538).
+  The heal lane previously skipped a non-NULL `content_norm` whose bytes
+  were not valid UTF-8. It now compares raw bytes for both cells and both
+  storage classes, healing the row to the canonical normalize of its content.
+
 - **Stale non-NULL content_norm rows now heal on every open** (issue #533).
   The one-shot 163 verification lane's stamped early return left a STALE
   non-NULL `content_norm` row planted by a raw external sqlite3 writer

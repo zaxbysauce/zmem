@@ -320,9 +320,9 @@ class CombinedLaneInventoryTest(unittest.TestCase):
             "content_norm contract (skip semantics shared with the 163 and "
             "NULL lanes)")
         self.assertEqual(
-            vals[rid_bad_norm], b"\xff\xfe nope",
-            "an undecodable NON-NULL norm stays outside the contract too — "
-            "skipped, never conflated with SQL NULL")
+            vals[rid_bad_norm], normalize_content("valid body").encode(),
+            "an undecodable NON-NULL norm is now healed to the canonical "
+            "normalize of its (valid) content (issue #538 AC8)")
         self.assertEqual(
             vals[rid_repairable], normalize_content("repair me").encode(),
             "the repairable stale row in the SAME batch still heals — an "
