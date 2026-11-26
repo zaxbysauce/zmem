@@ -40,7 +40,7 @@ REDACTED_SECRET = "[REDACTED_SECRET]"
 # boundaries would redact benign SHAs adjacent to non-ASCII text (issue #502
 # over-redaction direction).
 SECRET_CREDENTIAL_PATTERNS = [
-    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|private[_-]?key)\s*[:=]\s*(\S{8,})"),
+    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|pass|private[_-]?key)\s*[:=]\s*(\S{8,})"),
     # Authorization headers occur in prompts, rendered fences, and operation
     # transcripts.  Keep this ahead of the generic token patterns so the whole
     # credential (rather than an arbitrary suffix) is replaced consistently.
@@ -50,6 +50,16 @@ SECRET_CREDENTIAL_PATTERNS = [
     # be outside the credential alphabet so the greedy match consumes the
     # complete token while still respecting ordinary delimiters.
     re.compile(r"(?i)(?<![A-Za-z0-9_])Bearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])"),
+    # RFC 7617 Basic scheme (issue #502): the scheme word is case-insensitive
+    # through an inline-scoped group (the #180 command-pattern convention), the
+    # value classes are CASE-SENSITIVE, and two case-sensitive lookaheads
+    # require at least one uppercase-or-digit AND one lowercase char in the
+    # value, so all-lowercase prose ("Basic authentication", "Basic password")
+    # survives while a real base64 user:pass blob matches. Known disclosed gap:
+    # an all-lowercase, digit-free base64 credential survives (same disclosure
+    # class as the #537 IGNORECASE fold gap). Whole-match semantics like
+    # Bearer; the alphabet-boundary convention is copied verbatim.
+    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+(?=[A-Za-z0-9._+/=~-]*[0-9A-Z])(?=[A-Za-z0-9._+/=~-]*[a-z])[A-Za-z0-9._+/=~-]{8,}(?![A-Za-z0-9._+/=~-])"),
     # PEM: prefer the FULL block (BEGIN..END, whole-match) so the body dies
     # with the header; the header-only shape remains as fallback for a
     # truncated paste. Both are non-capturing so no group logic can misfire.
@@ -72,6 +82,49 @@ SECRET_GENERIC_PATTERNS = [
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
     re.compile(r"\b[0-9a-fA-F]{32,}\b"),
 ]
+
+# Issue #502 identifier-context calibration: a generic-pattern match whose
+# preceding text (same line, up to 48 chars back, stopping at any caller-
+# supplied field-join boundary) labels the run as a verifiable identifier
+# (release/commit/object checksum contexts) is EXEMPT from redaction — the
+# value is shape-identical to a secret but verifiable, and destroying it is
+# the data-loss half of #502. The fail-safe net stays: an UNLABELED run still
+# redacts (frozen corpus entry `unlabeled-hex-run`). Credential/command/
+# value-span patterns are NEVER exempted — a Bearer token after the word
+# "release" still dies.
+_GENERIC_PATTERNS = frozenset(SECRET_GENERIC_PATTERNS)
+_IDENTIFIER_CONTEXT_RE = re.compile(
+    r"(?i)(?:\b(?:release|commit|revision|object|blob|digest|tag|md5|sha1|sha256|sha512)\b\s*[:=]?"
+    r"|\bbuild\s+id\b)\s*$"
+)
+
+
+def is_identifier_context_match(
+    text: str, match_start: int, boundary: int | None = None,
+) -> bool:
+    """True when the text before ``match_start`` labels the run as a benign,
+    verifiable identifier (issue #502 calibration).
+
+    The window is the same-line text ending at ``match_start`` (at most 48
+    chars back). ``boundary``, when given, is a field-join offset (the
+    content|source_ref|tags join in ``write._check_secrets``): the window
+    never crosses it, so an identifier keyword ending one field can never
+    exempt a value in the next field. ``None`` (the redaction loop's single
+    texts) imposes no join.
+    """
+    if match_start <= 0:
+        return False
+    window_start = max(0, match_start - 48)
+    if boundary is not None:
+        window_start = max(window_start, boundary)
+    prefix = text[window_start:match_start]
+    if "\n" in prefix:
+        prefix = prefix[prefix.rfind("\n") + 1:]
+    # ``search`` + the ``$`` anchor: the keyword may sit anywhere in the
+    # window as long as only optional ``:/=`` and whitespace separate it from
+    # the match start (``match`` would wrongly demand it at the window's
+    # beginning — "Deployed release <sha>" has leading prose).
+    return bool(_IDENTIFIER_CONTEXT_RE.search(prefix))
 
 # Issue #180 command and URL credential shapes. Case-insensitivity is scoped
 # with inline groups to the COMMAND NAME / URL SYNTAX only — option letters
@@ -271,6 +324,7 @@ def _value_span_replacement(match: "re.Match[str]") -> str:
 def _redact_secret_like_text_with_positions(
     text: str,
     positions: list[int],
+    exempt_values: frozenset[str] = frozenset(),
 ) -> tuple[str, int, list[int]]:
     """Redact with the canonical pattern sequence and map selected positions.
 
@@ -279,6 +333,11 @@ def _redact_secret_like_text_with_positions(
     character of an otherwise valid 8 MiB record.  A position inside a
     redacted value maps to the replacement marker's start; callers therefore
     never search a marker that might itself contain their literal.
+
+    ``exempt_values`` (issue #502 repair durability) suppresses detection AND
+    redaction for GENERIC-pattern matches whose text is an exact verified
+    value — the repair lane's row-scoped exemption. Credential/command/
+    value-span patterns are never exempted by it.
     """
     redacted = text or ""
     mapped = list(positions)
@@ -291,9 +350,19 @@ def _redact_secret_like_text_with_positions(
         cursor = 0
         delta = 0
         for match in pattern.finditer(redacted):
-            replacement = (_value_span_replacement(match)
-                           if pattern in _VALUE_SPAN_PATTERNS
-                           else REDACTED_SECRET)
+            if (pattern in _GENERIC_PATTERNS
+                    and (match.group(0) in exempt_values
+                         or is_identifier_context_match(redacted, match.start()))):
+                # Calibrated identifier or verified repair value: the match is
+                # "not a secret" — the bytes pass through unchanged and the
+                # detection count does not increase.
+                replacement = match.group(0)
+                counted = False
+            else:
+                replacement = (_value_span_replacement(match)
+                               if pattern in _VALUE_SPAN_PATTERNS
+                               else REDACTED_SECRET)
+                counted = True
             while (target_index < len(ordered)
                    and ordered[target_index][1] < match.start()):
                 index, position = ordered[target_index]
@@ -321,7 +390,8 @@ def _redact_secret_like_text_with_positions(
             chunks.append(replacement)
             cursor = match.end()
             delta += len(replacement) - (match.end() - match.start())
-            count += 1
+            if counted:
+                count += 1
         while target_index < len(ordered):
             index, position = ordered[target_index]
             next_mapped[index] = position + delta
@@ -333,15 +403,21 @@ def _redact_secret_like_text_with_positions(
     return redacted, count, mapped
 
 
-def redact_secret_like_text(text: str) -> tuple[str, int]:
+def redact_secret_like_text(
+    text: str, exempt_values: frozenset[str] = frozenset(),
+) -> tuple[str, int]:
     """Replace secret-like VALUES with ``[REDACTED_SECRET]``.
 
     Value-span patterns rewrite only the captured value; everything else
     keeps the historical whole-match replacement. Returns
     ``(redacted_text, detection_count)``; the count includes matches whose
-    value was already the marker (idempotent no-ops).
+    value was already the marker (idempotent no-ops). ``exempt_values``
+    (issue #502 repair durability) suppresses detection AND redaction for
+    GENERIC-pattern matches whose text is an exact verified value; the
+    default keeps every caller's behavior byte-identical.
     """
-    redacted, count, _positions = _redact_secret_like_text_with_positions(text, [])
+    redacted, count, _positions = _redact_secret_like_text_with_positions(
+        text, [], exempt_values=exempt_values)
     return redacted, count
 
 

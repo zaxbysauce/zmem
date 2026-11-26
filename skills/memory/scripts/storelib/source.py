@@ -140,8 +140,20 @@ def _memory(conn: sqlite3.Connection, memory_id: str) -> tuple[sqlite3.Row, str]
     return row, namespace
 
 
-def _evidence(conn: sqlite3.Connection, memory_id: str) -> list[sqlite3.Row]:
-    """An orphan association is an evidence failure, never a fallback trigger."""
+def _evidence(
+    conn: sqlite3.Connection, memory_id: str, evidence_id: str | None = None,
+) -> tuple[list[sqlite3.Row], sqlite3.Row | None]:
+    """Resolve a memory's evidence associations and the anchor to use.
+
+    Issue #512: the FULL association list is always returned (never filtered
+    to the selection); ``evidence_id`` only picks WHICH anchor resolves. The
+    #139 invariants hold: an orphan association is an evidence failure, never
+    a fallback trigger; a multi-anchor memory without an explicit selector
+    refuses with a structured ambiguity naming every candidate (never a
+    silent pick); a selector that is not associated with the memory refuses.
+    A single-anchor memory keeps the historical behavior (its sole row is the
+    anchor); an evidence-less memory returns ([], None).
+    """
     rows = conn.execute(
         "SELECT me.evidence_id,e.id,e.session_id,e.lane,e.ts,e.excerpt,e.ref_path,e.ref_offset "
         "FROM memory_evidence me LEFT JOIN evidence e ON e.id=me.evidence_id "
@@ -149,11 +161,21 @@ def _evidence(conn: sqlite3.Connection, memory_id: str) -> list[sqlite3.Row]:
     if any(row[1] is None for row in rows):
         raise SourceRefusal("source unavailable")
     if not rows:
-        return []
+        return [], None
     anchors = {(r[2], r[3], r[4], r[5], r[6], r[7]) for r in rows}
-    if len(anchors) != 1:
-        raise SourceRefusal("source unavailable")
-    return rows
+    if len(anchors) == 1:
+        return rows, rows[0]
+    if evidence_id is not None:
+        for row in rows:
+            if str(row[0]) == str(evidence_id):
+                return rows, row
+        named = ", ".join(str(r[0]) for r in rows)
+        raise SourceRefusal(
+            f"evidence id {evidence_id!r} is not associated with this memory "
+            f"(associated: {named})")
+    named = ", ".join(str(r[0]) for r in rows)
+    raise SourceRefusal(
+        "ambiguous anchors: pass --evidence-id one of " + named)
 
 
 def _inside(root: Path, candidate: Path) -> bool:
@@ -393,26 +415,153 @@ def _hermes(ref: str, anchor: sqlite3.Row, context: int) -> tuple[str, dict[str,
     return excerpt, {"session_id": session, "turn_start": rows[0]["id"], "turn_end": rows[-1]["id"], "byte_start": None, "byte_end": None, "returned": len(rows), "truncated": before < context or after < context, "kind": "hermes_session"}, scan_rows
 
 
-def _resolved(conn: sqlite3.Connection, memory_id: str, context: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+_SOURCE_ROOT_ENV = "ZMEM_SOURCE_ROOT"
+
+
+def _source_root() -> Path:
+    """The trusted project-file root for #512 passage verification."""
+    raw = os.environ.get(_SOURCE_ROOT_ENV, "").strip()
+    if not raw:
+        raise SourceRefusal("source unavailable")
+    return Path(raw)
+
+
+def _safe_ref_allowed(ref: str) -> bool:
+    """A bare relative filename that _safe_ref would accept (no separators,
+    drives, schemes, or parent segments) — the shape a project-file ref must
+    have."""
+    try:
+        _safe_ref(ref)
+    except SourceRefusal:
+        return False
+    return True
+
+
+def _project_file_path(ref: str) -> Path:
+    """Resolve a bare relative evidence ref under the trusted source root."""
+    root = _source_root()
+    candidate = root / ref
+    try:
+        if candidate.parent.resolve(strict=True) != root.resolve(strict=True):
+            raise SourceRefusal("source unavailable")
+    except OSError as exc:
+        raise SourceRefusal("source unavailable") from exc
+    if not is_safe_regular_path(candidate):
+        raise SourceRefusal("source unavailable")
+    try:
+        if candidate.stat().st_size > MAX_SOURCE_FILE_BYTES:
+            raise SourceRefusal("source unavailable")
+    except OSError as exc:
+        raise SourceRefusal("source unavailable") from exc
+    return candidate
+
+
+def _project_file_lines(path: Path) -> list[str]:
+    try:
+        raw = path.read_bytes()
+        raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SourceRefusal("source unavailable") from exc
+    return _normalise(raw.decode("utf-8")).splitlines()
+
+
+def _verification_outcome(
+    anchor: sqlite3.Row, ref_path: str,
+) -> dict[str, Any] | None:
+    """Verify the selected evidence row's quoted passage against the CURRENT
+    bytes of its quoted project file (issue #512 AC3).
+
+    Outcome vocabulary: ``exact`` (verbatim line present at the recorded
+    0-based ``ref_offset``), ``relocated`` (present exactly once elsewhere),
+    ``ambiguous`` (multiple distinct occurrences), ``missing`` (absent).
+    Returns None for anchors that do not resolve to a project file under
+    ZMEM_SOURCE_ROOT — no fabricated outcome for transcript/zcode/hermes
+    kinds. Outcomes are REPORTS; only trust-boundary failures refuse.
+    """
+    try:
+        path = _project_file_path(ref_path)
+    except SourceRefusal:
+        return None
+    lines = _project_file_lines(path)
+    excerpt = str(anchor[5] or "")
+    quoted = excerpt.strip().splitlines()[0].strip() if excerpt.strip() else ""
+    if not quoted:
+        return None
+    hits = [i for i, line in enumerate(lines) if line.strip() == quoted]
+    selected = anchor[7] if anchor[7] is not None else -1
+    if not hits:
+        outcome = "missing"
+    elif len(hits) > 1:
+        outcome = "ambiguous"
+    elif selected >= 0 and hits[0] == selected:
+        outcome = "exact"
+    else:
+        outcome = "relocated"
+    return {"outcome": outcome, "evidence_id": str(anchor[0])}
+
+
+def _project_file_window(path: Path, anchor: sqlite3.Row, context: int) -> str:
+    """Render the project file's lines around the recorded offset (issue
+    #512 AC3): normalized, redacted, context-windowed."""
+    lines = _project_file_lines(path)
+    offset = anchor[7] if anchor[7] is not None else 0
+    lo = max(0, offset - context)
+    hi = min(len(lines), offset + context + 1)
+    window = "\n".join(lines[lo:hi])
+    shown, _count, _positions = _redact_secret_like_text_with_positions(window, [])
+    return shown
+
+
+def _resolved(
+    conn: sqlite3.Connection, memory_id: str, context: int,
+    evidence_id: str | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if not isinstance(context, int) or isinstance(context, bool) or not 0 <= context <= MAX_CONTEXT:
         raise ValueError("--context must be between 0 and 20")
-    memory, namespace = _memory(conn, memory_id); evidence = _evidence(conn, memory_id); anchor = evidence[0] if evidence else None
+    memory, namespace = _memory(conn, memory_id)
+    evidence, anchor = _evidence(conn, memory_id, evidence_id=evidence_id)
     ref = _safe_ref(anchor[6] if anchor else memory[2])
-    if ref.startswith("zcode:"):
-        if anchor is None: raise SourceRefusal("source unavailable")
-        excerpt, detail, scan_rows = _zcode(ref, anchor, context)
-    elif ref.startswith("hermes:"):
-        if anchor is None: raise SourceRefusal("hermes_db_unavailable")
-        excerpt, detail, scan_rows = _hermes(ref, anchor, context)
-    else:
-        path, kind = _configured_file(ref); excerpt, detail, scan_rows = _file_window(path, kind, anchor=anchor, context=context)
-        detail["kind"] = kind if kind == "hermes_session" else ("evidence" if anchor else kind)
+    verification = None
+    resolved_project_file = False
+    excerpt = ""
+    detail: dict[str, Any] = {}
+    scan_rows: list[dict[str, Any]] = []
+    if anchor is not None:
+        raw_ref = str(anchor[6] or "")
+        if os.environ.get(_SOURCE_ROOT_ENV, "").strip() and _safe_ref_allowed(raw_ref):
+            try:
+                path = _project_file_path(raw_ref)
+            except SourceRefusal:
+                path = None
+            if path is not None:
+                excerpt = _project_file_window(path, anchor, context)
+                detail = {"session_id": None, "turn_start": None,
+                          "turn_end": None, "byte_start": None,
+                          "byte_end": None, "returned": 1, "truncated": False,
+                          "kind": "project_file"}
+                verification = _verification_outcome(anchor, raw_ref)
+                resolved_project_file = True
+    if not resolved_project_file:
+        if ref.startswith("zcode:"):
+            if anchor is None: raise SourceRefusal("source unavailable")
+            excerpt, detail, scan_rows = _zcode(ref, anchor, context)
+        elif ref.startswith("hermes:"):
+            if anchor is None: raise SourceRefusal("hermes_db_unavailable")
+            excerpt, detail, scan_rows = _hermes(ref, anchor, context)
+        else:
+            path, kind = _configured_file(ref); excerpt, detail, scan_rows = _file_window(path, kind, anchor=anchor, context=context)
+            detail["kind"] = kind if kind == "hermes_session" else ("evidence" if anchor else kind)
     result = {"memory_id": str(memory[0]), "namespace": str(memory[1]), "source_ref": str(memory[2]), "evidence_ids": [str(r[0]) for r in evidence], "source_kind": detail["kind"], "source_path": ref, "session_id": detail["session_id"], "capture_time": anchor[4] if anchor else None, "turn_start": detail["turn_start"], "turn_end": detail["turn_end"], "byte_start": detail["byte_start"], "byte_end": detail["byte_end"], "context_requested": context, "context_returned": detail["returned"], "truncated": bool(detail["truncated"]), "truncated_reason": "context_bound" if detail["truncated"] else None, "excerpt_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(), "excerpt": excerpt}
+    if verification is not None:
+        result["verification"] = verification
     return result, scan_rows
 
 
-def show(conn: sqlite3.Connection, memory_id: str, context: int = 2) -> dict[str, Any]:
-    return _resolved(conn, memory_id, context)[0]
+def show(
+    conn: sqlite3.Connection, memory_id: str, context: int = 2,
+    evidence_id: str | None = None,
+) -> dict[str, Any]:
+    return _resolved(conn, memory_id, context, evidence_id=evidence_id)[0]
 
 
 def _normalise_with_byte_boundaries(original: str) -> tuple[str, list[int]]:
@@ -481,11 +630,320 @@ def scan(conn: sqlite3.Connection, memory_id: str, needle: str) -> dict[str, Any
     return {"memory_id": memory_id, "session_id": shown["session_id"], "source_path": shown["source_path"], "needle": needle, "matches": matches, "match_count": total, "truncated": total > MAX_SCAN_MATCHES, "truncated_reason": "match_limit" if total > MAX_SCAN_MATCHES else None}
 
 
-def source_show(conn: sqlite3.Connection, *, memory_id: str, context: int = 2) -> dict[str, Any]:
+def source_show(
+    conn: sqlite3.Connection, *, memory_id: str, context: int = 2,
+    evidence_id: str | None = None,
+) -> dict[str, Any]:
     """Public, keyword-only source show API retained by ``storelib``."""
-    return show(conn, memory_id, context)
+    return show(conn, memory_id, context, evidence_id=evidence_id)
 
 
 def source_scan(conn: sqlite3.Connection, *, memory_id: str, needle: str) -> dict[str, Any]:
     """Public, keyword-only literal scan API retained by ``storelib``."""
     return scan(conn, memory_id, needle)
+
+
+# --- issue #512: scope-aware revision resolution --------------------------------
+
+_GLOBAL_SCOPE_KEYS = ("global", "user:global")  # schema.GLOBAL_NAMESPACE
+
+
+def _scope_key(scope: str) -> str:
+    """Equal-breadth global aliases (issue #512 review round 4): the literal
+    ``global`` and the store's real ``user:global`` normalize to ONE key so
+    neither is narrower than the other."""
+    if scope in _GLOBAL_SCOPE_KEYS:
+        return "global"
+    return scope
+
+
+def _scope_narrower(scope: str, other: str) -> bool:
+    """True iff ``scope`` is strictly NARROWER than ``other``: different
+    (normalized) scopes where ``other`` is a global alias or ``scope``
+    descends from ``other`` by the ``other:`` prefix convention."""
+    s_key, o_key = _scope_key(scope), _scope_key(other)
+    if s_key == o_key:
+        return False
+    return o_key == "global" or scope.startswith(other + ":")
+
+
+def resolve_revision(
+    conn: sqlite3.Connection, *, revision_of: str, scope: str,
+    expected_namespace: str | None = None, reason: str = "",
+) -> dict[str, Any]:
+    """Scope-aware approved-revision tombstone (issue #512 AC4).
+
+    Row-factory-agnostic: all reads/writes use positional tuples and explicit
+    column lists, so a plain ``sqlite3.connect`` connection works. Transaction
+    ownership mirrors ``supersede_memory``: ``BEGIN IMMEDIATE`` only when the
+    caller's connection is not already in a transaction (owned — this call
+    commits or rolls back); a caller-owned transaction is JOINED (this call
+    never commits or rolls back the caller's work; the result reports what
+    THIS call wrote). The tombstone preserves the full supersede invariant
+    set, positionally: the knowledge-pointer refusal, the paired
+    superseded_at/valid_until columns, an optional ``supersede_reason``, the
+    mutation-generation bump, optional ``memory_vec`` cleanup, and expiry-row
+    cleanup (``_clear_expiry``).
+
+    Authorization: refused (no mutation, ``refused_ids=[target]``) when the
+    target is missing, already superseded, a reserved knowledge-pointer row,
+    or its namespace is strictly narrower than ``scope``. ``expected_namespace``
+    (when given) joins the SAME conditional UPDATE — atomic with the
+    tombstone, no read-then-write rekey race.
+
+    Result: ``{"outcome": "retained_exception"|"superseded"|
+    "refused_unauthorized", "superseded_ids": [...], "retained_ids": [...],
+    "refused_ids": [...]}`` where ``retained_ids`` lists the LIVE rows whose
+    namespace is strictly narrower than the TARGET's namespace (collected
+    inside the transaction, atomic with the tombstone).
+    """
+    from storelib.generation import bump_mutation_generation
+
+    def _refused(reason_text: str, owns_tx: bool) -> dict[str, Any]:
+        if owns_tx and conn.in_transaction:
+            conn.rollback()
+        return {"outcome": "refused_unauthorized", "superseded_ids": [],
+                "retained_ids": [], "refused_ids": [revision_of],
+                "reason": reason_text}
+
+    owns_tx = not conn.in_transaction
+    if owns_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        target = conn.execute(
+            "SELECT id, namespace, superseded_at, source_ref FROM memory "
+            "WHERE id=?", (revision_of,)).fetchone()
+        if target is None:
+            return _refused("unknown memory id", owns_tx)
+        t_id, t_ns, t_superseded, t_source_ref = (
+            target[0], target[1], target[2], target[3])
+        if t_superseded is not None:
+            return _refused("already superseded", owns_tx)
+        if _has_knowledge_prefix(t_source_ref or ""):
+            return _refused("reserved knowledge-pointer row", owns_tx)
+        if expected_namespace is not None and t_ns != expected_namespace:
+            return _refused("namespace guard mismatch", owns_tx)
+        if _scope_narrower(t_ns, scope):
+            return _refused(
+                "target scope is narrower than the revision's scope", owns_tx)
+
+        now = _revision_now()
+        cursor = conn.execute(
+            "UPDATE memory SET superseded_at=?, valid_until=?, "
+            "supersede_reason=? WHERE id=? AND superseded_at IS NULL "
+            "AND namespace=?",
+            (now, now, reason or "approved revision (issue #512)",
+             revision_of, t_ns))
+        if cursor.rowcount == 0:
+            # Concurrent tombstone/rekey won the race: nothing written.
+            return _refused("concurrent mutation won the race", owns_tx)
+
+        bump_mutation_generation(conn)
+        _clear_expiry(conn, revision_of)
+        _clear_vec_row(conn, revision_of)
+
+        retained: list[str] = []
+        for row in conn.execute(
+            "SELECT id, namespace FROM memory "
+            "WHERE superseded_at IS NULL AND id != ?",
+            (revision_of,)).fetchall():
+            if _scope_narrower(row[1], t_ns):
+                retained.append(str(row[0]))
+
+        if owns_tx:
+            conn.commit()
+        outcome = "retained_exception" if retained else "superseded"
+        return {"outcome": outcome, "superseded_ids": [str(t_id)],
+                "retained_ids": retained, "refused_ids": []}
+    except BaseException:
+        if owns_tx and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _revision_now() -> str:
+    """UTC timestamp for tombstone columns (append-only history)."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _clear_vec_row(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Remove the optional ``memory_vec`` row (vector support is optional —
+    an FTS-only store has no such table, and a store whose vec0 module is
+    unloadable must not fail either; mirrors supersede_memory's guard)."""
+    has_vec = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_vec'"
+    ).fetchone()
+    if has_vec:
+        try:
+            conn.execute("DELETE FROM memory_vec WHERE memory_id=?",
+                         (memory_id,))
+        except sqlite3.OperationalError:
+            pass  # vec0 table not available (module unloadable)
+
+
+def _clear_expiry(conn: sqlite3.Connection, memory_id: str) -> None:
+    """Clear the target's expiry rows (same cleanup ``supersede_memory``
+    performs)."""
+    has_expiry = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='memory_expiry'").fetchone()
+    if has_expiry:
+        conn.execute("DELETE FROM memory_expiry WHERE memory_id=?",
+                     (memory_id,))
+
+
+def _has_knowledge_prefix(source_ref: str) -> bool:
+    """Reserved knowledge-pointer rows never tombstone through this path."""
+    from storelib.write import _has_knowledge_prefix as _impl
+    return _impl(source_ref)
+
+
+# --- issue #502: evidence-backed repair -----------------------------------------
+
+_HEX_40_64_RE = re.compile(r"\b[0-9a-fA-F]{40}\b|\b[0-9a-fA-F]{64}\b")
+MARKER = "[REDACTED_SECRET]"
+
+
+def repair_from_evidence(
+    conn: sqlite3.Connection, *, memory_id: str, evidence_id: str,
+    mode: str,
+) -> dict[str, Any]:
+    """Restore a verified object identifier from linked evidence (issue #502
+    AC2).
+
+    ``mode`` is ``"preview"`` (no write of any kind) or ``"apply"`` (ONE
+    transaction with the full derived-state set). Refusals raise
+    :class:`SourceRefusal` with operator-safe detail; the caller maps them to
+    ``[zmem] source repair: refused`` and NOTHING is written.
+
+    Alignment (under the apply lock for apply; point-in-time for preview):
+    the excerpt must carry EXACTLY ONE hex-run candidate occurrence; the
+    aligned text (excerpt with the candidate replaced by the marker) must
+    occur EXACTLY ONCE in the CURRENT stored content. Zero -> changed
+    quotation; >1 candidates or occurrences -> ambiguous. The candidate must
+    verify as an object in the evidence-selected local git repository
+    (`rev-parse --show-toplevel` must equal the selected path; then
+    `cat-file -t` must exit 0).
+    """
+    import subprocess as _subprocess
+
+    if mode not in ("preview", "apply"):
+        raise SourceRefusal(f"unknown repair mode: {mode!r}")
+
+    memory_row, _namespace = _memory(conn, memory_id)
+    if _has_knowledge_prefix(str(memory_row[2] or "")):
+        # R6-4: pointer content is authoritative versioned payload mutated
+        # only through the knowledge handler's CAS transaction. (Positional
+        # index 2 = source_ref; _memory returns (row, namespace).)
+        raise SourceRefusal("reserved knowledge-pointer row")
+    _rows, anchor = _evidence(conn, memory_id, evidence_id=evidence_id)
+    if anchor is None:
+        raise SourceRefusal("memory has no evidence to repair from")
+    excerpt = str(anchor[5] or "")
+    ref_path = str(anchor[6] or "")
+
+    candidates = list(dict.fromkeys(_HEX_40_64_RE.findall(excerpt)))
+    if len(candidates) != 1:
+        raise SourceRefusal(
+            "evidence excerpt must quote exactly one verifiable identifier")
+    candidate = candidates[0]
+    alignment_text = excerpt.replace(candidate, MARKER)
+
+    repair_root = os.environ.get("ZMEM_REPAIR_ROOT", "").strip()
+    if not repair_root:
+        raise SourceRefusal("ZMEM_REPAIR_ROOT is not set")
+    repo_dir = Path(repair_root) / ref_path
+
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return _subprocess.run(
+            ["git", "-C", str(repo_dir), *args],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace")
+
+    probe = _git("rev-parse", "--show-toplevel")
+    if probe.returncode != 0:
+        raise SourceRefusal("ref_path is not a repository")
+    try:
+        toplevel = Path(probe.stdout.strip()).resolve()
+    except OSError as exc:
+        raise SourceRefusal("ref_path is not a repository") from exc
+    if toplevel != repo_dir.resolve():
+        raise SourceRefusal("ref_path is not a repository")
+
+    cat = _git("cat-file", "-t", candidate)
+    if cat.returncode != 0:
+        raise SourceRefusal(
+            "restored value is not an object in the evidence-linked "
+            "repository")
+
+    if mode == "preview":
+        return {"memory_id": memory_id, "evidence_id": evidence_id,
+                "mode": "preview", "restore_value": candidate,
+                "verified": True, "applied": False}
+
+    # APPLY: under the write lock, re-read content and re-run alignment
+    # (Round-5 critic: alignment runs against the LOCKED content — a
+    # concurrent first repair makes a same-span second repair refuse).
+    owns_tx = not conn.in_transaction
+    if owns_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT content FROM memory WHERE id=? AND superseded_at IS NULL",
+            (memory_id,)).fetchone()
+        if row is None:
+            raise SourceRefusal("memory vanished before apply")
+        content = row[0] or ""
+        occurrences = content.count(alignment_text)
+        if occurrences == 0:
+            raise SourceRefusal("changed quotation: evidence no longer "
+                                "matches the stored redacted context")
+        if occurrences > 1:
+            raise SourceRefusal("ambiguous target: the aligned quotation "
+                                "occurs more than once in the stored content")
+        # Replace ONLY the marker span inside the aligned occurrence: the
+        # aligned text carries exactly one marker; swap it for the verified
+        # value.
+        first = content.find(alignment_text)
+        repaired_span = alignment_text.replace(MARKER, candidate, 1)
+        new_content = content[:first] + repaired_span + content[
+            first + len(alignment_text):]
+        if new_content == content:
+            raise SourceRefusal("repair would not change the stored content")
+
+        from schema_meta import normalize_content  # the store's own normalizer
+        from storelib.generation import bump_mutation_generation
+        now = _revision_now()
+        conn.execute(
+            "UPDATE memory SET content=?, content_norm=?, embedding=NULL, "
+            "embedding_model=NULL, embedded_at=NULL WHERE id=?",
+            (new_content, normalize_content(new_content), memory_id))
+        _clear_vec_row(conn, memory_id)
+        bump_mutation_generation(conn)
+        # Accumulating provenance record (one row can need several
+        # independent repairs — one evidence row per span).
+        import json as _json
+        rec = conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (f"source_repair:{memory_id}",)).fetchone()
+        try:
+            entries = _json.loads(rec[0]) if rec is not None else []
+            if not isinstance(entries, list):
+                entries = []
+        except (TypeError, ValueError):
+            entries = []
+        entries.append({"memory_id": memory_id, "evidence_id": evidence_id,
+                        "restored": candidate, "at": now})
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            (f"source_repair:{memory_id}", _json.dumps(entries)))
+        if owns_tx:
+            conn.commit()
+        return {"memory_id": memory_id, "evidence_id": evidence_id,
+                "mode": "apply", "restore_value": candidate,
+                "verified": True, "applied": True}
+    except BaseException:
+        if owns_tx and conn.in_transaction:
+            conn.rollback()
+        raise

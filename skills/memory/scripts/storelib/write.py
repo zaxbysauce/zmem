@@ -301,6 +301,8 @@ try:
         SECRET_COMMAND_PATTERNS,
         SECRET_PATTERNS,
         SECRET_REFUSAL_PATTERNS,
+        _GENERIC_PATTERNS,
+        is_identifier_context_match,
         redact_secret_like_text as _shared_redact_secret_like_text,
     )
 except ImportError:
@@ -310,6 +312,8 @@ except ImportError:
         SECRET_COMMAND_PATTERNS,
         SECRET_PATTERNS,
         SECRET_REFUSAL_PATTERNS,
+        _GENERIC_PATTERNS,
+        is_identifier_context_match,
         redact_secret_like_text as _shared_redact_secret_like_text,
     )
 
@@ -409,12 +413,44 @@ class WriteResult(str):
         return obj
 
 
-def _check_secrets(content: str, source_ref: str, tags: str = "") -> list[str]:
+def _check_secrets(content: str, source_ref: str, tags: str = "",
+                   exempt_values: frozenset[str] = frozenset()) -> list[str]:
     """Advisory only. Returns list of warnings. Never blocks. Scans both content
-    source_ref, and tags (a token in metadata would otherwise slip through)."""
+    source_ref, and tags (a token in metadata would otherwise slip through).
+
+    Issue #502 calibration: GENERIC patterns scan ALL matches and warn on the
+    FIRST NON-EXEMPT one (an exempt first value never hides a later unlabeled
+    one); a match is exempt when its text is a caller-verified repaired value
+    (``exempt_values``, the repair lane's row-scoped durability exemption) or
+    when its preceding text labels it as a verifiable identifier. The
+    identifier-context window never crosses a field join: the boundary passed
+    to :func:`redaction.is_identifier_context_match` is the start of the field
+    the match sits in (content | source_ref | tags), so a keyword ending one
+    field can never exempt a value in the next. Non-generic patterns keep the
+    historical first-match-on-the-combined-string behavior and the registry
+    order, so the warning list shape is unchanged.
+    """
     warnings = []
     combined = " ".join((content, source_ref, tags))
+    source_ref_start = len(content) + 1
+    tags_start = source_ref_start + len(source_ref) + 1
     for pat in SECRET_PATTERNS:
+        if pat in _GENERIC_PATTERNS:
+            for m in pat.finditer(combined):
+                if m.group(0) in exempt_values:
+                    continue
+                pos = m.start()
+                if pos < source_ref_start:
+                    boundary = 0
+                elif pos < tags_start:
+                    boundary = source_ref_start
+                else:
+                    boundary = tags_start
+                if is_identifier_context_match(combined, pos, boundary=boundary):
+                    continue
+                warnings.append(f"possible secret-like text matched pattern {pat.pattern[:40]!r}: {m.group(0)[:20]!r}...")
+                break
+            continue
         m = pat.search(combined)
         if m:
             warnings.append(f"possible secret-like text matched pattern {pat.pattern[:40]!r}: {m.group(0)[:20]!r}...")
@@ -543,8 +579,10 @@ def warn_reserved_source_ref(source_ref: str | None) -> None:
     elif _has_knowledge_prefix(source_ref):
         print(KNOWLEDGE_SOURCE_REF_WARNING, file=sys.stderr)
 
-def _redact_secret_like_text(text: str) -> tuple[str, int]:
-    return _shared_redact_secret_like_text(text)
+def _redact_secret_like_text(
+    text: str, exempt_values: frozenset[str] = frozenset(),
+) -> tuple[str, int]:
+    return _shared_redact_secret_like_text(text, exempt_values=exempt_values)
 
 def _has_prompt_injection_risk(*values: str) -> bool:
     combined = " ".join(v for v in values if v)
@@ -620,6 +658,7 @@ def apply_capture_policy(
     source_ref: str,
     tags: str,
     capture_mode: str,
+    exempt_values: frozenset[str] = frozenset(),
 ) -> tuple[str, str, str, list[dict]]:
     """Apply capture-time redaction/labeling while preserving provenance.
 
@@ -668,7 +707,8 @@ def apply_capture_policy(
     # tags). For an allowlisted source_ref the hash-like shapes are legitimate
     # provenance, so the ref is excluded from the redaction/advisory scan;
     # credential shapes are still refused below.
-    secret_hits = _check_secrets(content, "" if allowlisted else source_ref, tags)
+    secret_hits = _check_secrets(content, "" if allowlisted else source_ref, tags,
+                                 exempt_values=exempt_values)
     if allowlisted and mode != "auto":
         # Reviewed/manual keep the original advisory contract: credential
         # shapes in an allowlisted ref stay reviewer-visible (generic
@@ -709,8 +749,10 @@ def apply_capture_policy(
         if any(p.search(combined_scan) for p in SECRET_REFUSAL_PATTERNS):
             raise _capture_refusal(REASON_UNREDACTABLE_SECRET)
     if mode == "auto" and secret_hits:
-        out_content, content_redactions = _redact_secret_like_text(content)
-        out_tags, tag_redactions = _redact_secret_like_text(tags)
+        out_content, content_redactions = _redact_secret_like_text(
+            content, exempt_values=exempt_values)
+        out_tags, tag_redactions = _redact_secret_like_text(
+            tags, exempt_values=exempt_values)
         total = content_redactions + tag_redactions
         if total <= 0:
             # Dead-man switch (PRR-001 kept AutoCaptureRuntimeError as the
@@ -2596,6 +2638,7 @@ def update_memory(
     inject_until: str | None = None,
     now: str | None = None,
     skip_dedup: bool = False,
+    exempt_values: frozenset[str] = frozenset(),
 ) -> tuple[WriteResult, bool]:
     """Append-only knowledge update (issue #59, 4.2): create a NEW live row
     that replaces ``mid``, tombstone ``mid``, and link the new row back to it
@@ -2751,6 +2794,7 @@ def update_memory(
         source_ref=source_ref_eff,
         tags=tags_eff,
         capture_mode=capture_mode,
+        exempt_values=exempt_values,
     )
     ns = _validate_namespace(conn, ns)
     # Single content-size cap, identical to add_memory (M8b / #36 M17) and
@@ -3331,17 +3375,39 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
     Dry-run performs the SELECT and the policy calls only — no BEGIN,
     INSERT, UPDATE, commit, checkpoint, FTS rebuild, or embedding work.
 
-    Apply opens ONE ``BEGIN IMMEDIATE`` after the complete candidate list
-    is known and calls ``update_memory`` once per candidate with the
-    sanitized content, tags, and source reference (all three passed
-    explicitly — None would inherit the original secret-bearing values from
-    the old row). Every call must return ``created_new=True``: a dedup fold
-    means the redaction cannot land as its own row, so the whole batch
-    rolls back and raises — an un-remediable store fails loudly instead of
-    silently skipping rows. ``update_memory`` joins the caller's open
-    transaction, so one commit lands the entire batch atomically; its human
-    progress prints are captured and routed to stderr so stdout stays a
-    single machine-readable line.
+    Issue #502 repair durability: each row's ``source_repair:<id>`` meta
+    record (written ONLY by the repair apply; validated per the trust rule —
+    entry shape ``{memory_id, evidence_id, restored, at}`` with ``restored``
+    a 40/64-hex run, ``memory_id`` equal to the row id, and ``evidence_id``
+    associated with the row) carries VERIFIED values that are exempt from
+    generic-pattern detection for that row, at candidate generation AND at
+    the applying leg. WITHOUT the exemption a rescan would re-redact a
+    repaired row and destroy the verified restoration.
+
+    Apply runs inside ONE atomic batch (issue #502 review rounds 8-9): the
+    whole batch is the failure boundary. Rescan-owned transaction: any
+    failure (fold, attach, pointer remediation) rolls back the entire
+    transaction. Caller-owned transaction: ONE apply-wide SAVEPOINT wraps
+    the complete applying leg — any failure rolls the WHOLE batch back to
+    the savepoint (the caller's pre-existing work is preserved) and the
+    failure surfaces exactly as today. COMMIT OWNERSHIP follows the
+    transaction-ownership rule: rescan-owned -> the rescan commits;
+    caller-owned -> the savepoint is released on success and NO commit is
+    issued here (the caller owns the commit). Under the write lock every
+    candidate is REVALIDATED against the CURRENT row state (content, tags,
+    source_ref, repair record) — the pre-lock snapshot is never installed;
+    a row whose re-computed delta disappeared is skipped. ``update_memory``'s
+    ``created_new`` is checked FIRST: a dedup fold is an existing keeper,
+    not a successor, and aborts the batch before any association attach or
+    repair-meta operation. On a real successor, the FULL association set is
+    attached to the successor id through ``attach_memory_evidence`` called
+    PER ID (independent idempotent calls — a single batched call would trip
+    the 256-id per-write cap), and the repair record is
+    VALIDATE-FILTER-REBOUND: only entries valid against the predecessor
+    enter the successor's record with ``memory_id`` rewritten to the
+    successor (the ONLY code that ever moves or rebinds a repair record;
+    entries ignored on the predecessor can never gain validity through a
+    move).
 
     Returns exactly ``{"mode", "rows_scanned", "rows_needing_review",
     "ids"}`` with ``ids`` covering ordinary candidates and pointer
@@ -3351,6 +3417,7 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
     unchanged.
     """
     import io as _io
+    import json as _json
 
     rows = conn.execute(
         "SELECT id, content, tags, source_ref FROM memory "
@@ -3367,15 +3434,56 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
     # case) is not a candidate and stays untouched, exactly like a clean
     # ordinary row.
     pointer_suspects: list[tuple[str, str]] = []
+
+    def _validated_repair_entries(memory_id: str) -> list[dict]:
+        """Read + validate the row's ``source_repair:<id>`` record per the
+        trust rule (shape, 40/64-hex restored value, memory_id binding,
+        evidence association). Malformed or wrongly-bound entries are
+        IGNORED — no exemption from garbage; the row then remediates
+        normally."""
+        rec = conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (f"source_repair:{memory_id}",)).fetchone()
+        if rec is None:
+            return []
+        try:
+            entries = _json.loads(rec[0])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(entries, list):
+            return []
+        assoc = {r[0] for r in conn.execute(
+            "SELECT evidence_id FROM memory_evidence WHERE memory_id=?",
+            (memory_id,)).fetchall()}
+        valid: list[dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("memory_id") != memory_id:
+                continue
+            if entry.get("evidence_id") not in assoc:
+                continue
+            restored = entry.get("restored")
+            if (not isinstance(restored, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
+                                        restored)):
+                continue
+            valid.append(entry)
+        return valid
+
     for row in rows:
         content = row["content"] or ""
         tags = row["tags"] or ""
         source_ref = row["source_ref"] or ""
         is_pointer = _has_knowledge_prefix(source_ref)
+        exempt = frozenset(
+            entry["restored"]
+            for entry in _validated_repair_entries(row["id"]))
         try:
             new_content, new_source_ref, new_tags, _warnings = (
                 apply_capture_policy(content=content, source_ref=source_ref,
-                                     tags=tags, capture_mode="auto"))
+                                     tags=tags, capture_mode="auto",
+                                     exempt_values=exempt))
         except CapturePolicyRefusal as exc:
             if is_pointer:
                 # e.g. an unredactable shape (sudo -S) in a hand-crafted
@@ -3413,12 +3521,41 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
 
     captured = _io.StringIO()
     started_tx = False
+    savepoint: str | None = None
     try:
         if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
             started_tx = True
+        else:
+            # Apply-wide atomicity (issue #502 review rounds 8-9): the whole
+            # batch is the failure boundary in a caller-owned transaction too.
+            conn.execute("SAVEPOINT rescan_secrets_batch")
+            savepoint = "rescan_secrets_batch"
         with contextlib.redirect_stdout(captured):
-            for mid, new_content, new_tags, new_source_ref in candidates:
+            for mid, _snap_content, _snap_tags, _snap_ref in candidates:
+                # Under-lock revalidation: re-read ALL policy inputs and the
+                # current repair record; the pre-lock snapshot is never
+                # installed (review rounds 5 and 8: content AND tags AND
+                # source_ref drift).
+                cur = conn.execute(
+                    "SELECT content, tags, source_ref FROM memory "
+                    "WHERE id=? AND superseded_at IS NULL", (mid,)).fetchone()
+                if cur is None:
+                    continue
+                exempt_now = frozenset(
+                    entry["restored"]
+                    for entry in _validated_repair_entries(mid))
+                new_content, new_source_ref, new_tags, _w = (
+                    apply_capture_policy(
+                        content=cur["content"] or "",
+                        source_ref=cur["source_ref"] or "",
+                        tags=cur["tags"] or "",
+                        capture_mode="auto",
+                        exempt_values=exempt_now))
+                if (new_content == (cur["content"] or "")
+                        and new_tags == (cur["tags"] or "")
+                        and new_source_ref == (cur["source_ref"] or "")):
+                    continue
                 _res, created_new = update_memory(
                     conn,
                     mid=mid,
@@ -3426,6 +3563,7 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                     tags=new_tags,
                     source_ref=new_source_ref,
                     capture_mode="auto",
+                    exempt_values=exempt_now,
                 )
                 if not created_new:
                     raise ValueError(
@@ -3433,6 +3571,29 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                         "(dedup) instead of creating its own replacement; "
                         "append-only lineage is impossible for this batch"
                     )
+                # Successor provenance: the FULL association set follows the
+                # successor (per-ID calls — a batched call would trip the
+                # 256-id per-write cap), then the repair record is
+                # VALIDATE-FILTER-REBOUND (only predecessor-valid entries;
+                # ignored entries can never gain validity through a move).
+                from storelib.evidence import attach_memory_evidence
+                successor_id = str(_res)
+                assoc_ids = [r[0] for r in conn.execute(
+                    "SELECT evidence_id FROM memory_evidence "
+                    "WHERE memory_id=?", (mid,)).fetchall()]
+                for evidence_id in assoc_ids:
+                    attach_memory_evidence(
+                        conn, memory_id=successor_id,
+                        evidence_ids=[evidence_id])
+                valid_entries = _validated_repair_entries(mid)
+                if valid_entries:
+                    rebound = [dict(entry, memory_id=successor_id)
+                               for entry in valid_entries]
+                    conn.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) "
+                        "VALUES(?, ?)",
+                        (f"source_repair:{successor_id}",
+                         _json.dumps(rebound)))
             if pointer_suspects:
                 # Lazy import: storelib.knowledge imports THIS module.
                 from storelib.knowledge import quarantine_pointer_row
@@ -3443,9 +3604,15 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                             "pointer row; the batch cannot land its "
                             "remediation"
                         )
-        _commit(conn)
+        if savepoint:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        else:
+            _commit(conn)
     except BaseException:
-        if started_tx and conn.in_transaction:
+        if savepoint and conn.in_transaction:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        elif started_tx and conn.in_transaction:
             conn.rollback()
         progress = captured.getvalue()
         if progress.strip():

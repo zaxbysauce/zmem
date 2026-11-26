@@ -1,0 +1,130 @@
+{
+  "contract": "AC1 (#502) redaction calibration corpus. Every entry is labeled with a kind and an expected outcome. 'benign' entries must pass through redact_secret_like_text byte-identical (verifiable-identifier contexts: release/commit/md5:/sha256:/object labels, version strings, short hex ids, credential-free URLs). 'credential' entries must be redacted (detection_count >= 1, text changed, credential_value substring absent from the output). The unlabeled-hex-run entry pins the fail-safe net: a 32+ hex run with NO verifiable-identifier context stays redacted.",
+  "corpus": [
+    {
+      "label": "release-sha-sentence",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "Deployed release 5f2a1b3c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f42 to prod today."
+    },
+    {
+      "label": "commit-sha-submodule",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "Pinned the vendor submodule to commit 0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f."
+    },
+    {
+      "label": "md5-labeled-context",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "artifact md5: 9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d verified before mirror sync"
+    },
+    {
+      "label": "version-string",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "Upgraded the release tool to version 2.13.0-rc.1 without incidents."
+    },
+    {
+      "label": "short-hex-build-id",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "build id 3f2a1b0c9d8e finished green on the windows lane"
+    },
+    {
+      "label": "sha256-public-artifact",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "sha256: b7e3c4a5d6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819a2b3c4d5e6f70819 matches the published checksum"
+    },
+    {
+      "label": "docs-url",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "Release notes live at https://example.com/builds/2026-11/ for the audit."
+    },
+    {
+      "label": "git-tree-object",
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "the empty tree object 4b825dc642cb6eb9a060e54bf8d69288fbee4904 is referenced by every fresh init"
+    },
+    {
+      "label": "basic-auth-short-b64",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+      "credential_value": "dXNlcjpwYXNzd29yZA=="
+    },
+    {
+      "label": "db-pass-compound-key",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "DB_PASS=Sup3rSecret!99",
+      "credential_value": "Sup3rSecret!99"
+    },
+    {
+      "label": "bearer-header",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "Authorization: Bearer abcdef1234567890ABCDEF",
+      "credential_value": "abcdef1234567890ABCDEF"
+    },
+    {
+      "label": "aws-access-key-id",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+      "credential_value": "AKIAIOSFODNN7EXAMPLE"
+    },
+    {
+      "label": "github-pat",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "ghp_16C7e42F294cA193ccE1CccB2b7a04a9D3B911Ee",
+      "credential_value": "ghp_16C7e42F294cA193ccE1CccB2b7a04a9D3B911Ee"
+    },
+    {
+      "label": "slack-bot-token",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "xoxb-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx",
+      "credential_value": "xoxb-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+    },
+    {
+      "label": "pem-header-truncated",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "-----BEGIN RSA PRIVATE KEY-----",
+      "credential_value": "-----BEGIN RSA PRIVATE KEY-----"
+    },
+    {
+      "label": "postgres-url-password",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "postgres://deploy:hunter2-secret@db.internal:5432/prod",
+      "credential_value": "hunter2-secret"
+    },
+    {
+      "label": "password-keyvalue",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "password=CorrectHorse9!",
+      "credential_value": "CorrectHorse9!"
+    },
+    {
+      "label": "sshpass-value",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "sshpass -p s3cretPASS ssh deploy@box",
+      "credential_value": "s3cretPASS"
+    },
+    {
+      "label": "unlabeled-hex-run",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "raw paste 44f0dcb1a3e5927c8b6a0d4e2f1c3b5a9d7e8f0c seen in logs",
+      "credential_value": "44f0dcb1a3e5927c8b6a0d4e2f1c3b5a9d7e8f0c"
+    }
+  ]
+}
