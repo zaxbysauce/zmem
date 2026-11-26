@@ -2719,10 +2719,12 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
     _bf_last = None
     while True:
         if _bf_last is None:
-            fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
+            fetch_sql = ("SELECT rowid, content, content_norm, "
+                         "typeof(content_norm) FROM memory "
                          "ORDER BY rowid LIMIT ?")
         else:
-            fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
+            fetch_sql = ("SELECT rowid, content, content_norm, "
+                         "typeof(content_norm) FROM memory "
                          "WHERE rowid > ? ORDER BY rowid LIMIT ?")
         try:
             rows = conn.execute(
@@ -2774,24 +2776,59 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
         # canonical value, a non-NULL norm that differs from the canonical
         # normalize of its own content wants the same canonical value. An
         # UNDECODABLE non-NULL norm (invalid UTF-8 bytes, e.g. a raw writer
-        # storing X'fffe') is SKIPPED here — never conflated with SQL NULL —
-        # as a known post-stamp gap: the 163 pass heals this shape on an
-        # UNSTAMPED store (it compares the content's canonical norm), but
-        # once the 163 stamp exists this lane is the only post-stamp healer
-        # and it cannot decode the norm. Tracked for a follow-up.
+        # storing X'fffe') is HEALED to the canonical normalize of its (valid)
+        # content (issue #538 AC8), never conflated with SQL NULL.
         candidates = []
         for r in rows:
-            text = _norm_text(r[1])
+            rid = r[0]
+            content_cell = r[1]
+            norm_cell = r[2]
+            kind_raw = r[3]
+            if isinstance(kind_raw, bytes):
+                kind = kind_raw.decode("ascii", "replace")
+            else:
+                kind = kind_raw
+            # content must be verifiable text; skip otherwise (AC9).
+            text = _norm_text(content_cell)
             if text is None:
                 continue
-            norm = r[2]
-            if isinstance(norm, bytes):
-                norm = _norm_text(norm)
-                if norm is None and r[2] is not None:
-                    continue  # undecodable non-NULL norm: skip the row
             canonical = _normalize_content(text)
-            if norm is None or norm != canonical:
-                candidates.append((r[0], text, canonical, norm))
+            # norm_text: None for NULL, decoded value for decodable,
+            # None for undecodable (always stale in that case).
+            if norm_cell is None:
+                norm_text = None
+            else:
+                norm_text = _norm_text(norm_cell)
+            # stale when NULL, or kind != 'text', or norm != canonical.
+            # An undecodable non-NULL norm (norm_text is None but
+            # norm_cell is not None) is always stale.
+            undecodable_norm = (norm_cell is not None and norm_text is None)
+            if norm_cell is None:
+                stale = True
+            elif kind != "text":
+                stale = True
+            elif undecodable_norm:
+                stale = True
+            elif norm_text != canonical:
+                stale = True
+            else:
+                stale = False
+            if not stale:
+                continue
+            # raw bytes for the compare-and-update
+            if isinstance(content_cell, bytes):
+                content_raw = content_cell
+            else:
+                content_raw = (content_cell or "").encode("utf-8")
+            if norm_cell is None:
+                norm_raw = None
+            elif isinstance(norm_cell, bytes):
+                norm_raw = norm_cell
+            else:
+                norm_raw = (norm_cell or "").encode("utf-8")
+            candidates.append(
+                (rid, text, canonical, content_raw, norm_raw,
+                 norm_cell is None))
         if not candidates:
             # Nothing healable in this batch: advance the keyset WITHOUT
             # acquiring the write lock (163 advisory; skip semantics
@@ -2800,79 +2837,95 @@ def _heal_content_norms_post_stamp(conn: sqlite3.Connection) -> None:
         own_tx = not conn.in_transaction
         sp = "zmem_norm_heal_164"
         try:
-            if own_tx:
-                conn.execute("BEGIN IMMEDIATE")
-            else:
-                conn.execute(f"SAVEPOINT {sp}")
-            for rid, text, canonical, old_norm in candidates:
-                if old_norm is None:
-                    cur = conn.execute(
-                        "UPDATE memory SET content_norm=? WHERE rowid=? "
-                        "AND content IS ? AND content_norm IS NULL",
-                        (canonical, rid, text))
+                if own_tx:
+                    conn.execute("BEGIN IMMEDIATE")
                 else:
-                    cur = conn.execute(
-                        "UPDATE memory SET content_norm=? WHERE rowid=? "
-                        "AND content IS ? AND content_norm IS ?",
-                        (canonical, rid, text, old_norm))
-                if cur.rowcount:
-                    continue
-                # Zero-row compare-and-update: the row changed under us.
-                fresh = conn.execute(
-                    "SELECT rowid, content, content_norm FROM memory "
-                    "WHERE rowid=?", (rid,)).fetchone()
-                if fresh is None:
-                    continue  # row deleted under us — nothing to heal
-                fresh_text = _norm_text(fresh[1])
-                if fresh_text is None:
-                    continue  # changed into an unverifiable shape — skip
-                fresh_canonical = _normalize_content(fresh_text)
-                if fresh[2] == fresh_canonical:
-                    continue  # the concurrent writer already fixed it
-                if fresh[2] is None:
-                    retry = conn.execute(
-                        "UPDATE memory SET content_norm=? WHERE rowid=? "
-                        "AND content IS ? AND content_norm IS NULL",
-                        (fresh_canonical, fresh[0], fresh[1]))
+                    conn.execute(f"SAVEPOINT {sp}")
+                for rid, text, canonical, content_raw, norm_raw, norm_is_null in candidates:
+                    if norm_is_null:
+                        cur = conn.execute(
+                            "UPDATE memory SET content_norm=? WHERE rowid=? "
+                            "AND CAST(content AS BLOB) IS ? AND content_norm IS NULL",
+                            (canonical, rid, content_raw))
+                    else:
+                        cur = conn.execute(
+                            "UPDATE memory SET content_norm=? WHERE rowid=? "
+                            "AND CAST(content AS BLOB) IS ? AND "
+                            "CAST(content_norm AS BLOB) IS ?",
+                            (canonical, rid, content_raw, norm_raw))
+                    if cur.rowcount:
+                        continue
+                    # Zero-row compare-and-update: the row changed under us.
+                    conn.text_factory = bytes
+                    try:
+                        fresh = conn.execute(
+                            "SELECT rowid, content, content_norm FROM memory "
+                            "WHERE rowid=?", (rid,)).fetchone()
+                    finally:
+                        conn.text_factory = str
+                    if fresh is None:
+                        continue  # row deleted under us — nothing to heal
+                    fresh_content_raw = fresh[1]
+                    fresh_norm_raw = fresh[2]
+                    fresh_text = _norm_text(fresh_content_raw)
+                    if fresh_text is None:
+                        continue  # changed into an unverifiable shape — skip
+                    fresh_canonical = _normalize_content(fresh_text)
+                    if fresh_norm_raw is not None:
+                        try:
+                            fresh_norm_text = _norm_text(fresh_norm_raw)
+                        except (UnicodeDecodeError, ValueError):
+                            fresh_norm_text = None
+                    else:
+                        fresh_norm_text = None
+                    if fresh_norm_text == fresh_canonical:
+                        continue  # the concurrent writer already fixed it
+                    if fresh_norm_raw is None:
+                        retry = conn.execute(
+                            "UPDATE memory SET content_norm=? WHERE rowid=? "
+                            "AND CAST(content AS BLOB) IS ? AND content_norm IS NULL",
+                            (fresh_canonical, fresh[0], fresh_content_raw))
+                    else:
+                        retry = conn.execute(
+                            "UPDATE memory SET content_norm=? WHERE rowid=? "
+                            "AND CAST(content AS BLOB) IS ? AND "
+                            "CAST(content_norm AS BLOB) IS ?",
+                            (fresh_canonical, fresh[0], fresh_content_raw,
+                             fresh_norm_raw))
+                    if not retry.rowcount:
+                        raise _NormVerifyConflict(
+                            f"rowid {rid} kept changing during the NULL "
+                            "content_norm heal")
+                if own_tx:
+                    conn.commit()
                 else:
-                    retry = conn.execute(
-                        "UPDATE memory SET content_norm=? WHERE rowid=? "
-                        "AND content IS ? AND content_norm IS ?",
-                        (fresh_canonical, fresh[0], fresh[1], fresh[2]))
-                if not retry.rowcount:
-                    raise _NormVerifyConflict(
-                        f"rowid {rid} kept changing during the NULL "
-                        "content_norm heal")
-            if own_tx:
-                conn.commit()
-            else:
-                conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
         except _NormVerifyConflict:
-            if not own_tx:
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-                    conn.execute(f"RELEASE SAVEPOINT {sp}")
-                except sqlite3.Error:
-                    pass
-            elif conn.in_transaction:
-                conn.rollback()
-            sys.stderr.write(
-                "[zmem] NULL content_norm heal deferred (a row kept "
-                "changing under the pass); the next open re-runs it\n")
-            return
-        except sqlite3.Error as exc:
-            if not own_tx:
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-                    conn.execute(f"RELEASE SAVEPOINT {sp}")
-                except sqlite3.Error:
-                    pass
-            elif conn.in_transaction:
-                conn.rollback()
-            sys.stderr.write(
-                "[zmem] NULL content_norm heal deferred (%s); the next "
-                "open re-runs it\n" % (exc,))
-            return
+                if not own_tx:
+                    try:
+                        conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                        conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    except sqlite3.Error:
+                        pass
+                elif conn.in_transaction:
+                    conn.rollback()
+                sys.stderr.write(
+                    "[zmem] NULL content_norm heal deferred (a row kept "
+                    "changing under the pass); the next open re-runs it\n")
+                return
+        except (sqlite3.Error, ValueError) as exc:
+                if not own_tx:
+                    try:
+                        conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                        conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    except sqlite3.Error:
+                        pass
+                elif conn.in_transaction:
+                    conn.rollback()
+                sys.stderr.write(
+                    "[zmem] NULL content_norm heal deferred (%s); the next "
+                    "open re-runs it\n" % (exc,))
+                return
 
 
 # Issue #137: additive belief-head side tables.  Like the v14 evidence

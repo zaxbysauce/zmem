@@ -8,31 +8,37 @@
   "lane": "for-injection",
   "metrics": {
     "hit_at_k": 1.0,
-    "precision_at_k": 0.8792483660130719,
+    "precision_at_k": 0.8815705128205129,
     "false_injection_rate": 0.0,
-    "empty_pool_rate": 0.08035714285714286,
-    "mrr": 0.9901960784313726,
-    "items": 112,
-    "positive_items": 102,
-    "negative_items": 10,
+    "empty_pool_rate": 0.0782608695652174,
+    "mrr": 0.9903846153846154,
+    "items": 115,
+    "positive_items": 104,
+    "negative_items": 11,
     "silent_reasons": {
       "empty-pool": 9,
       "omitted": 0,
       "below-bar": 0,
       "budget-drop": 0,
-      "below-relevance": 1
+      "below-relevance": 2,
+      "already-delivered": 0,
+      "expired": 0,
+      "hub-unreachable": 0,
+      "snapshot-expired": 0
     }
   },
   "per_moment": {
     "user-prompt": {
-      "items": 71,
-      "positive_items": 65,
-      "negative_items": 6,
+      "items": 74,
+      "positive_items": 67,
+      "negative_items": 7,
       "hit_at_k": 1.0,
-      "precision_at_k": 0.8658974358974358,
+      "precision_at_k": 0.8699004975124378,
       "false_injection_rate": 0.0,
-      "empty_pool_rate": 0.08450704225352113,
-      "mrr": 1.0
+      "empty_pool_rate": 0.08108108108108109,
+      "mrr": 1.0,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     },
     "pretool": {
       "items": 22,
@@ -42,7 +48,9 @@
       "precision_at_k": 0.885,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.045454545454545456,
-      "mrr": 0.9166666666666666
+      "mrr": 0.9166666666666666,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     },
     "subagent": {
       "items": 17,
@@ -52,7 +60,9 @@
       "precision_at_k": 0.90625,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.058823529411764705,
-      "mrr": 0.9375
+      "mrr": 0.9375,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     },
     "precompact": {
       "items": 2,
@@ -62,8 +72,10 @@
       "precision_at_k": 1.0,
       "false_injection_rate": 0.0,
       "empty_pool_rate": 0.5,
-      "mrr": 1.0
+      "mrr": 1.0,
+      "precision_delta": 0.0,
+      "false_injection_delta": 0.0
     }
   },
-  "note": "Committed HEAD baseline after the issue #234 type-diverse reseed (2026-09-27; supersedes the #113 baseline). SPLIT BASIS, disclosed: the metrics block is the WEIGHTED run of the reseeded 82-row corpus + 112-item gold (per-moment type profiles live, the same numbers the byte-pinned projection carries) and is the --compare-baseline drift basis; the per_moment block is the WEIGHTS-NEUTRAL run of the SAME corpus and gold (storelib.recall.type_preference pinned to 1.0 via scripts/eval_inject_runner.py --moment-weights-neutral) so per-moment precision_delta measures exactly the #126 profiles' contribution — pretool improves 0.885 -> 0.895 (the labeled decision row re-enters the k=5 cut under the 1.1163-vs-0.8372 multipliers), the other three moments are identical under both bases. Negative controls: false_injection_rate 0.0 on both bases. Reproduce either basis with the runner command plus/minus --moment-weights-neutral against a fresh --store."
+  "note": "Committed HEAD baseline after the issue #530 prompt-assertion reseed (2026-11-25; supersedes the issue #234 baseline of 2026-09-27). SPLIT BASIS, disclosed: the metrics block is the WEIGHTED run of the reseeded 88-row corpus (115 gold items, 104 positives incl. the two prompt-assertion include sets and the three new must_exclude controls; 11 negative controls incl. the conflict-destination silence), the per_moment block is the WEIGHTS-NEUTRAL --moment-weights-neutral run of the same corpus at the same commit. The prompt-assertion rows (eval-pa namespace) exercise the #498/#530 assertion grammar: ig-pa-rescue-approver pins the one-best rescue (both approver rows sit in the measured [0.25, 0.30) lexical window; the nominate-all mutant renders the second, moving precision_at_k), ig-pa-conflict-destination pins the conflict drop as a negative control, ig-pa-two-question-attributes pins asked-attribute survival plus the orthogonal drops. Determinism pins unchanged (BASE_ENV: fake embedder, evalpin fence token, link threshold 1.01) PLUS the runner's own _bootstrap_env force-set: the scoring clock (ZMEM_TEST_NOW = the corpus sentinel EVAL_PIN_TS) and the cross-encoder/model-absent pins. Regenerate with scripts/eval_inject_runner.py --store <scratch> --gold eval/injection_gold.jsonl (weighted run for metrics; --moment-weights-neutral for per_moment)."
 }

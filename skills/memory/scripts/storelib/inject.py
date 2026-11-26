@@ -1108,11 +1108,367 @@ def _pa_fold(text):
     a homoglyph inside 'not' ("no\u0301t") still reads as negation. The
     folded copy never feeds term extraction (subjects keep their original
     graphemes)."""
-    import unicodedata as _ud
-    folded = _ud.normalize("NFKD", text or "")
+    folded = _unicodedata.normalize("NFKD", text or "")
     folded = "".join(ch for ch in folded
-                     if not _ud.combining(ch))
+                     if not _unicodedata.combining(ch))
     return folded.casefold()
+
+
+# ---------------------------------------------------------------------------
+# Issue #530 AC2/AC7b — sentence-scoped negation with credible boundaries.
+#
+# A stored row's content is split into SENTENCES by a conservative boundary
+# test that errs toward the base parser: a mark (`.`, `!`, `?` followed by
+# whitespace or the row end) ends a sentence only when a sentence credibly
+# starts after it (T5), and — for a period — the period attaches to a
+# MATCHED closing delimiter (T1) or to a well-formed word (T2 no internal
+# dot, T6a whole-run word, T3 not a known abbreviation, T4 at least three
+# letters or none, T6b not preceded by list punctuation). Newlines and
+# semicolons are NEVER boundaries, so hard-wrapped or semicolon-joined
+# statements stay one statement, exactly as the base parser sees them.
+# Every rule has a negative and an affirmative twin pinned by
+# tests/test_498_prompt_assertions.py (SentenceBoundaryTests) and the
+# prototype sweep (plan rev 12, `05-fix-plan.md` AC2 section).
+# ---------------------------------------------------------------------------
+import unicodedata as _unicodedata  # noqa: E402  (placed beside its consumer)
+import bisect as _bisect  # noqa: E402
+
+# English abbreviations that never end a sentence (T3). The list is frozen:
+# the test file pins it by import, and an entry is added whenever one is
+# found (disclosed residual: an abbreviation outside the list is the ONE
+# class of invented boundary — see "What the boundary rule does not claim").
+_PA_ABBREV = frozenset("""
+etc vs cf approx mr mrs ms dr prof inc ltd corp co jr sr st fig figs eq eqs
+ref refs no nos al am pm ca misc dept univ ave rd blvd mt gen col sgt capt lt
+rev hon jan feb mar apr jun jul aug sep sept oct nov dec mon tue wed thu fri
+sat sun resp incl excl max min temp cit op ch sec est apt bros retd sen rep
+gov hw sw fw iw dpi api url uri pdf csv json xml html css id ids nb nf eod eof
+govt avg std viz hwy rte pkwy ctr bldg ste asst maj mfg mtg natl acct admin
+pres adm cpl pvt cmdr brig cons exec secy treas chap ibid loc deg pkg pcs qty
+gal fwd attn conf recap aka btw imo
+ter trl cir bbl doz hrs yrs wks mos seq messrs mme mlle msgr atty esq assoc
+inst sch acad ctrl dist eqpt pct prod proj imho tbh nvm idk faq str mins
+circ nec vid sic sqq inf sup
+""".split())
+_PA_END_PUNCT = re.compile(r"[.!?](?:\s+|$)")
+_PA_ASCII_LETTERS = re.compile(r"[A-Za-z]")
+_PA_LIST_NUMBER = re.compile(r"\d{1,3}[.)](?=\s)")
+# What a word must not follow, through whitespace only, if the period after it
+# is to count as a sentence end (T6b). Opening quotes are here only in their
+# typographic forms: an ASCII quote opens and closes, and '… "wet goods" here.'
+# is a real sentence end whose last word follows a CLOSING ASCII quote.
+_PA_T6_PUNCT = (",;:([{" "“‘‚‛„‟‹«（【"
+                "-‐‑‒–—―")
+# What a period may close (T1): a closing delimiter that is MATCHED (it
+# closes something: a bracket or typographic quote on the delimiter stack, or
+# an ASCII double quote that closes a quoted span) or stands directly after a
+# letter or a digit ("(Rule 3)", "dogs'"). A standalone closer refuses.
+_PA_CLOSERS = ")]}”’›»）】"
+_PA_ASCII_QUOTES = "\"'"
+_PA_OPENER_OF = {")": "(", "]": "[", "}": "{", "’": "‘", "”": "“",
+                 "›": "‹", "»": "«", "）": "（", "】": "【"}
+_PA_ASCII_DOUBLE = '"'
+# What the matching pass pushes onto the stack. ASCII apostrophes and the
+# ASCII double quote are excluded: an apostrophe is a word mark (don't,
+# dogs'), never a delimiter; the double quote is handled by the span toggle.
+# A typographic opening quote (U+2018) is a delimiter: U+2019 pops it.
+_PA_DELIMITER_OPENERS = "([{“‘‚‛„‟‹«（【"
+
+
+def _pa_credible_start(text, pos):
+    """Does a sentence credibly start at `pos`: after any opening quotes and
+    brackets, an upper-case letter — or a list number ("2." / "2)") and then
+    an upper-case letter — or the row ends? A bare digit does not start one
+    (T5)."""
+    while pos < len(text) and text[pos] in "\"'([{“‘‚‛„‟‹«（【":
+        pos += 1
+    if pos >= len(text):
+        return True
+    if text[pos].isupper():
+        return True
+    m = _PA_LIST_NUMBER.match(text, pos)
+    if not m:
+        return False
+    k = m.end()
+    while k < len(text) and (text[k].isspace() or text[k] in "\"'([{“‘‚‛„‟‹«（【"):
+        k += 1
+    return k < len(text) and text[k].isupper()
+
+
+def _pa_is_mark(ch):
+    """A combining mark: part of the letter before it, never a letter itself
+    (mirrors what _pa_fold strips)."""
+    return _unicodedata.category(ch) == "Mn" or bool(_unicodedata.combining(ch))
+
+
+def _pa_credible_closers(text):
+    """One forward pass: for every position, does the delimiter there CLOSE
+    something (T1's `matched` map)? A stack matches brackets and typographic
+    quotes (ASCII apostrophes are NEVER pushed); an ASCII double quote closes
+    an open span when one is open, and otherwise is a MEASUREMENT mark (5")
+    — and thus credible — exactly when it stands directly after a letter or a
+    digit; an opener otherwise. An ASCII single-quoted span is tracked when '
+    stands at a word boundary (preceded by space/start, followed by a letter),
+    like a double quote; intraword apostrophes (don't, dogs') are word marks
+    only. A closer that MISMATCHES a non-empty stack poisons the row: no
+    later closer may match. A bracket or typographic closer inside an open
+    ASCII quote (double or single) is not credible. A bracket closer is
+    credible only when, after it closes, the stack is EMPTY — every enclosing
+    opener is also closed. An ASCII double/single quote that CLOSES a span is
+    credible only when the stack is empty (no unmatched enclosing bracket).
+    A typographic apostrophe (U+2019) closes an outstanding ‘ only when it
+    stands directly after a letter or a digit AND is not followed by a letter
+    (intraword U+2019 never closes). Linear: O(n) over the row."""
+    matched = bytearray(len(text))
+    stack = []
+    in_ascii = False
+    in_single = False
+    poisoned = False
+    quote_inside = 0
+    for p, c in enumerate(text):
+        if poisoned:
+            continue
+        if c == _PA_ASCII_DOUBLE:
+            if in_ascii:
+                in_ascii = False
+                if not stack and quote_inside == 0:
+                    matched[p] = 1
+            else:
+                q = p - 1
+                while q >= 0 and _pa_is_mark(text[q]):
+                    q -= 1
+                if q >= 0 and text[q].isalnum():
+                    matched[p] = 1
+                else:
+                    if stack:
+                        quote_inside += 1
+                    in_ascii = True
+        elif c == "'":
+            q = p - 1
+            while q >= 0 and _pa_is_mark(text[q]):
+                q -= 1
+            nxt = text[p + 1] if p + 1 < len(text) else ""
+            is_intraword = (q >= 0 and text[q].isalnum() and nxt.isalpha())
+            if is_intraword:
+                continue                    # word mark (don't, dogs'): never a closer
+            if q >= 0 and text[q].isdigit():
+                matched[p] = 1              # measurement mark (5', 3'): credible
+            elif nxt.isalpha():
+                # opening a single-quoted span
+                if in_single:
+                    in_single = False
+                    if not stack and quote_inside == 0:
+                        matched[p] = 1
+                else:
+                    if stack:
+                        quote_inside += 1
+                    in_single = True
+            else:
+                # closing a single-quoted span (followed by space/period/etc.)
+                if in_single:
+                    in_single = False
+                    if not stack and quote_inside == 0:
+                        matched[p] = 1
+            # standalone apostrophe, not a closer: skip
+        elif c in _PA_OPENER_OF:
+            if c == "’":
+                q = p - 1
+                while q >= 0 and _pa_is_mark(text[q]):
+                    q -= 1
+                if q >= 0 and text[q].isalnum():
+                    nxt = text[p + 1] if p + 1 < len(text) else ""
+                    if not nxt.isalpha() and stack and stack[-1] == "‘":
+                        stack.pop()
+                        if not stack and not in_ascii and not in_single and quote_inside == 0:
+                            matched[p] = 1
+                elif stack and stack[-1] == "‘":
+                    stack.pop()
+                    if not stack and not in_ascii and not in_single and quote_inside == 0:
+                        matched[p] = 1
+            else:
+                if in_ascii or in_single:
+                    continue
+                if stack and stack[-1] == _PA_OPENER_OF[c]:
+                    stack.pop()
+                    if not stack and quote_inside == 0:
+                        matched[p] = 1
+                elif stack:
+                    poisoned = True
+                    stack = []
+                    quote_inside = 0
+        elif c in _PA_DELIMITER_OPENERS:
+            if not in_ascii and not in_single:
+                stack.append(c)
+        if (c == _PA_ASCII_DOUBLE and not in_ascii) or \
+           (c == "'" and not in_single):
+            quote_inside = 0
+    return matched
+
+
+def _pa_is_terminator(text, m, matched):
+    """A sentence-end test that errs toward the base parser. Index arithmetic
+    only: no prefix slices, so a long row with many marks stays linear
+    (delimiter matching is precomputed once per row by _pa_credible_closers)."""
+    if not _pa_credible_start(text, m.end()):
+        return False                                    # T5
+    start = m.start()
+    if text[start] in "!?":
+        return True
+    # The character the period attaches to: back over spaces, combining marks
+    # and any earlier periods of an ellipsis ("etc.." and "etc. . ." attach
+    # to "etc").
+    i = start - 1
+    while i >= 0 and (text[i] == "." or text[i].isspace() or _pa_is_mark(text[i])):
+        i -= 1
+    if i < 0:
+        return True                                     # nothing before the period
+    c = text[i]
+    if not c.isalnum():
+        if c in _PA_CLOSERS or c in _PA_ASCII_QUOTES:
+            if matched[i]:
+                return True                             # T1: closes something
+            if c in "'’":                               # an apostrophe has no opener to match: it ends a
+                p = i - 1                               # sentence only directly after a letter or digit
+                while p >= 0 and _pa_is_mark(text[p]):  # ("dogs'", "the Fridays’"); a standalone one refuses
+                    p -= 1
+                return p >= 0 and text[p].isalnum()
+            return False        # a bracket/quote that closes nothing: refuse
+        return False            # an opening delimiter or a standalone symbol
+    j = i
+    while j > 0 and not text[j - 1].isspace():
+        j -= 1
+    tok = text[j:i + 1]                                 # the whole run without whitespace
+    if "." in tok:
+        return False                                    # T2
+    # The word the period attaches to: the run of letters, digits, combining
+    # marks, apostrophes and hyphens at the end of that run ("mgr" in
+    # "Fridays,mgr", "hand-held" in "hand-held").
+    a = i
+    while a > j and (text[a - 1].isalnum() or _pa_is_mark(text[a - 1]) or text[a - 1] in "'’-"):
+        a -= 1
+    if a > j or not text[a].isalnum():
+        return False                                    # T6a
+    word = text[a:i + 1]
+    n_letters = sum(1 for ch in word if ch.isalpha())
+    if 1 <= n_letters <= 2:
+        return False                                    # T4
+    if "".join(_PA_ASCII_LETTERS.findall(word)).lower() in _PA_ABBREV:
+        return False                                    # T3 (English list: ASCII letters only)
+    k = j - 1
+    while k >= 0 and text[k].isspace():
+        k -= 1
+    return not (k >= 0 and text[k] in _PA_T6_PUNCT)     # T6b
+
+
+def _pa_row_boundaries(text):
+    """Sentence start offsets and sentence end offsets of a row (raw)."""
+    matched = _pa_credible_closers(text)
+    starts, ends = [0], []
+    for m in _PA_END_PUNCT.finditer(text):
+        if not _pa_is_terminator(text, m, matched):
+            continue
+        ends.append(m.start())
+        starts.append(m.end())
+    ends.append(len(text))
+    return starts, ends
+
+
+class _PaSentenceFacts:
+    """Per sentence, computed once and only when a cue match needs it, in row
+    order: `marked` (negated or hypothetical) and the sentence's `terms`.
+    Each sentence is folded and term-extracted at most once, and the question
+    chain is carried forward as one flag, so the whole row costs one pass
+    (plan rev 12 counted-cost contract; asserted by SentenceBoundaryTests)."""
+
+    def __init__(self, text, starts, ends, ends_in_question):
+        self.text, self.starts, self.ends = text, starts, ends
+        self.ends_in_question = ends_in_question
+        self.marked, self.terms = [], []
+        self.chain_hyp = False   # a hypothesis in the "?"/"!"-ended run up to the last sentence computed
+
+    def _fill(self, i):
+        while len(self.marked) <= i:
+            k = len(self.marked)
+            own = self.text[self.starts[k]:self.ends[k]]
+            folded = _pa_fold(own)
+            hyp = bool(_PA_HYPOTHETICAL.search(folded))
+            self.marked.append(bool(_PA_NEGATION.search(folded)) or hyp or self.chain_hyp)
+            self.terms.append(_pa_terms(own))
+            self.chain_hyp = (k < len(self.ends_in_question) and bool(self.ends_in_question[k])
+                              and (hyp or self.chain_hyp))
+
+    def is_marked(self, i):
+        self._fill(i)
+        return self.marked[i]
+
+    def sentence_terms(self, i):
+        self._fill(i)
+        return self.terms[i]
+
+
+def _pa_head_subject(text, starts, facts, i, mstart):
+    """Terms before the cue: the statement's own sentence first; while that
+    span holds no content term, the sentence before it, and so on."""
+    subject = _pa_terms(text[starts[i]:mstart])
+    if subject:
+        return subject
+    for j in range(i - 1, -1, -1):
+        subject = facts.sentence_terms(j)
+        if subject:
+            return subject
+    return []
+
+
+def _pa_tail_subject(text, ends, facts, i, mend):
+    """Terms after the verb for 'PERSON approves THING', same walk forward."""
+    subject = _pa_terms(text[mend:ends[i]])
+    if subject:
+        return subject
+    for j in range(i + 1, len(ends)):
+        subject = facts.sentence_terms(j)
+        if subject:
+            return subject
+    return []
+
+
+def _pa_parse_row_assertions(content):
+    """The rev-12 row grammar (issue #530 AC2/AC7b): every affirmative
+    assertion parsed from a stored fact's content, with negation and
+    hypothetical gating scoped to the CUE MATCH'S OWN SENTENCE, and subjects
+    taken from that sentence (walking outward only while the span is empty).
+    Order preserved; first assertion is the primary one."""
+    if not content:
+        return []
+    starts, ends = _pa_row_boundaries(content)
+    ends_in_question = [content[e] in "!?" for e in ends[:-1]]
+    facts = _PaSentenceFacts(content, starts, ends, ends_in_question)
+    found = []
+    for relation, (cues, _q) in _PA_RELATIONS.items():
+        for cue in cues:
+            asserted = False
+            for n_match, m in enumerate(re.finditer(cue, content)):
+                if n_match >= 200:
+                    break
+                value = _pa_match_value(m)
+                if not value:
+                    continue
+                i = _bisect.bisect_right(starts, m.start()) - 1
+                if facts.is_marked(i):
+                    continue   # negated/hypothetical: a later affirmative one may assert
+                if relation == "approver" and " approves" in m.group(0):
+                    subject = _pa_tail_subject(content, ends, facts, i, m.end())
+                else:
+                    subject = _pa_head_subject(content, starts, facts, i, m.start())
+                if not subject:
+                    break      # as at base: no subject ends this cue
+                found.append({"subject": subject, "relation": relation,
+                              "value": value, "clause_index": -1})
+                asserted = True
+                break
+            if asserted:
+                break
+    return found
+
 _PA_SENTENCE_SPLIT = re.compile(
     r"[.!?;]\s+|\s+-\s+|\n+|[;?](?=[A-Za-z])")
 _PA_QUESTION_MARK = re.compile(r"\?")
@@ -1127,6 +1483,11 @@ _PA_Q_AUX = re.compile(
     r"would|will|shall|may|might|must)\b", re.IGNORECASE)
 _PA_WHETHER = re.compile(r"\bwhether\b", re.IGNORECASE)
 _PA_ANAPHOR_WORDS = frozenset(("this", "that", "it", "these", "those", "such"))
+
+_PA_QUESTION_WORDS = frozenset((
+    "belongs", "belong", "goes", "go", "owns", "own", "owned",
+    "takes", "take", "long", "often", "much",
+))
 
 
 def _pa_terms(text):
@@ -1224,7 +1585,21 @@ def _pa_focus_subject(clause):
     matched cue text emptied legitimate subjects — issue #498 probe)."""
     subj = _pa_terms(clause)
     raw = re.findall(r"[A-Za-z]+", clause)
-    if raw and raw[0].lower() in _PA_ANAPHOR_WORDS:
+    # An anaphor counts only when it fills the subject position — i.e.
+    # it appears before any content term (issue #530 AC6 fix for the
+    # critic's "that runs nightly" counter-example). A relative pronoun
+    # after a noun is NOT an anaphoric subject.
+    content_positions = [i for i, w in enumerate(raw)
+                         if w.lower() not in _PA_STOPWORDS
+                         and w.lower() not in _PA_ANAPHOR_WORDS]
+    anaphor_positions = [i for i, w in enumerate(raw)
+                         if w.lower() in _PA_ANAPHOR_WORDS]
+    if anaphor_positions and (not content_positions
+                              or anaphor_positions[0] < content_positions[0]):
+        is_anaphor = True
+    else:
+        is_anaphor = False
+    if is_anaphor:
         return subj, True
     return subj, False
 
@@ -1239,24 +1614,23 @@ def _pa_parse_foci(clauses, assertions):
             if not qm:
                 continue
             subj, is_anaphor = _pa_focus_subject(clause)
-            # PR #526 feedback (P-F3): a focus whose subject is anaphoric or
+            # Apply question-only word list to focus subjects (plan AC6).
+            subj = [t for t in subj if t not in _PA_QUESTION_WORDS]
             # empty (ellipsis) is discourse-BOUND when a preceding assertion
             # supplies it; only such bound foci may use the subject-unbound
             # rescue fallback later.
             bound_ctx = False
             if is_anaphor or not subj:
-                # Anaphor OR ellipsis (the question names no subject at all —
-                # "What destination should be used?"): bind to the nearest
-                # PRECEDING assertion's subject. The mixed prompt binds its
-                # approver focus to the destination assertion's subject, which
-                # carries no approver assertion — the focus stays unanswered,
-                # which is exactly the rescue case.
                 bound = None
                 for a in assertions:
                     if a["clause_index"] < idx:
                         bound = a
                 if bound is not None:
                     subj = list(bound["subject"])
+                # bound=True only when anaphoric AND subject has at most
+                # one term (P-F3 safeguard); ellipsis-only keeps base
+                # behavior (bound=False).
+                if is_anaphor and len(subj) <= 1:
                     bound_ctx = True
             answered = any(
                 a["relation"] == relation
@@ -1265,7 +1639,10 @@ def _pa_parse_foci(clauses, assertions):
             foci.append({"subject": subj, "relation": relation,
                          "clause_index": idx, "answered": answered,
                          "bound": bound_ctx})
-            break
+            # Note: do NOT break here — a single clause can carry multiple
+            # question foci (issue #530 AC6, e.g. "Who approves X and what
+            # does it cost?").
+        # (end relation loop)
     return foci
 
 
@@ -1304,12 +1681,16 @@ def parse_row_assertions(content):
     stored fact's content (a qualified fact can carry both a destination and
     a cost). Order preserved; first assertion is the primary one.
 
+    Issue #530 AC2/AC7b: negation and hypothetical gating are scoped to the
+    CUE MATCH'S OWN SENTENCE under the credible-boundary rules
+    (_pa_row_boundaries); subjects come from that sentence, walking outward
+    only while the span is empty. See the boundary-rule block above
+    _pa_fold for the rule text and its disclosed residuals.
+
     (Final-critic round 1: the singular parse_row_assertion wrapper was
     deleted — it was reachable only from tests, which the stranded-census
     gate correctly flagged as unwired code.)"""
-    if not content:
-        return []
-    return _pa_parse_clause(content)
+    return _pa_parse_row_assertions(content)
 
 
 def _pa_values_overlap(v1, v2):
@@ -1356,11 +1737,24 @@ def _pa_row_drop_type(frame, row_asserts):
                 return "redundant"
             return "conflict"
     foci = frame["foci"]
-    if len(foci) == 1 and foci[0]["relation"] in _PA_UNSUPPORTED_FOCI:
-        focus = foci[0]
-        for ra in row_asserts:
-            if _pa_subject_compat(focus["subject"], ra["subject"]):
-                return "orthogonal"
+    if foci and any(f.get("relation") in _PA_UNSUPPORTED_FOCI for f in foci):
+        # "Asked" is EVERY relation any question in the prompt asks about
+        # (plan AC1: "asserts none of the relations ANY focus asks") — not
+        # just the unsupported ones. A mixed prompt (cost + destination)
+        # must not drop the fact that answers its destination question.
+        asked = {f.get("relation") for f in foci}
+        # Row-level exemption first (the documented rule): a fact that
+        # asserts an ASKED attribute is never dropped as orthogonal, even
+        # when another assertion of the same row matches the subject —
+        # the exemption is per ROW, not per assertion.
+        if any(ra["relation"] in asked for ra in row_asserts):
+            return None
+        for focus in foci:
+            if focus.get("relation") not in _PA_UNSUPPORTED_FOCI:
+                continue
+            for ra in row_asserts:
+                if _pa_subject_compat(focus["subject"], ra["subject"]):
+                    return "orthogonal"
     return None
 
 
@@ -2267,10 +2661,17 @@ def select_and_budget_for_injection(
                     kwargs.pop("query", None)
                     kwargs.pop("cross_rerank", None)
                     kwargs.pop("_state_hazard_hint", None)
+                    # Issue #530 AC3: the bridged zero-hit fallback must apply
+                    # the same prompt-assertion partition as the query lane.
+                    # Pass the bridged text as _pa_query so partition, gate,
+                    # rescue and diagnostics run in one place (not after
+                    # delivery).
+                    _bridged_text_saved = effective_query if effective_query.strip() else None
                     effective_query = ""
                     if effective_min_confidence is None:
                         effective_min_confidence = inject_recent_floor()
                     kwargs["min_confidence"] = effective_min_confidence
+                    kwargs["_pa_query"] = _bridged_text_saved
                     recall_module.recent_memory(conn, **kwargs)
         else:
             recall_module.recent_memory(conn, **kwargs)
