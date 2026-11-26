@@ -3270,6 +3270,7 @@ def _recall_injection_details(
     expiry_acc: dict | None = None,
     conn: sqlite3.Connection | None = None,
     defer_ids: list[str] | None = None,
+    moment: str | None = None,
 ) -> tuple[dict, list[dict]]:
     """Apply the one passive post-retrieval decision pipeline.
 
@@ -3324,7 +3325,7 @@ def _recall_injection_details(
     # BEFORE the gate, so a conflicting/redundant/orthogonal row is never
     # gated, rendered, or counted as surfaced. Constraints, decisions and
     # belief-head types are never dropped (partition is facts-only).
-    pa_frame = analyze_prompt(query) if query else None
+    pa_frame = analyze_prompt(query) if (query and moment in ("user_prompt", "subagent", None)) else None
     pa_drops: dict = {}
     pa_rescue: dict = {}
     pa_survivors: list = selected_rows
@@ -3475,7 +3476,10 @@ def _recall_injection_details(
     if pa_drops or pa_rescue:
         details["attribute_dropped"] = len(pa_drops)
         details["attribute_drop_labels"] = dict(pa_drops)
-        details["attribute_rescued"] = len(pa_rescue)
+        rescued_delivered = sum(
+            1 for r in selected_rows
+            if r.get("id") in pa_rescue and not r.get("withheld_for_secret"))
+        details["attribute_rescued"] = rescued_delivered
     # Issue #256 (F-267-2): the no-session --for-injection envelope reports
     # the withhold too — keyed only when it happened, so every zero-withhold
     # envelope stays byte-identical (C5 freeze).
@@ -4249,6 +4253,7 @@ def _recall_memory_impl(
             expiry_acc=expiry_acc,
             conn=conn,
             defer_ids=_defer_ids,
+            moment=effective_moment,
         )
         results = injection_details["results"]
         for _r in results:
@@ -4880,6 +4885,7 @@ def explain_recall(
     weights: dict | None = None,
     cross_rerank: bool = False,
     for_injection: bool = False,
+    moment: str | None = None,
 ) -> list[dict]:
     """Read-only retrieval debugger behind `recall --explain` (issue #82).
 
@@ -5038,7 +5044,15 @@ def explain_recall(
             # live seam runs, from the same query — candidate_ids/
             # candidate_lanes keep their PRE-partition identity (the maps
             # below iterate the untouched injection_candidate_rows list).
-            _pa_frame = analyze_prompt(query) if query else None
+            # Issue #530 AC4: the mirror is moment-gated by the SAME
+            # allow-list as the live seam via the explicit `moment`
+            # parameter (programmatic callers only — the CLI explain route
+            # cannot carry a moment and keeps its historic user-prompt
+            # behavior, plan AC4).
+            _pa_frame = (analyze_prompt(query)
+                         if (query and moment in ("user_prompt", "subagent",
+                                                  None))
+                         else None)
             pa_drops: dict = {}
             pa_survivors = injection_candidate_rows
             if _pa_frame is not None:
@@ -5647,6 +5661,7 @@ def _recent_memory_impl(
     _user_global_floor: float | None = None,
     _authorized_namespaces: frozenset | None = None,
     _defer_ids: list[str] | None = None,
+    _pa_query: str | None = None,
 ) -> list[dict]:
     """Cheap admin pull of the most recent live memories (no FTS scoring).
 
@@ -5822,6 +5837,8 @@ def _recent_memory_impl(
             expiry_acc=expiry_acc,
             conn=conn,
             defer_ids=_defer_ids,
+            moment=effective_moment,
+            query=_pa_query or "",
         )
         results = injection_details["results"]
         for _r in results:
@@ -5923,6 +5940,7 @@ def _collect_injection_candidates(
     _authorized_namespaces: frozenset | None = None,
     _state_hazard_hint: str | None = None,
     _defer_ids: list[str] | None = None,
+    _pa_query: str | None = None,
 ) -> dict:
     """Run one passive retrieval and return its unrendered details object.
 
@@ -5963,6 +5981,7 @@ def _collect_injection_candidates(
                             else 0.5),
             # Review FB-01201: the query-less leg owns the same admission.
             _defer_ids=_defer_ids,
+            _pa_query=_pa_query,
             **common,
         )
     else:
@@ -6277,6 +6296,7 @@ def recent_memory(
     _user_global_floor: float | None = None,
     _authorized_namespaces: frozenset | None = None,
     _defer_ids: list[str] | None = None,
+    _pa_query: str | None = None,
 ) -> list[dict]:
     # _recent_memory_impl performs the same emit-time _classify_injection
     # filtering before this public wrapper hands candidates to the shared
@@ -6311,6 +6331,7 @@ def recent_memory(
             _user_global_floor=_user_global_floor,
             _authorized_namespaces=_authorized_namespaces,
             _defer_ids=_defer_ids,
+            _pa_query=_pa_query,
         )
 
     if scopes is not None:
@@ -6347,6 +6368,7 @@ def recent_memory(
         lane=lane,
         _user_global_floor=_user_global_floor,
         _authorized_namespaces=_authorized_namespaces,
+        _pa_query=_pa_query,
         # Review FB-01201: the query-less lane owns the same admission, so
         # the defer set has to reach the collector from THIS call too.
         _defer_ids=_defer_ids,
