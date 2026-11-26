@@ -2636,10 +2636,15 @@ def update_memory(
 
     Issue #507: every decision this function writes (namespace, type, tags,
     source_ref, confidence, signal, taint, capture policy, size cap, incoming
-    taint) is derived from the row RE-READ under the caller-owned
-    ``BEGIN IMMEDIATE`` write transaction — the CALLER must already hold that
-    transaction when it calls (the CLI and the consolidate callers do; a bare
-    call on an unlocked connection revalidates nothing and is a caller bug).
+    taint) is derived from the row RE-READ under a write transaction. When
+    the caller's connection is not already in a transaction (the CLI passes
+    a bare connection) this function takes its own ``BEGIN IMMEDIATE`` and
+    commits or rolls back only the transaction it started. When
+    ``conn.in_transaction`` is true the CALLER owns the transaction and no
+    second one is begun — the caller must then hold a ``BEGIN IMMEDIATE``
+    (the ops applier, rescan_secrets and the organize paths do). A DEFERRED
+    caller-owned transaction is not a write lock and is not supported for
+    this function.
     """
     # #135 correction lineage is a closed export signal.  Validate before the
     # first read or transaction so an invalid request cannot partially update.

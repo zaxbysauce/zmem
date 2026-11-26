@@ -1558,9 +1558,19 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
                     p.unlink()
             if dest_exists and not dest_nonempty:
                 dest.touch()
-            for p in [dest] + sidecars:
+            # The rolled-back target state is destination-SPECIFIC: a
+            # destination that was missing must be missing again; one that
+            # was an empty file must exist and be 0 bytes again (the touch
+            # above recreated it). Checking bare existence would condemn
+            # every correctly-rolled-back empty destination (4.5 round-2
+            # finding F1: the ruled success line never printed).
+            for p in sidecars:
                 if p.exists():
                     raise RuntimeError(f"{p.name} survived the rollback")
+            if dest.exists() != (dest_exists and not dest_nonempty):
+                raise RuntimeError(f"{dest.name} survived the rollback")
+            if dest.exists() and dest.stat().st_size != 0:
+                raise RuntimeError(f"{dest.name} is not empty again")
             print("[zmem] restore: rolled back: destination was "
                   "missing/empty before the restore and is again", file=sys.stderr)
         except Exception as rb:
@@ -1940,12 +1950,14 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
 
     # --- 10. Success output. ---
     if stash_dir is not None and stash_dir.is_dir():
-        leftovers = sorted(p.name for p in stash_dir.iterdir())
-        if not leftovers:
-            stash_dir.rmdir()
-        else:
-            for name in leftovers:
-                print(f"[zmem] restore: {name} is set aside at {stash_dir}",
+        # Ruling step 8: "the stash removed" — on SUCCESS the stashed
+        # sidecars' bytes are already preserved in the forensic directory,
+        # so the whole stash tree goes (a bare rmdir would never fire: the
+        # moved files are still inside it). A removal failure is reported.
+        shutil.rmtree(stash_dir, ignore_errors=True)
+        if stash_dir.is_dir():
+            for leftover in sorted(p.name for p in stash_dir.iterdir()):
+                print(f"[zmem] restore: {leftover} is set aside at {stash_dir}",
                       file=sys.stderr)
     print(f"[zmem] restore: destination {dest}")
     print(f"[zmem] restore: post-restore integrity_check={post_integrity}")

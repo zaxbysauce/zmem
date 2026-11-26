@@ -1137,7 +1137,8 @@ def _recover_search_index(conn: sqlite3.Connection) -> None:
                 break
         if main_file:
             _fts_schema_surgery(main_file)
-        return
+            return
+        raise
     conn.execute("BEGIN IMMEDIATE")
     try:
         for name in _FTS_SHADOW_TABLES:
