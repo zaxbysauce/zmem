@@ -2633,6 +2633,13 @@ def update_memory(
     an ordinary row INTO ``entity_card``, an explicitly supplied watermark-
     prefix tag, or claiming a ``card:`` source_ref on an ordinary row (a
     pre-existing card row's content-only edit stays allowed).
+
+    Issue #507: every decision this function writes (namespace, type, tags,
+    source_ref, confidence, signal, taint, capture policy, size cap, incoming
+    taint) is derived from the row RE-READ under the caller-owned
+    ``BEGIN IMMEDIATE`` write transaction — the CALLER must already hold that
+    transaction when it calls (the CLI and the consolidate callers do; a bare
+    call on an unlocked connection revalidates nothing and is a caller bug).
     """
     # #135 correction lineage is a closed export signal.  Validate before the
     # first read or transaction so an invalid request cannot partially update.

@@ -1124,7 +1124,19 @@ def _recover_search_index(conn: sqlite3.Connection) -> None:
         # THIS connection re-raises the constructor error (probed). The
         # schema-cookie bump makes every later statement reload the healthy
         # schema; init_db's main script is all IF NOT EXISTS no-ops here.
-        _fts_schema_surgery(STORE_PATH)
+        # Phase-4.5 finding 1: the surgery must target the file THIS
+        # connection has open (restore's staged migrate opens a private
+        # copy), never the STORE_PATH global — a staged open with an
+        # unconstructible vtable would otherwise surgery the LIVE store.
+        # An un-file-backed main (in-memory) cannot be treated by a second
+        # connection at all, so the original error propagates.
+        main_file = None
+        for _seq, _name, _file in conn.execute("PRAGMA database_list"):
+            if _name == "main":
+                main_file = _file
+                break
+        if main_file:
+            _fts_schema_surgery(main_file)
         return
     conn.execute("BEGIN IMMEDIATE")
     try:

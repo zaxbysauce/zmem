@@ -378,5 +378,54 @@ class DoctorHealthyTest(SuppBase):
                 f"fts lane: {fts_lane!r}")
 
 
+class TombstoneCasPinTest(SuppBase):
+    """Phase-4.5 finding 2: the conditional tombstone in _absorb_into_keeper
+    is defense-in-depth behind the under-lock CAS (a single-writer BEGIN
+    IMMEDIATE cannot normally make it fire), so NO frozen check kills the
+    mutation "revert the conditional tombstone". This leg pins the hunk
+    directly: a stale (already-superseded) absorbed row must raise and the
+    caller's transaction must roll back, never merge."""
+
+    def test_dead_neighbour_at_tombstone_time_raises_and_rolls_back(self):
+        self._add("tombstone cas keeper content")
+        self._add("tombstone cas neighbour content")
+        # storelib/__init__ re-exports the consolidate() FUNCTION, shadowing
+        # the submodule name — import the module object itself.
+        import importlib
+        consolidate_lib = importlib.import_module("storelib.consolidate")
+        conn = self._store_conn()
+        try:
+            keeper = conn.execute(
+                "SELECT * FROM memory WHERE superseded_at IS NULL"
+                " AND content LIKE 'tombstone cas keeper%'").fetchone()
+            nb = conn.execute(
+                "SELECT * FROM memory WHERE superseded_at IS NULL"
+                " AND content LIKE 'tombstone cas neighbour%'").fetchone()
+            self.assertIsNotNone(keeper)
+            self.assertIsNotNone(nb)
+            # A concurrent writer tombstoned the neighbour between the
+            # working-set read and this cluster's tombstone: the stale row
+            # object still says live, the table does not.
+            conn.execute(
+                "UPDATE memory SET superseded_at=?, valid_until=?,"
+                " supersede_reason='superseded by another writer'"
+                " WHERE id=?", (A_NOW, A_NOW, nb["id"]))
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(RuntimeError) as raised:
+                consolidate_lib._absorb_into_keeper(
+                    conn, keeper, nb, now=A_NOW)
+            self.assertIn("was not live at tombstone time", str(raised.exception))
+            conn.rollback()
+            # nothing merged: the keeper is untouched and carries no
+            # provenance from the dead neighbour
+            fresh = conn.execute(
+                "SELECT * FROM memory WHERE id=?", (keeper["id"],)).fetchone()
+            self.assertNotIn(nb["id"], fresh["merged_from"] or "")
+            self.assertEqual(fresh["content"], keeper["content"])
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
