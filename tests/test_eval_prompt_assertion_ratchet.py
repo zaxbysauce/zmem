@@ -36,6 +36,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
+
 REPO = Path(__file__).resolve().parents[1]
 SCRATCH = Path(tempfile.mkdtemp(prefix="zmem-pa-ratchet-"))
 atexit.register(shutil.rmtree, SCRATCH, True, None)
