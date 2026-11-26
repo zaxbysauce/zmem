@@ -2777,7 +2777,15 @@ def update_memory(
             raise ValueError(
                 f"[zmem] no memory with id {mid}; cannot update "
                 "(the row vanished between read and write)")
-        ns = namespace if namespace is not None else locked["namespace"]
+        # Final-critic finding 1: a CALLER-supplied namespace must be the
+        # CANONICALIZED one (trimmed, near-miss-checked against the live
+        # store) — the raw value regressed update to storing
+        # "  project:x  " where add (and update on main) store "project:x".
+        # Re-validate under the lock so the canonicalization also sees the
+        # live store; an inherited namespace is taken verbatim from the
+        # locked row (it was canonicalized when it was written).
+        ns = (_validate_namespace(conn, namespace)
+              if namespace is not None else locked["namespace"])
         type_eff = type_ if type_ is not None else locked["type"]
         tags_eff = tags if tags is not None else locked["tags"]
         source_ref_eff = (

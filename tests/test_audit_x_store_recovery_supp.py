@@ -1166,5 +1166,64 @@ class LoopBoundShapeTest(SuppBase, _SnapshotMixin):
         self.assertIn("alter upgraded source row", self._live_rows())
 
 
+class NamespaceTrimSuppTest(SuppBase):
+    """Final-critic finding 1: update stores a CALLER-supplied namespace in
+    its canonicalized form (trimmed), through the library AND the public
+    CLI — the locked-row rework had regressed update to the raw value
+    (add, and update on main, always stored the trimmed one)."""
+
+    def test_update_trims_caller_namespace_library(self):
+        os.environ["ZMEM_STORE"] = str(self.store)
+        os.environ["ZMEM_DATA"] = str(self.dir)
+        import storelib
+        storelib._refresh_env_state()
+        conn = storelib.connect()
+        storelib.init_db(conn)
+        storelib.migrate(conn)
+        self.addCleanup(conn.close)
+        import storelib.write as writelib
+        writelib.add_memory(
+            conn, namespace=NS, type_="fact",
+            content="namespace trim library row", signal="test")
+        row = conn.execute(
+            "SELECT id FROM memory WHERE content LIKE 'namespace trim%'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        writelib.update_memory(
+            conn, mid=row["id"],
+            content="namespace trim library row two",
+            namespace="  " + NS + "  ")
+        successor = conn.execute(
+            "SELECT namespace FROM memory WHERE update_of=? "
+            "AND superseded_at IS NULL", (row["id"],)).fetchone()
+        self.assertIsNotNone(successor)
+        self.assertEqual(successor["namespace"], NS,
+                         repr(successor["namespace"]))
+
+    def test_update_trims_caller_namespace_cli(self):
+        seeded = "namespace trim cli row"
+        r = self._add(seeded)
+        import json as _json
+        mid = _json.loads(r.stdout)["id"]
+        env = _child_env(self.dir, self.store)
+        r2 = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "update", "--id", mid,
+             "--namespace", "  " + NS + "  ", "--content",
+             "namespace trim cli row two", "--json"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=180)
+        self.assertEqual(r2.returncode, 0, r2.stderr[-300:])
+        conn = self._store_conn()
+        try:
+            ns_rows = conn.execute(
+                "SELECT namespace FROM memory WHERE update_of=? "
+                "AND superseded_at IS NULL", (mid,)).fetchall()
+        finally:
+            conn.close()
+        self.assertTrue(ns_rows, "no live successor after the CLI update")
+        self.assertEqual(ns_rows[0]["namespace"], NS,
+                         repr(ns_rows[0]["namespace"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
