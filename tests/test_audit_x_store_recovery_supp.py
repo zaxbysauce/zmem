@@ -757,10 +757,15 @@ class RestoreFaultMatrixTest(_InProcessRestoreBase):
         self.assertEqual(result["rc"], 1)
         self.assertIn("restored row counts differ", result["err"])
         self.assertIn("automatic rollback also failed", result["err"])
-        # the rollback's verification of the re-installed file failed: the
-        # corrupted page surfaces as "database disk image is malformed"
-        # (a DatabaseError from the same verification leg)
-        self.assertIn("malformed", result["err"])
+        # the rollback's verification of the re-installed file failed. The
+        # corrupted page's wording is SQLite-build-dependent: the WAL pragma
+        # raises "database disk image is malformed" first on some builds,
+        # while others reach the integrity_check leg and report
+        # "btreeInitPage() returns error code 11" (the ubuntu CI lane showed
+        # the second). Pin that SOME corruption wording surfaced.
+        self.assertTrue("malformed" in result["err"]
+                        or "integrity_check" in result["err"],
+                        result["err"][-300:])
 
     def test_safety_copy_failure_aborts_untouched(self):
         self._add("abort keeper row")

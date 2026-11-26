@@ -1636,23 +1636,6 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     from schema_meta import SCHEMA_VERSION_KEY, SUPPORTED_SCHEMA_VERSION
     from storelib.readonly import open_readonly, ReadOnlyStoreError
 
-    def _read_stamp_sidecar_free(path: Path) -> int | None:
-        try:
-            if not path.exists() or path.stat().st_size == 0:
-                return None
-            handle = open_readonly(path)
-            try:
-                row = handle.execute(
-                    "SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)
-                ).fetchone()
-            finally:
-                handle.close()
-            if not row:
-                return None
-            return int(row[0])
-        except (FileNotFoundError, ReadOnlyStoreError, sqlite3.Error, OSError):
-            return None
-
     snap = Path(from_path).expanduser()
     dest = STORE_PATH
 
@@ -1864,7 +1847,6 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             # Fall through to the step-9 rollback machinery via the same
             # path the success-path failures take.
             print(f"[zmem] restore FAILED: {cause}", file=sys.stderr)
-            rollback_err = cause
             staged = None
             return _finish_failed_restore(
                 dest=dest, dest_exists=dest_exists, dest_nonempty=dest_nonempty,
@@ -1898,7 +1880,6 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         return 1
 
     # --- 8. The success path (today's sequence, unchanged in statements). ---
-    rollback_err: str | None = None
     try:
         try:
             conn = sqlite3.connect(str(dest))

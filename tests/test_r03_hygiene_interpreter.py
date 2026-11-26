@@ -84,9 +84,15 @@ class OperatorCommandPrefixPin(unittest.TestCase):
         self.assertIn("command_prefix()", schema,
                       "schema reembed hint must use the opcmds prefix")
         backup = BACKUP.read_text(encoding="utf-8")
-        self.assertEqual(backup.count("command_prefix()"), 5,
-                         "all five backup rollback hints must use the prefix "
-                         "(4 original + the #493 post-restore-open arm)")
+        # PR #541 (#504) consolidated the old five-branch rollback into one
+        # _finish_failed_restore with ONE hand-rollback hint site (the
+        # pre-restore backup arm); the empty/missing-destination arms advise
+        # file deletion, which carries no command. The rule's intent — every
+        # operator COMMAND hint renders through the prefix — is unchanged.
+        self.assertEqual(backup.count("command_prefix()"), 1,
+                         "the backup hand-rollback hint must use the prefix "
+                         "(consolidated to one site by PR #541's restore "
+                         "rework; the pre-#504 five-branch shape is gone)")
 
     def test_doctor_hints_use_the_prefix(self):
         doctor = DOCTOR.read_text(encoding="utf-8")

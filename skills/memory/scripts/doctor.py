@@ -3850,7 +3850,7 @@ def _check_fts_index(resolved_store: Path) -> dict:
                 "fts-index",
                 "warn",
                 "Full-text index is missing its memory_fts_docsize shadow "
-                "table; run `store.py rebuild-fts` (or open the store once "
+                f"table; run `{_prefix()} rebuild-fts` (or open the store "
                 "with any writable command) to rebuild it.",
                 repair="rebuild-fts",
             )
@@ -3864,7 +3864,7 @@ def _check_fts_index(resolved_store: Path) -> dict:
             "fts-index",
             "warn",
             f"Could not compare memory rows with the full-text index: "
-            f"{type(exc).__name__}: {exc}; run `store.py rebuild-fts`.",
+            f"{type(exc).__name__}: {exc}; run `{_prefix()} rebuild-fts`.",
             repair="rebuild-fts",
         )
     finally:
@@ -3881,7 +3881,7 @@ def _check_fts_index(resolved_store: Path) -> dict:
         "warn",
         f"Full-text index is missing {len(missing)} of {len(memory_ids)} "
         f"memory rows (lexical search cannot find them); run "
-        f"`store.py rebuild-fts` to re-index.",
+        f"`{_prefix()} rebuild-fts` to re-index.",
         missing_rows=len(missing),
         total_rows=len(memory_ids),
         repair="rebuild-fts",

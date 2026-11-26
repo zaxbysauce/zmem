@@ -642,28 +642,46 @@ class InterruptedSchemaAndFtsTests(AuditSchemaRecoveryBase):
             " warn/fail checks were: %r"
             % [(str(c.get("id")), str(c.get("status")),
                 (str(c.get("summary") or ""))[:80]) for c in candidates])
-        # (d) every failing check names the full-text / search index in its
-        #     id, so an unrelated failure cannot satisfy this leg.
+        # (d) every failing STORE-FACING check names the full-text / search
+        #     index in its id, so an unrelated failure cannot satisfy this
+        #     leg. Host-state checks (the runner's claude-native-memory, the
+        #     served-install family) diagnose the MACHINE, not the store, and
+        #     are out of this leg's scope — a CI runner with no Claude
+        #     install fails them while the store is perfectly healthy (the
+        #     ubuntu lane proved exactly that; AMENDED CHECK_WRONG after the
+        #     first CI round).
+        _HOST_STATE_MARKERS = ("claude", "native-memory", "served", "install",
+                               "host-config")
         unrelated = [str(c.get("id")) for c in checks
                      if c.get("status") == "fail"
+                     and not any(m in str(c.get("id") or "").lower()
+                                 for m in _HOST_STATE_MARKERS)
                      and not any(t in str(c.get("id") or "").lower()
                                  for t in ("fts", "index", "search"))]
         self.assertEqual(unrelated, [],
-            "AC1-506: every failing check must name the full-text / search"
+            "AC1-506: every failing store-facing check must name the"
+            " full-text / search"
             " index in its id so an unrelated failure cannot satisfy this leg;"
             " unrelated fail checks: %r" % (unrelated,))
 
     def _leg_doctor_healthy(self, fresh_dir):
         r = self._doctor(fresh_dir, fresh_dir / "store.sqlite")
-        self.assertEqual(r.returncode, 0,
-            "AC1-506: control - doctor on a healthy never-interrupted store exited %s:"
-            " stderr %r" % (r.returncode, r.stderr[-300:]))
+        # The control pins STORE health, not machine health: doctor's global
+        # exit code and ok flag include HOST-state checks (claude-native-
+        # memory, served installs) that fail on a bare CI runner while the
+        # store is healthy (AMENDED CHECK_WRONG after the first ubuntu CI
+        # round tripped on exactly that). The store-facing assertions below
+        # carry the leg's discriminating power.
         payload = self._loads(r, "AC1-506: doctor healthy control")
-        summary = (payload.get("summary") or {})
-        self.assertTrue(payload.get("ok") is True
-                        and int(summary.get("fail") or 0) == 0,
-            "AC1-506: control - the doctor must keep reporting a healthy never-interrupted store"
-            " as healthy: ok=%r summary=%r" % (payload.get("ok"), summary))
+        _HOST_STATE_MARKERS = ("claude", "native-memory", "served", "install",
+                               "host-config")
+        store_fail = [str(c.get("id")) for c in payload.get("checks") or []
+                      if c.get("status") == "fail"
+                      and not any(m in str(c.get("id") or "").lower()
+                                  for m in _HOST_STATE_MARKERS)]
+        self.assertEqual(store_fail, [],
+            "AC1-506: control - no store-facing check may fail on a healthy"
+            " never-interrupted store; failing: %r" % (store_fail,))
         index_checks = [(str(c.get("id")), str(c.get("status")))
                         for c in payload.get("checks") or []
                         if _names_search_index(c)]

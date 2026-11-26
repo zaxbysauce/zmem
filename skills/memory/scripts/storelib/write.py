@@ -2708,6 +2708,24 @@ def update_memory(
     # surrounding try/except rolls the transaction back on any refusal.
     tx_now = now if now is not None else now_iso()
 
+    # CI-fed pinned contract (tests/test_evidence.py, "safe redaction counts
+    # are reported before a lock failure"): a PRE-LOCK warning pass on the
+    # caller-visible triple so an operator learns their content carried a
+    # secret even when the write lock is contended and the update aborts.
+    # The AUTHORITATIVE policy evaluation stays under the lock (issue #507,
+    # locked-row-derived inherited values); its emission below reports only
+    # warnings this pass did not already print, so the success path still
+    # prints each warning exactly once.
+    _pre_content, _pre_src, _pre_tags, _pre_warns = apply_capture_policy(
+        content=content,
+        source_ref=(source_ref if source_ref is not None
+                    else old["source_ref"]),
+        tags=tags if tags is not None else old["tags"],
+        capture_mode=capture_mode,
+    )
+    _emit_capture_policy_warnings(_pre_warns, capture_mode=capture_mode)
+    _pre_warn_keys = {(w.get("type"), w.get("message")) for w in _pre_warns}
+
     started_tx = False
     try:
         if not conn.in_transaction:
@@ -2847,7 +2865,13 @@ def update_memory(
             else _default_taint_for_signal(sig_eff))
         incoming_taint = worse_taint(
             locked["taint"] or "trusted_internal", effective_base)
-        _emit_capture_policy_warnings(warns, capture_mode=capture_mode)
+        # Delta emission (see the pre-lock pass above): only warnings the
+        # pre-lock pass could not have known — e.g. a secret a concurrent
+        # writer added to an INHERITED value the locked row now carries.
+        _emit_capture_policy_warnings(
+            [w for w in warns
+             if (w.get("type"), w.get("message")) not in _pre_warn_keys],
+            capture_mode=capture_mode)
 
         # v15 (#173 PR-review F21): resolve the side-table pair against a
         # snapshot taken UNDER the write lock, so a concurrent purge/supersede
