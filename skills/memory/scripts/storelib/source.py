@@ -163,9 +163,10 @@ def _evidence(
     if not rows:
         return [], None
     anchors = {(r[2], r[3], r[4], r[5], r[6], r[7]) for r in rows}
-    if len(anchors) == 1:
-        return rows, rows[0]
     if evidence_id is not None:
+        # Membership FIRST (review 4.5 round 1): even when every row shares
+        # one anchor tuple, an unassociated selector must refuse — repair
+        # reports the requested id, so its provenance must be associated.
         for row in rows:
             if str(row[0]) == str(evidence_id):
                 return rows, row
@@ -173,6 +174,8 @@ def _evidence(
         raise SourceRefusal(
             f"evidence id {evidence_id!r} is not associated with this memory "
             f"(associated: {named})")
+    if len(anchors) == 1:
+        return rows, rows[0]
     named = ", ".join(str(r[0]) for r in rows)
     raise SourceRefusal(
         "ambiguous anchors: pass --evidence-id one of " + named)
@@ -484,10 +487,17 @@ def _verification_outcome(
         return None
     lines = _project_file_lines(path)
     excerpt = str(anchor[5] or "")
-    quoted = excerpt.strip().splitlines()[0].strip() if excerpt.strip() else ""
-    if not quoted:
+    # R4.5-3: verify the COMPLETE quoted passage (every non-empty line, in
+    # order, as one contiguous block, whitespace-insensitive per line) — a
+    # change to ANY quoted line affects the outcome, not just the first.
+    quoted_lines = [ln.strip() for ln in excerpt.strip().splitlines()
+                    if ln.strip()]
+    if not quoted_lines:
         return None
-    hits = [i for i, line in enumerate(lines) if line.strip() == quoted]
+    stripped = [ln.strip() for ln in lines]
+    n = len(quoted_lines)
+    hits = [i for i in range(len(stripped) - n + 1)
+            if stripped[i:i + n] == quoted_lines]
     selected = anchor[7] if anchor[7] is not None else -1
     if not hits:
         outcome = "missing"
@@ -805,6 +815,19 @@ _HEX_40_64_RE = re.compile(r"\b[0-9a-fA-F]{40}\b|\b[0-9a-fA-F]{64}\b")
 MARKER = "[REDACTED_SECRET]"
 
 
+def _check_alignment(content: str, alignment_text: str) -> None:
+    """The shared alignment rule (issue #502 AC2): the aligned quotation must
+    occur EXACTLY ONCE in the stored content. Zero -> changed quotation;
+    more than one -> ambiguous target."""
+    occurrences = content.count(alignment_text)
+    if occurrences == 0:
+        raise SourceRefusal("changed quotation: evidence no longer "
+                            "matches the stored redacted context")
+    if occurrences > 1:
+        raise SourceRefusal("ambiguous target: the aligned quotation "
+                            "occurs more than once in the stored content")
+
+
 def repair_from_evidence(
     conn: sqlite3.Connection, *, memory_id: str, evidence_id: str,
     mode: str,
@@ -842,7 +865,11 @@ def repair_from_evidence(
         raise SourceRefusal("memory has no evidence to repair from")
     excerpt = str(anchor[5] or "")
     ref_path = str(anchor[6] or "")
-
+    # R4.5-2: the repair contract resolves a BARE relative name beneath the
+    # trusted root — reject separators, drives, schemes, and parent traversal
+    # BEFORE any git call (an absolute or ../ ref_path must never select a
+    # repository outside ZMEM_REPAIR_ROOT).
+    _safe_ref(ref_path)
     candidates = list(dict.fromkeys(_HEX_40_64_RE.findall(excerpt)))
     if len(candidates) != 1:
         raise SourceRefusal(
@@ -877,14 +904,24 @@ def repair_from_evidence(
             "restored value is not an object in the evidence-linked "
             "repository")
 
+    # Alignment (R4.5-4): PREVIEW checks it point-in-time too — a preview
+    # must not report a verified restoration the stored row cannot accept.
+    # APPLY re-runs it UNDER THE WRITE LOCK (Round-5 critic: a concurrent
+    # first repair makes a same-span second repair refuse).
     if mode == "preview":
+        content_now = conn.execute(
+            "SELECT content FROM memory WHERE id=? AND superseded_at IS NULL",
+            (memory_id,)).fetchone()
+        if content_now is None:
+            raise SourceRefusal("memory vanished")
+        _check_alignment(content_now[0] or "", alignment_text)
+        # Preview NEVER proceeds into the apply transaction (the arm-B
+        # snapshot connection is query-only — a fall-through would fail with
+        # "attempt to write a readonly database").
         return {"memory_id": memory_id, "evidence_id": evidence_id,
                 "mode": "preview", "restore_value": candidate,
                 "verified": True, "applied": False}
 
-    # APPLY: under the write lock, re-read content and re-run alignment
-    # (Round-5 critic: alignment runs against the LOCKED content — a
-    # concurrent first repair makes a same-span second repair refuse).
     owns_tx = not conn.in_transaction
     if owns_tx:
         conn.execute("BEGIN IMMEDIATE")
@@ -895,13 +932,7 @@ def repair_from_evidence(
         if row is None:
             raise SourceRefusal("memory vanished before apply")
         content = row[0] or ""
-        occurrences = content.count(alignment_text)
-        if occurrences == 0:
-            raise SourceRefusal("changed quotation: evidence no longer "
-                                "matches the stored redacted context")
-        if occurrences > 1:
-            raise SourceRefusal("ambiguous target: the aligned quotation "
-                                "occurs more than once in the stored content")
+        _check_alignment(content, alignment_text)
         # Replace ONLY the marker span inside the aligned occurrence: the
         # aligned text carries exactly one marker; swap it for the verified
         # value.

@@ -382,7 +382,8 @@ class RepairAlignmentTests(unittest.TestCase):
             self.assertIsNotNone(_meta(db, f"source_repair:{memory_id}"))
 
     def test_two_repairs_accumulate(self) -> None:
-        # R4-2: two independently repaired spans accumulate in the record.
+        # R4-2 + review 4.5-5: TWO real repairs on one row accumulate both
+        # provenance entries.
         with tempfile.TemporaryDirectory(
                 prefix="zmem-supp-two-") as temp:
             root = Path(temp)
@@ -393,43 +394,61 @@ class RepairAlignmentTests(unittest.TestCase):
             _git(repo, "config", "user.name", "fixture")
             (repo / "README.txt").write_text("fixture\n", encoding="utf-8")
             _git(repo, "add", "-A")
-            _git(repo, "-c", "commit.gpgsign=false", "commit", "-m", "c")
-            sha = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "-c", "commit.gpgsign=false", "commit", "-m", "first")
+            sha1 = _git(repo, "rev-parse", "HEAD")
+            (repo / "second.txt").write_text("second\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "-c", "commit.gpgsign=false", "commit", "-m", "second")
+            sha2 = _git(repo, "rev-parse", "HEAD")
+            self.assertNotEqual(sha1, sha2)
             repair_env: dict[str, str | None] = {"ZMEM_REPAIR_ROOT": str(root)}
             _init(root, repair_env)
-            # Two DISTINCT 40-hex runs: one labeled (preserved at add), one
-            # unlabeled (destroyed at add). Repair the unlabeled one.
-            labeled_sha = ("a" * 8 + "b" * 8 + "c" * 8 + "d" * 8 + "e" * 8)
+            # BOTH unlabeled 40-hex runs destroyed at add (fail-safe net).
             memory_id = _add(
                 root,
-                f"release {labeled_sha} shipped; "
                 f"rollback [REDACTED_SECRET] noted; "
-                f"password=[REDACTED_SECRET] rotated",
+                f"rebuild [REDACTED_SECRET] verified",
                 repair_env)
             db = root / "store.sqlite"
-            _insert_evidence(db, memory_id, [(
-                "ev-supp-3", "sess-supp", "codex", "pretool", "turn",
-                "2026-11-26T12:00:00Z", "h1",
-                f"rollback {sha} noted", "repo", 0)])
-            apply_result = _run(root, "source", "repair", "--id", memory_id,
-                                "--evidence-id", "ev-supp-3", "--apply",
-                                extra_env=repair_env)
-            self.assertEqual(apply_result.returncode, 0, apply_result.stderr)
+            _insert_evidence(db, memory_id, [
+                ("ev-supp-3", "sess-supp", "codex", "pretool", "turn",
+                 "2026-11-26T12:00:00Z", "h1",
+                 f"rollback {sha1} noted", "repo", 0),
+                ("ev-supp-4", "sess-supp", "codex", "pretool", "turn",
+                 "2026-11-26T12:05:00Z", "h2",
+                 f"rebuild {sha2} verified", "repo", 0),
+            ])
+            # Repair one: restores sha1 (the multi-anchor memory selects
+            # explicitly), appends entry 1.
+            r1 = _run(root, "source", "repair", "--id", memory_id,
+                      "--evidence-id", "ev-supp-3", "--apply",
+                      extra_env=repair_env)
+            self.assertEqual(r1.returncode, 0, r1.stderr)
             record = json.loads(_meta(db, f"source_repair:{memory_id}"))
             self.assertEqual(len(record), 1)
-            self.assertEqual(record[0]["restored"], sha)
-            # A second repair via a second evidence row appends.
-            _insert_evidence(db, memory_id, [(
-                "ev-supp-4", "sess-supp", "codex", "pretool", "turn",
-                "2026-11-26T12:05:00Z", "h2",
-                f"password Hunter2Secret99 rotated",
-                "repo", 0)]) if False else None
-            # (Only one repairable identifier is wired in this fixture: the
-            # second-span case is covered by the accumulating-record unit
-            # semantics above — the record append path was exercised once.)
+            self.assertEqual(record[0]["restored"], sha1)
+            self.assertIn(sha1, _memory_content(db, memory_id))
+            self.assertNotIn(sha2, _memory_content(db, memory_id))
+            # Repair two: restores sha2, APPENDS entry 2 (never overwrites).
+            r2 = _run(root, "source", "repair", "--id", memory_id,
+                      "--evidence-id", "ev-supp-4", "--apply",
+                      extra_env=repair_env)
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            record = json.loads(_meta(db, f"source_repair:{memory_id}"))
+            self.assertEqual(len(record), 2)
+            self.assertEqual({e["restored"] for e in record}, {sha1, sha2})
+            self.assertEqual({e["evidence_id"] for e in record},
+                             {"ev-supp-3", "ev-supp-4"})
             content = _memory_content(db, memory_id)
-            self.assertIn(sha, content)
-            self.assertIn(labeled_sha, content)  # labeled SHA survived add
+            self.assertIn(sha1, content)
+            self.assertIn(sha2, content)
+            # Rescan durability for BOTH values: the repaired row is not a
+            # candidate and the record carries both entries.
+            dry = _run(root, "rescan-secrets", "--dry-run",
+                       extra_env=repair_env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertNotIn(memory_id, json.loads(
+                dry.stdout.strip().splitlines()[-1])["ids"])
 
 
 def _init_repo(repo: Path) -> Path:
