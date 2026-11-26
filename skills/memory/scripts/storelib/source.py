@@ -487,11 +487,11 @@ def _verification_outcome(
         return None
     lines = _project_file_lines(path)
     excerpt = str(anchor[5] or "")
-    # R4.5-3: verify the COMPLETE quoted passage (every non-empty line, in
-    # order, as one contiguous block, whitespace-insensitive per line) — a
-    # change to ANY quoted line affects the outcome, not just the first.
-    quoted_lines = [ln.strip() for ln in excerpt.strip().splitlines()
-                    if ln.strip()]
+    # R4.5-3 + review 4.5 r2: verify the COMPLETE quoted passage — every
+    # line of the excerpt (internal blank lines included) as one contiguous
+    # block, whitespace-insensitive per line — so a change to ANY quoted
+    # line, or to the block's line sequence, affects the outcome.
+    quoted_lines = [ln.strip() for ln in excerpt.splitlines()]
     if not quoted_lines:
         return None
     stripped = [ln.strip() for ln in lines]
@@ -875,12 +875,35 @@ def repair_from_evidence(
         raise SourceRefusal(
             "evidence excerpt must quote exactly one verifiable identifier")
     candidate = candidates[0]
+    if MARKER in excerpt:
+        # Review 4.5 r2: a pre-existing marker in the excerpt means the
+        # evidence was itself auto-redacted — the original value is gone and
+        # the marker substitution below would hit the WRONG position.
+        raise SourceRefusal(
+            "evidence excerpt was itself redacted; no original value to "
+            "restore")
     alignment_text = excerpt.replace(candidate, MARKER)
 
     repair_root = os.environ.get("ZMEM_REPAIR_ROOT", "").strip()
     if not repair_root:
         raise SourceRefusal("ZMEM_REPAIR_ROOT is not set")
-    repo_dir = Path(repair_root) / ref_path
+    root_path = Path(repair_root)
+    repo_dir = root_path / ref_path
+    # Review 4.5 r2: a bare-name child may still be a symlink/reparse point
+    # to an outside location — neither the root nor the child may be a
+    # reparse point, and the child must resolve strictly inside the resolved
+    # trusted root before any git call.
+    try:
+        if _is_reparse(root_path) or _is_reparse(repo_dir):
+            raise SourceRefusal("ref_path is not a safe directory")
+    except OSError as exc:
+        raise SourceRefusal("ref_path is not a safe directory") from exc
+    try:
+        if (not repo_dir.resolve().is_relative_to(root_path.resolve())
+                and repo_dir.resolve() != root_path.resolve()):
+            raise SourceRefusal("ref_path escapes the trusted repair root")
+    except OSError as exc:
+        raise SourceRefusal("ref_path is not a safe directory") from exc
 
     def _git(*args: str) -> subprocess.CompletedProcess:
         return _subprocess.run(
