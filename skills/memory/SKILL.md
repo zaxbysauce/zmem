@@ -482,6 +482,31 @@ A pool fully suppressed
 by the prompt's assertions reports below-relevance, not below-bar; the
 explain replay mirrors the same semantics and keys
 attribute_dropped/attribute_drop_labels/attribute_rescued on occurrence.
+
+Issue #530 refines the contract along five axes. (1) Multi-focus: the
+ORTHOGONAL drop applies under a prompt with several questions — a fact is
+orthogonal when it asserts none of the attributes any question asks about
+and shares a subject with an asked cost/ownership/duration focus; a fact
+that asserts an asked attribute is never dropped as orthogonal, and the
+qualified-fact exemption from the CONFLICT drop is unchanged from PR #526
+(it applies to a single cost/ownership/duration question). (2)
+Sentence-scoped negation: a stored row is split into sentences by a
+conservative credible-boundary test (a mark ends a sentence only when a
+sentence credibly starts after it; a period attaches to a matched closing
+delimiter or a well-formed word — abbreviations never split; newlines and
+semicolons are never boundaries), and a negator or hypothetical marker
+suppresses only the cue matches in its own sentence, so "Do not ship on
+Fridays. Kennet policy sends unsealed parcels to Rowan Dock." still
+asserts its second sentence. (3) Moment allow-list: the admission seam
+parses prompt assertions only on the documented moments (user_prompt and
+subagent, plus the historic no-moment callers); the pretool moment — whose
+query is agent-authored TOOL text — is refused, so a command line can
+never suppress a stored fact. (4) Bridged fallback: when the bridged
+subagent pull falls back to the recent lane on a zero-hit query, the same
+partition runs on the fallback lane (the parked task text is the frame
+source). (5) Rescue count: attribute_rescued counts only rescued rows
+that are actually delivered (a rescued row dropped by the score margin,
+the credential withhold, or the token budget is not counted).
 Derived pages whose bullets embed a suppressed source are withheld from the
 combined admission. Disclosed limits: the cue grammar is English-only, and
 distinct generic-noun subjects without identifiers ("usage reports" vs

@@ -97,9 +97,9 @@ class EndToEndReportTest(unittest.TestCase):
         self.assertEqual(self.report["lane"], "for-injection")
         self.assertEqual(self.report["profile"], "fake (model-absent)")
         self.assertEqual(self.report["clock"], EVAL_PIN_TS)
-        self.assertEqual(self.report["metrics"]["items"], 112)
-        self.assertEqual(self.report["metrics"]["positive_items"], 102)
-        self.assertEqual(self.report["metrics"]["negative_items"], 10)
+        self.assertEqual(self.report["metrics"]["items"], 115)
+        self.assertEqual(self.report["metrics"]["positive_items"], 104)
+        self.assertEqual(self.report["metrics"]["negative_items"], 11)
 
     def test_profile_metrics_match_recorded_artifact(self):
         """Issue #126: --profile-json-out writes the STABLE projection and
@@ -302,8 +302,13 @@ class EndToEndReportTest(unittest.TestCase):
         their documented meaning."""
         doc = json.loads(BASELINE.read_text(encoding="utf-8"))
         note = doc.get("note", "")
+        # Issue #234 origin + issue #530 reseed provenance, the split
+        # basis (weighted metrics vs weights-neutral per_moment), and the
+        # authoring flag the per_moment block is measured with.
         self.assertIn("234", note)
+        self.assertIn("530", note)
         self.assertIn("2026-09-27", note)
+        self.assertIn("2026-11-25", note)
         self.assertIn("--moment-weights-neutral", note)
         self.assertIn("WEIGHTS-NEUTRAL", note)
 
