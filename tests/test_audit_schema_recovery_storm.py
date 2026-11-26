@@ -68,6 +68,11 @@ from test_audit_schema_recovery import (  # noqa: E402
     AuditSchemaRecoveryBase, NS, PY, REPO_ROOT, SCRIPTS_DIR,
     _TIGHT_POLL, _TIGHT_WAIT,
 )
+import _store_guard  # noqa: E402,F401  (#244 wiring census: this companion
+#                      names store.py/storelib in its child-writer source;
+#                      the shared base module imported above already pinned
+#                      the env and the guard — this literal import satisfies
+#                      the census's per-file wiring requirement)
 
 _N_CHILDREN = 32
 _N_ROUNDS = 3

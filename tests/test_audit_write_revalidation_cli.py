@@ -34,6 +34,9 @@ TESTS_DIR = Path(__file__).resolve().parent
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 import test_audit_write_revalidation as base  # noqa: E402  (pins env + guard)
+import _store_guard  # noqa: E402,F401  (#244 wiring census: the literal
+#                      per-file import; the base module above already pins
+#                      the env and the guard)
 
 # Round 2, critic leg 6: a tag the DEFAULT capture intent (auto — no
 # --capture-mode flag, ZMEM_CAPTURE_MODE unset) treats specially. The 32-hex

@@ -79,6 +79,10 @@ for _k in ("ZMEM_SESSION", "ZMEM_SESSION_ID", "ZMEM_TIER0",
             "ZMEM_SKILLS_DIRS", "ZMEM_PYTHON"):
     os.environ.pop(_k, None)
 sys.path.insert(0, str(SCRIPTS_DIR))
+import _store_guard  # noqa: E402,F401  (issue #244 isolation guard; the
+#                      wiring census requires it in every test file that
+#                      names storelib/store.py — after the env pin, so the
+#                      guard sees the scratch store, never the real one)
 
 NS = "project:x-store-recovery-supp"
 A_NOW = "2026-11-25T12:00:00Z"
