@@ -1502,6 +1502,24 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 print("[zmem] purge FAILED: backup scrub failed (%s)"
                       % e, file=sys.stderr)
                 return 6
+            # F-005 (swarm-pr-review MV-003): restore's forensic and work
+            # dirs hold byte-copies of the pre-restore store and its -wal
+            # (WAL page images can carry purged-content bytes the restored
+            # store no longer has). Leaving them silently behind would
+            # violate --scrub-backups' completeness surface — refuse loudly
+            # (they are operator recovery artifacts, so deleting them
+            # automatically is not this flag's call; the operator inspects
+            # and removes them, then re-runs).
+            restore_artifacts = sorted(
+                d for d in bdir.glob("restore-forensic-*") if d.is_dir()
+            ) + sorted(d for d in bdir.glob("restore-work-*") if d.is_dir())
+            if restore_artifacts:
+                print("[zmem] purge: WARNING: --scrub-backups found restore "
+                      "recovery artifacts it does NOT scrub; they can hold "
+                      "pre-restore bytes of purged content — inspect and "
+                      "remove them, then re-run:", file=sys.stderr)
+                for d in restore_artifacts:
+                    print("  %s" % d, file=sys.stderr)
             if not snapshots:
                 # F-266-10: a typo'd or empty out-dir must not silently
                 # report a successful scrub of zero snapshots.

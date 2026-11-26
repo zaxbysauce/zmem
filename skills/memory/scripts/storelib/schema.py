@@ -1167,12 +1167,23 @@ def _fts_schema_surgery(store_path) -> None:
     plain recovery transaction afterwards is a no-op. The schema-cookie
     bump makes every other connection (including the caller's) reload its
     schema on its next statement.
+
+    Surgery shape (swarm-pr-review F-002 / MX-001, critic-probed): the
+    writable_schema pass deletes ONLY the ``memory_fts`` vtable row — a
+    vtable row has rootpage 0 and owns no pages, so removing it from
+    sqlite_master leaks nothing. The SURVIVING shadow tables are then
+    dropped with real ``DROP TABLE IF EXISTS`` statements on a second
+    connection, which frees their pages properly (deleting their
+    sqlite_master rows instead stranded those pages forever: every later
+    integrity_check reported "Page N: never used", the backup safety net
+    refused the store, and restore-over-healed-store aborted). Probed
+    both ways on SQLite 3.45.1: this shape heals with integrity_check ok
+    and search working, with no VACUUM and no exclusive lock.
     """
     surgery = sqlite3.connect(str(store_path))
     try:
         surgery.execute("PRAGMA writable_schema=ON")
-        for name in ("memory_fts",) + _FTS_SHADOW_TABLES:
-            surgery.execute("DELETE FROM sqlite_master WHERE name=?", (name,))
+        surgery.execute("DELETE FROM sqlite_master WHERE name='memory_fts'")
         ver = surgery.execute("PRAGMA schema_version").fetchone()[0]
         surgery.execute(f"PRAGMA schema_version = {ver + 1}")
         surgery.execute("PRAGMA writable_schema=OFF")
@@ -1181,6 +1192,11 @@ def _fts_schema_surgery(store_path) -> None:
         surgery.close()
     rebuilt = sqlite3.connect(str(store_path))
     try:
+        for shadow in _FTS_SHADOW_TABLES:
+            # Real drops free the pages the writable_schema pass must not
+            # touch; shadows already missing (the reason we are here) are
+            # no-ops under IF EXISTS.
+            rebuilt.execute(f'DROP TABLE IF EXISTS "{shadow}"')
         rebuilt.execute(FTS_VTAB_DDL)
         rebuilt.execute(FTS_TRIGGER_AI_DDL)
         rebuilt.execute(FTS_TRIGGER_AD_DDL)
@@ -1193,6 +1209,16 @@ def _fts_schema_surgery(store_path) -> None:
         rebuilt.execute(FTS_TRIGGER_AU_GUARDED_DDL if stamp >= 2
                         else FTS_TRIGGER_AU_DDL)
         rebuilt.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+        # F-018 (swarm-pr-review II-003): the plain recovery arm bumps the
+        # mutation generation for the #474 recall-cache rule; the surgery
+        # arm heals the SAME damage and must not be the one lane a cached
+        # stale recall survives. (Benign while the damage freezes writes,
+        # but keep the two arms of one recovery consistent.)
+        try:
+            from storelib.generation import bump_mutation_generation
+            bump_mutation_generation(rebuilt)
+        except Exception:
+            pass  # no meta table: nothing to invalidate
         rebuilt.commit()
     finally:
         rebuilt.close()

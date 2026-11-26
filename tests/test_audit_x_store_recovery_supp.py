@@ -137,8 +137,8 @@ class SuppBase(unittest.TestCase):
 class CrashWindowSweepTest(SuppBase):
     """Every early stamp statement survives a kill immediately before it."""
 
-    def test_stamp_statement_sweep_resumes(self):
-        conn = sqlite3.connect(str(self.store))
+    def _seed_v1_store(self, path):
+        conn = sqlite3.connect(str(path))
         conn.execute(
             "CREATE TABLE memory (id TEXT PRIMARY KEY, namespace TEXT NOT NULL, "
             "type TEXT NOT NULL, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '', "
@@ -155,10 +155,20 @@ class CrashWindowSweepTest(SuppBase):
             "'', '', '', 0.9, 'test', '', NULL, ?, 0, NULL)", (NS, A_NOW))
         conn.commit()
         conn.close()
-        # Drive the public open with a one-shot trace that kills BEFORE each
-        # "UPDATE meta SET value=" statement in turn; every kill must resume.
+
+    def test_stamp_statement_sweep_resumes(self):
+        # F-006 (swarm-pr-review TF-001): a FRESH v1 store per stamp, and the
+        # kill must actually FIRE for every stamp the ladder reaches. The old
+        # single-store loop migrated to stamp 19 on the first resume, so
+        # iterations 3-19 killed nothing (1/18 legs) while the module
+        # docstring claimed a whole-ladder sweep.
+        fired, not_reached = [], []
         for i in range(2, 20):
-            child = self.dir / f"kill_before_stamp_{i}.py"
+            store_i = self.dir / ("sweep%d_store.sqlite" % i)
+            data_i = self.dir / ("sweep%d_data" % i)
+            data_i.mkdir(parents=True, exist_ok=True)
+            self._seed_v1_store(store_i)
+            child = self.dir / ("kill_before_stamp_%d.py" % i)
             child.write_text(
                 "import os, sqlite3, sys\n"
                 "sys.path.insert(0, %r)\n" % str(SCRIPTS_DIR) +
@@ -170,28 +180,38 @@ class CrashWindowSweepTest(SuppBase):
                 "        os._exit(137)\n"
                 "conn.set_trace_callback(kill)\n"
                 "schema._prepare_store(conn)\n", encoding="utf-8")
-            env = _child_env(self.dir, self.store)
+            env = _child_env(data_i, store_i)
             r = subprocess.run([PY, "-X", "utf8", str(child), str(i)],
                                cwd=str(REPO_ROOT), capture_output=True,
                                text=True, env=env, timeout=180)
-            # A kill (137) or a clean finish are both fine; the OPEN must
-            # always complete on the next attempt.
+            if r.returncode == 137:
+                fired.append(i)
+            else:
+                not_reached.append(i)  # stamp i not written on the v1 path
             r2 = subprocess.run(
                 [PY, "-X", "utf8", str(STORE_PY), "add", "--namespace", NS,
-                 "--type", "fact", "--content", f"resume probe {i}",
+                 "--type", "fact", "--content", ("resume probe %d" % i),
                  "--signal", "test", "--json"],
                 cwd=str(REPO_ROOT), capture_output=True, text=True,
                 env=env, timeout=180)
             self.assertEqual(r2.returncode, 0,
-                             f"stamp {i}: kill rc={r.returncode} then resume "
-                             f"failed: {r2.stderr[-300:]}")
-        conn = self._store_conn()
-        try:
-            stamp = conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-        finally:
-            conn.close()
-        self.assertEqual(int(stamp) >= 2, True, stamp)
+                             ("stamp %d: kill rc=%d then resume failed: %s"
+                              % (i, r.returncode, r2.stderr[-300:])))
+            conn = sqlite3.connect(str(store_i))
+            try:
+                stamp = conn.execute(
+                    "SELECT value FROM meta WHERE key="
+                    "'schema_version'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertGreaterEqual(int(stamp), 2, (i, stamp))
+        # Every consecutive stamp the ladder writes must have been
+        # kill-proven; a gap means a block skipped a stamp or the sweep
+        # broke — either is a coverage loss.
+        self.assertTrue(fired, "no kill fired at all")
+        self.assertEqual(fired, list(range(2, 2 + len(fired))),
+                         ("kill gaps in the stamp ladder; fired=%r "
+                          "not_reached=%r" % (fired, not_reached)))
 
 
 class ShadowTableRecoveryTest(SuppBase):
@@ -211,6 +231,15 @@ class ShadowTableRecoveryTest(SuppBase):
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
         conn = self._store_conn()
         try:
+            # F-002/MX-001: a heal through the SURGERY arm (an unconstructible
+            # vtable is exactly the dropped-_data shape) must leave the store
+            # integrity-clean — the old sqlite_master DELETE of the shadow
+            # rows stranded their pages and every later integrity_check
+            # reported "Page N: never used", losing the backup safety net.
+            integrity = conn.execute(
+                "PRAGMA integrity_check").fetchone()[0]
+            self.assertEqual(integrity, "ok",
+                             "surgery-healed store must stay integrity-clean")
             for word in ("populated", "post"):
                 hits = conn.execute(
                     "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?",
@@ -231,6 +260,15 @@ class ShadowTableRecoveryTest(SuppBase):
         conn.close()
         r = self._add("first row after empty heal")
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        conn = self._store_conn()
+        try:
+            # F-002/MX-001: same integrity pin for the emptied-store leg.
+            integrity = conn.execute(
+                "PRAGMA integrity_check").fetchone()[0]
+            self.assertEqual(integrity, "ok",
+                             "surgery-healed store must stay integrity-clean")
+        finally:
+            conn.close()
 
 
 class ImpostorMemoryTest(SuppBase):
@@ -350,6 +388,17 @@ class PreflightSidecarFreeTest(SuppBase):
         # sidecar (its own verification closes them away); the assertion of
         # interest is the START: no sidecar existed before it began.
         self.assertIn("[zmem] restore: OK", r.stdout)
+        # F-013 (TF-002): pin the sidecar claim itself — a restore whose
+        # preflight manufactured a -wal/-shm beside THIS quiesced store
+        # fails here even when it finished OK. `before` is the quiesced
+        # listing; the only new names allowed are the snapshot artifacts.
+        after = sorted(p.name for p in self.dir.iterdir())
+        permitted = set(before) | {"backups", "snap.sqlite"}
+        leaked = [n for n in after
+                  if n not in permitted
+                  and (n.startswith("store.sqlite-")
+                       or ".restore-" in n)]
+        self.assertEqual(leaked, [], f"preflight leaked: {leaked}")
 
     def _snapshot(self):
         r = subprocess.run(
@@ -523,12 +572,15 @@ class _InProcessRestoreBase(SuppBase, _SnapshotMixin):
     def _run(self, snap, patch=None, unpatch=None):
         import io as _io
         import contextlib as _cl
+        # F-012 (MT-001): snapshot the env BEFORE _pinned() mutates it, or
+        # the finally-restore below reinstates the mutated values and leaves
+        # the process pinned at this leg's (soon rmtree'd) directory.
+        saved = {k: v for k, v in os.environ.items()
+                 if k.startswith("ZMEM_")}
         storelib = self._pinned()
         import storelib.backup as backup_mod
         out, err = _io.StringIO(), _io.StringIO()
         rc, raised = None, None
-        saved = {k: v for k, v in os.environ.items()
-                 if k.startswith("ZMEM_")}
         try:
             if patch:
                 patch(backup_mod)
@@ -1232,6 +1284,227 @@ class NamespaceTrimSuppTest(SuppBase):
         self.assertTrue(ns_rows, "no live successor after the CLI update")
         self.assertEqual(ns_rows[0]["namespace"], NS,
                          repr(ns_rows[0]["namespace"]))
+
+
+class PurgeScrubWarnsTest(SuppBase, _SnapshotMixin):
+    """F-005 (MV-003): --scrub-backups must loudly refuse to claim
+    completeness while restore-forensic-*/restore-work-* dirs sit in the
+    backup dir holding pre-restore bytes."""
+
+    def test_scrub_warns_about_restore_artifacts(self):
+        import json as _json
+        r0 = self._add("purge scrub warn row")
+        mid = _json.loads(r0.stdout)["id"]
+        snap = self._snapshot(self.dir, self.store)
+        forensic = self.dir / "backups" / "restore-forensic-test"
+        forensic.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.store, forensic / "store.sqlite")
+        env = _child_env(self.dir, self.store)
+        r = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "purge", "--id", mid,
+             "--scrub-backups", "--out-dir", str(self.dir / "backups")],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=180)
+        self.assertIn("restore recovery artifacts", r.stderr,
+                      (r.returncode, r.stdout[-200:], r.stderr[-300:]))
+        self.assertIn(str(forensic), r.stderr)
+
+
+class UnusableBackupDirTest(SuppBase, _SnapshotMixin):
+    """F-004 (RP-003 group incl. the round-2 critic's second regression):
+    a failure in restore steps 3-4 (unusable ZMEM_BACKUP_DIR) must print a
+    ruled ABORTED line, leave the destination untouched, and leak nothing —
+    for BOTH a populated destination and a first-time restore into an empty
+    location (the base behavior for the empty case was SUCCESS; the
+    regression died raw on the backup dir it never needed)."""
+
+    def _restore_with_bad_dir(self):
+        self._add("unusable backup dir row")
+        snap_in_backups = self._snapshot(self.dir, self.store)
+        # move the snapshot OUT of the dir we are about to break
+        snap = self.dir / "snap.sqlite"
+        shutil.copyfile(snap_in_backups, snap)
+        before = self.store.read_bytes()
+        blocker = self.dir / "backups"
+        if blocker.is_dir():
+            shutil.rmtree(blocker)
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_bytes(b"not a directory")
+        env = _child_env(self.dir, self.store)
+        env["ZMEM_BACKUP_DIR"] = str(blocker)
+        r = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "restore", "--from", str(snap),
+             "--force"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=300)
+        leftovers = sorted(
+            p.name for p in self.dir.iterdir()
+            if ".restore-" in p.name
+            or (p.name.startswith("store.sqlite") and p.name != "store.sqlite"))
+        return r, before, leftovers
+
+    def test_populated_destination_unusable_backup_dir(self):
+        r, before, leftovers = self._restore_with_bad_dir()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("restore ABORTED", r.stderr)
+        self.assertIn("destination untouched", r.stderr)
+        self.assertEqual(self.store.read_bytes(), before)
+        self.assertEqual(leftovers, [], leftovers)
+
+    def test_first_time_restore_unusable_backup_dir(self):
+        # no store, no sidecars: the backup dir is never needed — the
+        # restore must SUCCEED (base behavior), not die on ZMEM_BACKUP_DIR.
+        snap_dir = Path(tempfile.mkdtemp(prefix="f004-empty-src-"))
+        self.addCleanup(shutil.rmtree, snap_dir, ignore_errors=True)
+        src = snap_dir / "store.sqlite"
+        env0 = _child_env(snap_dir, src)
+        r0 = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "add", "--namespace", NS,
+             "--type", "fact", "--content", "first time source row",
+             "--signal", "test", "--json"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env0,
+            timeout=180)
+        self.assertEqual(r0.returncode, 0, r0.stderr[-200:])
+        snap = self._snapshot(snap_dir, src)
+        # destination: empty location with an unusable ZMEM_BACKUP_DIR
+        blocker = self.dir / "backups"
+        if blocker.is_dir():
+            shutil.rmtree(blocker)
+        blocker.parent.mkdir(parents=True, exist_ok=True)
+        blocker.write_bytes(b"not a directory")
+        env = _child_env(self.dir, self.store)
+        env["ZMEM_BACKUP_DIR"] = str(blocker)
+        r = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "restore", "--from", str(snap),
+             "--force"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertIn("restore: OK", r.stdout)
+
+
+class ContentionRuledRetryTest(SuppBase):
+    """F-003 (swarm-pr-review RP-001): when BEGIN IMMEDIATE fails on write
+    contention, the cluster except path must not itself raise ('cannot
+    rollback - no transaction is active') — the run continues and prints
+    the ruled 'rolled back, will retry next run' line."""
+
+    def test_lock_contention_prints_ruled_retry(self):
+        os.environ["ZMEM_STORE"] = str(self.store)
+        os.environ["ZMEM_DATA"] = str(self.dir)
+        import storelib
+        storelib._refresh_env_state()
+        conn = storelib.connect()
+        storelib.init_db(conn)
+        storelib.migrate(conn)
+        self.addCleanup(conn.close)
+        import storelib.write as writelib
+        writelib.add_memory(
+            conn, namespace=NS, type_="fact",
+            content="contention keeper one two", confidence=0.9,
+            signal="test")
+        writelib.add_memory(
+            conn, namespace=NS, type_="fact",
+            content="contention neighbour one two", confidence=0.8,
+            signal="test")
+        blocker = sqlite3.connect(str(self.store), timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        self.addCleanup(blocker.close)
+        import io as _io
+        import contextlib as _cl
+        import importlib
+        cons = importlib.import_module("storelib.consolidate")
+        out, err = _io.StringIO(), _io.StringIO()
+        # the contention must surface INSIDE consolidate as the ruled line,
+        # never as an escaping OperationalError
+        try:
+            with _cl.redirect_stdout(out), _cl.redirect_stderr(err):
+                report = cons.consolidate(
+                    conn, threshold=0.05, force=True, namespace=NS)
+        except Exception as e:
+            self.fail(f"consolidate let the contention escape as "
+                      f"{type(e).__name__}: {e}")
+        finally:
+            blocker.rollback()
+        self.assertTrue(
+            "rolled back, will retry next run" in err.getvalue()
+            or "run-start write failed" in err.getvalue(),
+            err.getvalue()[-400:])
+
+
+class Vec0RekeyCasSuppTest(SuppBase):
+    """F-001 (swarm-pr-review CS-001): the vec0 gather path must carry the
+    decision fields (namespace included) so the per-neighbour CAS refuses a
+    concurrent rekey committed in the gather->refresh window. The frozen C5
+    checks hook only _admitted_neighbors (post-refresh); this pins the
+    window before it, on the REAL fake-embed vec0 lane."""
+
+    def test_vec0_gather_carries_namespace(self):
+        os.environ["ZMEM_STORE"] = str(self.store)
+        os.environ["ZMEM_DATA"] = str(self.dir)
+        os.environ["ZMEM_EMBED_PROFILE"] = "fake"
+        import storelib
+        storelib._refresh_env_state()
+        conn = storelib.connect()
+        storelib.init_db(conn)
+        storelib.migrate(conn)
+        self.addCleanup(conn.close)
+        other = storelib.connect()
+        self.addCleanup(other.close)
+        import storelib.write as writelib
+        writelib.add_memory(conn, namespace="project:alpha", type_="fact",
+                            content="vec0 rekey keeper alpha shared tokens",
+                            confidence=0.9, signal="test")
+        writelib.add_memory(conn, namespace="project:alpha", type_="fact",
+                            content="vec0 rekey neighbour alpha shared tokens",
+                            confidence=0.8, signal="test")
+        nb = conn.execute(
+            "SELECT id FROM memory WHERE content LIKE "
+            "'vec0 rekey neighbour%'").fetchone()
+        self.assertIsNotNone(nb)
+        vec_n = conn.execute("SELECT count(*) FROM memory_vec").fetchone()[0]
+        self.assertGreaterEqual(vec_n, 2, vec_n)
+        import io as _io
+        import contextlib as _cl
+        import importlib
+        cons = importlib.import_module("storelib.consolidate")
+
+        def fire():
+            other.execute("BEGIN IMMEDIATE")
+            other.execute(
+                "UPDATE memory SET namespace='project:beta' WHERE id=?",
+                (nb["id"],))
+            other.commit()
+
+        original = cons._refresh_live_row
+        state = {"fired": False}
+
+        def hooked(c, row_id):
+            result = original(c, row_id)
+            if not state["fired"]:
+                state["fired"] = True
+                fire()
+            return result
+
+        cons._refresh_live_row = hooked
+        try:
+            out, err = _io.StringIO(), _io.StringIO()
+            with _cl.redirect_stdout(out), _cl.redirect_stderr(err):
+                report = cons.consolidate(conn, threshold=0.05, force=True)
+        finally:
+            cons._refresh_live_row = original
+            os.environ.pop("ZMEM_EMBED_PROFILE", None)
+            storelib._refresh_env_state()
+        self.assertTrue(state["fired"], "seam never fired")
+        self.assertEqual(report.get("merged"), 0,
+                         f"cross-namespace absorb: {report}")
+        self.assertIn("changed on a decision field", err.getvalue(),
+                      err.getvalue()[-400:])
+        beta_live = conn.execute(
+            "SELECT count(*) FROM memory WHERE id=? AND namespace="
+            "'project:beta' AND superseded_at IS NULL",
+            (nb["id"],)).fetchone()[0]
+        self.assertEqual(beta_live, 1)
 
 
 if __name__ == "__main__":

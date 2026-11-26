@@ -6868,9 +6868,14 @@ def _report_lane_status(resolved_store: Path) -> dict:
                     else:
                         fts = _lane("ok")
                 except sqlite3.Error:
-                    fts = _lane("error", "fts-probe-failed")
+                    # F-016 (MV-001): keep the lane's verdict consistent
+                    # with the fts-index CHECK for damaged-table shapes —
+                    # the check grades them warn/degraded (repairable
+                    # derived data); an error grade told machine consumers
+                    # the probe failed when the tables are simply absent.
+                    fts = _lane("degraded", "fts-index-tables-absent")
             except sqlite3.Error:
-                fts = _lane("error", "fts-probe-failed")
+                fts = _lane("degraded", "fts-index-tables-absent")
             for name, table, lane_reason in (
                     ("entity", "entity", "table-absent"),
                     ("graph", "memory_link", "table-absent")):

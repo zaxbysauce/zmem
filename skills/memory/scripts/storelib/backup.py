@@ -1115,6 +1115,22 @@ _SHAPE_TOKEN = re.compile(
 _FTS_TRIGGERS = ("memory_ai", "memory_ad", "memory_au")
 
 
+def _esc(text: str) -> str:
+    """F-007 (swarm-pr-review MU-001): escape snapshot-derived text before
+    it reaches the operator's terminal. Restore refusal lines echo
+    attacker-controlled sqlite_master identifiers and SQLite error text; a
+    crafted snapshot name carrying OSC 0/OSC 52 (clipboard-write) or CSI
+    sequences must not execute in the ruled output. When any
+    non-printable character is present the whole text is rendered in its
+    escaped form (\\x1b visible); clean text passes through unchanged so
+    ordinary names stay greppable.
+    """
+    text = str(text)
+    if all(ch.isprintable() for ch in text):
+        return text
+    return text.encode("unicode_escape").decode("ascii")
+
+
 def _ascii_lower(text: str) -> str:
     """SQLite's identifier case folding: ASCII A-Z only.
 
@@ -1515,9 +1531,29 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
             for p in sidecars:
                 if p.exists():
                     p.unlink()
-            stage_back = dest.parent / (dest.name + ".restore-rollback-")
-            shutil.copyfile(prerestore_path, stage_back)
-            os.replace(stage_back, dest)
+            # F-017/F-020 (swarm-pr-review MS-001/MA-003): stage the rollback
+            # copy at a mkstemp name (never the predictable
+            # .restore-rollback- name a local actor could pre-plant), unlink
+            # it on any failure, and harden the re-installed store BEFORE
+            # the verification that may raise (a rollback whose verification
+            # fails must not leave the live store at umask-default mode).
+            fd_rb, rb_str = tempfile.mkstemp(
+                prefix=dest.name + ".restore-rollback-",
+                dir=str(dest.parent))
+            os.close(fd_rb)
+            stage_back = Path(rb_str)
+            try:
+                shutil.copyfile(prerestore_path, stage_back)
+                os.replace(stage_back, dest)
+            except BaseException:
+                if stage_back.exists():
+                    stage_back.unlink()
+                raise
+            if _host is not None:
+                try:
+                    _host.set_owner_only_perms(dest)
+                except OSError:
+                    pass  # hardening is best-effort on the rollback path
             conn = sqlite3.connect(str(dest))
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -1529,8 +1565,6 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
                 raise RuntimeError(
                     f"re-installed pre-restore backup failed integrity_check: "
                     f"{rb_integrity}")
-            if _host is not None:
-                _host.set_owner_only_perms(dest)
             print(f"[zmem] restore: rolled back: live store re-installed from the "
                   f"pre-restore backup {prerestore_path}", file=sys.stderr)
         except Exception as rb:
@@ -1647,13 +1681,14 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     try:
         snap_integrity = _integrity_check_readonly(snap)
     except Exception as e:
-        print(f"[zmem] restore FAILED: cannot read snapshot {snap} read-only: {e}",
+        print(f"[zmem] restore FAILED: cannot read snapshot {_esc(snap)} "
+              f"read-only: {_esc(e)}",
               file=sys.stderr)
         print("[zmem] restore: (a snapshot with a hot -wal sidecar must be "
               "checkpointed before it can be restored)", file=sys.stderr)
         return 1
     if snap_integrity != "ok":
-        print(f"[zmem] restore FAILED: snapshot integrity_check={snap_integrity} "
+        print(f"[zmem] restore FAILED: snapshot integrity_check={_esc(snap_integrity)} "
               f"- destination untouched", file=sys.stderr)
         return 1
     print(f"[zmem] restore: source snapshot {snap}")
@@ -1756,31 +1791,51 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             except OSError:
                 pass
         print(f"[zmem] restore FAILED: the staged copy could not be validated "
-              f"({e}) - destination untouched", file=sys.stderr)
+              f"({_esc(e)}) - destination untouched", file=sys.stderr)
         return 1
 
-    # --- 3. Rotate the incarnation on the staged copy (before the install;
-    # a crash before install discards the staging and cached identities stay
-    # valid; after install the new store already answers with the new one). ---
-    rotate_incarnation_on_staging(staged)
-
-    # --- 4. Forensic copy: whenever any sidecar is present, whatever size. ---
-    backup_dir = _ensure_backup_dir(out_dir)
-    if present:
-        forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}"
-        n = 1
-        while forensic_dir.exists():
-            forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}-{n}"
-            n += 1
-        forensic_dir.mkdir(parents=True)
-        for p in [dest] + present:
-            if p.exists():
-                shutil.copy2(p, forensic_dir / p.name)
-        if _host is not None:
-            _host.set_owner_only_perms(forensic_dir)
+    # --- 3+4. Rotate the incarnation on the staged copy and take the
+    # forensic copy — guarded like every neighbouring step (F-004,
+    # swarm-pr-review RP-003/CS-002/MA-004): a failure here (an unusable
+    # --out-dir/ZMEM_BACKUP_DIR, an unwritable backup tree, an AV-locked
+    # forensic target, an OSError from the rotation) must print a ruled
+    # ABORTED line, clean the staged copy, and leave the destination
+    # untouched — never a raw traceback with a leaked full-store stage.
+    # The backup dir is only needed when there is something to preserve
+    # (sidecars to set aside, or a non-empty destination to back up), so a
+    # first-time disaster-recovery restore into an empty location must not
+    # fail on an unusable ZMEM_BACKUP_DIR at all (the round-2 critic's
+    # second regression). ---
+    try:
+        rotate_incarnation_on_staging(staged)
+        backup_dir = (
+            _ensure_backup_dir(out_dir) if (present or dest_nonempty) else None)
+        if present:
+            forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}"
+            n = 1
+            while forensic_dir.exists():
+                forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}-{n}"
+                n += 1
+            forensic_dir.mkdir(parents=True)
+            for p in [dest] + present:
+                if p.exists():
+                    shutil.copy2(p, forensic_dir / p.name)
+            if _host is not None:
+                _host.set_owner_only_perms(forensic_dir)
+    except Exception as e:
+        print(f"[zmem] restore ABORTED: preparation failed ({e}) — "
+              f"destination untouched", file=sys.stderr)
+        for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+        return 1
 
     # --- 5. Safety copy from a PRIVATE working copy (non-empty destination). ---
     if dest_nonempty:
+        work_dir = None
         try:
             work_dir = backup_dir / f"restore-work-{_snapshot_stamp()}"
             n = 1
@@ -1805,6 +1860,10 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             print(f"[zmem] restore ABORTED: pre-restore backup of the current store "
                   f"failed ({e}) — refusing to overwrite the only copy of it.",
                   file=sys.stderr)
+            # F-004/MA-001: the private working copy must not survive a
+            # failed safety copy (it holds plaintext store + WAL bytes).
+            if work_dir is not None:
+                shutil.rmtree(work_dir, ignore_errors=True)
             for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
                 try:
                     if p.exists():

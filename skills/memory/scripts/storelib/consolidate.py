@@ -649,9 +649,22 @@ def _gather_neighbors(
                 continue
             sim = 1.0 - r["distance"]
             if sim >= effective_threshold:
+                # F-001 (swarm-pr-review CS-001): carry EVERY decision field
+                # this row has (the #507 run-start and per-neighbour CAS
+                # compare only fields present in the gathered row). The old
+                # narrow projection omitted namespace, source_ref, embedding,
+                # embedding_model and ingestion_ts — they existed only as
+                # WHERE predicates — so a concurrent namespace rekey
+                # committing between this gather and the refresh passed both
+                # CAS layers and tombstoned a live row into a keeper of the
+                # OLD namespace (violating #507 AC1 on the default
+                # embeddings path). The refresh projection (_refresh_live_row)
+                # is the reference; gather the same columns here.
                 row = conn.execute(
-                    "SELECT id, confidence, signal, tags, type, rowid, retrieval_count, "
-                    "surfaced_count, content, taint "
+                    "SELECT id, namespace, content, tags, type, rowid, "
+                    "confidence, signal, retrieval_count, surfaced_count, "
+                    "embedding, embedding_model, ingestion_ts, taint, "
+                    "source_ref "
                     "FROM memory "
                     "WHERE id=? AND superseded_at IS NULL AND namespace=? "
                     # PR1 (knowledge companion): pointer rows are never
@@ -1197,20 +1210,31 @@ def consolidate(
     # Write the consolidation timestamp BEFORE the clustering loop, so a killed
     # run still creates backpressure on the next session. Count is start-of-run
     # (pre-clustering) live count.
+    # F-003 companion (swarm-pr-review B1): this run-start write is the FIRST
+    # write under contention — guard it the same way as the cluster loop so a
+    # busy store produces a ruled skip line, never a raw OperationalError
+    # traceback out of consolidate().
     if not dry_run:
-        ts = now_iso()
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation', ?)",
-            (ts,),
-        )
-        live_count_now = conn.execute(
-            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
-        ).fetchone()[0]
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation_count', ?)",
-            (str(live_count_now),),
-        )
-        conn.commit()
+        try:
+            ts = now_iso()
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation', ?)",
+                (ts,),
+            )
+            live_count_now = conn.execute(
+                "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation_count', ?)",
+                (str(live_count_now),),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            print(f"[zmem] consolidate: run-start write failed "
+                  f"({type(exc).__name__}: {exc}); skipped, will retry next run",
+                  file=sys.stderr)
+            report["skipped_by_contention"] = True
+            return report
 
     # Load live memories. In embedding mode, only rows with an embedding are
     # candidates (vec0 KNN needs a query vector); in lexical fallback mode every
@@ -1375,13 +1399,11 @@ def consolidate(
             fresh = _refresh_live_row(conn, nb["id"])
             if fresh is not None:
                 # Same stale-decision rule for neighbours, against the
-                # working-set row this run selected them from. The gathered
-                # row's projection varies by gather path (the lexical path
-                # projects the full working-set column list; the vec0 KNN
-                # path projects fewer), so compare the decision fields the
-                # gathered row CARRIES — the fields it does not carry cannot
-                # drift against their run-start values because this run
-                # never read them.
+                # working-set row this run selected them from. Both gather
+                # paths now project the full decision-field set (F-001 fixed
+                # the vec0 KNN's narrow projection), so every decision field
+                # is compared; the projection-filter remains only as a
+                # defensive shape for any future gather path.
                 _nb_fields = tuple(f for f in _DECISION_FIELDS if f in nb.keys())
                 if any(fresh[f] != nb[f] for f in _nb_fields):
                     print(f"[zmem] consolidate: neighbour [{nb['id'][:8]}] "
@@ -1789,7 +1811,15 @@ def consolidate(
             # swallowed-exception catch is pre-existing, but the new multi-write
             # _absorb_into_keeper enlarges what this transaction must succeed at
             # (implementation-review finding #3).
-            conn.execute("ROLLBACK")
+            # F-003 (swarm-pr-review RP-001): when the failure IS the BEGIN
+            # IMMEDIATE itself (write-lock contention past busy_timeout), no
+            # transaction is open and a bare ROLLBACK would raise "cannot
+            # rollback - no transaction is active" OUT of this handler,
+            # killing the whole run with an unhandled traceback. Guard with
+            # conn.in_transaction (the write.py idiom) so the ruled retry
+            # line below is what the operator sees.
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] failed "
                   f"({type(exc).__name__}: {exc}); rolled back, will retry next run",
                   file=sys.stderr)

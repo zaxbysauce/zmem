@@ -82,7 +82,7 @@ Hermetic: every subprocess and the in-process legs pin a fresh throwaway
 store (ZMEM_STORE/ZMEM_DATA/ZMEM_BACKUP_DIR under a system-temp scratch
 dir, ZMEM_MODELS_DIR nonexistent, autodownload off, UTF-8 IO); ambient
 zmem/plugin env is stripped from children; the operator store is never
-opened.  Run: C:/Python311/python.exe -X utf8 <this file>.
+opened.  Run: python tests/test_audit_restore_identity_recovery.py (repo convention, no pytest)
 """
 
 from __future__ import annotations
