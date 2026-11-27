@@ -325,7 +325,18 @@ class SourceRepairResolverTests(unittest.TestCase):
                      f"password is {CANARY}",
                      f"secret {CANARY}",
                      f"pwd {CANARY}",
-                     f"the api token was {CANARY} keep private"):
+                     f"the api token was {CANARY} keep private",
+                     # Final-critic r4 finding 1: compound/camelCase/plural
+                     # labels and long-prefix lines (substring scan, whole
+                     # line before the span).
+                     f"GITHUB_TOKEN {CANARY}",
+                     f"SECRET_KEY {CANARY}",
+                     f"db_password {CANARY}",
+                     f"apiToken {CANARY}",
+                     f"my credentials are {CANARY}",
+                     f"the passphrase is {CANARY}",
+                     f"password for the production database server is "
+                     f"currently {CANARY}"):
             with self.subTest(line=line):
                 env, memory_id = self._seed(
                     [LINE1, line, LINE3],

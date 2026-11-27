@@ -821,13 +821,18 @@ def _has_knowledge_prefix(source_ref: str) -> bool:
 
 _HEX_40_64_RE = re.compile(r"\b[0-9a-fA-F]{40}\b|\b[0-9a-fA-F]{64}\b")
 MARKER = "[REDACTED_SECRET]"
-# Final-critic r3: credential words in PROSE before a marker-only span
-# (same line, within the 48-char identifier-context window) mark the value
-# as secret-shaped. Word-boundary anchored; 'authorization'/'auth' join the
-# registry keywords the r2 gate already covers at the grammar level.
+# Final-critic r3+r4: credential words in PROSE before a marker-only span
+# (same line, anywhere before it) mark the value as secret-shaped. The
+# match is a case-insensitive SUBSTRING search on the whole line prefix —
+# word boundaries would miss compound/camelCase/digit-joined labels
+# (db_password, SECRET_KEY, API_TOKEN, apiToken, 2fa_secret) because _ and
+# digits are word characters; over-refusal here is the safe direction
+# (positively-labelled identifiers are never redacted, so a marker-only
+# span is always unlabeled and a genuine identifier line simply does not
+# carry these words). Plurals and near-synonyms included (r4).
 _CREDENTIAL_PROSE_RE = re.compile(
-    r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|pass"
-    r"|private[_-]?key|bearer|credential|auth)\b")
+    r"(?i)(?:api[_ -]?key|secret|token|password|passwd|pwd|pass"
+    r"|private[_ -]?key|bearer|credential|passphrase)")
 
 
 def _LINE_OF_MARKER(block_raw: str, redacted: str) -> int:
@@ -886,12 +891,10 @@ def _bind_block_candidate(
     # verifiable identifier.
     m_line = _LINE_OF_MARKER(block_raw, redacted)
     line_start = block_raw.rfind("\n", 0, m_line) + 1
-    line_end = block_raw.find("\n", m_line)
-    if line_end < 0:
-        line_end = len(block_raw)
-    line = block_raw[line_start:line_end]
-    span_line_offset = m_line - line_start
-    prefix = line[:span_line_offset][-48:]
+    # r4: scan the WHOLE line before the span — the calibration window is
+    # the redactor's logic, not the binder's; a credential word earlier on
+    # the line still labels the value.
+    prefix = block_raw[line_start:m_line]
     if _CREDENTIAL_PROSE_RE.search(prefix):
         raise SourceRefusal(
             "the redacted span is a credential-labelled value, not a "
