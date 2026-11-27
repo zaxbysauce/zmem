@@ -563,16 +563,19 @@ class VerifyRecordTests(unittest.TestCase):
 
 
 class BasicAuthTwoRuleTests(unittest.TestCase):
-    """Review 4.5 r6 closure: TWO Basic rules.
+    """Review 4.5 r6+ closure: TWO Basic rules, NO surviving credential
+    class.
 
     1. Explicit `Authorization: Basic <val>` header: UNCONDITIONAL 4+ char
        match — no length floor, no case requirement. Short credentials
        (YTpi), pure-lowercase values, all-uppercase values, prose-as-value
        (fail-safe over-redaction, the #180 ssh -p direction) all redact.
-    2. Bare `Basic <val>` (no header): 12+ chars AND at least one
-       non-pure-lowercase char — digit-bearing/mixed shapes redact;
-       pure-lowercase prose survives (a pure-lowercase 12+ base64 value in
-       bare context stays a disclosed gap, the #537 disclosure class)."""
+    2. Bare `Basic <val>` (no header): UNCONDITIONAL 8+ char match — the
+       same value floor as the key=value rule (\S{8,}) — so EVERY shape
+       including pure-lowercase values and prose words redacts. The cost is
+       fail-safe over-redaction of 8+ char words after bare "Basic "
+       ("Basic password", "Basic authentication" are redacted — the #180
+       ssh -p fail-safe direction); sub-8-char values survive."""
 
     def test_header_context_unconditional(self) -> None:
         from redaction import redact_secret_like_text
@@ -586,16 +589,23 @@ class BasicAuthTwoRuleTests(unittest.TestCase):
                 self.assertGreaterEqual(count, 1)
                 self.assertNotIn("Basic ", out)
 
-    def test_bare_context_rules(self) -> None:
+    def test_bare_context_unconditional_8plus(self) -> None:
         from redaction import redact_secret_like_text
-        # Digit-bearing bare 12+ value: redacted.
-        out, count = redact_secret_like_text("bare Basic abc123def456")
-        self.assertGreaterEqual(count, 1)
-        # Pure-lowercase bare values (prose AND the disclosed 12+ base64
-        # class): survive.
-        for text in ("bare Basic dagsqwxzmore",
-                     "use Basic authentication for the API",
-                     "Basic password"):
+        # EVERY bare value shape 8+ chars redacts — including the
+        # previously-surviving pure-lowercase and prose words.
+        for text in ("bare Basic dagsqwxzmore",        # pure-lowercase
+                     "bare Basic abc123def456",        # digit-bearing
+                     "Basic password",                 # prose word, 8 chars
+                     "use Basic authentication here"):  # prose, 14 chars
+            out, count = redact_secret_like_text(text)
+            with self.subTest(text=text):
+                self.assertGreaterEqual(count, 1)
+
+    def test_sub8_survives(self) -> None:
+        from redaction import redact_secret_like_text
+        for text in ("say basic things",       # 'things' after plain word
+                     "Basic hi",               # 2-char value
+                     "use Basic auth for the API"):  # 'auth' is 4 chars
             out, count = redact_secret_like_text(text)
             with self.subTest(text=text):
                 self.assertEqual(count, 0)
