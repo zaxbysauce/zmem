@@ -1080,6 +1080,25 @@ def _resolve_trusted_source_candidate(
         "occurrence")
 
 
+def _check_destination_context(content: str) -> None:
+    """Final-critic r6/r7: the destination-context credential gate, shared
+    by preview AND apply (parity — a preview must not report a verified
+    restoration the stored row cannot accept, and must not print a value
+    the memory's own context labels as a credential). Scans the whole
+    destination content with every marker removed through both gates
+    (registry + prose substring)."""
+    dest_scan = content.replace(MARKER, " ")
+    for pattern in (SECRET_CREDENTIAL_PATTERNS
+                    + SECRET_COMMAND_PATTERNS
+                    + SECRET_REFUSAL_PATTERNS):
+        if pattern.search(dest_scan):
+            raise SourceRefusal(
+                "the repair destination labels this value as a credential")
+    if _CREDENTIAL_PROSE_RE.search(dest_scan):
+        raise SourceRefusal(
+            "the repair destination labels this value as a credential")
+
+
 def _check_alignment(content: str, alignment_text: str) -> None:
     """The shared alignment rule (issue #502 AC2): the aligned quotation must
     occur EXACTLY ONCE in the stored content. Zero -> changed quotation;
@@ -1249,6 +1268,11 @@ def repair_from_evidence(
         if content_now is None:
             raise SourceRefusal("memory vanished")
         _check_alignment(content_now[0] or "", alignment_text)
+        if resolver_kind != "excerpt":
+            # Final-critic r7: preview/apply PARITY — the destination gate
+            # runs here too, so a preview never reports verified (and never
+            # prints restore_value) for a case apply will refuse.
+            _check_destination_context(content_now[0] or "")
         # Preview NEVER proceeds into the apply transaction (the arm-B
         # snapshot connection is query-only — a fall-through would fail with
         # "attempt to write a readonly database").
@@ -1282,24 +1306,11 @@ def repair_from_evidence(
             # Final-critic r6 finding 1: the excerpt-boundary gate (r5) does
             # not see labels OUTSIDE the excerpt — a credential label on a
             # NEIGHBOURING line of the memory content (the repair writes the
-            # raw value right next to it) must refuse too. Scan the whole
-            # destination content with every marker removed (the same two
-            # gates as the source-side binding; the marker contains
-            # "SECRET" and must be excluded; hex digits cannot form any
-            # keyword). The destination is the authoritative context: it is
-            # what the value will sit inside after the write.
-            dest_scan = content.replace(MARKER, " ")
-            for pattern in (SECRET_CREDENTIAL_PATTERNS
-                            + SECRET_COMMAND_PATTERNS
-                            + SECRET_REFUSAL_PATTERNS):
-                if pattern.search(dest_scan):
-                    raise SourceRefusal(
-                        "the repair destination labels this value as a "
-                        "credential")
-            if _CREDENTIAL_PROSE_RE.search(dest_scan):
-                raise SourceRefusal(
-                    "the repair destination labels this value as a "
-                    "credential")
+            # raw value right next to it) must refuse too. The destination
+            # is the authoritative context: it is what the value will sit
+            # inside after the write. (r7: the scan is the SHARED helper —
+            # preview runs it too, for parity.)
+            _check_destination_context(content)
         _check_alignment(content, alignment_text)
         # Replace ONLY the marker span inside the aligned occurrence: the
         # aligned text carries exactly one marker; swap it for the verified

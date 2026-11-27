@@ -403,6 +403,15 @@ class SourceRepairResolverTests(unittest.TestCase):
                 db = self.root / "store.sqlite"
                 evidence_id = _write_production_evidence(
                     db, memory_id, lines[off], "notes.md", off)
+                # Final-critic r7: PREVIEW PARITY — the destination gate
+                # runs in preview too (rc 1, and the canary must not be
+                # printed to stdout or stderr).
+                preview = _run(self.root, "source", "repair", "--id",
+                               memory_id, "--evidence-id", evidence_id,
+                               "--preview", extra_env=env)
+                self.assertEqual(preview.returncode, 1, preview.stdout)
+                self.assertNotIn(CANARY, preview.stdout)
+                self.assertNotIn(CANARY, preview.stderr)
                 result = _run(self.root, "source", "repair", "--id",
                               memory_id, "--evidence-id", evidence_id,
                               "--apply", extra_env=env)
