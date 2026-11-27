@@ -1009,11 +1009,13 @@ def _resolve_hermes_candidate(
 def _resolve_trusted_source_candidate(
     anchor: sqlite3.Row, excerpt: str,
 ) -> tuple[str, str]:
-    """Amendment A1-R2 (R5) router: zcode/hermes prefixes FIRST (they pass
-    _safe_ref), then the bare-name project-file route (ZMEM_SOURCE_ROOT pin
-    + a recorded position); every other ref shape keeps the EXACT historical
-    refusal — the refusal surface is byte-identical for every input that
-    refused before the resolvers existed."""
+    """Amendment A1-R2 (R5) router, round-17 correction: dispatch assumes
+    _safe_ref ALREADY ran (the caller gates it unconditionally), so the
+    native prefixes match the EXACT _safe_ref-accepted shapes
+    (zcode:session/<name>, hermes:state.db/session/<name>) and a bare name
+    is separator/colon-free. Every other ref shape keeps the EXACT
+    historical refusal — the refusal surface is byte-identical for every
+    input that refused before the resolvers existed."""
     ref_path = str(anchor[6] or "")
     if ref_path.startswith("zcode:session/"):
         return _resolve_zcode_candidate(ref_path, anchor, excerpt)
@@ -1092,6 +1094,16 @@ def repair_from_evidence(
         raise SourceRefusal("memory has no evidence to repair from")
     excerpt = str(anchor[5] or "")
     ref_path = str(anchor[6] or "")
+    # R4.5-2 (round-17 finding 1): the reference grammar is enforced
+    # UNCONDITIONALLY before any dispatch — exactly as pre-amendment — so an
+    # invalid shape (separators, drives, schemes, parent traversal, or a
+    # native-session ref violating the exact zcode/hermes grammar) refuses
+    # with the SAME "source unavailable" refusal it always got, regardless
+    # of the excerpt's candidate/marker shape. The router below then
+    # dispatches on the exact validated shapes: _safe_ref fullmatches
+    # zcode:session/<name> and hermes:state.db/session/<name>, so a prefix
+    # match after this gate IS the exact native shape (review 4.5 r17).
+    _safe_ref(ref_path)
     # EXACTLY ONE candidate OCCURRENCE (plan R2-7 + review 4.5 r3): the same
     # identifier repeated twice is still two spans — the alignment below
     # replaces every occurrence but apply restores only the first, so a
@@ -1108,11 +1120,10 @@ def repair_from_evidence(
     resolver_kind: str | None = None
     verification_kind: str | None = None
     if len(candidate_occurrences) == 1 and marker_count == 0:
-        # Excerpt path (unchanged): R4.5-2 still rejects separators, drives,
-        # schemes, and parent traversal BEFORE any git call (an absolute or
-        # ../ ref_path must never select a repository outside
-        # ZMEM_REPAIR_ROOT).
-        _safe_ref(ref_path)
+        # Excerpt path (unchanged): the grammar gate above already rejected
+        # separators, drives, schemes, and parent traversal BEFORE any git
+        # call (an absolute or ../ ref_path must never select a repository
+        # outside ZMEM_REPAIR_ROOT).
         candidate = candidate_occurrences[0]
         resolver_kind = "excerpt"
         verification_kind = "git_object"
