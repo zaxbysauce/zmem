@@ -385,6 +385,39 @@ class RepairAlignmentTests(unittest.TestCase):
             self.assertIn(sha, _memory_content(db, memory_id))
             self.assertIsNotNone(_meta(db, f"source_repair:{memory_id}"))
 
+    def test_non_boundary_duplicate_no_false_refusal(self) -> None:
+        # swarm-pr-review COR-001/FB-006: the excerpt carries exactly one
+        # regex-boundary-matched 40-hex candidate, but the SAME literal also
+        # appears in a non-boundary suffix (<sha>_note). The old literal
+        # replace-all produced an extra marker -> false changed-quotation
+        # refusal; the span-based alignment replaces only the matched span.
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-nbdup-") as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            _git(repo, "init")
+            _git(repo, "config", "user.email", "fixture@example.invalid")
+            _git(repo, "config", "user.name", "fixture")
+            (repo / "README.txt").write_text("fixture\n", encoding="utf-8")
+            _git(repo, "add", "-A")
+            _git(repo, "-c", "commit.gpgsign=false", "commit", "-m", "c")
+            sha = _git(repo, "rev-parse", "HEAD")
+            excerpt = f"pinned to commit {sha} yesterday; see {sha}_note"
+            content = f"pinned to commit [REDACTED_SECRET] yesterday; see {sha}_note"
+            memory_id, repair_env, _ = self._build(
+                root, content, excerpt, repo)
+            apply_result = _run(root, "source", "repair", "--id", memory_id,
+                                "--evidence-id", "ev-supp-1", "--apply",
+                                extra_env=repair_env)
+            self.assertEqual(apply_result.returncode, 0, apply_result.stderr)
+            payload = json.loads(
+                apply_result.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["restore_value"], sha)
+            repaired = _memory_content(root / "store.sqlite", memory_id)
+            self.assertIn(sha, repaired)
+            self.assertIn(f"{sha}_note", repaired)  # suffix untouched
+
     def test_two_repairs_accumulate(self) -> None:
         # R4-2 + review 4.5-5: TWO real repairs on one row accumulate both
         # provenance entries.
