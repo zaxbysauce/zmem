@@ -821,6 +821,22 @@ def _has_knowledge_prefix(source_ref: str) -> bool:
 
 _HEX_40_64_RE = re.compile(r"\b[0-9a-fA-F]{40}\b|\b[0-9a-fA-F]{64}\b")
 MARKER = "[REDACTED_SECRET]"
+# Final-critic r3: credential words in PROSE before a marker-only span
+# (same line, within the 48-char identifier-context window) mark the value
+# as secret-shaped. Word-boundary anchored; 'authorization'/'auth' join the
+# registry keywords the r2 gate already covers at the grammar level.
+_CREDENTIAL_PROSE_RE = re.compile(
+    r"(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|pass"
+    r"|private[_-]?key|bearer|credential|auth)\b")
+
+
+def _LINE_OF_MARKER(block_raw: str, redacted: str) -> int:
+    """The offset of the marker in the REDACTED block, mapped to the RAW
+    block: the bytes before the marker are unchanged raw bytes (the
+    marker-anchored reconstruction already proved startswith(pre)), so the
+    marker's raw offset is len(pre) — the redacted prefix and raw prefix
+    are byte-identical up to the marker."""
+    return redacted.find(MARKER)
 
 
 def _bind_block_candidate(
@@ -839,7 +855,9 @@ def _bind_block_candidate(
     ``raw.startswith(pre)``, ``raw.endswith(post)`` and the slice is
     strictly nonempty and non-overlapping; the span MUST fullmatch the
     40/64-hex identifier rule (wrapper spans ``token=[H``, ``token=H]``,
-    ``token=[H]`` refuse; bare ``H`` and value-span ``token=H`` bind).
+    ``token=[H]`` refuse; bare ``H`` binds; keyword-labelled values —
+    ``token=H`` and prose forms like ``secret <hex>`` — refuse through the
+    credential gates).
     """
     if count != 1 or redacted.count(MARKER) != 1 or redacted == block_raw:
         raise SourceRefusal(
@@ -856,6 +874,28 @@ def _bind_block_candidate(
             raise SourceRefusal(
                 "the redacted span is a credential-labelled value, not a "
                 "verifiable identifier")
+    # Final-critic r3 finding 1: the registry gate above is grammar-only
+    # (key:/key=). A credential keyword in PROSE before the span
+    # ("secret <hex>", "pwd <hex>", "password is <hex>") never triggers it
+    # — the redactor saw an ordinary unlabeled run. Refuse when a
+    # credential keyword appears on the span's line before the span within
+    # the same 48-char identifier-context window the calibration uses:
+    # positively-labelled identifiers (commit/release/sha) are never
+    # redacted, so a marker-only span is always unlabeled, and a nearby
+    # credential word marks the value as a secret-shaped token, not a
+    # verifiable identifier.
+    m_line = _LINE_OF_MARKER(block_raw, redacted)
+    line_start = block_raw.rfind("\n", 0, m_line) + 1
+    line_end = block_raw.find("\n", m_line)
+    if line_end < 0:
+        line_end = len(block_raw)
+    line = block_raw[line_start:line_end]
+    span_line_offset = m_line - line_start
+    prefix = line[:span_line_offset][-48:]
+    if _CREDENTIAL_PROSE_RE.search(prefix):
+        raise SourceRefusal(
+            "the redacted span is a credential-labelled value, not a "
+            "verifiable identifier")
     # Line-sequence equality: the raw block (keepends) carries the file's
     # trailing terminator where the stored excerpt may not; the sequence of
     # content lines is the binding datum (a trailing terminator is not).

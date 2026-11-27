@@ -319,7 +319,13 @@ class SourceRepairResolverTests(unittest.TestCase):
         for line in (f"password: {CANARY}",
                      f"secret = {CANARY}",
                      f"api_token={CANARY}",
-                     f"Authorization: Bearer {CANARY}"):
+                     f"Authorization: Bearer {CANARY}",
+                     # Final-critic r3 finding 1: prose forms without :/=
+                     # grammar — the negative-context gate refuses them.
+                     f"password is {CANARY}",
+                     f"secret {CANARY}",
+                     f"pwd {CANARY}",
+                     f"the api token was {CANARY} keep private"):
             with self.subTest(line=line):
                 env, memory_id = self._seed(
                     [LINE1, line, LINE3],
