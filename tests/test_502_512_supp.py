@@ -562,41 +562,44 @@ class VerifyRecordTests(unittest.TestCase):
                 db, f"source_verify:{memory_id}:ev-supp-v2"))
 
 
-class BasicAuthUnconditionalTests(unittest.TestCase):
-    """Review 4.5 r5 closure: the Basic detector matches EVERY 12+ char value
-    unconditionally (12 = base64 length of the shortest realistic
-    "user:pass") — mixed, all-uppercase, digit-bearing AND pure-lowercase
-    credentials all redact. The cost is fail-safe over-redaction of 12+ char
-    prose after "Basic " (the same accepted fail-safe direction as the #180
-    ssh -p precedent); 8-11 char prose ("Basic password") still survives."""
+class BasicAuthTwoRuleTests(unittest.TestCase):
+    """Review 4.5 r6 closure: TWO Basic rules.
 
-    def test_basic_all_value_shapes_redacted(self) -> None:
+    1. Explicit `Authorization: Basic <val>` header: UNCONDITIONAL 4+ char
+       match — no length floor, no case requirement. Short credentials
+       (YTpi), pure-lowercase values, all-uppercase values, prose-as-value
+       (fail-safe over-redaction, the #180 ssh -p direction) all redact.
+    2. Bare `Basic <val>` (no header): 12+ chars AND at least one
+       non-pure-lowercase char — digit-bearing/mixed shapes redact;
+       pure-lowercase prose survives (a pure-lowercase 12+ base64 value in
+       bare context stays a disclosed gap, the #537 disclosure class)."""
+
+    def test_header_context_unconditional(self) -> None:
         from redaction import redact_secret_like_text
-        for text in ("Authorization: Basic QUFBRUFCQ0RFRg==",
-                     "Authorization: Basic abc123def456",
-                     "Authorization: Basic dXNlcjpwYXNzd29yZA==",
-                     "Authorization: Basic YWFhYWFhYWFhYWFhYWFh"):
+        for text in ("Authorization: Basic YTpi",          # 4-char short cred
+                     "Authorization: Basic dagsqwxz",      # pure-lowercase
+                     "Authorization: Basic QUFBRUFCQ0RFRg==",  # all-uppercase
+                     "Authorization: Basic dXNlcjpwYXNzd29yZA==",  # mixed
+                     "Authorization: Basic authentication"):  # prose-as-value
             out, count = redact_secret_like_text(text)
             with self.subTest(text=text):
                 self.assertGreaterEqual(count, 1)
                 self.assertNotIn("Basic ", out)
 
-    def test_basic_prose_over_redaction_disclosed(self) -> None:
+    def test_bare_context_rules(self) -> None:
         from redaction import redact_secret_like_text
-        # 14-char value: FAIL-SAFE OVER-REDACTION (disclosed in the pattern
-        # comment + PR body) — the credential-class gap outranks the prose
-        # false positive, per the #180 ssh -p precedent.
-        out, count = redact_secret_like_text(
-            "use Basic authentication for the API")
+        # Digit-bearing bare 12+ value: redacted.
+        out, count = redact_secret_like_text("bare Basic abc123def456")
         self.assertGreaterEqual(count, 1)
-        self.assertIn("[REDACTED_SECRET]", out)
-
-    def test_basic_below_floor_survives(self) -> None:
-        from redaction import redact_secret_like_text
-        # "password" is 8 chars — below the 12-char credential floor.
-        out, count = redact_secret_like_text("Basic password")
-        self.assertEqual(count, 0)
-        self.assertEqual(out, "Basic password")
+        # Pure-lowercase bare values (prose AND the disclosed 12+ base64
+        # class): survive.
+        for text in ("bare Basic dagsqwxzmore",
+                     "use Basic authentication for the API",
+                     "Basic password"):
+            out, count = redact_secret_like_text(text)
+            with self.subTest(text=text):
+                self.assertEqual(count, 0)
+                self.assertEqual(out, text)
 
 
 class VerbatimPassageVerificationTests(unittest.TestCase):

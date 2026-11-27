@@ -50,19 +50,28 @@ SECRET_CREDENTIAL_PATTERNS = [
     # be outside the credential alphabet so the greedy match consumes the
     # complete token while still respecting ordinary delimiters.
     re.compile(r"(?i)(?<![A-Za-z0-9_])Bearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])"),
-    # RFC 7617 Basic scheme (issue #502): the scheme word is case-insensitive
-    # through an inline-scoped group (the #180 command-pattern convention);
-    # the VALUE is matched unconditionally at 12+ chars — the base64 length
-    # of the shortest realistic "user:pass" credential — so EVERY encoded
-    # credential shape (mixed, all-uppercase, digit-bearing, AND
-    # pure-lowercase) is redacted (review 4.5 r5: a value-shape filter that
-    # survives lowercase-only credentials was rejected — no user deferral of
-    # that class exists). The cost is fail-safe over-redaction of 12+ char
-    # prose after "Basic " ("Basic authentication" is redacted) — the SAME
-    # accepted fail-safe direction as the #180 matrix's ssh -p port
-    # over-redaction, disclosed here and in SKILL.md. Whole-match semantics
-    # like Bearer; the alphabet-boundary convention is copied verbatim.
-    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+[A-Za-z0-9._+/=~-]{12,}(?![A-Za-z0-9._+/=~-])"),
+    # RFC 7617 Basic scheme (issue #502), TWO rules (review 4.5 r6):
+    # 1. EXPLICIT AUTHORIZATION HEADER (`Authorization: Basic <val>`): the
+    #    context is unambiguous, so the value matches UNCONDITIONALLY at 4+
+    #    chars (the base64 minimum) — no length floor, no case requirement:
+    #    mixed, all-uppercase, digit-bearing, AND pure-lowercase values all
+    #    redact. The cost is fail-safe over-redaction of long prose inside a
+    #    literal auth header ("Authorization: Basic authentication") — the
+    #    SAME accepted fail-safe direction as the #180 matrix's ssh -p port
+    #    precedent; a literal 12+ char word as a header VALUE carries no
+    #    credential meaning anyway.
+    # 2. BARE `Basic <val>` (no header prefix): the weaker context keeps the
+    #    r5 shape — 12+ chars AND at least one non-pure-lowercase char (a
+    #    digit, uppercase, or base64 symbol) — so prose ("Basic password",
+    #    "Basic authentication" without a header) survives while digit-
+    #    bearing/mixed shapes redact. Disclosed gap: a PURE-LOWERCASE 12+
+    #    base64 value in bare context survives (same disclosure class as the
+    #    #537 IGNORECASE fold gap). The header rule runs FIRST in the
+    #    registry, so header contexts are consumed before this rule is
+    #    tried. Whole-match semantics like Bearer; the alphabet-boundary
+    #    convention is copied verbatim.
+    re.compile(r"(?i)(?<![A-Za-z0-9_])Authorization\s*:\s*Basic\s+[A-Za-z0-9._+/=~-]{4,}(?![A-Za-z0-9._+/=~-])"),
+    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+(?=[A-Za-z0-9._+/=~-]*[0-9A-Z+/=])[A-Za-z0-9._+/=~-]{12,}(?![A-Za-z0-9._+/=~-])"),
     # PEM: prefer the FULL block (BEGIN..END, whole-match) so the body dies
     # with the header; the header-only shape remains as fallback for a
     # truncated paste. Both are non-capturing so no group logic can misfire.
