@@ -336,7 +336,13 @@ class SourceRepairResolverTests(unittest.TestCase):
                      f"my credentials are {CANARY}",
                      f"the passphrase is {CANARY}",
                      f"password for the production database server is "
-                     f"currently {CANARY}"):
+                     f"currently {CANARY}",
+                     # Final-critic r5 finding 1: labels AFTER the value or
+                     # on an EARLIER line of the same block — the whole-
+                     # block scan (marker removed) refuses them.
+                     f"auth {CANARY}",
+                     f"signing key {CANARY}",
+                     f"session cookie {CANARY}"):
             with self.subTest(line=line):
                 env, memory_id = self._seed(
                     [LINE1, line, LINE3],
@@ -350,6 +356,33 @@ class SourceRepairResolverTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertTrue(result.stderr.startswith(
                     "[zmem] source repair: refused"), result.stderr)
+                self.assertNotIn(CANARY, _memory_content(db, memory_id))
+
+    def test_trailing_and_previous_line_labels_refuse(self) -> None:
+        # Final-critic r5: a credential word AFTER the value on the same
+        # line, or on an earlier line of the same verified block, labels
+        # the value — the whole-block scan (marker removed) refuses.
+        cases = (
+            # trailing label on the value's line (excerpt = that line)
+            (f"{CANARY}   <- db password",),
+            # previous-line label (excerpt = the whole 3-line block)
+            (f"production API key:", CANARY, LINE3),
+            # post-value prose label on a single line
+            (f"{CANARY} is the api key",),
+        )
+        for lines in cases:
+            with self.subTest(lines=lines):
+                env, memory_id = self._seed(
+                    list(lines),
+                    chr(10).join(lines))
+                db = self.root / "store.sqlite"
+                excerpt = chr(10).join(lines)
+                evidence_id = _write_production_evidence(
+                    db, memory_id, excerpt, "notes.md", 0)
+                result = _run(self.root, "source", "repair", "--id",
+                              memory_id, "--evidence-id", evidence_id,
+                              "--preview", extra_env=env)
+                self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertNotIn(CANARY, _memory_content(db, memory_id))
 
     def test_non_routable_ref_keeps_historical_refusal(self) -> None:

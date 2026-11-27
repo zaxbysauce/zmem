@@ -832,16 +832,8 @@ MARKER = "[REDACTED_SECRET]"
 # carry these words). Plurals and near-synonyms included (r4).
 _CREDENTIAL_PROSE_RE = re.compile(
     r"(?i)(?:api[_ -]?key|secret|token|password|passwd|pwd|pass"
-    r"|private[_ -]?key|bearer|credential|passphrase)")
-
-
-def _LINE_OF_MARKER(block_raw: str, redacted: str) -> int:
-    """The offset of the marker in the REDACTED block, mapped to the RAW
-    block: the bytes before the marker are unchanged raw bytes (the
-    marker-anchored reconstruction already proved startswith(pre)), so the
-    marker's raw offset is len(pre) — the redacted prefix and raw prefix
-    are byte-identical up to the marker."""
-    return redacted.find(MARKER)
+    r"|private[_ -]?key|bearer|credential|passphrase|auth|hmac"
+    r"|signing|session|cookie)")
 
 
 def _bind_block_candidate(
@@ -879,23 +871,19 @@ def _bind_block_candidate(
             raise SourceRefusal(
                 "the redacted span is a credential-labelled value, not a "
                 "verifiable identifier")
-    # Final-critic r3 finding 1: the registry gate above is grammar-only
-    # (key:/key=). A credential keyword in PROSE before the span
-    # ("secret <hex>", "pwd <hex>", "password is <hex>") never triggers it
+    # Final-critic r3/r4/r5 finding 1: the registry gate above is
+    # grammar-only (key:/key=), so PROSE credential labels never trigger it
     # — the redactor saw an ordinary unlabeled run. Refuse when a
-    # credential keyword appears on the span's line before the span within
-    # the same 48-char identifier-context window the calibration uses:
-    # positively-labelled identifiers (commit/release/sha) are never
-    # redacted, so a marker-only span is always unlabeled, and a nearby
-    # credential word marks the value as a secret-shaped token, not a
-    # verifiable identifier.
-    m_line = _LINE_OF_MARKER(block_raw, redacted)
-    line_start = block_raw.rfind("\n", 0, m_line) + 1
-    # r4: scan the WHOLE line before the span — the calibration window is
-    # the redactor's logic, not the binder's; a credential word earlier on
-    # the line still labels the value.
-    prefix = block_raw[line_start:m_line]
-    if _CREDENTIAL_PROSE_RE.search(prefix):
+    # credential keyword appears ANYWHERE in the verified block (r5: whole
+    # block with the marker REMOVED — the marker itself contains "SECRET",
+    # and a label after the value or on an earlier line of the block labels
+    # the value just as clearly as a prefix; hex digits cannot form any
+    # keyword, so the value itself can never trigger the gate). A
+    # positively-labelled identifier (commit/release/sha) is never
+    # redacted, so a marker-only span is always unlabeled — over-refusal is
+    # the safe direction.
+    scan = redacted.replace(MARKER, " ")
+    if _CREDENTIAL_PROSE_RE.search(scan):
         raise SourceRefusal(
             "the redacted span is a credential-labelled value, not a "
             "verifiable identifier")
