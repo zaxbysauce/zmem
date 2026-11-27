@@ -3,7 +3,7 @@
 This script exists so the guardrail's behaviour can be proven by a probe
 that does not merely re-run the repo's own test module. It imports
 `scripts/release_gate.py` from the revision it is run against and
-asserts the exact expected diagnostic count for each of six inputs:
+asserts the exact expected diagnostic count for each input:
 
   1. the repo's real CHANGELOG          -> 0  (it ships no marker)
   2. `<<<<<<< HEAD`                      -> 1  (a HEAD-labelled marker)
@@ -13,8 +13,9 @@ asserts the exact expected diagnostic count for each of six inputs:
                                             is legitimate content, and the
                                             separator is only a marker
                                             INSIDE a conflict block)
-  6. prose mentioning a marker          -> 0  (a marker word in prose is
+  6. a bullet that mentions a marker -> 0  (a marker word in prose is
                                             not a marker)
+  7. the same prose without the bullet marker -> 0
 
 Cases 2-4 are the ones that a fixed LIST of marker labels would miss: git
 writes seven marker characters and then an ARBITRARY label (the branch
@@ -45,6 +46,7 @@ CASES = [
     ("a branch-labelled marker", ">>>>>>> feature-branch\n", 1),
     ("a diff3 base marker", "||||||| origin/main\n", 1),
     ("a markdown setext underline", "Title\n=======\n", 0),
+    ("a bullet that mentions a marker", "- prose mentions <<<<<<< HEAD\n", 0),
     ("prose that mentions a marker", "prose mentions <<<<<<< HEAD\n", 0),
 ]
 
