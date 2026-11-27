@@ -9,7 +9,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
-<<<<<<< ours
 - **An interrupted first open is now restartable, a lost search table is
   rebuilt with every old row re-indexed, and 32 concurrent writers are no
   longer refused with a restore-blaming message** (issue #506). The v3 and
@@ -82,7 +81,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   directory beside it, on a best-effort basis: a filesystem that cannot
   harden must not break the restore, so the hardening call is made and a
   failure to harden does not abort it.
-=======
 - **Pre-tool recall no longer injects unrelated lessons before plain
   read-only commands.** The pre-tool query was the raw command text, so
   `ls`, `cat`, `sed -n '1,40p'`, path fragments and heredoc bodies matched
@@ -105,7 +103,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   path only; the fleet broker and the OpenCode bridge do not pass the tool
   input and are unchanged. Noise from `git status`, `grep`/`rg` and inline
   scripts is deliberately not filtered.
->>>>>>> theirs
+
+- **The release gate now refuses a CHANGELOG that carries an unresolved
+  merge marker** (issue #546). A merge whose conflict is resolved by
+  RECONSTRUCTION can leave the conflict MARKERS in the file beside the
+  reconstructed content, and the CHANGELOG ships to users. This PR's own
+  merge of `origin/main` reconstructed the union of both sides' notes
+  correctly and still left the three marker lines in place; nothing else
+  in the gate could see them, because the heading contract reads only
+  release headings and the drift gate asks only whether the section
+  carries content. The gate now reports the line number and the marker
+  and fails, in both the default release path and the per-PR
+  unreleased-drift path, and the shipped CHANGELOG is marker-free.
 
 - **Prompt-assertion partition: sentence-scoped negation, multi-focus orthogonal drop, moment allow-list, rescue count after admission** (issue #530).
   The partition now splits a stored row into sentences before applying

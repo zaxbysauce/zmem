@@ -280,6 +280,40 @@ def _changelog_heading_violations(text: str) -> list[str]:
     return violations
 
 
+def _changelog_conflict_markers(text: str) -> list[str]:
+    """Unresolved-merge-marker diagnostics for the CHANGELOG (issue #546).
+
+    A merge whose conflict was resolved by RECONSTRUCTION can leave the
+    conflict MARKERS in the file beside the reconstructed content. The
+    CHANGELOG ships to users, so a `<<<<<<< ours` line is a shipped
+    defect -- and one no other gate here can see: the heading contract
+    only looks at release headings, and the unreleased-drift check only
+    asks whether the section carries content.
+
+    This PR shipped one: its merge of `origin/main` reconstructed the
+    union of both sides' `[Unreleased]` bullets correctly (the bullet
+    multiset was exactly the union) and left the three marker lines in
+    place beside them.
+
+    Returns one diagnostic per marker line, naming its line number and
+    the marker. A line is a marker only when it IS the marker (after
+    stripping trailing whitespace) -- a marker word inside prose is not,
+    so the check cannot fire on documentation that merely quotes one.
+    """
+    violations: list[str] = []
+    for number, line in enumerate(text.split("\n"), 1):
+        stripped = line.strip()
+        if stripped in ("<<<<<<< ours", "<<<<<<< theirs", "=======",
+                        ">>>>>>> ours", ">>>>>>> theirs", "||||||| base"):
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (issue #546)"
+            )
+    return violations
+
+
 def tag_exists(version: str) -> bool:
     out = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/v{version}"],
@@ -455,6 +489,14 @@ def check_unreleased_drift(repo_root: Path) -> int:
               f"section and DELETE the stranded duplicate (a second heading "
               f"often sits mid-file below the released sections) "
               f"(issue #364)")
+        return 1
+    # Issue #546: an unresolved merge marker left in the CHANGELOG ships to
+    # users. This check runs here, BEFORE the content census, so it fires
+    # even when the section carries no content at all.
+    marker_violations = _changelog_conflict_markers(changelog)
+    if marker_violations:
+        for diagnostic in marker_violations:
+            print(f"::error::{diagnostic}")
         return 1
     if not unreleased_has_content(changelog):
         print("[release-gate] no unreleased drift: "
@@ -985,6 +1027,15 @@ def main(argv: list[str] | None = None) -> int:
     heading_violations = _changelog_heading_violations(changelog)
     if heading_violations:
         for diagnostic in heading_violations:
+            print(f"::error::{diagnostic}")
+        return 1
+    # Issue #546: an unresolved merge marker left in the CHANGELOG ships to
+    # users, and no other gate here can see it (the heading contract reads
+    # only release headings; the drift check only asks whether the section
+    # carries content).
+    marker_violations = _changelog_conflict_markers(changelog)
+    if marker_violations:
+        for diagnostic in marker_violations:
             print(f"::error::{diagnostic}")
         return 1
     section = latest_changelog_section(changelog)

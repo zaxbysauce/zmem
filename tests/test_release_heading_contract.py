@@ -209,6 +209,80 @@ class HeadingContractGatePathTest(unittest.TestCase):
         self.assertIn("unreadable", buffer.getvalue().lower())
 
 
+class ConflictMarkerContractTest(unittest.TestCase):
+    """Issue #546: an unresolved merge marker must not ship in the
+    CHANGELOG.
+
+    This PR shipped one: its merge of `origin/main` reconstructed the
+    union of both sides' `[Unreleased]` bullets correctly and left the
+    three conflict-marker lines in place beside them. No other gate saw
+    it -- the heading contract reads only release headings, and the
+    unreleased-drift check asks only whether the section has content.
+
+    The unit leg proves the detector fires on each marker form and stays
+    quiet on prose that merely mentions one; the repo leg proves the
+    SHIPPED CHANGELOG is clean, which is the guardrail that would have
+    caught the shipped defect.
+    """
+
+    def test_each_marker_form_is_detected(self):
+        for marker in ("<<<<<<< ours", "<<<<<<< theirs", "=======",
+                       ">>>>>>> ours", ">>>>>>> theirs", "||||||| base"):
+            text = f"# Changelog\n\n## [Unreleased]\n\n{marker}\n"
+            violations = gate._changelog_conflict_markers(text)
+            self.assertEqual(len(violations), 1,
+                             f"marker {marker!r} was not detected")
+            # the marker is the 5th line of that fixture
+            self.assertIn("line 5", violations[0])
+            self.assertIn("issue #546", violations[0])
+
+    def test_marker_with_trailing_whitespace_is_detected(self):
+        text = "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours   \n"
+        self.assertEqual(len(gate._changelog_conflict_markers(text)), 1)
+
+    def test_prose_mentioning_a_marker_is_not_a_marker(self):
+        # A changelog entry that DOCUMENTS the marker (as this PR's
+        # release notes do) must not trip the detector.
+        text = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "- The merge left a `<<<<<<< ours` line in this file.\n"
+            "- A line reading ===== is prose, not a separator.\n"
+        )
+        self.assertEqual(gate._changelog_conflict_markers(text), [])
+
+    def test_clean_changelog_has_no_markers(self):
+        text = (
+            "# Changelog\n\n## [Unreleased]\n\n- nothing yet\n\n"
+            "## [2.1.0] - 2026-01-03\n\nnewest\n"
+        )
+        self.assertEqual(gate._changelog_conflict_markers(text), [])
+
+    def test_repo_changelog_carries_no_conflict_marker(self):
+        # THE GUARDRAIL: the shipped CHANGELOG must be marker-free. This
+        # leg is what would have failed on the merged head.
+        text = CHANGELOG.read_text(encoding="utf-8")
+        violations = gate._changelog_conflict_markers(text)
+        self.assertEqual(violations, [],
+                         "the repo CHANGELOG must not carry conflict markers")
+
+    def test_drift_gate_fails_on_a_conflicted_changelog(self):
+        # The drift gate is the per-PR path CI runs; it must exit 1 on a
+        # CHANGELOG that carries a marker, even when the Unreleased
+        # section is empty (so the content census cannot mask it).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours\n\n"
+                "## [2.1.0] - 2026-01-03\n\nnewest\n",
+                encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                rc = gate.check_unreleased_drift(root)
+            self.assertEqual(rc, 1)
+            self.assertIn("conflict marker", buffer.getvalue())
+            self.assertIn("::error::", buffer.getvalue())
+
+
 class RepairedRepoChangelogTest(unittest.TestCase):
     """AC3 guard: the real repo CHANGELOG (post-#214 repair) satisfies the
     heading contract and keeps exactly one 0.43.0 heading."""
