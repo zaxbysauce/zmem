@@ -226,8 +226,16 @@ class ConflictMarkerContractTest(unittest.TestCase):
     """
 
     def test_each_marker_form_is_detected(self):
-        for marker in ("<<<<<<< ours", "<<<<<<< theirs", "=======",
-                       ">>>>>>> ours", ">>>>>>> theirs", "||||||| base"):
+        # The marker SHAPE is what matters: git writes SEVEN marker
+        # characters and then an ARBITRARY label (the branch name, HEAD, a
+        # path). The first version of the check matched a fixed list of
+        # six literals, so a `<<<<<<< HEAD` or `>>>>>>> feature-branch`
+        # line slipped through -- the reviewer's R-9 finding.
+        for marker in ("<<<<<<< ours", "<<<<<<< theirs", "<<<<<<< HEAD",
+                       "<<<<<<< feature-branch", "<<<<<<< /dev/null",
+                       ">>>>>>> ours", ">>>>>>> theirs", ">>>>>>> HEAD",
+                       ">>>>>>> feature-branch", "||||||| base",
+                       "||||||| origin/main"):
             text = f"# Changelog\n\n## [Unreleased]\n\n{marker}\n"
             violations = gate._changelog_conflict_markers(text)
             self.assertEqual(len(violations), 1,
@@ -236,17 +244,52 @@ class ConflictMarkerContractTest(unittest.TestCase):
             self.assertIn("line 5", violations[0])
             self.assertIn("issue #546", violations[0])
 
+    def test_separator_is_detected_inside_a_conflict_block(self):
+        # `=======` alone is a markdown setext H1 underline -- legitimate
+        # content -- so it is reported only where git puts it: inside a
+        # conflict block.
+        block = ("# Changelog\n\n## [Unreleased]\n\n"
+                 "<<<<<<< HEAD\n"
+                 "- ours\n"
+                 "=======\n"
+                 "- theirs\n"
+                 ">>>>>>> HEAD\n")
+        violations = gate._changelog_conflict_markers(block)
+        self.assertEqual(len(violations), 3, violations)
+        # the start marker is line 5, the separator line 7, the end line 9
+        self.assertTrue(any("line 5" in v and "<<<<<<< HEAD" in v
+                            for v in violations))
+        self.assertTrue(any("line 7" in v and "=======" in v
+                            and "conflict block opened at line 5" in v
+                            for v in violations))
+        self.assertTrue(any("line 9" in v and ">>>>>>> HEAD" in v
+                            for v in violations))
+
+    def test_separator_outside_a_block_is_not_a_marker(self):
+        # A setext H1 underline is the same seven characters and is
+        # legitimate markdown content.
+        text = "# Changelog\n\n## [Unreleased]\n\nA Title\n=======\n\nbody\n"
+        self.assertEqual(gate._changelog_conflict_markers(text), [])
+
     def test_marker_with_trailing_whitespace_is_detected(self):
         text = "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours   \n"
         self.assertEqual(len(gate._changelog_conflict_markers(text)), 1)
 
+    def test_label_may_contain_spaces(self):
+        # git writes the branch name verbatim after the space, so a label
+        # with spaces is still a marker.
+        text = "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours with spaces\n"
+        self.assertEqual(len(gate._changelog_conflict_markers(text)), 1)
+
     def test_prose_mentioning_a_marker_is_not_a_marker(self):
         # A changelog entry that DOCUMENTS the marker (as this PR's
-        # release notes do) must not trip the detector.
+        # release notes do) must not trip the detector: the marker must be
+        # at the START of the line and be the WHOLE line.
         text = (
             "# Changelog\n\n## [Unreleased]\n\n"
             "- The merge left a `<<<<<<< ours` line in this file.\n"
             "- A line reading ===== is prose, not a separator.\n"
+            "- `>>>>>>> theirs` is quoted here too.\n"
         )
         self.assertEqual(gate._changelog_conflict_markers(text), [])
 

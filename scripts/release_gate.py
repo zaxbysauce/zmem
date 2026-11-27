@@ -280,6 +280,23 @@ def _changelog_heading_violations(text: str) -> list[str]:
     return violations
 
 
+# A git conflict marker is SEVEN marker characters, optionally followed by
+# a space and an ARBITRARY label (the branch name, `HEAD`, a path, or
+# whatever the user passed). The first version of this check matched a
+# fixed list of six literals, which caught only the labels one particular
+# merge happened to produce -- a `<<<<<<< HEAD` or `>>>>>>> feature-branch`
+# line slipped through. So the marker SHAPE is matched, not a label list.
+#
+# `=======` is deliberately NOT matched on its own: in markdown a run of
+# seven `=` under a line is a setext H1 underline, which is legitimate
+# content. The separator is reported only where git puts it -- INSIDE a
+# conflict block, between a `<<<<<<<` line and a `>>>>>>>` line.
+_CONFLICT_START_RE = re.compile(r"^<{7}(?: .*)?$")
+_CONFLICT_END_RE = re.compile(r"^>{7}(?: .*)?$")
+_CONFLICT_BASE_RE = re.compile(r"^\|{7}(?: .*)?$")
+_CONFLICT_SEPARATOR = "=" * 7
+
+
 def _changelog_conflict_markers(text: str) -> list[str]:
     """Unresolved-merge-marker diagnostics for the CHANGELOG (issue #546).
 
@@ -295,19 +312,51 @@ def _changelog_conflict_markers(text: str) -> list[str]:
     multiset was exactly the union) and left the three marker lines in
     place beside them.
 
+    A line is a marker when it IS the marker: seven `<`, `>` or `|` marker
+    characters, optionally followed by a space and any label, and nothing
+    else on the line. The separator (`=======`) is reported only inside a
+    conflict block, because a markdown setext underline is the same seven
+    characters and is legitimate content. A marker word inside prose is
+    never a marker, so the check cannot fire on documentation that merely
+    quotes one.
+
     Returns one diagnostic per marker line, naming its line number and
-    the marker. A line is a marker only when it IS the marker (after
-    stripping trailing whitespace) -- a marker word inside prose is not,
-    so the check cannot fire on documentation that merely quotes one.
+    the marker.
     """
+    lines = text.split("\n")
     violations: list[str] = []
-    for number, line in enumerate(text.split("\n"), 1):
+    # the separator is only a marker inside a block, so track the block
+    open_start: int | None = None
+    for number, line in enumerate(lines, 1):
         stripped = line.strip()
-        if stripped in ("<<<<<<< ours", "<<<<<<< theirs", "=======",
-                        ">>>>>>> ours", ">>>>>>> theirs", "||||||| base"):
+        if _CONFLICT_START_RE.match(stripped):
+            open_start = number
             violations.append(
                 f"CHANGELOG.md line {number} carries the unresolved merge "
                 f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (issue #546)"
+            )
+        elif _CONFLICT_END_RE.match(stripped):
+            open_start = None
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (issue #546)"
+            )
+        elif _CONFLICT_BASE_RE.match(stripped):
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (issue #546)"
+            )
+        elif stripped == _CONFLICT_SEPARATOR and open_start is not None:
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} (inside the conflict block opened at "
+                f"line {open_start}) — a merged CHANGELOG must not ship "
                 f"conflict markers; resolve the conflict and delete the "
                 f"marker lines (issue #546)"
             )
