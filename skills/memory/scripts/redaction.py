@@ -51,19 +51,18 @@ SECRET_CREDENTIAL_PATTERNS = [
     # complete token while still respecting ordinary delimiters.
     re.compile(r"(?i)(?<![A-Za-z0-9_])Bearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])"),
     # RFC 7617 Basic scheme (issue #502): the scheme word is case-insensitive
-    # through an inline-scoped group (the #180 command-pattern convention); the
-    # value must carry at least one character OUTSIDE the pure-lowercase
-    # alphabet (a digit, uppercase, or base64 symbol) — all-lowercase values
-    # are the prose signature ("Basic authentication", "Basic password") and
-    # survive; any value containing a digit/uppercase/symbol is redacted
-    # (review 4.5 r5: no case-MIXTURE requirement — all-uppercase base64
-    # credentials like QUFBRUFCQ0RFRg== match). Known disclosed gap: a
-    # pathological pure-lowercase base64 credential survives (real base64 of
-    # ASCII credentials for 8+ chars is vanishingly rarely lowercase-only —
-    # same disclosure class as the #537 IGNORECASE fold gap). Whole-match
-    # semantics like Bearer; the alphabet-boundary convention is copied
-    # verbatim.
-    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+(?=[A-Za-z0-9._+/=~-]*[0-9A-Z+/=])[A-Za-z0-9._+/=~-]{8,}(?![A-Za-z0-9._+/=~-])"),
+    # through an inline-scoped group (the #180 command-pattern convention);
+    # the VALUE is matched unconditionally at 12+ chars — the base64 length
+    # of the shortest realistic "user:pass" credential — so EVERY encoded
+    # credential shape (mixed, all-uppercase, digit-bearing, AND
+    # pure-lowercase) is redacted (review 4.5 r5: a value-shape filter that
+    # survives lowercase-only credentials was rejected — no user deferral of
+    # that class exists). The cost is fail-safe over-redaction of 12+ char
+    # prose after "Basic " ("Basic authentication" is redacted) — the SAME
+    # accepted fail-safe direction as the #180 matrix's ssh -p port
+    # over-redaction, disclosed here and in SKILL.md. Whole-match semantics
+    # like Bearer; the alphabet-boundary convention is copied verbatim.
+    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+[A-Za-z0-9._+/=~-]{12,}(?![A-Za-z0-9._+/=~-])"),
     # PEM: prefer the FULL block (BEGIN..END, whole-match) so the body dies
     # with the header; the header-only shape remains as fallback for a
     # truncated paste. Both are non-capturing so no group logic can misfire.

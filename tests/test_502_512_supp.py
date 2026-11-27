@@ -562,35 +562,41 @@ class VerifyRecordTests(unittest.TestCase):
                 db, f"source_verify:{memory_id}:ev-supp-v2"))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class BasicAuthUnconditionalTests(unittest.TestCase):
+    """Review 4.5 r5 closure: the Basic detector matches EVERY 12+ char value
+    unconditionally (12 = base64 length of the shortest realistic
+    "user:pass") — mixed, all-uppercase, digit-bearing AND pure-lowercase
+    credentials all redact. The cost is fail-safe over-redaction of 12+ char
+    prose after "Basic " (the same accepted fail-safe direction as the #180
+    ssh -p precedent); 8-11 char prose ("Basic password") still survives."""
 
-
-class BasicAuthWideningTests(unittest.TestCase):
-    """Review 4.5 r5: the Basic detector requires a non-pure-lowercase value
-    (no case-MIXTURE requirement) — all-uppercase base64 credentials are
-    redacted; prose survives; the pure-lowercase base64 class stays a
-    disclosed gap."""
-
-    def test_basic_all_uppercase_and_digit_values_redacted(self) -> None:
+    def test_basic_all_value_shapes_redacted(self) -> None:
         from redaction import redact_secret_like_text
         for text in ("Authorization: Basic QUFBRUFCQ0RFRg==",
                      "Authorization: Basic abc123def456",
-                     "Authorization: Basic dXNlcjpwYXNzd29yZA=="):
+                     "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+                     "Authorization: Basic YWFhYWFhYWFhYWFhYWFh"):
             out, count = redact_secret_like_text(text)
             with self.subTest(text=text):
                 self.assertGreaterEqual(count, 1)
                 self.assertNotIn("Basic ", out)
 
-    def test_basic_prose_survives(self) -> None:
+    def test_basic_prose_over_redaction_disclosed(self) -> None:
         from redaction import redact_secret_like_text
-        for text in ("use Basic authentication for the API",
-                     "Basic password",
-                     "a basically automatic process"):
-            out, count = redact_secret_like_text(text)
-            with self.subTest(text=text):
-                self.assertEqual(count, 0)
-                self.assertEqual(out, text)
+        # 14-char value: FAIL-SAFE OVER-REDACTION (disclosed in the pattern
+        # comment + PR body) — the credential-class gap outranks the prose
+        # false positive, per the #180 ssh -p precedent.
+        out, count = redact_secret_like_text(
+            "use Basic authentication for the API")
+        self.assertGreaterEqual(count, 1)
+        self.assertIn("[REDACTED_SECRET]", out)
+
+    def test_basic_below_floor_survives(self) -> None:
+        from redaction import redact_secret_like_text
+        # "password" is 8 chars — below the 12-char credential floor.
+        out, count = redact_secret_like_text("Basic password")
+        self.assertEqual(count, 0)
+        self.assertEqual(out, "Basic password")
 
 
 class VerbatimPassageVerificationTests(unittest.TestCase):
@@ -650,3 +656,7 @@ class VerbatimPassageVerificationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload["verification"]["outcome"], "exact")
+
+
+if __name__ == "__main__":
+    unittest.main()
