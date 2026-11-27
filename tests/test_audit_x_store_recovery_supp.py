@@ -46,6 +46,7 @@ via the module-top env pin (before any storelib import, per the guard).
 """
 from __future__ import annotations
 
+import atexit
 import contextlib
 import io
 import os
@@ -67,6 +68,36 @@ PY = sys.executable
 # ---- module-top env pin (before any storelib import) --------------------
 _Tmp = Path(tempfile.mkdtemp(prefix="x-store-recovery-supp-"))
 _STORE = _Tmp / "store.sqlite"
+# TG-4 (the round-1 review comment): the pin must be restored at MODULE
+# teardown, and the restore must be ORIGINAL-based: a per-module snapshot
+# would capture whatever a sibling module had already pinned. The shared
+# helper captures the original values once per process and refcounts the
+# pins, so the environment is restored only after the LAST pinning module
+# has torn down (a middle module's teardown must not strip a pin a later
+# module's tests still need).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _store_env_pin  # noqa: E402  (shared pin/restore helper)
+
+_PINNED_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_BACKUP_DIR", "ZMEM_MODELS_DIR",
+                "ZMEM_MODEL_AUTODOWNLOAD", "PYTHONIOENCODING", "ZMEM_SESSION",
+                "ZMEM_SESSION_ID", "ZMEM_TIER0", "ZMEM_SKILLS_DIRS",
+                "ZMEM_PYTHON")
+_ENV_TOKEN = _store_env_pin.acquire(_PINNED_KEYS)
+
+
+def tearDownModule():
+    # TG-4 (the round-1 review comment): atexit is PROCESS exit, so a
+    # sibling test module imported into the SAME process still inherited
+    # these pins. Restore at MODULE teardown -- after this module's legs
+    # have finished (they need the pin) and before any sibling runs.
+    _store_env_pin.release(_ENV_TOKEN)
+
+
+@atexit.register
+def _release_env_at_exit():
+    _store_env_pin.release(_ENV_TOKEN)
+
+
 os.environ.update({
     "ZMEM_STORE": str(_STORE),
     "ZMEM_DATA": str(_Tmp),
@@ -293,6 +324,154 @@ class ImpostorMemoryTest(SuppBase):
         self.assertIsInstance(r.returncode, int)
         self.assertNotEqual(r.returncode, 0)
         self.assertNotIn("Traceback", r.stderr, r.stderr[-300:])
+
+
+    def test_impostor_recovery_step_is_reached_and_changes_nothing(self):
+        # TG-3(b) (the round-1 review comment): the impostor leg above only
+        # proves the ADD fails. Call the recovery helper DIRECTLY on the
+        # impostor connection: it must be REACHED, raise nothing, and leave
+        # the impostor's schema untouched (no rebuild attempted).
+        conn = sqlite3.connect(str(self.store))
+        try:
+            conn.executescript(
+                "CREATE TABLE memory (id TEXT PRIMARY KEY, content TEXT); "
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); "
+                "INSERT INTO meta VALUES ('schema_version', '19')")
+            conn.commit()
+            before = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            cols_before = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+        finally:
+            conn.close()
+        import storelib.schema as schema_mod
+        conn = sqlite3.connect(str(self.store))
+        try:
+            schema_mod._recover_search_index(conn)   # must not raise
+            after = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            cols_after = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+        finally:
+            conn.close()
+        self.assertEqual(after, before,
+                         "the impostor store's tables must be untouched")
+        self.assertEqual(cols_after, cols_before,
+                         "the impostor memory table's columns must be untouched")
+
+
+    def test_impostor_recovery_is_reached_end_to_end_and_rebuilds_nothing(self):
+        # TG-3(b): the direct call above cannot prove the OPEN path reaches
+        # the recovery helper. Run the real CLI add against the impostor
+        # store with the helper wrapped, and assert (a) the helper was
+        # reached, (b) the impostor's schema is unchanged, (c) the add
+        # failed cleanly.
+        conn = sqlite3.connect(str(self.store))
+        try:
+            conn.executescript(
+                "CREATE TABLE memory (id TEXT PRIMARY KEY, content TEXT); "
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); "
+                "INSERT INTO meta VALUES ('schema_version', '19')")
+            conn.commit()
+            before = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            cols_before = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+        finally:
+            conn.close()
+        import storelib.schema as schema_mod
+        original = schema_mod._recover_search_index
+        calls = []
+
+        def wrapper(conn_):
+            calls.append(1)
+            return original(conn_)
+
+        # The CLI runs in a CHILD, so an in-process wrapper is invisible to
+        # it: drive the same open sequence the CLI uses, in-process.
+        os.environ["ZMEM_STORE"] = str(self.store)
+        os.environ["ZMEM_DATA"] = str(self.dir)
+        import storelib
+        storelib._refresh_env_state()
+        schema_mod._recover_search_index = wrapper
+        try:
+            # The impostor's own schema makes the open fail cleanly (the
+            # index DDL needs the columns the impostor lacks) -- that IS
+            # the impostor contract: a controlled refusal, never a rebuild.
+            with self.assertRaisesRegex(sqlite3.OperationalError, "namespace"):
+                conn = storelib.connect()
+                try:
+                    storelib.init_db(conn)
+                finally:
+                    conn.close()
+        finally:
+            schema_mod._recover_search_index = original
+        self.assertTrue(calls, "the open path never reached the recovery helper")
+        conn = sqlite3.connect(str(self.store))
+        try:
+            after = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            cols_after = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+        finally:
+            conn.close()
+        # The open creates the (empty) vec0 shadow tables, so the impostor
+        # contract is about the SEARCH index: no memory_fts and no search
+        # shadow table may appear, and the impostor's own memory table must
+        # be untouched.
+        self.assertNotIn("memory_fts", after,
+                         "the impostor store must not gain a search index")
+        for shadow in ("memory_fts_config", "memory_fts_data",
+                       "memory_fts_docsize", "memory_fts_idx"):
+            self.assertNotIn(shadow, after,
+                             "the impostor store must not gain %s" % shadow)
+        self.assertEqual(cols_after, cols_before,
+                         "the impostor memory table's columns must be untouched")
+
+
+class StoreEnvPinHelperTest(unittest.TestCase):
+    """TG-4: the shared pin helper's lifetime semantics."""
+
+    def setUp(self):
+        import _store_env_pin as pin
+        self.pin = pin
+        self._orig = dict(pin._ORIGINAL)
+        self._active = set(pin._ACTIVE)
+        self._next = pin._NEXT_TOKEN
+        # Isolate the holder state: the modules that hold pins in THIS
+        # process would otherwise keep the restore from happening, and the
+        # point of the legs is the helper's own semantics.
+        pin._ORIGINAL.clear()
+        pin._ACTIVE.clear()
+
+    def tearDown(self):
+        self.pin._ORIGINAL.clear()
+        self.pin._ORIGINAL.update(self._orig)
+        self.pin._ACTIVE.clear()
+        self.pin._ACTIVE.update(self._active)
+        self.pin._NEXT_TOKEN = self._next
+
+    def test_two_holders_of_the_same_keys_stay_independent(self):
+        os.environ["ZMEM_PIN_PROBE"] = "original"
+        self.addCleanup(os.environ.pop, "ZMEM_PIN_PROBE", None)
+        first = self.pin.acquire(("ZMEM_PIN_PROBE",))
+        second = self.pin.acquire(("ZMEM_PIN_PROBE",))
+        os.environ["ZMEM_PIN_PROBE"] = "pinned"
+        self.pin.release(first)
+        self.assertEqual(os.environ.get("ZMEM_PIN_PROBE"), "pinned",
+                         "the second holder must keep the pin")
+        self.pin.release(second)
+        self.assertEqual(os.environ.get("ZMEM_PIN_PROBE"), "original",
+                         "the last release must restore the original")
+
+    def test_the_restore_covers_every_captured_key(self):
+        for key, value in (("ZMEM_PIN_A", "orig-a"), ("ZMEM_PIN_B", "orig-b")):
+            os.environ[key] = value
+            self.addCleanup(os.environ.pop, key, None)
+        first = self.pin.acquire(("ZMEM_PIN_A",))
+        second = self.pin.acquire(("ZMEM_PIN_B",))
+        os.environ["ZMEM_PIN_A"] = "pinned-a"
+        os.environ["ZMEM_PIN_B"] = "pinned-b"
+        self.pin.release(first)
+        self.pin.release(second)
+        self.assertEqual(os.environ.get("ZMEM_PIN_A"), "orig-a")
+        self.assertEqual(os.environ.get("ZMEM_PIN_B"), "orig-b")
 
 
 class HealthyStoreByteIdentityTest(SuppBase):
@@ -647,6 +826,81 @@ class RestoreFaultMatrixTest(_InProcessRestoreBase):
         self.assertTrue(self.store.exists())
         self.assertEqual(self.store.stat().st_size, 0)
         self._no_leftovers()
+
+    def test_empty_destination_rollback_not_empty_again_is_reported(self):
+        # TG-1 (the round-1 review comment): the empty-destination rollback
+        # FAILURE arm had no test. The rollback's postcondition check must
+        # fire, be reported, and carry the EMPTY-destination manual
+        # instructions. A generic "automatic rollback also failed" assertion
+        # would not distinguish the arms.
+        self._add("f1 empty rollback failure keeper row")
+        snap = self._snapshot(self.dir, self.store)
+        self.store.write_bytes(b"")
+        import pathlib
+        import storelib.backup as bm
+        _orig = bm._row_counts
+        counts = {"n": 0}
+
+        def wrong_second(conn):
+            counts["n"] += 1
+            if counts["n"] == 1:
+                return _orig(conn)
+            return (999, 999)  # installed verification mismatch
+
+        def _touch_writes_a_byte(path_self, *a, **k):
+            path_self.write_bytes(b"x")   # the re-created file is not empty
+
+        unpatch_row = self._patch_attr(bm, "_row_counts", wrong_second)
+        unpatch_touch = self._patch_attr(pathlib.Path, "touch",
+                                         _touch_writes_a_byte)
+        try:
+            result = self._run(snap, lambda m: None, unpatch_row)
+        finally:
+            unpatch_touch()
+        self.assertEqual(result["rc"], 1, result["err"][-300:])
+        self.assertIn("is not empty again", result["err"])
+        self.assertIn("automatic rollback also failed", result["err"])
+        self.assertIn("replace", result["err"],
+                      "the empty-destination rollback must print the manual "
+                      f"instructions: {result['err'][-400:]}")
+
+    def test_missing_destination_rollback_survived_is_reported(self):
+        # TG-1 (the round-1 review comment): the missing-destination rollback
+        # FAILURE arm ("survived the rollback") had no test either.
+        self._add("f1 missing rollback failure keeper row")
+        snap = self._snapshot(self.dir, self.store)
+        self.store.unlink()                    # the destination is MISSING
+        import pathlib
+        import storelib.backup as bm
+        _orig = bm._row_counts
+        counts = {"n": 0}
+
+        def wrong_second(conn):
+            counts["n"] += 1
+            if counts["n"] == 1:
+                return _orig(conn)
+            return (999, 999)  # installed verification mismatch
+
+        _real_unlink = pathlib.Path.unlink
+
+        def _unlink_skips_the_destination(path_self, *a, **k):
+            if path_self == self.store:
+                return None        # the destination survives the rollback
+            return _real_unlink(path_self, *a, **k)
+
+        unpatch_row = self._patch_attr(bm, "_row_counts", wrong_second)
+        unpatch_unlink = self._patch_attr(pathlib.Path, "unlink",
+                                          _unlink_skips_the_destination)
+        try:
+            result = self._run(snap, lambda m: None, unpatch_row)
+        finally:
+            unpatch_unlink()
+        self.assertEqual(result["rc"], 1, result["err"][-300:])
+        self.assertIn("survived the rollback", result["err"])
+        self.assertIn("automatic rollback also failed", result["err"])
+        self.assertIn("delete", result["err"],
+                      "the missing-destination rollback must print the manual "
+                      f"instructions: {result['err'][-400:]}")
 
     def test_installed_verification_failure_rolls_back(self):
         self._add("verify keeper row one")

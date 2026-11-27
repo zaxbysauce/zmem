@@ -459,13 +459,18 @@ class CliJsonTest(unittest.TestCase):
         empty, and the exit code is nonzero (reviewer finding #3)."""
         conn = self.mod.connect()
         try:
-            # Issue #506 note: this test originally dropped `meta`, which
-            # raised only because the v3 migration then crashed on
-            # `duplicate column name` (the #506 defect itself). The column
-            # guards fix that crash, so the injection now drops a table the
-            # working-set query genuinely requires — the exception still
-            # fires inside consolidate(), after the JSON redirect is armed.
-            conn.execute("DROP TABLE memory")  # working-set query raises mid-run
+            # TG-3(a) (the round-1 review comment): this leg must fail
+            # AFTER initialization and INSIDE consolidate(), or it cannot
+            # prove the failure site. Dropping a table does NOT: the CLI's
+            # own _prepare_store (init_db + migrate) recreates it before
+            # consolidate() runs, so the old injection produced no
+            # consolidate-time failure at all. A trigger that aborts on the
+            # consolidation's OWN write fails deterministically inside the
+            # run, with a marker no other failure can produce.
+            conn.execute(
+                "CREATE TRIGGER zmem_tg3a_fail BEFORE INSERT ON meta "
+                "WHEN NEW.key = 'last_consolidation' BEGIN "
+                "SELECT RAISE(ABORT, 'TG3A_MARKER_inside_consolidate'); END")
             conn.commit()
         finally:
             conn.close()
@@ -473,6 +478,16 @@ class CliJsonTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "", result.stdout[:200])
         self.assertTrue(result.stderr.strip(), "expected a traceback on stderr")
+        # TG-3(a) (the round-1 review comment): the assertions above cannot
+        # tell WHICH site failed -- an initialization failure BEFORE
+        # consolidate() would satisfy them too. The injected marker and the
+        # failing frame must both be inside consolidate().
+        self.assertIn("TG3A_MARKER_inside_consolidate", result.stderr,
+                      "the injected marker must reach stderr: %r"
+                      % (result.stderr[-600:],))
+        self.assertIn("consolidate.py", result.stderr,
+                      "the failure must be inside consolidate(), not in "
+                      "initialization: %r" % (result.stderr[-600:],))
 
 
 class CosineContestedTest(unittest.TestCase):

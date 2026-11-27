@@ -1917,7 +1917,8 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             return 1
     elif dest_exists:
         print("[zmem] restore: pre-restore backup skipped - destination store is "
-              "an empty file (nothing to preserve)")
+              "an empty file (no store content needed preserving; any sidecar "
+              "bytes were kept in the forensic copy)")
     else:
         print("[zmem] restore: pre-restore backup skipped - destination store "
               "does not exist yet")

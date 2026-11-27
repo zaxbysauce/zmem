@@ -66,9 +66,34 @@ PY = sys.executable
 _SCRATCH = Path(tempfile.mkdtemp(prefix="zmem-506-recovery-"))
 
 
+# TG-4 (the round-1 review comment): the module-top pin mutates the
+# process environment; it must be restored at MODULE teardown, and the
+# restore must be ORIGINAL-based: a per-module snapshot would capture
+# whatever a sibling module had already pinned. The shared helper captures
+# the original values once per process and refcounts the pins, so the
+# environment is restored only after the LAST pinning module has torn down
+# (a middle module's teardown must not strip a pin a later module's tests
+# still need).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _store_env_pin  # noqa: E402  (shared pin/restore helper)
+
+_PINNED_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_BACKUP_DIR")
+_ENV_TOKEN = _store_env_pin.acquire(_PINNED_KEYS)
+
+
+def tearDownModule():
+    # TG-4 (the round-1 review comment): atexit is PROCESS exit, so a
+    # sibling test module imported into the SAME process still inherited
+    # these pins. Restore at MODULE teardown -- after this module's tests
+    # have finished (they need the pin) and before any sibling runs.
+    _store_env_pin.release(_ENV_TOKEN)
+
+
 @atexit.register
 def _cleanup_scratch():
-    shutil.rmtree(_SCRATCH, ignore_errors=True)
+    _store_env_pin.release(_ENV_TOKEN)
+    shutil.rmtree(_SCRATCH, errors="ignore") if False else shutil.rmtree(
+        _SCRATCH, ignore_errors=True)
 
 
 os.environ["ZMEM_STORE"] = str(_SCRATCH / "guard-pin.sqlite")

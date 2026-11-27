@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import sys
+import ast
 import unittest
 from pathlib import Path
 
@@ -68,6 +69,140 @@ class HygieneInterpreterPin(unittest.TestCase):
                       "sys.executable")
 
 
+def _operator_hints(tree):
+    """Find the operator command hints in a parsed module.
+
+    An operator instruction is a literal that STARTS with a command (the
+    "[zmem] " prefix is stripped) and carries one of that command's flags --
+    the shape every operator hint in this repo has ("restore --from X",
+    "doctor --json"). PROSE that merely names a command mid-sentence ("For
+    diagnostics, see doctor --json in the manual") is NOT a hint.
+
+    Returns (fstring_hints, bare_hints): the f-strings that render a command
+    (each must call `command_prefix()`), and the plain string literals that
+    read as a command with no prefix at all (each is a bare hint).
+    """
+    docstrings = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body:
+            first = body[0]
+            if (isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                docstrings.add(id(first.value))
+    fstring_parts = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.JoinedStr):
+            for v in n.values:
+                if isinstance(v, ast.Constant):
+                    fstring_parts.add(id(v))
+    fstring_hints = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.JoinedStr):
+            continue
+        parts = [v.value for v in n.values
+                 if isinstance(v, ast.Constant) and isinstance(v.value, str)]
+        if any(_is_operator_instruction(p) for p in parts):
+            fstring_hints.append(n)
+    bare_hints = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Constant) and isinstance(n.value, str)):
+            continue
+        if id(n) in docstrings or id(n) in fstring_parts:
+            continue
+        if _is_operator_instruction(n.value):
+            bare_hints.append(n)
+    return fstring_hints, bare_hints
+
+
+_OPERATOR_COMMANDS = ("restore", "backup", "doctor", "reindex", "reembed",
+                       "import-store", "export", "list", "recall", "consolidate")
+# An operator instruction RENDERS a copyable command: the command word
+# comes FIRST, optionally behind the repo's own "[zmem] " prefix, an
+# executable prefix ("zmem ", "python .../store.py ") or an interpreter path.
+_CMD_RE = re.compile(
+    r"^\s*(?:(?P<label>(?:run|try|use)\s*:?\s+)?"
+    r"(?P<prefix>\[zmem\]\s*)?)"
+    r"(?P<exec>(?:zmem|python)\s+\S*store\.py\s+|[\w./:\\-]*store\.py\s+"
+    r"|zmem\s+)?"
+    r"(?:" + "|".join(_OPERATOR_COMMANDS) + r")\b", re.IGNORECASE)
+
+
+def _is_operator_instruction(text: str) -> bool:
+    """True when the literal READS as an operator instruction.
+
+    An instruction (a) STARTS with the command, (b) carries one of that
+    command's flags, (c) is short, and (d) does not end like a sentence.
+    Prose that merely names a command -- mid-sentence ("For diagnostics, see
+    doctor --json in the manual") or as a sentence ("restore --from is the
+    option that selects the source.") -- is NOT an instruction.
+    """
+    stripped = text.strip()
+    if len(stripped) > 120:
+        return False
+    if re.search(r"[.!?]\s*$", stripped):
+        return False
+    match = _CMD_RE.match(text)
+    if not match:
+        return False
+    # A copyable instruction either carries one of the command's flags, or
+    # is EXECUTABLE on its own: "zmem restore", "python .../store.py
+    # restore" and "C:/x/store.py restore" are all pasteable, flagless or
+    # not. Every executable form the pattern accepts counts.
+    return bool(re.search(r"\s--[a-z]", stripped)) or bool(
+        match.group("exec"))
+
+
+class OperatorHintDetectorTest(unittest.TestCase):
+    """TG-2: the detector must flag an operator instruction and leave prose
+    alone -- both are pinned here so the pin above cannot silently rot."""
+
+    def test_flags_a_bare_operator_instruction(self):
+        tree = ast.parse('hint = "doctor --json --rebuild-fts"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(bare), 1, bare)
+
+    def test_flags_an_unprefixed_fstring_hint(self):
+        tree = ast.parse('hint = f"restore --from {path}"\n')
+        fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(fstrings), 1, fstrings)
+        self.assertEqual(bare, [])
+
+    def test_leaves_prose_alone(self):
+        prose = ('note = "For diagnostics, see doctor --json in the manual"\n'
+                 'doc = """\nrestore --from is the option that selects the source.\n"""\n')
+        tree = ast.parse(prose)
+        fstrings, bare = _operator_hints(tree)
+        self.assertEqual(bare, [], bare)
+        self.assertEqual(fstrings, [], fstrings)
+
+    def test_leaves_a_flagless_mention_alone(self):
+        tree = ast.parse('note = "the restore path is guarded"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(bare, [], bare)
+
+    def test_flags_a_flagless_bare_command(self):
+        tree = ast.parse('hint = "zmem restore"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(bare), 1, bare)
+
+    def test_flags_an_executable_prefixed_hint(self):
+        tree = ast.parse('hint = "python C:/x/store.py restore --from Y"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(bare), 1, bare)
+
+    def test_flags_a_flagless_interpreter_path_hint(self):
+        tree = ast.parse('hint = "C:/x/store.py restore"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(bare), 1, bare)
+
+    def test_flags_a_labelled_unprefixed_hint(self):
+        tree = ast.parse('hint = "Run: zmem restore --from X"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(bare), 1, bare)
+
+
 class OperatorCommandPrefixPin(unittest.TestCase):
     """schema.py + backup.py render operator-facing store.py hints (review
     round: PRR-004); they must go through the same opcmds prefix."""
@@ -93,6 +228,41 @@ class OperatorCommandPrefixPin(unittest.TestCase):
                          "the backup hand-rollback hint must use the prefix "
                          "(consolidated to one site by PR #541's restore "
                          "rework; the pre-#504 five-branch shape is gone)")
+        # TG-2 (the round-1 review comment): the count above is a sentinel
+        # that cannot catch a NEW unprefixed hint -- a second hint added
+        # without the prefix would leave both counts at one. Pin the FORM,
+        # over EXECUTABLE strings only: the AST gives the hint literals
+        # (a comment is not a node; a docstring is excluded explicitly), so
+        # a harmless prose mention is not a false positive and a bare
+        # operator hint is.
+        tree = ast.parse(backup, filename="backup.py")
+        fstring_hints, bare_hints = _operator_hints(tree)
+        # (the detector itself is `_operator_hints`, unit-tested with
+        # positive and negative fixtures below)
+        self.assertTrue(fstring_hints or bare_hints,
+                        "the backup hand-rollback hint disappeared")
+        for n in fstring_hints:
+            prefixed = [v for v in n.values
+                        if isinstance(v, ast.FormattedValue)
+                        and isinstance(v.value, ast.Call)
+                        and isinstance(v.value.func, ast.Name)
+                        and v.value.func.id == "command_prefix"]
+            self.assertTrue(
+                prefixed,
+                "an operator command hint must render through "
+                "command_prefix(): %r" % (ast.dump(n),))
+        self.assertEqual(
+            bare_hints, [],
+            "a bare operator command hint must render through "
+            "command_prefix(): %r" % ([n.value for n in bare_hints],))
+        prefix_calls = [n for n in ast.walk(tree)
+                        if isinstance(n, ast.Call)
+                        and isinstance(n.func, ast.Name)
+                        and n.func.id == "command_prefix"]
+        self.assertEqual(
+            len(fstring_hints), len(prefix_calls),
+            "every operator command hint in backup.py must use "
+            "command_prefix()")
 
     def test_doctor_hints_use_the_prefix(self):
         doctor = DOCTOR.read_text(encoding="utf-8")

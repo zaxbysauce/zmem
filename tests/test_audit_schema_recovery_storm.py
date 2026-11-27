@@ -60,6 +60,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -73,6 +74,16 @@ import _store_guard  # noqa: E402,F401  (#244 wiring census: this companion
 #                      the shared base module imported above already pinned
 #                      the env and the guard — this literal import satisfies
 #                      the census's per-file wiring requirement)
+
+# TG-4 (the round-1 review comment): this file IMPORTS the recovery module,
+# so the recovery module's own pin could be released (at ITS teardown)
+# before these tests run. Hold a pin of our own for this module's whole
+# lifetime, and release it at our teardown.
+_STORM_TOKEN = _recovery._store_env_pin.acquire(_recovery._PINNED_KEYS)
+
+
+def tearDownModule():
+    _recovery._store_env_pin.release(_STORM_TOKEN)
 
 _N_CHILDREN = 32
 _N_ROUNDS = 3
@@ -103,6 +114,11 @@ while not os.path.exists(go_path):
     time.sleep(0.002)
 raise SystemExit(store.main() or 0)
 """
+
+
+def _raise_spawn_failure(i):
+    if i == 1:
+        raise OSError("injected spawn failure")
 
 
 class ConcurrentWritersStormTests(AuditSchemaRecoveryBase):
@@ -144,29 +160,38 @@ class ConcurrentWritersStormTests(AuditSchemaRecoveryBase):
             with self.subTest(round=rnd):
                 self._storm_round(rnd)
 
-    def _readback(self, store_dir, namespace):
-        """The storm's recovery readback: read-only SQLite on the store file,
-        selecting (id, content) for the namespace.  `list --json` rows carry
-        a `preview` and no `content` key, so full-content equality cannot be
-        built on the CLI's JSON shape; this read touches nothing (mode=ro)."""
-        return self._ro_sql(store_dir / "store.sqlite",
-                            "SELECT id, content FROM memory"
-                            " WHERE namespace = ?", (namespace,))
+    def _reap(self, procs):
+        """Kill and reap every child that is still alive (TG-5).
 
-    def _storm_round(self, rnd):
-        ns = "%s-storm%d" % (NS, rnd)
-        d = self._store_dir("storm-round-%d" % rnd)
-        (d / "no-models").mkdir(exist_ok=True)  # lexical writers: empty models dir
-        writer = d / "_storm_writer.py"
-        writer.write_text(_STORM_WRITER_SOURCE, encoding="utf-8")
-        tight = {"ZMEM_MAINTENANCE_WAIT_SECONDS": _TIGHT_WAIT,
-                 "ZMEM_MAINTENANCE_POLL_SECONDS": _TIGHT_POLL}
-        env = self._child_env(d, tight)
-        barrier = d / "barrier"
-        barrier.mkdir()
-        go = barrier / "go"
-        procs = []
-        for i in range(_N_CHILDREN):
+        Returns the children that could NOT be reaped. An empty list is the
+        only clean outcome: a swallowed wait failure must not pass as
+        successful cleanup.
+        """
+        unreaped = []
+        for j, q in procs:
+            if q.poll() is None:
+                try:
+                    q.kill()
+                except OSError:
+                    pass
+            try:
+                q.wait(timeout=10)
+            except Exception:
+                unreaped.append((j, q.pid))
+                continue
+            if q.poll() is None:
+                unreaped.append((j, q.pid))
+        return unreaped
+
+    def _spawn_writers(self, procs, d, writer, barrier, go, ns, env, count,
+                       spawn_hook=None):
+        """Start the storm's writer children into the CALLER's list, so a
+        spawn failure still leaves the already-started children reachable
+        for the reaper (TG-5). `spawn_hook` may raise BEFORE a child is
+        started, to exercise that failure path."""
+        for i in range(count):
+            if spawn_hook is not None:
+                spawn_hook(i)
             out = open(d / ("writer-%02d.out" % i), "wb")
             err = open(d / ("writer-%02d.err" % i), "wb")
             try:
@@ -180,41 +205,227 @@ class ConcurrentWritersStormTests(AuditSchemaRecoveryBase):
             finally:
                 out.close()
                 err.close()
-        # -- build the barrier: wait until every child signalled ready ------
+
+    def _wait_for_barrier(self, procs, barrier, rnd):
+        """Wait for the start barrier. TG-5 (the round-1 review comment): a
+        child that DIED never signals ready, so poll the children and fail
+        PROMPTLY with the dead child's exit code and stderr tail instead of
+        burning the whole barrier budget."""
         deadline = time.time() + _BARRIER_WAIT_S
         unready = self._unready(barrier)
         while unready and time.time() < deadline:
+            dead = [(j, q.poll()) for j, q in procs if q.poll() is not None]
+            if dead:
+                tails = {}
+                for j, _rc in dead:
+                    p = barrier.parent / ("writer-%02d.err" % j)
+                    if p.exists():
+                        tails[j] = p.read_text(encoding="utf-8",
+                                                errors="replace")[-300:]
+                self.fail(
+                    "AC2-506: scenario setup: [round %d/%d] a writer child died"
+                    " before signalling ready (index, exit code): %r (stderr"
+                    " tails: %r)" % (rnd, _N_ROUNDS, dead, tails))
             time.sleep(0.05)
             unready = self._unready(barrier)
-        if unready:
-            tails = {}
-            for i in unready:
-                p = d / ("writer-%02d.err" % i)
-                if p.exists():
-                    tails[i] = p.read_text(encoding="utf-8",
-                                           errors="replace")[-300:]
-            for _i, p in procs:
-                if p.poll() is None:
-                    p.kill()
-            self.fail(
-                "AC2-506: scenario setup: [round %d/%d] the start barrier"
-                " could not be built; children that never signalled ready:"
-                " %r (stderr tails: %r)" % (rnd, _N_ROUNDS, unready, tails))
-        # -- release every child together ----------------------------------
-        go.write_text("go", encoding="utf-8")
-        finish_by = time.time() + _STORM_WAIT_S
-        for i, p in procs:
+        return unready
+
+    def test_barrier_wait_fails_promptly_when_a_child_dies(self):
+        # TG-5 (the round-1 review comment): a child that dies before
+        # signalling ready must fail the barrier PROMPTLY, with its exit
+        # code -- not after the whole barrier budget -- and every started
+        # child must be reaped.
+        d = self._store_dir("storm-dead-child")
+        (d / "no-models").mkdir(exist_ok=True)
+        barrier = d / "barrier"
+        barrier.mkdir()
+        procs = []
+        try:
+            out = open(d / "writer-00.out", "wb")
+            err = open(d / "writer-00.err", "wb")
             try:
-                p.wait(timeout=max(0.0, finish_by - time.time()))
-            except subprocess.TimeoutExpired:
-                running = [(j, q.pid) for j, q in procs if q.poll() is None]
-                for _j, q in procs:
-                    if q.poll() is None:
-                        q.kill()
+                procs.append((0, subprocess.Popen(
+                    [PY, "-c", "import sys; sys.stderr.write('TG5 dead child\\n');"
+                     " sys.exit(7)"], stdout=out, stderr=err)))
+            finally:
+                out.close()
+                err.close()
+            out = open(d / "writer-01.out", "wb")
+            err = open(d / "writer-01.err", "wb")
+            try:
+                procs.append((1, subprocess.Popen(
+                    [PY, "-c", "import time; time.sleep(600)"],
+                    stdout=out, stderr=err)))
+            finally:
+                out.close()
+                err.close()
+            started = time.time()
+            with self.assertRaises(AssertionError) as cm:
+                self._wait_for_barrier(procs, barrier, 0)
+            elapsed = time.time() - started
+            self.assertLess(elapsed, 30.0,
+                            "the barrier must fail promptly, not burn the "
+                            "whole %.0f s budget" % _BARRIER_WAIT_S)
+            self.assertIn("(0, 7)", str(cm.exception),
+                          "the failure must name the dead child's exit code: "
+                          "%r" % (str(cm.exception),))
+        finally:
+            self._reap(procs)
+        for _j, q in procs:
+            self.assertIsNotNone(q.poll(),
+                                 "every started child must be reaped")
+
+    def test_real_reaper_reports_a_child_whose_wait_failed(self):
+        # TG-5 (the round-1 review comment): the reaper must REPORT a child
+        # it could not reap -- a swallowed wait failure must not pass as a
+        # successful cleanup. This drives the REAL reaper's failed-wait
+        # branch with a controlled child double.
+        class _ChildDouble:
+            pid = 4242
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("writer", timeout)
+
+        unreaped = self._reap([(0, _ChildDouble())])
+        self.assertEqual(len(unreaped), 1,
+                         "a child whose wait failed must be reported: %r"
+                         % (unreaped,))
+        self.assertEqual(unreaped[0][0], 0)
+
+    def test_unreaped_child_fails_the_round(self):
+        # TG-5 (the round-1 review comment): a child that could NOT be
+        # reaped must FAIL the round -- a swallowed wait failure must not
+        # pass as a successful cleanup. The reaper still does its work (so
+        # no child is left running); only its REPORT is falsified.
+        original_reap = self._reap
+
+        def fake_reap(procs):
+            original_reap(procs)
+            return [(0, 4242)]
+
+        with mock.patch.object(self, "_reap", fake_reap):
+            with self.assertRaises(AssertionError) as cm:
+                self._storm_round(0)
+        self.assertIn("could not reap", str(cm.exception))
+
+    def test_cleanup_failure_keeps_the_original_failure_chained(self):
+        # TG-5: when the round is ALREADY failing and the cleanup also
+        # fails, the cleanup failure must keep the original exception as
+        # its cause (not replace it silently).
+        original_reap = self._reap
+
+        def fake_reap(procs):
+            original_reap(procs)
+            return [(0, 4242)]
+
+        with mock.patch.object(self, "_reap", fake_reap):
+            with self.assertRaises(AssertionError) as cm:
+                self._storm_round(0, spawn_hook=_raise_spawn_failure)
+        self.assertIn("could not reap", str(cm.exception))
+        self.assertIsNotNone(cm.exception.__cause__,
+                             "the original failure must stay chained")
+
+    def test_spawn_failure_reaps_the_started_children(self):
+        # TG-5 (the round-1 review comment): a spawn failure must not leak
+        # the children that were already started. This leg drives the
+        # round's OWN cleanup seam (a spawn hook that fails before the
+        # second child starts), not a hand-rolled harness -- and it asserts
+        # that the round reaped every started child and that NOTHING was
+        # left unreaped.
+        def hook(i):
+            if i == 1:
+                raise OSError("injected spawn failure")
+
+        with self.assertRaises(OSError):
+            self._storm_round(0, spawn_hook=hook)
+        started = getattr(self, "_last_procs", None)
+        self.assertTrue(started,
+                        "the round never recorded its children, so its "
+                        "cleanup seam did not run")
+        self.assertEqual(getattr(self, "_last_unreaped", [("x", 0)]), [],
+                         "a started child could not be reaped")
+        for _j, q in started:
+            self.assertIsNotNone(q.returncode,
+                                 "a started child leaked after the spawn "
+                                 "failure")
+
+    def _readback(self, store_dir, namespace):
+        """The storm's recovery readback: read-only SQLite on the store file,
+        selecting (id, content) for the namespace.  `list --json` rows carry
+        a `preview` and no `content` key, so full-content equality cannot be
+        built on the CLI's JSON shape; this read touches nothing (mode=ro)."""
+        return self._ro_sql(store_dir / "store.sqlite",
+                            "SELECT id, content FROM memory"
+                            " WHERE namespace = ?", (namespace,))
+
+    def _storm_round(self, rnd, spawn_hook=None):
+        ns = "%s-storm%d" % (NS, rnd)
+        d = self._store_dir("storm-round-%d" % rnd)
+        (d / "no-models").mkdir(exist_ok=True)  # lexical writers: empty models dir
+        writer = d / "_storm_writer.py"
+        writer.write_text(_STORM_WRITER_SOURCE, encoding="utf-8")
+        tight = {"ZMEM_MAINTENANCE_WAIT_SECONDS": _TIGHT_WAIT,
+                 "ZMEM_MAINTENANCE_POLL_SECONDS": _TIGHT_POLL}
+        env = self._child_env(d, tight)
+        barrier = d / "barrier"
+        barrier.mkdir()
+        go = barrier / "go"
+        procs = []
+        try:
+            self._spawn_writers(procs, d, writer, barrier, go, ns, env,
+                                _N_CHILDREN, spawn_hook)
+            # -- build the barrier: wait until every child signalled ready --
+            unready = self._wait_for_barrier(procs, barrier, rnd)
+            if unready:
+                tails = {}
+                for i in unready:
+                    p = d / ("writer-%02d.err" % i)
+                    if p.exists():
+                        tails[i] = p.read_text(encoding="utf-8",
+                                               errors="replace")[-300:]
                 self.fail(
-                    "AC2-506: [round %d/%d] the storm exceeded its bounded"
-                    " wait; children still running (index, pid), now killed:"
-                    " %r" % (rnd, _N_ROUNDS, running))
+                    "AC2-506: scenario setup: [round %d/%d] the start barrier"
+                    " could not be built; children that never signalled ready:"
+                    " %r (stderr tails: %r)" % (rnd, _N_ROUNDS, unready, tails))
+            # -- release every child together ------------------------------
+            go.write_text("go", encoding="utf-8")
+            finish_by = time.time() + _STORM_WAIT_S
+            for i, p in procs:
+                try:
+                    p.wait(timeout=max(0.0, finish_by - time.time()))
+                except subprocess.TimeoutExpired:
+                    running = [(j, q.pid) for j, q in procs if q.poll() is None]
+                    for _j, q in procs:
+                        if q.poll() is None:
+                            q.kill()
+                    self.fail(
+                        "AC2-506: [round %d/%d] the storm exceeded its bounded"
+                        " wait; children still running (index, pid), now killed:"
+                        " %r" % (rnd, _N_ROUNDS, running))
+        finally:
+            # TG-5 (the round-1 review comment): every child that is still
+            # alive is killed AND reaped on EVERY exit path -- a spawn
+            # failure, a barrier failure, a timeout, or an assertion. The
+            # outcome is recorded so a leg can assert that the cleanup
+            # really happened, and a child that could NOT be reaped FAILS
+            # the round (a swallowed wait failure must not pass as a
+            # successful cleanup) while the original failure context is
+            # retained.
+            self._last_procs = list(procs)
+            self._last_unreaped = self._reap(procs)
+            if self._last_unreaped:
+                _msg = ("AC2-506: [round %d/%d] cleanup could not reap %r"
+                        % (rnd, _N_ROUNDS, self._last_unreaped))
+                _original = sys.exc_info()[1]
+                if _original is not None:
+                    raise AssertionError(_msg) from _original
+                self.fail(_msg)
         # -- every child must have been acknowledged ------------------------
         failures = []
         for i, p in procs:
