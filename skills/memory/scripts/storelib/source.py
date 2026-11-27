@@ -9,7 +9,12 @@ import re
 import sqlite3
 from typing import Any
 
-from redaction import _redact_secret_like_text_with_positions
+from redaction import (
+    SECRET_COMMAND_PATTERNS,
+    SECRET_CREDENTIAL_PATTERNS,
+    SECRET_REFUSAL_PATTERNS,
+    _redact_secret_like_text_with_positions,
+)
 from storelib.write import redact_text
 
 MAX_CONTEXT = 20
@@ -839,6 +844,18 @@ def _bind_block_candidate(
     if count != 1 or redacted.count(MARKER) != 1 or redacted == block_raw:
         raise SourceRefusal(
             "trusted source block is not a single verifiable identifier")
+    # Final-critic r2 finding 1 (owner-scope guard): a span the redactor
+    # reached through a credential/command/refusal rule was ALREADY
+    # classified as a secret — ASK-2 approved recovering identifiers, not
+    # values the engine labelled as passwords. Refuse when any non-generic
+    # pattern matches the raw block; only the generic identifier patterns
+    # (unlabeled hex/base64 runs) may produce a binder.
+    for pattern in (SECRET_CREDENTIAL_PATTERNS + SECRET_COMMAND_PATTERNS
+                    + SECRET_REFUSAL_PATTERNS):
+        if pattern.search(block_raw):
+            raise SourceRefusal(
+                "the redacted span is a credential-labelled value, not a "
+                "verifiable identifier")
     # Line-sequence equality: the raw block (keepends) carries the file's
     # trailing terminator where the stored excerpt may not; the sequence of
     # content lines is the binding datum (a trailing terminator is not).

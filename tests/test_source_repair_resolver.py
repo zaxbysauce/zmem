@@ -1,5 +1,4 @@
-"""DRAFT C5 frozen check (Amendment A1-R2/R3) — staged in Temp; moves to
-tests/test_source_repair_resolver.py at implementation. Full, careful pass.
+"""C5 frozen check (Amendment A1-R2/R3, final-critic r2 credential gate).
 
 AC2-extension contract (Amendment A1-R2/R3, owner decision 2026-11-27):
 ``store.py source repair`` recovers a redacted identifier from the TRUSTED
@@ -305,6 +304,30 @@ class SourceRepairResolverTests(unittest.TestCase):
                       extra_env=env)
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertNotIn(CANARY, _memory_content(db, memory_id))
+
+    def test_credential_labelled_spans_refuse(self) -> None:
+        # Final-critic r2 finding 1: a value the redactor reached through a
+        # credential rule was already classified as a secret - ASK-2
+        # approved recovering IDENTIFIERS, not labelled credentials. Only
+        # the generic identifier patterns may produce a binder.
+        for line in (f"password: {CANARY}",
+                     f"secret = {CANARY}",
+                     f"api_token={CANARY}",
+                     f"Authorization: Bearer {CANARY}"):
+            with self.subTest(line=line):
+                env, memory_id = self._seed(
+                    [LINE1, line, LINE3],
+                    f"{LINE1}\n{line}\n{LINE3}")
+                db = self.root / "store.sqlite"
+                evidence_id = _write_production_evidence(
+                    db, memory_id, line, "notes.md", 1)
+                result = _run(self.root, "source", "repair", "--id",
+                              memory_id, "--evidence-id", evidence_id,
+                              "--preview", extra_env=env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertTrue(result.stderr.startswith(
+                    "[zmem] source repair: refused"), result.stderr)
+                self.assertNotIn(CANARY, _memory_content(db, memory_id))
 
     def test_non_routable_ref_keeps_historical_refusal(self) -> None:
         # Absolute/transcript-unroutable refs keep the exact historical
