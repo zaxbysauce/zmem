@@ -125,6 +125,20 @@
       "expected": "redacted",
       "text": "raw paste 44f0dcb1a3e5927c8b6a0d4e2f1c3b5a9d7e8f0c seen in logs",
       "credential_value": "44f0dcb1a3e5927c8b6a0d4e2f1c3b5a9d7e8f0c"
+    },
+    {
+      "label": "bare-basic-short-cred",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "bare paste Basic YTpi extracted from a header fragment",
+      "credential_value": "YTpi"
+    },
+    {
+      "label": "bare-basic-lowercase",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "bare paste Basic dagsqwxzmore extracted from logs",
+      "credential_value": "dagsqwxzmore"
     }
   ]
 }
