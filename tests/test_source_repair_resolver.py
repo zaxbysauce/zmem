@@ -385,6 +385,30 @@ class SourceRepairResolverTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertNotIn(CANARY, _memory_content(db, memory_id))
 
+    def test_destination_context_labels_refuse(self) -> None:
+        # Final-critic r6: the excerpt can be a single value line while the
+        # label sits on a NEIGHBOURING line of the memory content — the
+        # destination scan (whole content, markers removed) refuses, so the
+        # raw value never lands next to a credential label.
+        cases = (
+            # previous-line label, single-line excerpt (ref_offset=1)
+            ([f"{LINE1} password:", CANARY, LINE3], 1),
+            # next-line label, single-line excerpt (ref_offset=1)
+            ([LINE1, CANARY, "^ that is the prod api key"], 1),
+        )
+        for lines, off in cases:
+            with self.subTest(lines=lines):
+                env, memory_id = self._seed(
+                    list(lines), chr(10).join(lines))
+                db = self.root / "store.sqlite"
+                evidence_id = _write_production_evidence(
+                    db, memory_id, lines[off], "notes.md", off)
+                result = _run(self.root, "source", "repair", "--id",
+                              memory_id, "--evidence-id", evidence_id,
+                              "--apply", extra_env=env)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertNotIn(CANARY, _memory_content(db, memory_id))
+
     def test_non_routable_ref_keeps_historical_refusal(self) -> None:
         # Absolute/transcript-unroutable refs keep the exact historical
         # refusal text (byte-identical refusal surface).

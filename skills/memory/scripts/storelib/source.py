@@ -1279,6 +1279,27 @@ def repair_from_evidence(
             if (re_candidate, re_kind) != (candidate, resolver_kind):
                 raise SourceRefusal(
                     "trusted source changed between resolution and apply")
+            # Final-critic r6 finding 1: the excerpt-boundary gate (r5) does
+            # not see labels OUTSIDE the excerpt — a credential label on a
+            # NEIGHBOURING line of the memory content (the repair writes the
+            # raw value right next to it) must refuse too. Scan the whole
+            # destination content with every marker removed (the same two
+            # gates as the source-side binding; the marker contains
+            # "SECRET" and must be excluded; hex digits cannot form any
+            # keyword). The destination is the authoritative context: it is
+            # what the value will sit inside after the write.
+            dest_scan = content.replace(MARKER, " ")
+            for pattern in (SECRET_CREDENTIAL_PATTERNS
+                            + SECRET_COMMAND_PATTERNS
+                            + SECRET_REFUSAL_PATTERNS):
+                if pattern.search(dest_scan):
+                    raise SourceRefusal(
+                        "the repair destination labels this value as a "
+                        "credential")
+            if _CREDENTIAL_PROSE_RE.search(dest_scan):
+                raise SourceRefusal(
+                    "the repair destination labels this value as a "
+                    "credential")
         _check_alignment(content, alignment_text)
         # Replace ONLY the marker span inside the aligned occurrence: the
         # aligned text carries exactly one marker; swap it for the verified
