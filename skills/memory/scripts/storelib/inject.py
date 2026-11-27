@@ -2336,6 +2336,55 @@ def select_and_budget_for_injection(
             # malformed matcher must retain the established query/ring path.
             current_ops = []
             checkpoint = ""
+    # Pretool query sanitation: the raw tool text (cd/ls chains, path
+    # fragments, heredoc source) is not an operation.  A sanitized query
+    # replaces the raw one BEFORE the ops/checkpoint composition below.  An
+    # empty result means the sanitizer saw no operation.  That verdict is
+    # only trusted when the store's own hazard matcher agrees:
+    #   - a checkpoint phrase selected from the input WITHOUT its
+    #     description (a git stash/reset/push/merge shape, or a test/citation
+    #     path) means an operation is present that the sanitizer failed to
+    #     parse -> keep the legacy raw query and the phrase untouched;
+    #   - otherwise, operation tokens (a read-only command naming a file,
+    #     e.g. ``wc -c README.md`` -> ``readme.md``; or tokens the caller
+    #     supplied) become the whole query: the file is worth a lookup, the
+    #     shell text around it is not.  A description-only checkpoint is
+    #     discarded with the description the sanitizer dropped;
+    #   - with neither, return the standard silent envelope (same
+    #     side-effect profile as the earlier silent returns: nothing
+    #     ledgered, no bump).
+    # Skipped entirely when the query-context lane is switched off: without
+    # the matcher there is nothing to cross-check the verdict.
+    if (moment == "pretool" and query_context_enabled
+            and isinstance(pretool_input, dict)):
+        try:
+            sanitized_query = ops.pretool_query_text(pretool_input)
+        except Exception:
+            sanitized_query = None
+        if isinstance(sanitized_query, str):
+            if sanitized_query.strip():
+                effective_query = sanitized_query
+            else:
+                try:
+                    command_checkpoint = ops.checkpoint_query_expansion({
+                        key: value for key, value in pretool_input.items()
+                        if key != "description"})
+                except Exception:
+                    # Cannot cross-check: behave as if a hazard was found.
+                    command_checkpoint = checkpoint or "unknown"
+                # Only FILE-shaped derived tokens justify a lookup: a bare
+                # runner left over from inline code (``python - <<EOF`` ->
+                # ``python``) names neither an operation nor a file.
+                file_ops = [token for token in current_ops
+                            if any(c in token for c in "._-/")]
+                if command_checkpoint:
+                    pass
+                elif file_ops or effective_ops:
+                    effective_query = ""
+                    checkpoint = ""
+                    current_ops = file_ops
+                else:
+                    return _selector_silent(budget_tokens=budget)
     if moment == "pretool" and current_ops:
         effective_ops = current_ops
     elif moment == "pretool" and ops_tokens is None and query_context_enabled:
