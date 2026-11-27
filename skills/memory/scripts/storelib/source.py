@@ -870,11 +870,16 @@ def repair_from_evidence(
     # BEFORE any git call (an absolute or ../ ref_path must never select a
     # repository outside ZMEM_REPAIR_ROOT).
     _safe_ref(ref_path)
-    candidates = list(dict.fromkeys(_HEX_40_64_RE.findall(excerpt)))
-    if len(candidates) != 1:
+    # EXACTLY ONE candidate OCCURRENCE (plan R2-7 + review 4.5 r3): the same
+    # identifier repeated twice is still two spans — the alignment below
+    # replaces every occurrence but apply restores only the first, so a
+    # repeated value must refuse like a multi-value excerpt.
+    candidate_occurrences = _HEX_40_64_RE.findall(excerpt)
+    if len(candidate_occurrences) != 1:
         raise SourceRefusal(
-            "evidence excerpt must quote exactly one verifiable identifier")
-    candidate = candidates[0]
+            "evidence excerpt must quote exactly one verifiable identifier "
+            "occurrence")
+    candidate = candidate_occurrences[0]
     if MARKER in excerpt:
         # Review 4.5 r2: a pre-existing marker in the excerpt means the
         # evidence was itself auto-redacted — the original value is gone and
