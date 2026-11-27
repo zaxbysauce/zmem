@@ -40,6 +40,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+BASH = "C:/Program Files/Git/bin/bash.exe"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -48,13 +50,19 @@ def main() -> int:
     parser.add_argument("--expect", required=True)
     parser.add_argument("--frozen", action="append", default=[])
     parser.add_argument("--repo", default=os.environ.get("ZMEM_FROZEN_REPO", ""))
-    parser.add_argument("argv", nargs=argparse.REMAINDER)
+    parser.add_argument("--command", default="",
+                        help="the shell command to run in the base worktree")
     args = parser.parse_args()
 
-    argv = list(args.argv)
-    if argv and argv[0] == "--":
-        argv = argv[1:]
-    if not argv:
+    command = args.command
+    if not command:
+        # the acceptance table's argv is a SHELL COMMAND ("env A=B python ..."),
+        # so it is run through a shell, exactly as repro-check.sh runs it
+        argv = list(args.argv)
+        if argv and argv[0] == "--":
+            argv = argv[1:]
+        command = " ".join(argv)
+    if not command:
         print("frozen_base_leg: no command given", file=sys.stderr)
         return 2
 
@@ -69,6 +77,17 @@ def main() -> int:
     worktree = Path(tempfile.mkdtemp(prefix="zmem-frozen-base-"))
     target = worktree / "tree"
     env = dict(os.environ)
+    # pytest lives in the USER site-packages on this host, and the child's
+    # HOME/USERPROFILE/APPDATA are redirected below -- which would hide it.
+    # The redirect is only for the child's scratch dirs, so the user site's
+    # location is preserved explicitly (the same interpreter that runs this
+    # driver is the one that runs the check).
+    user_site = subprocess.run(
+        [sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+        capture_output=True, text=True).stdout.strip()
+    if user_site:
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (user_site + os.pathsep + existing) if existing else user_site
     env.update({
         "HOME": str(worktree / "home"),
         "USERPROFILE": str(worktree / "home"),
@@ -102,8 +121,9 @@ def main() -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
-        run = subprocess.run(argv, cwd=str(target), capture_output=True, text=True,
-                             env=env, timeout=1800)
+        run = subprocess.run(
+            [BASH, "-c", command], cwd=str(target), capture_output=True, text=True,
+            env=env, timeout=1800)
         output = (run.stdout or "") + (run.stderr or "")
         print("=== the base leg of %s at %s ===" % (args.check, args.base[:12]))
         print("exit_code: %d" % run.returncode)
