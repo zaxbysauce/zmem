@@ -96,7 +96,7 @@ class _BasicCredentialScannerPattern:
 _BASIC_CREDENTIAL_SCANNER = _BasicCredentialScannerPattern()
 
 SECRET_CREDENTIAL_PATTERNS = [
-    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|(?<![A-Za-z])pass|private[_-]?key)\s*[:=]\s*(\S{8,})"),
+    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|(?<=[_-])pass|private[_-]?key)\s*[:=]\s*(\S{8,})"),
     # Authorization headers occur in prompts, rendered fences, and operation
     # transcripts.  Keep this ahead of the generic token patterns so the whole
     # credential (rather than an arbitrary suffix) is replaced consistently.

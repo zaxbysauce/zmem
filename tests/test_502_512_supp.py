@@ -611,18 +611,25 @@ class BasicDecodeColonTests(unittest.TestCase):
             {"content": "Authorization: Basic dXNlcjpwYXNzd29yZA=="}))
 
     def test_pass_keyword_anchored(self) -> None:
-        # Final-critic finding 5: the `pass` keyword addition must not
-        # redact ordinary words containing 'pass'.
+        # Final-critic finding 5 + r2 finding 4: the pass keyword is
+        # COMPOUND-KEY ONLY ((?<=[_-])pass) - ordinary words containing
+        # 'pass' survive, including the prose key shapes ('all checks
+        # pass: <8+ chars>', 'CI pass=') that the bare-key form redacted.
         from redaction import redact_secret_like_text
         for text in ("bypass=enabled_always", "compass: northbound",
-                     "surpass=expected_values"):
+                     "surpass=expected_values",
+                     "all checks pass: test_suite_green",
+                     "CI pass=everything-ok",
+                     "pass=whatever123"):
             out, count = redact_secret_like_text(text)
             with self.subTest(text=text):
                 self.assertEqual(count, 0)
                 self.assertEqual(out, text)
-        # The compound-key credential still redacts.
-        out, count = redact_secret_like_text("DB_PASS=Sup3rSecret!99")
-        self.assertGreaterEqual(count, 1)
+        # Compound-key credentials still redact.
+        for text in ("DB_PASS=Sup3rSecret!99", "MY_PASS=abc12345"):
+            out, count = redact_secret_like_text(text)
+            with self.subTest(text=text):
+                self.assertGreaterEqual(count, 1)
 
 
 class VerbatimPassageVerificationTests(unittest.TestCase):
