@@ -50,6 +50,7 @@ def main() -> int:
     parser.add_argument("--expect", required=True)
     parser.add_argument("--frozen", action="append", default=[])
     parser.add_argument("--repo", default=os.environ.get("ZMEM_FROZEN_REPO", ""))
+    parser.add_argument("--user-site", default=os.environ.get("ZMEM_FROZEN_USER_SITE", ""))
     parser.add_argument("--command", default="",
                         help="the shell command to run in the base worktree")
     args = parser.parse_args()
@@ -82,7 +83,10 @@ def main() -> int:
     # The redirect is only for the child's scratch dirs, so the user site's
     # location is preserved explicitly (the same interpreter that runs this
     # driver is the one that runs the check).
-    user_site = subprocess.run(
+    # The runner redirects APPDATA/HOME, so site.getusersitepackages() INSIDE
+    # the sandbox points at the scratch, not at the real user site where
+    # pytest lives. The request passes the REAL site explicitly.
+    user_site = args.user_site or subprocess.run(
         [sys.executable, "-c", "import site; print(site.getusersitepackages())"],
         capture_output=True, text=True).stdout.strip()
     if user_site:
