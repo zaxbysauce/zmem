@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -28,7 +29,8 @@ os.environ["ZMEM_MODEL_AUTODOWNLOAD"] = "0"
 for _k in list(os.environ):
     if _k.startswith("ZMEM_SESSION") or _k in (
             "CLAUDE_PROJECT_DIR", "ZCODE_PROJECT_DIR", "ZMEM_PRETOOL_SANITIZE",
-            "ZMEM_QUERY_CONTEXT", "ZMEM_TEST_NOW", "ZMEM_HOME"):
+            "ZMEM_QUERY_CONTEXT", "ZMEM_TEST_NOW", "ZMEM_HOME",
+            "ZMEM_REMOTE_URL", "ZMEM_LINK_THRESHOLD"):
         os.environ.pop(_k, None)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -199,6 +201,61 @@ COMMAND_TABLE = [
     ("cat /etc/hosts && git push", "git push"),
     ("ls", ""),
     ("", ""),
+    # PR 536 review F-1/F-2: ``#`` is not a comment to this tokenizer, so a
+    # comment line (or a mid-word ``#``) never swallows a later command.
+    ("# step 1\nrm -rf build", "step 1 rm -rf build"),
+    ("git status # check\nrm -rf build", "git status check rm -rf build"),
+    ("ls a#b; rm -rf build", "rm -rf build"),
+    ("echo ${#arr[@]}; rm -rf build", "rm -rf build"),
+    ("# list files\nls -la", "list files"),
+    # F-3: substitution inside an otherwise-dropped segment's heredoc body,
+    # here-string or redirect target keeps (abstains on) the command.
+    ("cat <<E\n$(rm -rf /data)\nE", "cat <<E $(rm -rf /data) E"),
+    ("cat <<< $(rm -rf /data)", "rm -rf data"),
+    ("cat < $(rm -rf /data)", "rm -rf data"),
+    # F-4: ``>& word`` writes a file; ``>&2`` / ``2>&1`` are fd duplication.
+    ("echo hi >& config", "echo hi config"),
+    ("echo hi >&2", ""),
+    ("ls 2>&1", ""),
+    # Review nits: ``file -C`` writes, local ./cat is not the system cat,
+    # glob operands are targets, ``-c`` after a script operand is the
+    # script's, ``-o pipefail`` does not hide the ``-c`` string, and a
+    # backslash-escaped quote makes the command unjudgeable.
+    ("file -C magic", "file -C magic"),
+    # bash and the tokenizer pair these quotes differently: do not judge.
+    ('echo "a \\"" ; git push -f ; echo "\\""',
+     'echo "a \\"" ; git push -f ; echo "\\""'),
+    ("less -o out.log f", "less -o out.log f"),
+    ("bash x.sh <<< yes", "bash x.sh <<< yes"),
+    ("file magic", ""),
+    ("./cat foo", "./cat foo"),
+    ("rm -rf *", "rm -rf *"),
+    ("rm -rf ./*", "rm -rf ./*"),
+    ("bash deploy.sh -c ls", "bash deploy.sh -c ls"),
+    ("bash -o pipefail -c 'git push -f'", "git push -f"),
+    ("bash -euo pipefail -c 'ls'", ""),
+    # A quote inside a comment must not pair with a later quote.
+    ("cd build # don't panic\nrm -rf dist\n# that's it",
+     "cd build # don't panic rm -rf dist # that's it"),
+    ("cd repo # don't push yet\ngit push --force origin main\n# that's all",
+     "cd repo # don't push yet git push --force origin main # that's all"),
+    # Backslash at the end of a comment does not continue the comment.
+    ("ls # trailing \\\nrm -rf x", "ls # trailing \\ rm -rf x"),
+    ("cat README # \\\ngit reset --hard", "cat README # \\ git reset --hard"),
+    # Quoted substitution forms (unquoted ones split into their own
+    # segment and never needed the new flag).
+    ("cat <<EOF\n`rm -rf q`\nEOF", "cat <<EOF `rm -rf q` EOF"),
+    ("cat <<< `rm -rf q`", "cat <<< `rm -rf q`"),
+    ("cat < `rm -rf q`", "cat < `rm -rf q`"),
+    ('cat <<< "$(rm -rf /data)"', 'cat <<< "$(rm -rf /data)"'),
+    ('cat < "$(rm -rf /data)"', 'cat < "$(rm -rf /data)"'),
+    ('echo hi >& "$(rm -rf q)"', 'echo hi $(rm -rf q)'),
+    # A comment that mentions ``<<WORD`` must not turn the commands after
+    # it into a heredoc "body".
+    ("ls # see <<EOF\nrm -rf build\nEOF", "ls # see <<EOF rm -rf build EOF"),
+    ("echo done # note <<X\ngit push --force\nX",
+     "echo done # note <<X git push --force X"),
+    ('echo \\"; rm -rf x; echo \\"', 'echo \\"; rm -rf x; echo \\"'),
 ]
 
 
@@ -208,6 +265,29 @@ class SanitizeCommandTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertEqual(ops.sanitize_pretool_command(command),
                                  expected)
+
+    def test_quoted_hash_and_escaped_quote_do_not_abstain(self):
+        # A ``#`` or an escaped quote inside a QUOTED string is plain text:
+        # abstaining would return the raw text cut at 500 chars and lose a
+        # hazard command placed after the cap.
+        noise = " && ".join("ls -la /some/long/dir%d/sub" % i
+                            for i in range(20))
+        for head in ('git commit -m "fix #123"', "grep -n 'a\\\"b' x.py",
+                     'git commit -m "fix \\"x\\""'):
+            with self.subTest(head=head):
+                got = ops.sanitize_pretool_command(
+                    head + " && " + noise + " && git push --force")
+                self.assertTrue(got.endswith("git push --force"), got)
+
+    def test_unterminated_heredocs_are_linear(self):
+        # Thousands of ``<<A`` lines with no terminator used to rescan to
+        # the end of the text for every operator (quadratic, ~11 s at 16k
+        # lines, past the hook's 8 s kill).
+        started = time.monotonic()
+        ops.sanitize_pretool_command("cat <<A\n" * 16000)
+        ops.sanitize_pretool_command(
+            "".join("cat <<A%d\n" % i for i in range(16000)))
+        self.assertLess(time.monotonic() - started, 5.0)
 
     def test_unbalanced_quote_never_raises(self):
         # Text that cannot be tokenized is kept whole (whitespace-collapsed):
@@ -441,6 +521,16 @@ class SelectorIntegrationTest(unittest.TestCase):
         # If the sanitizer returns "" while the only derived token is a bare
         # runner word (no file shape), the call is silent rather than
         # querying that one generic word.
+        # A row that only the bare word ``python`` can retrieve makes the
+        # guard observable (without one, removing the guard still passes).
+        r = subprocess.run(
+            [sys.executable, str(SCRIPTS / "store.py"), "add",
+             "--namespace", NS, "--type", "lesson", "--content",
+             "python barerunnercanary: the python interpreter word alone "
+             "must never select this row",
+             "--signal", "test", "--confidence", "0.9"],
+            capture_output=True, text=True, env=_env(), timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         call = {"command": "python helper", "description": "probe"}
         with mock.patch.object(ops, "pretool_query_text", return_value=""), \
                 mock.patch.object(ops, "compose_pretool_query",
@@ -448,6 +538,17 @@ class SelectorIntegrationTest(unittest.TestCase):
             env = self._select(call)
         self.assertEqual(env["results"], [], sorted(env.keys()))
         self.assertEqual(env["reason"], "empty-pool")
+        # Discrimination: the row IS retrievable by the bare word, so the
+        # empty result above comes from the guard, not from an empty store.
+        conn = schema_mod.connect()
+        try:
+            hits = inject_mod.select_and_budget_for_injection(
+                conn, query="python", namespace=NS, moment="user_prompt",
+                session_id="sanitize-" + uuid.uuid4().hex[:10],
+                budget_tokens=2000, data_dir=_TMP)
+        finally:
+            conn.close()
+        self.assertIn("barerunnercanary", hits.get("rendered", ""))
 
     def test_query_context_off_skips_sanitation(self):
         # ZMEM_QUERY_CONTEXT=0 removes the matcher that cross-checks the

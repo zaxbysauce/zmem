@@ -27,6 +27,7 @@ Runs standalone (no storelib siblings required at import time).
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -417,8 +418,8 @@ _PRETOOL_QUERY_CAP = 500
 # a segment is dropped only when it is positively recognised as read-only.
 _INSPECTION_HEADS = frozenset({
     "cd", "pushd", "popd", "ls", "dir", "pwd", "cat", "head", "tail", "wc",
-    "echo", "printf", "true", "which", "type", "stat", "file",
-    "cut", "tr", "less", "more", "whoami",
+    "echo", "printf", "true", "which", "type", "stat",
+    "cut", "tr", "whoami",
 })
 # Interpreters whose argument can be inline SOURCE CODE (not a shell
 # command): interpreter -> the flags that say so.
@@ -451,6 +452,65 @@ _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _ABS_PATH_RE = re.compile(r"^(?:[/~\\]|[A-Za-z]:[\\/])")
 _SHORT_FLAGS_RE = re.compile(r"^-[A-Za-z]+$")
 _POSIX_C_FLAG_RE = re.compile(r"^-[A-Za-z]*c$")
+_FD_DUP_TARGET_RE = re.compile(r"^(?:[0-9]+-?|-)$")
+
+
+def _unjudgeable_quoting(command: str) -> bool:
+    """True when quoting/comment shapes make the tokenizer unreliable.
+
+    Escape handling is off (Windows paths) and ``#`` is not a comment to
+    the tokenizer, so three shapes would let a later command be swallowed:
+    a backslash-escaped quote outside any quotes, a word-start ``#``
+    (comment) whose line contains a quote (it would pair with a later
+    quote), and a comment ending in a backslash (the line join would fold
+    the next command into the comment).  A ``#`` or quote INSIDE a quoted
+    string (``-m "fix #123"``) is ordinary text and never triggers this.
+    """
+    bq = ""       # bash's view of the open quote
+    sq = ""       # shlex's view (escape handling off: no backslash rule)
+    skip = False  # bash: previous char was an escaping backslash
+    prev = "\n"
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if sq:
+            if ch == sq:
+                sq = ""
+        elif ch in "\"'":
+            sq = ch
+        if skip:
+            skip = False
+        elif bq == "'":
+            if ch == "'":
+                bq = ""
+        elif ch == "\\" and i + 1 < n:
+            skip = True
+        elif bq == '"':
+            if ch == '"':
+                bq = ""
+        elif ch in "\"'":
+            bq = ch
+        elif ch == "#" and prev in " \t\n;&|(" and not sq:
+            end = command.find("\n", i)
+            line = command[i:] if end < 0 else command[i:end]
+            if "'" in line or '"' in line:
+                return True
+            if end >= 0 and line.endswith("\\"):
+                return True
+            i = n if end < 0 else end
+            prev = "\n"
+            continue
+        # The two views disagree about quoting while a command separator
+        # passes: bash and the tokenizer would split the command apart
+        # differently, so a command could be swallowed.
+        if bool(bq) != bool(sq) and ch in ";&|\n":
+            return True
+        prev = ch
+        i += 1
+    return False
+
+
 _HEREDOC_RE = re.compile(
     r"<<(?!<)-?[ \t]*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 # Commands that EXECUTE what they read on stdin: a heredoc fed to one of
@@ -495,6 +555,15 @@ def _strip_heredocs(command: str) -> tuple:
     lines = command.split("\n")
     out: list = []
     bodies: list = []
+    # Index every candidate terminator line once (word -> ascending line
+    # numbers) so each ``<<WORD`` finds its terminator by bisection; the
+    # old rescan-to-end made thousands of unterminated ``<<A`` lines
+    # quadratic.
+    positions: dict = {}
+    for idx, text_line in enumerate(lines):
+        word = text_line.strip()
+        if word.isascii() and word.isidentifier():
+            positions.setdefault(word, []).append(idx)
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -502,11 +571,11 @@ def _strip_heredocs(command: str) -> tuple:
         i += 1
         for match in _HEREDOC_RE.finditer(line):
             delim = match.group(2)
-            end = i
-            while end < len(lines) and lines[end].strip() != delim:
-                end += 1
-            if end >= len(lines):
+            cands = positions.get(delim, ())
+            at = bisect.bisect_left(cands, i)
+            if at >= len(cands):
                 continue
+            end = cands[at]
             bodies.append("\n".join(lines[i:end]))
             i = end + 1
     return "\n".join(out), bodies
@@ -515,7 +584,14 @@ def _strip_heredocs(command: str) -> tuple:
 def _split_segments(command: str):
     """Return ``[{"t": tokens, "b": heredoc bodies, "w": writes}, ...]`` or
     ``None`` when the text cannot be tokenized (unbalanced quotes)."""
+    if _unjudgeable_quoting(command):
+        return None
     text, bodies = _strip_heredocs(command.replace("\\\n", " "))
+    # ANSI-C quoting (``$'a\'b'``) escapes a quote the scan models as plain
+    # single quotes; and a heredoc body with an odd quote can hide a
+    # divergence in the raw text, so scan what the tokenizer will see too.
+    if "$'" in text or _unjudgeable_quoting(text):
+        return None
     # A newline separates commands exactly like ``;`` (shlex would fold it
     # into whitespace and glue two commands into one segment).
     text = text.replace("\n", " ; ")
@@ -523,6 +599,10 @@ def _split_segments(command: str):
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         lex.escape = ""
+        # shlex's default ``#`` comment handling would swallow every later
+        # command once newlines are flattened to `` ; `` (and bash treats a
+        # mid-word ``#`` literally).  Fail toward keeping.
+        lex.commenters = ""
         toks = list(lex)
     except ValueError:
         return None
@@ -535,6 +615,11 @@ def _split_segments(command: str):
         1 for tok in toks
         if _is_punct(tok) and "<<" in tok and not tok.startswith("<<<"))
     if heredoc_ops != len(bodies):
+        return None
+    # A ``#`` word may be a comment that merely MENTIONS ``<<WORD`` (the
+    # regex pre-pass is comment-blind and would strip real commands up to
+    # a later WORD line as its "body"): with heredocs in play, do not judge.
+    if bodies and any(tok.startswith("#") for tok in toks):
         return None
     body_iter = iter(bodies)
     segments: list = []
@@ -566,8 +651,12 @@ def _split_segments(command: str):
             elif "<" in tok or ">" in tok:
                 if cur["t"] and cur["t"][-1].isdigit():
                     cur["t"].pop()
-                # ``>``/``>>``/``&>`` write a file; ``>&`` duplicates an fd.
-                if ">" in tok and not tok.startswith(">&"):
+                # ``>``/``>>``/``&>`` write a file.  ``>&`` duplicates an fd
+                # only when its word is a number or ``-``; ``>& file``
+                # writes both streams to a file.
+                if tok.startswith(">&"):
+                    pending = "dup"
+                elif ">" in tok:
                     pending = "write"
                 else:
                     pending = "skip"
@@ -582,16 +671,29 @@ def _split_segments(command: str):
                 cur = {"t": [], "b": [], "w": False, "i": False, "p": False}
             continue
         if pending == "heredoc":
-            cur["b"].append(next(body_iter, ""))
+            body = next(body_iter, "")
+            cur["b"].append(body)
+            if "$(" in body or "`" in body:
+                cur["x"] = True
         elif pending == "herestring":
             cur["b"].append(tok)
-        elif pending == "write":
+            if "$(" in tok or "`" in tok:
+                cur["x"] = True
+        elif pending == "write" or (
+                pending == "dup" and not _FD_DUP_TARGET_RE.match(tok)):
+            if "$(" in tok or "`" in tok:
+                cur["x"] = True
             if tok.lower() not in _NULL_SINKS:
                 # Output redirected to a real file is a WRITE: the segment
                 # is kept whatever its head, and the target names the file.
                 cur["w"] = True
                 cur["t"].append(tok)
-        elif pending != "skip":
+        elif pending in ("skip", "dup"):
+            # A redirect target or fd number is plumbing, but bash still
+            # expands ``$(...)`` / backticks inside it: flag the segment.
+            if "$(" in tok or "`" in tok:
+                cur["x"] = True
+        else:
             cur["t"].append(tok)
         pending = ""
     if cur["t"] or cur["b"]:
@@ -631,6 +733,11 @@ def _segment_dropped(head: str, args: list, inline: bool) -> bool:
         return (has_n and not in_place and flags == ["-n"] and print_only)
     if head == "find":
         return not any(a in _FIND_MUTATORS for a in args)
+    if head == "file":
+        # ``file -C`` compiles and WRITES a magic database.
+        return not any(
+            a == "--compile" or (_SHORT_FLAGS_RE.match(a) and "C" in a)
+            for a in args)
     return False
 
 
@@ -662,9 +769,21 @@ class _Abstain(Exception):
 def _shell_inner_source(head: str, args: list, bodies: list):
     """The nested shell command a shell segment runs, or ``None``."""
     if head in _POSIX_SHELLS:
+        skip = False
         for i, a in enumerate(args):
+            if skip:
+                skip = False
+                continue
             if _POSIX_C_FLAG_RE.match(a):
                 return args[i + 1] if i + 1 < len(args) else None
+            if (a in ("--rcfile", "--init-file")
+                    or re.match(r"^[-+][A-Za-z]*[oO]$", a)):
+                skip = True  # option that takes a word (``-o pipefail``)
+                continue
+            if not a.startswith(("-", "+")):
+                # Script operand: a later ``-c`` belongs to the script, and
+                # a heredoc/here-string is its stdin, not shell source.
+                return None
         return "\n".join(bodies) if bodies else None
     if head in _POWERSHELLS:
         for i, a in enumerate(args):
@@ -707,8 +826,9 @@ def sanitize_pretool_command(command: str, _depth: int = 0) -> str:
                     tok = _abs_basename(tok)
                 # Punctuation-only tokens are plumbing, except a bare path
                 # root, which is a real (and dangerous) operand.
+                # A glob operand (``rm -rf *``) is a real target too.
                 if tok and (any(c.isalnum() for c in tok)
-                            or _ABS_PATH_RE.match(tok)):
+                            or _ABS_PATH_RE.match(tok) or "*" in tok):
                     out.append(tok)
             return out
 
@@ -752,8 +872,14 @@ def sanitize_pretool_command(command: str, _depth: int = 0) -> str:
             if _runs_opaque_code(head, args, bool(seg["b"]),
                                  inner_src is not None):
                 raise _Abstain()
-            substitution = any("$(" in t or "`" in t for t in tokens)
+            substitution = seg.get("x", False) or any(
+                "$(" in t or "`" in t for t in tokens)
+            # A relative path-qualified head (``./cat``, ``bin/stat``) is a
+            # local program, not the system utility it is named after.
+            local_prog = (("/" in tokens[0] or "\\" in tokens[0])
+                          and not _ABS_PATH_RE.match(tokens[0]))
             if (inner_src is None and not seg["w"] and not substitution
+                    and not local_prog
                     and _segment_dropped(head, args, bool(seg["b"]))):
                 decided.append(None)
                 continue

@@ -389,7 +389,8 @@ source-order deduplicated from the first 12 safe operation tokens and newest
 three safe edit basenames, capped at 150 context characters and 500 total
 characters. The threshold defaults to 4 and is overridden by the positive
 integer `ZMEM_AMBIG_MIN_TERMS`. `ZMEM_QUERY_CONTEXT=0` bypasses the rewrite at every host/store
-boundary. Host consumers fail open silently on missing or malformed context,
+boundary. `ZMEM_PRETOOL_SANITIZE=0` turns off the local
+pre-tool query sanitizer and restores the raw command text as the query. Host consumers fail open silently on missing or malformed context,
 read errors, and timeouts; the standalone query-rewrite CLI preserves the
 original prompt with `rewrite=0` and emits one sanitized warning when its store
 or context is unavailable. Explicit search and other passive moments are

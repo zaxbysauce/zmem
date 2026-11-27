@@ -762,7 +762,9 @@ command reads a heredoc, here-string or file on stdin, including a file
 written by heredoc (`cat > run.sh <<EOF`), unless it is a shell whose heredoc
 is sanitized recursively or an executor such as `ssh`/`sudo`/`psql` whose
 heredoc body is kept verbatim; the command uses process substitution
-(`<(...)`, `>(...)`) or pipes into a subshell; the text cannot be tokenized;
+(`<(...)`, `>(...)`) or pipes into a subshell; the text cannot be tokenized; a `#` comment
+contains a quote or ends in a backslash, or a backslash-escaped quote
+appears outside any quotes;
 or a recognised
 interpreter is given inline source (`python -c`, `node -e`) or a shell is
 given no script operand. Recognition by command name is best-effort; the
