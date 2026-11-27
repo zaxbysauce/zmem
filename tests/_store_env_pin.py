@@ -39,6 +39,11 @@ def acquire(keys) -> int:
     release is idempotent.
     """
     global _NEXT_TOKEN
+    if not _ACTIVE:
+        # A NEW cycle starts here: capture the CURRENT values as the
+        # originals for THIS cycle, so a later cycle cannot restore a stale
+        # first-cycle snapshot.
+        _ORIGINAL.clear()
     for k in keys:
         if k not in _ORIGINAL:
             _ORIGINAL[k] = os.environ.get(k)
@@ -58,6 +63,27 @@ def _restore_at_exit():
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+def is_active(token) -> bool:
+    """Whether this token still holds a pin.
+
+    A module whose pin was released by ANOTHER module's teardown (a
+    helper-imported module never runs its own teardown) uses this to
+    re-acquire before its own tests run.
+    """
+    return token in _ACTIVE
+
+
+def apply(values) -> None:
+    """Apply the pinned values to the environment.
+
+    The ORIGINAL snapshot is untouched: this only re-establishes the pin
+    after a restore, so a module that re-acquires keeps the same original
+    values it would have restored.
+    """
+    for k, v in values.items():
+        os.environ[k] = v
 
 
 def release(token) -> None:

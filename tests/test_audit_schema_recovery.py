@@ -78,7 +78,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _store_env_pin  # noqa: E402  (shared pin/restore helper)
 
 _PINNED_KEYS = ("ZMEM_STORE", "ZMEM_DATA", "ZMEM_BACKUP_DIR")
+_PIN_VALUES = {
+    "ZMEM_STORE": str(_SCRATCH / "guard-pin.sqlite"),
+    "ZMEM_DATA": str(_SCRATCH),
+    "ZMEM_BACKUP_DIR": str(_SCRATCH / "backups"),
+}
 _ENV_TOKEN = _store_env_pin.acquire(_PINNED_KEYS)
+_store_env_pin.apply(_PIN_VALUES)
+
+
+def setUpModule():
+    # TG-4 (the round-1 review comment) + the round-2 Stage-B review: this
+    # module can be torn down by ANOTHER module's teardown (the storm
+    # companion imports it as a helper, and its own teardown then never
+    # runs). Re-acquire the pin if that happened, and re-apply the pinned
+    # values, so this module's tests always run against the scratch store.
+    global _ENV_TOKEN
+    if not _store_env_pin.is_active(_ENV_TOKEN):
+        _ENV_TOKEN = _store_env_pin.acquire(_PINNED_KEYS)
+    _store_env_pin.apply(_PIN_VALUES)
 
 
 def tearDownModule():
@@ -87,6 +105,14 @@ def tearDownModule():
     # these pins. Restore at MODULE teardown -- after this module's tests
     # have finished (they need the pin) and before any sibling runs.
     _store_env_pin.release(_ENV_TOKEN)
+    # The storm companion is imported as a HELPER by this module's published
+    # argv (test_concurrent_writers), so in that process the companion's own
+    # teardown never runs and its pin would outlive this module's tests.
+    # Release it here too; `release` is idempotent, so a process where the
+    # companion IS collected releases the same token twice with no effect.
+    companion = sys.modules.get("test_audit_schema_recovery_storm")
+    if companion is not None:
+        _store_env_pin.release(companion._STORM_TOKEN)
 
 
 @atexit.register
@@ -96,10 +122,8 @@ def _cleanup_scratch():
         _SCRATCH, ignore_errors=True)
 
 
-os.environ["ZMEM_STORE"] = str(_SCRATCH / "guard-pin.sqlite")
-os.environ["ZMEM_DATA"] = str(_SCRATCH)
-os.environ["ZMEM_BACKUP_DIR"] = str(_SCRATCH / "backups")
-
+# The pinned values were applied by the pin itself (see _PIN_VALUES), so
+# the guard below judges the SAME environment it always did.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _store_guard  # noqa: F401,E402  (issue #244 isolation guard)
 
@@ -676,11 +700,17 @@ class InterruptedSchemaAndFtsTests(AuditSchemaRecoveryBase):
         #     ubuntu lane proved exactly that; AMENDED CHECK_WRONG after the
         #     first CI round).
         _HOST_STATE_MARKERS = ("claude", "native-memory", "served", "install",
-                               "host-config", "node", "bash")
+                               "host-config")
+        # The host-TOOLING checks are excluded by their EXACT ids: a
+        # substring match would also swallow a future store-facing check
+        # whose id merely contains "node" or "bash". "windows-bash" is the
+        # Windows id of the same bash check.
+        _HOST_STATE_IDS = ("node", "bash", "windows-bash")
         unrelated = [str(c.get("id")) for c in checks
                      if c.get("status") == "fail"
                      and not any(m in str(c.get("id") or "").lower()
                                  for m in _HOST_STATE_MARKERS)
+                     and str(c.get("id") or "") not in _HOST_STATE_IDS
                      and not any(t in str(c.get("id") or "").lower()
                                  for t in ("fts", "index", "search"))]
         self.assertEqual(unrelated, [],
@@ -699,11 +729,13 @@ class InterruptedSchemaAndFtsTests(AuditSchemaRecoveryBase):
         # carry the leg's discriminating power.
         payload = self._loads(r, "AC1-506: doctor healthy control")
         _HOST_STATE_MARKERS = ("claude", "native-memory", "served", "install",
-                               "host-config", "node", "bash")
+                               "host-config")
+        _HOST_STATE_IDS = ("node", "bash", "windows-bash")
         store_fail = [str(c.get("id")) for c in payload.get("checks") or []
                       if c.get("status") == "fail"
                       and not any(m in str(c.get("id") or "").lower()
-                                  for m in _HOST_STATE_MARKERS)]
+                                  for m in _HOST_STATE_MARKERS)
+                      and str(c.get("id") or "") not in _HOST_STATE_IDS]
         self.assertEqual(store_fail, [],
             "AC1-506: control - no store-facing check may fail on a healthy"
             " never-interrupted store; failing: %r" % (store_fail,))

@@ -460,6 +460,23 @@ class StoreEnvPinHelperTest(unittest.TestCase):
         self.assertEqual(os.environ.get("ZMEM_PIN_PROBE"), "original",
                          "the last release must restore the original")
 
+    def test_a_new_cycle_captures_a_fresh_original(self):
+        # TG-4: a second cycle must capture the CURRENT values, not the
+        # first cycle's stale snapshot.
+        os.environ["ZMEM_PIN_CYCLE"] = "first"
+        self.addCleanup(os.environ.pop, "ZMEM_PIN_CYCLE", None)
+        first = self.pin.acquire(("ZMEM_PIN_CYCLE",))
+        os.environ["ZMEM_PIN_CYCLE"] = "pinned"
+        self.pin.release(first)
+        self.assertEqual(os.environ.get("ZMEM_PIN_CYCLE"), "first")
+        # the environment legitimately changes between cycles
+        os.environ["ZMEM_PIN_CYCLE"] = "second"
+        second = self.pin.acquire(("ZMEM_PIN_CYCLE",))
+        os.environ["ZMEM_PIN_CYCLE"] = "pinned-again"
+        self.pin.release(second)
+        self.assertEqual(os.environ.get("ZMEM_PIN_CYCLE"), "second",
+                         "a new cycle must restore ITS OWN original")
+
     def test_the_restore_covers_every_captured_key(self):
         for key, value in (("ZMEM_PIN_A", "orig-a"), ("ZMEM_PIN_B", "orig-b")):
             os.environ[key] = value

@@ -82,8 +82,26 @@ import _store_guard  # noqa: E402,F401  (#244 wiring census: this companion
 _STORM_TOKEN = _recovery._store_env_pin.acquire(_recovery._PINNED_KEYS)
 
 
+def setUpModule():
+    # The recovery module is imported here as a HELPER, so ITS teardown
+    # never runs in a standalone storm run and the pin it holds would
+    # outlive this module's tests. Re-acquire if that happened, and
+    # re-apply the pinned values.
+    global _STORM_TOKEN
+    pin = _recovery._store_env_pin
+    if not pin.is_active(_STORM_TOKEN):
+        _STORM_TOKEN = pin.acquire(_recovery._PINNED_KEYS)
+    pin.apply(_recovery._PIN_VALUES)
+
+
 def tearDownModule():
-    _recovery._store_env_pin.release(_STORM_TOKEN)
+    pin = _recovery._store_env_pin
+    pin.release(_STORM_TOKEN)
+    # The recovery module's own teardown does not run when this file runs
+    # standalone (it is imported as a helper), so its pin is released here
+    # too. `release` is idempotent, so a process where BOTH files are
+    # collected releases the same token twice with no effect.
+    pin.release(_recovery._ENV_TOKEN)
 
 _N_CHILDREN = 32
 _N_ROUNDS = 3
