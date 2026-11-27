@@ -818,6 +818,218 @@ _HEX_40_64_RE = re.compile(r"\b[0-9a-fA-F]{40}\b|\b[0-9a-fA-F]{64}\b")
 MARKER = "[REDACTED_SECRET]"
 
 
+def _bind_block_candidate(
+    block_raw: str, redacted: str, count: int, excerpt: str, kind: str,
+) -> tuple[str, str]:
+    """Amendment A1-R2 (R1-v2) binding of ONE known raw block, with the
+    D3-probe-pinned validity conditions.
+
+    Requires: the engine count is exactly 1, the redacted block carries
+    exactly ONE ``[REDACTED_SECRET]`` occurrence, the redaction changed the
+    bytes, and the block's redaction equals the normalized excerpt. The
+    replaced span is reconstructed ANCHORED TO THE MARKER (never by common
+    affixes — D2 executed the ``token=[H`` bypass): the redacted bytes
+    before the marker and after it are unchanged raw bytes, so
+    ``span = raw[len(pre) : len(raw) - len(post)]``. The slice is valid iff
+    ``raw.startswith(pre)``, ``raw.endswith(post)`` and the slice is
+    strictly nonempty and non-overlapping; the span MUST fullmatch the
+    40/64-hex identifier rule (wrapper spans ``token=[H``, ``token=H]``,
+    ``token=[H]`` refuse; bare ``H`` and value-span ``token=H`` bind).
+    """
+    if count != 1 or redacted.count(MARKER) != 1 or redacted == block_raw:
+        raise SourceRefusal(
+            "trusted source block is not a single verifiable identifier")
+    # Line-sequence equality: the raw block (keepends) carries the file's
+    # trailing terminator where the stored excerpt may not; the sequence of
+    # content lines is the binding datum (a trailing terminator is not).
+    if _normalise(redacted).splitlines() != _normalise(excerpt).splitlines():
+        raise SourceRefusal("trusted source no longer quotes the excerpt")
+    m = redacted.find(MARKER)
+    pre = redacted[:m]
+    post = redacted[m + len(MARKER):]
+    if not block_raw.startswith(pre) or not block_raw.endswith(post):
+        raise SourceRefusal(
+            "trusted source block boundaries are inconsistent")
+    end = len(block_raw) - len(post)
+    if len(pre) >= end:
+        raise SourceRefusal(
+            "trusted source block boundaries are inconsistent")
+    span = block_raw[len(pre):end]
+    if not _HEX_40_64_RE.fullmatch(span):
+        raise SourceRefusal("the redacted span is not a verifiable identifier")
+    return span, kind
+
+
+def _resolve_project_file_candidate(
+    ref_path: str, anchor: sqlite3.Row, excerpt: str,
+) -> tuple[str, str]:
+    """Amendment A1-R2 (R2): position-anchored project-file recovery.
+
+    ``ref_offset`` is a MANDATORY anchor (a non-boolean, non-negative int;
+    None refuses): the block is the file's raw lines starting EXACTLY at
+    normalized line ``ref_offset`` with the normalized excerpt's line count.
+    No whole-file search exists — an unrelated block can never substitute.
+    """
+    off = anchor[7]
+    if not isinstance(off, int) or isinstance(off, bool) or off < 0:
+        raise SourceRefusal(
+            "trusted source recovery requires a recorded position")
+    try:
+        path = _project_file_path(ref_path)
+    except SourceRefusal:
+        raise SourceRefusal("trusted source unavailable")
+    try:
+        raw = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise SourceRefusal("trusted source unavailable")
+    norm_lines = _normalise(raw).splitlines()
+    block_len = len(_normalise(excerpt).splitlines())
+    if block_len == 0 or off + block_len > len(norm_lines):
+        raise SourceRefusal(
+            "trusted source no longer quotes the excerpt at the recorded "
+            "position")
+    raw_lines = raw.splitlines(keepends=True)
+    if len(raw_lines) != len(norm_lines):
+        raise SourceRefusal("trusted source unavailable")
+    block_raw = "".join(raw_lines[off:off + block_len])
+    redacted, count = redact_text(block_raw)
+    return _bind_block_candidate(block_raw, redacted, count, excerpt,
+                                 "project-file")
+
+
+def _scan_bind_in_text(
+    text: str, excerpt: str, kind: str,
+) -> tuple[str, str]:
+    """Amendment A1-R2 (R2): unique equality window inside a uniquely
+    contained transcript turn, then full binding of that window.
+
+    The window list is the excerpt's normalized line count sliding over the
+    turn's raw lines; a window qualifies on redaction EQUALITY only; EXACTLY
+    ONE equality window must exist and it must fully bind. Two equality
+    windows refuse (ambiguous); one equality window whose span is not a
+    verifiable identifier refuses (fail-safe).
+    """
+    norm_lines = _normalise(text).splitlines()
+    block_len = len(_normalise(excerpt).splitlines())
+    if block_len == 0 or block_len > len(norm_lines):
+        raise SourceRefusal("trusted source no longer quotes the excerpt")
+    raw_lines = text.splitlines(keepends=True)
+    if len(raw_lines) != len(norm_lines):
+        raise SourceRefusal("trusted source unavailable")
+    matches = []
+    for i in range(len(norm_lines) - block_len + 1):
+        block_raw = "".join(raw_lines[i:i + block_len])
+        red, count = redact_text(block_raw)
+        if _normalise(red).splitlines() == _normalise(excerpt).splitlines():
+            matches.append((block_raw, red, count))
+    if len(matches) != 1:
+        raise SourceRefusal(
+            "trusted source must quote the excerpt exactly once")
+    block_raw, red, count = matches[0]
+    return _bind_block_candidate(block_raw, red, count, excerpt, kind)
+
+
+def _resolve_zcode_candidate(
+    ref_path: str, anchor: sqlite3.Row, excerpt: str,
+) -> tuple[str, str]:
+    """Amendment A1-R2 (R2): zcode session-DB recovery. Mirrors the _zcode
+    containment (env-pinned DB, session identity check, unique-turn
+    containment of the stored redacted excerpt) and binds inside the matched
+    turn's raw content."""
+    session = ref_path.split("/", 1)[1]
+    if anchor[2] != session:
+        raise SourceRefusal("source unavailable")
+    db_path = os.environ.get("ZMEM_ZCODE_DB", "")
+    if not db_path.strip():
+        raise SourceRefusal("source unavailable")
+    conn = _external_db(Path(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT p.message_id,p.sequence,p.data FROM part p "
+            "WHERE p.session_id=? ORDER BY p.sequence", (session,)).fetchall()
+    except sqlite3.Error:
+        raise SourceRefusal("source unavailable")
+    finally:
+        conn.close()
+    raws: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row[2])
+        except (TypeError, ValueError):
+            raise SourceRefusal("source unavailable")
+        if not isinstance(payload, dict):
+            raise SourceRefusal("source unavailable")
+        raws.append(_content(payload.get("text", payload.get("content", ""))))
+    matched = [raw for raw in raws
+               if excerpt in _redact(_normalise(raw))]
+    if len(matched) != 1:
+        raise SourceRefusal("source unavailable")
+    return _scan_bind_in_text(matched[0], excerpt, "zcode")
+
+
+def _resolve_hermes_candidate(
+    ref_path: str, anchor: sqlite3.Row, excerpt: str,
+) -> tuple[str, str]:
+    """Amendment A1-R2 (R2): hermes session-DB recovery. Mirrors the _hermes
+    containment (pinned home state.db, safe-path checks, session identity,
+    unique-message containment of the stored redacted excerpt) and binds
+    inside the matched message's raw content."""
+    session = ref_path.rsplit("/", 1)[1]
+    if anchor[2] != session:
+        raise SourceRefusal("hermes_db_unavailable")
+    db_path = _hermes_home() / "state.db"
+    if not all(is_safe_regular_path(p)
+               for p in (db_path, Path(str(db_path) + "-wal"),
+                         Path(str(db_path) + "-shm"))):
+        raise SourceRefusal("hermes_db_unavailable")
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=db_path, read_only=True)
+        try:
+            resolved = db.resolve_resume_session_id(session)
+            available = db.get_messages(resolved)
+            matched = [
+                r for r in available
+                if excerpt in _redact(_normalise(
+                    _content(r.get("content", r.get("text", "")))))
+            ]
+            if len(matched) != 1 or not isinstance(matched[0].get("id"), int):
+                raise SourceRefusal("hermes_db_unavailable")
+            raw = _content(
+                matched[0].get("content", matched[0].get("text", "")))
+        finally:
+            db.close()
+    except SourceRefusal:
+        raise
+    except Exception as exc:
+        raise SourceRefusal("hermes_db_unavailable") from exc
+    return _scan_bind_in_text(raw, excerpt, "hermes")
+
+
+def _resolve_trusted_source_candidate(
+    anchor: sqlite3.Row, excerpt: str,
+) -> tuple[str, str]:
+    """Amendment A1-R2 (R5) router: zcode/hermes prefixes FIRST (they pass
+    _safe_ref), then the bare-name project-file route (ZMEM_SOURCE_ROOT pin
+    + a recorded position); every other ref shape keeps the EXACT historical
+    refusal — the refusal surface is byte-identical for every input that
+    refused before the resolvers existed."""
+    ref_path = str(anchor[6] or "")
+    if ref_path.startswith("zcode:session/"):
+        return _resolve_zcode_candidate(ref_path, anchor, excerpt)
+    if ref_path.startswith("hermes:state.db/session/"):
+        return _resolve_hermes_candidate(ref_path, anchor, excerpt)
+    off = anchor[7]
+    if (os.environ.get(_SOURCE_ROOT_ENV, "").strip()
+            and _safe_ref_allowed(ref_path)
+            and isinstance(off, int) and not isinstance(off, bool)
+            and off >= 0):
+        return _resolve_project_file_candidate(ref_path, anchor, excerpt)
+    raise SourceRefusal(
+        "evidence excerpt must quote exactly one verifiable identifier "
+        "occurrence")
+
+
 def _check_alignment(content: str, alignment_text: str) -> None:
     """The shared alignment rule (issue #502 AC2): the aligned quotation must
     occur EXACTLY ONCE in the stored content. Zero -> changed quotation;
@@ -851,6 +1063,18 @@ def repair_from_evidence(
     verify as an object in the evidence-selected local git repository
     (`rev-parse --show-toplevel` must equal the selected path; then
     `cat-file -t` must exit 0).
+
+    Amendment A1-R2/R3 (owner decision 2026-11-27) adds the trusted-source
+    resolver path: an excerpt with ZERO candidates and EXACTLY ONE marker
+    recovers the value from the source the evidence was captured from
+    (project file position-anchored at ref_offset under ZMEM_SOURCE_ROOT;
+    zcode/hermes session DBs via their existing containment pins), bound by
+    marker-anchored span fidelity (the replaced span IS the 40/64-hex run).
+    Apply re-runs the complete resolver under the write lock and requires
+    the same candidate. Trusted-source repairs record verification_kind
+    "trusted_source" and NO raw value in metadata (digest only); they are
+    NOT exempt from rescan. Every pre-resolver refusal keeps its exact
+    historical message.
     """
     import subprocess as _subprocess
 
@@ -868,73 +1092,93 @@ def repair_from_evidence(
         raise SourceRefusal("memory has no evidence to repair from")
     excerpt = str(anchor[5] or "")
     ref_path = str(anchor[6] or "")
-    # R4.5-2: the repair contract resolves a BARE relative name beneath the
-    # trusted root — reject separators, drives, schemes, and parent traversal
-    # BEFORE any git call (an absolute or ../ ref_path must never select a
-    # repository outside ZMEM_REPAIR_ROOT).
-    _safe_ref(ref_path)
     # EXACTLY ONE candidate OCCURRENCE (plan R2-7 + review 4.5 r3): the same
     # identifier repeated twice is still two spans — the alignment below
     # replaces every occurrence but apply restores only the first, so a
     # repeated value must refuse like a multi-value excerpt.
+    #
+    # Amendment A1-R2/R3 routing (owner decision 2026-11-27): the excerpt
+    # path (one candidate, no marker) is UNCHANGED; the resolver path
+    # (zero candidates, exactly one marker) recovers the value from the
+    # trusted source; every other class keeps the EXACT historical
+    # refusals — the refusal surface is byte-identical for every input that
+    # refused before the resolvers existed.
     candidate_occurrences = _HEX_40_64_RE.findall(excerpt)
-    if len(candidate_occurrences) != 1:
-        raise SourceRefusal(
-            "evidence excerpt must quote exactly one verifiable identifier "
-            "occurrence")
-    candidate = candidate_occurrences[0]
-    if MARKER in excerpt:
+    marker_count = excerpt.count(MARKER)
+    resolver_kind: str | None = None
+    verification_kind: str | None = None
+    if len(candidate_occurrences) == 1 and marker_count == 0:
+        # Excerpt path (unchanged): R4.5-2 still rejects separators, drives,
+        # schemes, and parent traversal BEFORE any git call (an absolute or
+        # ../ ref_path must never select a repository outside
+        # ZMEM_REPAIR_ROOT).
+        _safe_ref(ref_path)
+        candidate = candidate_occurrences[0]
+        resolver_kind = "excerpt"
+        verification_kind = "git_object"
+        alignment_text = excerpt.replace(candidate, MARKER)
+    elif len(candidate_occurrences) == 0 and marker_count == 1:
+        # Resolver path (Amendment A1-R2/R3): recover from the trusted
+        # source the evidence was captured from.
+        candidate, resolver_kind = _resolve_trusted_source_candidate(
+            anchor, excerpt)
+        verification_kind = "trusted_source"
+        alignment_text = excerpt
+    else:
+        if len(candidate_occurrences) != 1:
+            raise SourceRefusal(
+                "evidence excerpt must quote exactly one verifiable "
+                "identifier occurrence")
         # Review 4.5 r2: a pre-existing marker in the excerpt means the
         # evidence was itself auto-redacted — the original value is gone and
         # the marker substitution below would hit the WRONG position.
         raise SourceRefusal(
             "evidence excerpt was itself redacted; no original value to "
             "restore")
-    alignment_text = excerpt.replace(candidate, MARKER)
 
-    repair_root = os.environ.get("ZMEM_REPAIR_ROOT", "").strip()
-    if not repair_root:
-        raise SourceRefusal("ZMEM_REPAIR_ROOT is not set")
-    root_path = Path(repair_root)
-    repo_dir = root_path / ref_path
-    # Review 4.5 r2: a bare-name child may still be a symlink/reparse point
-    # to an outside location — neither the root nor the child may be a
-    # reparse point, and the child must resolve strictly inside the resolved
-    # trusted root before any git call.
-    try:
-        if _is_reparse(root_path) or _is_reparse(repo_dir):
-            raise SourceRefusal("ref_path is not a safe directory")
-    except OSError as exc:
-        raise SourceRefusal("ref_path is not a safe directory") from exc
-    try:
-        if (not repo_dir.resolve().is_relative_to(root_path.resolve())
-                and repo_dir.resolve() != root_path.resolve()):
-            raise SourceRefusal("ref_path escapes the trusted repair root")
-    except OSError as exc:
-        raise SourceRefusal("ref_path is not a safe directory") from exc
+    if resolver_kind == "excerpt":
+        repair_root = os.environ.get("ZMEM_REPAIR_ROOT", "").strip()
+        if not repair_root:
+            raise SourceRefusal("ZMEM_REPAIR_ROOT is not set")
+        root_path = Path(repair_root)
+        repo_dir = root_path / ref_path
+        # Review 4.5 r2: a bare-name child may still be a symlink/reparse point
+        # to an outside location — neither the root nor the child may be a
+        # reparse point, and the child must resolve strictly inside the resolved
+        # trusted root before any git call.
+        try:
+            if _is_reparse(root_path) or _is_reparse(repo_dir):
+                raise SourceRefusal("ref_path is not a safe directory")
+        except OSError as exc:
+            raise SourceRefusal("ref_path is not a safe directory") from exc
+        try:
+            if (not repo_dir.resolve().is_relative_to(root_path.resolve())
+                    and repo_dir.resolve() != root_path.resolve()):
+                raise SourceRefusal("ref_path escapes the trusted repair root")
+        except OSError as exc:
+            raise SourceRefusal("ref_path is not a safe directory") from exc
 
-    def _git(*args: str) -> subprocess.CompletedProcess:
-        return _subprocess.run(
-            ["git", "-C", str(repo_dir), *args],
-            capture_output=True, text=True, timeout=60,
-            encoding="utf-8", errors="replace")
+        def _git(*args: str) -> subprocess.CompletedProcess:
+            return _subprocess.run(
+                ["git", "-C", str(repo_dir), *args],
+                capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace")
 
-    probe = _git("rev-parse", "--show-toplevel")
-    if probe.returncode != 0:
-        raise SourceRefusal("ref_path is not a repository")
-    try:
-        toplevel = Path(probe.stdout.strip()).resolve()
-    except OSError as exc:
-        raise SourceRefusal("ref_path is not a repository") from exc
-    if toplevel != repo_dir.resolve():
-        raise SourceRefusal("ref_path is not a repository")
+        probe = _git("rev-parse", "--show-toplevel")
+        if probe.returncode != 0:
+            raise SourceRefusal("ref_path is not a repository")
+        try:
+            toplevel = Path(probe.stdout.strip()).resolve()
+        except OSError as exc:
+            raise SourceRefusal("ref_path is not a repository") from exc
+        if toplevel != repo_dir.resolve():
+            raise SourceRefusal("ref_path is not a repository")
 
-    cat = _git("cat-file", "-t", candidate)
-    if cat.returncode != 0:
-        raise SourceRefusal(
-            "restored value is not an object in the evidence-linked "
-            "repository")
-
+        cat = _git("cat-file", "-t", candidate)
+        if cat.returncode != 0:
+            raise SourceRefusal(
+                "restored value is not an object in the evidence-linked "
+                "repository")
     # Alignment (R4.5-4): PREVIEW checks it point-in-time too — a preview
     # must not report a verified restoration the stored row cannot accept.
     # APPLY re-runs it UNDER THE WRITE LOCK (Round-5 critic: a concurrent
@@ -951,6 +1195,8 @@ def repair_from_evidence(
         # "attempt to write a readonly database").
         return {"memory_id": memory_id, "evidence_id": evidence_id,
                 "mode": "preview", "restore_value": candidate,
+                "resolver": resolver_kind,
+                "verification_kind": verification_kind,
                 "verified": True, "applied": False}
 
     owns_tx = not conn.in_transaction
@@ -963,6 +1209,17 @@ def repair_from_evidence(
         if row is None:
             raise SourceRefusal("memory vanished before apply")
         content = row[0] or ""
+        # Amendment A1-R2 (R4-v2): for the resolver paths, apply re-runs the
+        # COMPLETE resolver under the write lock and requires the SAME
+        # candidate — an apply-local TOCTOU window on the mutable trusted
+        # source is closed. Direct --apply (no prior preview) resolves once
+        # here; the git-object path is unchanged (objects are immutable).
+        if resolver_kind != "excerpt":
+            re_candidate, re_kind = _resolve_trusted_source_candidate(
+                anchor, excerpt)
+            if (re_candidate, re_kind) != (candidate, resolver_kind):
+                raise SourceRefusal(
+                    "trusted source changed between resolution and apply")
         _check_alignment(content, alignment_text)
         # Replace ONLY the marker span inside the aligned occurrence: the
         # aligned text carries exactly one marker; swap it for the verified
@@ -995,8 +1252,22 @@ def repair_from_evidence(
                 entries = []
         except (TypeError, ValueError):
             entries = []
-        entries.append({"memory_id": memory_id, "evidence_id": evidence_id,
-                        "restored": candidate, "at": now})
+        # Amendment A1-R2/R3: provenance is explicit; a trusted_source
+        # entry NEVER carries the raw value (digest only — no copy of the
+        # value exists anywhere rescan does not cover). git_object entries
+        # keep the raw `restored` value (an object hash, not a secret).
+        if verification_kind == "git_object":
+            entries.append({"memory_id": memory_id,
+                            "evidence_id": evidence_id,
+                            "restored": candidate, "at": now,
+                            "verification_kind": "git_object"})
+        else:
+            entries.append({"memory_id": memory_id,
+                            "evidence_id": evidence_id,
+                            "at": now,
+                            "verification_kind": "trusted_source",
+                            "restored_sha256": hashlib.sha256(
+                                candidate.encode("utf-8")).hexdigest()})
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
             (f"source_repair:{memory_id}", _json.dumps(entries)))
@@ -1004,6 +1275,8 @@ def repair_from_evidence(
             conn.commit()
         return {"memory_id": memory_id, "evidence_id": evidence_id,
                 "mode": "apply", "restore_value": candidate,
+                "resolver": resolver_kind,
+                "verification_kind": verification_kind,
                 "verified": True, "applied": True}
     except BaseException:
         if owns_tx and conn.in_transaction:

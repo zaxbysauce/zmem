@@ -684,5 +684,336 @@ class VerbatimPassageVerificationTests(unittest.TestCase):
             self.assertEqual(payload["verification"]["outcome"], "exact")
 
 
+
+class TrustedSourceResolverTests(unittest.TestCase):
+    """Amendment A1-R2/R3 supplementary depth (owner decision 2026-11-27):
+    trusted-source resolvers for marker-only production evidence.
+
+    - Rescan durability (D3's extended test): a trusted_source repair's
+      value is RE-DETECTED by rescan (never exempt), the raw value exists in
+      NO repair metadata, and the digest-only entry rebinds to the successor
+      with the successor id.
+    - git_object repairs keep the pre-A1 exemption (pinned by the existing
+      RepairAlignmentTests rescan durability test).
+    - Apply-local TOCTOU: apply re-resolves under the lock and refuses a
+      changed source (deterministic patched-resolver side effect).
+    - zcode + hermes routing: positive recovery through their containment
+      pins; wrong-session evidence refuses.
+    """
+    CANARY = "5f2a1b3c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f42"
+    OTHER = "0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f"
+    LINE1 = "release canary context line one"
+    LINE3 = "release canary context line three"
+
+    def _write_production_evidence(self, db_path, memory_id, excerpt,
+                                   ref_path, ref_offset, session_id):
+        """One evidence row through the PRODUCTION writer (redact default
+        ON) - the stored excerpt is the REDACTED text."""
+        scripts = Path(__file__).resolve().parents[1] / "skills" / "memory" \
+            / "scripts"
+        os.environ["ZMEM_STORE"] = str(db_path)
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from storelib.evidence import write_evidence
+        conn = sqlite3.connect(db_path)
+        try:
+            evidence_id = write_evidence(
+                conn, session_id=session_id, lane="codex", moment="pretool",
+                kind="turn", ts="2026-11-27T12:00:00Z", excerpt=excerpt,
+                ref_path=ref_path, ref_offset=ref_offset)
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id,evidence_id)"
+                " VALUES(?,?)", (memory_id, evidence_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return evidence_id
+
+    def _seed_source(self, root: Path, lines: list[str],
+                     memory_line: str) -> tuple[dict, str]:
+        src = root / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "notes.md").write_text("\n".join(lines) + "\n",
+                                      encoding="utf-8")
+        env = {"ZMEM_SOURCE_ROOT": str(src)}
+        _init(root, env)
+        memory_id = _add(root, memory_line, env)
+        return env, memory_id
+
+    def test_rescan_remediates_trusted_source_value_keeps_digest(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-resolver-rescan-") as temp:
+            root = Path(temp)
+            excerpt_line = (f"canary fails rollback {self.CANARY} "
+                            "immediately")
+            env, memory_id = self._seed_source(
+                root,
+                [self.LINE1, excerpt_line, self.LINE3],
+                f"{self.LINE1}\n{excerpt_line}\n{self.LINE3}")
+            db = root / "store.sqlite"
+            evidence_id = self._write_production_evidence(
+                db, memory_id, excerpt_line, "notes.md", 1, "sess-supp")
+            applied = _run(root, "source", "repair", "--id", memory_id,
+                           "--evidence-id", evidence_id, "--apply",
+                           extra_env=env)
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            payload = json.loads(
+                applied.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["resolver"], "project-file")
+            self.assertEqual(payload["verification_kind"], "trusted_source")
+            self.assertIn(self.CANARY, _memory_content(db, memory_id))
+            # The trusted_source meta entry carries NO raw value.
+            pred_entries = json.loads(_meta(
+                db, f"source_repair:{memory_id}"))
+            self.assertEqual(len(pred_entries), 1)
+            self.assertNotIn("restored", pred_entries[0])
+            self.assertIn("restored_sha256", pred_entries[0])
+
+            # Applying rescan: the trusted_source value is NOT exempt -
+            # rescan re-detects and remediates it into a redacted successor.
+            applied_rescan = _run(root, "rescan-secrets", "--apply",
+                                  extra_env=env)
+            self.assertEqual(applied_rescan.returncode, 0,
+                             applied_rescan.stderr)
+            live = sqlite3.connect(db)
+            try:
+                rows = live.execute(
+                    "SELECT id, content FROM memory "
+                    "WHERE superseded_at IS NULL").fetchall()
+                metas = live.execute(
+                    "SELECT key, value FROM meta "
+                    "WHERE key LIKE 'source_repair:%'").fetchall()
+            finally:
+                live.close()
+            # (i) the canary is absent from EVERY live memory row.
+            for mid, content in rows:
+                self.assertNotIn(self.CANARY, str(content))
+            # (ii) absent from BOTH predecessor and successor metadata.
+            blob = json.dumps(metas)
+            self.assertNotIn(self.CANARY, blob)
+            # (iii) the successor's digest-only entry exists.
+            successor = None
+            for key, value in metas:
+                for entry in json.loads(value):
+                    if (entry.get("verification_kind") == "trusted_source"
+                            and entry.get("memory_id") not in
+                            (memory_id,)):
+                        successor = entry
+            self.assertIsNotNone(successor)
+            self.assertIn("restored_sha256", successor)
+            self.assertNotIn("restored", successor)
+
+    def test_apply_refuses_when_source_changes_under_lock(self) -> None:
+        # R4-v2: apply re-resolves under the lock; a changed source refuses
+        # with no mutation (deterministic patched-resolver side effect).
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-resolver-toctou-") as temp:
+            root = Path(temp)
+            excerpt_line = (f"canary fails rollback {self.CANARY} "
+                            "immediately")
+            env, memory_id = self._seed_source(
+                root,
+                [self.LINE1, excerpt_line, self.LINE3],
+                f"{self.LINE1}\n{excerpt_line}\n{self.LINE3}")
+            db = root / "store.sqlite"
+            evidence_id = self._write_production_evidence(
+                db, memory_id, excerpt_line, "notes.md", 1, "sess-supp")
+            scripts = Path(__file__).resolve().parents[1] / "skills" \
+                / "memory" / "scripts"
+            os.environ["ZMEM_STORE"] = str(db)
+            # The in-process _memory lookup filters by namespace aliases
+            # resolved from the AMBIENT env - pin the seeded namespace.
+            os.environ["ZMEM_NAMESPACE"] = NS
+            os.environ.update({k: v for k, v in {
+                "ZMEM_SOURCE_ROOT": str(root / "src"),
+            }.items()})
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            from storelib import source as source_mod
+            calls = []
+
+            def flippy(anchor, excerpt):
+                calls.append(1)
+                if len(calls) == 1:
+                    return self.CANARY, "project-file"
+                return self.OTHER, "project-file"
+
+            saved = source_mod._resolve_trusted_source_candidate
+            source_mod._resolve_trusted_source_candidate = flippy
+            try:
+                conn = sqlite3.connect(db)
+                try:
+                    with self.assertRaises(source_mod.SourceRefusal) as ctx:
+                        source_mod.repair_from_evidence(
+                            conn, memory_id=memory_id,
+                            evidence_id=evidence_id, mode="apply")
+                finally:
+                    conn.close()
+                self.assertIn("changed between resolution and apply",
+                              str(ctx.exception))
+            finally:
+                source_mod._resolve_trusted_source_candidate = saved
+            self.assertNotIn(self.CANARY, _memory_content(db, memory_id))
+            self.assertNotIn(self.OTHER, _memory_content(db, memory_id))
+
+    def test_zcode_session_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-resolver-zcode-") as temp:
+            root = Path(temp)
+            env = dict(os.environ)
+            env.update({
+                "ZMEM_STORE": str(root / "store.sqlite"),
+                "ZMEM_DATA": str(root),
+                "ZMEM_MODELS_DIR": str(root / "missing-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_EMBED_PROFILE": "fake",
+                "ZMEM_NAMESPACE": "project:resolver-supp",
+            })
+            for key in ("ZMEM_ZCODE_DB", "ZMEM_HERMES_SESSIONS",
+                        "HERMES_HOME", "ZMEM_SOURCE_ROOT",
+                        "ZMEM_REPAIR_ROOT"):
+                env.pop(key, None)
+            turn_raw = (f"canary fails rollback {self.CANARY} immediately")
+            zcdb = root / "zc.sqlite"
+            zconn = sqlite3.connect(zcdb)
+            try:
+                zconn.execute(
+                    "CREATE TABLE part(session_id, message_id, sequence, "
+                    "data)")
+                zconn.execute(
+                    "INSERT INTO part VALUES(?,?,?,?)",
+                    ("s-zc", "t1", 0, json.dumps({"text": turn_raw})))
+                zconn.commit()
+            finally:
+                zconn.close()
+            env["ZMEM_ZCODE_DB"] = str(zcdb)
+            result = _run(root, "init", extra_env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            add = _run(root, "add", "--namespace", "project:resolver-supp",
+                       "--type", "fact", "--content", turn_raw,
+                       "--signal", "test", "--confidence", "0.9", "--json",
+                       extra_env=env)
+            self.assertEqual(add.returncode, 0, add.stderr)
+            memory_id = str(json.loads(add.stdout)["id"])
+            evidence_id = self._write_production_evidence(
+                root / "store.sqlite", memory_id, turn_raw,
+                "zcode:session/s-zc", None, "s-zc")
+            applied = _run(root, "source", "repair", "--id", memory_id,
+                           "--evidence-id", evidence_id, "--apply",
+                           extra_env=env)
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            payload = json.loads(
+                applied.stdout.strip().splitlines()[-1])
+            self.assertEqual(payload["resolver"], "zcode")
+            self.assertIn(self.CANARY,
+                          _memory_content(root / "store.sqlite", memory_id))
+
+    def test_hermes_wrong_session_refuses(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-resolver-hermes-") as temp:
+            root = Path(temp)
+            env = dict(os.environ)
+            env.update({
+                "ZMEM_STORE": str(root / "store.sqlite"),
+                "ZMEM_DATA": str(root),
+                "ZMEM_MODELS_DIR": str(root / "missing-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_EMBED_PROFILE": "fake",
+                "ZMEM_NAMESPACE": "project:resolver-supp",
+            })
+            turn_raw = f"canary fails rollback {self.CANARY} immediately"
+            result = _run(root, "init", extra_env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            add = _run(root, "add", "--namespace", "project:resolver-supp",
+                       "--type", "fact", "--content", turn_raw,
+                       "--signal", "test", "--confidence", "0.9", "--json",
+                       extra_env=env)
+            self.assertEqual(add.returncode, 0, add.stderr)
+            memory_id = str(json.loads(add.stdout)["id"])
+            # The evidence row's session identity does NOT match the ref's
+            # session - the containment identity check refuses BEFORE any DB
+            # access (no hermes home pin exists here).
+            evidence_id = self._write_production_evidence(
+                root / "store.sqlite", memory_id, turn_raw,
+                "hermes:state.db/session/other", None, "s-h")
+            refused = _run(root, "source", "repair", "--id", memory_id,
+                           "--evidence-id", evidence_id, "--preview",
+                           extra_env=env)
+            self.assertEqual(refused.returncode, 1, refused.stdout)
+            self.assertTrue(refused.stderr.startswith(
+                "[zmem] source repair: refused"), refused.stderr)
+            self.assertNotIn(self.CANARY,
+                             _memory_content(root / "store.sqlite",
+                                             memory_id))
+
+    def test_hermes_positive_recovery_via_pinned_home(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-resolver-hermes-pos-") as temp:
+            root = Path(temp)
+            excerpt_line = (f"canary fails rollback {self.CANARY} "
+                            "immediately")
+            env, memory_id = self._seed_source(
+                root,
+                [self.LINE1, excerpt_line, self.LINE3],
+                f"{self.LINE1}\n{excerpt_line}\n{self.LINE3}")
+            db = root / "store.sqlite"
+            scripts = Path(__file__).resolve().parents[1] / "skills" \
+                / "memory" / "scripts"
+            os.environ["ZMEM_STORE"] = str(db)
+            # The in-process _memory lookup filters by namespace aliases
+            # resolved from the AMBIENT env - pin the seeded namespace.
+            os.environ["ZMEM_NAMESPACE"] = NS
+            os.environ["ZMEM_SOURCE_ROOT"] = str(root / "src")
+            home = root / "hermes-home"
+            home.mkdir(parents=True, exist_ok=True)
+            for suffix in ("", "-wal", "-shm"):
+                (home / f"state.db{suffix}").write_bytes(b"")
+            os.environ["HERMES_HOME"] = str(home)
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            # hermes_state is the EXTERNAL Hermes module (absent on this
+            # host) - inject a fake into sys.modules; the resolver's lazy
+            # `from hermes_state import SessionDB` reads the attribute at
+            # call time.
+            import types as _types
+            from storelib import source as source_mod
+            fake_hermes = _types.ModuleType("hermes_state")
+
+            class FakeDB:
+                def __init__(self, *, db_path, read_only):
+                    pass
+
+                def resolve_resume_session_id(self, session):
+                    return "resolved"
+
+                def get_messages(self, session):
+                    return [{"id": 1, "content": excerpt_line}]
+
+                def close(self):
+                    pass
+
+            fake_hermes.SessionDB = FakeDB
+            saved = sys.modules.get("hermes_state")
+            sys.modules["hermes_state"] = fake_hermes
+            try:
+                evidence_id = self._write_production_evidence(
+                    db, memory_id, excerpt_line,
+                    "hermes:state.db/session/s-h", None, "s-h")
+                conn = sqlite3.connect(db)
+                try:
+                    result = source_mod.repair_from_evidence(
+                        conn, memory_id=memory_id,
+                        evidence_id=evidence_id, mode="apply")
+                finally:
+                    conn.close()
+            finally:
+                if saved is None:
+                    sys.modules.pop("hermes_state", None)
+                else:
+                    sys.modules["hermes_state"] = saved
+            self.assertEqual(result["resolver"], "hermes")
+            self.assertIn(self.CANARY, _memory_content(db, memory_id))
+
+
 if __name__ == "__main__":
     unittest.main()

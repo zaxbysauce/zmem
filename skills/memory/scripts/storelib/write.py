@@ -3435,27 +3435,39 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
     # ordinary row.
     pointer_suspects: list[tuple[str, str]] = []
 
-    def _validated_repair_entries(memory_id: str) -> list[dict]:
+    def _validated_repair_entries(
+            memory_id: str) -> tuple[list[dict], frozenset[str]]:
         """Read + validate the row's ``source_repair:<id>`` record per the
-        trust rule (shape, 40/64-hex restored value, memory_id binding,
-        evidence association). Malformed or wrongly-bound entries are
-        IGNORED — no exemption from garbage; the row then remediates
-        normally."""
+        trust rule, returning (all valid entries eligible for successor
+        rebinding, the generic-pattern exemption values).
+
+        Amendment A1-R3: rebinding eligibility and exemption eligibility are
+        SEPARATE. ``git_object`` entries (and legacy entries without the
+        field — every pre-A1 repair passed cat-file) carry a raw 40/64-hex
+        ``restored`` value and contribute it to the exemption set.
+        ``trusted_source`` entries NEVER carry ``restored`` (digest-only:
+        ``restored_sha256``) — they are valid for rebinding (provenance is
+        preserved on the successor) but contribute NOTHING to the exemption
+        set, so the fail-safe net re-evaluates the recovered value on every
+        rescan. Unknown ``verification_kind`` values fail closed (the entry
+        is ignored entirely). Malformed or wrongly-bound entries are IGNORED
+        — no exemption from garbage; the row then remediates normally."""
         rec = conn.execute(
             "SELECT value FROM meta WHERE key=?",
             (f"source_repair:{memory_id}",)).fetchone()
         if rec is None:
-            return []
+            return [], frozenset()
         try:
             entries = _json.loads(rec[0])
         except (TypeError, ValueError):
-            return []
+            return [], frozenset()
         if not isinstance(entries, list):
-            return []
+            return [], frozenset()
         assoc = {r[0] for r in conn.execute(
             "SELECT evidence_id FROM memory_evidence WHERE memory_id=?",
             (memory_id,)).fetchall()}
         valid: list[dict] = []
+        exempt: set[str] = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -3463,22 +3475,34 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                 continue
             if entry.get("evidence_id") not in assoc:
                 continue
+            kind = entry.get("verification_kind", "git_object")
+            if kind not in ("git_object", "trusted_source"):
+                continue  # fail closed: unknown kinds are ignored entirely
+            if kind == "trusted_source":
+                # Digest-only shape; a raw value is never valid here.
+                if "restored" in entry:
+                    continue
+                digest = entry.get("restored_sha256")
+                if (not isinstance(digest, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                    continue
+                valid.append(entry)
+                continue
             restored = entry.get("restored")
             if (not isinstance(restored, str)
                     or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}",
                                         restored)):
                 continue
             valid.append(entry)
-        return valid
+            exempt.add(restored)
+        return valid, frozenset(exempt)
 
     for row in rows:
         content = row["content"] or ""
         tags = row["tags"] or ""
         source_ref = row["source_ref"] or ""
         is_pointer = _has_knowledge_prefix(source_ref)
-        exempt = frozenset(
-            entry["restored"]
-            for entry in _validated_repair_entries(row["id"]))
+        _valid_entries, exempt = _validated_repair_entries(row["id"])
         try:
             new_content, new_source_ref, new_tags, _warnings = (
                 apply_capture_policy(content=content, source_ref=source_ref,
@@ -3542,9 +3566,8 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                     "WHERE id=? AND superseded_at IS NULL", (mid,)).fetchone()
                 if cur is None:
                     continue
-                exempt_now = frozenset(
-                    entry["restored"]
-                    for entry in _validated_repair_entries(mid))
+                _under_lock_valid, exempt_now = _validated_repair_entries(
+                    mid)
                 new_content, new_source_ref, new_tags, _w = (
                     apply_capture_policy(
                         content=cur["content"] or "",
@@ -3585,7 +3608,8 @@ def rescan_secrets(conn: sqlite3.Connection, *, apply: bool) -> dict:
                     attach_memory_evidence(
                         conn, memory_id=successor_id,
                         evidence_ids=[evidence_id])
-                valid_entries = _validated_repair_entries(mid)
+                valid_entries, _rebind_exempt = _validated_repair_entries(
+                    mid)
                 if valid_entries:
                     rebound = [dict(entry, memory_id=successor_id)
                                for entry in valid_entries]
