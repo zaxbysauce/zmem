@@ -564,3 +564,89 @@ class VerifyRecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BasicAuthWideningTests(unittest.TestCase):
+    """Review 4.5 r5: the Basic detector requires a non-pure-lowercase value
+    (no case-MIXTURE requirement) — all-uppercase base64 credentials are
+    redacted; prose survives; the pure-lowercase base64 class stays a
+    disclosed gap."""
+
+    def test_basic_all_uppercase_and_digit_values_redacted(self) -> None:
+        from redaction import redact_secret_like_text
+        for text in ("Authorization: Basic QUFBRUFCQ0RFRg==",
+                     "Authorization: Basic abc123def456",
+                     "Authorization: Basic dXNlcjpwYXNzd29yZA=="):
+            out, count = redact_secret_like_text(text)
+            with self.subTest(text=text):
+                self.assertGreaterEqual(count, 1)
+                self.assertNotIn("Basic ", out)
+
+    def test_basic_prose_survives(self) -> None:
+        from redaction import redact_secret_like_text
+        for text in ("use Basic authentication for the API",
+                     "Basic password",
+                     "a basically automatic process"):
+            out, count = redact_secret_like_text(text)
+            with self.subTest(text=text):
+                self.assertEqual(count, 0)
+                self.assertEqual(out, text)
+
+
+class VerbatimPassageVerificationTests(unittest.TestCase):
+    """Review 4.5 r5: verification is VERBATIM — indentation and intra-line
+    whitespace are meaningful; only line terminators are normalised."""
+
+    def _build(self, root: Path, lines_a: list[str], lines_b: list[str]) -> str:
+        trusted = root / "trusted"
+        trusted.mkdir(parents=True, exist_ok=True)
+        notes = trusted / "notes.txt"
+        notes.write_text("\n".join(lines_a) + "\n", encoding="utf-8")
+        show_env: dict[str, str | None] = {"ZMEM_SOURCE_ROOT": str(trusted)}
+        _init(root, show_env)
+        memory_id = _add(root, "ops note quoting the deploy file", show_env)
+        _insert_evidence(root / "store.sqlite", memory_id, [(
+            "ev-verb-1", "sess-verb", "codex", "pretool", "turn",
+            "2026-11-26T12:00:00Z", "h1", lines_a[0], "notes.txt", 0)])
+        notes.write_text("\n".join(lines_b) + "\n", encoding="utf-8")
+        return memory_id
+
+    def test_indented_line_is_not_exact(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-verb-") as temp:
+            root = Path(temp)
+            quoted = "staging rollout completes in ten minutes"
+            memory_id = self._build(
+                root, [quoted],
+                ["    " + quoted])  # indentation-only change
+            show_env: dict[str, str | None] = {"ZMEM_SOURCE_ROOT":
+                                               str(root / "trusted")}
+            result = _run(root, "source", "show", "--id", memory_id,
+                          extra_env=show_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            # Verbatim comparison: the indented line is NOT the recorded
+            # line, so the verbatim quotation is absent -> missing.
+            self.assertEqual(payload["verification"]["outcome"], "missing")
+
+    def test_crlf_file_still_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-crlf-") as temp:
+            root = Path(temp)
+            quoted = "staging rollout completes in ten minutes"
+            trusted = root / "trusted"
+            trusted.mkdir(parents=True)
+            notes = trusted / "notes.txt"
+            notes.write_bytes((quoted + "\r\n").encode("utf-8"))
+            show_env: dict[str, str | None] = {"ZMEM_SOURCE_ROOT": str(trusted)}
+            _init(root, show_env)
+            memory_id = _add(root, "ops note quoting the deploy file",
+                             show_env)
+            _insert_evidence(root / "store.sqlite", memory_id, [(
+                "ev-verb-2", "sess-verb", "codex", "pretool", "turn",
+                "2026-11-26T12:00:00Z", "h1", quoted, "notes.txt", 0)])
+            result = _run(root, "source", "show", "--id", memory_id,
+                          extra_env=show_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["verification"]["outcome"], "exact")

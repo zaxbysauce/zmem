@@ -51,15 +51,19 @@ SECRET_CREDENTIAL_PATTERNS = [
     # complete token while still respecting ordinary delimiters.
     re.compile(r"(?i)(?<![A-Za-z0-9_])Bearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])"),
     # RFC 7617 Basic scheme (issue #502): the scheme word is case-insensitive
-    # through an inline-scoped group (the #180 command-pattern convention), the
-    # value classes are CASE-SENSITIVE, and two case-sensitive lookaheads
-    # require at least one uppercase-or-digit AND one lowercase char in the
-    # value, so all-lowercase prose ("Basic authentication", "Basic password")
-    # survives while a real base64 user:pass blob matches. Known disclosed gap:
-    # an all-lowercase, digit-free base64 credential survives (same disclosure
-    # class as the #537 IGNORECASE fold gap). Whole-match semantics like
-    # Bearer; the alphabet-boundary convention is copied verbatim.
-    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+(?=[A-Za-z0-9._+/=~-]*[0-9A-Z])(?=[A-Za-z0-9._+/=~-]*[a-z])[A-Za-z0-9._+/=~-]{8,}(?![A-Za-z0-9._+/=~-])"),
+    # through an inline-scoped group (the #180 command-pattern convention); the
+    # value must carry at least one character OUTSIDE the pure-lowercase
+    # alphabet (a digit, uppercase, or base64 symbol) — all-lowercase values
+    # are the prose signature ("Basic authentication", "Basic password") and
+    # survive; any value containing a digit/uppercase/symbol is redacted
+    # (review 4.5 r5: no case-MIXTURE requirement — all-uppercase base64
+    # credentials like QUFBRUFCQ0RFRg== match). Known disclosed gap: a
+    # pathological pure-lowercase base64 credential survives (real base64 of
+    # ASCII credentials for 8+ chars is vanishingly rarely lowercase-only —
+    # same disclosure class as the #537 IGNORECASE fold gap). Whole-match
+    # semantics like Bearer; the alphabet-boundary convention is copied
+    # verbatim.
+    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+(?=[A-Za-z0-9._+/=~-]*[0-9A-Z+/=])[A-Za-z0-9._+/=~-]{8,}(?![A-Za-z0-9._+/=~-])"),
     # PEM: prefer the FULL block (BEGIN..END, whole-match) so the body dies
     # with the header; the header-only shape remains as fallback for a
     # truncated paste. Both are non-capturing so no group logic can misfire.

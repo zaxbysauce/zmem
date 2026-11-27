@@ -491,13 +491,16 @@ def _verification_outcome(
     # line of the excerpt (internal blank lines included) as one contiguous
     # block, whitespace-insensitive per line — so a change to ANY quoted
     # line, or to the block's line sequence, affects the outcome.
-    quoted_lines = [ln.strip() for ln in excerpt.splitlines()]
+    # Verbatim per the frozen contract (review 4.5 r5): indentation and
+    # intra-line whitespace are meaningful; only line terminators are
+    # normalised (the same _normalise the file lines went through).
+    excerpt_normalised = _normalise(excerpt)
+    quoted_lines = excerpt_normalised.splitlines()
     if not quoted_lines:
         return None
-    stripped = [ln.strip() for ln in lines]
     n = len(quoted_lines)
-    hits = [i for i in range(len(stripped) - n + 1)
-            if stripped[i:i + n] == quoted_lines]
+    hits = [i for i in range(len(lines) - n + 1)
+            if lines[i:i + n] == quoted_lines]
     selected = anchor[7] if anchor[7] is not None else -1
     if not hits:
         outcome = "missing"
