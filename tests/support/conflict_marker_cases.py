@@ -1,4 +1,4 @@
-"""The conflict-marker guard's six cases, as a SEPARATELY AUTHORED oracle.
+"""The conflict-marker guard's cases, as a SEPARATELY AUTHORED oracle.
 
 This script exists so the guardrail's behaviour can be proven by a probe
 that does not merely re-run the repo's own test module. It imports
@@ -75,7 +75,7 @@ def main() -> int:
         for failure in failures:
             print("FAIL: %s" % failure)
         return 1
-    print("ALL SIX CASES HOLD")
+    print("ALL %d CASES HOLD" % len(CASES))
     return 0
 
 
