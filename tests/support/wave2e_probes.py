@@ -246,6 +246,10 @@ def main() -> int:
             print("%-18s %s" % ("DISCRIMINATING" if ok else "NOT-DISCRIMINATING", label))
             print("                 executed probe rc=%s (%s anchor(s) mutated)"
                   % (rc, "+".join(str(c) for c in counts)))
+            # the ASSERTION that killed the mutant, so a reviewer can see the
+            # mutant failed for the intended reason and not another
+            print("                 mutant failure tail: %s"
+                  % " | ".join(tail.strip().splitlines()[-2:]))
             if not ok:
                 failures.append(label)
                 print("                 tail: %s" % tail[-400:])
