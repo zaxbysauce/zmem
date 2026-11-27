@@ -19,7 +19,11 @@ Usage (this is the shape the probe request uses):
         --expect "AC1-506: a first open killed inside the v3 migration did not resume" \
         --frozen tests/test_audit_schema_recovery.py \
         --frozen tests/_store_env_pin.py \
-        -- env ZMEM_STORE=... python -X utf8 -m pytest -q tests/test_audit_schema_recovery.py::test_interrupted_schema_and_fts
+        --command "env ZMEM_STORE=... python -X utf8 -m pytest -q tests/test_audit_schema_recovery.py::test_interrupted_schema_and_fts"
+
+The command is passed as ONE string (--command): the acceptance table's
+argv is a SHELL COMMAND ("env A=B python ..."), not an argv list, so it
+is run through a shell exactly as repro-check.sh runs it.
 
 The frozen files are taken from the CURRENT tree (the extracted revision --
 the frozen bytes) and copied into the disposable base worktree, which is
@@ -57,14 +61,9 @@ def main() -> int:
 
     command = args.command
     if not command:
-        # the acceptance table's argv is a SHELL COMMAND ("env A=B python ..."),
-        # so it is run through a shell, exactly as repro-check.sh runs it
-        argv = list(args.argv)
-        if argv and argv[0] == "--":
-            argv = argv[1:]
-        command = " ".join(argv)
-    if not command:
-        print("frozen_base_leg: no command given", file=sys.stderr)
+        print("frozen_base_leg: --command is required (the acceptance "
+              "table's argv is a shell command, passed as ONE string)",
+              file=sys.stderr)
         return 2
 
     repo = args.repo or subprocess.run(
