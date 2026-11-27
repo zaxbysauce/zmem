@@ -135,10 +135,9 @@
     },
     {
       "label": "bare-basic-lowercase",
-      "kind": "credential",
-      "expected": "redacted",
-      "text": "bare paste Basic dagsqwxzmore extracted from logs",
-      "credential_value": "dagsqwxzmore"
+      "kind": "benign",
+      "expected": "preserved",
+      "text": "bare paste Basic dagsqwxzmore extracted from logs"
     }
   ]
 }

@@ -15,6 +15,8 @@ already-placeholder hits, never byte-change counts.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 
 
@@ -39,8 +41,62 @@ REDACTED_SECRET = "[REDACTED_SECRET]"
 # base64/hex patterns below deliberately KEEP ``\b`` — widening their
 # boundaries would redact benign SHAs adjacent to non-ASCII text (issue #502
 # over-redaction direction).
+_BASIC_SCANNER_SOURCE = (
+    r"(?i:(?<![A-Za-z0-9_])Basic)\s+[A-Za-z0-9._+/=~-]{4,}(?![A-Za-z0-9._+/=~-])"
+)
+
+
+def _basic_value_is_credential(value: str) -> bool:
+    """RFC 7617 Basic credentials encode ``user-id : password`` — the decoded
+    bytes MUST contain the colon separator (issue #502, final-critic fix).
+    A value that is not valid base64 or decodes to colon-free bytes is not a
+    Basic credential: prose words (idea, auth, workflow, password) and
+    colon-free junk all survive, while EVERY shape whose decode contains the
+    colon (mixed, all-uppercase, digit-bearing, pure-lowercase) redacts.
+    """
+    cleaned = value.replace("-", "+").replace("_", "/")
+    cleaned = re.sub(r"[^A-Za-z0-9+/=]", "", cleaned)
+    padded = cleaned + "=" * (-len(cleaned) % 4)
+    try:
+        raw = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    return b"\x3a" in raw
+
+
+class _BasicCredentialScannerPattern:
+    """Duck-typed pattern (like the #535 URL credential scanner) that yields
+    only matches whose value is a real RFC 7617 Basic credential — the
+    protocol-true decode test replaces the r5-r7 case/length filters, whose
+    over-redaction withheld stored memories and rejected knowledge documents
+    (final-critic fix). ``search``/``finditer``/``pattern`` serve every
+    registry consumer; the match protocol serves the whole-match redaction
+    loop."""
+
+    pattern = _BASIC_SCANNER_SOURCE
+
+    def __init__(self):
+        self._broad = re.compile(_BASIC_SCANNER_SOURCE)
+
+    def _yield_credential_matches(self, text):
+        for match in self._broad.finditer(text or ""):
+            parts = match.group(0).split(None, 1)
+            if len(parts) == 2 and _basic_value_is_credential(parts[1]):
+                yield match
+
+    def finditer(self, text):
+        return self._yield_credential_matches(text)
+
+    def search(self, text):
+        for match in self._yield_credential_matches(text):
+            return match
+        return None
+
+
+_BASIC_CREDENTIAL_SCANNER = _BasicCredentialScannerPattern()
+
 SECRET_CREDENTIAL_PATTERNS = [
-    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|pass|private[_-]?key)\s*[:=]\s*(\S{8,})"),
+    re.compile(r"(?i)(?:api[_-]?key|secret|token|password|passwd|pwd|(?<![A-Za-z])pass|private[_-]?key)\s*[:=]\s*(\S{8,})"),
     # Authorization headers occur in prompts, rendered fences, and operation
     # transcripts.  Keep this ahead of the generic token patterns so the whole
     # credential (rather than an arbitrary suffix) is replaced consistently.
@@ -50,33 +106,22 @@ SECRET_CREDENTIAL_PATTERNS = [
     # be outside the credential alphabet so the greedy match consumes the
     # complete token while still respecting ordinary delimiters.
     re.compile(r"(?i)(?<![A-Za-z0-9_])Bearer\s+[A-Za-z0-9._+/~-]{16,}(?![A-Za-z0-9._+/~-])"),
-    # RFC 7617 Basic scheme (issue #502), TWO rules (review 4.5 r6):
-    # 1. EXPLICIT AUTHORIZATION HEADER (`Authorization: Basic <val>`): the
-    #    context is unambiguous, so the value matches UNCONDITIONALLY at 4+
-    #    chars (the base64 minimum) — no length floor, no case requirement:
-    #    mixed, all-uppercase, digit-bearing, AND pure-lowercase values all
-    #    redact. The cost is fail-safe over-redaction of long prose inside a
-    #    literal auth header ("Authorization: Basic authentication") — the
-    #    SAME accepted fail-safe direction as the #180 matrix's ssh -p port
-    #    precedent; a literal 12+ char word as a header VALUE carries no
-    #    credential meaning anyway.
-    # 2. BARE `Basic <val>` (no header prefix): unconditional at 4+ chars —
-    #    the SAME floor as the header rule (the base64 minimum) — so EVERY
-    #    value shape at EVERY credential-plausible length (mixed, all-
-    #    uppercase, digit-bearing, AND pure-lowercase) redacts in bare
-    #    context too (review 4.5 r7: the sub-8-char bare gap was rejected —
-    #    `Basic YTpi` is a valid 4-char encoding of a:b, and no user
-    #    deferral of short bare credentials exists). The cost is fail-safe
-    #    over-redaction of 4+ char words after bare "Basic " ("Basic
-    #    things", "Basic password" are redacted) — the #180 ssh -p
-    #    fail-safe direction, disclosed as the accepted price of closing
-    #    the credential class. Sub-4-char values survive (below ANY
-    #    credential floor in the registry). The header rule runs FIRST in
-    #    the registry, so header contexts are consumed before this rule is
-    #    tried. Whole-match semantics like Bearer; the alphabet-boundary
-    #    convention is copied verbatim.
-    re.compile(r"(?i)(?<![A-Za-z0-9_])Authorization\s*:\s*Basic\s+[A-Za-z0-9._+/=~-]{4,}(?![A-Za-z0-9._+/=~-])"),
-    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+[A-Za-z0-9._+/=~-]{4,}(?![A-Za-z0-9._+/=~-])"),
+    # RFC 7617 Basic scheme (issue #502, review 4.5 final-critic fix): ONE
+    # decode-checked scanner rule. RFC 7617 Basic credentials encode
+    # "user-id : password" — the decoded bytes MUST contain the colon
+    # separator. A value that is not valid base64 or decodes to colon-free
+    # bytes is NOT a Basic credential (prose words — idea, auth, workflow —
+    # and colon-free junk all survive), so the rule closes the credential
+    # class COMPLETELY (mixed, all-uppercase, digit-bearing AND
+    # pure-lowercase shapes whose decode contains the colon) while
+    # preserving ordinary prose, recall visibility, and knowledge documents.
+    # This replaces the r5-r7 case/length filters, whose over-redaction the
+    # final critic showed withheld stored memories and rejected knowledge
+    # documents (the protocol-true decode test needs neither).
+    # Duck-typed scanner like the #535 URL credential pattern; whole-match
+    # semantics like Bearer; the alphabet-boundary convention is copied
+    # verbatim.
+    _BASIC_CREDENTIAL_SCANNER,
     # PEM: prefer the FULL block (BEGIN..END, whole-match) so the body dies
     # with the header; the header-only shape remains as fallback for a
     # truncated paste. Both are non-capturing so no group logic can misfire.

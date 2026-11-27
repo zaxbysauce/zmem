@@ -139,6 +139,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (zero-write floor). Disclosed cost: the probe is a full-table scan
   (~79 ms median at 50k rows / 87 MB vs ~1.8 ms for a stamped open).
   Undecodable-content rows keep NULL (skip semantics unchanged).
+- **Redaction: Basic-auth credentials, identifier calibration, evidence-backed repair; source: evidence selection, passage verification, scope-aware revisions** (issues #502 #512). The Basic scheme is detected by the RFC 7617 decode contract (values whose base64 decode contains the `user:pass` colon separator) — closing the previously-surviving `Authorization: Basic` shape without over-redacting prose (the r5-r7 case/length filters withheld recall rows and rejected knowledge documents; the decode rule needs neither). Generic-pattern identifier-context calibration preserves verifiable release/commit SHAs and checksums. The `source repair` CLI restores a verified object identifier from linked evidence (preview/apply, under-lock alignment, full derived-state set). The `source show` CLI lists and selects evidence by ID with verbatim passage verification (exact/relocated/ambiguous/missing under `ZMEM_SOURCE_ROOT`); `source verify` persists the outcome for the recall hint. `supersede --scope` authorizes revisions with scope-aware retention of narrower-scope exceptions.
 
 ## [0.165.0] - 2026-11-21
 

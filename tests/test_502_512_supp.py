@@ -562,56 +562,67 @@ class VerifyRecordTests(unittest.TestCase):
                 db, f"source_verify:{memory_id}:ev-supp-v2"))
 
 
-class BasicAuthTwoRuleTests(unittest.TestCase):
-    """Review 4.5 r7 closure: TWO Basic rules, NO surviving credential
-    class at ANY credential-plausible length.
+class BasicDecodeColonTests(unittest.TestCase):
+    """Review 4.5 final-critic closure: ONE decode-checked Basic rule —
+    RFC 7617 values encode "user-id : password", so the decoded bytes MUST
+    contain the colon. EVERY shape whose decode contains the colon redacts
+    (mixed, all-uppercase, digit-bearing, pure-lowercase); values that are
+    invalid base64 or decode colon-free survive (prose words, colon-free
+    junk). The scanner filters at the REGISTRY level, so recall withholding
+    and knowledge-document admission get the same decode semantics (the
+    r5-r7 over-redaction regressions are gone)."""
 
-    1. Explicit `Authorization: Basic <val>` header: UNCONDITIONAL 4+ char
-       match — no length floor, no case requirement. Short credentials
-       (YTpi), pure-lowercase values, all-uppercase values, prose-as-value
-       (fail-safe over-redaction, the #180 ssh -p direction) all redact.
-    2. Bare `Basic <val>` (no header): UNCONDITIONAL 4+ char match — the
-       SAME floor as the header rule — so EVERY shape INCLUDING short
-       values (YTpi) and prose words (password, things, authentication)
-       redacts. The cost is fail-safe over-redaction of ANY 4+ char word
-       after bare "Basic " (disclosed as the accepted price of closing the
-       credential class — the #180 ssh -p direction); sub-4-char values
-       survive (below the base64 minimum)."""
-
-    def test_header_context_unconditional(self) -> None:
+    def test_decode_colon_values_redacted(self) -> None:
         from redaction import redact_secret_like_text
-        for text in ("Authorization: Basic YTpi",          # 4-char short cred
-                     "Authorization: Basic dagsqwxz",      # pure-lowercase
-                     "Authorization: Basic QUFBRUFCQ0RFRg==",  # all-uppercase
-                     "Authorization: Basic dXNlcjpwYXNzd29yZA==",  # mixed
-                     "Authorization: Basic authentication"):  # prose-as-value
-            out, count = redact_secret_like_text(text)
-            with self.subTest(text=text):
-                self.assertGreaterEqual(count, 1)
-                self.assertNotIn("Basic ", out)
-
-    def test_bare_context_unconditional_4plus(self) -> None:
-        from redaction import redact_secret_like_text
-        # EVERY bare value shape 4+ chars redacts — including SHORT
-        # credentials (YTpi), pure-lowercase values, and prose words.
-        for text in ("Basic YTpi",                     # short cred, bare
-                     "bare Basic dagsqwxzmore",        # pure-lowercase
-                     "bare Basic abc123def456",        # digit-bearing
-                     "Basic password",                 # prose word, 8 chars
-                     "Basic things",                   # prose word, 6 chars
-                     "use Basic authentication here"):  # prose, 14 chars
+        for text in ("Authorization: Basic dXNlcjpwYXNzd29yZA==",
+                     "Authorization: Basic YTpi",              # a:b
+                     "bare paste Basic YTpi extracted",
+                     "log shows Basic mjqb fragment"):         # pure-lowercase base64, decode contains colon
             out, count = redact_secret_like_text(text)
             with self.subTest(text=text):
                 self.assertGreaterEqual(count, 1)
 
-    def test_sub4_survives(self) -> None:
+    def test_decode_colonfree_and_invalid_survive(self) -> None:
         from redaction import redact_secret_like_text
-        for text in ("Basic hi",          # 2-char value, below base64 minimum
-                     "Basic go"):         # 2-char value
+        for text in ("bare paste Basic dagsqwxzmore extracted",  # colon-free
+                     "The basic idea is simple.",
+                     "Use basic auth for the proxy",
+                     "The basic workflow is documented here.",
+                     "Basic password",                           # colon-free
+                     "Basic things",
+                     "Basic hi",                                 # 2 chars
+                     "bare Basic QUFBRUFCQ0RFRg==",              # colon-free uppercase
+                     "say basic things"):
             out, count = redact_secret_like_text(text)
             with self.subTest(text=text):
                 self.assertEqual(count, 0)
                 self.assertEqual(out, text)
+
+    def test_recall_withholding_regression_fixed(self) -> None:
+        # The final critic's executed regression: _classify_credential must
+        # NOT withhold a row whose content mentions "basic auth" in prose.
+        from storelib.recall import _classify_credential
+        self.assertFalse(_classify_credential(
+            {"content": "Use basic auth for the reverse proxy"}))
+        self.assertFalse(_classify_credential(
+            {"content": "The basic workflow is documented here."}))
+        # A real credential shape IS withheld.
+        self.assertTrue(_classify_credential(
+            {"content": "Authorization: Basic dXNlcjpwYXNzd29yZA=="}))
+
+    def test_pass_keyword_anchored(self) -> None:
+        # Final-critic finding 5: the `pass` keyword addition must not
+        # redact ordinary words containing 'pass'.
+        from redaction import redact_secret_like_text
+        for text in ("bypass=enabled_always", "compass: northbound",
+                     "surpass=expected_values"):
+            out, count = redact_secret_like_text(text)
+            with self.subTest(text=text):
+                self.assertEqual(count, 0)
+                self.assertEqual(out, text)
+        # The compound-key credential still redacts.
+        out, count = redact_secret_like_text("DB_PASS=Sup3rSecret!99")
+        self.assertGreaterEqual(count, 1)
 
 
 class VerbatimPassageVerificationTests(unittest.TestCase):
