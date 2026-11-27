@@ -1325,10 +1325,11 @@ def repair_from_evidence(
             if (re_candidate, re_kind) != (candidate, resolver_kind):
                 raise SourceRefusal(
                     "trusted source changed between resolution and apply")
-            # Final-critic r6/r7 + swarm-pr-review G2: the destination gate
-            # runs on EVERY repair path under the lock (the destination is
-            # the authoritative context of what the value will sit inside).
-            _check_destination_context(content)
+        # Final-critic r6/r7 + swarm-pr-review G2/FB-003 (Stage B reviewer):
+        # the destination gate runs on EVERY repair path under the lock —
+        # unconditional, matching preview parity exactly (the destination is
+        # the authoritative context of what the value will sit inside).
+        _check_destination_context(content)
         _check_alignment(content, alignment_text)
         # Replace ONLY the marker span inside the aligned occurrence: the
         # aligned text carries exactly one marker; swap it for the verified
