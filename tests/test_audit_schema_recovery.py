@@ -676,7 +676,7 @@ class InterruptedSchemaAndFtsTests(AuditSchemaRecoveryBase):
         #     ubuntu lane proved exactly that; AMENDED CHECK_WRONG after the
         #     first CI round).
         _HOST_STATE_MARKERS = ("claude", "native-memory", "served", "install",
-                               "host-config")
+                               "host-config", "node", "bash")
         unrelated = [str(c.get("id")) for c in checks
                      if c.get("status") == "fail"
                      and not any(m in str(c.get("id") or "").lower()
@@ -699,7 +699,7 @@ class InterruptedSchemaAndFtsTests(AuditSchemaRecoveryBase):
         # carry the leg's discriminating power.
         payload = self._loads(r, "AC1-506: doctor healthy control")
         _HOST_STATE_MARKERS = ("claude", "native-memory", "served", "install",
-                               "host-config")
+                               "host-config", "node", "bash")
         store_fail = [str(c.get("id")) for c in payload.get("checks") or []
                       if c.get("status") == "fail"
                       and not any(m in str(c.get("id") or "").lower()
