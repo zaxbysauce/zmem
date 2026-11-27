@@ -9,6 +9,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+<<<<<<< ours
 - **An interrupted first open is now restartable, a lost search table is
   rebuilt with every old row re-indexed, and 32 concurrent writers are no
   longer refused with a restore-blaming message** (issue #506). The v3 and
@@ -81,6 +82,30 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   directory beside it, on a best-effort basis: a filesystem that cannot
   harden must not break the restore, so the hardening call is made and a
   failure to harden does not abort it.
+=======
+- **Pre-tool recall no longer injects unrelated lessons before plain
+  read-only commands.** The pre-tool query was the raw command text, so
+  `ls`, `cat`, `sed -n '1,40p'`, path fragments and heredoc bodies matched
+  stored lessons by accident. The local hook path now builds the query from
+  the operation only: read-only inspection segments are dropped, absolute
+  paths reduce to their basename, and a command with nothing left gets no
+  injection (reported as `empty-pool`) unless a file-shaped token in it
+  still justifies a lookup. The filter keeps the whole command
+  whenever it cannot prove a segment is read-only: any data flowing into a
+  kept command (pipe, heredoc, here-string, stdin file), inline interpreter
+  code, process substitution, unbalanced quotes, or an unparsable shape. The
+  checkpoint detector still runs on the full command, so a checkpoint
+  command (for example `git push -f`) inside the detector's existing
+  150-character window keeps its hazard recall. A `#` is never treated as a comment
+  (a plain comment line no longer hides the commands after it), a `>& word` redirect
+  counts as a file write, command substitution inside a heredoc body,
+  here-string or redirect target keeps the command, and a backslash-escaped
+  quote is not judged.
+  `ZMEM_PRETOOL_SANITIZE=0` restores the raw query. Scope: the local hook
+  path only; the fleet broker and the OpenCode bridge do not pass the tool
+  input and are unchanged. Noise from `git status`, `grep`/`rg` and inline
+  scripts is deliberately not filtered.
+>>>>>>> theirs
 
 - **Prompt-assertion partition: sentence-scoped negation, multi-focus orthogonal drop, moment allow-list, rescue count after admission** (issue #530).
   The partition now splits a stored row into sentences before applying
