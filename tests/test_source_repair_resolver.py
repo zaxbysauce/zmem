@@ -236,10 +236,16 @@ class SourceRepairResolverTests(unittest.TestCase):
         self.assertIn("restored_sha256", entries[0])
 
     def test_wrapper_spans_refuse(self) -> None:
-        # D2-C1 executed bypasses: the redacted span must BE the hex run.
-        for line in (f"token=[{CANARY}",
-                     f"token={CANARY}]",
-                     f"token=[{CANARY}]"):
+        # The redacted span must BE the hex run (span fidelity). Post
+        # credential-gate (a808d042), keyword-value wrappers are refused by
+        # the credential gate; the SPAN-FIDELITY gate's own discriminators
+        # are non-hex RUN spans: a base64 char prefix or a trailing word
+        # char makes the replaced run non-hex (probe-verified: both redact
+        # with count 1 through the generic pattern only, no credential
+        # label). Preserved-wrapper shapes (commit=[H) bind correctly —
+        # the wrapper stays outside the marker, so the span IS the hex.
+        for line in (f"Z{CANARY}",
+                     f"x={CANARY}y"):
             with self.subTest(line=line):
                 env, memory_id = self._seed(
                     [LINE1, line, LINE3],
