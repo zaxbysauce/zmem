@@ -3828,7 +3828,18 @@ V9_COLUMNS = ("valid_until", "update_of", "taint")
 # store stays exit 0 — the schema-version check owns "this store is too
 # old".
 def _check_fts_index(resolved_store: Path) -> dict:
-    """Compare memory rowids with memory_fts_docsize rowids (read-only)."""
+    """Compare memory rowids with memory_fts_docsize rowids (read-only).
+
+    F-010 (swarm-pr-review round 2): a read-only REFUSAL (residue held by a
+    live writer, a torn copy, the lock_aware contract) propagates out of
+    this check instead of being reported as a degraded lane. That is the
+    deliberate fail-loud contract of `_open_store_ro` (PR #422: keep the
+    operator-actionable reason instead of collapsing it to "store
+    unreadable"), and every sibling check that opens the store read-only
+    behaves the same way -- so the contract is documented here rather than
+    changed at one call site. Making doctor degrade on refusals is a
+    repository-wide decision, not a local one.
+    """
     conn = _open_store_ro(resolved_store)
     if conn is None:
         return _check(

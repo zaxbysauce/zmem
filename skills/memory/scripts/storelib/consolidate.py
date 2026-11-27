@@ -1230,6 +1230,26 @@ def consolidate(
             )
             conn.commit()
         except sqlite3.OperationalError as exc:
+            # F-003 (swarm-pr-review round 2): roll the implicit transaction
+            # back before returning. pysqlite's deferred BEGIN succeeds
+            # WITHOUT taking a lock and SQLite does NOT end the transaction
+            # on SQLITE_BUSY, so the connection can come back from this
+            # handler still inside a transaction -- and the next caller
+            # (organize.py reuses this connection) would then fail with
+            # 'cannot start a transaction within a transaction'. The guard
+            # mirrors the cluster-loop handler below.
+            if conn.in_transaction:
+                try:
+                    conn.rollback()
+                except sqlite3.Error as rb_exc:
+                    # F-003 (swarm-pr-review round 2, Stage-B review): a
+                    # rollback that itself fails must be REPORTED, not
+                    # swallowed -- the operator is told the connection may
+                    # still hold an open transaction.
+                    print(f"[zmem] consolidate: run-start rollback failed "
+                          f"({type(rb_exc).__name__}: {rb_exc}); the connection "
+                          f"may still hold an open transaction",
+                          file=sys.stderr)
             print(f"[zmem] consolidate: run-start write failed "
                   f"({type(exc).__name__}: {exc}); skipped, will retry next run",
                   file=sys.stderr)

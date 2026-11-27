@@ -1008,8 +1008,8 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
                 # Fail closed exactly like _read_schema_version: a
                 # non-integer stamp refuses with the same RuntimeError (exit 2).
                 raise RuntimeError(
-                    f"zmem: store {path} has a non-integer schema_version "
-                    f"{row[0]!r}; refusing to modify it")
+                    f"zmem: store {_esc(path)} has a non-integer "
+                    f"schema_version {_esc(repr(row[0]))}; refusing to modify it")
         except (FileNotFoundError, _ROErr, sqlite3.Error, OSError):
             return None
 
@@ -1031,13 +1031,13 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
         if v2 is not None:
             _compat(v2, Path(from_path).expanduser())
     except RuntimeError as e:
-        print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+        print(f"[zmem] restore FAILED: {_esc(e)}", file=sys.stderr)
         return 2
     if _host is not None:
         try:
             _host.assert_local_fs(dest.parent)
         except ValueError as e:
-            print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+            print(f"[zmem] restore FAILED: {_esc(e)}", file=sys.stderr)
             return 1
 
     m_token = _acquire_maintenance_lock_with_liveness()
@@ -1566,17 +1566,27 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
                     f"re-installed pre-restore backup failed integrity_check: "
                     f"{rb_integrity}")
             print(f"[zmem] restore: rolled back: live store re-installed from the "
-                  f"pre-restore backup {prerestore_path}", file=sys.stderr)
+                  f"pre-restore backup {_esc(prerestore_path)}", file=sys.stderr)
         except Exception as rb:
             print(f"[zmem] restore FAILED: automatic rollback also failed "
-                  f"({rb}); the live store is NOT trustworthy", file=sys.stderr)
+                  f"({_esc(rb)}); the live store is NOT trustworthy",
+                  file=sys.stderr)
+            # F-002 (swarm-pr-review round 2, Stage-B review round 3):
+            # this line is a COPY-PASTE COMMAND, so the path must stay
+            # byte-exact -- escaping it here would print a path that does
+            # not exist and make the recovery command unusable. The path is
+            # shell-quoted, so it cannot inject a shell command either; and
+            # it is zmem's OWN backup file inside the operator's own backup
+            # directory, not an attacker-supplied snapshot value (every
+            # snapshot-derived string on this path IS escaped).
             print(f"[zmem] restore: roll back by hand with "
                   f"{command_prefix()} restore --from "
-                  f"{shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
+                  f"{shlex.quote(str(prerestore_path))} --force",
+                  file=sys.stderr)
             if forensic_dir is not None:
                 print(f"[zmem] restore: the files that were at the destination "
                       f"before the restore are kept byte-for-byte in "
-                      f"{forensic_dir}; do not copy them back beside the store "
+                      f"{_esc(forensic_dir)}; do not copy them back beside the store "
                       f"(inspect them only from a copy outside the store "
                       f"directory)", file=sys.stderr)
             return 1
@@ -1592,6 +1602,15 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
                     p.unlink()
             if dest_exists and not dest_nonempty:
                 dest.touch()
+                # F-005 (round-1 review comment): the re-created EMPTY
+                # destination is a file this restore writes, so it is
+                # hardened like every other one (best-effort: a filesystem
+                # that cannot harden must not break the rollback).
+                if _host is not None:
+                    try:
+                        _host.set_owner_only_perms(dest)
+                    except Exception:
+                        pass
             # The rolled-back target state is destination-SPECIFIC: a
             # destination that was missing must be missing again; one that
             # was an empty file must exist and be 0 bytes again (the touch
@@ -1609,21 +1628,22 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
                   "missing/empty before the restore and is again", file=sys.stderr)
         except Exception as rb:
             print(f"[zmem] restore FAILED: automatic rollback also failed "
-                  f"({rb}); the live store is NOT trustworthy", file=sys.stderr)
+                  f"({_esc(rb)}); the live store is NOT trustworthy",
+                  file=sys.stderr)
             if not dest_exists:
-                print(f"[zmem] restore: roll back by hand: delete {dest} and any "
-                      f"{dest}-wal, {dest}-shm, {dest}-journal beside it "
+                print(f"[zmem] restore: roll back by hand: delete {_esc(dest)} and any "
+                      f"{_esc(dest)}-wal, {_esc(dest)}-shm, {_esc(dest)}-journal beside it "
                       f"(the destination store did not exist before the restore)",
                       file=sys.stderr)
             else:
-                print(f"[zmem] restore: roll back by hand: delete any {dest}-wal, "
-                      f"{dest}-shm, {dest}-journal beside it, then replace {dest} "
-                      f"with an empty 0-byte file (the destination store was an "
-                      f"empty file before the restore)", file=sys.stderr)
+                print(f"[zmem] restore: roll back by hand: delete any {_esc(dest)}-wal, "
+                      f"{_esc(dest)}-shm, {_esc(dest)}-journal beside it, then replace "
+                      f"{_esc(dest)} with an empty 0-byte file (the destination store "
+                      f"was an empty file before the restore)", file=sys.stderr)
             if forensic_dir is not None:
                 print(f"[zmem] restore: the files that were at the destination "
                       f"before the restore are kept byte-for-byte in "
-                      f"{forensic_dir}; do not copy them back beside the store "
+                      f"{_esc(forensic_dir)}; do not copy them back beside the store "
                       f"(inspect them only from a copy outside the store "
                       f"directory)", file=sys.stderr)
             return 1
@@ -1635,8 +1655,8 @@ def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
         shutil.rmtree(stash_dir, ignore_errors=True)
         if stash_dir.is_dir():
             for leftover in sorted(p.name for p in stash_dir.iterdir()):
-                print(f"[zmem] restore: {leftover} is set aside at {stash_dir}",
-                      file=sys.stderr)
+                print(f"[zmem] restore: {_esc(leftover)} is set aside at "
+                      f"{_esc(stash_dir)}", file=sys.stderr)
     return 1
 
 
@@ -1674,7 +1694,8 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     dest = STORE_PATH
 
     if not snap.is_file():
-        print(f"[zmem] restore FAILED: snapshot not found: {snap}", file=sys.stderr)
+        print(f"[zmem] restore FAILED: snapshot not found: {_esc(snap)}",
+              file=sys.stderr)
         return 1
 
     # --- 1. Verify the snapshot BEFORE touching the destination at all. ---
@@ -1691,13 +1712,14 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         print(f"[zmem] restore FAILED: snapshot integrity_check={_esc(snap_integrity)} "
               f"- destination untouched", file=sys.stderr)
         return 1
-    print(f"[zmem] restore: source snapshot {snap}")
-    print(f"[zmem] restore: snapshot integrity_check={snap_integrity}")
+    print(f"[zmem] restore: source snapshot {_esc(snap)}")
+    print(f"[zmem] restore: snapshot integrity_check={_esc(snap_integrity)}")
 
     dest_exists = dest.exists()
     dest_nonempty = dest_exists and dest.stat().st_size > 0
     if dest_exists and not force:
-        print(f"[zmem] restore FAILED: destination store already exists: {dest}\n"
+        print(f"[zmem] restore FAILED: destination store already exists: "
+              f"{_esc(dest)}\n"
               f"       pass --force to overwrite it (a pre-restore backup of the "
               f"current store is taken automatically).", file=sys.stderr)
         return 1
@@ -1715,15 +1737,21 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
     os.close(fd_stage)
     staged = Path(stage_str)
-    shutil.copy2(snap, staged)
-    # A hand-supplied snapshot may carry its own sidecars: recover them on
-    # the STAGED copy, never beside the live file.
-    for sfx in ("-wal", "-shm", "-journal"):
-        src_sib = Path(str(snap) + sfx)
-        if src_sib.exists():
-            shutil.copy2(src_sib, Path(str(staged) + sfx))
-            print(f"[zmem] restore: recovered snapshot {src_sib.name} onto the staged copy")
     try:
+        # F-004 (round-1 review comment): the staged copy and its sidecars
+        # are made INSIDE the guarded block, so an OSError (disk full, an AV
+        # lock) takes the same controlled path as a failed validation -- a
+        # ruled message and the staged file removed -- instead of escaping
+        # as a raw traceback and leaving a .restore-stage-* file behind.
+        shutil.copy2(snap, staged)
+        # A hand-supplied snapshot may carry its own sidecars: recover them on
+        # the STAGED copy, never beside the live file.
+        for sfx in ("-wal", "-shm", "-journal"):
+            src_sib = Path(str(snap) + sfx)
+            if src_sib.exists():
+                shutil.copy2(src_sib, Path(str(staged) + sfx))
+                print(f"[zmem] restore: recovered snapshot {_esc(src_sib.name)} "
+                      f"onto the staged copy")
         conn = sqlite3.connect(str(staged))
         try:
             staged_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -1817,13 +1845,16 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                 forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}-{n}"
                 n += 1
             forensic_dir.mkdir(parents=True)
+            if _host is not None:
+                # F-005 (round-1 review comment): harden the forensic dir
+                # BEFORE the pre-restore copies land in it -- those bytes
+                # must never exist with default permissions.
+                _host.set_owner_only_perms(forensic_dir)
             for p in [dest] + present:
                 if p.exists():
                     shutil.copy2(p, forensic_dir / p.name)
-            if _host is not None:
-                _host.set_owner_only_perms(forensic_dir)
     except Exception as e:
-        print(f"[zmem] restore ABORTED: preparation failed ({e}) — "
+        print(f"[zmem] restore ABORTED: preparation failed ({_esc(e)}) — "
               f"destination untouched", file=sys.stderr)
         for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
             try:
@@ -1843,6 +1874,19 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                 work_dir = backup_dir / f"restore-work-{_snapshot_stamp()}-{n}"
                 n += 1
             work_dir.mkdir(parents=True)
+            # F-005 (swarm-pr-review round 2): the forensic dir is
+            # owner-only hardened; the work dir holds a byte copy of the
+            # LIVE store, so it must be too -- otherwise the guarantee
+            # depends on how backup_dir happened to be created (a
+            # pre-existing, operator-supplied --out-dir is not hardened
+            # by _ensure_backup_dir). Best-effort: a filesystem that
+            # cannot harden must not break the restore, and the safety
+            # copy itself is the priority.
+            if _host is not None:
+                try:
+                    _host.set_owner_only_perms(work_dir)
+                except Exception:
+                    pass
             working_main = work_dir / dest.name
             shutil.copyfile(dest, working_main)
             for sfx in ("-wal", "-journal"):     # never -shm
@@ -1853,12 +1897,12 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             pre_info = create_snapshot(working_main, pre_dest)
             prerestore_path = Path(pre_info["path"])
             shutil.rmtree(work_dir, ignore_errors=True)
-            print(f"[zmem] restore: pre-restore backup {prerestore_path} "
-                  f"(integrity_check={pre_info['integrity_check']}, "
+            print(f"[zmem] restore: pre-restore backup {_esc(prerestore_path)} "
+                  f"(integrity_check={_esc(pre_info['integrity_check'])}, "
                   f"total={pre_info['snapshot_total']} live={pre_info['snapshot_live']})")
         except Exception as e:
             print(f"[zmem] restore ABORTED: pre-restore backup of the current store "
-                  f"failed ({e}) — refusing to overwrite the only copy of it.",
+                  f"failed ({_esc(e)}) — refusing to overwrite the only copy of it.",
                   file=sys.stderr)
             # F-004/MA-001: the private working copy must not survive a
             # failed safety copy (it holds plaintext store + WAL bytes).
@@ -1889,8 +1933,8 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             for p in present:
                 p.rename(stash_dir / p.name)
                 moved.append(p)
-                print(f"[zmem] restore: removed stale {p.name} from beside the store "
-                      f"(set aside; byte copy kept in {forensic_dir})")
+                print(f"[zmem] restore: removed stale {_esc(p.name)} from beside the store "
+                      f"(set aside; byte copy kept in {_esc(forensic_dir)})")
 
         # --- 7. Swap. ---
         os.replace(staged, dest)
@@ -1905,7 +1949,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         if swap_done:
             # Fall through to the step-9 rollback machinery via the same
             # path the success-path failures take.
-            print(f"[zmem] restore FAILED: {cause}", file=sys.stderr)
+            print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
             staged = None
             return _finish_failed_restore(
                 dest=dest, dest_exists=dest_exists, dest_nonempty=dest_nonempty,
@@ -1926,14 +1970,15 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                     putback_failed = True
         if putback_failed:
             leftovers = sorted(p.name for p in stash_dir.iterdir()) if stash_dir and stash_dir.is_dir() else []
-            print(f"[zmem] restore FAILED: {cause}", file=sys.stderr)
+            print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
             for name in leftovers:
-                print(f"[zmem] restore: {name} is set aside at {stash_dir}", file=sys.stderr)
+                print(f"[zmem] restore: {_esc(name)} is set aside at "
+                      f"{_esc(stash_dir)}", file=sys.stderr)
             if forensic_dir is not None:
                 print(f"[zmem] restore: byte copies of the files from before the restore "
-                      f"are kept in {forensic_dir}", file=sys.stderr)
+                      f"are kept in {_esc(forensic_dir)}", file=sys.stderr)
             return 1
-        print(f"[zmem] restore FAILED: {cause}", file=sys.stderr)
+        print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
         if stash_dir is not None and stash_dir.is_dir() and not any(stash_dir.iterdir()):
             stash_dir.rmdir()
         return 1
@@ -1963,8 +2008,8 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                 raise RuntimeError(
                     f"could not set owner-only permissions on {dest}: {e}")
         if post_integrity != "ok":
-            print(f"[zmem] restore: destination {dest}")
-            print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
+            print(f"[zmem] restore: destination {_esc(dest)}")
+            print(f"[zmem] restore: post-restore integrity_check={_esc(post_integrity)}")
             raise RuntimeError(f"post-restore integrity_check={post_integrity}")
         try:
             mconn = _schema.connect()
@@ -1982,7 +2027,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             raise RuntimeError(f"post-restore open/migrate failed: {e}")
     except Exception as e:
         # --- 9. ANY error after the swap rolls back. ---
-        print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+        print(f"[zmem] restore FAILED: {_esc(e)}", file=sys.stderr)
         return _finish_failed_restore(
             dest=dest, dest_exists=dest_exists, dest_nonempty=dest_nonempty,
             prerestore_path=prerestore_path, stash_dir=stash_dir,
@@ -1997,27 +2042,28 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         shutil.rmtree(stash_dir, ignore_errors=True)
         if stash_dir.is_dir():
             for leftover in sorted(p.name for p in stash_dir.iterdir()):
-                print(f"[zmem] restore: {leftover} is set aside at {stash_dir}",
-                      file=sys.stderr)
-    print(f"[zmem] restore: destination {dest}")
-    print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
+                print(f"[zmem] restore: {_esc(leftover)} is set aside at "
+                      f"{_esc(stash_dir)}", file=sys.stderr)
+    print(f"[zmem] restore: destination {_esc(dest)}")
+    print(f"[zmem] restore: post-restore integrity_check={_esc(post_integrity)}")
     print(f"[zmem] restore: restored rows total={total} live={live}")
-    print(f"[zmem] restore: migrated shape schema_version={migrated_ver}")
+    print(f"[zmem] restore: migrated shape schema_version={_esc(migrated_ver)}")
     if prerestore_path is not None:
         if forensic_dir is not None:
             print(f"[zmem] restore: sidecars and main file kept byte-for-byte in "
-                  f"{forensic_dir}; the pre-restore backup {prerestore_path} is the "
-                  f"store as SQLite read it, including committed -wal frames")
+                  f"{_esc(forensic_dir)}; the pre-restore backup "
+                  f"{_esc(prerestore_path)} is the store as SQLite read it, "
+                  f"including committed -wal frames")
     else:
         if forensic_dir is not None:
             if dest_exists:
                 print(f"[zmem] restore: the files that were at the destination before "
-                      f"the restore are kept byte-for-byte in {forensic_dir}; no "
+                      f"the restore are kept byte-for-byte in {_esc(forensic_dir)}; no "
                       f"pre-restore backup exists because the destination store was "
                       f"an empty file")
             else:
                 print(f"[zmem] restore: the files that were at the destination before "
-                      f"the restore are kept byte-for-byte in {forensic_dir}; no "
+                      f"the restore are kept byte-for-byte in {_esc(forensic_dir)}; no "
                       f"pre-restore backup exists because the destination store did "
                       f"not exist")
     if shape_info.get("rebuilt_index"):

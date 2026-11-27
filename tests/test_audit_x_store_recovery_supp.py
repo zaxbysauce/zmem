@@ -1387,9 +1387,23 @@ class ContentionRuledRetryTest(SuppBase):
     """F-003 (swarm-pr-review RP-001): when BEGIN IMMEDIATE fails on write
     contention, the cluster except path must not itself raise ('cannot
     rollback - no transaction is active') — the run continues and prints
-    the ruled 'rolled back, will retry next run' line."""
+    the ruled 'rolled back, will retry next run' line.
 
-    def test_lock_contention_prints_ruled_retry(self):
+    F-011 (swarm-pr-review round 2): the two guards are DIFFERENT code
+    paths and one test cannot cover both. The run-start write is the FIRST
+    write, so a blocker taken before the call makes the RUN-START handler
+    return before the cluster loop is ever reached — the old single leg
+    asserted an OR over both ruled lines and therefore pinned NEITHER
+    guard. The two legs below are split accordingly, and the run-start leg
+    also pins the transaction state (F-003: the handler must roll the
+    implicit transaction back before returning).
+
+    The #542 AC2 cross-reference stands: that issue carries the
+    writer-lease liveness AC, and the contention seam exercised here is the
+    same seam AC2's contention tests will use.
+    """
+
+    def _seeded_conn(self):
         os.environ["ZMEM_STORE"] = str(self.store)
         os.environ["ZMEM_DATA"] = str(self.dir)
         import storelib
@@ -1407,6 +1421,19 @@ class ContentionRuledRetryTest(SuppBase):
             conn, namespace=NS, type_="fact",
             content="contention neighbour one two", confidence=0.8,
             signal="test")
+        return conn
+
+    def test_run_start_contention_leaves_no_open_transaction(self):
+        # F-003 (swarm-pr-review round 2): the run-start handler returns
+        # after a contended write; pysqlite's implicit BEGIN succeeds
+        # WITHOUT taking a lock and SQLite does not end the transaction on
+        # SQLITE_BUSY, so without the rollback guard the connection comes
+        # back still inside a transaction and the next caller (organize.py
+        # reuses it) trips over 'cannot start a transaction within a
+        # transaction'.
+        conn = self._seeded_conn()
+        before = conn.execute(
+            "SELECT value FROM meta WHERE key='last_consolidation'").fetchone()
         blocker = sqlite3.connect(str(self.store), timeout=0)
         blocker.execute("BEGIN IMMEDIATE")
         self.addCleanup(blocker.close)
@@ -1415,8 +1442,6 @@ class ContentionRuledRetryTest(SuppBase):
         import importlib
         cons = importlib.import_module("storelib.consolidate")
         out, err = _io.StringIO(), _io.StringIO()
-        # the contention must surface INSIDE consolidate as the ruled line,
-        # never as an escaping OperationalError
         try:
             with _cl.redirect_stdout(out), _cl.redirect_stderr(err):
                 report = cons.consolidate(
@@ -1426,10 +1451,99 @@ class ContentionRuledRetryTest(SuppBase):
                       f"{type(e).__name__}: {e}")
         finally:
             blocker.rollback()
-        self.assertTrue(
-            "rolled back, will retry next run" in err.getvalue()
-            or "run-start write failed" in err.getvalue(),
-            err.getvalue()[-400:])
+        self.assertIn("run-start write failed", err.getvalue())
+        self.assertNotIn("rolled back, will retry next run", err.getvalue())
+        self.assertTrue(report.get("skipped_by_contention"), report)
+        self.assertFalse(conn.in_transaction,
+                         "the contended run-start write left the connection "
+                         "inside an open transaction")
+        after = conn.execute(
+            "SELECT value FROM meta WHERE key='last_consolidation'").fetchone()
+        self.assertEqual(before, after,
+                         "a contended run-start write must not change the "
+                         "last_consolidation stamp")
+
+    def test_cluster_loop_contention_prints_ruled_retry(self):
+        # The cluster-loop guard: the BEGIN IMMEDIATE inside the loop
+        # fails (write-lock contention past busy_timeout). No transaction
+        # is open, so a bare ROLLBACK would raise 'cannot rollback - no
+        # transaction is active' OUT of the handler and kill the run with
+        # an unhandled traceback. The guard must skip the rollback and
+        # print the ruled retry line.
+        conn = self._seeded_conn()
+
+        class _BeginLocked:
+            """Fails ONLY the cluster loop's explicit BEGIN IMMEDIATE."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **k):
+                if "BEGIN IMMEDIATE" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+                return self._inner.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        import io as _io
+        import contextlib as _cl
+        import importlib
+        cons = importlib.import_module("storelib.consolidate")
+        out, err = _io.StringIO(), _io.StringIO()
+        try:
+            with _cl.redirect_stdout(out), _cl.redirect_stderr(err):
+                report = cons.consolidate(
+                    _BeginLocked(conn), threshold=0.05, force=True,
+                    namespace=NS)
+        except Exception as e:
+            self.fail(f"consolidate let the cluster-loop contention escape as "
+                      f"{type(e).__name__}: {e}")
+        self.assertIn("rolled back, will retry next run", err.getvalue(),
+                      err.getvalue()[-400:])
+        self.assertNotIn("run-start write failed", err.getvalue())
+
+    def test_rollback_failure_is_reported(self):
+        # F-003 (swarm-pr-review round 2, Stage-B review): a rollback that
+        # ITSELF fails must be REPORTED — the handler must not return a
+        # clean-looking retry report while the connection may still hold an
+        # open transaction.
+        conn = self._seeded_conn()
+
+        class _RollbackFails:
+            """The write fails (lock held) and the rollback fails too."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def rollback(self):
+                raise sqlite3.OperationalError("rollback refused")
+
+            def execute(self, sql, *a, **k):
+                return self._inner.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        blocker = sqlite3.connect(str(self.store), timeout=0)
+        blocker.execute("BEGIN IMMEDIATE")
+        self.addCleanup(blocker.close)
+        import io as _io
+        import contextlib as _cl
+        import importlib
+        cons = importlib.import_module("storelib.consolidate")
+        out, err = _io.StringIO(), _io.StringIO()
+        try:
+            with _cl.redirect_stdout(out), _cl.redirect_stderr(err):
+                cons.consolidate(_RollbackFails(conn), threshold=0.05,
+                                 force=True, namespace=NS)
+        except Exception as e:
+            self.fail(f"consolidate let the rollback failure escape as "
+                      f"{type(e).__name__}: {e}")
+        finally:
+            blocker.rollback()
+        self.assertIn("run-start rollback failed", err.getvalue(),
+                      err.getvalue()[-400:])
 
 
 class Vec0RekeyCasSuppTest(SuppBase):
@@ -1505,6 +1619,416 @@ class Vec0RekeyCasSuppTest(SuppBase):
             "'project:beta' AND superseded_at IS NULL",
             (nb["id"],)).fetchone()[0]
         self.assertEqual(beta_live, 1)
+
+
+class SurgeryAtomicityTest(SuppBase):
+    """F-001 (swarm-pr-review round 2): the FTS surgery's recreate must be
+    ONE transaction.
+
+    With pysqlite's default isolation level the DROP/CREATE DDL auto-commits
+    one statement at a time while the rebuild INSERT commits later, so a
+    failure (or a kill) between the DDL and the rebuild left all five FTS
+    objects PRESENT with an EMPTY index. `_recover_search_index` only
+    rebuilds when an object is MISSING, so the next open never healed it and
+    every pre-existing row stayed unsearchable until a manual rebuild-fts.
+    With the recreate in one explicit transaction the failure rolls the
+    whole recreate back, and the plain recovery arm heals the store.
+    """
+
+    def _unconstructible_store(self):
+        self._add("surgery atomicity row one alpha")
+        self._add("surgery atomicity row two beta")
+        conn = sqlite3.connect(str(self.store))
+        conn.execute("DROP TABLE memory_fts_data")  # -> unconstructible vtable
+        conn.commit()
+        conn.close()
+
+    def test_failed_surgery_leaves_a_healable_store(self):
+        self._unconstructible_store()
+        import storelib.schema as schema
+        real_connect = sqlite3.connect
+
+        class _RebuildFails:
+            """Fails the rebuild INSERT (after the DDL) and nothing else."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **k):
+                if "VALUES('rebuild')" in sql:
+                    raise sqlite3.OperationalError("injected rebuild failure")
+                return self._inner.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        def _boom_connect(*args, **kwargs):
+            return _RebuildFails(real_connect(*args, **kwargs))
+
+        sqlite3.connect = _boom_connect
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                schema._fts_schema_surgery(str(self.store))
+        finally:
+            sqlite3.connect = real_connect
+
+        # The next open must heal the index and every PRE-EXISTING row must
+        # be MATCH-findable again (pre-fix: the objects were all present, so
+        # the recovery gate skipped the rebuild and the rows stayed
+        # unsearchable).
+        r = self._add("post surgery failure row")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        conn = self._store_conn()
+        try:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            self.assertEqual(integrity, "ok",
+                             "a rolled-back surgery must leave the store "
+                             "integrity-clean")
+            for word in ("alpha", "beta"):
+                hits = conn.execute(
+                    "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?",
+                    (f'"{word}"',)).fetchone()[0]
+                self.assertGreater(hits, 0, word)
+        finally:
+            conn.close()
+
+    def _surgery_must_propagate(self, message):
+        self._unconstructible_store()
+        import storelib.generation as gen_mod
+        import storelib.schema as schema
+        original = gen_mod.bump_mutation_generation
+
+        def _boom(_conn):
+            raise sqlite3.OperationalError(message)
+
+        gen_mod.bump_mutation_generation = _boom
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                schema._fts_schema_surgery(str(self.store))
+        finally:
+            gen_mod.bump_mutation_generation = original
+
+    def test_bump_failure_with_a_different_table_is_not_swallowed(self):
+        # "no such table: meta_extra" is NOT the benign case: a substring
+        # test would swallow it.
+        self._surgery_must_propagate("no such table: meta_extra")
+
+    def test_bump_failure_ending_with_the_benign_phrase_is_not_swallowed(self):
+        # Only the EXACT message is the benign case: an unrelated error
+        # whose text merely ends with "no such table: meta" must propagate
+        # too, so the recreate rolls back.
+        self._surgery_must_propagate("boom: no such table: meta")
+
+    def test_failed_generation_bump_rolls_the_recreate_back(self):
+        # The mutation-generation bump IS the #474 recall-cache
+        # invalidation: generation.py is explicit that a bump which cannot
+        # run inside the write transaction is a caller bug, not a
+        # degraded-ok state. A swallowed bump would commit a healed store
+        # whose cached recall survives the heal, so the bump failure must
+        # roll the whole recreate back.
+        self._unconstructible_store()
+        import storelib.generation as gen_mod
+        import storelib.schema as schema
+        original = gen_mod.bump_mutation_generation
+
+        def _boom(_conn):
+            raise sqlite3.OperationalError("injected bump failure")
+
+        gen_mod.bump_mutation_generation = _boom
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                schema._fts_schema_surgery(str(self.store))
+        finally:
+            gen_mod.bump_mutation_generation = original
+
+        # The recreate rolled back, so the next open heals the store and
+        # every pre-existing row is MATCH-findable again.
+        r = self._add("post bump failure row")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        conn = self._store_conn()
+        try:
+            for word in ("alpha", "beta"):
+                hits = conn.execute(
+                    "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?",
+                    (f'"{word}"',)).fetchone()[0]
+                self.assertGreater(hits, 0, word)
+        finally:
+            conn.close()
+
+
+class RoundOneCommentLegsTest(_InProcessRestoreBase):
+    """Legs for the round-1 review comment's code findings (which the
+    round-2 inventory did not cover until the closeout critic found the gap).
+
+    - R1-F-002: the surgery's `meta` READ is gated on the meta table's
+      presence, so a store with no meta table cannot fail mid-recreate.
+    - R1-F-004: the staged copy is made INSIDE the guarded block, so a copy
+      failure is contained (a ruled message, no traceback, no leftover
+      `.restore-stage-*` file).
+    - R1-F-005: the forensic dir is hardened BEFORE the pre-restore copies
+      land in it.
+    - R1-F-010: init_db recreates a dropped `memory_au` with the form the
+      store's stamp implies (the guarded v2+ form on a v2+ store).
+    """
+
+    def test_surgery_heals_a_store_without_a_meta_table(self):
+        self._add("no meta table row alpha")
+        conn = sqlite3.connect(str(self.store))
+        conn.execute("DROP TABLE memory_fts_data")   # -> unconstructible vtable
+        conn.execute("DROP TABLE meta")
+        conn.commit()
+        conn.close()
+        import storelib.schema as schema
+        schema._fts_schema_surgery(str(self.store))   # must NOT raise
+        conn = sqlite3.connect(str(self.store))
+        try:
+            hits = conn.execute(
+                "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?",
+                ('"alpha"',)).fetchone()[0]
+            self.assertGreater(hits, 0, "the healed index must find the row")
+        finally:
+            conn.close()
+
+    def test_staged_copy_failure_is_contained(self):
+        self._add("staged copy failure row")
+        snap = self._snapshot(self.dir, self.store)
+        original = {}
+
+        def _patch(_mod):
+            import shutil as sh
+            original["copy2"] = sh.copy2
+
+            def _boom(src, dst, *a, **k):
+                if ".restore-stage-" in str(dst):
+                    raise OSError("injected staged copy failure")
+                return original["copy2"](src, dst, *a, **k)
+
+            sh.copy2 = _boom
+
+        def _unpatch(_mod):
+            import shutil as sh
+            sh.copy2 = original["copy2"]
+
+        result = self._run(snap, patch=_patch, unpatch=_unpatch)
+        self.assertEqual(result["rc"], 1, result)
+        self.assertIn("destination untouched", result["err"])
+        self.assertNotIn("Traceback", result["err"])
+        leftovers = [p.name for p in self.dir.iterdir()
+                     if ".restore-stage-" in p.name]
+        self.assertEqual(leftovers, [],
+                         "a failed staged copy must not leave a stage file")
+
+    def test_forensic_dir_is_hardened_before_the_copies(self):
+        self._add("forensic hardening order row")
+        snap = self._snapshot(self.dir, self.store)
+        # sidecars beside the store make the restore take the forensic-copy
+        # path (step 3+4).
+        for p in [self.store] + [Path(str(self.store) + s)
+                                 for s in ("-wal", "-shm", "-journal")]:
+            if p.exists():
+                p.unlink()
+        Path(str(self.store) + "-wal").write_bytes(b"WALJUNK")
+        Path(str(self.store) + "-shm").write_bytes(b"SHMJUNK")
+        events = []
+        original = {}
+
+        def _patch(_mod):
+            import shutil as sh
+            original["copy2"] = sh.copy2
+            original["host"] = _mod._host
+
+            class _RecordingHost:
+                def __init__(self, real):
+                    self._real = real
+
+                def set_owner_only_perms(self, path):
+                    events.append(("harden", str(path)))
+                    if self._real is not None:
+                        return self._real.set_owner_only_perms(path)
+
+                def __getattr__(self, name):
+                    if self._real is None:
+                        raise AttributeError(name)
+                    return getattr(self._real, name)
+
+            def _spy(src, dst, *a, **k):
+                events.append(("copy", str(dst)))
+                return original["copy2"](src, dst, *a, **k)
+
+            sh.copy2 = _spy
+            _mod._host = _RecordingHost(_mod._host)
+
+        def _unpatch(mod):
+            import shutil as sh
+            sh.copy2 = original["copy2"]
+            mod._host = original["host"]
+
+        result = self._run(snap, patch=_patch, unpatch=_unpatch)
+        self.assertEqual(result["rc"], 0, result["err"][-400:])
+        hardens = [i for i, (kind, path) in enumerate(events)
+                   if kind == "harden" and "restore-forensic-" in path]
+        copies = [i for i, (kind, path) in enumerate(events)
+                  if kind == "copy" and "restore-forensic-" in path]
+        self.assertTrue(hardens, f"the forensic dir was never hardened: {events}")
+        self.assertTrue(copies, f"no forensic copy happened: {events}")
+        self.assertLess(hardens[0], copies[0],
+                        "the forensic dir must be hardened BEFORE the "
+                        f"pre-restore copies land in it: {events}")
+
+    def test_init_db_recreates_the_guarded_update_trigger(self):
+        self._add("trigger parity row")
+        conn = sqlite3.connect(str(self.store))
+        conn.execute("DROP TRIGGER memory_au")
+        conn.commit()
+        conn.close()
+        r = self._add("post parity row")
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        conn = sqlite3.connect(str(self.store))
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='memory_au'").fetchone()
+            self.assertIsNotNone(row, "memory_au was not recreated")
+            self.assertIn("WHEN", row[0].upper(),
+                          "a v2+ store must get the GUARDED update trigger")
+        finally:
+            conn.close()
+
+
+class RestoreOutputEscapingTest(_InProcessRestoreBase):
+    """F-002 (swarm-pr-review round 2): every restore-path line that echoes
+    snapshot- or store-derived text goes through the _esc() helper, so a
+    crafted snapshot (or a crafted SQLite error) cannot inject terminal
+    control bytes into the operator's terminal."""
+
+    def test_preparation_failure_text_is_escaped(self):
+        # The preparation-failure line (step 3+4) echoed the raw exception
+        # text; pre-fix this leg fails because the ESC byte reaches the
+        # output unescaped.
+        self._add("escaping control row")
+        snap = self._snapshot(self.dir, self.store)
+        original = {}
+
+        def _raise(_path):
+            raise RuntimeError("incarnation rotation failed \x1b[31mRED\x1b[0m")
+
+        def _patch(_mod):
+            import storelib.generation as gen_mod
+            original["fn"] = gen_mod.rotate_incarnation_on_staging
+            gen_mod.rotate_incarnation_on_staging = _raise
+
+        def _unpatch(_mod):
+            import storelib.generation as gen_mod
+            gen_mod.rotate_incarnation_on_staging = original["fn"]
+
+        result = self._run(snap, patch=_patch, unpatch=_unpatch)
+        self.assertEqual(result["rc"], 1, result)
+        self.assertIn("restore ABORTED", result["err"])
+        out = result["out"] + result["err"]
+        self.assertNotIn("\x1b", out,
+                         "a raw ESC byte reached the restore output")
+        self.assertIn("\\x1b[31m", out,
+                      "the control bytes must appear in escaped form")
+
+    def test_esc_helper_escapes_a_control_bearing_name(self):
+        # The reviewer asked for a leg over an ESC-bearing SNAPSHOT NAME.
+        # Windows forbids ASCII control characters in a file name, so such a
+        # file cannot exist on this host (the ubuntu CI lane could create
+        # one); the reachable carrier of the same bytes is the text the
+        # restore echoes (the SQLite error text, the snapshot-derived
+        # identifiers), which the leg above drives end to end. This leg pins
+        # the helper itself on an ESC-bearing NAME string, so the escaping
+        # contract of a path-shaped value is pinned on every platform.
+        import storelib.backup as backup_mod
+        escaped = backup_mod._esc("snap\x1b[31mshot.sqlite")
+        self.assertNotIn("\x1b", escaped)
+        self.assertIn("\\x1b[31m", escaped)
+        # clean text passes through unchanged, so ordinary names stay
+        # greppable in the ruled output.
+        self.assertEqual(backup_mod._esc("store-2026.sqlite"),
+                         "store-2026.sqlite")
+
+    @unittest.skipUnless(os.name != "nt",
+                         "Windows forbids ASCII control characters in a file "
+                         "name, so an ESC-bearing snapshot file cannot exist "
+                         "on this platform (the ubuntu CI lane runs it)")
+    def test_esc_bearing_snapshot_filename_is_escaped(self):
+        # The end-to-end filename leg: the restore echoes the snapshot path
+        # it was given, and a snapshot whose NAME carries terminal control
+        # bytes must reach the operator escaped.
+        self._add("esc filename row")
+        snap = self._snapshot(self.dir, self.store)
+        esc_name = snap.parent / ("snap\x1b[31mshot.sqlite")
+        shutil.copy2(snap, esc_name)
+        result = self._run(esc_name)
+        out = result["out"] + result["err"]
+        self.assertNotIn("\x1b", out,
+                         "a raw ESC byte from the snapshot name reached the "
+                         "restore output")
+        self.assertIn("\\x1b[31m", out,
+                      "the snapshot name must appear in escaped form")
+
+
+class RestoreWorkDirHardeningTest(_InProcessRestoreBase):
+    """F-005 (swarm-pr-review round 2): the restore's WORK directory (a byte
+    copy of the live store) must be owner-only hardened like the forensic
+    directory beside it, so the guarantee does not depend on how the backup
+    directory was created (an operator-supplied --out-dir is not hardened by
+    _ensure_backup_dir). The leg pins the CALL, not the identifier: the
+    hardening helper must be invoked with the work directory."""
+
+    def test_work_dir_is_hardened(self):
+        self._add("work dir hardening row")
+        snap = self._snapshot(self.dir, self.store)
+        calls = []
+
+        class _RecordingHost:
+            def __init__(self, real):
+                self._real = real
+
+            def set_owner_only_perms(self, path):
+                calls.append(Path(path))
+                if self._real is not None:
+                    return self._real.set_owner_only_perms(path)
+
+            def __getattr__(self, name):
+                if self._real is None:
+                    raise AttributeError(name)
+                return getattr(self._real, name)
+
+        original = {}
+
+        def _patch(mod):
+            original["host"] = mod._host
+            mod._host = _RecordingHost(mod._host)
+
+        def _unpatch(mod):
+            mod._host = original["host"]
+
+        result = self._run(snap, patch=_patch, unpatch=_unpatch)
+        self.assertEqual(result["rc"], 0, result["err"][-400:])
+        hardened = [p for p in calls if p.name.startswith("restore-work-")]
+        self.assertTrue(hardened,
+                        f"the restore work dir was never hardened: {calls}")
+
+
+class CliEarlyErrorShapeTest(SuppBase):
+    """F-019 (swarm-pr-review round 2): the early connect/prepare failure
+    path prints the same command prefix as the general writer-lease path, so
+    an operator sees WHICH command failed (and never a traceback)."""
+
+    def test_early_failure_prints_the_command_prefix(self):
+        blocker = self.dir / "not-a-directory"
+        blocker.write_bytes(b"x")
+        env = _child_env(self.dir, blocker / "store.sqlite")
+        r = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "recall", "--query", "probe",
+             "--no-bump", "--json"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=180)
+        self.assertEqual(r.returncode, 2, r.stderr[-300:])
+        self.assertIn("[zmem] recall: ", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

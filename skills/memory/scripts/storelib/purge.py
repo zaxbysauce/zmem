@@ -1506,10 +1506,11 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             # dirs hold byte-copies of the pre-restore store and its -wal
             # (WAL page images can carry purged-content bytes the restored
             # store no longer has). Leaving them silently behind would
-            # violate --scrub-backups' completeness surface — refuse loudly
-            # (they are operator recovery artifacts, so deleting them
-            # automatically is not this flag's call; the operator inspects
-            # and removes them, then re-runs).
+            # violate --scrub-backups' completeness surface — WARN loudly
+            # on stderr (they are operator recovery artifacts, so deleting
+            # them automatically is not this flag's call; the operator
+            # inspects and removes them, then re-runs). The distinct exit
+            # code for rc-keying automation is issue #542's AC5.
             restore_artifacts = sorted(
                 d for d in bdir.glob("restore-forensic-*") if d.is_dir()
             ) + sorted(d for d in bdir.glob("restore-work-*") if d.is_dir())

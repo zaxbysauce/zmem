@@ -63,6 +63,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   derives every inherited value, guard, capture-policy decision and derived
   field ONCE, from the row read under the write lock, after the existing
   drift refusals have compared that row with the pre-lock snapshot.
+- **The store-recovery paths are now atomic where they were not.** The
+  search-index surgery recreates the whole search table in ONE transaction:
+  a failure or a kill between the DDL and the rebuild now rolls the
+  recreate back and the next open heals the store — instead of leaving
+  every search object present with an EMPTY index that the recovery gate
+  (which only rebuilds a MISSING object) would never repair, so the rows
+  stayed unsearchable until a manual `rebuild-fts`. A consolidation run
+  that loses the write lock at its first write now rolls its transaction
+  back before it returns, so the next caller does not trip over an open
+  transaction. Every restore-path line that echoes snapshot- or store-derived
+  text is escaped — the ONE exception is the manual-recovery line, which is
+  a copy-paste command and therefore keeps the path byte-exact (and
+  shell-quoted) — so a crafted snapshot cannot inject terminal control
+  bytes into the operator's terminal. The restore's working directory (a
+  byte copy of the live store) is now owner-only hardened like the forensic
+  directory beside it, on a best-effort basis: a filesystem that cannot
+  harden must not break the restore, so the hardening call is made and a
+  failure to harden does not abort it.
 
 - **Prompt-assertion partition: sentence-scoped negation, multi-focus orthogonal drop, moment allow-list, rescue count after admission** (issue #530).
   The partition now splits a stored row into sentences before applying

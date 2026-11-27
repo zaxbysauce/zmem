@@ -6492,7 +6492,7 @@ def main():
         if conn is not None:
             conn.close()
         _release_writer_lease(writer_lease)
-        print(f"[zmem] {e}", file=sys.stderr)
+        print(f"[zmem] {args.cmd}: {e}", file=sys.stderr)
         sys.exit(2)
     except BaseException:
         if conn is not None:
