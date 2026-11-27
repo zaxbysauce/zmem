@@ -60,20 +60,23 @@ SECRET_CREDENTIAL_PATTERNS = [
     #    SAME accepted fail-safe direction as the #180 matrix's ssh -p port
     #    precedent; a literal 12+ char word as a header VALUE carries no
     #    credential meaning anyway.
-    # 2. BARE `Basic <val>` (no header prefix): unconditional at 8+ chars —
-    #    the SAME value floor as the key=value credential rule (\S{8,}) —
-    #    so EVERY value shape (mixed, all-uppercase, digit-bearing, AND
-    #    pure-lowercase) redacts in bare context too (review 4.5 r6: the
-    #    lowercase-only bare gap was rejected — no user deferral exists).
-    #    The cost is fail-safe over-redaction of 8+ char words after bare
-    #    "Basic " ("Basic authentication" is redacted) — the #180 ssh -p
-    #    fail-safe direction; sub-8-char values survive (below ANY
+    # 2. BARE `Basic <val>` (no header prefix): unconditional at 4+ chars —
+    #    the SAME floor as the header rule (the base64 minimum) — so EVERY
+    #    value shape at EVERY credential-plausible length (mixed, all-
+    #    uppercase, digit-bearing, AND pure-lowercase) redacts in bare
+    #    context too (review 4.5 r7: the sub-8-char bare gap was rejected —
+    #    `Basic YTpi` is a valid 4-char encoding of a:b, and no user
+    #    deferral of short bare credentials exists). The cost is fail-safe
+    #    over-redaction of 4+ char words after bare "Basic " ("Basic
+    #    things", "Basic password" are redacted) — the #180 ssh -p
+    #    fail-safe direction, disclosed as the accepted price of closing
+    #    the credential class. Sub-4-char values survive (below ANY
     #    credential floor in the registry). The header rule runs FIRST in
     #    the registry, so header contexts are consumed before this rule is
     #    tried. Whole-match semantics like Bearer; the alphabet-boundary
     #    convention is copied verbatim.
     re.compile(r"(?i)(?<![A-Za-z0-9_])Authorization\s*:\s*Basic\s+[A-Za-z0-9._+/=~-]{4,}(?![A-Za-z0-9._+/=~-])"),
-    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+[A-Za-z0-9._+/=~-]{8,}(?![A-Za-z0-9._+/=~-])"),
+    re.compile(r"(?i:(?<![A-Za-z0-9_])Basic)\s+[A-Za-z0-9._+/=~-]{4,}(?![A-Za-z0-9._+/=~-])"),
     # PEM: prefer the FULL block (BEGIN..END, whole-match) so the body dies
     # with the header; the header-only shape remains as fallback for a
     # truncated paste. Both are non-capturing so no group logic can misfire.
