@@ -167,3 +167,8 @@ def test_scope_vs_revision() -> None:
         assert _superseded_at(db, e) is None
         assert _superseded_at(db, f) is None
         assert _superseded_at(db, g2) is None
+
+
+if __name__ == "__main__":
+    test_scope_vs_revision()
+    print("test_scope_vs_revision passed")

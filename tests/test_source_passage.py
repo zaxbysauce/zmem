@@ -200,17 +200,18 @@ class SourcePassageTests(unittest.TestCase):
         sha = _init_git_repo(repo)
         repair_env: dict[str, str | None] = {"ZMEM_REPAIR_ROOT": str(root)}
         content = (f"canary fails rollback {sha} immediately; "
-                   "password=An0therSecret!42 for the service account.")
+                   "reference 77f0e1d2c3b4a596877869504132f3e4d5c6b7a8 "  # noqa: E501
+                   "for the service account.")
         _init(root, repair_env)
         memory_id = _add(root, content, repair_env)
         db = root / "store.sqlite"
 
         # Base behavior anchor: the capture path redacted both spans (the
-        # unlabeled 40-hex run and the password value).
+        # two unlabeled hex runs — no credential label nearby).
         stored = _memory_content(db, memory_id)
         self.assertIn("[REDACTED_SECRET]", stored)
         self.assertNotIn(sha, stored)
-        self.assertNotIn("An0therSecret!42", stored)
+        self.assertNotIn("77f0e1d2c3b4a596877869504132f3e4d5c6b7a8", stored)
 
         evidence_id = "ev-repair-1"
         _insert_evidence(db, memory_id, [(
@@ -258,7 +259,7 @@ class SourcePassageTests(unittest.TestCase):
         repaired = _memory_content(db, memory_id)
         self.assertIn(sha, repaired)
         self.assertIn("[REDACTED_SECRET]", repaired)
-        self.assertNotIn("An0therSecret!42", repaired)
+        self.assertNotIn("77f0e1d2c3b4a596877869504132f3e4d5c6b7a8", repaired)
 
         # Refusals on a second, independent store: a TAMPERED quotation and a
         # context-matching but unverified object both refuse without mutation.

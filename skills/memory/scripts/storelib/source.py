@@ -735,12 +735,16 @@ def resolve_revision(
             return _refused("unknown memory id", owns_tx)
         t_id, t_ns, t_superseded, t_source_ref = (
             target[0], target[1], target[2], target[3])
+        if expected_namespace is not None and t_ns != expected_namespace:
+            # swarm-pr-review INTENT-001/FB-005: the namespace guard runs
+            # BEFORE any state-revealing refusal, matching supersede_memory's
+            # guard-first ordering — a wrong-namespace caller learns nothing
+            # about the target's liveness or pointer status.
+            return _refused("namespace guard mismatch", owns_tx)
         if t_superseded is not None:
             return _refused("already superseded", owns_tx)
         if _has_knowledge_prefix(t_source_ref or ""):
             return _refused("reserved knowledge-pointer row", owns_tx)
-        if expected_namespace is not None and t_ns != expected_namespace:
-            return _refused("namespace guard mismatch", owns_tx)
         if _scope_narrower(t_ns, scope):
             return _refused(
                 "target scope is narrower than the revision's scope", owns_tx)
@@ -831,9 +835,11 @@ MARKER = "[REDACTED_SECRET]"
 # span is always unlabeled and a genuine identifier line simply does not
 # carry these words). Plurals and near-synonyms included (r4).
 _CREDENTIAL_PROSE_RE = re.compile(
-    r"(?i)(?:api[_ -]?key|secret|token|password|passwd|pwd|pass"
-    r"|private[_ -]?key|bearer|credential|passphrase|auth|hmac"
-    r"|signing|session|cookie)")
+    r"(?i)(?:api[_\s-]*key|secret|token|password|passwd|pwd|pass"
+    r"|private[_\s-]*key|bearer|credential|passphrase|auth|hmac"
+    r"|signing|session|cookie"
+    r"|(?:ssh|gpg|pgp|aes|master|encryption|decryption|access|cipher"
+    r"|secret)[_\s-]*key)")
 
 
 def _bind_block_candidate(
@@ -1192,9 +1198,16 @@ def repair_from_evidence(
         # call (an absolute or ../ ref_path must never select a repository
         # outside ZMEM_REPAIR_ROOT).
         candidate = candidate_occurrences[0]
+        # swarm-pr-review COR-001/FB-006: record the candidate's SPAN so
+        # alignment replaces exactly the regex-matched occurrence — a
+        # non-boundary duplicate (<sha>_note) must not produce an extra
+        # marker (literal replace-all did).
+        _m = _HEX_40_64_RE.search(excerpt)
+        candidate_span = (_m.start(), _m.end())
         resolver_kind = "excerpt"
         verification_kind = "git_object"
-        alignment_text = excerpt.replace(candidate, MARKER)
+        alignment_text = (excerpt[:candidate_span[0]] + MARKER
+                          + excerpt[candidate_span[1]:])
     elif len(candidate_occurrences) == 0 and marker_count == 1:
         # Resolver path (Amendment A1-R2/R3): recover from the trusted
         # source the evidence was captured from.
@@ -1236,11 +1249,20 @@ def repair_from_evidence(
         except OSError as exc:
             raise SourceRefusal("ref_path is not a safe directory") from exc
 
+        # swarm-pr-review SUBP-001/FB-004: the verification subprocess
+        # must not inherit ambient GIT_* variables — GIT_DIR,
+        # GIT_OBJECT_DIRECTORY or GIT_ALTERNATE_OBJECT_DIRECTORIES could
+        # redirect the containment checks (toplevel equality, cat-file) to
+        # outside object stores. Strip every GIT_* variable; -C supplies
+        # the working tree.
+        _git_env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("GIT_")}
+
         def _git(*args: str) -> subprocess.CompletedProcess:
             return _subprocess.run(
                 ["git", "-C", str(repo_dir), *args],
                 capture_output=True, text=True, timeout=60,
-                encoding="utf-8", errors="replace")
+                encoding="utf-8", errors="replace", env=_git_env)
 
         probe = _git("rev-parse", "--show-toplevel")
         if probe.returncode != 0:
@@ -1268,11 +1290,11 @@ def repair_from_evidence(
         if content_now is None:
             raise SourceRefusal("memory vanished")
         _check_alignment(content_now[0] or "", alignment_text)
-        if resolver_kind != "excerpt":
-            # Final-critic r7: preview/apply PARITY — the destination gate
-            # runs here too, so a preview never reports verified (and never
-            # prints restore_value) for a case apply will refuse.
-            _check_destination_context(content_now[0] or "")
+        # Final-critic r7 + swarm-pr-review G2: the destination gate runs on
+        # EVERY repair path (preview parity; the excerpt path too — a
+        # neighbouring credential label in the stored content refuses even
+        # though the restored value is a git-object id).
+        _check_destination_context(content_now[0] or "")
         # Preview NEVER proceeds into the apply transaction (the arm-B
         # snapshot connection is query-only — a fall-through would fail with
         # "attempt to write a readonly database").
@@ -1303,13 +1325,9 @@ def repair_from_evidence(
             if (re_candidate, re_kind) != (candidate, resolver_kind):
                 raise SourceRefusal(
                     "trusted source changed between resolution and apply")
-            # Final-critic r6 finding 1: the excerpt-boundary gate (r5) does
-            # not see labels OUTSIDE the excerpt — a credential label on a
-            # NEIGHBOURING line of the memory content (the repair writes the
-            # raw value right next to it) must refuse too. The destination
-            # is the authoritative context: it is what the value will sit
-            # inside after the write. (r7: the scan is the SHARED helper —
-            # preview runs it too, for parity.)
+            # Final-critic r6/r7 + swarm-pr-review G2: the destination gate
+            # runs on EVERY repair path under the lock (the destination is
+            # the authoritative context of what the value will sit inside).
             _check_destination_context(content)
         _check_alignment(content, alignment_text)
         # Replace ONLY the marker span inside the aligned occurrence: the

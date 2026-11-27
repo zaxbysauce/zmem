@@ -342,7 +342,16 @@ class SourceRepairResolverTests(unittest.TestCase):
                      # block scan (marker removed) refuses them.
                      f"auth {CANARY}",
                      f"signing key {CANARY}",
-                     f"session cookie {CANARY}"):
+                     f"session cookie {CANARY}",
+                     # swarm-pr-review G1/FB-001: widened vocabulary +
+                     # whitespace variants (each must refuse end-to-end).
+                     f"encryption key: {CANARY}",
+                     f"aes key: {CANARY}",
+                     f"master key {CANARY}",
+                     f"access key {CANARY}",
+                     f"cipher key {CANARY}",
+                     f"api  key: {CANARY}",
+                     f"api	key: {CANARY}"):
             with self.subTest(line=line):
                 env, memory_id = self._seed(
                     [LINE1, line, LINE3],

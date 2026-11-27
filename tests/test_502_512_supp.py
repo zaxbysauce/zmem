@@ -775,6 +775,12 @@ class TrustedSourceResolverTests(unittest.TestCase):
             self.assertEqual(len(pred_entries), 1)
             self.assertNotIn("restored", pred_entries[0])
             self.assertIn("restored_sha256", pred_entries[0])
+            # swarm-pr-review TEST-002/FB-011: the digest must be the value's
+            # actual SHA-256, not just any present string.
+            import hashlib as _hashlib
+            self.assertEqual(
+                pred_entries[0]["restored_sha256"],
+                _hashlib.sha256(self.CANARY.encode("utf-8")).hexdigest())
 
             # Applying rescan: the trusted_source value is NOT exempt -
             # rescan re-detects and remediates it into a redacted successor.

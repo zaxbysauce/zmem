@@ -2726,7 +2726,7 @@ def _dispatch_source_repair(args: "argparse.Namespace") -> None:
                 _release_writer_lease(writer_lease)
         else:  # pragma: no cover - argparse enforces the group
             raise SourceRefusal("one of --preview/--apply is required")
-    except (SourceRefusal, ValueError, OSError, sqlite3.Error) as exc:
+    except (SourceRefusal, ValueError, OSError, sqlite3.Error, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"[zmem] source repair: refused ({exc})", file=sys.stderr)
         sys.exit(1)
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
@@ -2784,7 +2784,7 @@ def _dispatch_source_verify(args: "argparse.Namespace") -> None:
             sys.exit(0)
         finally:
             conn.close()
-    except (SourceRefusal, ValueError, OSError, sqlite3.Error) as exc:
+    except (SourceRefusal, ValueError, OSError, sqlite3.Error, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"[zmem] source verify: refused ({exc})", file=sys.stderr)
         sys.exit(1)
     finally:
