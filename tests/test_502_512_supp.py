@@ -169,7 +169,9 @@ class PerFieldCalibrationTests(unittest.TestCase):
 
     def test_boundary_selection_same_last_field(self) -> None:
         # R5-3 positive: the label occurs earlier in the SAME (last) field.
-        combined = "build notes build id 3f2a1b0c9d8e"
+        # (posted-review F-001: the value must now be a digest-shaped run —
+        # 32/40/64/128 all-hex — so the fixture uses a 40-hex build id.)
+        combined = "build notes build id 3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f42"
         pos = combined.index("3f2a1b0c9d8e")
         self.assertTrue(is_identifier_context_match(combined, pos,
                                                     boundary=0))
@@ -957,6 +959,47 @@ class TrustedSourceResolverTests(unittest.TestCase):
             self.assertEqual(payload["resolver"], "zcode")
             self.assertIn(self.CANARY,
                           _memory_content(root / "store.sqlite", memory_id))
+
+    def test_zcode_wrong_session_refuses(self) -> None:
+        # posted-review F-017: the zcode resolver's session identity check
+        # must refuse evidence whose session does not match the ref.
+        with tempfile.TemporaryDirectory(
+                prefix="zmem-supp-resolver-zcode-wrong-") as temp:
+            root = Path(temp)
+            env = dict(os.environ)
+            env.update({
+                "ZMEM_STORE": str(root / "store.sqlite"),
+                "ZMEM_DATA": str(root),
+                "ZMEM_MODELS_DIR": str(root / "missing-models"),
+                "ZMEM_MODEL_AUTODOWNLOAD": "0",
+                "ZMEM_EMBED_PROFILE": "fake",
+                "ZMEM_NAMESPACE": "project:resolver-supp",
+            })
+            for key in ("ZMEM_ZCODE_DB", "ZMEM_HERMES_SESSIONS",
+                        "HERMES_HOME", "ZMEM_SOURCE_ROOT",
+                        "ZMEM_REPAIR_ROOT"):
+                env.pop(key, None)
+            turn_raw = f"canary fails rollback {self.CANARY} immediately"
+            result = _run(root, "init", extra_env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            add = _run(root, "add", "--namespace", "project:resolver-supp",
+                       "--type", "fact", "--content", turn_raw,
+                       "--signal", "test", "--confidence", "0.9", "--json",
+                       extra_env=env)
+            self.assertEqual(add.returncode, 0, add.stderr)
+            memory_id = str(json.loads(add.stdout)["id"])
+            # Evidence session (s-other) does NOT match the ref session
+            # (s-zc): the identity check refuses before any DB access.
+            evidence_id = self._write_production_evidence(
+                root / "store.sqlite", memory_id, turn_raw,
+                "zcode:session/s-zc", None, "s-other")
+            refused = _run(root, "source", "repair", "--id", memory_id,
+                           "--evidence-id", evidence_id, "--preview",
+                           extra_env=env)
+            self.assertEqual(refused.returncode, 1, refused.stdout)
+            self.assertNotIn(self.CANARY,
+                             _memory_content(root / "store.sqlite",
+                                             memory_id))
 
     def test_hermes_wrong_session_refuses(self) -> None:
         with tempfile.TemporaryDirectory(

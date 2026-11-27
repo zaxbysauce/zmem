@@ -138,6 +138,13 @@
       "kind": "benign",
       "expected": "preserved",
       "text": "bare paste Basic dagsqwxzmore extracted from logs"
+    },
+    {
+      "label": "labeled-base64-secret",
+      "kind": "credential",
+      "expected": "redacted",
+      "text": "tag: a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tr",
+      "credential_value": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tr"
     }
   ]
 }

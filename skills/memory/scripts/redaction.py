@@ -161,6 +161,28 @@ _IDENTIFIER_CONTEXT_RE = re.compile(
 )
 
 
+# Posted-review F-001 (PR #544): the calibration exempts ONLY all-hex runs
+# of exactly a hash length (32/40/64/128) — never base64-alphabet runs
+# (``/`` and ``+`` never occur in a digest), never arbitrary-length hex. A
+# credential word in the window also refuses the exemption (same vocabulary
+# as the repair lane's gates).
+_IDENTIFIER_HEX_LENGTHS = (32, 40, 64, 128)
+_CREDENTIAL_WINDOW_RE = re.compile(
+    r"(?i)\b(?:api[_\s-]*key|secret|token|password|passwd|pwd|pass"
+    r"|private[_\s-]*key|bearer|credential|passphrase|auth|hmac"
+    r"|signing|session|cookie"
+    r"|(?:ssh|gpg|pgp|aes|master|encryption|decryption|access|cipher"
+    r"|secret)[_\s-]*key)\b")
+
+
+def _is_identifier_value_shape(value: str) -> bool:
+    """True when the matched run is entirely hex AND exactly a digest
+    length (posted-review F-001: a base64-alphabet run or an arbitrary-
+    length hex run is never a verifiable identifier)."""
+    return (len(value) in _IDENTIFIER_HEX_LENGTHS
+            and re.fullmatch(r"[0-9a-fA-F]+", value) is not None)
+
+
 def is_identifier_context_match(
     text: str, match_start: int, boundary: int | None = None,
 ) -> bool:
@@ -186,7 +208,17 @@ def is_identifier_context_match(
     # window as long as only optional ``:/=`` and whitespace separate it from
     # the match start (``match`` would wrongly demand it at the window's
     # beginning — "Deployed release <sha>" has leading prose).
-    return bool(_IDENTIFIER_CONTEXT_RE.search(prefix))
+    if not _IDENTIFIER_CONTEXT_RE.search(prefix):
+        return False
+    # Posted-review F-001: the labeled value must BE a digest-shaped run.
+    value = text[match_start:].split(None, 1)[0] if text[match_start:] else ""
+    if not _is_identifier_value_shape(value.rstrip(".,;)")):
+        return False
+    # A credential word in the window refuses the exemption (the label may
+    # name the ALGORITHM of a secret — "webhook secret for the release <v>").
+    if _CREDENTIAL_WINDOW_RE.search(prefix):
+        return False
+    return True
 
 # Issue #180 command and URL credential shapes. Case-insensitivity is scoped
 # with inline groups to the COMMAND NAME / URL SYNTAX only — option letters

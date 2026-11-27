@@ -3510,8 +3510,11 @@ def main():
                                type=str, default=None,
                                help="select one evidence anchor (required "
                                     "for a multi-anchor memory)")
-    p_source_show.add_argument("--context", type=int, default=2,
-                               help="context lines/turns (0..20)")
+    # posted-review F-005/PFB-005: no child default — the parent's
+    # --context value must not be silently re-defaulted to 2 here
+    # (source --context 5 show --id X was yielding context=2).
+    p_source_show.add_argument("--context", type=int, default=None,
+                               help="context lines/turns (0..20; default: the parent --context, itself defaulting to 2)")
     # Issue #502 AC2: evidence-backed repair of a verified identifier.
     p_source_repair = source_sub.add_parser(
         "repair", help="repair a redacted identifier from linked evidence")
@@ -3942,9 +3945,10 @@ def main():
     # flag can only NARROW authorization, never bypass the guard.
     p_sup.add_argument(
         "--scope", default=None,
-        help="authorize the tombstone as an approved revision within this "
-             "scope label (a row's scope is its namespace); routes through "
-             "storelib.source.resolve_revision")
+        help="authorize the tombstone as an approved revision whose "
+             "scope is AT LEAST AS BROAD as this label (a row's scope is "
+             "its namespace; strictly-narrower rows refuse); routes "
+             "through storelib.source.resolve_revision")
     p_sup.add_argument(
         "--expected-namespace", default=None,
         help="refuse (exit 2, nothing written) unless the target row lives in "
@@ -6007,8 +6011,10 @@ def main():
         print(STORE_PATH)
         sys.exit(0)
 
-    # Source resolution is an observation over an existing store.  It must not
-    # initialize, migrate, rekey, lease, or create a cache entry.
+    # Source resolution is an observation over an existing store: show and
+    # scan must not initialize, migrate, rekey, lease, or create a cache
+    # entry. (repair and verify DO take the writer lease — see their
+    # dispatch arms.)
     if args.cmd == "source":
         if getattr(args, "source_cmd", None) == "repair":
             _dispatch_source_repair(args)
@@ -6017,13 +6023,18 @@ def main():
         if not args.memory_id:
             print("store.py: error: --id is required", file=sys.stderr)
             sys.exit(2)
+        # posted-review F-005/PFB-005: the show subcommand no longer
+        # re-defaults --context; resolve None to the parent default here so
+        #  honors the 5.
+        if getattr(args, "context", None) is None:
+            args.context = 2
         if args.source_cmd is None:
             try:
                 args.context = int(args.context)
             except (TypeError, ValueError):
                 print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
                 sys.exit(2)
-        if args.source_cmd is None and not (0 <= args.context <= 20):
+        if not (0 <= args.context <= 20):
             print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
             sys.exit(2)
         if args.source_cmd == "scan" and not args.needle:
@@ -7573,7 +7584,12 @@ def main():
                           hybrid=False, as_of=args.as_of, link_hops=0,
                           exclude_ids=args.exclude, exact=args.exact)
         elif args.cmd == "supersede":
-            if getattr(args, "scope", None):
+            if getattr(args, "scope", None) == "":
+                # posted-review F-006/PFB-006: an explicitly EMPTY --scope
+                # is a caller error, never the legacy unscoped path.
+                print("[zmem] supersede: --scope must not be empty", file=sys.stderr)
+                sys.exit(2)
+            if getattr(args, "scope", None) is not None:
                 # Issue #512 AC4: scope-aware revision route. Exit codes:
                 # refused_unauthorized -> exit 2 (nothing written); applied
                 # outcomes -> one JSON result line on stdout, exit 0.
