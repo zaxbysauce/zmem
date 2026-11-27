@@ -264,11 +264,12 @@ class SourceRepairResolverTests(unittest.TestCase):
         # (no whole-file search exists).
         excerpt_line = f"canary fails rollback {CANARY} immediately"
         memory_content = f"{LINE1}\n{excerpt_line}\n{LINE3}"
-        # The anchored line was rewritten after capture; an unrelated hex
-        # value sits elsewhere in the file and must never bind.
+        # The anchored line was rewritten after capture; the SAME excerpt
+        # context sits at another offset (a whole-file scan would bind it —
+        # only the mandatory position anchor refuses). A value elsewhere
+        # must never substitute; there is no whole-file search.
         env, memory_id = self._seed(
-            [LINE1, "totally different line now", LINE3,
-             f"unrelated {CANARY} tail"],
+            [LINE1, "totally different line now", LINE3, excerpt_line],
             memory_content)
         db = self.root / "store.sqlite"
         evidence_id = _write_production_evidence(
