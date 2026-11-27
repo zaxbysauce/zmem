@@ -57,7 +57,16 @@ def acquire(keys) -> int:
 def _restore_at_exit():
     """Process-exit backstop: a module that only IMPORTED another pinning
     module never runs that module's teardown, so the original environment
-    is restored here as well."""
+    is restored here as well.
+
+    Only an OUTSTANDING pin is restored. Once every pin has been
+    released the environment has already been restored, and a later module
+    may legitimately have changed it -- putting the old snapshot back at
+    exit would undo that change. The same holds after a fresh cycle: the
+    previous cycle's snapshot is cleared when the new cycle starts.
+    """
+    if not _ACTIVE:
+        return
     for k, v in _ORIGINAL.items():
         if v is None:
             os.environ.pop(k, None)
@@ -103,3 +112,6 @@ def release(token) -> None:
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+    # The snapshot has been restored: clear it, so nothing stale survives
+    # into a later cycle or into the process-exit backstop.
+    _ORIGINAL.clear()
