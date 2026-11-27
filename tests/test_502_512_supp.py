@@ -334,11 +334,15 @@ class RepairAlignmentTests(unittest.TestCase):
             _git(repo, "-c", "commit.gpgsign=false", "commit", "-m", "c")
             sha = _git(repo, "rev-parse", "HEAD")
             # The UNLABELED SHA was destroyed at add (fail-safe net); the
-            # password too. Repair restores ONLY the verified commit.
+            # unlabeled reference too. Repair restores ONLY the verified
+            # commit. (swarm-pr-feedback: the unlinked span was relabeled
+            # from password= to a credential-free run so the destination
+            # gate — which now runs on every repair path — accepts it; the
+            # gate refusing the old content is the fix working.)
             memory_id, repair_env, _ = self._build(
                 root,
                 f"canary fails rollback [REDACTED_SECRET] immediately; "
-                f"password=[REDACTED_SECRET] for the service account.",
+                f"reference [REDACTED_SECRET] for the service account.",
                 f"canary fails rollback {sha} immediately", repo)
             apply_result = _run(root, "source", "repair", "--id", memory_id,
                                 "--evidence-id", "ev-supp-1", "--apply",
