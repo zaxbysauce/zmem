@@ -105,7 +105,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   scripts is deliberately not filtered.
 
 - **The release gate now refuses a CHANGELOG that carries an unresolved
-  merge marker** (issue #546). A merge whose conflict is resolved by
+  merge marker** (PR #541). A merge whose conflict is resolved by
   RECONSTRUCTION can leave the conflict MARKERS in the file beside the
   reconstructed content, and the CHANGELOG ships to users. This PR's own
   merge of `origin/main` reconstructed the union of both sides' notes

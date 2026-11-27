@@ -210,7 +210,7 @@ class HeadingContractGatePathTest(unittest.TestCase):
 
 
 class ConflictMarkerContractTest(unittest.TestCase):
-    """Issue #546: an unresolved merge marker must not ship in the
+    """PR #541: an unresolved merge marker must not ship in the
     CHANGELOG.
 
     This PR shipped one: its merge of `origin/main` reconstructed the
@@ -242,7 +242,7 @@ class ConflictMarkerContractTest(unittest.TestCase):
                              f"marker {marker!r} was not detected")
             # the marker is the 5th line of that fixture
             self.assertIn("line 5", violations[0])
-            self.assertIn("issue #546", violations[0])
+            self.assertIn("PR #541", violations[0])
 
     def test_separator_is_detected_inside_a_conflict_block(self):
         # `=======` alone is a markdown setext H1 underline -- legitimate

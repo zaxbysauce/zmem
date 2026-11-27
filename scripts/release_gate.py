@@ -298,7 +298,7 @@ _CONFLICT_SEPARATOR = "=" * 7
 
 
 def _changelog_conflict_markers(text: str) -> list[str]:
-    """Unresolved-merge-marker diagnostics for the CHANGELOG (issue #546).
+    """Unresolved-merge-marker diagnostics for the CHANGELOG (PR #541).
 
     A merge whose conflict was resolved by RECONSTRUCTION can leave the
     conflict MARKERS in the file beside the reconstructed content. The
@@ -335,7 +335,7 @@ def _changelog_conflict_markers(text: str) -> list[str]:
                 f"CHANGELOG.md line {number} carries the unresolved merge "
                 f"marker {stripped!r} — a merged CHANGELOG must not ship "
                 f"conflict markers; resolve the conflict and delete the "
-                f"marker lines (issue #546)"
+                f"marker lines (PR #541)"
             )
         elif _CONFLICT_END_RE.match(stripped):
             open_start = None
@@ -343,14 +343,14 @@ def _changelog_conflict_markers(text: str) -> list[str]:
                 f"CHANGELOG.md line {number} carries the unresolved merge "
                 f"marker {stripped!r} — a merged CHANGELOG must not ship "
                 f"conflict markers; resolve the conflict and delete the "
-                f"marker lines (issue #546)"
+                f"marker lines (PR #541)"
             )
         elif _CONFLICT_BASE_RE.match(stripped):
             violations.append(
                 f"CHANGELOG.md line {number} carries the unresolved merge "
                 f"marker {stripped!r} — a merged CHANGELOG must not ship "
                 f"conflict markers; resolve the conflict and delete the "
-                f"marker lines (issue #546)"
+                f"marker lines (PR #541)"
             )
         elif stripped == _CONFLICT_SEPARATOR and open_start is not None:
             violations.append(
@@ -358,7 +358,7 @@ def _changelog_conflict_markers(text: str) -> list[str]:
                 f"marker {stripped!r} (inside the conflict block opened at "
                 f"line {open_start}) — a merged CHANGELOG must not ship "
                 f"conflict markers; resolve the conflict and delete the "
-                f"marker lines (issue #546)"
+                f"marker lines (PR #541)"
             )
     return violations
 
@@ -539,7 +539,7 @@ def check_unreleased_drift(repo_root: Path) -> int:
               f"often sits mid-file below the released sections) "
               f"(issue #364)")
         return 1
-    # Issue #546: an unresolved merge marker left in the CHANGELOG ships to
+    # PR #541: an unresolved merge marker left in the CHANGELOG ships to
     # users. This check runs here, BEFORE the content census, so it fires
     # even when the section carries no content at all.
     marker_violations = _changelog_conflict_markers(changelog)
@@ -1078,7 +1078,7 @@ def main(argv: list[str] | None = None) -> int:
         for diagnostic in heading_violations:
             print(f"::error::{diagnostic}")
         return 1
-    # Issue #546: an unresolved merge marker left in the CHANGELOG ships to
+    # PR #541: an unresolved merge marker left in the CHANGELOG ships to
     # users, and no other gate here can see it (the heading contract reads
     # only release headings; the drift check only asks whether the section
     # carries content).
