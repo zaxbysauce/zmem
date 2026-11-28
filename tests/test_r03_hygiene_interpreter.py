@@ -154,6 +154,34 @@ def _is_operator_instruction(text: str) -> bool:
         match.group("exec"))
 
 
+def _unprefixed_hint_literals(tree):
+    """The operator command literals in `tree` that are NOT rendered
+    through `command_prefix()`.
+
+    TG-2 (the closeout reviewer): EVERY operator command inside an
+    f-string must have its OWN prefix -- a second command literal beside
+    a prefixed one is a bare hint. The check lives here (not inline in
+    the sentinel) so a fixture can prove it bites.
+    """
+    fstring_hints, _bare = _operator_hints(tree)
+    bad = []
+    for n in fstring_hints:
+        values = list(n.values)
+        for idx, part in enumerate(values):
+            if not (isinstance(part, ast.Constant)
+                    and isinstance(part.value, str)):
+                continue
+            if not _is_operator_instruction(part.value):
+                continue
+            prev = values[idx - 1] if idx > 0 else None
+            if not (isinstance(prev, ast.FormattedValue)
+                    and isinstance(prev.value, ast.Call)
+                    and isinstance(prev.value.func, ast.Name)
+                    and prev.value.func.id == "command_prefix"):
+                bad.append(part.value)
+    return bad
+
+
 class OperatorHintDetectorTest(unittest.TestCase):
     """TG-2: the detector must flag an operator instruction and leave prose
     alone -- both are pinned here so the pin above cannot silently rot."""
@@ -178,6 +206,10 @@ class OperatorHintDetectorTest(unittest.TestCase):
         fstrings, bare = _operator_hints(tree)
         self.assertEqual(len(fstrings), 1, fstrings)
         self.assertEqual(bare, [])
+        # and the CHECK bites: the second command has no prefix of its own
+        bad = _unprefixed_hint_literals(tree)
+        self.assertEqual(len(bad), 1, bad)
+        self.assertIn("doctor --json", bad[0])
 
     def test_leaves_prose_alone(self):
         prose = ('note = "For diagnostics, see doctor --json in the manual"\n'
@@ -273,21 +305,11 @@ class OperatorCommandPrefixPin(unittest.TestCase):
             # the interpolation that PRECEDES it must be the prefix call
             # (the command word itself is a literal; the interpreter is
             # the prefixed part).
-            values = list(n.values)
-            for idx, part in enumerate(values):
-                if not (isinstance(part, ast.Constant)
-                        and isinstance(part.value, str)):
-                    continue
-                if not _is_operator_instruction(part.value):
-                    continue
-                prev = values[idx - 1] if idx > 0 else None
-                self.assertTrue(
-                    isinstance(prev, ast.FormattedValue)
-                    and isinstance(prev.value, ast.Call)
-                    and isinstance(prev.value.func, ast.Name)
-                    and prev.value.func.id == "command_prefix",
-                    "an operator command literal must be rendered through "
-                    "command_prefix(): %r" % (part.value,))
+            unprefixed = _unprefixed_hint_literals(tree)
+            self.assertEqual(
+                unprefixed, [],
+                "an operator command literal must be rendered through "
+                "command_prefix(): %r" % (unprefixed,))
         self.assertEqual(
             bare_hints, [],
             "a bare operator command hint must render through "

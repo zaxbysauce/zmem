@@ -1260,7 +1260,16 @@ def _shape_tokens(sql):
                 except ValueError:
                     out.append(("n", text))
             else:
-                out.append(("n", "i:%d" % int(text)))
+                value = int(text)
+                if -(2 ** 63) <= value < 2 ** 63:
+                    out.append(("n", "i:%d" % value))
+                else:
+                    # SQLite's own rule: an integer literal that does NOT
+                    # fit in its signed 64-bit range is stored as a REAL,
+                    # so tagging it an integer would make the shape proof
+                    # compare a REAL against an integer token and refuse
+                    # a legitimate store.
+                    out.append(("n", "r:%r" % float(text)))
         elif text[0].isalpha() or text[0] == "_":
             out.append(("w", _ascii_lower(text)))
         else:
@@ -1825,12 +1834,12 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
         fd_stage, stage_str = tempfile.mkstemp(
             prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
         staged = Path(stage_str)
-        try:
-            os.close(fd_stage)
-        except OSError:
-            # the descriptor is released at process exit; the FILE is
-            # removed by the handler below
-            pass
+        # a FAILED close is a real failure: it takes the same controlled
+        # path as every other failure in this block (the guard's cleanup
+        # removes the staged file and the ruled message is printed). A
+        # close that failed means the descriptor was already closed, so
+        # the file CAN be removed.
+        os.close(fd_stage)
         shutil.copy2(snap, staged)
         # A hand-supplied snapshot may carry its own sidecars: recover them on
         # the STAGED copy, never beside the live file.

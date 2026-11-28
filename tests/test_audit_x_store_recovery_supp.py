@@ -1221,6 +1221,11 @@ class SwapSharingViolationTest(_InProcessRestoreBase):
         # the capture must have watched the REPLACEMENT fail, with a
         # sharing violation, and the staged copy must have been present
         # at that moment -- that is what the swap's inference rests on
+        # the observation is PRINTED, so the runner receipt carries it as
+        # primary output (not just the leg's `ok`)
+        print("F-006-CAPTURE: the replacement failed with %s; the staged "
+              "copy was present at that moment: %s"
+              % (seen.get("error"), seen.get("staged_exists")))
         self.assertIn("error", seen,
                       "the replacement was never observed failing: %r" % (result,))
         self.assertRegex(seen["error"], r"(?i)(permission|sharing)",
