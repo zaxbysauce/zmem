@@ -6885,8 +6885,18 @@ def _report_lane_status(resolved_store: Path) -> dict:
                     # derived data); an error grade told machine consumers
                     # the probe failed when the tables are simply absent.
                     fts = _lane("degraded", "fts-index-tables-absent")
-            except sqlite3.Error:
-                fts = _lane("degraded", "fts-index-tables-absent")
+            except sqlite3.Error as exc:
+                # F-016 (MV-001) + the closeout reviewer's round 24: the
+                # tables-absent verdict belongs to the tables-absent case.
+                # Any OTHER sqlite error from the MATCH query — a LOCKED
+                # store, an I/O error — is a PROBE failure, and it keeps the
+                # base's verdict (the base carried no "fts-index-tables-
+                # absent" string at all), so the reason never names a cause
+                # that did not happen.
+                if "no such table" in str(exc).lower():
+                    fts = _lane("degraded", "fts-index-tables-absent")
+                else:
+                    fts = _lane("error", "fts-probe-failed")
             for name, table, lane_reason in (
                     ("entity", "entity", "table-absent"),
                     ("graph", "memory_link", "table-absent")):

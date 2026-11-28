@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "f222aca5ea765cf39edebc862b7cdd9634eaa7737441fd44947f8fd6fff9017b",
+  "digest": "0a2477b11f4bebab06dca363802fa117843b97adb86244207bd5701002be6f52",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -99,7 +99,7 @@
     "skills/memory/scripts/correction_queue.py": "cfeed1f228488fa926eefc7ad4b9c48ac8370f5ceb29340ed02921ef94c9dbfb",
     "skills/memory/scripts/corrections.py": "cf6ac131d092bb319cf9cfcf762b8384105588c8adb968349c804efb50bbaf7a",
     "skills/memory/scripts/cross_encoder_profiles.py": "8fbada332da7c8710ca402cf7a082d903c55a0d6178084bc44a7bee6fd5f1c9a",
-    "skills/memory/scripts/doctor.py": "8df16a92c65b098839776822651dc42cf3d4f6a7dd2c671115ed5bb471a9f300",
+    "skills/memory/scripts/doctor.py": "1fb42892f2e7d8e146887c083d64853f6cf44d1d3ca12450f48a93750cf893b0",
     "skills/memory/scripts/drift.py": "f921c25e49465e85a01c5973beddc1640419fd2306d7b318e9d20bd29c5cce35",
     "skills/memory/scripts/embed_profiles.py": "25472fda70a7fe9c704066d6a9badb0eb60c14350e36c73ed983321958e3157c",
     "skills/memory/scripts/embeddings.py": "26ef5e242b27c525e32363a50a88b0f6e5f15e3555ea14ebf650659c3513347b",
