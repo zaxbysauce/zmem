@@ -2100,13 +2100,25 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                 dest=dest, dest_exists=dest_exists, dest_nonempty=dest_nonempty,
                 prerestore_path=prerestore_path, stash_dir=stash_dir,
                 forensic_dir=forensic_dir, sidecars=sidecars)
-        # the staged copy is never left on a failure path
-        for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
+        # the staged copy is never left on a failure path -- and if the
+        # removal ITSELF fails, the survivor is REPORTED (it holds the
+        # snapshot, i.e. plaintext store bytes), like on every other
+        # failure path
+        survivors = []
+        for p in ([staged]
+                  + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
             try:
                 if p.exists():
                     p.unlink()
             except OSError:
                 pass
+            if p.exists():
+                survivors.append(p)
+        for p in survivors:
+            print(f"[zmem] restore FAILED: the staged copy "
+                  f"{_esc(str(p))} SURVIVED its cleanup and still "
+                  "holds plaintext store bytes - remove it by hand",
+                  file=sys.stderr)
         if moved:
             for p in reversed(moved):
                 try:
