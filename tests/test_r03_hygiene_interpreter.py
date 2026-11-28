@@ -169,6 +169,16 @@ class OperatorHintDetectorTest(unittest.TestCase):
         self.assertEqual(len(fstrings), 1, fstrings)
         self.assertEqual(bare, [])
 
+    def test_flags_a_second_unprefixed_hint_in_one_fstring(self):
+        # TG-2 (the closeout reviewer's round 30): an f-string that carries
+        # a PREFIXED command and a second, UNPREFIXED command literal is
+        # two hints, and the unprefixed one is a bare hint.
+        tree = ast.parse(
+            'hint = f"{command_prefix()} restore --from {p} doctor --json"\n')
+        fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(fstrings), 1, fstrings)
+        self.assertEqual(bare, [])
+
     def test_leaves_prose_alone(self):
         prose = ('note = "For diagnostics, see doctor --json in the manual"\n'
                  'doc = """\nrestore --from is the option that selects the source.\n"""\n')
@@ -255,6 +265,29 @@ class OperatorCommandPrefixPin(unittest.TestCase):
                 prefixed,
                 "an operator command hint must render through "
                 "command_prefix(): %r" % (ast.dump(n),))
+            # TG-2 (the closeout reviewer's round 30): the check above only
+            # asks whether a prefix call appears SOMEWHERE in the f-string,
+            # so a SECOND, UNPREFIXED operator command literal beside a
+            # prefixed one used to pass. EVERY operator instruction literal
+            # inside the f-string must be rendered through the prefix --
+            # the interpolation that PRECEDES it must be the prefix call
+            # (the command word itself is a literal; the interpreter is
+            # the prefixed part).
+            values = list(n.values)
+            for idx, part in enumerate(values):
+                if not (isinstance(part, ast.Constant)
+                        and isinstance(part.value, str)):
+                    continue
+                if not _is_operator_instruction(part.value):
+                    continue
+                prev = values[idx - 1] if idx > 0 else None
+                self.assertTrue(
+                    isinstance(prev, ast.FormattedValue)
+                    and isinstance(prev.value, ast.Call)
+                    and isinstance(prev.value.func, ast.Name)
+                    and prev.value.func.id == "command_prefix",
+                    "an operator command literal must be rendered through "
+                    "command_prefix(): %r" % (part.value,))
         self.assertEqual(
             bare_hints, [],
             "a bare operator command hint must render through "
