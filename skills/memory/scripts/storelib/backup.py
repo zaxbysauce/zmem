@@ -1980,11 +1980,11 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                 survivors.append(p)
         # the staged copy holds PLAINTEXT store bytes: a survivor must be
         # REPORTED, never silently left behind
-                for p in survivors:
-                    print(f"[zmem] restore FAILED: the staged copy "
-                          f"{_esc(str(p))} SURVIVED its cleanup and still "
-                          "holds plaintext store bytes - remove it by hand",
-                          file=sys.stderr)
+        for p in survivors:
+            print(f"[zmem] restore FAILED: the staged copy "
+                  f"{_esc(str(p))} SURVIVED its cleanup and still "
+                  "holds plaintext store bytes - remove it by hand",
+                  file=sys.stderr)
         return 1
 
     # --- 5. Safety copy from a PRIVATE working copy (non-empty destination). ---
