@@ -9,6 +9,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **Session closeout follows the user's request and the resolved store.**
+  The gate tracks each armed request, records false-trigger releases,
+  and checks session ownership and review actions. SessionStart exposes
+  the closeout session and namespace, queue output redacts flagged text,
+  and global memory readback queries `user:global` directly.
+  ([#529](https://github.com/zaxbysauce/zmem/issues/529),
+  [#543](https://github.com/zaxbysauce/zmem/issues/543))
+
 - **Store opens skip content-normalization scans on clean stores.** Existing
   stores repair stale values in bounded batches across opens. The doctor
   report shows catch-up progress, and store-open timings are written to

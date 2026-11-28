@@ -724,10 +724,14 @@ def main():
     store_note = ("# Memory skill: invoke `%s %s <subcommand>` to recall/add/search memories."
                   % (shlex.quote(sys.executable),
                      shlex.quote(store_py))) if store_py and os.path.isfile(store_py) else ""
+    identity_note = ""
+    if all(value and len(value) <= 256 and value.isprintable() and "`" not in value
+           for value in (log_session_id, namespace)):
+        identity_note = f"Closeout session: `session_id={log_session_id}` `namespace={namespace}`"
     nudge = _native_nudge(host, settings_dir, marker)
     closeout_reminder = _closeout_reminder(data_dir, session_id)
     first_ctx = _soft_trim("\n\n".join(x for x in
-                            (tier0, store_note, nudge, closeout_reminder)
+                            (tier0, store_note, identity_note, nudge, closeout_reminder)
                             if x), budget)
     first_payload = {}
     if first_ctx:

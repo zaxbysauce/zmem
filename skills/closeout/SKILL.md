@@ -28,14 +28,15 @@ matching step below, then record it.
    it. There is no `zmem` program: below, `<store>` means that interpreter and
    `store.py` path together. If the header is missing, ask the user for the
    `store.py` path (on Windows the interpreter is `py -3`).
-2. **Session id.** On Claude Code it is in your shell environment:
-   `$CLAUDE_CODE_SESSION_ID` in Bash, `$env:CLAUDE_CODE_SESSION_ID` in
-   PowerShell. On other hosts use the id shown in a zmem closeout reminder or
-   closeout-gate message. Never invent one. If you have no id, still do Steps
+2. **Session id.** Use `session_id=` from the session-start memory header.
+   With an older header, use the id shown in a zmem reminder or gate message,
+   or Claude Code's `CLAUDE_CODE_SESSION_ID` environment variable. If you have
+   no confirmed id, still do Steps
    0.5 to 5.5 without `--source-ref`, skip Steps 6 and 7, and say in the report
    that the closeout could not be recorded.
-3. **Namespace.** Never type a `project:` name by hand; derive it from the
-   project directory, with the folder that contains `store.py` written out:
+3. **Namespace.** Use `namespace=` from the session-start memory header.
+   With an older header, derive it from the project directory, with the folder
+   that contains `store.py` written out:
 
    ```bash
    '<python>' -c "import sys; sys.path.insert(0, r'<folder containing store.py>'); import host; print(host.resolve_namespace('.'))"
@@ -190,15 +191,25 @@ you pass `--signal`, so pass the signal the corrected claim has earned. Read
 automatically beat an older one: if both can be true in different conditions
 (one platform, one branch), keep both and state the condition in each.
 
-Readback, with the saved question:
+Read the corrected row back in its own namespace with the saved question.
+For a project row, use the project namespace:
 
 ```bash
 <store> recall --query "<natural question>" --namespace "<namespace>" --include-global --min-confidence 0 --no-bump --json
 ```
 
-The corrected row's id (after `update`, the new live id) should be among the
-first five `results[].id`. If it is not, report the miss with the question and
-the rank you saw. Do not add a second copy.
+For a global row, query `user:global` directly:
+
+```bash
+<store> recall --query "<natural question>" --namespace user:global --min-confidence 0 --no-bump --json
+```
+
+The project-first merge puts project matches first and appends up to
+`--global-limit` global rows (three by default). A healthy global row can fall
+outside the first five or be absent from that merged response. Look for the
+corrected row's id in `results[].id`, using the new live id after an update.
+If it is absent in its own namespace, report the question and result.
+`recall --explain --target <id>` can show why a row was omitted.
 
 ## Step 4 — Merge duplicates
 
@@ -270,10 +281,10 @@ Make every change first (Steps 2 and 3). Then:
 ```
 
 For each id under `unreviewed_rows`, read the row with `get` and record a
-verdict: `keep` (right as stored), `resignal` (the claim is right but its
-signal was wrong) or `invalidate` (it should not stand). The verdict only
-records your decision. To change a row, use `update` or `invalidate` first,
-then run `closeout-status` again, because a write adds a new row to review.
+verdict. Use `keep` for a live row that is right as stored. For
+`resignal`, run `update --signal <signal> --no-dedup` first. For `invalidate`, run
+`invalidate --reason` first. Record the verdict against the original id,
+then run `closeout-status` again to review any new row.
 
 ```bash
 <store> closeout-review --session-id "<session id>" --memory-id <full-uuid> --verdict <keep|resignal|invalidate>
@@ -289,8 +300,8 @@ Record the receipts last, one for each step you actually carried out:
 <store> closeout-step --session-id "<session id>" --step knowledge-status
 ```
 
-A step that could not run gets a skip with the real reason, which you repeat
-in the report. Looking and finding nothing to do (no duplicates, no promotion
+A step that could not run gets a skip with the real reason in at least three
+words. Repeat it in the report. Looking and finding nothing to do (no duplicates, no promotion
 candidates, clusters you declined to merge) counts as carrying the step out.
 
 ```bash
@@ -298,6 +309,11 @@ candidates, clusters you declined to merge) counts as carrying the step out.
 ```
 
 ## Step 7 — Acknowledge and report
+
+If the user confirms that an armed closeout was unintended, record that
+disposition with `<store> closeout-release --session-id "<session id>"`.
+Use `closeout-status` to verify `request_disposition: not_requested`, then
+report the release.
 
 Run `closeout-status` again. `missing_steps`: do the step, then record it.
 `stale_steps`: a write followed the receipt; record it again, and redo the
