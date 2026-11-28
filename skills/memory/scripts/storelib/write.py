@@ -2753,9 +2753,15 @@ def update_memory(
     tx_now = now if now is not None else now_iso()
 
     # CI-fed pinned contract (tests/test_evidence.py, "safe redaction counts
-    # are reported before a lock failure"): a PRE-LOCK warning pass on the
+    # are reported before a lock failure"): a PRE-LOCK pass on the
     # caller-visible triple so an operator learns their content carried a
     # secret even when the write lock is contended and the update aborts.
+    # This pass is a FULL policy evaluation: in auto/reviewed mode it can
+    # REFUSE (CapturePolicyRefusal) on the pre-lock inherited tags/source_ref,
+    # fail-closed, before the lock is taken. It can refuse an update the
+    # locked-row evaluation would accept only when inherited tags were
+    # re-merged in place in the read-to-lock window (source_ref has no in-place
+    # writer); a retry re-reads and succeeds. Same pre-lock refusal as main.
     # The AUTHORITATIVE policy evaluation stays under the lock (issue #507,
     # locked-row-derived inherited values); its emission below reports only
     # warnings this pass did not already print, so the success path still

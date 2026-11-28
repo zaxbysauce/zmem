@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "5c5e38c78b7f1a10214f1a4becfd92bc5e3ff93a1583ef350906a105939b5039",
+  "digest": "a96d78bc79a282aa385593fda89c168af89b8298eb427297d66a7794d341e58a",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -177,7 +177,7 @@
     "skills/memory/scripts/storelib/training_capture.py": "8b5c744ceb4e9e64ff8b8edd05c14c4273f7ef4b2f2282bcf21de52af0293873",
     "skills/memory/scripts/storelib/training_export.py": "400e80e6616166273c57eb7a3b6b07635f1a803217e1c373ac03ec6a60eebc83",
     "skills/memory/scripts/storelib/tune.py": "f12112f31d6be26e31bf56f61bfcfe5eba6c8123b352dcadda95c8518bdfcb00",
-    "skills/memory/scripts/storelib/write.py": "ea0b5d9faf0f3c712c8a4d3f7c48c96f5ffedd55efb60c0c58297cc5749e3155",
+    "skills/memory/scripts/storelib/write.py": "58bc6ae3c8690a1b9a155358c490ae64704ac9271c8e239cd6b2b8f393538c92",
     "skills/swarm-pr-feedback/SKILL.md": "3eeb4c34dd21e000b701185c0feb630d35489f40e966b8cf162aa697ae83682d",
     "skills/swarm-pr-review/SKILL.md": "326b5c31a8ef3f37749fbce1fe10385a2e04acdf34afaf4d036db8f596bd007c"
   },
