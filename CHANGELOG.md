@@ -104,6 +104,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   input and are unchanged. Noise from `git status`, `grep`/`rg` and inline
   scripts is deliberately not filtered.
 
+- **The restore now reports a working copy that survived its cleanup.**
+  The private safety copy the restore makes of the live store holds
+  PLAINTEXT store and WAL bytes, and its removal is best-effort — so on a
+  locked file (the common Windows case) the directory used to survive
+  with nobody told. A directory nobody is told about is a directory
+  nobody removes. The restore now checks the removal's outcome and, when
+  the directory survived, reports its exact location and what it holds —
+  at the moment the restore happens, not only if a later
+  `purge --scrub-backups` happens to run.
+
 - **The restore's required-shape proof now parses a table definition
   the way SQLite parses it.** Before the staged copy of a snapshot may
   replace the destination, the proof compares that snapshot's schema

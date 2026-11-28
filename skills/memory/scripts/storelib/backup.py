@@ -954,6 +954,37 @@ def _integrity_check_readonly(path: Path) -> str:
     finally:
         handle.close()
 
+def _report_surviving_work_dir(work_dir: Path | None) -> bool:
+    """Report a work directory that survived its cleanup.
+
+    The restore's private working copy holds PLAINTEXT store and WAL
+    bytes. Its removal is best-effort (`ignore_errors=True`), so a
+    locked file can leave it behind -- and a directory nobody is told
+    about is a directory nobody removes. This reports the survivor with
+    its exact location and what it holds, at the moment the restore
+    happens.
+
+    Returns True when the directory survived. Never raises: the report
+    is best-effort and must not turn a restore into a failure.
+    """
+    if work_dir is None:
+        return False
+    try:
+        survived = work_dir.is_dir()
+    except OSError:
+        survived = False
+    if not survived:
+        return False
+    try:
+        print(f"[zmem] restore: WARNING - the private working copy "
+              f"{_esc(work_dir)} SURVIVED its cleanup and still holds "
+              f"plaintext store and WAL bytes; remove it by hand",
+              file=sys.stderr)
+    except Exception:
+        pass
+    return True
+
+
 def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
     """Restore the store from a snapshot, under the maintenance locks.
 
@@ -1914,6 +1945,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             pre_info = create_snapshot(working_main, pre_dest)
             prerestore_path = Path(pre_info["path"])
             shutil.rmtree(work_dir, ignore_errors=True)
+            _report_surviving_work_dir(work_dir)
             print(f"[zmem] restore: pre-restore backup {_esc(prerestore_path)} "
                   f"(integrity_check={_esc(pre_info['integrity_check'])}, "
                   f"total={pre_info['snapshot_total']} live={pre_info['snapshot_live']})")
@@ -1925,6 +1957,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             # failed safety copy (it holds plaintext store + WAL bytes).
             if work_dir is not None:
                 shutil.rmtree(work_dir, ignore_errors=True)
+                _report_surviving_work_dir(work_dir)
             for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
                 try:
                     if p.exists():

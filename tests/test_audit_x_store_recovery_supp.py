@@ -1139,6 +1139,44 @@ class StashRemovalTest(_InProcessRestoreBase):
                         "expected the stash to survive the failed removal")
 
 
+class SurvivingWorkDirReportTest(_InProcessRestoreBase):
+    """The restore's private WORK DIRECTORY (the safety copy of the live
+    store) holds PLAINTEXT store and WAL bytes. Its removal is
+    best-effort, so a locked file can leave it behind -- and a directory
+    nobody is told about is a directory nobody removes. The restore must
+    REPORT the survivor, with its location and what it holds, at the
+    moment the restore happens (not only if a later
+    `purge --scrub-backups` happens to run)."""
+
+    def test_a_surviving_work_directory_is_reported(self):
+        """R1-F-009b: the private working copy holds PLAINTEXT store and
+        WAL bytes; when its cleanup fails, the restore must REPORT the
+        survivor -- a directory nobody is told about is a directory
+        nobody removes. (The closeout reviewer's round-14 finding.)"""
+        self._add("work dir keeper row")
+        snap = self._snapshot(self.dir, self.store)
+        import shutil as _sh
+        real_rmtree = _sh.rmtree
+
+        def keep_work_dir(path, *a, **k):
+            if "restore-work-" in str(path):
+                return  # pretend the removal failed silently
+            return real_rmtree(path, *a, **k)
+
+        import storelib.backup as bm
+        unpatch = self._patch_attr(bm.shutil, "rmtree", keep_work_dir)
+        result = self._run(snap, lambda m: None, unpatch)
+        self.assertEqual(result["rc"], 0, result["err"][-300:])
+        self.assertIn("SURVIVED its cleanup", result["err"])
+        self.assertIn("plaintext store and WAL bytes", result["err"])
+        self.assertIn("remove it by hand", result["err"])
+        survivors = list(self.dir.glob("**/restore-work-*"))
+        self.assertTrue(survivors,
+                        "expected the work directory to survive the failed "
+                        "removal, so the report is the only notice")
+
+
+
 class CompatPolicyTest(SuppBase, _SnapshotMixin):
     """The compat-window and override stamp policy (unchanged by the new
     preflight): a newer-than-forward destination refuses with exit 2, and
