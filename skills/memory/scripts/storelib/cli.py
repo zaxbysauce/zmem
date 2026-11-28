@@ -6733,6 +6733,9 @@ def main():
             close_open_connection()
             print(f"[zmem] {e}", file=sys.stderr)
             sys.exit(2)
+        except BaseException:
+            close_open_connection()
+            raise
 
     if (
         args.cmd in {"add", "supersede", "invalidate", "update", "rebuild-fts", "ingest-jsonl",

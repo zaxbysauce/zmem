@@ -1,7 +1,9 @@
 import os
+import sqlite3
 import sys
 
 import _store_guard  # noqa: F401
+import pytest
 
 from _issue546_helpers import SCRIPTS
 
@@ -37,3 +39,30 @@ def test_current_process_birth_identity_on_supported_hosts():
         if os.name == "nt" or os.path.isfile("/proc/sys/kernel/random/boot_id"):
             assert identity is not None
         assert schema._host.process_birth_identity(os.getpid()) == identity
+
+
+def test_failed_embedding_check_closes_connection_and_releases_open_lease(tmp_path, monkeypatch):
+    from storelib import cli
+
+    monkeypatch.setattr(schema, "STORE_PATH", tmp_path / "store.sqlite")
+    monkeypatch.setattr(sys, "argv", [
+        "store.py", "add", "--content", "fixture", "--namespace", "project:fixture", "--type", "fact",
+    ])
+    monkeypatch.setattr(cli, "_prepare_store", lambda conn: None)
+    monkeypatch.setattr(cli, "_auto_near_miss_rekey", lambda conn, **kwargs: None)
+
+    def fail_check(conn, **kwargs):
+        assert len(list(schema._open_lease_dir().glob("*.lease"))) == 1
+        raise KeyError("embedding check failed unexpectedly")
+
+    monkeypatch.setattr(cli, "assert_embedding_compatible", fail_check)
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(cli, "connect", lambda: conn)
+    try:
+        with pytest.raises(KeyError, match="embedding check failed unexpectedly"):
+            cli.main()
+        assert list(schema._open_lease_dir().glob("*.lease")) == []
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            conn.execute("SELECT 1")
+    finally:
+        conn.close()

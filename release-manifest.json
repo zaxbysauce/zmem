@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "481c64ecdf357533bcf3543cfdba3c9a6739e7b8f468e4e8b9b80dc53c538de2",
+  "digest": "ef4f41b1c85a0bb00fa41d704c2c5c7b546b8c28b994962e3a57b60df2ac77f0",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -80,7 +80,7 @@
     "scripts/fleet/serve-status-classify.sh": "0529bbe8f947bf84b2018b189a4693bf661aa2f6e7f3e20d214ac1ddd969dc49",
     "scripts/fleet/serve-status-lib.ps1": "a3b2756754548a6673be830da7d8afd9b9e54cf92696decfa83175b0ef652f28",
     "scripts/generate_canary_fixtures.py": "382467197fdb868ae31f982980750c45103e8b873a897083388f5231427e1b22",
-    "scripts/host_canary.py": "7de557dc7989b7454d211895f1556cb3f5f139a38090fe2219384a398e93ca7f",
+    "scripts/host_canary.py": "62902c8a6d27cbe04fb035b822378cbd3115db3e704dcc6e8b0f4dcc3a1d9378",
     "scripts/host_evidence_guard.py": "9fc902c385c5df1d41ada417eeb6049f45096585c43aa4661a22c6adae54d870",
     "scripts/host_registry.py": "f6beab143eeec65f7d16f0a3cac2bd2b6436656ab38e84175088e3051511dd8e",
     "scripts/ingest_harvest.py": "830666cf0aa033ac6bbb03fdb5ba53831b70079c7677251f823ab5239e8121d3",
@@ -130,7 +130,7 @@
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
     "skills/memory/scripts/storelib/backup.py": "b0ec397f3b1a681eea565bc5a4946b8a64041140c463103ebd2ff1db787a5836",
     "skills/memory/scripts/storelib/beliefs.py": "b3ad20d6b3dd77725dabbe8f164902baff709741fe1742826434495d5f4080c5",
-    "skills/memory/scripts/storelib/cli.py": "1e85a588c0d6f67f7264619f12114301c76246a96b4c9f0973372476fb868baa",
+    "skills/memory/scripts/storelib/cli.py": "e119bec402edaf6d33440b5316f670102e99adbaa16760169daf063ef7293c57",
     "skills/memory/scripts/storelib/config.py": "36448a1f80cdfc60b5ddd101a679a166f1522ad1e2eb3555139bac351ec7fc38",
     "skills/memory/scripts/storelib/consolidate.py": "36870a84a40537e6b1f4e047da15ffc4c03db08c165f656001c4c225bbe08f9f",
     "skills/memory/scripts/storelib/cross_encoder.py": "5903c34b4086668c750ac1712cc29cffc0054dc7fbb4b10f7a9143a2a3a01b1c",
