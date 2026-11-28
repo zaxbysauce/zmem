@@ -1,6 +1,6 @@
 {
   "algorithm": "sha256-crlf-norm",
-  "digest": "20f471cd2b7c54d220edb796ccbe3995db608dd73b7bd3acad2355261b7447cf",
+  "digest": "34c3aaeb6de49d815d33f99b1f81c78eedc9368ed9c8a84e6c5f51797181591d",
   "files": {
     ".agents/plugins/marketplace.json": "3b8a27a27b953093ca67aa306e1a667a391d0304590be60ceb67def98a21652f",
     ".claude-plugin/marketplace.json": "188c7a5c20679ea9a71a08ece417b9a61bd3ecf602804c4da19109806bd7bf3a",
@@ -99,7 +99,7 @@
     "skills/memory/scripts/correction_queue.py": "cfeed1f228488fa926eefc7ad4b9c48ac8370f5ceb29340ed02921ef94c9dbfb",
     "skills/memory/scripts/corrections.py": "cf6ac131d092bb319cf9cfcf762b8384105588c8adb968349c804efb50bbaf7a",
     "skills/memory/scripts/cross_encoder_profiles.py": "8fbada332da7c8710ca402cf7a082d903c55a0d6178084bc44a7bee6fd5f1c9a",
-    "skills/memory/scripts/doctor.py": "40a533258e01c0c9746c274f19b2ceb557e24891731875459d3b2baf671e62c6",
+    "skills/memory/scripts/doctor.py": "1d0808f07fb215538b3230978973213b695fa41b190ec956e03491ac436da873",
     "skills/memory/scripts/drift.py": "f921c25e49465e85a01c5973beddc1640419fd2306d7b318e9d20bd29c5cce35",
     "skills/memory/scripts/embed_profiles.py": "25472fda70a7fe9c704066d6a9badb0eb60c14350e36c73ed983321958e3157c",
     "skills/memory/scripts/embeddings.py": "26ef5e242b27c525e32363a50a88b0f6e5f15e3555ea14ebf650659c3513347b",
@@ -128,7 +128,7 @@
     "skills/memory/scripts/schema_meta.py": "526f25aaaf91ce24475599cfccd219796a1c68c4278b8d36ecb68b43742d2f0f",
     "skills/memory/scripts/store.py": "5492a0026aea6ce74d7a88bdcfa702a602465c0969ff810fdb64b81a35f49176",
     "skills/memory/scripts/storelib/__init__.py": "a0935a47debc89e06f9b8f82c830870ed8ba3c898503b8759757aab9a47aa99a",
-    "skills/memory/scripts/storelib/backup.py": "09b6053e0b51b5e1873b1a70edcaa6e4134dc4393e0f53eef84a5265257573ab",
+    "skills/memory/scripts/storelib/backup.py": "7e7a2e2f66e127f97ef043e2e90972d272ea7e7b784abe610655426fd41c871c",
     "skills/memory/scripts/storelib/beliefs.py": "b3ad20d6b3dd77725dabbe8f164902baff709741fe1742826434495d5f4080c5",
     "skills/memory/scripts/storelib/cli.py": "f2d930fc6329f5035686bfae1f4cd88c7a5c53ab18d6a663d809a21a4f04722d",
     "skills/memory/scripts/storelib/config.py": "36448a1f80cdfc60b5ddd101a679a166f1522ad1e2eb3555139bac351ec7fc38",

@@ -156,7 +156,7 @@ def _is_operator_instruction(text: str) -> bool:
 
 _CMD_OCCURRENCE_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:restore|backup|doctor|reindex|reembed|import-store"
-    r"|export|list|recall|consolidate)\s+--[a-z]")
+    r"|export|list|recall|consolidate)\b")
 
 
 def _command_occurrences(text: str) -> int:
@@ -165,7 +165,9 @@ def _command_occurrences(text: str) -> int:
     TG-2 (the closeout reviewer): a literal can carry TWO commands -- the
     first one is rendered through `command_prefix()`, the second one is
     not, and an operator who copies it runs a bare command. So a literal
-    that is itself an instruction must carry exactly ONE command.
+    that is itself an instruction must carry exactly ONE command. The
+    counter recognises BOTH forms the detector accepts: a command with a
+    flag and a FLAGLESS executable command ("zmem restore").
     """
     return len(_CMD_OCCURRENCE_RE.findall(text))
 
@@ -239,6 +241,12 @@ class OperatorHintDetectorTest(unittest.TestCase):
         bad2 = _unprefixed_hint_literals(tree2)
         self.assertEqual(len(bad2), 1, bad2)
         self.assertIn("doctor --json", bad2[0])
+        # and the FLAGLESS form the detector also accepts
+        tree3 = ast.parse(
+            'hint = f"{command_prefix()} restore --from store.sqlite '
+            'zmem doctor"\n')
+        bad3 = _unprefixed_hint_literals(tree3)
+        self.assertEqual(len(bad3), 1, bad3)
 
     def test_leaves_prose_alone(self):
         prose = ('note = "For diagnostics, see doctor --json in the manual"\n'

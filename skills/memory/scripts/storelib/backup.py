@@ -1968,12 +1968,23 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     except Exception as e:
         print(f"[zmem] restore ABORTED: preparation failed ({_esc(e)}) — "
               f"destination untouched", file=sys.stderr)
-        for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
+        survivors = []
+        for p in ([staged]
+                  + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
             try:
                 if p.exists():
                     p.unlink()
             except OSError:
                 pass
+            if p.exists():
+                survivors.append(p)
+        # the staged copy holds PLAINTEXT store bytes: a survivor must be
+        # REPORTED, never silently left behind
+                for p in survivors:
+                    print(f"[zmem] restore FAILED: the staged copy "
+                          f"{_esc(str(p))} SURVIVED its cleanup and still "
+                          "holds plaintext store bytes - remove it by hand",
+                          file=sys.stderr)
         return 1
 
     # --- 5. Safety copy from a PRIVATE working copy (non-empty destination). ---
@@ -2029,13 +2040,24 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                     shutil.rmtree(work_dir, ignore_errors=True)
                     _report_surviving_work_dir(work_dir)
             finally:
-                for p in [staged] + [Path(str(staged) + sfx)
-                                     for sfx in SIDECAR_SUFFIXES]:
+                survivors = []
+                for p in ([staged]
+                          + [Path(str(staged) + sfx)
+                             for sfx in SIDECAR_SUFFIXES]):
                     try:
                         if p.exists():
                             p.unlink()
                     except OSError:
                         pass
+                    if p.exists():
+                        survivors.append(p)
+                # the staged copy holds PLAINTEXT store bytes: a survivor
+                # must be REPORTED, never silently left behind
+                for p in survivors:
+                    print(f"[zmem] restore FAILED: the staged copy "
+                          f"{_esc(str(p))} SURVIVED its cleanup and still "
+                          "holds plaintext store bytes - remove it by hand",
+                          file=sys.stderr)
             return 1
     elif dest_exists:
         print("[zmem] restore: pre-restore backup skipped - destination store is "
