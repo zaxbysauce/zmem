@@ -2302,10 +2302,6 @@ class CliEarlyErrorShapeTest(SuppBase):
         self.assertNotIn("Traceback", r.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class ShapeTokenizerFidelityTest(SuppBase):
     """R1-F-007 / #542 AC6: the shape proof must parse what SQLite parses.
 
@@ -2422,3 +2418,7 @@ class ShapeTokenizerFidelityTest(SuppBase):
             "AC6: the shape proof ACCEPTED a staged store whose required "
             "column's default is a REAL where the fresh store's is an "
             "INTEGER -- a store of the wrong shape reached the destination")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
