@@ -397,7 +397,13 @@ jobs:
             # runs in this loop.)
             echo "=== $f ==="
             log="$(mktemp)"
-            if python "$f" 2>&1 | tee "$log"; then
+            command=(python "$f")
+            case "$f" in
+              tests/test_open_path_*.py|tests/test_recall_hook_lock_wait_budget.py|tests/test_schema_lock_release_loud.py)
+                command=(python -X utf8 -m pytest -q "$f")
+                ;;
+            esac
+            if "${command[@]}" 2>&1 | tee "$log"; then
               # Executed-count gate (fail-closed): a suite that reports
               # "Ran 0 tests" — a collection bomb, a silent no-op, or a
               # class-level SkipTest — is an ERROR, not a green run.

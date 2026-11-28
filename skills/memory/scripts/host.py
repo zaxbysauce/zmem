@@ -1177,11 +1177,14 @@ def _try_create_lock(p: Path, token: str) -> bool | None:
     return True
 
 
-def release_lock(path: str | Path, token: str | None) -> None:
+def release_lock(path: str | Path, token: str | None) -> bool:
     """Release a lock previously taken with acquire_lock(). Only unlinks the
     file if it still carries OUR token, so a lock that was broken as stale and
     re-taken by someone else is never deleted out from under its new owner.
-    No-op for the unlocked-degraded token. Never raises.
+    No-op for the unlocked-degraded token. Return ``True`` when the lock is
+    already absent or belongs to another owner; return ``False`` only when an
+    ownership-preserving release or its identity confirmation genuinely fails.
+    Never raises.
 
     Why the unlink is not a plain unlink (the TOCTOU this closes): read-then-
     unlink checks identity at the READ and deletes at the PATH. Between the two
@@ -1207,7 +1210,7 @@ def release_lock(path: str | Path, token: str | None) -> None:
     happens when we still appear to be the owner.
     """
     if not token or token == _NO_LOCK_TOKEN:
-        return
+        return True
     p = Path(path)
     attempts = (_RELEASE_RETRY_ATTEMPTS if _RELEASE_RETRY_IS_WINDOWS else 1)
 
@@ -1222,10 +1225,12 @@ def release_lock(path: str | Path, token: str | None) -> None:
         # lost the path entirely; neither case may trigger another rename.
         try:
             content = p.read_text(encoding="utf-8").strip()
-        except OSError:
-            return
+        except FileNotFoundError:
+            return True
+        except (OSError, UnicodeError):
+            return False
         if content != token:
-            return  # already broken and re-taken — nothing to do
+            return True  # already broken and re-taken — nothing to do
 
         aside = p.with_name(p.name + f".release.{uuid.uuid4().hex}")
         try:
@@ -1233,10 +1238,10 @@ def release_lock(path: str | Path, token: str | None) -> None:
             break
         except OSError as exc:
             if attempt + 1 >= attempts or not retryable(exc):
-                return
+                return False
             time.sleep(_RELEASE_RETRY_DELAY_SECONDS)
     else:
-        return
+        return False
 
     # `aside` is set immediately before the successful rename above.
     assert aside is not None
@@ -1245,7 +1250,7 @@ def release_lock(path: str | Path, token: str | None) -> None:
         try:
             moved = Path(aside).read_text(encoding="utf-8").strip()
             break
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             # A Windows reader may keep the moved file briefly unavailable.
             # If confirmation never succeeds, preserve the existing safety
             # behavior: put the unconfirmed file back without clobbering a
@@ -1258,8 +1263,8 @@ def release_lock(path: str | Path, token: str | None) -> None:
         try:
             os.unlink(str(aside))
         except OSError:
-            pass
-        return
+            return False
+        return True
 
     # We moved a lock that is not ours: ours had already been broken as stale
     # and this is its live successor. Put it back exactly as _break_stale_lock
@@ -1271,7 +1276,8 @@ def release_lock(path: str | Path, token: str | None) -> None:
         try:
             os.unlink(str(aside))
         except OSError:
-            pass
+            return False
+    return moved is not None
 
 
 def busy_retry(fn, attempts: int = 5):

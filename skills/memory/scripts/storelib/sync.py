@@ -24,7 +24,7 @@ from pathlib import Path
 import embed_profiles as _profiles
 from storelib.entity import link_memory_entities, relink_memory, split_tag_tokens
 from storelib.mine import _sanitize_error_text, _sanitize_pack_content
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, SIGNAL_CONFIDENCE, STATE_EXPIRY_CLASSES, STORE_PATH, _clear_content_norm_dirty, _commit, _normalize_content, _parse_iso_to_epoch, now_iso
 from storelib.state_expiry import validate_inject_until
 from storelib.write import CapturePolicyRefusal, QUARANTINE_REASONS, REASON_UNREDACTABLE_SECRET, _GLOBAL_NEAR_MISS_STEMS, _normalize_capture_mode, apply_capture_policy, quarantine_import_row, _default_taint_for_signal, _detect_duplicate, _global_near_miss_key, _merge_on_dedup, _warn_degraded_embeddings_once, supersede_memory, redact_text, warn_reserved_source_ref, KNOWLEDGE_SOURCE_REF_PREFIX, _has_knowledge_prefix
 # PR1 (knowledge companion): the ingest-side demotion of imported pointer
@@ -1805,6 +1805,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
                  ingestion_ts, merged_from, _normalize_content(content),
                  trust_score, applied_count, violated_count),
             )
+            _clear_content_norm_dirty(conn, mid)
             _store_generation.bump_mutation_generation(conn)  # issue #474 census
             # v10 (issue #60, sync decision): entities are NOT carried in the
             # JSONL (they are store-local derived data, like content_norm and
@@ -2013,6 +2014,7 @@ def _ingest_row(conn: sqlite3.Connection, obj: dict, *, allow_tombstones: bool,
              merged_from, _normalize_content(content), trust_score,
              applied_count, violated_count),
         )
+        _clear_content_norm_dirty(conn, mid)
         _store_generation.bump_mutation_generation(conn)  # issue #474 census
         if emb is not None:
             try:

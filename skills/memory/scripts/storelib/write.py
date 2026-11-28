@@ -220,7 +220,7 @@ def _link_threshold_now() -> float:
     actually used."""
     from storelib import links as _links_live
     return _links_live.LINK_THRESHOLD
-from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, TRUST_VIOLATION_FLOOR_DROP, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
+from storelib.schema import CAPTURE_MODES, GLOBAL_NAMESPACE, MAX_CONTENT_CHARS, PROMPT_INJECTION_PATTERNS, SIGNAL_CONFIDENCE, TRUST_VIOLATION_FLOOR_DROP, _clear_content_norm_dirty, _commit, _embeddings, _env_float, _normalize_content, _vec_knn_in_namespace, now_iso
 
 _degraded_embedding_warned = False
 
@@ -2134,6 +2134,7 @@ def add_memory(
              ts if emb is not None else None, _normalize_content(content),
              update_of or "", taint),
         )
+        _clear_content_norm_dirty(conn, mid)
         # Insert into vec0 table if we have an embedding.
         if emb is not None:
             try:
@@ -3285,6 +3286,7 @@ def update_memory(
              ts if emb is not None else None, _normalize_content(content_eff),
              mid, incoming_taint),
         )
+        _clear_content_norm_dirty(conn, new_id)
         if emb is not None:
             try:
                 conn.execute(

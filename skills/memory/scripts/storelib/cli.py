@@ -67,7 +67,7 @@ from storelib.rekey import (MapError, apply_namespace_map, assert_store_schema_c
                             embedding_census, load_vec_extension,
                             load_vec_extension_if_available, open_readonly_store, parse_namespace_map,
                             preview_namespace_map)
-from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STATE_EXPIRY_CLASSES, STORE_PATH, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, now_iso, SUPPORTED_SCHEMA_VERSION
+from storelib.schema import ALLOWED_SIGNALS, ALLOWED_TYPES, ALLOWED_TAINTS, CAPTURE_MODES, GLOBAL_NAMESPACE, STATE_EXPIRY_CLASSES, STORE_PATH, _acquire_open_lease, _acquire_writer_lease, assert_embedding_compatible, _prepare_store, _release_writer_lease, _wait_for_maintenance_clear, connect, _host as _schema_host, now_iso, SUPPORTED_SCHEMA_VERSION
 from storelib.sync import EXPORT_PACK_DEFAULT_GLOBAL_LIMIT, EXPORT_PACK_DEFAULT_MAX_BYTES, EXPORT_PACK_DEFAULT_MIN_CONFIDENCE, EXPORT_PACK_DEFAULT_PROJECT_LIMIT, cmd_export_jsonl, cmd_export_pack, cmd_ingest_jsonl, cmd_ingest_jsonl_strict
 from storelib.dataset import (
     cmd_export_dataset, cmd_import_dataset, cmd_publish_dataset,
@@ -6649,26 +6649,35 @@ def main():
         ap.error("association cursor requires both --after-namespace and --after-memory-id")
 
     writer_lease = None
+    open_lease = None
     conn = None
+    explain = args.cmd == "recall" and bool(getattr(args, "explain", False))
+
+    def close_open_connection():
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            _release_writer_lease(writer_lease)
+            _release_writer_lease(open_lease)
+
     try:
-        _wait_for_maintenance_clear(args.cmd)
-        # Export snapshots must not open an old database between a restore and
-        # taking its writer lease.  Acquisition itself is connection-free.
+        open_lease = _acquire_open_lease(args.cmd)
+        # Export snapshots need their writer lease before opening SQLite.
         if args.cmd == "export-training":
-            writer_lease = _acquire_writer_lease(args.cmd)
+            writer_lease = _acquire_writer_lease(args.cmd, open_lease=open_lease)
         conn = _connect_existing_store() if existing_only_evidence_write else connect()
         if not existing_only_evidence_write:
-            _prepare_store(conn)
-    except (RuntimeError, sqlite3.Error, OSError) as e:
-        if conn is not None:
-            conn.close()
-        _release_writer_lease(writer_lease)
+            if explain:
+                _prepare_store(conn, track_content_norm=False)
+            else:
+                _prepare_store(conn)
+    except (RuntimeError, sqlite3.Error, OSError, ValueError) as e:
+        close_open_connection()
         print(f"[zmem] {e}", file=sys.stderr)
         sys.exit(2)
     except BaseException:
-        if conn is not None:
-            conn.close()
-        _release_writer_lease(writer_lease)
+        close_open_connection()
         raise
 
     # Issue #71 C: after the store is open and migrated, remediate any rows
@@ -6681,7 +6690,7 @@ def main():
     # --confirm into "no matching live rows found".
     if args.cmd not in ("rekey-namespace", "export-dataset", "export-training",
                         "convention-drift", "rescan-secrets") \
-            and not existing_only_evidence_write:
+            and not existing_only_evidence_write and not explain:
         # export-dataset joins the exemption (issue #134): it is a pure-read
         # surface and must not trigger the near-miss rekey's writes against
         # the store it is reading. convention-drift joins it (issue #261)
@@ -6719,6 +6728,7 @@ def main():
                 allow_rebuild=(args.cmd == "reembed" and (args.all or args.dry_run)),
             )
         except RuntimeError as e:
+            close_open_connection()
             print(f"[zmem] {e}", file=sys.stderr)
             sys.exit(2)
 
@@ -6746,11 +6756,8 @@ def main():
         # _acquire_writer_lease() would put a host-lock `_wait_for_maintenance_clear`
         # (up to MAINTENANCE_WAIT_SECONDS) on every hot-path recall — the hot-path
         # latency/write-contention PLAN.md §5 and the issue's "bounded" guidance exist
-        # to avoid. The dispatch ALREADY runs `_wait_for_maintenance_clear` before
-        # connect for every command (incl. no_bump recall), so a passive writer cannot
-        # START during an active restore; the residual mid-flight window is fail-open
-        # (lost surface telemetry on POSIX, clean restore refusal on Windows), never
-        # corruption. See issue #21 implementation-review closure.
+        # to avoid. The open lease already lets restore wait for an in-flight
+        # passive command to close its connection before replacing the store.
         # Issue #82 (PR-review PRR-002): --explain is a zero-write read-only
         # debugger — it must never hold the writer lease (which would make a
         # concurrent restore/backup refuse against a diagnostic read).
@@ -6778,7 +6785,15 @@ def main():
         or args.cmd == "session-cadence"
     ):
         if writer_lease is None:
-            writer_lease = _acquire_writer_lease(args.cmd)
+            try:
+                writer_lease = _acquire_writer_lease(args.cmd, open_lease=open_lease)
+            except (RuntimeError, OSError) as e:
+                close_open_connection()
+                print(f"[zmem] {e}", file=sys.stderr)
+                sys.exit(2)
+            except BaseException:
+                close_open_connection()
+                raise
 
     try:
         if args.cmd == "init":
@@ -8201,5 +8216,4 @@ def main():
                 print(f"[zmem] {exc}", file=sys.stderr)
                 sys.exit(1)
     finally:
-        _release_writer_lease(writer_lease)
-        conn.close()
+        close_open_connection()

@@ -410,7 +410,7 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
 
     try:
         from storelib.schema import (  # noqa: PLC0415 - lazy
-            STATE_EXPIRY_CLASSES, _normalize_content, init_db, migrate)
+            STATE_EXPIRY_CLASSES, _clear_content_norm_dirty, _normalize_content, init_db, migrate)
         from storelib.sync import _INGEST_ID_RE  # noqa: PLC0415 - lazy
         # init_db creates the base tables; migrate() brings the LATER
         # columns the selector reads (supersede_reason, embedding, …) —
@@ -494,7 +494,7 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
             # instead of re-walking the repaired head of the table every
             # round (measured 2.78s -> 1.50s at 30k rows).
             _bf_rows = out.execute(
-                "SELECT rowid, content FROM memory "
+                "SELECT rowid, content, id FROM memory "
                 "WHERE content_norm IS NULL AND rowid > ? "
                 "ORDER BY rowid LIMIT ?", (_bf_last, _bf_batch)).fetchall()
             if not _bf_rows:
@@ -504,6 +504,8 @@ def _build_from_payload(payload: dict, env: dict[str, str]) -> Path:
             out.executemany(
                 "UPDATE memory SET content_norm=? WHERE rowid=?",
                 [(_normalize_content(r[1] or ""), r[0]) for r in _bf_rows])
+            for _, _, memory_id in _bf_rows:
+                _clear_content_norm_dirty(out, memory_id)
             _bf_last = _bf_rows[-1][0]
         # Issue #414: restore the additive ``expiry`` family — the shipped
         # state rows' memory_expiry side records. Older hubs omit the key

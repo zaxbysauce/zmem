@@ -1235,7 +1235,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
             # lane's Jaccard token sets) silently degrades to no-ops when the
             # column is NULL, so compute it per row at INSERT from the same
             # normalizer the write path uses.
-            from storelib.schema import _normalize_content  # noqa: PLC0415
+            from storelib.schema import _clear_content_norm_dirty, _normalize_content  # noqa: PLC0415
             _insert_cols = _MEMORY_STORE_COLUMNS + ("content_norm",)
             for row in kept:
                 _row_content = row.get("content")
@@ -1255,6 +1255,7 @@ def import_dataset(source: str, *, revision: str, dest_dir: str,
                     + ", ".join("?" * len(_insert_cols)) + ")",
                     tuple(row.get(col) for col in _MEMORY_STORE_COLUMNS)
                     + (_normalize_content(_row_content or ""),))
+                _clear_content_norm_dirty(conn, row["id"])
                 _store_generation.bump_mutation_generation(conn)  # issue #474 census
             kept_ids = {row["id"] for row in kept}
             # Issue #414 (#324 parent-outcome-aware rule): expiry records

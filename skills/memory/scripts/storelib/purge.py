@@ -49,6 +49,7 @@ from storelib.schema import (
     SCHEMA_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_WAIT_SECONDS,
     _acquire_maintenance_lock_with_liveness,
+    _clear_content_norm_dirty,
     _cleanup_stale_writer_leases,
     _normalize_content,
     _load_vec,
@@ -486,6 +487,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                 "WHERE id=?",
                 (new_content, _normalize_content(new_content), new_merged,
                  kid))
+            _clear_content_norm_dirty(conn, kid)
             relink_memory(conn, kid)
 
         # Belief heads: rebuild survivors, delete the sourceless.
