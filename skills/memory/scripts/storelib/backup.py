@@ -973,10 +973,15 @@ def _report_surviving_work_dir(work_dir: Path | None) -> bool:
     """
     if work_dir is None:
         return False
+    indeterminate = False
     try:
         survived = work_dir.is_dir()
     except OSError:
-        survived = False
+        # The CHECK failed. That is not proof of removal: the directory may
+        # still hold plaintext store bytes, so it is INDETERMINATE and is
+        # reported as such (the closeout reviewer's finding).
+        survived = True
+        indeterminate = True
     if not survived:
         return False
     record = work_dir / "RESTORE-LEFTOVER.txt"
@@ -987,17 +992,28 @@ def _report_surviving_work_dir(work_dir: Path | None) -> bool:
     record_error = None
     try:
         record.write_text(
-            "The restore\'s private working copy SURVIVED its cleanup.\n"
-            "This directory holds PLAINTEXT store and WAL bytes.\n"
-            "Remove it by hand once you have read what you need from it.\n",
+            ("The restore\'s private working copy could not be checked and "
+             "MAY have SURVIVED its cleanup.\n"
+             "This directory may hold PLAINTEXT store and WAL bytes.\n"
+             "Remove it by hand once you have read what you need from it.\n"
+             if indeterminate else
+             "The restore\'s private working copy SURVIVED its cleanup.\n"
+             "This directory holds PLAINTEXT store and WAL bytes.\n"
+             "Remove it by hand once you have read what you need from it.\n"),
             encoding="utf-8")
     except Exception as exc:
         record_error = exc
     warning_error = None
     try:
+        if indeterminate:
+            _what = ("could not be checked and MAY have survived its cleanup; "
+                     "it may hold plaintext store and WAL bytes; remove it "
+                     "by hand")
+        else:
+            _what = ("SURVIVED its cleanup and still holds plaintext store "
+                     "and WAL bytes; remove it by hand")
         print(f"[zmem] restore: WARNING - the private working copy "
-              f"{_esc(work_dir)} SURVIVED its cleanup and still holds "
-              f"plaintext store and WAL bytes; remove it by hand "
+              f"{_esc(work_dir)} {_what} "
               f"(the record is in {_esc(record)})",
               file=sys.stderr)
     except Exception as exc:
