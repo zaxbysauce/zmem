@@ -115,7 +115,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   reports its exact location and what it holds, at the moment the restore
   happens, not only if a later `purge --scrub-backups` happens to run.
   Neither the record nor the warning can fail silently: a restore that
-  cannot report a surviving plaintext copy does not report success.
+  cannot report a surviving plaintext copy does not report success. The
+  record and the warning cover each other -- only if BOTH fail does the
+  survivor become unknowable, and then the restore fails rather than
+  reporting success -- and the staged copy (which holds the snapshot) is
+  cleaned up even when the report raises.
 
 - **The restore's required-shape proof now parses a table definition
   the way SQLite parses it.** Before the staged copy of a snapshot may

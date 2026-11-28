@@ -980,16 +980,34 @@ def _report_surviving_work_dir(work_dir: Path | None) -> bool:
     if not survived:
         return False
     record = work_dir / "RESTORE-LEFTOVER.txt"
-    record.write_text(
-        "The restore\'s private working copy SURVIVED its cleanup.\n"
-        "This directory holds PLAINTEXT store and WAL bytes.\n"
-        "Remove it by hand once you have read what you need from it.\n",
-        encoding="utf-8")
-    print(f"[zmem] restore: WARNING - the private working copy "
-          f"{_esc(work_dir)} SURVIVED its cleanup and still holds "
-          f"plaintext store and WAL bytes; remove it by hand "
-          f"(the record is in {_esc(record)})",
-          file=sys.stderr)
+    # The two mechanisms cover each other: the durable record is the
+    # fallback for the warning, and the warning is the fallback for the
+    # record. Only if BOTH fail is the survivor genuinely unknowable --
+    # and that must not pass silently.
+    record_error = None
+    try:
+        record.write_text(
+            "The restore\'s private working copy SURVIVED its cleanup.\n"
+            "This directory holds PLAINTEXT store and WAL bytes.\n"
+            "Remove it by hand once you have read what you need from it.\n",
+            encoding="utf-8")
+    except Exception as exc:
+        record_error = exc
+    warning_error = None
+    try:
+        print(f"[zmem] restore: WARNING - the private working copy "
+              f"{_esc(work_dir)} SURVIVED its cleanup and still holds "
+              f"plaintext store and WAL bytes; remove it by hand "
+              f"(the record is in {_esc(record)})",
+              file=sys.stderr)
+    except Exception as exc:
+        warning_error = exc
+    if record_error is not None and warning_error is not None:
+        raise RuntimeError(
+            "a private working copy (%s) survived its cleanup and NEITHER "
+            "the durable record nor the warning could be written; the "
+            "copy holds plaintext store and WAL bytes and must be removed "
+            "by hand" % work_dir) from record_error
     return True
 
 
@@ -1958,20 +1976,28 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                   f"(integrity_check={_esc(pre_info['integrity_check'])}, "
                   f"total={pre_info['snapshot_total']} live={pre_info['snapshot_live']})")
         except Exception as e:
-            print(f"[zmem] restore ABORTED: pre-restore backup of the current store "
-                  f"failed ({_esc(e)}) — refusing to overwrite the only copy of it.",
-                  file=sys.stderr)
+            print(f"[zmem] restore ABORTED: the pre-restore backup of the "
+                  f"current store, or the report of a surviving working copy, "
+                  f"failed ({_esc(e)}) — refusing to overwrite the only copy "
+                  f"of it.", file=sys.stderr)
             # F-004/MA-001: the private working copy must not survive a
             # failed safety copy (it holds plaintext store + WAL bytes).
-            if work_dir is not None:
-                shutil.rmtree(work_dir, ignore_errors=True)
-                _report_surviving_work_dir(work_dir)
-            for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
-                try:
-                    if p.exists():
-                        p.unlink()
-                except OSError:
-                    pass
+            # The staged copy holds the snapshot -- plaintext store bytes --
+            # so its cleanup runs even when the survivor report raises. The
+            # report's failure still propagates: it is never converted into
+            # a success.
+            try:
+                if work_dir is not None:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    _report_surviving_work_dir(work_dir)
+            finally:
+                for p in [staged] + [Path(str(staged) + sfx)
+                                     for sfx in SIDECAR_SUFFIXES]:
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except OSError:
+                        pass
             return 1
     elif dest_exists:
         print("[zmem] restore: pre-restore backup skipped - destination store is "

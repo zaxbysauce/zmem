@@ -1184,6 +1184,38 @@ class SurvivingWorkDirReportTest(_InProcessRestoreBase):
         self.assertIn("PLAINTEXT store and WAL bytes",
                       records[0].read_text(encoding="utf-8"))
 
+    def test_a_failed_report_still_cleans_the_staged_copy(self):
+        """R1-F-009b: the staged copy holds the snapshot -- plaintext store
+        bytes -- so its cleanup must run even when the survivor report
+        raises, and the restore must not report success (the closeout
+        reviewer's round-16 finding)."""
+        import storelib.backup as bm
+
+        self._add("staged cleanup row")
+        snap = self._snapshot(self.dir, self.store)
+
+        def boom(_work_dir):
+            raise RuntimeError("the survivor report could not be written")
+
+        def fail_snapshot(*_a, **_k):
+            raise OSError("the backup device is gone")
+
+        unpatch_report = self._patch_attr(bm, "_report_surviving_work_dir", boom)
+        unpatch_snapshot = self._patch_attr(bm, "create_snapshot", fail_snapshot)
+        try:
+            result = self._run(snap, lambda m: None, unpatch_report)
+        finally:
+            unpatch_snapshot()
+            unpatch_report()
+        staged = [p.name for p in self.dir.iterdir()
+                  if ".restore-stage-" in p.name]
+        self.assertEqual(
+            staged, [],
+            "the staged copy survived a failed survivor report; it holds the "
+            "snapshot (plaintext store bytes): %r" % (staged,))
+        self.assertNotEqual(result["rc"], 0,
+                            "a restore that could not report a surviving "
+                            "working copy reported success: %r" % (result,))
 
 
 class CompatPolicyTest(SuppBase, _SnapshotMixin):
