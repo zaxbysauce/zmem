@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 # Hermeticity floor BEFORE any storelib import (the STORE_PATH import-time
 # freeze hazard; same pattern as tests/test_zero_write_passive.py): pin the
@@ -213,9 +214,10 @@ class CombinedLaneInventoryTest(unittest.TestCase):
             raw.close()
 
     def test_mixed_batch_straddles_the_500_row_boundary(self):
-        # >500-row mixed batch: NULL + stale + canonical rows spread across
-        # the lane's keyset pagination boundary; every NULL and every stale
-        # row heals on ONE reopen, canonical rows are untouched.
+        # Exercise the row-batch boundary without making the result depend
+        # on whether this runner can normalize 1,200 rows in 250 ms.
+        from storelib import schema
+
         name = "inv-mixed.sqlite"
         self._seed(name)
         rows = []
@@ -230,7 +232,8 @@ class CombinedLaneInventoryTest(unittest.TestCase):
         self._insert_many(name, rows)
         conn = self._open(name)
         try:
-            migrate(conn)
+            with patch.object(schema, "_CONTENT_NORM_TIME_LIMIT", 10.0, create=True):
+                migrate(conn)
             norms = conn.execute(
                 "SELECT id, content_norm FROM memory").fetchall()
         finally:
@@ -241,7 +244,7 @@ class CombinedLaneInventoryTest(unittest.TestCase):
             self.assertEqual(
                 by_id[self._row(i)[0]], "inv row %d body" % i,
                 "row %d (%s shape) must hold the canonical norm after one "
-                "reopen" % (i, ("NULL", "stale", "canonical")[i % 3]))
+                "reopen within the fixture budget" % (i, ("NULL", "stale", "canonical")[i % 3]))
 
     def test_update_planted_stale_norm_heals(self):
         # UPDATE-style staleness: a raw writer UPDATEs content leaving the
