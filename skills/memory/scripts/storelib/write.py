@@ -2893,11 +2893,16 @@ def update_memory(
 
         # Capture policy, namespace validation and the size cap run on the
         # locked-row-derived effective values (moved from the pre-lock block).
+        # The AUTHORITATIVE evaluation carries the repair lane's
+        # row-scoped exemptions too: without them an exempt value that
+        # survived beside a value being repaired was redacted anyway by
+        # this second pass (the exemption mechanism is new in this PR).
         content_eff, source_ref_eff, tags_eff, warns = apply_capture_policy(
             content=content,
             source_ref=source_ref_eff,
             tags=tags_eff,
             capture_mode=capture_mode,
+            exempt_values=exempt_values,
         )
         if len(content_eff) > MAX_CONTENT_CHARS:
             if started_tx and conn.in_transaction:

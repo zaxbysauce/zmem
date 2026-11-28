@@ -9,6 +9,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **The repair lane's row-scoped exemptions are no longer dropped by
+  the authoritative capture-policy evaluation.** `update_memory` evaluates
+  the capture policy twice — a PRE-LOCK warning pass and the AUTHORITATIVE
+  evaluation under the write lock — and only the first carried the repair
+  lane's `exempt_values`, so an exempt value that survived beside a value
+  being repaired was redacted anyway by the authoritative pass. Both
+  evaluations now carry the exemptions.
+- **The restore's staged copy is now CREATED inside its guarded block.**
+  `tempfile.mkstemp` and the descriptor close ran before the guard, so a
+  failure there escaped as a raw traceback and could leave a
+  `.restore-stage-*` file behind unreported — the same leak class this PR
+  closed for the private working copy. The creation is now inside the
+  guard, and the guard's cleanup skips the staged file when it was never
+  created.
 - **`purge --scrub-backups` no longer writes THROUGH an alias in the
   backup tree.** The scrub rewrites each snapshot IN PLACE (the purge
   transaction and the VACUUM), so a symlink (or a Windows reparse point)

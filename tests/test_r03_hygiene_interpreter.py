@@ -220,14 +220,18 @@ class OperatorCommandPrefixPin(unittest.TestCase):
                       "schema reembed hint must use the opcmds prefix")
         backup = BACKUP.read_text(encoding="utf-8")
         # PR #541 (#504) consolidated the old five-branch rollback into one
-        # _finish_failed_restore with ONE hand-rollback hint site (the
-        # pre-restore backup arm); the empty/missing-destination arms advise
-        # file deletion, which carries no command. The rule's intent — every
-        # operator COMMAND hint renders through the prefix — is unchanged.
-        self.assertEqual(backup.count("command_prefix()"), 1,
-                         "the backup hand-rollback hint must use the prefix "
-                         "(consolidated to one site by PR #541's restore "
-                         "rework; the pre-#504 five-branch shape is gone)")
+        # _finish_failed_restore; the empty/missing-destination arms advise
+        # file deletion, which carries no command. There are now TWO
+        # hand-rollback hint sites — the automatic-rollback failure arm and
+        # the put-back failure arm (F-007: the operator must be told how to
+        # re-install the pre-restore backup BY HAND) — and BOTH render
+        # through the prefix. The rule's intent — every operator COMMAND
+        # hint renders through the prefix — is unchanged, and the AST checks
+        # below are what enforce it.
+        self.assertEqual(backup.count("command_prefix()"), 2,
+                         "both backup hand-rollback hints must use the prefix "
+                         "(the automatic-rollback arm and the put-back arm; "
+                         "the pre-#504 five-branch shape is gone)")
         # TG-2 (the round-1 review comment): the count above is a sentinel
         # that cannot catch a NEW unprefixed hint -- a second hint added
         # without the prefix would leave both counts at one. Pin the FORM,

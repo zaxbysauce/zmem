@@ -1812,16 +1812,23 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     prerestore_path: Path | None = None
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd_stage, stage_str = tempfile.mkstemp(
-        prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
-    os.close(fd_stage)
-    staged = Path(stage_str)
     try:
-        # F-004 (round-1 review comment): the staged copy and its sidecars
-        # are made INSIDE the guarded block, so an OSError (disk full, an AV
-        # lock) takes the same controlled path as a failed validation -- a
-        # ruled message and the staged file removed -- instead of escaping
-        # as a raw traceback and leaving a .restore-stage-* file behind.
+        # F-004 (round-1 review comment) + the closeout reviewer's round 24:
+        # the staged copy is CREATED inside the guarded block as well as
+        # copied there, so an OSError in the creation (an unwritable
+        # directory, a failed descriptor close) takes the same controlled
+        # path as a failed validation -- a ruled message and the staged
+        # file removed -- instead of escaping as a raw traceback and
+        # leaving a .restore-stage-* file behind UNREPORTED.
+        fd_stage, stage_str = tempfile.mkstemp(
+            prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
+        staged = Path(stage_str)
+        try:
+            os.close(fd_stage)
+        except OSError:
+            # the descriptor is released at process exit; the FILE is
+            # removed by the handler below
+            pass
         shutil.copy2(snap, staged)
         # A hand-supplied snapshot may carry its own sidecars: recover them on
         # the STAGED copy, never beside the live file.
@@ -1891,12 +1898,16 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             if p.exists():
                 p.unlink()
     except Exception as e:
-        for p in [staged] + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]:
-            try:
-                if p.exists():
-                    p.unlink()
-            except OSError:
-                pass
+        # the staged file may never have been CREATED (the creation is
+        # inside this guard now), so the cleanup skips it then
+        if staged is not None:
+            for p in ([staged]
+                      + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
         print(f"[zmem] restore FAILED: the staged copy could not be validated "
               f"({_esc(e)}) - destination untouched", file=sys.stderr)
         return 1

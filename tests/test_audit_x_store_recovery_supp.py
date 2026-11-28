@@ -338,24 +338,34 @@ class ImpostorMemoryTest(SuppBase):
                 "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); "
                 "INSERT INTO meta VALUES ('schema_version', '19')")
             conn.commit()
-            before = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
+            # TG-3(b) (the closeout reviewer's round 25): comparing only
+            # the table names and the memory table's column names cannot
+            # see a changed index, trigger, table definition or stored
+            # row -- so the WHOLE schema and the stored rows are compared.
+            before = list(conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"))
             cols_before = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+            rows_before = list(conn.execute("SELECT * FROM memory"))
         finally:
             conn.close()
         import storelib.schema as schema_mod
         conn = sqlite3.connect(str(self.store))
         try:
             schema_mod._recover_search_index(conn)   # must not raise
-            after = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
+            after = list(conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"))
             cols_after = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+            rows_after = list(conn.execute("SELECT * FROM memory"))
         finally:
             conn.close()
         self.assertEqual(after, before,
-                         "the impostor store's tables must be untouched")
+                         "the impostor store's whole schema must be untouched")
         self.assertEqual(cols_after, cols_before,
                          "the impostor memory table's columns must be untouched")
+        self.assertEqual(rows_after, rows_before,
+                         "the impostor store's stored rows must be untouched")
 
 
     def test_impostor_recovery_is_reached_end_to_end_and_rebuilds_nothing(self):
@@ -374,6 +384,13 @@ class ImpostorMemoryTest(SuppBase):
             before = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             cols_before = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+            # the impostor's OWN table definition and rows, so a change to
+            # either is visible (the column names alone would not show a
+            # changed CREATE TABLE)
+            memory_sql_before = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='memory'").fetchone()
+            rows_before = list(conn.execute("SELECT * FROM memory"))
         finally:
             conn.close()
         import storelib.schema as schema_mod
@@ -409,6 +426,10 @@ class ImpostorMemoryTest(SuppBase):
             after = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             cols_after = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
+            memory_sql_after = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='memory'").fetchone()
+            rows_after = list(conn.execute("SELECT * FROM memory"))
         finally:
             conn.close()
         # The open creates the (empty) vec0 shadow tables, so the impostor
@@ -423,6 +444,11 @@ class ImpostorMemoryTest(SuppBase):
                              "the impostor store must not gain %s" % shadow)
         self.assertEqual(cols_after, cols_before,
                          "the impostor memory table's columns must be untouched")
+        self.assertEqual(memory_sql_after, memory_sql_before,
+                         "the impostor memory table's definition must be "
+                         "untouched")
+        self.assertEqual(rows_after, rows_before,
+                         "the impostor store's stored rows must be untouched")
 
 
 class StoreEnvPinHelperTest(unittest.TestCase):
@@ -877,9 +903,22 @@ class RestoreFaultMatrixTest(_InProcessRestoreBase):
         self.assertEqual(result["rc"], 1, result["err"][-300:])
         self.assertIn("is not empty again", result["err"])
         self.assertIn("automatic rollback also failed", result["err"])
-        self.assertIn("replace", result["err"],
+        # TG-1 (the closeout reviewer's round 25): the instruction must be
+        # the DESTINATION-SPECIFIC one, not merely a message containing
+        # the word "replace" -- and the missing-destination instruction
+        # must NOT be printed here.
+        self.assertIn("then replace", result["err"],
                       "the empty-destination rollback must print the manual "
                       f"instructions: {result['err'][-400:]}")
+        self.assertIn("with an empty 0-byte file", result["err"],
+                      "the empty-destination instruction must name the "
+                      f"0-byte replacement: {result['err'][-400:]}")
+        self.assertIn("was an empty file before the restore", result["err"],
+                      "the empty-destination instruction must name the "
+                      f"destination state: {result['err'][-400:]}")
+        self.assertNotIn("did not exist before the restore", result["err"],
+                         "the missing-destination instruction must not be "
+                         f"printed for an empty destination: {result['err'][-400:]}")
 
     def test_missing_destination_rollback_survived_is_reported(self):
         # TG-1 (the round-1 review comment): the missing-destination rollback
@@ -915,9 +954,21 @@ class RestoreFaultMatrixTest(_InProcessRestoreBase):
         self.assertEqual(result["rc"], 1, result["err"][-300:])
         self.assertIn("survived the rollback", result["err"])
         self.assertIn("automatic rollback also failed", result["err"])
-        self.assertIn("delete", result["err"],
-                      "the missing-destination rollback must print the manual "
-                      f"instructions: {result['err'][-400:]}")
+        # TG-1 (the closeout reviewer's round 25): the instruction must be
+        # the DESTINATION-SPECIFIC one -- the destination itself is deleted
+        # -- and the empty-destination instruction must NOT be printed here.
+        self.assertIn(f"delete {self.store} and any", result["err"],
+                      "the missing-destination instruction must delete the "
+                      f"destination itself: {result['err'][-400:]}")
+        self.assertIn("did not exist before the restore", result["err"],
+                      "the missing-destination instruction must name the "
+                      f"destination state: {result['err'][-400:]}")
+        self.assertNotIn("then replace", result["err"],
+                         "the empty-destination instruction must not be "
+                         f"printed for a missing destination: {result['err'][-400:]}")
+        self.assertNotIn("with an empty 0-byte file", result["err"],
+                         "the empty-destination instruction must not be "
+                         f"printed for a missing destination: {result['err'][-400:]}")
 
     def test_installed_verification_failure_rolls_back(self):
         self._add("verify keeper row one")
@@ -1119,6 +1170,15 @@ class SwapSharingViolationTest(_InProcessRestoreBase):
     """
 
     def test_a_locked_destination_takes_the_pre_swap_failure_path(self):
+        # The sharing violation is a WINDOWS file-sharing behaviour: a
+        # Windows handle carries no FILE_SHARE_DELETE, so os.replace over
+        # an open destination fails. On POSIX the replacement SUCCEEDS
+        # (the old inode stays alive for the open handle), so the seam
+        # this leg captures does not exist there -- the leg is skipped
+        # rather than asserting a behaviour the platform does not have.
+        if os.name != "nt":
+            self.skipTest("the sharing violation is a Windows file-sharing "
+                          "behaviour; POSIX replaces an open destination")
         self._add("swap sharing victim")
         snap = self._snapshot(self.dir, self.store)
         before = self._live_rows()
