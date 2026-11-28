@@ -1030,6 +1030,24 @@ class CanaryHelperUnitTest(unittest.TestCase):
         self.assertIn("<memory-context>",
                       "<memory-context>\n%s\n</memory-context>" % fence)
 
+    def test_store_open_timing_does_not_count_as_hermes_delivery(self):
+        mod = self._load()
+        data_dir = self._data_dir("hermes-timing-only")
+        ops = data_dir / "ops"
+        ops.mkdir(parents=True)
+        decisions = data_dir / "zmem-decisions.log"
+        for name in ("store-open.jsonl", "store-open.jsonl.1", ".store-open.lock",
+                     ".store-open.lock.release.test"):
+            (ops / name).touch()
+
+        self.assertFalse(mod._delivery_evidence(data_dir, decisions, 0, set()))
+        self.assertFalse(mod._delivery_evidence(data_dir, decisions, 0))
+        (ops / "fixture.ledger").write_text("fixture\n", encoding="utf-8")
+        self.assertTrue(mod._delivery_evidence(data_dir, decisions, 0, set()))
+        self.assertFalse(mod._delivery_evidence(data_dir, decisions, 0, {"fixture.ledger"}))
+        decisions.write_text("delivered\n", encoding="utf-8")
+        self.assertTrue(mod._delivery_evidence(data_dir, decisions, 0, {"fixture.ledger"}))
+
     def test_lane_changes_only_canary_inventory(self):
         """Issue #96 AC6: only the allowed canary-data paths change across a
         lane run; operator-config and host-roots stay byte-identical; a

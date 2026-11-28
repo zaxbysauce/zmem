@@ -309,7 +309,11 @@ class InvalidTokenTest(unittest.TestCase):
                 timeout=180, cwd=str(REPO_ROOT))
             self.assertEqual(r.returncode, 0, r.stderr[-300:])
             mid = json.loads(r.stdout)["id"]
-            self.assertFalse((fresh / "ops").exists(),
+            ops = fresh / "ops"
+            if ops.exists():
+                (ops / "store-open.jsonl").unlink(missing_ok=True)
+                ops.rmdir()
+            self.assertFalse(ops.exists(),
                              "fixture must start with no ops dir")
             pr = subprocess.run(
                 [sys.executable, "-X", "utf8", str(STORE_PY), "purge",

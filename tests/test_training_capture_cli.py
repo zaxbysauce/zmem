@@ -241,7 +241,8 @@ class TrainingCaptureCliTests(unittest.TestCase):
     def test_export_lease_precedes_connect_and_releases_on_setup_base_exception(self) -> None:
         """The restore barrier is held even when setup raises outside expected errors."""
         calls: list[str] = []
-        lease = object()
+        admission_token = object()
+        writer_token = object()
         old_argv = sys.argv
         sys.argv = [
             str(STORE), "export-training", str(self.root / "training"),
@@ -249,28 +250,43 @@ class TrainingCaptureCliTests(unittest.TestCase):
             "--namespace", "project:training-cli",
         ]
 
-        def acquire(_command: str) -> object:
-            calls.append("acquire")
-            return lease
+        def acquire_open(command: str) -> object:
+            self.assertEqual(command, "export-training")
+            calls.append("acquire_open")
+            return admission_token
+
+        def acquire_writer(command: str, *, open_lease: object | None = None) -> object:
+            self.assertEqual(command, "export-training")
+            self.assertIs(open_lease, admission_token)
+            calls.append("acquire_writer")
+            return writer_token
 
         def fail_connect() -> sqlite3.Connection:
             calls.append("connect")
             raise KeyError("unanticipated setup fault")
 
         def release(token: object | None) -> None:
-            self.assertIs(token, lease)
-            calls.append("release")
+            if token is writer_token:
+                calls.append("release_writer")
+            elif token is admission_token:
+                calls.append("release_open")
+            else:
+                self.fail("unexpected lease token")
 
         try:
             with patch.object(store_cli, "_wait_for_maintenance_clear"), \
-                 patch.object(store_cli, "_acquire_writer_lease", side_effect=acquire), \
+                 patch.object(store_cli, "_acquire_open_lease", side_effect=acquire_open), \
+                 patch.object(store_cli, "_acquire_writer_lease", side_effect=acquire_writer), \
                  patch.object(store_cli, "_release_writer_lease", side_effect=release), \
                  patch.object(store_cli, "connect", side_effect=fail_connect):
                 with self.assertRaisesRegex(KeyError, "unanticipated setup fault"):
                     store_cli.main()
         finally:
             sys.argv = old_argv
-        self.assertEqual(calls, ["acquire", "connect", "release"])
+        self.assertEqual(
+            calls,
+            ["acquire_open", "acquire_writer", "connect", "release_writer", "release_open"],
+        )
 
     def test_partial_governance_is_accepted_as_metadata_only_and_timestamps_refused(self) -> None:
         delivery_id = str(uuid.uuid4())

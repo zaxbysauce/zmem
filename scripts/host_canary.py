@@ -1798,7 +1798,13 @@ def _delivery_evidence(data_dir, decisions, pre_size, pre_ops=None):
             return True
         ops = Path(data_dir) / "ops"
         if ops.is_dir():
-            current = {p.name for p in ops.iterdir()}
+            # Opening the store can create or rotate timing artifacts even
+            # when the probe never reaches a delivery path.
+            current = {
+                p.name for p in ops.iterdir()
+                if p.name not in {"store-open.jsonl", "store-open.jsonl.1", ".store-open.lock"}
+                and not p.name.startswith(".store-open.lock.")
+            }
             if pre_ops is None:
                 # No baseline captured (legacy caller): any content counts,
                 # but this branch is only used before the probe baselines.

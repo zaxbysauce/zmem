@@ -654,7 +654,7 @@ class HookBodyComposeTest(unittest.TestCase):
             env = _clean_env(tmp)
             _seed(env, "project:ops-e2e", self.LESSON)
             ring = Path(ops_tokens._ring_path(tmp, "sess-e2e"))
-            ring.parent.mkdir(parents=True)
+            ring.parent.mkdir(parents=True, exist_ok=True)
             ring.write_text(
                 json.dumps({"ts": 1, "tool": "Bash", "ops": "git stash pop"}),
                 encoding="utf-8")
@@ -1119,7 +1119,7 @@ class HermesPrefetchComposeTest(unittest.TestCase):
                   "prefetchcanary hazard: blind git stash pop applies a "
                   "foreign stash; verify git stash list first")
             ring = Path(ops_tokens._ring_path(tmp, "sess-pf"))
-            ring.parent.mkdir(parents=True)
+            ring.parent.mkdir(parents=True, exist_ok=True)
             ring.write_text(
                 json.dumps({"ts": 1, "tool": "Bash", "ops": "git stash pop"}),
                 encoding="utf-8")

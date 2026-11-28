@@ -1265,6 +1265,67 @@ def _read_schema_version(store_path: Path) -> tuple[int | None, str | None]:
         return None, f"unparseable schema_version={row[0]!r}"
 
 
+def _check_content_norm_pass(store_path: Path) -> dict | None:
+    """Inspect only progress metadata and counts, without advancing repair."""
+    if not store_path.is_file():
+        return None
+    try:
+        ro = _open_store_ro(store_path)
+    except (OSError, sqlite3.Error, ValueError, RuntimeError):
+        return None
+    if ro is None:
+        return None
+    try:
+        conn = ro.conn
+        state = conn.execute(
+            "SELECT value FROM meta WHERE key='content_norm_pass_state'"
+        ).fetchone()
+        if state is None:
+            return None
+        dirty = conn.execute("SELECT COUNT(*) FROM memory_content_norm_dirty").fetchone()[0]
+        if state[0] == "done":
+            return _check(
+                "content-norm-pass", "warn" if dirty else "pass",
+                f"Content normalization baseline complete. {dirty} marked rows await repair.",
+                state="done", dirty_rows=dirty, remaining_batches=0,
+            )
+        cursor = conn.execute(
+            "SELECT key FROM meta WHERE key IN "
+            "('content_norm_pass_after_id', 'content_norm_pass_after_null_rowid')"
+        ).fetchone()
+        observed = conn.execute(
+            "SELECT value FROM meta WHERE key='content_norm_pass_batch_rows'"
+        ).fetchone()
+        if cursor is None:
+            remaining = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+        elif cursor[0] == "content_norm_pass_after_null_rowid":
+            remaining = conn.execute(
+                "SELECT COUNT(id) + (SELECT COUNT(*) FROM memory WHERE id IS NULL "
+                "AND rowid > (SELECT CAST(value AS INTEGER) FROM meta WHERE key=?)) FROM memory",
+                (cursor[0],),
+            ).fetchone()[0]
+        else:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM memory WHERE id > (SELECT value FROM meta WHERE key=?)",
+                (cursor[0],),
+            ).fetchone()[0]
+        try:
+            batch_rows = max(1, int(observed[0])) if observed else 1
+        except (TypeError, ValueError):
+            batch_rows = 1
+        batches = (remaining + batch_rows - 1) // batch_rows
+        return _check(
+            "content-norm-pass", "warn",
+            f"Content normalization {state[0]} pass pending. Estimated {batches} batches remain.",
+            state=state[0], dirty_rows=dirty, remaining_rows=remaining,
+            remaining_batches=batches,
+        )
+    except sqlite3.Error:
+        return None
+    finally:
+        ro.close()
+
+
 def _check_schema(store_path: Path, access_check: dict) -> dict:
     version, err = _read_schema_version(store_path)
     writable = bool(access_check["details"].get("store_write"))
@@ -6390,6 +6451,9 @@ def build_report(
     access_check = _check_store_access(resolved_store)
     checks.append(access_check)
     checks.append(_check_schema(resolved_store, access_check))
+    content_norm_pass = _check_content_norm_pass(resolved_store)
+    if content_norm_pass is not None:
+        checks.append(content_norm_pass)
     # Issue #322 AC1: conditional skew diagnostic (emits only when the ops
     # dir holds unsupported-family delivery-state files).
     checks.extend(_check_delivery_state_skew(resolved_store))

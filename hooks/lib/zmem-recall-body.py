@@ -39,6 +39,12 @@ _HOOK_INPUT_MAX_BYTES = 256 * 1024
 # transport for raw tool input.
 _PRETOOL_INPUT_MAX_BYTES = _HOOK_INPUT_MAX_BYTES
 _PRIVATE_PRETOOL_STDIN_MARKER = "ZMEM_PRIVATE_PRETOOL_STDIN"
+_MAINTENANCE_WAIT_ENV = "ZMEM_MAINTENANCE_WAIT_SECONDS"
+_SCHEMA_LOCK_WAIT_ENV = "ZMEM_SCHEMA_LOCK_WAIT_SECONDS"
+_MAINTENANCE_WAIT_DEADLINE_ENV = "ZMEM_MAINTENANCE_WAIT_DEADLINE_MONOTONIC"
+_MAINTENANCE_WAIT_DEFAULT_S = 5.0
+_SCHEMA_LOCK_WAIT_DEFAULT_S = 15.0
+_WAIT_RESERVE_MAX_S = 0.50
 # Issue #253: the delegating prompt rides the store argv (same surface as the
 # --query free text).  The bound is an ARGV bound, not the parked-byte size:
 # the store redacts first and only then caps at TASK_TEXT_MAX, so truncating
@@ -139,6 +145,17 @@ def _store_timeout_s():
         except Exception:
             pass
     return value
+
+
+def _configured_wait_s(env, name, default):
+    """Read a finite, nonnegative wait setting from a child environment."""
+    try:
+        value = float(env.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(0.0, value)
 
 
 def _classify_silent_reason(rows, omitted=0, budget_emptied=False,
@@ -602,6 +619,37 @@ def _run_store(store_py: str, args: list[str], timeout=None, *,
                     child_env.pop(key, None)
                 else:
                     child_env[key] = value
+        # The store may wait on both the maintenance and schema locks. Reserve
+        # room for process startup and clean exit, then make the two waits a
+        # single bounded budget. Read settings after applying overrides so a
+        # smaller finite child setting remains authoritative; the final values
+        # are scoped to this child and never mutate the hook's environment.
+        try:
+            timeout_budget = float(effective_timeout)
+        except (TypeError, ValueError):
+            timeout_budget = 0.0
+        if not math.isfinite(timeout_budget) or timeout_budget < 0.0:
+            timeout_budget = 0.0
+        reserve = min(_WAIT_RESERVE_MAX_S, timeout_budget / 4.0)
+        wait_budget = max(0.0, timeout_budget - reserve)
+        maintenance_wait = min(
+            _configured_wait_s(child_env, _MAINTENANCE_WAIT_ENV,
+                               _MAINTENANCE_WAIT_DEFAULT_S),
+            wait_budget,
+        )
+        schema_wait = min(
+            _configured_wait_s(child_env, _SCHEMA_LOCK_WAIT_ENV,
+                               _SCHEMA_LOCK_WAIT_DEFAULT_S),
+            max(0.0, wait_budget - maintenance_wait),
+        )
+        child_env[_MAINTENANCE_WAIT_ENV] = repr(maintenance_wait)
+        child_env[_SCHEMA_LOCK_WAIT_ENV] = repr(schema_wait)
+        # The schema-side maintenance waits share this one deadline, including
+        # both waits made while taking a writer lease. Set it immediately before
+        # launch so the monotonic budget starts at the final child boundary.
+        child_env[_MAINTENANCE_WAIT_DEADLINE_ENV] = repr(
+            time.monotonic() + maintenance_wait
+        )
         kwargs["env"] = child_env
         # Supplying ``input`` makes check_output use communicate(), avoiding a
         # pipe-buffer deadlock if a version-skewed child exits before reading
