@@ -1808,7 +1808,13 @@ def cmd_queue_list(*, namespace: str, as_json: bool) -> int:
     """
     try:
         import correction_queue as _cq
+        from redaction import REDACTED_SECRET, redact_secret_like_text
+
         items = _cq.load_queue(namespace)
+        for item in items:
+            if item.get("secret_warning"):
+                message, redactions = redact_secret_like_text(str(item.get("message") or ""))
+                item["message"] = message if redactions else REDACTED_SECRET
     except Exception:
         items = []
     if as_json:

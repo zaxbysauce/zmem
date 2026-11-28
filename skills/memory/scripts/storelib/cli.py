@@ -3025,7 +3025,6 @@ def _closeout_ops_paths(session_id: str) -> dict:
         "nudged": os.path.join(ops, stem + ".nudged"),
         "closeout": os.path.join(ops, stem + ".closeout"),
         "receipts": os.path.join(ops, stem + ".closeout-steps.jsonl"),
-        "requested": os.path.join(ops, stem + ".closeout-requested"),
     }
 
 
@@ -3079,6 +3078,14 @@ def _closeout_marker_ts(path: str) -> float:
         return 0.0
 
 
+_CLOSEOUT_SESSION_MATCH = "(source_ref COLLATE BINARY = ? OR instr(source_ref, ?) = 1)"
+
+
+def _closeout_session_refs(session_id: str) -> tuple[str, str]:
+    ref = f"session:{session_id}"
+    return ref, ref + ":"
+
+
 def _closeout_unreviewed_rows(session_id: str, since_ts: float) -> list:
     """Live memory rows attributed to this session (source_ref shaped
     `session:<sid>` or `session:<sid>:…`) ingested after ``since_ts`` and
@@ -3087,16 +3094,16 @@ def _closeout_unreviewed_rows(session_id: str, since_ts: float) -> list:
     an error row — the gate fails closed on it)."""
     if not os.path.isfile(STORE_PATH):
         return []
-    like = f"session:{session_id}%"
     try:
         db = sqlite3.connect(
             f"file:{STORE_PATH}?mode=ro", uri=True, timeout=10)
         try:
             cur = db.execute(
                 "SELECT id, namespace, substr(content, 1, 120), ingestion_ts"
-                " FROM memory WHERE source_ref LIKE ? AND superseded_at IS"
-                " NULL AND ingestion_ts > ? ORDER BY ingestion_ts",
-                (like, since_ts),
+                f" FROM memory WHERE {_CLOSEOUT_SESSION_MATCH}"
+                " AND superseded_at IS NULL AND ingestion_ts > ?"
+                " ORDER BY ingestion_ts",
+                (*_closeout_session_refs(session_id), since_ts),
             )
             return [
                 {"id": r[0], "namespace": r[1], "content_head": r[2],
@@ -3179,18 +3186,17 @@ def _cmd_closeout_skip(args) -> None:
             "required": sorted(CLOSEOUT_REQUIRED_STEPS),
         }, separators=(",", ":")) + "\n", end="")
         sys.exit(2)
-    if not (args.reason or "").strip():
+    reason = (args.reason or "").strip()[:300]
+    if sum(any(char.isalnum() for char in word) for word in reason.split()) < 3:
         print(json.dumps({
             "ok": False,
-            "error": "closeout-skip requires --reason (a skip without a "
-                     "recorded reason is the silent deferral this gate "
-                     "exists to prevent)",
+            "error": "closeout-skip requires a reason with at least three words",
         }, separators=(",", ":")) + "\n", end="")
         sys.exit(2)
     _closeout_append_receipt(args.session_id, {
         "type": "skip",
         "step": args.step,
-        "reason": args.reason.strip()[:300],
+        "reason": reason,
     })
     print(json.dumps({"ok": True, "step": args.step, "skipped": True},
                      separators=(",", ":")) + "\n", end="")
@@ -3213,15 +3219,20 @@ def _cmd_closeout_review(args) -> None:
             "error": "store.sqlite not found; nothing to review",
         }, separators=(",", ":")) + "\n", end="")
         sys.exit(2)
-    like = f"session:{args.session_id}%"
+    successor_evidence = "0"
+    if verdict == "resignal":
+        successor_evidence = (
+            "EXISTS (SELECT 1 FROM memory AS successor WHERE successor.update_of = m.id"
+            " AND successor.signal IS NOT m.signal)"
+        )
     try:
         db = sqlite3.connect(
             f"file:{STORE_PATH}?mode=ro", uri=True, timeout=10)
         try:
             cur = db.execute(
-                "SELECT source_ref FROM memory WHERE id = ? AND"
-                " source_ref LIKE ?",
-                (args.memory_id, like),
+                f"SELECT m.superseded_at, {successor_evidence}"
+                f" FROM memory AS m WHERE m.id = ? AND {_CLOSEOUT_SESSION_MATCH}",
+                (args.memory_id, *_closeout_session_refs(args.session_id)),
             )
             hit = cur.fetchone()
         finally:
@@ -3240,6 +3251,17 @@ def _cmd_closeout_review(args) -> None:
                      f"source_ref)",
         }, separators=(",", ":")) + "\n", end="")
         sys.exit(2)
+    superseded_at, signal_changed = hit
+    problem = None
+    if verdict == "keep" and superseded_at is not None:
+        problem = "keep requires a live memory row"
+    elif verdict == "invalidate" and superseded_at is None:
+        problem = "run store.py invalidate on the memory row before recording invalidate"
+    elif verdict == "resignal" and (superseded_at is None or not signal_changed):
+        problem = "run store.py update --signal on the memory row before recording resignal"
+    if problem:
+        print(json.dumps({"ok": False, "error": problem}, separators=(",", ":")))
+        sys.exit(2)
     _closeout_append_receipt(args.session_id, {
         "type": "review",
         "memory_id": args.memory_id,
@@ -3251,10 +3273,26 @@ def _cmd_closeout_review(args) -> None:
 
 
 def _cmd_closeout_status(args) -> None:
+    from closeout_request import disposition
+
     report = _closeout_gate_report(args.session_id)
+    report["request_disposition"] = disposition(args.session_id)
     report["ok"] = True
     report["required_steps"] = sorted(CLOSEOUT_REQUIRED_STEPS)
     print(json.dumps(report, separators=(",", ":")) + "\n", end="")
+
+
+def _cmd_closeout_release(args) -> None:
+    from closeout_request import release
+
+    active_session = os.environ.get("ZMEM_SESSION", "")
+    if not args.session_id or (active_session and active_session != args.session_id):
+        print(json.dumps({"ok": False, "error": "closeout-release requires the current session id"}))
+        sys.exit(2)
+    if not release(args.session_id):
+        print(json.dumps({"ok": False, "error": "this session has no armed closeout request"}))
+        sys.exit(2)
+    print(json.dumps({"ok": True, "disposition": "not_requested"}, separators=(",", ":")))
 
 
 def _cmd_closeout_ack(args) -> None:
@@ -3865,9 +3903,7 @@ def main():
     p_closeout_skip.add_argument("--step", required=True,
                                  help="Required step being skipped")
     p_closeout_skip.add_argument("--reason", required=True,
-                                 help="Why the step is skipped (required; a "
-                                      "skip without a reason is the silent "
-                                      "deferral this gate prevents)")
+                                 help="Why the step is skipped (at least three words)")
 
     p_closeout_review = _add_parser(
         "closeout-review", help="record a keep|resignal|invalidate verdict "
@@ -3887,6 +3923,11 @@ def main():
         "closeout still needs (missing/stale steps, unreviewed session rows)")
     p_closeout_status.add_argument("--session-id", required=True,
                                    help="Session id whose closeout is reported")
+
+    p_closeout_release = _add_parser(
+        "closeout-release", help="record that an armed closeout was not requested")
+    p_closeout_release.add_argument("--session-id", required=True,
+                                    help="Session id whose armed request is released")
 
     p_closeout_ack = _add_parser(
         "closeout-ack", help="record that this session ran the closeout "
@@ -5877,13 +5918,14 @@ def main():
     # own; closeout-ack's contract refusal exits 2 (machine-readable JSON on
     # stdout), and only an OSError (marker I/O) exits 1.
     if args.cmd in ("closeout-ack", "closeout-step", "closeout-skip",
-                    "closeout-review", "closeout-status"):
+                    "closeout-review", "closeout-status", "closeout-release"):
         handler = {
             "closeout-ack": _cmd_closeout_ack,
             "closeout-step": _cmd_closeout_step,
             "closeout-skip": _cmd_closeout_skip,
             "closeout-review": _cmd_closeout_review,
             "closeout-status": _cmd_closeout_status,
+            "closeout-release": _cmd_closeout_release,
         }[args.cmd]
         try:
             handler(args)
