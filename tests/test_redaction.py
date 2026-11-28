@@ -183,7 +183,10 @@ class RedactTextHelperTest(unittest.TestCase):
         self.assertEqual(redact_text(too_long_aiza), (too_long_aiza, 0))
 
     def test_non_bearer_scheme_is_not_redacted_by_bearer_rule(self):
-        text = "Basic " + "A" * 16
+        # The BEARER rule still does not touch a Basic-prefixed value; the
+        # #502 Basic detector intentionally covers "Basic <value>" now, so
+        # the bearer-rule isolation pin uses a scheme no pattern claims.
+        text = "Negotiate " + "A" * 16
         redacted, count = redact_text(text)
         self.assertEqual(redacted, text)
         self.assertEqual(count, 0)
