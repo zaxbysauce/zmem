@@ -1365,6 +1365,48 @@ class SurvivingWorkDirReportTest(_InProcessRestoreBase):
                             "a restore that could not report a surviving "
                             "working copy reported success: %r" % (result,))
 
+    def test_a_surviving_staged_copy_is_reported_exactly_once(self):
+        """The closeout critic's requirement: a staged copy that SURVIVES
+        its cleanup -- the removal fails, so the file (which holds the
+        snapshot, i.e. plaintext store bytes) is still there -- must be
+        REPORTED, and reported EXACTLY ONCE (an earlier report loop ran
+        inside the cleanup loop and repeated every survivor on each hit).
+        """
+        import pathlib
+        import storelib.backup as bm
+
+        self._add("staged survivor report row")
+        snap = self._snapshot(self.dir, self.store)
+
+        def fail_snapshot(*_a, **_k):
+            raise OSError("the backup device is gone")
+
+        real_unlink = pathlib.Path.unlink
+
+        def unlink_fails_for_the_stage(path_self, *a, **k):
+            if ".restore-stage-" in path_self.name:
+                raise OSError("the staged copy is locked")
+            return real_unlink(path_self, *a, **k)
+
+        unpatch_snapshot = self._patch_attr(bm, "create_snapshot",
+                                           fail_snapshot)
+        unpatch_unlink = self._patch_attr(pathlib.Path, "unlink",
+                                          unlink_fails_for_the_stage)
+        try:
+            result = self._run(snap, lambda m: None)
+        finally:
+            unpatch_unlink()
+            unpatch_snapshot()
+        lines = [line for line in result["err"].splitlines()
+                 if "SURVIVED its cleanup" in line]
+        self.assertEqual(
+            len(lines), 1,
+            "a surviving staged copy (plaintext store bytes) must be "
+            "reported exactly once: %r" % (lines,))
+        self.assertNotEqual(result["rc"], 0,
+                            "a restore that could not remove its staged "
+                            "copy reported success: %r" % (result,))
+
 
 class CompatPolicyTest(SuppBase, _SnapshotMixin):
     """The compat-window and override stamp policy (unchanged by the new
