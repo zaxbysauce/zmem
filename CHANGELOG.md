@@ -9,6 +9,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- **`purge --scrub-backups` no longer writes THROUGH an alias in the
+  backup tree.** The scrub rewrites each snapshot IN PLACE (the purge
+  transaction and the VACUUM), so a symlink (or a Windows reparse point)
+  standing in for a snapshot -- or a hard link to a file outside the tree
+  -- had the delete and the rewrite land on a file the operator never
+  nominated, OUTSIDE the sanctioned backup tree, while the scrub still
+  reported "no residue". The scrub now REFUSES an aliased snapshot
+  before it opens it, names the alias and its target, and the purge exits
+  6 -- its own "backup scrub failed" channel -- because the flag's
+  contract is completeness: an unscrubbed snapshot is never reported as
+  clean. The refusal is per snapshot, so a legitimate snapshot beside the
+  alias is still scrubbed. (swarm review F-016)
 - **An interrupted first open is now restartable, a lost search table is
   rebuilt with every old row re-indexed, and 32 concurrent writers are no
   longer refused with a restore-blaming message** (issue #506). The v3 and

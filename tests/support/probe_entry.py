@@ -18,6 +18,7 @@ fails the test when the driver reports a failure.
   lifetime       tests/support/wave2e_lifetime.py
   frozen-base    tests/support/frozen_base_leg.py
   vec-suite      tests/support/vec_suite_leg.py
+  f011           tests/support/f011_probes.py
 
 The frozen-base driver's own arguments arrive through the environment
 (the runner's `env_extra`), because the runner's argv belongs to
@@ -43,6 +44,7 @@ DRIVERS = {
     "lifetime": "wave2e_lifetime",
     "frozen-base": "frozen_base_leg",
     "vec-suite": "vec_suite_leg",
+    "f011": "f011_probes",
 }
 
 

@@ -2573,5 +2573,105 @@ class ShapeTokenizerFidelityTest(SuppBase):
             "INTEGER -- a store of the wrong shape reached the destination")
 
 
+class ScrubAliasRefusalTest(SuppBase, _SnapshotMixin):
+    """F-016: the backup scrub must NEVER write THROUGH an alias.
+
+    The scrub rewrites a snapshot IN PLACE (the purge transaction and the
+    VACUUM), so a symlink/junction standing in for a snapshot -- or a hard
+    link to a file outside the tree -- had the delete and the rewrite land
+    on a file the operator never nominated, OUTSIDE the sanctioned backup
+    tree. The EXECUTED probe showed it: on Linux (a real symlink) the
+    victim's bytes changed and the purged row was gone from it; on Windows
+    (a hard link -- the only alias this host can create) the same.
+
+    FIXED: the scrub REFUSES an aliased snapshot before it connects, names
+    the alias and its target, and the purge exits 6 -- the flag's own
+    "backup scrub failed" channel, because the flag's contract is
+    completeness ("no residue"): an unscrubbed snapshot must never be
+    reported as clean. The refusal is per snapshot, so a legitimate
+    snapshot beside the alias is still scrubbed.
+    """
+
+    def _alias_case(self, kind, name):
+        import json as _json
+        r0 = self._add("scrub alias row")
+        mid = _json.loads(r0.stdout)["id"]
+        snap = self._snapshot(self.dir, self.store)
+        # the VICTIM lives OUTSIDE the backup tree
+        victim = self.dir / "victim.sqlite"
+        shutil.copyfile(snap, victim)
+        before = victim.read_bytes()
+        # the alias takes a snapshot's place in the backup tree
+        alias = snap.parent / name
+        snap.unlink()
+        if kind == "symlink":
+            try:
+                os.symlink(str(victim), str(alias))
+            except OSError as exc:
+                self.skipTest("this host cannot create a symlink: %s" % exc)
+        else:
+            os.link(str(victim), str(alias))
+        env = _child_env(self.dir, self.store)
+        r = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "purge", "--id", mid,
+             "--scrub-backups", "--out-dir", str(self.dir / "backups")],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=180)
+        # the scrub REFUSED the alias, through the flag's own channel
+        self.assertEqual(6, r.returncode,
+                         (r.returncode, r.stdout[-300:], r.stderr[-400:]))
+        self.assertIn("backup scrub refused", r.stderr, r.stderr[-400:])
+        self.assertIn(alias.name, r.stderr, r.stderr[-400:])
+        self.assertIn("ALIAS", r.stderr, r.stderr[-400:])
+        # the file OUTSIDE the backup tree is byte-identical
+        self.assertEqual(before, victim.read_bytes(),
+                         "the file outside the backup tree was rewritten")
+        # and the purged row is still in it
+        conn = sqlite3.connect(str(victim))
+        try:
+            rows = conn.execute("SELECT id FROM memory WHERE id=?",
+                                (mid,)).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([(mid,)], rows,
+                         "the row was deleted from the file outside the "
+                         "backup tree")
+
+    def test_a_hardlink_alias_in_the_store_glob_is_refused(self):
+        self._alias_case("hardlink", "store-alias.sqlite")
+
+    def test_b_hardlink_alias_in_the_prerestore_glob_is_refused(self):
+        self._alias_case("hardlink", "prerestore-alias.sqlite")
+
+    def test_c_a_symlink_alias_is_refused(self):
+        self._alias_case("symlink", "store-alias.sqlite")
+
+    def test_d_an_ordinary_snapshot_is_still_scrubbed(self):
+        """the negative control: the alias refusal must NOT refuse an
+        ordinary snapshot -- it is still scrubbed and the purge exits 0."""
+        import json as _json
+        r0 = self._add("scrub control row")
+        mid = _json.loads(r0.stdout)["id"]
+        snap = self._snapshot(self.dir, self.store)
+        env = _child_env(self.dir, self.store)
+        r = subprocess.run(
+            [PY, "-X", "utf8", str(STORE_PY), "purge", "--id", mid,
+             "--scrub-backups", "--out-dir", str(self.dir / "backups")],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, env=env,
+            timeout=180)
+        self.assertEqual(0, r.returncode,
+                         (r.returncode, r.stdout[-300:], r.stderr[-400:]))
+        self.assertIn("no residue", r.stdout, r.stdout[-300:])
+        # the snapshot no longer holds the purged row
+        conn = sqlite3.connect(str(snap))
+        try:
+            rows = conn.execute("SELECT id FROM memory WHERE id=?",
+                                (mid,)).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([], rows,
+                         "the snapshot still holds the purged row")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
