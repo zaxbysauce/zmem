@@ -104,6 +104,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   input and are unchanged. Noise from `git status`, `grep`/`rg` and inline
   scripts is deliberately not filtered.
 
+- **The restore's required-shape proof now parses a table definition
+  the way SQLite parses it.** Before the staged copy of a snapshot may
+  replace the destination, the proof compares that snapshot's schema
+  against a freshly built store, token for token. Its tokenizer
+  normalized every numeric literal through `float`, so a column's
+  `DEFAULT 0` (an INTEGER) and `DEFAULT 0.0` (a REAL) compared EQUAL --
+  SQLite stores them as different values -- and two integers one unit
+  apart (`9007199254740992` and `9007199254740993`) collided as well. It
+  also ended a backtick-quoted identifier at the first backtick, while
+  SQLite reads a doubled backtick as an escaped one, so `` `a``b` `` is
+  the ONE identifier `a`b`. A snapshot whose required column's default
+  differed in kind, or by one unit, could therefore pass the proof and
+  replace the destination with a store of the wrong shape. The tokenizer
+  now keeps SQLite's own kind (INTEGER or REAL) with an EXACT value --
+  the proof still normalizes numbers BY VALUE, so `007` and `7` compare
+  equal, as before -- and reads a doubled-backtick identifier as the one
+  identifier SQLite sees. (issue #542 AC6)
+
 - **The release gate now refuses a CHANGELOG that carries an unresolved
   merge marker** (PR #541). A merge whose conflict is resolved by
   RECONSTRUCTION can leave the conflict MARKERS in the file beside the

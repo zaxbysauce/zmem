@@ -2304,3 +2304,121 @@ class CliEarlyErrorShapeTest(SuppBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ShapeTokenizerFidelityTest(SuppBase):
+    """R1-F-007 / #542 AC6: the shape proof must parse what SQLite parses.
+
+    The shape proof is NEW in this PR, and its tokenizer had two gaps
+    that let a snapshot of the WRONG shape past it:
+
+    * a numeric DEFAULT was normalised through ``float``, so ``DEFAULT 0``
+      (an INTEGER) and ``DEFAULT 0.0`` (a REAL) compared EQUAL -- and
+      SQLite stores them as different values -- and ``9007199254740992``
+      and ``9007199254740993`` collided as well (one ULP apart);
+    * a backtick-quoted identifier with a DOUBLED backtick escape is ONE
+      identifier to SQLite (`` `a``b` `` is ``a`b``), but the pattern
+      ended the identifier at the first backtick, so the impostor's single
+      column read as the two columns the fresh store has.
+
+    The numeric one is the material accept: the proof compares a column's
+    DEFINITION token for token, and only the column NAME is cross-checked
+    against ``table_xinfo`` -- so a required column whose default is a
+    REAL where the fresh store's is an INTEGER was ACCEPTED, and the
+    store that replaced the destination was not the required shape.
+    """
+
+    def _tokens(self, sql):
+        import storelib.backup as backup_mod
+        return backup_mod._shape_tokens(sql)
+
+    def test_the_numeric_default_kind_is_part_of_the_shape(self):
+        # R1-F-007: an INTEGER default and a REAL default are DIFFERENT
+        # values to SQLite, so the shape proof must not call them equal.
+        integer = self._tokens("c INTEGER NOT NULL DEFAULT 0")
+        real = self._tokens("c INTEGER NOT NULL DEFAULT 0.0")
+        self.assertNotEqual(
+            integer, real,
+            "AC6: `DEFAULT 0` (an INTEGER) and `DEFAULT 0.0` (a REAL) "
+            "compare EQUAL in the shape proof; SQLite stores them as "
+            "different values, so a store of the wrong shape is accepted")
+
+    def test_the_numeric_default_value_is_exact(self):
+        # R1-F-007: 2**53 and 2**53+1 differ by one ULP; a float cannot
+        # tell them apart, so the proof must not.
+        low = self._tokens("c INTEGER NOT NULL DEFAULT 9007199254740992")
+        high = self._tokens("c INTEGER NOT NULL DEFAULT 9007199254740993")
+        self.assertNotEqual(
+            low, high,
+            "AC6: the numeric default 9007199254740992 and 9007199254740993 "
+            "compare EQUAL in the shape proof; they differ by one ULP, so a "
+            "store whose required default is a different value is accepted")
+
+    def test_the_value_tolerance_of_the_proof_is_kept(self):
+        # The proof normalizes numbers BY VALUE (its own documented
+        # contract), so two spellings of the same value still compare
+        # equal -- a legitimate older backup must not be refused for it.
+        self.assertEqual(
+            self._tokens("c INTEGER NOT NULL DEFAULT 007"),
+            self._tokens("c INTEGER NOT NULL DEFAULT 7"),
+            "the shape proof must keep normalizing an INTEGER by value")
+        self.assertEqual(
+            self._tokens("c REAL NOT NULL DEFAULT 1e3"),
+            self._tokens("c REAL NOT NULL DEFAULT 1000.0"),
+            "the shape proof must keep normalizing a REAL by value")
+
+    def test_a_doubled_backtick_is_one_identifier(self):
+        # R1-F-007: SQLite reads `a``b` as the ONE identifier `a`b`.
+        tokens = self._tokens("`a``b`")
+        self.assertEqual(
+            tokens, [("w", "a`b")],
+            "AC6: a backtick-quoted identifier with a doubled-backtick "
+            "escape is not read as one identifier; the tokenizer split it")
+
+    def test_the_proof_refuses_a_real_default_impostor(self):
+        # THE CONSEQUENCE: a staged store whose required column's default
+        # is a REAL where the fresh store's is an INTEGER must be
+        # REFUSED by the proof -- not accepted.
+        import shutil as _shutil
+        import storelib.backup as backup_mod
+
+        self._add("shape impostor row")
+        fresh = self.dir / "fresh.sqlite"
+        staged = self.dir / "staged.sqlite"
+        _shutil.copyfile(self.store, fresh)
+        _shutil.copyfile(self.store, staged)
+
+        # tamper the staged copy's `memory` DDL: the required column's
+        # default becomes a REAL where the fresh store's is an INTEGER.
+        conn = sqlite3.connect(str(staged))
+        try:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory'"
+            ).fetchone()
+            self.assertIsNotNone(row, "the store has no `memory` table")
+            ddl = row[0]
+            self.assertIn("retrieval_count INTEGER NOT NULL DEFAULT 0", ddl,
+                          "the memory DDL no longer carries the expected "
+                          "retrieval_count default: %r" % ddl[:400])
+            tampered = ddl.replace(
+                "retrieval_count INTEGER NOT NULL DEFAULT 0",
+                "retrieval_count INTEGER NOT NULL DEFAULT 0.0")
+            self.assertNotEqual(tampered, ddl, "the tamper did not apply")
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute("UPDATE sqlite_master SET sql=? WHERE type='table' "
+                         "AND name='memory'", (tampered,))
+            conn.execute("PRAGMA writable_schema=OFF")
+            conn.commit()
+        finally:
+            conn.close()
+
+        refused = False
+        try:
+            backup_mod.prove_required_shape(staged, fresh)
+        except Exception:
+            refused = True
+        self.assertTrue(
+            refused,
+            "AC6: the shape proof ACCEPTED a staged store whose required "
+            "column's default is a REAL where the fresh store's is an "
+            "INTEGER -- a store of the wrong shape reached the destination")

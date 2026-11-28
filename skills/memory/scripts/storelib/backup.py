@@ -1105,7 +1105,9 @@ _SHAPE_TOKEN = re.compile(
     r"|'(?:[^']|'')*'"
     r"|\"(?:[^\"]|\"\")*\""
     r"|\[[^\]]*\]"
-    r"|`[^`]*`"
+    r"|`(?:[^`]|``)*`"   # a doubled backtick is an ESCAPED backtick,
+    #                        so the identifier ends at the backtick that
+    #                        is NOT doubled -- SQLite's own rule
     r"|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|\.[0-9]+"
     r"|[A-Za-z_][A-Za-z0-9_$]*"
     r"|\|\||->>|<<|>>|<=|>=|==|!=|<>|[(),.;+\-*/%<>=~&|:\[\]]",
@@ -1153,7 +1155,9 @@ def _shape_tokens(sql):
     Comments and whitespace are dropped; bare words fold case with SQLite's
     ASCII-only rule (_ascii_lower, NOT str.lower()/casefold(): Python equates
     the Kelvin sign K with k, SQLite does not); quoted identifiers fold the
-    same way after unquoting; numbers normalize by value; any character the
+    same way after unquoting (a DOUBLED backtick is an escaped backtick, so
+    `` `a``b` `` is the ONE identifier `a`b`); numbers keep SQLite's own
+    kind -- INTEGER or REAL -- and their EXACT value; any character the
     scanner does not consume raises ShapeError (an unconsumed non-ASCII byte
     is an identifier character to SQLite and must not slip through as
     nothing).
@@ -1176,10 +1180,23 @@ def _shape_tokens(sql):
             inner = text[1:-1].replace(text[0] * 2, text[0])
             out.append(("w", _ascii_lower(inner)))
         elif text[0].isdigit() or text[0] == ".":
-            try:
-                out.append(("n", repr(float(text))))
-            except ValueError:
-                out.append(("n", text))
+            # SQLite's own rule: a numeric literal with a point or an
+            # exponent is a REAL, otherwise it is an INTEGER, and the two
+            # kinds are DIFFERENT values to SQLite (`DEFAULT 0` stores
+            # integer 0, `DEFAULT 0.0` stores real 0.0) -- so the kind is
+            # part of the shape. The INTEGER value is EXACT: a float
+            # would make 9007199254740992 and 9007199254740993 the same
+            # number (they differ by one ULP), and the proof would then
+            # accept a store whose required default is a different value.
+            # The proof's tolerance is kept: numbers normalize BY VALUE,
+            # so `007` and `7` still compare equal.
+            if "." in text or "e" in text or "E" in text:
+                try:
+                    out.append(("n", "r:%r" % float(text)))
+                except ValueError:
+                    out.append(("n", text))
+            else:
+                out.append(("n", "i:%d" % int(text)))
         elif text[0].isalpha() or text[0] == "_":
             out.append(("w", _ascii_lower(text)))
         else:
