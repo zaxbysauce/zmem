@@ -2689,6 +2689,113 @@ def _maybe_prune_convention_rows(conn: sqlite3.Connection, *,
         _release_named_lock("maintenance", token)
 
 
+def _dispatch_source_repair(args: "argparse.Namespace") -> None:
+    """Issue #502 AC2 dispatch (always exits).
+
+    Preview: the READ-ONLY path (no store preparation, point-in-time). Apply:
+    the dedicated existing-store writable arm — writer lease, supported-schema
+    stamp, compatible-schema gate, no init/migration/auto-rekey — mirroring
+    the rescan-secrets apply arm. Refusals print
+    ``[zmem] source repair: refused`` and exit 1 with nothing written.
+    """
+    from storelib.source import SourceRefusal, repair_from_evidence
+    mode = getattr(args, "repair_mode", None)
+    try:
+        if mode == "preview":
+            ro = _connect_existing_store_readonly()
+            conn = ro.conn
+            try:
+                result = repair_from_evidence(
+                    conn, memory_id=args.memory_id,
+                    evidence_id=args.evidence_id, mode="preview")
+            finally:
+                ro.close()
+        elif mode == "apply":
+            writer_lease = _acquire_writer_lease("source-repair")
+            try:
+                _require_supported_schema_stamp()
+                conn = _connect_existing_store()
+                try:
+                    assert_store_schema_compatible(conn, STORE_PATH)
+                    result = repair_from_evidence(
+                        conn, memory_id=args.memory_id,
+                        evidence_id=args.evidence_id, mode="apply")
+                finally:
+                    conn.close()
+            finally:
+                _release_writer_lease(writer_lease)
+        else:  # pragma: no cover - argparse enforces the group
+            raise SourceRefusal("one of --preview/--apply is required")
+    except (SourceRefusal, ValueError, OSError, sqlite3.Error, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"[zmem] source repair: refused ({exc})", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    sys.exit(0)
+
+
+def _dispatch_source_verify(args: "argparse.Namespace") -> None:
+    """Issue #512 CF-4 dispatch (always exits). INTENTIONALLY WRITES: one
+    ``source_verify:<memory>:<evidence>`` meta record + a mutation-generation
+    bump in one transaction. Non-project-file anchors refuse fail-closed with
+    nothing written."""
+    from storelib.generation import bump_mutation_generation
+    from storelib.source import SourceRefusal, _resolved
+    writer_lease = _acquire_writer_lease("source-verify")
+    try:
+        _require_supported_schema_stamp()
+        conn = _connect_existing_store()
+        try:
+            assert_store_schema_compatible(conn, STORE_PATH)
+            outcome = None
+            try:
+                result, _scan_rows = _resolved(
+                    conn, args.memory_id, 0,
+                    evidence_id=getattr(args, "evidence_id", None))
+                outcome = result.get("verification")
+            except SourceRefusal as exc:
+                print(f"[zmem] source verify: refused ({exc})",
+                      file=sys.stderr)
+                sys.exit(1)
+            if outcome is None:
+                print("[zmem] source verify: refused (unsupported source "
+                      "kind for verification)", file=sys.stderr)
+                sys.exit(1)
+            evidence_id = str(outcome["evidence_id"])
+            checked_at = _verify_now()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                    (f"source_verify:{args.memory_id}:{evidence_id}",
+                     json.dumps({"outcome": outcome["outcome"],
+                                 "checked_at": checked_at},
+                                ensure_ascii=False, separators=(",", ":"))))
+                bump_mutation_generation(conn)
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            print(json.dumps({"memory_id": args.memory_id,
+                              "evidence_id": evidence_id,
+                              "outcome": outcome["outcome"],
+                              "recorded": True, "checked_at": checked_at},
+                             ensure_ascii=False, separators=(",", ":")))
+            sys.exit(0)
+        finally:
+            conn.close()
+    except (SourceRefusal, ValueError, OSError, sqlite3.Error, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"[zmem] source verify: refused ({exc})", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        _release_writer_lease(writer_lease)
+
+
+def _verify_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def cmd_hermes_convention(
     conn: sqlite3.Connection, *, payload: dict[str, object]
 ) -> int:
@@ -3392,6 +3499,47 @@ def main():
                                required=True, help="memory UUID")
     p_source_scan.add_argument("--needle", type=str, required=True,
                                help="literal substring")
+    # Issue #512: explicit show sub — multi-anchor memories list evidence ids
+    # and select one via --evidence-id; the direct single-anchor
+    # `source --id` form is unchanged.
+    p_source_show = source_sub.add_parser(
+        "show", help="show verified local provenance (evidence-aware)")
+    p_source_show.add_argument("--id", dest="memory_id", type=str,
+                               required=True, help="memory UUID")
+    p_source_show.add_argument("--evidence-id", dest="evidence_id",
+                               type=str, default=None,
+                               help="select one evidence anchor (required "
+                                    "for a multi-anchor memory)")
+    # posted-review F-005/PFB-005: no child default — the parent's
+    # --context value must not be silently re-defaulted to 2 here
+    # (source --context 5 show --id X was yielding context=2).
+    p_source_show.add_argument("--context", type=int, default=None,
+                               help="context lines/turns (0..20; default: the parent --context, itself defaulting to 2)")
+    # Issue #502 AC2: evidence-backed repair of a verified identifier.
+    p_source_repair = source_sub.add_parser(
+        "repair", help="repair a redacted identifier from linked evidence")
+    p_source_repair.add_argument("--id", dest="memory_id", type=str,
+                                 required=True, help="memory UUID")
+    p_source_repair.add_argument("--evidence-id", dest="evidence_id",
+                                 type=str, required=True,
+                                 help="the evidence row quoting the original")
+    repair_mode = p_source_repair.add_mutually_exclusive_group(required=True)
+    repair_mode.add_argument("--preview", dest="repair_mode",
+                             action="store_const", const="preview",
+                             help="report the proposed restoration; no write")
+    repair_mode.add_argument("--apply", dest="repair_mode",
+                             action="store_const", const="apply",
+                             help="restore the verified value")
+    # Issue #512 CF-4: persist a passage-verification record for the recall
+    # hint. INTENTIONALLY WRITES (one meta record + generation bump).
+    p_source_verify = source_sub.add_parser(
+        "verify", help="verify a quoted project passage and record the result")
+    p_source_verify.add_argument("--id", dest="memory_id", type=str,
+                                 required=True, help="memory UUID")
+    p_source_verify.add_argument("--evidence-id", dest="evidence_id",
+                                 type=str, default=None,
+                                 help="select one evidence anchor (required "
+                                      "for a multi-anchor memory)")
 
     p_recall.add_argument("--exclude", action="append", default=None,
                           help="repeatable: exclude these memory ids from the results "
@@ -3791,6 +3939,16 @@ def main():
     p_sup = _add_parser("supersede", help="tombstone a memory")
     p_sup.add_argument("--id", required=True)
     p_sup.add_argument("--reason", default="")
+    # Issue #512 AC4: scope-aware revision authorization. The namespace
+    # guard (--expected-namespace) runs first exactly as today (exit 2,
+    # nothing written) and the scope authorization applies on top — the new
+    # flag can only NARROW authorization, never bypass the guard.
+    p_sup.add_argument(
+        "--scope", default=None,
+        help="authorize the tombstone as an approved revision whose "
+             "scope is AT LEAST AS BROAD as this label (a row's scope is "
+             "its namespace; strictly-narrower rows refuse); routes "
+             "through storelib.source.resolve_revision")
     p_sup.add_argument(
         "--expected-namespace", default=None,
         help="refuse (exit 2, nothing written) unless the target row lives in "
@@ -5853,19 +6011,30 @@ def main():
         print(STORE_PATH)
         sys.exit(0)
 
-    # Source resolution is an observation over an existing store.  It must not
-    # initialize, migrate, rekey, lease, or create a cache entry.
+    # Source resolution is an observation over an existing store: show and
+    # scan must not initialize, migrate, rekey, lease, or create a cache
+    # entry. (repair and verify DO take the writer lease — see their
+    # dispatch arms.)
     if args.cmd == "source":
+        if getattr(args, "source_cmd", None) == "repair":
+            _dispatch_source_repair(args)
+        if getattr(args, "source_cmd", None) == "verify":
+            _dispatch_source_verify(args)
         if not args.memory_id:
             print("store.py: error: --id is required", file=sys.stderr)
             sys.exit(2)
+        # posted-review F-005/PFB-005: the show subcommand no longer
+        # re-defaults --context; resolve None to the parent default here so
+        #  honors the 5.
+        if getattr(args, "context", None) is None:
+            args.context = 2
         if args.source_cmd is None:
             try:
                 args.context = int(args.context)
             except (TypeError, ValueError):
                 print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
                 sys.exit(2)
-        if args.source_cmd is None and not (0 <= args.context <= 20):
+        if not (0 <= args.context <= 20):
             print("store.py: error: --context must be between 0 and 20", file=sys.stderr)
             sys.exit(2)
         if args.source_cmd == "scan" and not args.needle:
@@ -5887,7 +6056,9 @@ def main():
                 probe.execute("PRAGMA query_only=1")
                 result = (source_scan(probe, memory_id=args.memory_id, needle=args.needle)
                            if args.source_cmd == "scan"
-                           else source_show(probe, memory_id=args.memory_id, context=args.context))
+                           else source_show(probe, memory_id=args.memory_id,
+                                            context=args.context,
+                                            evidence_id=getattr(args, "evidence_id", None)))
             finally:
                 probe.close()
         except (SourceRefusal, sqlite3.Error, OSError, ValueError) as exc:
@@ -7422,6 +7593,30 @@ def main():
                           hybrid=False, as_of=args.as_of, link_hops=0,
                           exclude_ids=args.exclude, exact=args.exact)
         elif args.cmd == "supersede":
+            if getattr(args, "scope", None) == "":
+                # posted-review F-006/PFB-006: an explicitly EMPTY --scope
+                # is a caller error, never the legacy unscoped path.
+                print("[zmem] supersede: --scope must not be empty", file=sys.stderr)
+                sys.exit(2)
+            if getattr(args, "scope", None) is not None:
+                # Issue #512 AC4: scope-aware revision route. Exit codes:
+                # refused_unauthorized -> exit 2 (nothing written); applied
+                # outcomes -> one JSON result line on stdout, exit 0.
+                from storelib.source import resolve_revision
+                result = resolve_revision(
+                    conn, revision_of=args.id, scope=args.scope,
+                    expected_namespace=args.expected_namespace,
+                    reason=args.reason)
+                if result["outcome"] == "refused_unauthorized":
+                    print(
+                        "[zmem] supersede: refused ("
+                        + str(result.get("reason", "unauthorized"))
+                        + ")", file=sys.stderr)
+                    sys.exit(2)
+                print(json.dumps(result, ensure_ascii=False,
+                                 separators=(",", ":")))
+                _session_write_marker("")
+                sys.exit(0)
             try:
                 ok = supersede_memory(conn, args.id, args.reason,
                                       expected_namespace=args.expected_namespace)

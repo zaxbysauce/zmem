@@ -2575,11 +2575,42 @@ def _source_hint_namespaces(conn: sqlite3.Connection) -> frozenset[str]:
         return frozenset()
 
 
+def _source_verify_records(
+    conn: sqlite3.Connection, rows: list[dict],
+) -> dict[str, list[dict]]:
+    """Issue #512 CF-4: the persisted verification records for the hinted
+    rows, keyed by memory id. NO live file reads — a record says what was
+    true at its checked_at instant. A store without records yields an empty
+    dict and the hint renders byte-identical to today."""
+    records: dict[str, list[dict]] = {}
+    ids = [str(r["id"]) for r in rows]
+    if not ids:
+        return records
+    for memory_id in ids:
+        cur = conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE ?",
+            (f"source_verify:{memory_id}:%",)).fetchall()
+        for key, value in cur:
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+            if (not isinstance(parsed, dict)
+                    or not isinstance(parsed.get("outcome"), str)
+                    or not isinstance(parsed.get("checked_at"), str)):
+                continue
+            records.setdefault(memory_id, []).append(
+                {"outcome": parsed["outcome"],
+                 "checked_at": parsed["checked_at"]})
+    return records
+
+
 def _format_fenced_recall(rows: list[dict], header: str,
                           budget_note: str | None = None,
                           legacy_injection_wire: bool = False,
                           source_hint: bool = False,
-                          source_hint_namespaces: frozenset[str] | None = None) -> str:
+                          source_hint_namespaces: frozenset[str] | None = None,
+                          source_verify_records: dict[str, list[dict]] | None = None) -> str:
     """Render a fenced, provenance-tagged bullet block for hook inject.
 
     Issue #58, 3.5: wrap hook-injected memories in a non-executable
@@ -2703,7 +2734,22 @@ def _format_fenced_recall(rows: list[dict], header: str,
                              escape_fence_shaped_text(r["source_ref"]))[4:])
         if (source_hint and source_hint_namespaces is not None
                 and r.get("namespace") in source_hint_namespaces):
-            lines.append(f"    -> source {r['id']} (store.py source --id {r['id']})")
+            verify_note = ""
+            verify_records = (source_verify_records or {}).get(str(r["id"]))
+            if verify_records:
+                # Issue #512 CF-4: worst outcome across the memory's records
+                # (multi-anchor memories never silently pick one anchor's
+                # status) with the OLDEST checked_at date — staleness is
+                # VISIBLE, not authoritative.
+                order = {"exact": 0, "relocated": 1, "ambiguous": 2,
+                         "missing": 3}
+                worst = max(verify_records,
+                            key=lambda rec: order.get(rec["outcome"], 4))
+                oldest = min(rec["checked_at"] for rec in verify_records)
+                verify_note = (f" [source={worst['outcome']} as of "
+                               f"{str(oldest)[:10]}]")
+            lines.append(f"    -> source {r['id']}"
+                         f"{verify_note} (store.py source --id {r['id']})")
         # Issue #138's retained page is a derived row.  Keep its grounding
         # visible through the shared fence without changing ordinary recall
         # bytes or introducing a host-specific renderer.
@@ -4347,6 +4393,10 @@ def _recall_memory_impl(
                 source_hint=not for_injection,
                 source_hint_namespaces=(
                     _source_hint_namespaces(conn) if not for_injection else frozenset()
+                ),
+                source_verify_records=(
+                    _source_verify_records(conn, results)
+                    if not for_injection else None
                 ),
             ))
     return results

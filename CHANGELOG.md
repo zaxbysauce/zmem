@@ -223,6 +223,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   (zero-write floor). Disclosed cost: the probe is a full-table scan
   (~79 ms median at 50k rows / 87 MB vs ~1.8 ms for a stamped open).
   Undecodable-content rows keep NULL (skip semantics unchanged).
+- **Redaction**: Basic-auth credentials are detected by the RFC 7617 decode contract (a value whose base64 decoding contains the user:password colon separator is a credential; prose like "the basic idea" is not). Identifier-context calibration preserves verifiable release/commit SHA and checksum values — only all-hex runs of digest length (32/40/64/128 characters) qualify, and a credential word nearby refuses the exemption. The compound-key `pass` keyword is letter-anchored so prose like "all checks pass:" is not redacted. (issues #502 #512)
+- **Source repair** (new `store.py source repair` command): restores a redacted object identifier from linked evidence, with preview and apply modes. When the evidence excerpt was itself redacted at capture, the value is recovered from the trusted source the evidence came from — a project file at the recorded position, or a session transcript — with credential-label gates on both the source and the destination. (issue #502)
+- **Source show/verify** (new `store.py source show` / `source verify`): list and select evidence by ID, verify the quoted passage against the current file bytes (exact/relocated/ambiguous/missing), and persist the outcome for the recall hint. (issue #502)
+- **Scope-aware revisions** (`supersede --scope`): authorize a tombstone as an approved revision; the target's scope must be at least as broad as the label, and narrower-scope exceptions are retained. (issue #512)
 
 ## [0.165.0] - 2026-11-21
 

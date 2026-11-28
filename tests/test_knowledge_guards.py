@@ -1230,7 +1230,7 @@ class RescanPointerLaneTest(_StoreTestCase):
         import re as _re
         future_pat = _re.compile(r"FUTUREWORD")
 
-        def fake_redact(text):
+        def fake_redact(text, exempt_values=frozenset()):
             count = 1 if future_pat.search(text) else 0
             return (future_pat.sub("[REDACTED_SECRET]", text), count)
 
