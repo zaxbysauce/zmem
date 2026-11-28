@@ -963,7 +963,10 @@ def _acquire_open_lease(op: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     if not parent_existed:
         _host.set_owner_only_perms(STORE_PATH.parent)
-    lease = directory / f"{os.getpid()}-{uuid.uuid4().hex}.lease"
+    pid = os.getpid()
+    birth = _host.process_birth_identity(pid)
+    identity = f"-{birth}" if birth is not None else ""
+    lease = directory / f"{pid}-{uuid.uuid4().hex}{identity}.lease"
     lease.touch(exist_ok=False)
     try:
         if _lock_path("maintenance").exists():
@@ -988,11 +991,18 @@ def _wait_for_open_connections() -> bool:
         for lease in leases:
             if lease.suffix != ".lease":
                 continue
-            pid = lease.name.partition("-")[0]
+            pid, _, suffix = lease.stem.partition("-")
             if pid.isascii() and pid.isdecimal() and _host is not None:
-                if _host.process_alive(int(pid)) is False:
+                process_id = int(pid)
+                if _host.process_alive(process_id) is False:
                     _release_writer_lease(lease)
                     continue
+                _, _, birth = suffix.partition("-")
+                if birth:
+                    live_birth = _host.process_birth_identity(process_id)
+                    if live_birth is not None and live_birth != birth:
+                        _release_writer_lease(lease)
+                        continue
             active = True
         if not active:
             return True
@@ -1074,8 +1084,8 @@ def _prepare_store(conn: sqlite3.Connection, *, track_content_norm: bool = True)
             init_db(conn, track_content_norm=False)
             migrate(conn, track_content_norm=False)
     finally:
-        _release_named_lock("schema", token)
-        if track_content_norm:
+        released = _release_named_lock("schema", token)
+        if track_content_norm and released:
             _record_store_open(
                 (acquired - started) * 1000, (time.monotonic() - acquired) * 1000,
                 catchup_ms, pending,
@@ -2159,278 +2169,6 @@ def _norm_text(value):
     return None
 
 
-def _verify_content_norms_163(conn: sqlite3.Connection) -> None:
-    """One-time VERIFICATION of every retained content_norm value (issue
-    #493 AC6; issue #489's repair closed only the admission-time half).
-
-    ``_repair_null_content_norm_162`` selects NULL rows only and stamps
-    ``content_norm_repair_162``; a store polluted by a PRE-#491 sqlite
-    import can carry a source-supplied STALE NON-NULL norm the NULL-only
-    pass never reaches. This pass verifies ALL retained norms (non-NULL
-    included) against the canonical ``_normalize_content`` of each row's
-    own content, under a NEW one-time stamp of its own
-    (``content_norm_verify_163``) so stores already stamped by #491's
-    repair are still verified.
-
-    Concurrency (plan-critic rounds 2-4): each batch takes the write lock
-    up front — top-level ``BEGIN IMMEDIATE`` when no caller transaction
-    exists (a deferred read snapshot could upgrade into
-    SQLITE_BUSY_SNAPSHOT instead of reaching the compare-and-update), and a
-    uniquely named SAVEPOINT when one does (a savepoint is not a nested
-    BEGIN, and ``ROLLBACK TO`` needs one on the stack to bound the undo to
-    this batch). The UPDATE is a compare-and-update on
-    (rowid, content, content_norm): a zero-row update means the row changed
-    under us — re-read immediately, recompute, retry once; a second
-    unresolved mismatch, or a locked/busy OperationalError on the
-    caller-transaction path, aborts the pass WITHOUT stamping (forward-only
-    keyset pagination never revisits a row, so the next open re-runs the
-    whole pass; stamping after an unresolved mismatch would make the stale
-    value permanent).
-    """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(memory)")}
-    if "content_norm" not in cols or "content" not in cols:
-        return
-    stamped = conn.execute(
-        "SELECT value FROM meta WHERE key='content_norm_verify_163'"
-    ).fetchone()
-    if stamped is not None:
-        return
-    # Trigger-safety guard, same discipline as _repair_null_content_norm_162:
-    # a hand-planted tags-less store must be skipped AND stay unstamped (a
-    # stamp would permanently exempt a shape a later full-schema store
-    # could still migrate into the verified set).
-    if "tags" not in cols:
-        return
-    batch_size = 200
-    _bf_last = None
-    healed = 0
-    # Final-critic finding 1: a caller transaction (if any) owns the commit
-    # decision — heal batches ride a savepoint inside it and the caller's
-    # transaction stays OPEN for the caller to commit or roll back; only
-    # when we opened our own transaction do we commit it (per batch, and
-    # once more for the post-scan stamp).
-    caller_tx = conn.in_transaction
-    # CI round (PR #525): the pass must be a ZERO-WRITE surface on clean
-    # stores — byte-identical contracts (explain zero-write, op-queue
-    # replay idempotence) snapshot stores seeded after `init` whose first
-    # production open is the assertion's own read. A clean scan therefore
-    # writes NOTHING (no stamp); the stamp rides an actual heal in the
-    # same transaction. NULL norms are the post-stamp NULL lane's
-    # (_heal_content_norms_post_stamp, issue #527); this pass skips
-    # them so raw-seeded NULL rows do not turn a read-only open into a
-    # write. Consequence: a clean store re-verifies on every open
-    # (read-only scan).
-    while True:
-        if _bf_last is None:
-            fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
-                         "ORDER BY rowid LIMIT ?")
-        else:
-            fetch_sql = ("SELECT rowid, content, content_norm FROM memory "
-                         "WHERE rowid > ? ORDER BY rowid LIMIT ?")
-        try:
-            rows = conn.execute(fetch_sql, (batch_size,) if _bf_last is None
-                                else (_bf_last, batch_size)).fetchall()
-        except (UnicodeDecodeError, sqlite3.OperationalError) as decode_exc:
-            # PR #525 feedback (round-1 F-2): a TEXT cell holding bytes
-            # that are not valid UTF-8 raises INSIDE the SELECT's own
-            # decode — UnicodeDecodeError on older stacks,
-            # OperationalError('Could not decode to UTF-8 column ...')
-            # on sqlite >= 3.45. A real database error re-raises from the
-            # bytes-factory refetch below.
-            conn.text_factory = bytes
-            try:
-                raw_rows = conn.execute(
-                    fetch_sql, (batch_size,) if _bf_last is None
-                    else (_bf_last, batch_size)).fetchall()
-            except sqlite3.OperationalError:
-                raise decode_exc
-            finally:
-                conn.text_factory = str
-            # decode ONLY the norm column here and keep the raw content
-            # bytes — the stale filter's single _norm_text(r[1]) call
-            # classifies content (stage-B reviewer: pre-decoding turned
-            # an undecodable-content row into "" and healed it to an
-            # empty norm instead of skipping it). A genuine NULL norm
-            # stays None: _norm_text(None) maps to "" and would wrongly
-            # enter the stale set (stage-B reviewer round 2).
-            rows = [(r[0], r[1], None if r[2] is None else _norm_text(r[2]))
-                    for r in raw_rows]
-        if not rows:
-            break
-        # Index access (rowid=0, content=1, content_norm=2): the pass must
-        # run on connections without a Row factory too (raw sqlite3.connect
-        # callers; the busy-abort supp probe found the mapping access
-        # crashing there).
-        for r in rows:
-            if _bf_last is None or r[0] > _bf_last:
-                _bf_last = r[0]
-        # PR #525 feedback (round-1 F-2): rows whose content is not
-        # verifiable text (undecodable bytes; _norm_text maps them to
-        # None) are skipped — outside the norm contract, never
-        # normalized. With a bytes-factory batch the norm column is
-        # decoded through the same helper.
-        stale = [r for r in rows
-                 if r[2] is not None
-                 and _norm_text(r[1]) is not None
-                 and r[2] != _normalize_content(_norm_text(r[1]))]
-        if not stale:
-            continue
-        own_tx = not conn.in_transaction
-        sp = "zmem_norm_verify_163"
-        try:
-            if own_tx:
-                conn.execute("BEGIN IMMEDIATE")
-            else:
-                conn.execute(f"SAVEPOINT {sp}")
-            for r in stale:
-                canonical = _normalize_content(_norm_text(r[1]))
-                cur = conn.execute(
-                    "UPDATE memory SET content_norm=? WHERE rowid=? "
-                    "AND content IS ? AND content_norm IS ?",
-                    (canonical, r[0], r[1], r[2]))
-                if cur.rowcount:
-                    healed += 1
-                    continue
-                # Zero-row compare-and-update: the row changed under us.
-                fresh = conn.execute(
-                    "SELECT rowid, content, content_norm FROM memory "
-                    "WHERE rowid=?", (r[0],)).fetchone()
-                if fresh is None:
-                    continue  # row deleted under us — nothing to verify
-                fresh_text = _norm_text(fresh[1])
-                if fresh_text is None:
-                    # the row changed under us into an unverifiable shape
-                    continue
-                canonical = _normalize_content(fresh_text)
-                if fresh[2] == canonical:
-                    continue  # the concurrent writer already fixed it
-                retry = conn.execute(
-                    "UPDATE memory SET content_norm=? WHERE rowid=? "
-                    "AND content IS ? AND content_norm IS ?",
-                    (canonical, fresh[0], fresh[1], fresh[2]))
-                if not retry.rowcount:
-                    raise _NormVerifyConflict(
-                        f"rowid {r[0]} kept changing during the "
-                        "norm-verification pass")
-                healed += 1
-            # Heal batch commits WITHOUT the stamp (round-6 reviewer
-            # finding: a stamp committed with an EARLY batch would
-            # permanently certify a partial verification if a later batch
-            # fails or the process dies mid-scan — the early-return stamp
-            # check would then skip the unscanned rows forever). The stamp
-            # is written once, after the ENTIRE scan completes.
-            if own_tx:
-                conn.commit()
-            else:
-                conn.execute(f"RELEASE SAVEPOINT {sp}")
-        except _NormVerifyConflict:
-            if not own_tx:
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-                    conn.execute(f"RELEASE SAVEPOINT {sp}")
-                except sqlite3.Error:
-                    pass
-            elif conn.in_transaction:
-                # Final-critic finding 1: the own-transaction arm must not
-                # keep the BEGIN IMMEDIATE write lock when the pass aborts
-                # (same discipline as the sqlite3.Error arm below).
-                conn.rollback()
-            # PR #525 feedback (round-1 F-7): abort paths must not be
-            # fully silent — one stderr line, never stdout (hooks parse
-            # stdout envelopes).
-            sys.stderr.write(
-                "[zmem] content_norm verification deferred (a row kept "
-                "changing under the pass); the next open re-runs it\n")
-            return  # abort without stamping; a later open re-runs
-        except sqlite3.Error as exc:
-            # database-is-locked / SQLITE_BUSY_SNAPSHOT (OperationalError)
-            # or any other mid-batch database failure (review round 2: a
-            # constraint-style failure must not strand the batch
-            # savepoint): bound the undo to this batch on the
-            # caller-transaction path and abort without stamping — never
-            # misclassify as a zero-row compare miss.
-            if not own_tx:
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-                    conn.execute(f"RELEASE SAVEPOINT {sp}")
-                except sqlite3.Error:
-                    pass
-            elif conn.in_transaction:
-                conn.rollback()
-            # PR #525 feedback (round-1 F-7): one stderr line on the
-            # sqlite-failure abort (locked/busy, damaged FTS, ...) — the
-            # pass is deferred, not lost; the next open re-runs it.
-            sys.stderr.write(
-                "[zmem] content_norm verification deferred (%s); the "
-                "next open re-runs it\n" % (exc,))
-            return
-    # Post-scan stamp (round-6 reviewer finding): the completion stamp is
-    # written exactly once, AFTER the entire scan has finished with no
-    # abort — a persisted stamp therefore implies the whole verification
-    # completed. A heal batch that committed earlier stays durable (the
-    # rows are canonical now) but does NOT certify the pass; if a later
-    # batch aborted or the process died mid-scan, the stamp is absent and
-    # the next open re-scans (finding only the still-stale rows).
-    # Zero-write on clean stores (and on only-NULL scans — the post-stamp
-    # NULL lane owns NULLs now, issue #527) still holds: no heals -> no
-    # stamp -> no bytes. With a caller transaction open the stamp rides the
-    # caller's commit; otherwise it commits its own small transaction.
-    if healed > 0:
-        # Round-7 reviewer finding: on the own-transaction path the heal
-        # batches have committed and RELEASED the write lock by the time
-        # the stamp needs a fresh one, so a concurrent writer can hold it
-        # here. The stamp is an optimization (skip later re-scans), never
-        # a correctness requirement — a failure at stamp time must leave
-        # the pass unstamped and return, exactly like the batch abort
-        # arms, instead of aborting the caller's open. Residual,
-        # disclosed: heals that committed before the failed stamp leave
-        # nothing stale, so that store never stamps — it re-scans
-        # read-only on every open (the disclosed clean-store steady
-        # state); correctness is unaffected. On the caller-transaction
-        # path the heals already upgraded that transaction to write, so
-        # this arm can only fire on exotic failures (e.g. disk full) —
-        # swallow-and-return there too, never touching the caller's
-        # transaction.
-        # Round-8 reviewer finding: SQLite's FAIL conflict resolution does
-        # NOT undo the failing statement's own changes, so an error AFTER
-        # the stamp row was inserted (e.g. an AFTER INSERT trigger) would
-        # leave the partial stamp pending inside a CALLER-owned
-        # transaction for the caller's commit to persist. A stamp-local
-        # SAVEPOINT bounds the undo to the stamp statement alone — the
-        # caller's transaction stays open with its prior work intact
-        # (heals already released), and no stamp survives any failure,
-        # including a commit() failure on the verifier-owned path (the
-        # rollback there discards the stamp the commit failed to land).
-        stamp_sp = "zmem_norm_verify_163_stamp"
-        try:
-            if caller_tx:
-                conn.execute(f"SAVEPOINT {stamp_sp}")
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) "
-                "VALUES ('content_norm_verify_163', 'done')")
-            if not caller_tx:
-                conn.commit()
-            else:
-                conn.execute(f"RELEASE SAVEPOINT {stamp_sp}")
-        except sqlite3.Error as exc:
-            if not caller_tx:
-                if conn.in_transaction:
-                    conn.rollback()
-            else:
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {stamp_sp}")
-                    conn.execute(f"RELEASE SAVEPOINT {stamp_sp}")
-                except sqlite3.Error:
-                    pass
-            # PR #525 feedback (round-1 F-7): same one-line stderr
-            # discipline for the stamp-time failure.
-            sys.stderr.write(
-                "[zmem] content_norm verification completed but its "
-                "completion stamp could not be written (%s); the next "
-                "open re-scans\n" % (exc,))
-            return
-
-
 class _NormVerifyConflict(Exception):
     """Internal: a row kept changing under the norm-verification pass."""
 
@@ -2440,30 +2178,36 @@ _CONTENT_NORM_TIME_LIMIT = 0.250
 _CONTENT_NORM_DIRTY_BATCH = 500
 _CONTENT_NORM_STATE = "content_norm_pass_state"
 _CONTENT_NORM_CURSOR = "content_norm_pass_after_id"
+_CONTENT_NORM_NULL_CURSOR = "content_norm_pass_after_null_rowid"
 _CONTENT_NORM_BATCH_ROWS = "content_norm_pass_batch_rows"
 _CONTENT_NORM_SAW_STALE = "content_norm_pass_saw_stale"
+_CONTENT_NORM_TRACKER_REVISION = "content_norm_tracker_revision"
 
+# TEXT affinity on memory.id converts numeric inputs to TEXT. Integer keys
+# here can therefore identify the rowid of a raw row with a NULL memory ID.
 _CONTENT_NORM_TRACKER_DDL = (
     """CREATE TABLE IF NOT EXISTS memory_content_norm_dirty (
-           memory_id TEXT PRIMARY KEY NOT NULL
+           memory_id BLOB PRIMARY KEY NOT NULL
        ) WITHOUT ROWID""",
-    """CREATE TRIGGER IF NOT EXISTS memory_cnorm_ai AFTER INSERT ON memory
-       WHEN NEW.id IS NOT NULL BEGIN
-           INSERT OR IGNORE INTO memory_content_norm_dirty VALUES (NEW.id);
+    """CREATE TRIGGER IF NOT EXISTS memory_cnorm_ai AFTER INSERT ON memory BEGIN
+           INSERT INTO memory_content_norm_dirty VALUES (COALESCE(NEW.id, NEW.rowid))
+               ON CONFLICT(memory_id) DO NOTHING;
        END""",
     """CREATE TRIGGER IF NOT EXISTS memory_cnorm_au
-       AFTER UPDATE OF id, content, content_norm ON memory
+       AFTER UPDATE OF id, content, content_norm, rowid, _rowid_, oid ON memory
        WHEN (
            OLD.id IS NOT NEW.id OR OLD.content IS NOT NEW.content
            OR OLD.content_norm IS NOT NEW.content_norm
+           OR (OLD.id IS NULL AND OLD.rowid IS NOT NEW.rowid)
        ) BEGIN
            DELETE FROM memory_content_norm_dirty
-               WHERE memory_id = OLD.id AND OLD.id IS NOT NEW.id;
-           INSERT OR IGNORE INTO memory_content_norm_dirty
-               SELECT NEW.id WHERE NEW.id IS NOT NULL;
+               WHERE memory_id = COALESCE(OLD.id, OLD.rowid)
+               AND COALESCE(OLD.id, OLD.rowid) IS NOT COALESCE(NEW.id, NEW.rowid);
+           INSERT INTO memory_content_norm_dirty VALUES (COALESCE(NEW.id, NEW.rowid))
+               ON CONFLICT(memory_id) DO NOTHING;
        END""",
     """CREATE TRIGGER IF NOT EXISTS memory_cnorm_ad AFTER DELETE ON memory BEGIN
-           DELETE FROM memory_content_norm_dirty WHERE memory_id = OLD.id;
+           DELETE FROM memory_content_norm_dirty WHERE memory_id = COALESCE(OLD.id, OLD.rowid);
        END""",
 )
 
@@ -2502,18 +2246,12 @@ def _set_content_norm_meta(conn: sqlite3.Connection, key: str, value: str | byte
 
 
 def _finish_content_norm_pass(conn: sqlite3.Connection) -> None:
-    if _content_norm_meta(conn, _CONTENT_NORM_SAW_STALE) == "1":
-        conn.execute(
-            "INSERT OR IGNORE INTO meta(key,value) VALUES ('content_norm_verify_163','done')"
-        )
-    conn.execute(
-        "INSERT OR IGNORE INTO meta(key,value) VALUES ('content_norm_repair_162','done')"
-    )
     conn.execute(
         "DELETE FROM meta WHERE key IN (?,?,?)",
-        (_CONTENT_NORM_CURSOR, _CONTENT_NORM_BATCH_ROWS, _CONTENT_NORM_SAW_STALE),
+        (_CONTENT_NORM_CURSOR, _CONTENT_NORM_NULL_CURSOR, _CONTENT_NORM_BATCH_ROWS),
     )
     _set_content_norm_meta(conn, _CONTENT_NORM_STATE, "done")
+    _restore_legacy_content_norm_stamps(conn)
 
 
 def _ensure_content_norm_change_detection(conn: sqlite3.Connection) -> None:
@@ -2527,7 +2265,8 @@ def _ensure_content_norm_change_detection(conn: sqlite3.Connection) -> None:
         )
     }
     state = _content_norm_meta(conn, _CONTENT_NORM_STATE)
-    if len(names) == len(_CONTENT_NORM_TRACKER_DDL) and state is not None:
+    revision = _content_norm_meta(conn, _CONTENT_NORM_TRACKER_REVISION)
+    if len(names) == len(_CONTENT_NORM_TRACKER_DDL) and state is not None and revision == "2":
         return
     columns = {_norm_text(row[1]) for row in conn.execute("PRAGMA table_info(memory)")}
     if not {"id", "content", "content_norm", "tags"} <= columns:
@@ -2535,11 +2274,19 @@ def _ensure_content_norm_change_detection(conn: sqlite3.Connection) -> None:
         return
 
     with _content_norm_write(conn):
+        if names and _content_norm_meta(conn, _CONTENT_NORM_TRACKER_REVISION) != "2":
+            # Replace the original tracker shape atomically, then rescan from
+            # the start to recover any writes the earlier triggers missed.
+            conn.execute("DROP TRIGGER IF EXISTS memory_cnorm_ai")
+            conn.execute("DROP TRIGGER IF EXISTS memory_cnorm_au")
+            conn.execute("DROP TRIGGER IF EXISTS memory_cnorm_ad")
+            conn.execute("DROP TABLE IF EXISTS memory_content_norm_dirty")
         for statement in _CONTENT_NORM_TRACKER_DDL:
             conn.execute(statement)
+        _set_content_norm_meta(conn, _CONTENT_NORM_TRACKER_REVISION, "2")
         conn.execute(
             "DELETE FROM meta WHERE key IN (?,?,?)",
-            (_CONTENT_NORM_CURSOR, _CONTENT_NORM_BATCH_ROWS, _CONTENT_NORM_SAW_STALE),
+            (_CONTENT_NORM_CURSOR, _CONTENT_NORM_NULL_CURSOR, _CONTENT_NORM_BATCH_ROWS),
         )
         if conn.execute("SELECT 1 FROM memory LIMIT 1").fetchone() is None:
             _finish_content_norm_pass(conn)
@@ -2547,15 +2294,23 @@ def _ensure_content_norm_change_detection(conn: sqlite3.Connection) -> None:
             _set_content_norm_meta(conn, _CONTENT_NORM_STATE, "forced" if state else "initial")
 
 
-def _content_norm_id(row) -> str | bytes:
-    """Preserve SQLite key identity, including BLOB ids from raw writers."""
+_ContentNormKey = tuple[bytes | int, str]
+
+
+def _content_norm_key(row) -> _ContentNormKey:
     value, kind = row
-    if _norm_text(kind) == "blob":
-        return value
-    memory_id = _norm_text(value)
-    if memory_id is None:
-        raise sqlite3.DatabaseError("invalid memory ID in content_norm repair")
-    return memory_id
+    return value, kind.decode("ascii") if isinstance(kind, bytes) else kind
+
+
+def _content_norm_key_binding(kind: str) -> str:
+    # Bind raw TEXT bytes as TEXT in SQLite without decoding in Python.
+    return "CAST(? AS TEXT)" if kind == "text" else "?"
+
+
+def _content_norm_locator(kind: str) -> str:
+    if kind == "integer":
+        return "id IS NULL AND rowid=?"
+    return f"id={_content_norm_key_binding(kind)}"
 
 
 def _clear_content_norm_dirty(conn: sqlite3.Connection, memory_id: str | bytes) -> None:
@@ -2567,16 +2322,19 @@ def _clear_content_norm_dirty(conn: sqlite3.Connection, memory_id: str | bytes) 
             raise
 
 
-def _content_norm_payload(conn: sqlite3.Connection, memory_id: str | bytes):
+def _content_norm_payload(conn: sqlite3.Connection, key: _ContentNormKey):
+    value, kind = key
     return conn.execute(
         "SELECT CAST(content AS BLOB), CAST(content_norm AS BLOB), "
-        "typeof(content), typeof(content_norm) FROM memory WHERE id=?",
-        (memory_id,),
+        f"typeof(content), typeof(content_norm) FROM memory WHERE {_content_norm_locator(kind)}",
+        (value,),
     ).fetchone()
 
 
-def _repair_content_norm_row(conn: sqlite3.Connection, memory_id: str | bytes, row) -> bool:
+def _repair_content_norm_row(conn: sqlite3.Connection, key: _ContentNormKey, row) -> bool:
     """Compare the raw bytes and storage type before replacing a derived norm."""
+    value, kind = key
+    saw_stale = False
     for _ in range(2):
         if row is None:
             break
@@ -2591,18 +2349,22 @@ def _repair_content_norm_row(conn: sqlite3.Connection, memory_id: str | bytes, r
         if norm_kind == "text" and _norm_text(previous) == canonical:
             break
         updated = conn.execute(
-            "UPDATE memory SET content_norm=? WHERE id=? AND CAST(content AS BLOB) IS ? "
+            f"UPDATE memory SET content_norm=? WHERE {_content_norm_locator(kind)} "
+            "AND CAST(content AS BLOB) IS ? "
             "AND CAST(content_norm AS BLOB) IS ? AND typeof(content_norm)=?",
-            (canonical, memory_id, content, previous, norm_kind),
+            (canonical, value, content, previous, norm_kind),
         )
         if updated.rowcount:
-            _clear_content_norm_dirty(conn, memory_id)
-            return previous is not None
-        row = _content_norm_payload(conn, memory_id)
+            saw_stale = previous is not None
+            break
+        row = _content_norm_payload(conn, key)
     else:
-        raise _NormVerifyConflict(f"memory {memory_id} kept changing during content_norm repair")
-    _clear_content_norm_dirty(conn, memory_id)
-    return False
+        raise _NormVerifyConflict("memory row kept changing during content_norm repair")
+    conn.execute(
+        f"DELETE FROM memory_content_norm_dirty WHERE memory_id={_content_norm_key_binding(kind)}",
+        (value,),
+    )
+    return saw_stale
 
 
 class _ContentNormBudget:
@@ -2624,6 +2386,34 @@ class _ContentNormBudget:
         return True
 
 
+def _next_content_norm_key(
+    conn: sqlite3.Connection, after_id: _ContentNormKey | None, after_null: int | None,
+) -> _ContentNormKey | None:
+    if after_id is None:
+        if after_null is None:
+            nullable_row = conn.execute(
+                "SELECT rowid FROM memory WHERE id IS NULL ORDER BY rowid LIMIT 1"
+            ).fetchone()
+        else:
+            nullable_row = conn.execute(
+                "SELECT rowid FROM memory WHERE id IS NULL AND rowid > ? ORDER BY rowid LIMIT 1",
+                (after_null,),
+            ).fetchone()
+        if nullable_row is not None:
+            return nullable_row[0], "integer"
+        candidate = conn.execute(
+            "SELECT CAST(id AS BLOB), typeof(id) FROM memory WHERE id IS NOT NULL ORDER BY id LIMIT 1"
+        ).fetchone()
+    else:
+        value, kind = after_id
+        candidate = conn.execute(
+            "SELECT CAST(id AS BLOB), typeof(id) FROM memory "
+            f"WHERE id > {_content_norm_key_binding(kind)} ORDER BY id LIMIT 1",
+            (value,),
+        ).fetchone()
+    return _content_norm_key(candidate) if candidate is not None else None
+
+
 def _content_norm_catchup_step(conn: sqlite3.Connection) -> bool:
     """Advance a resumable baseline by one bounded transaction, keyed by memory ID."""
     if _content_norm_meta(conn, _CONTENT_NORM_STATE) in (None, "done"):
@@ -2631,35 +2421,39 @@ def _content_norm_catchup_step(conn: sqlite3.Connection) -> bool:
     budget = _ContentNormBudget()
     with _content_norm_write(conn):
         cursor = conn.execute(
-            "SELECT value, typeof(value) FROM meta WHERE key=?", (_CONTENT_NORM_CURSOR,)
+            "SELECT CAST(value AS BLOB), typeof(value) FROM meta WHERE key=?", (_CONTENT_NORM_CURSOR,)
         ).fetchone()
-        after = _content_norm_id(cursor) if cursor else None
+        after_id = _content_norm_key(cursor) if cursor else None
+        null_cursor = _content_norm_meta(conn, _CONTENT_NORM_NULL_CURSOR)
+        after_null = int(null_cursor) if null_cursor is not None else None
         saw_stale = False
         while budget.available():
-            if after is None:
-                candidate = conn.execute(
-                    "SELECT id, typeof(id) FROM memory WHERE id IS NOT NULL ORDER BY id LIMIT 1"
-                ).fetchone()
-            else:
-                candidate = conn.execute(
-                    "SELECT id, typeof(id) FROM memory WHERE id > ? ORDER BY id LIMIT 1", (after,)
-                ).fetchone()
-            if candidate is None:
+            key = _next_content_norm_key(conn, after_id, after_null)
+            if key is None:
                 break
-            memory_id = _content_norm_id(candidate)
-            row = _content_norm_payload(conn, memory_id)
+            row = _content_norm_payload(conn, key)
             if not budget.admit(len(row[0] or b"") if row else 0):
                 break
-            saw_stale = _repair_content_norm_row(conn, memory_id, row) or saw_stale
-            after = memory_id
+            saw_stale = _repair_content_norm_row(conn, key, row) or saw_stale
+            value, kind = key
+            if kind == "integer":
+                after_null = value
+            else:
+                after_id = key
         if saw_stale:
             _set_content_norm_meta(conn, _CONTENT_NORM_SAW_STALE, "1")
-        if after is None or conn.execute(
-            "SELECT 1 FROM memory WHERE id > ? LIMIT 1", (after,)
-        ).fetchone() is None:
+        if _next_content_norm_key(conn, after_id, after_null) is None:
             _finish_content_norm_pass(conn)
             return False
-        _set_content_norm_meta(conn, _CONTENT_NORM_CURSOR, after)
+        if after_id is not None:
+            value, kind = after_id
+            conn.execute(
+                f"INSERT OR REPLACE INTO meta(key,value) VALUES (?,{_content_norm_key_binding(kind)})",
+                (_CONTENT_NORM_CURSOR, value),
+            )
+            conn.execute("DELETE FROM meta WHERE key=?", (_CONTENT_NORM_NULL_CURSOR,))
+        elif after_null is not None:
+            _set_content_norm_meta(conn, _CONTENT_NORM_NULL_CURSOR, str(after_null))
         if budget.rows:
             _set_content_norm_meta(conn, _CONTENT_NORM_BATCH_ROWS, str(budget.rows))
         return True
@@ -2669,28 +2463,51 @@ def _heal_content_norm_dirty(conn: sqlite3.Connection) -> None:
     budget = _ContentNormBudget()
     while budget.available():
         marks = conn.execute(
-            "SELECT memory_id, typeof(memory_id) FROM memory_content_norm_dirty "
+            "SELECT CASE typeof(memory_id) WHEN 'integer' THEN memory_id ELSE CAST(memory_id AS BLOB) END, "
+            "typeof(memory_id) FROM memory_content_norm_dirty "
             "ORDER BY memory_id LIMIT ?",
             (_CONTENT_NORM_DIRTY_BATCH,),
         ).fetchall()
         if not marks:
-            return
+            break
         exhausted = False
+        batch_saw_stale = False
         with _content_norm_write(conn):
-            saw_stale = False
             for mark in marks:
-                memory_id = _content_norm_id(mark)
-                row = _content_norm_payload(conn, memory_id)
+                key = _content_norm_key(mark)
+                row = _content_norm_payload(conn, key)
                 if not budget.admit(len(row[0] or b"") if row else 0):
                     exhausted = True
                     break
-                saw_stale = _repair_content_norm_row(conn, memory_id, row) or saw_stale
-            if saw_stale:
-                conn.execute(
-                    "INSERT OR IGNORE INTO meta(key,value) VALUES ('content_norm_verify_163','done')"
-                )
+                batch_saw_stale = _repair_content_norm_row(conn, key, row) or batch_saw_stale
+            if (batch_saw_stale
+                    and _content_norm_meta(conn, "content_norm_verify_163") is None
+                    and _content_norm_meta(conn, _CONTENT_NORM_SAW_STALE) is None):
+                _set_content_norm_meta(conn, _CONTENT_NORM_SAW_STALE, "1")
         if exhausted:
+            break
+
+
+def _restore_legacy_content_norm_stamps(conn: sqlite3.Connection) -> None:
+    """Publish compatibility markers after a complete drain, separately from repairs."""
+    missing_repair = _content_norm_meta(conn, "content_norm_repair_162") is None
+    carried = _content_norm_meta(conn, _CONTENT_NORM_SAW_STALE) == "1"
+    missing_verify = carried and _content_norm_meta(conn, "content_norm_verify_163") is None
+    if not (missing_repair or missing_verify or carried):
+        return
+    with _content_norm_write(conn):
+        if conn.execute("SELECT 1 FROM memory_content_norm_dirty LIMIT 1").fetchone():
             return
+        if missing_repair:
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES ('content_norm_repair_162','done')"
+            )
+        if missing_verify:
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES ('content_norm_verify_163','done')"
+            )
+        if carried:
+            conn.execute("DELETE FROM meta WHERE key=?", (_CONTENT_NORM_SAW_STALE,))
 
 
 def _heal_content_norms_incremental(conn: sqlite3.Connection) -> tuple[float, bool]:
@@ -2706,6 +2523,7 @@ def _heal_content_norms_incremental(conn: sqlite3.Connection) -> tuple[float, bo
         state = _content_norm_meta(conn, _CONTENT_NORM_STATE)
         if state == "done":
             _heal_content_norm_dirty(conn)
+            _restore_legacy_content_norm_stamps(conn)
             return 0.0, False
         if state is not None:
             started = time.monotonic()

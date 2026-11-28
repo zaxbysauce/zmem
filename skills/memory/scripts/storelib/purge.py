@@ -55,6 +55,7 @@ from storelib.schema import (
     _load_vec,
     _release_named_lock,
     _strict_acquire_lock,
+    _wait_for_open_connections,
     now_iso,
 )
 from storelib.backup import (
@@ -1251,14 +1252,25 @@ def _scrub_snapshot(path: Path, chain: list[str],
 # CLI entry
 # --------------------------------------------------------------------------
 
+def _purge_has_active_writers() -> bool:
+    live = _cleanup_stale_writer_leases()
+    if not live:
+        return False
+    print("[zmem] purge REFUSED: a normal writer is currently "
+          "active; re-run when it finishes", file=sys.stderr)
+    for lease in live[:5]:
+        print("[zmem]   active writer lease: %s" % lease.name, file=sys.stderr)
+    return True
+
+
 def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
               out_dir: str | None = None, as_json: bool = False) -> int:
     """`store.py purge --id <id> [...] [--scrub-backups --out-dir DIR]`.
 
     Exit ladder: 0 clean; 2 bad usage (incl. an invalid
     ZMEM_TEST_LEDGER_FAMILIES token); 3 unknown id; 4 maintenance, schema,
-    backup, consolidate, or live-writer refusal; 5 residue detected OR the
-    delivery-state skew refusal (an ops file family this client cannot
+    backup, consolidate, live-connection, or live-writer refusal;
+    5 residue detected OR the delivery-state skew refusal (an ops file family this client cannot
     scrub — in that case NOTHING was deleted, the store was not even
     opened, and no purged_id rows exist); 6 compaction/scrub failure."""
     from storelib import schema as schema_mod
@@ -1283,10 +1295,9 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 print("[zmem] purge REFUSED: %s" % e, file=sys.stderr)
                 return 4
 
-    # Full cmd_restore ladder (backup.py:647-701): maintenance -> schema ->
-    # backup -> consolidate -> live-writer refusal. Maintenance gates writers
-    # at their START only, so the lock + lease + backup/consolidate locks are
-    # what makes the byte-verify window exclusive.
+    # Like restore, hold maintenance while draining admitted connections
+    # before taking schema. A connection already admitted can still need
+    # schema and can register its writer lease while maintenance is held.
     m_token = _acquire_maintenance_lock_with_liveness()
     if m_token is None:
         print("[zmem] purge REFUSED: another maintenance operation "
@@ -1295,6 +1306,12 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         return 4
     s_token = b_token = c_token = None
     try:
+        if _purge_has_active_writers():
+            return 4
+        if not _wait_for_open_connections():
+            print("[zmem] purge REFUSED: a store connection is active - "
+                  "store untouched; re-run when it finishes", file=sys.stderr)
+            return 4
         # Issue #357: a dead schema-lock holder is broken instead of
         # blocking purge for the stale window; a live holder keeps the
         # identical bounded wait and refusal below.
@@ -1315,13 +1332,7 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             print("[zmem] purge REFUSED: a consolidation is currently "
                   "running - re-run when it finishes", file=sys.stderr)
             return 4
-        live = _cleanup_stale_writer_leases()
-        if live:
-            print("[zmem] purge REFUSED: a normal writer is currently "
-                  "active; re-run when it finishes", file=sys.stderr)
-            for lease in live[:5]:
-                print("[zmem]   active writer lease: %s" % lease.name,
-                      file=sys.stderr)
+        if _purge_has_active_writers():
             return 4
 
         # Issue #322 AC2: fail closed BEFORE any store access when the

@@ -1290,16 +1290,24 @@ def _check_content_norm_pass(store_path: Path) -> dict | None:
                 state="done", dirty_rows=dirty, remaining_batches=0,
             )
         cursor = conn.execute(
-            "SELECT value FROM meta WHERE key='content_norm_pass_after_id'"
+            "SELECT key FROM meta WHERE key IN "
+            "('content_norm_pass_after_id', 'content_norm_pass_after_null_rowid')"
         ).fetchone()
         observed = conn.execute(
             "SELECT value FROM meta WHERE key='content_norm_pass_batch_rows'"
         ).fetchone()
         if cursor is None:
-            remaining = conn.execute("SELECT COUNT(id) FROM memory").fetchone()[0]
+            remaining = conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0]
+        elif cursor[0] == "content_norm_pass_after_null_rowid":
+            remaining = conn.execute(
+                "SELECT COUNT(id) + (SELECT COUNT(*) FROM memory WHERE id IS NULL "
+                "AND rowid > (SELECT CAST(value AS INTEGER) FROM meta WHERE key=?)) FROM memory",
+                (cursor[0],),
+            ).fetchone()[0]
         else:
             remaining = conn.execute(
-                "SELECT COUNT(*) FROM memory WHERE id > ?", (cursor[0],)
+                "SELECT COUNT(*) FROM memory WHERE id > (SELECT value FROM meta WHERE key=?)",
+                (cursor[0],),
             ).fetchone()[0]
         try:
             batch_rows = max(1, int(observed[0])) if observed else 1

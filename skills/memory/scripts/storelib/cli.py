@@ -6652,6 +6652,14 @@ def main():
     open_lease = None
     conn = None
     explain = args.cmd == "recall" and bool(getattr(args, "explain", False))
+    # Dry-runs, diagnostics and governed snapshot exports must not consume
+    # pending repair markers or write store-open timing during setup.
+    defer_content_repair = (
+        explain
+        or getattr(args, "dry_run", False)
+        or (args.cmd == "entity-merge" and not args.confirm)
+        or args.cmd in {"export-dataset", "export-training", "convention-drift", "tune-weights"}
+    )
 
     def close_open_connection():
         try:
@@ -6668,7 +6676,7 @@ def main():
             writer_lease = _acquire_writer_lease(args.cmd, open_lease=open_lease)
         conn = _connect_existing_store() if existing_only_evidence_write else connect()
         if not existing_only_evidence_write:
-            if explain:
+            if defer_content_repair:
                 _prepare_store(conn, track_content_norm=False)
             else:
                 _prepare_store(conn)
@@ -6688,14 +6696,8 @@ def main():
     # remediation work, and the auto pass running first would consume the rows
     # their command targets — turning --dry-run into an empty preview and
     # --confirm into "no matching live rows found".
-    if args.cmd not in ("rekey-namespace", "export-dataset", "export-training",
-                        "convention-drift", "rescan-secrets") \
-            and not existing_only_evidence_write and not explain:
-        # export-dataset joins the exemption (issue #134): it is a pure-read
-        # surface and must not trigger the near-miss rekey's writes against
-        # the store it is reading. convention-drift joins it (issue #261)
-        # for the same reason: a drift scan that auto-rekeyed namespaces
-        # would violate its own read-only contract on near-miss stores.
+    if (args.cmd not in {"rekey-namespace", "rescan-secrets"}
+            and not existing_only_evidence_write and not defer_content_repair):
         # rescan-secrets joins it (issue #181) as defense-in-depth: the
         # command early-dispatches above and never reaches this site, but if
         # that ever changes, a dry-run must not write and apply's write set

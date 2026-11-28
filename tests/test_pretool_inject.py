@@ -619,7 +619,7 @@ class HermesReflectDeliveryTest(unittest.TestCase):
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
             ring = self._hashed_ring(tmp, "s-reflect")
-            ring.parent.mkdir(parents=True)
+            ring.parent.mkdir(parents=True, exist_ok=True)
             ring.write_text(
                 json.dumps({"ts": 200, "tool": "Bash",
                             "ops": "git stash pop"}) + "\n",
@@ -662,7 +662,7 @@ class HermesReflectDeliveryTest(unittest.TestCase):
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
             ring = self._hashed_ring(tmp, "s-reflect")
-            ring.parent.mkdir(parents=True)
+            ring.parent.mkdir(parents=True, exist_ok=True)
             ring.write_text(
                 json.dumps({"ts": 200, "tool": "Bash",
                             "ops": "git stash pop"}) + "\n",
@@ -690,7 +690,7 @@ class HermesReflectDeliveryTest(unittest.TestCase):
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
             ring = self._hashed_ring(tmp, "s-reflect")
-            ring.parent.mkdir(parents=True)
+            ring.parent.mkdir(parents=True, exist_ok=True)
             ring.write_text(
                 json.dumps({"ts": 200, "tool": "Bash",
                             "ops": "git stash pop"}) + "\n",
@@ -718,7 +718,7 @@ class HermesReflectDeliveryTest(unittest.TestCase):
         try:
             _seed(_clean_env(tmp), "user:global", LESSON)
             ring = self._hashed_ring(tmp, "s-reflect")
-            ring.parent.mkdir(parents=True)
+            ring.parent.mkdir(parents=True, exist_ok=True)
             same_second = json.dumps({"ts": 200, "tool": "Bash",
                                       "ops": "git stash pop"}) + "\n"
             ring.write_text(same_second, encoding="utf-8")

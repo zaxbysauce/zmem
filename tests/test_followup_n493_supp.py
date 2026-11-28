@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -496,6 +497,37 @@ class NormVerifySuppTest(unittest.TestCase):
         for n in norms:
             self.assertEqual(n, _normalize_content("norm heal stamp body"))
 
+    def test_verify_stamp_waits_for_multi_open_dirty_drain(self):
+        store = _fresh_store("nv-resume-stamp")
+        conn = sqlite3.connect(str(store))
+        try:
+            conn.executemany(
+                "INSERT INTO memory (id, namespace, type, content, tags, source_ref, "
+                "ingestion_ts, content_norm) VALUES (?, 'project:supp', 'fact', ?, '', "
+                "'session:x', '2026-01-01T00:00:00Z', ?)",
+                [("a-stale", "Stale body", "WRONG"), ("z-null", "x" * (2 * 1024 * 1024 + 1), None)],
+            )
+            conn.commit()
+            stamp_sql = "SELECT value FROM meta WHERE key='content_norm_verify_163'"
+            first = _run_cli(store, "stats")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(conn.execute(
+                "SELECT content_norm FROM memory WHERE id='a-stale'"
+            ).fetchone()[0], "stale body")
+            self.assertIsNone(conn.execute(
+                "SELECT content_norm FROM memory WHERE id='z-null'"
+            ).fetchone()[0])
+            self.assertIsNone(conn.execute(stamp_sql).fetchone())
+
+            second = _run_cli(store, "stats")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(conn.execute(stamp_sql).fetchone(), ("done",))
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM memory_content_norm_dirty"
+            ).fetchone()[0], 0)
+        finally:
+            conn.close()
+
     def test_partial_pass_leaves_no_stamp_and_retries(self):
         """Round-6 reviewer finding: a heal batch that COMMITS must NOT
         certify the pass. 205 rows so the scan spans TWO batches
@@ -541,7 +573,9 @@ class NormVerifySuppTest(unittest.TestCase):
                 "'96000000-0000-4000-8000-000000000205' "
                 "BEGIN SELECT RAISE(ABORT, 'partial probe'); END;")
             conn.commit()
-            schema_mod._verify_content_norms_163(conn)
+            with mock.patch.object(schema_mod, "_CONTENT_NORM_DIRTY_BATCH", 200), \
+                 mock.patch.object(schema_mod, "_CONTENT_NORM_TIME_LIMIT", 10.0):
+                schema_mod._heal_content_norms_incremental(conn)
             stamped = conn.execute(
                 "SELECT value FROM meta WHERE "
                 "key='content_norm_verify_163'").fetchone()
@@ -586,7 +620,7 @@ class NormVerifySuppTest(unittest.TestCase):
             # retry: drop the trigger, re-run — everything heals + stamps
             conn.execute("DROP TRIGGER zmem_493_partial_probe")
             conn.commit()
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             stamped2 = conn.execute(
                 "SELECT value FROM meta WHERE "
                 "key='content_norm_verify_163'").fetchone()
@@ -632,10 +666,13 @@ class NormVerifySuppTest(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        r = _run_cli(store, "stats")
-        self.assertEqual(r.returncode, 0, r.stderr)
         conn = sqlite3.connect(str(store))
         try:
+            for _ in range(8):
+                r = _run_cli(store, "stats")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                if conn.execute("SELECT 1 FROM memory_content_norm_dirty LIMIT 1").fetchone() is None:
+                    break
             rows = conn.execute(
                 "SELECT content, content_norm FROM memory").fetchall()
         finally:
@@ -1124,7 +1161,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
                 "WHERE content='miss probe body'")
             conn.commit()
             # First run heals (single mismatch -> compare-and-update hits).
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             row = conn.execute(
                 "SELECT content_norm FROM memory WHERE content="
                 "'miss probe body'").fetchone()
@@ -1174,7 +1211,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             # the open caller transaction, driving the true SAVEPOINT arm
             # (conn.in_transaction True), exactly the production shape a
             # migrate()-under-caller-tx caller would present.
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             stamped = conn.execute(
                 "SELECT value FROM meta WHERE "
                 "key='content_norm_verify_163'").fetchone()
@@ -1227,7 +1264,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
                 "content_norm ON memory BEGIN SELECT RAISE(IGNORE); "
                 "END;")
             conn.commit()
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             stamped = conn.execute(
                 "SELECT value FROM meta WHERE "
                 "key='content_norm_verify_163'").fetchone()
@@ -1268,7 +1305,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
                 "'2026-01-01T00:00:00Z','STALE CALLERTX NORM')")
             conn.execute(
                 "DELETE FROM meta WHERE key='content_norm_verify_163'")
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             self.assertTrue(
                 conn.in_transaction,
                 "a successful pass inside a caller transaction must leave "
@@ -1331,7 +1368,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             probe = s3.connect(str(store), timeout=0.3,
                                isolation_level=None)
             try:
-                schema_mod._verify_content_norms_163(probe)
+                schema_mod._heal_content_norms_incremental(probe)
             finally:
                 probe.close()
             check = s3.connect(str(store), timeout=5)
@@ -1397,7 +1434,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         try:
             # own-transaction path: the heal batch commits, the post-scan
             # stamp hits the trigger — the call must RETURN, never raise.
-            schema_mod._verify_content_norms_163(probe)
+            schema_mod._heal_content_norms_incremental(probe)
             self.assertFalse(
                 probe.in_transaction,
                 "a failed stamp must not strand a verifier-owned "
@@ -1420,11 +1457,8 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         self.assertEqual(norm[0], _normalize_content("stamp probe body"),
                          "the committed heal stays durable across the "
                          "stamp-time failure")
-        # Retry after the simulated contention clears. DISCLOSED RESIDUAL
-        # (round-7 fix): the healed row leaves nothing stale, so the retry
-        # scan heals nothing (healed == 0) and the store stays unstamped —
-        # it re-scans read-only on every open (the disclosed clean-store
-        # steady state) until any future drift re-opens the stamp path.
+        # The repair committed before the stamp failed. The next open can
+        # publish the stamp from that durable evidence after the fault clears.
         retry_setup = s3.connect(str(store), timeout=5)
         try:
             for ev in ("INSERT", "UPDATE"):
@@ -1435,7 +1469,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             retry_setup.close()
         retry = s3.connect(str(store), timeout=5)
         try:
-            schema_mod._verify_content_norms_163(retry)  # must not raise
+            schema_mod._heal_content_norms_incremental(retry)  # must not raise
         finally:
             retry.close()
         final = s3.connect(str(store), timeout=5)
@@ -1448,14 +1482,14 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
                 "'93000000-0000-4000-8000-000000000001'").fetchone()
         finally:
             final.close()
-        self.assertIsNone(stamped2,
-                          "the residual: a fully-healed store re-scans "
-                          "clean and does not re-stamp")
+        self.assertEqual(stamped2, ("done",),
+                         "a retry publishes the stamp for the committed repair")
         self.assertEqual(norm2[0], _normalize_content("stamp probe body"),
                          "the healed row stays canonical across retries")
-        # Self-healing property: any FUTURE drift re-opens the stamp path.
+        # Re-create the missing-stamp case with fresh drift.
         drift = s3.connect(str(store), timeout=5)
         try:
+            drift.execute("DELETE FROM meta WHERE key='content_norm_verify_163'")
             drift.execute(
                 "UPDATE memory SET content_norm='STALE AGAIN' WHERE id="
                 "'93000000-0000-4000-8000-000000000001'")
@@ -1464,7 +1498,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             drift.close()
         recovery = s3.connect(str(store), timeout=5)
         try:
-            schema_mod._verify_content_norms_163(recovery)
+            schema_mod._heal_content_norms_incremental(recovery)
         finally:
             recovery.close()
         post = s3.connect(str(store), timeout=5)
@@ -1530,7 +1564,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         probe = s3.connect(str(store), timeout=5)
         try:
             probe.execute("BEGIN")  # caller-owned transaction
-            schema_mod._verify_content_norms_163(probe)  # must not raise
+            schema_mod._heal_content_norms_incremental(probe)  # must not raise
             self.assertTrue(
                 probe.in_transaction,
                 "the caller's transaction stays open — the helper never "
@@ -1609,7 +1643,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
         probe = s3.connect(str(store), timeout=5, factory=_BoomCommit)
         try:
             # commit #1 = the heal batch; commit #2 = the stamp -> raises
-            schema_mod._verify_content_norms_163(probe)  # must not raise
+            schema_mod._heal_content_norms_incremental(probe)  # must not raise
             # In-connection assertions BEFORE any close (round-9: close()
             # itself rolls back an open transaction, so post-close checks
             # cannot establish the verifier's own rollback ran).
@@ -1667,7 +1701,7 @@ class NormVerifyConcurrencySuppTest(unittest.TestCase):
             conn.execute(
                 "DELETE FROM meta WHERE key='content_norm_verify_163'")
             conn.commit()
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             row = conn.execute(
                 "SELECT content_norm FROM memory WHERE id="
                 "'90000000-0000-4000-8000-000000000001'").fetchone()
@@ -1721,7 +1755,7 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
                      (norm if norm is not None
                       else _normalize_content(content))))
             conn.commit()
-            schema_mod._verify_content_norms_163(conn)
+            schema_mod._heal_content_norms_incremental(conn)
             rows_out = conn.execute(
                 "SELECT content, content_norm, superseded_at FROM memory"
             ).fetchall()
@@ -1737,22 +1771,16 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
             conn.close()
 
     def test_post_stamp_stale_heals_and_unstamped_163_recreates_stamp(self):
-        """Issue #533 rewrite of the round-2 F-3 pin: the combined
-        post-stamp lane (_heal_content_norms_post_stamp) now heals a stale
-        norm planted AFTER the stamp, and the unstamped-163 leg keeps a REAL
-        discriminator — after deleting the stamp and RE-PLANTING a fresh
-        stale norm, the reopen must both heal it AND re-create the
-        content_norm_verify_163 stamp. Only the 163 verification pass ever
-        writes that stamp (it rides an actual heal; the combined lane has no
-        marker), so the stamp assertion proves the 163 pass itself ran —
-        without it, the combined lane alone would green this test and a
-        deleted _verify_content_norms_163 would go unnoticed (plan-critic
-        round 2 masking finding)."""
+        """A reopen heals dirty rows even when the old verify stamp exists.
+
+        After deleting the stamp, a fresh stale row proves that the reopen
+        both repairs the norm and restores the compatibility stamp.
+        """
         store = _fresh_store("nv-noscan")
         _run_cli(store, "add", "--content", "noscan body",
                  "--namespace", "project:supp", "--type", "fact")
-        _run_cli(store, "stats")  # clean scan: heals nothing, no stamp
-        # Give the store a heal so the post-scan stamp lands.
+        _run_cli(store, "stats")  # No stale repair, so no verify stamp.
+        # Seed a stale norm so a successful repair publishes the stamp.
         conn = sqlite3.connect(str(store))
         try:
             conn.execute(
@@ -1768,10 +1796,7 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
                 "SELECT value FROM meta WHERE "
                 "key='content_norm_verify_163'").fetchone()
             self.assertIsNotNone(stamped, "fixture: stamp must be present")
-            # Plant a stale norm AFTER the stamp; the combined post-stamp
-            # lane must heal it on the next open (issue #533 — this is the
-            # deliberate inversion of the old pin, which asserted the stale
-            # value survived the stamped early return).
+            # Issue #533: the verify stamp must not suppress later repairs.
             conn.execute(
                 "UPDATE memory SET content_norm='STALE AFTER STAMP' "
                 "WHERE content='noscan body'")
@@ -1789,13 +1814,8 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
             conn.close()
         self.assertEqual(
             norm[0], _normalize_content("noscan body"),
-            "post-stamp stale norm heals on the next open (issue #533 "
-            "combined lane)")
-        # Unstamped-163 leg with a REAL discriminator: RE-PLANT a fresh
-        # stale norm (the post-stamp leg just healed the row, so without
-        # re-planting the assertion below would pass on an already-canonical
-        # row), delete the stamp, reopen — the 163 pass must heal it AND
-        # re-create the stamp.
+            "post-stamp stale norm heals on the next open (issue #533)")
+        # Plant a fresh stale norm before deleting the verify stamp.
         conn = sqlite3.connect(str(store))
         try:
             conn.execute(
@@ -1821,10 +1841,7 @@ class NormVerifyRowShapeSuppTest(unittest.TestCase):
                          "unstamped, the re-planted stale row heals")
         self.assertIsNotNone(
             restamped,
-            "the unstamped reopen RE-CREATES content_norm_verify_163 — "
-            "only the 163 verification pass writes that stamp (it rides an "
-            "actual heal); its absence would mean the combined lane healed "
-            "the row while the 163 pass itself is gone")
+            "a successful stale-norm repair restores content_norm_verify_163")
 
 
 def tearDownModule():

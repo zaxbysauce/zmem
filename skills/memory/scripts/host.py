@@ -29,6 +29,7 @@ import os
 import re
 import stat as _stat
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -1388,6 +1389,44 @@ def process_alive(pid) -> bool | None:
         return True
     except Exception:
         return None
+
+
+def process_birth_identity(pid: int) -> str | None:
+    """Return a PID reuse discriminator when the operating system exposes one."""
+    if not 1 <= pid <= 2**31 - 1:
+        return None
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
+            k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            filetime = ctypes.POINTER(wintypes.FILETIME)
+            k32.GetProcessTimes.argtypes = (wintypes.HANDLE, filetime, filetime, filetime, filetime)
+            k32.GetProcessTimes.restype = wintypes.BOOL
+            handle = k32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            try:
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                if k32.GetProcessTimes(handle, created, exited, kernel, user):
+                    return f"w{created.dwHighDateTime:08x}{created.dwLowDateTime:08x}"
+            finally:
+                k32.CloseHandle(handle)
+        elif sys.platform.startswith("linux"):
+            with open("/proc/sys/kernel/random/boot_id", "rb") as source:
+                boot = source.read(64).strip().replace(b"-", b"")
+            with open(f"/proc/{pid}/stat", "rb") as source:
+                # Fields after the closing comm parenthesis start at field 3.
+                start = source.read(4096).rsplit(b")", 1)[1].split()[19]
+            if len(boot) == 32 and start.isdigit():
+                return f"l{bytes.fromhex(boot.decode('ascii')).hex()}_{int(start)}"
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
 
 
 def read_lock_holder_pid(path):

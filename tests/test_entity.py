@@ -389,13 +389,18 @@ class EntityMergeTest(_Store):
         self.add("use `ripgrep` here")
         self.add("shorthand `rg` row")
         before = self._ids_by_name()
+        conn = self.db()
+        conn.execute("UPDATE memory SET content_norm=NULL WHERE content='shorthand `rg` row'")
+        conn.commit()
         r = self.run_store("entity-merge", "--from", before["rg"],
                            "--to", before["ripgrep"])
         self.assertIn("DRY RUN", r.stdout)
         self.assertIn("no writes", r.stdout)
+        self.assertIsNone(conn.execute(
+            "SELECT content_norm FROM memory WHERE content='shorthand `rg` row'"
+        ).fetchone()[0])
         after = self._ids_by_name()
         self.assertEqual(before, after, "dry run must not write")
-        conn = self.db()
         n = conn.execute("SELECT count(*) FROM entity").fetchone()[0]
         self.assertEqual(n, len(before))
 
