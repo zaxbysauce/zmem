@@ -110,9 +110,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   locked file (the common Windows case) the directory used to survive
   with nobody told. A directory nobody is told about is a directory
   nobody removes. The restore now checks the removal's outcome and, when
-  the directory survived, reports its exact location and what it holds —
-  at the moment the restore happens, not only if a later
-  `purge --scrub-backups` happens to run.
+  the directory survived, records it DURABLY — a `RESTORE-LEFTOVER.txt`
+  marker inside the surviving directory, beside the bytes it holds — and
+  reports its exact location and what it holds, at the moment the restore
+  happens, not only if a later `purge --scrub-backups` happens to run.
+  Neither the record nor the warning can fail silently: a restore that
+  cannot report a surviving plaintext copy does not report success.
 
 - **The restore's required-shape proof now parses a table definition
   the way SQLite parses it.** Before the staged copy of a snapshot may

@@ -1174,6 +1174,15 @@ class SurvivingWorkDirReportTest(_InProcessRestoreBase):
         self.assertTrue(survivors,
                         "expected the work directory to survive the failed "
                         "removal, so the report is the only notice")
+        # the report must be DURABLE, not only printed: the record sits
+        # inside the surviving directory, beside the bytes it holds, so
+        # it survives even when the warning cannot be written.
+        records = list(self.dir.glob("**/RESTORE-LEFTOVER.txt"))
+        self.assertTrue(records,
+                        "expected a durable RESTORE-LEFTOVER.txt record in "
+                        "the surviving work directory")
+        self.assertIn("PLAINTEXT store and WAL bytes",
+                      records[0].read_text(encoding="utf-8"))
 
 
 

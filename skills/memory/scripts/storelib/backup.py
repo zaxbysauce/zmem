@@ -960,12 +960,16 @@ def _report_surviving_work_dir(work_dir: Path | None) -> bool:
     The restore's private working copy holds PLAINTEXT store and WAL
     bytes. Its removal is best-effort (`ignore_errors=True`), so a
     locked file can leave it behind -- and a directory nobody is told
-    about is a directory nobody removes. This reports the survivor with
-    its exact location and what it holds, at the moment the restore
-    happens.
+    about is a directory nobody removes.
 
-    Returns True when the directory survived. Never raises: the report
-    is best-effort and must not turn a restore into a failure.
+    The survivor is recorded DURABLY FIRST (a marker file inside the
+    surviving directory, next to the bytes it holds) and only then
+    printed. Neither step swallows an exception: if the record cannot
+    be written, or the warning cannot be printed, the failure
+    PROPAGATES -- a restore that cannot report a surviving plaintext
+    copy must not report success.
+
+    Returns True when the directory survived.
     """
     if work_dir is None:
         return False
@@ -975,13 +979,17 @@ def _report_surviving_work_dir(work_dir: Path | None) -> bool:
         survived = False
     if not survived:
         return False
-    try:
-        print(f"[zmem] restore: WARNING - the private working copy "
-              f"{_esc(work_dir)} SURVIVED its cleanup and still holds "
-              f"plaintext store and WAL bytes; remove it by hand",
-              file=sys.stderr)
-    except Exception:
-        pass
+    record = work_dir / "RESTORE-LEFTOVER.txt"
+    record.write_text(
+        "The restore\'s private working copy SURVIVED its cleanup.\n"
+        "This directory holds PLAINTEXT store and WAL bytes.\n"
+        "Remove it by hand once you have read what you need from it.\n",
+        encoding="utf-8")
+    print(f"[zmem] restore: WARNING - the private working copy "
+          f"{_esc(work_dir)} SURVIVED its cleanup and still holds "
+          f"plaintext store and WAL bytes; remove it by hand "
+          f"(the record is in {_esc(record)})",
+          file=sys.stderr)
     return True
 
 
