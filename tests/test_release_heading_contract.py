@@ -209,6 +209,123 @@ class HeadingContractGatePathTest(unittest.TestCase):
         self.assertIn("unreadable", buffer.getvalue().lower())
 
 
+class ConflictMarkerContractTest(unittest.TestCase):
+    """PR #541: an unresolved merge marker must not ship in the
+    CHANGELOG.
+
+    This PR shipped one: its merge of `origin/main` reconstructed the
+    union of both sides' `[Unreleased]` bullets correctly and left the
+    three conflict-marker lines in place beside them. No other gate saw
+    it -- the heading contract reads only release headings, and the
+    unreleased-drift check asks only whether the section has content.
+
+    The unit leg proves the detector fires on each marker form and stays
+    quiet on prose that merely mentions one; the repo leg proves the
+    SHIPPED CHANGELOG is clean, which is the guardrail that would have
+    caught the shipped defect.
+    """
+
+    def test_each_marker_form_is_detected(self):
+        # The marker SHAPE is what matters: git writes SEVEN marker
+        # characters and then an ARBITRARY label (the branch name, HEAD, a
+        # path). The first version of the check matched a fixed list of
+        # six literals, so a `<<<<<<< HEAD` or `>>>>>>> feature-branch`
+        # line slipped through -- the reviewer's R-9 finding.
+        for marker in ("<<<<<<< ours", "<<<<<<< theirs", "<<<<<<< HEAD",
+                       "<<<<<<< feature-branch", "<<<<<<< /dev/null",
+                       ">>>>>>> ours", ">>>>>>> theirs", ">>>>>>> HEAD",
+                       ">>>>>>> feature-branch", "||||||| base",
+                       "||||||| origin/main"):
+            text = f"# Changelog\n\n## [Unreleased]\n\n{marker}\n"
+            violations = gate._changelog_conflict_markers(text)
+            self.assertEqual(len(violations), 1,
+                             f"marker {marker!r} was not detected")
+            # the marker is the 5th line of that fixture
+            self.assertIn("line 5", violations[0])
+            self.assertIn("PR #541", violations[0])
+
+    def test_separator_is_detected_inside_a_conflict_block(self):
+        # `=======` alone is a markdown setext H1 underline -- legitimate
+        # content -- so it is reported only where git puts it: inside a
+        # conflict block.
+        block = ("# Changelog\n\n## [Unreleased]\n\n"
+                 "<<<<<<< HEAD\n"
+                 "- ours\n"
+                 "=======\n"
+                 "- theirs\n"
+                 ">>>>>>> HEAD\n")
+        violations = gate._changelog_conflict_markers(block)
+        self.assertEqual(len(violations), 3, violations)
+        # the start marker is line 5, the separator line 7, the end line 9
+        self.assertTrue(any("line 5" in v and "<<<<<<< HEAD" in v
+                            for v in violations))
+        self.assertTrue(any("line 7" in v and "=======" in v
+                            and "conflict block opened at line 5" in v
+                            for v in violations))
+        self.assertTrue(any("line 9" in v and ">>>>>>> HEAD" in v
+                            for v in violations))
+
+    def test_separator_outside_a_block_is_not_a_marker(self):
+        # A setext H1 underline is the same seven characters and is
+        # legitimate markdown content.
+        text = "# Changelog\n\n## [Unreleased]\n\nA Title\n=======\n\nbody\n"
+        self.assertEqual(gate._changelog_conflict_markers(text), [])
+
+    def test_marker_with_trailing_whitespace_is_detected(self):
+        text = "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours   \n"
+        self.assertEqual(len(gate._changelog_conflict_markers(text)), 1)
+
+    def test_label_may_contain_spaces(self):
+        # git writes the branch name verbatim after the space, so a label
+        # with spaces is still a marker.
+        text = "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours with spaces\n"
+        self.assertEqual(len(gate._changelog_conflict_markers(text)), 1)
+
+    def test_prose_mentioning_a_marker_is_not_a_marker(self):
+        # A changelog entry that DOCUMENTS the marker (as this PR's
+        # release notes do) must not trip the detector: the marker must be
+        # at the START of the line and be the WHOLE line.
+        text = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "- The merge left a `<<<<<<< ours` line in this file.\n"
+            "- A line reading ===== is prose, not a separator.\n"
+            "- `>>>>>>> theirs` is quoted here too.\n"
+        )
+        self.assertEqual(gate._changelog_conflict_markers(text), [])
+
+    def test_clean_changelog_has_no_markers(self):
+        text = (
+            "# Changelog\n\n## [Unreleased]\n\n- nothing yet\n\n"
+            "## [2.1.0] - 2026-01-03\n\nnewest\n"
+        )
+        self.assertEqual(gate._changelog_conflict_markers(text), [])
+
+    def test_repo_changelog_carries_no_conflict_marker(self):
+        # THE GUARDRAIL: the shipped CHANGELOG must be marker-free. This
+        # leg is what would have failed on the merged head.
+        text = CHANGELOG.read_text(encoding="utf-8")
+        violations = gate._changelog_conflict_markers(text)
+        self.assertEqual(violations, [],
+                         "the repo CHANGELOG must not carry conflict markers")
+
+    def test_drift_gate_fails_on_a_conflicted_changelog(self):
+        # The drift gate is the per-PR path CI runs; it must exit 1 on a
+        # CHANGELOG that carries a marker, even when the Unreleased
+        # section is empty (so the content census cannot mask it).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## [Unreleased]\n\n<<<<<<< ours\n\n"
+                "## [2.1.0] - 2026-01-03\n\nnewest\n",
+                encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                rc = gate.check_unreleased_drift(root)
+            self.assertEqual(rc, 1)
+            self.assertIn("conflict marker", buffer.getvalue())
+            self.assertIn("::error::", buffer.getvalue())
+
+
 class RepairedRepoChangelogTest(unittest.TestCase):
     """AC3 guard: the real repo CHANGELOG (post-#214 repair) satisfies the
     heading contract and keeps exactly one 0.43.0 heading."""

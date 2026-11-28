@@ -2673,11 +2673,25 @@ flag the backup always runs. Also single-flighted (its own lockfile).
 ```
 <interpreter> <store.py> restore --from <snapshot.sqlite> [--force] [--out-dir DIR]
 ```
-Refuses unless `--force` when a store already exists. Verifies the snapshot's
-own `integrity_check` **before** touching the destination, then takes a
-`prerestore-<timestamp>.sqlite` copy of the current store (your rollback path —
-deliberately outside the retention glob so rotation can never prune it), clears
-stale `-wal`/`-shm` sidecars, copies, and re-verifies the restored store.
+Refuses unless `--force` when a store already exists. The snapshot is staged
+on a private copy and **proven** before anything replaces the live store: its
+own `integrity_check`, its identity (the v1 core columns), a migration to the
+running schema, and a semantic required-shape proof against a fresh store
+built by the same code (wrong definitions, impostor objects and extra
+indexes/triggers are refused; a damaged-but-derivable search index is healed
+by one rebuild). A `prerestore-<timestamp>.sqlite` copy of the current store
+(your rollback path — deliberately outside the retention glob so rotation can
+never prune it) is taken from a private working copy whenever the destination
+is non-empty. Stale `-wal`/`-shm` sidecars are **set aside** into a
+`<store>.restore-stash-*` directory beside the store, and whenever any sidecar
+was present their bytes — together with the pre-restore main file — are kept
+byte-for-byte in a `restore-forensic-<timestamp>/` directory under the backup
+dir. Any failure after the swap rolls the destination back automatically
+(from the pre-restore copy, or to its missing/empty prior state) and prints
+the ruled `restore FAILED` / `rolled back` lines; recovery artifacts are
+never silently removed. The doctor carries an `fts-index` check (graded
+`warn`, the derived-data convention) that names `rebuild-fts` for missing
+index rows, and the `fts` lane reports `degraded`/`fts-index-missing-rows`.
 
 Takes the **full maintenance lock ladder** — `maintenance`, `schema`, `backup`,
 and `consolidate` — for its whole duration, and refuses when a live writer
@@ -2823,7 +2837,11 @@ What one purge does:
 - `--scrub-backups --out-dir DIR` applies the same removal inside every
   `store-*.sqlite` **and** `prerestore-*.sqlite` snapshot in DIR, rewriting
   files **in place** (never deleted, truncated, or renamed) and re-verifying
-  each with `integrity_check`.
+  each with `integrity_check`. Restore's `restore-forensic-*` and
+  `restore-work-*` directories under DIR are recovery artifacts the scrub
+  does **not** rewrite: when any are present the purge prints a loud
+  WARNING listing them (they can hold pre-restore bytes of purged content —
+  inspect and remove them, then re-run).
 
 Vector erasure is fail-closed: when a `memory_vec` table exists, purge must
 load sqlite-vec and verify that no vector rows remain for the deleted ids. If

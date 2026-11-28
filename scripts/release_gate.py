@@ -280,6 +280,89 @@ def _changelog_heading_violations(text: str) -> list[str]:
     return violations
 
 
+# A git conflict marker is SEVEN marker characters, optionally followed by
+# a space and an ARBITRARY label (the branch name, `HEAD`, a path, or
+# whatever the user passed). The first version of this check matched a
+# fixed list of six literals, which caught only the labels one particular
+# merge happened to produce -- a `<<<<<<< HEAD` or `>>>>>>> feature-branch`
+# line slipped through. So the marker SHAPE is matched, not a label list.
+#
+# `=======` is deliberately NOT matched on its own: in markdown a run of
+# seven `=` under a line is a setext H1 underline, which is legitimate
+# content. The separator is reported only where git puts it -- INSIDE a
+# conflict block, between a `<<<<<<<` line and a `>>>>>>>` line.
+_CONFLICT_START_RE = re.compile(r"^<{7}(?: .*)?$")
+_CONFLICT_END_RE = re.compile(r"^>{7}(?: .*)?$")
+_CONFLICT_BASE_RE = re.compile(r"^\|{7}(?: .*)?$")
+_CONFLICT_SEPARATOR = "=" * 7
+
+
+def _changelog_conflict_markers(text: str) -> list[str]:
+    """Unresolved-merge-marker diagnostics for the CHANGELOG (PR #541).
+
+    A merge whose conflict was resolved by RECONSTRUCTION can leave the
+    conflict MARKERS in the file beside the reconstructed content. The
+    CHANGELOG ships to users, so a `<<<<<<< ours` line is a shipped
+    defect -- and one no other gate here can see: the heading contract
+    only looks at release headings, and the unreleased-drift check only
+    asks whether the section carries content.
+
+    This PR shipped one: its merge of `origin/main` reconstructed the
+    union of both sides' `[Unreleased]` bullets correctly (the bullet
+    multiset was exactly the union) and left the three marker lines in
+    place beside them.
+
+    A line is a marker when it IS the marker: seven `<`, `>` or `|` marker
+    characters, optionally followed by a space and any label, and nothing
+    else on the line. The separator (`=======`) is reported only inside a
+    conflict block, because a markdown setext underline is the same seven
+    characters and is legitimate content. A marker word inside prose is
+    never a marker, so the check cannot fire on documentation that merely
+    quotes one.
+
+    Returns one diagnostic per marker line, naming its line number and
+    the marker.
+    """
+    lines = text.split("\n")
+    violations: list[str] = []
+    # the separator is only a marker inside a block, so track the block
+    open_start: int | None = None
+    for number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if _CONFLICT_START_RE.match(stripped):
+            open_start = number
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (PR #541)"
+            )
+        elif _CONFLICT_END_RE.match(stripped):
+            open_start = None
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (PR #541)"
+            )
+        elif _CONFLICT_BASE_RE.match(stripped):
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (PR #541)"
+            )
+        elif stripped == _CONFLICT_SEPARATOR and open_start is not None:
+            violations.append(
+                f"CHANGELOG.md line {number} carries the unresolved merge "
+                f"marker {stripped!r} (inside the conflict block opened at "
+                f"line {open_start}) — a merged CHANGELOG must not ship "
+                f"conflict markers; resolve the conflict and delete the "
+                f"marker lines (PR #541)"
+            )
+    return violations
+
+
 def tag_exists(version: str) -> bool:
     out = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/v{version}"],
@@ -455,6 +538,14 @@ def check_unreleased_drift(repo_root: Path) -> int:
               f"section and DELETE the stranded duplicate (a second heading "
               f"often sits mid-file below the released sections) "
               f"(issue #364)")
+        return 1
+    # PR #541: an unresolved merge marker left in the CHANGELOG ships to
+    # users. This check runs here, BEFORE the content census, so it fires
+    # even when the section carries no content at all.
+    marker_violations = _changelog_conflict_markers(changelog)
+    if marker_violations:
+        for diagnostic in marker_violations:
+            print(f"::error::{diagnostic}")
         return 1
     if not unreleased_has_content(changelog):
         print("[release-gate] no unreleased drift: "
@@ -985,6 +1076,15 @@ def main(argv: list[str] | None = None) -> int:
     heading_violations = _changelog_heading_violations(changelog)
     if heading_violations:
         for diagnostic in heading_violations:
+            print(f"::error::{diagnostic}")
+        return 1
+    # PR #541: an unresolved merge marker left in the CHANGELOG ships to
+    # users, and no other gate here can see it (the heading contract reads
+    # only release headings; the drift check only asks whether the section
+    # carries content).
+    marker_violations = _changelog_conflict_markers(changelog)
+    if marker_violations:
+        for diagnostic in marker_violations:
             print(f"::error::{diagnostic}")
         return 1
     section = latest_changelog_section(changelog)

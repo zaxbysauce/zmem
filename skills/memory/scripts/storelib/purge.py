@@ -1185,13 +1185,76 @@ def _verify_ledgers_clean(data_dir: Path, needles: list[str]) -> dict[str, int]:
 # Backup snapshot scrub
 # --------------------------------------------------------------------------
 
+def _alias_target(path: Path, root: Path | None = None) -> tuple[str, str] | None:
+    """The kind and the description of an ALIAS, or None for an ordinary
+    file.
+
+    Two alias kinds defeat the backup tree's containment:
+
+    - a SYMLINK (or a Windows reparse point / junction): the path
+      resolves to a file in ANOTHER directory;
+    - a HARD LINK: the path resolves to itself, but the same inode is
+      reachable under another name, so a write to it lands there too.
+
+    The comparison is made against the PARENT's resolved path, so it is
+    not fooled by the case or the short/long form of the directory's own
+    name.
+    """
+    try:
+        parent_real = os.path.realpath(str(path.parent))
+        target_real = os.path.realpath(str(path))
+    except OSError:
+        return None
+    # The root (the backup directory the scrub is pointed at) is the
+    # boundary: the snapshot must resolve to a file DIRECTLY inside the
+    # resolved root. The PARENT-relative comparison alone would let a
+    # snapshot reached through a symlinked sub-directory slip past it.
+    if root is not None:
+        try:
+            root_real = os.path.realpath(str(root))
+        except OSError:
+            return None
+        expected = os.path.join(root_real, os.path.basename(str(path)))
+    else:
+        expected = os.path.join(parent_real, os.path.basename(str(path)))
+    if os.path.normcase(target_real) != os.path.normcase(expected):
+        return ("a symlink or a reparse point",
+                "it resolves to %s" % target_real)
+    try:
+        nlink = os.stat(str(path)).st_nlink
+    except OSError:
+        return None
+    if nlink > 1:
+        return ("a hard link",
+                "the same file is reachable under %d names" % nlink)
+    return None
+
+
 def _scrub_snapshot(path: Path, chain: list[str],
-                    needles: list[str]) -> dict[str, str]:
+                    needles: list[str],
+                    root: Path | None = None) -> dict[str, str]:
     """Apply the SAME remediation inside one snapshot file, in place.
 
     Old-schema snapshots skip tables they do not have. The scrub never
     schema-migrates a snapshot: purged_id rows are inserted only when the
     table already exists."""
+    # F-016: an ALIAS must never be scrubbed. This scrub rewrites the
+    # snapshot IN PLACE (the purge transaction below and the VACUUM in
+    # compact_and_verify), so a symlink/junction standing in for a
+    # snapshot -- or a hard link to a file outside the tree -- would have
+    # the delete and the rewrite land on a file the operator never
+    # nominated, OUTSIDE the sanctioned backup tree. Refuse it BEFORE any
+    # connection: the flag's contract is completeness ("no residue"), so
+    # an unscrubbed snapshot must not be reported as clean. The caller
+    # turns the refusal into the flag's own "backup scrub failed" exit.
+    alias = _alias_target(path, root)
+    if alias is not None:
+        kind, detail = alias
+        return {"snapshot": path.name, "status": "refused",
+                "detail": "the snapshot is an ALIAS (%s; %s) - refusing to "
+                          "scrub it, because the scrub rewrites the file in "
+                          "place and would modify a file outside the backup "
+                          "tree" % (kind, detail)}
     conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
@@ -1510,11 +1573,51 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 for snap in sorted(list(bdir.glob("store-*.sqlite"))
                                    + list(bdir.glob("prerestore-*.sqlite"))):
                     snapshots.append(
-                        _scrub_snapshot(snap, snapshot_targets, needles))
+                        _scrub_snapshot(snap, snapshot_targets, needles,
+                                        root=bdir))
             except (sqlite3.Error, OSError, RuntimeError) as e:
                 print("[zmem] purge FAILED: backup scrub failed (%s)"
                       % e, file=sys.stderr)
                 return 6
+            # F-016: an ALIASED snapshot was refused, so its content is
+            # NOT verified free of the purged content. The flag's
+            # contract is completeness, so the purge reports the
+            # failure through its own "backup scrub failed" channel --
+            # but the refusal is per snapshot, so every legitimate
+            # snapshot beside it was still scrubbed.
+            refused = [s for s in snapshots
+                       if s.get("status") == "refused"]
+            if refused:
+                print("[zmem] purge FAILED: backup scrub refused %d "
+                      "aliased snapshot(s) - an alias in the backup tree "
+                      "is rewritten THROUGH, so the scrub did not touch "
+                      "it and its content is NOT verified free of the "
+                      "purged content: remove the alias (or scrub the "
+                      "file it names) and re-run --scrub-backups:"
+                      % len(refused), file=sys.stderr)
+                for s in refused:
+                    print("  %s: %s" % (s["snapshot"], s["detail"]),
+                          file=sys.stderr)
+                return 6
+            # F-005 (swarm-pr-review MV-003): restore's forensic and work
+            # dirs hold byte-copies of the pre-restore store and its -wal
+            # (WAL page images can carry purged-content bytes the restored
+            # store no longer has). Leaving them silently behind would
+            # violate --scrub-backups' completeness surface — WARN loudly
+            # on stderr (they are operator recovery artifacts, so deleting
+            # them automatically is not this flag's call; the operator
+            # inspects and removes them, then re-runs). The distinct exit
+            # code for rc-keying automation is issue #542's AC5.
+            restore_artifacts = sorted(
+                d for d in bdir.glob("restore-forensic-*") if d.is_dir()
+            ) + sorted(d for d in bdir.glob("restore-work-*") if d.is_dir())
+            if restore_artifacts:
+                print("[zmem] purge: WARNING: --scrub-backups found restore "
+                      "recovery artifacts it does NOT scrub; they can hold "
+                      "pre-restore bytes of purged content — inspect and "
+                      "remove them, then re-run:", file=sys.stderr)
+                for d in restore_artifacts:
+                    print("  %s" % d, file=sys.stderr)
             if not snapshots:
                 # F-266-10: a typo'd or empty out-dir must not silently
                 # report a successful scrub of zero snapshots.

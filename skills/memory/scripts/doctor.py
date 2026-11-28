@@ -3875,6 +3875,91 @@ def _check_opencode_adapter(repo_root: Path,
 V9_COLUMNS = ("valid_until", "update_of", "taint")
 
 
+# Issue #506: the full-text search index. A store whose memory_fts (or any
+# shadow table) was lost used to be recreated EMPTY with no diagnosis; the
+# schema layer now rebuilds it on open. Doctor's job is the residual state
+# the rebuild cannot produce — an index that EXISTS but is incomplete: rows
+# present in memory and missing from memory_fts_docsize. Graded warn (not
+# fail) on purpose: every comparable derived-data check in doctor grades a
+# degraded store as warn, and only fail flips report.ok and the exit code.
+# When the probe itself cannot run (a shadow table missing, or a SQLite
+# error) the check reports the state with the repair hint and grades it
+# warn: every comparable derived-data check grades a degraded store as warn
+# (only fail flips report.ok and the exit code), so a hand-built or pre-FTS
+# store stays exit 0 — the schema-version check owns "this store is too
+# old".
+def _check_fts_index(resolved_store: Path) -> dict:
+    """Compare memory rowids with memory_fts_docsize rowids (read-only).
+
+    F-010 (swarm-pr-review round 2): a read-only REFUSAL (residue held by a
+    live writer, a torn copy, the lock_aware contract) propagates out of
+    this check instead of being reported as a degraded lane. That is the
+    deliberate fail-loud contract of `_open_store_ro` (PR #422: keep the
+    operator-actionable reason instead of collapsing it to "store
+    unreadable"), and every sibling check that opens the store read-only
+    behaves the same way -- so the contract is documented here rather than
+    changed at one call site. Making doctor degrade on refusals is a
+    repository-wide decision, not a local one.
+    """
+    conn = _open_store_ro(resolved_store)
+    if conn is None:
+        return _check(
+            "fts-index",
+            "skip",
+            "Store not available; skipped full-text index check.",
+        )
+    try:
+        names = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "memory" not in names:
+            return _check(
+                "fts-index",
+                "skip",
+                "No memory table; skipped full-text index check.",
+            )
+        if "memory_fts_docsize" not in names:
+            return _check(
+                "fts-index",
+                "warn",
+                "Full-text index is missing its memory_fts_docsize shadow "
+                f"table; run `{_prefix()} rebuild-fts` (or open the store "
+                "with any writable command) to rebuild it.",
+                repair="rebuild-fts",
+            )
+        memory_ids = {row[0] for row in conn.execute(
+            "SELECT rowid FROM memory")}
+        indexed = {row[0] for row in conn.execute(
+            "SELECT id FROM memory_fts_docsize")}
+        missing = memory_ids - indexed
+    except Exception as exc:
+        return _check(
+            "fts-index",
+            "warn",
+            f"Could not compare memory rows with the full-text index: "
+            f"{type(exc).__name__}: {exc}; run `{_prefix()} rebuild-fts`.",
+            repair="rebuild-fts",
+        )
+    finally:
+        conn.close()
+    if not missing:
+        return _check(
+            "fts-index",
+            "pass",
+            f"Full-text index is complete ({len(memory_ids)} rows indexed).",
+            indexed=len(memory_ids),
+        )
+    return _check(
+        "fts-index",
+        "warn",
+        f"Full-text index is missing {len(missing)} of {len(memory_ids)} "
+        f"memory rows (lexical search cannot find them); run "
+        f"`{_prefix()} rebuild-fts` to re-index.",
+        missing_rows=len(missing),
+        total_rows=len(memory_ids),
+        repair="rebuild-fts",
+    )
+
+
 def _check_v9_columns(resolved_store: Path) -> dict:
     """Confirm the v9 append-only lineage columns exist (issue #59, 4.1).
 
@@ -6462,6 +6547,8 @@ def build_report(
     checks.append(_check_training_capture_health(resolved_store))
     checks.append(_check_training_staging(project, training_output))
     checks.append(_check_v9_columns(resolved_store))
+    # Issue #506: search-index completeness (graded warn; see the check).
+    checks.append(_check_fts_index(resolved_store))
     checks.append(_check_entity_tables(resolved_store))
     # v11 (issue #61, 6.1): link surface + trust range probe.
     checks.append(_check_link_tables(resolved_store))
@@ -6843,9 +6930,43 @@ def _report_lane_status(resolved_store: Path) -> dict:
                 conn.execute(
                     "SELECT COUNT(*) FROM memory_fts "
                     "WHERE memory_fts MATCH 'zmem'").fetchone()
-                fts = _lane("ok")
-            except sqlite3.Error:
-                fts = _lane("error", "fts-probe-failed")
+                # Issue #506: an existing-but-incomplete index is `degraded`
+                # with its own reason, not silently ok — the same comparison
+                # as the fts-index check, computed independently of the
+                # checks list (this lane runs even when checks are skipped).
+                try:
+                    _mem = {r[0] for r in conn.execute("SELECT rowid FROM memory")}
+                    _idx = {r[0] for r in conn.execute(
+                        "SELECT id FROM memory_fts_docsize")}
+                    if _mem - _idx:
+                        fts = _lane("degraded", "fts-index-missing-rows")
+                    else:
+                        fts = _lane("ok")
+                except sqlite3.Error as exc:
+                    # F-016 (MV-001): keep the lane's verdict consistent
+                    # with the fts-index CHECK for damaged-table shapes —
+                    # the check grades them warn/degraded (repairable
+                    # derived data); an error grade told machine consumers
+                    # the probe failed when the tables are simply absent.
+                    # The absent-table reason belongs to THAT case only:
+                    # any other sqlite error is a probe failure, and it
+                    # reports the base's reason.
+                    if "no such table" in str(exc).lower():
+                        fts = _lane("degraded", "fts-index-tables-absent")
+                    else:
+                        fts = _lane("error", "fts-probe-failed")
+            except sqlite3.Error as exc:
+                # F-016 (MV-001) + the closeout reviewer's round 24: the
+                # tables-absent verdict belongs to the tables-absent case.
+                # Any OTHER sqlite error from the MATCH query — a LOCKED
+                # store, an I/O error — is a PROBE failure, and it keeps the
+                # base's verdict (the base carried no "fts-index-tables-
+                # absent" string at all), so the reason never names a cause
+                # that did not happen.
+                if "no such table" in str(exc).lower():
+                    fts = _lane("degraded", "fts-index-tables-absent")
+                else:
+                    fts = _lane("error", "fts-probe-failed")
             for name, table, lane_reason in (
                     ("entity", "entity", "table-absent"),
                     ("graph", "memory_link", "table-absent")):

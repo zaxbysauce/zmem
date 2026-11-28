@@ -8,7 +8,104 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
-
+- **The repair lane's row-scoped exemptions are no longer dropped by
+  the authoritative capture-policy evaluation.** `update_memory` evaluates
+  the capture policy twice — a PRE-LOCK warning pass and the AUTHORITATIVE
+  evaluation under the write lock — and only the first carried the repair
+  lane's `exempt_values`, so an exempt value that survived beside a value
+  being repaired was redacted anyway by the authoritative pass. Both
+  evaluations now carry the exemptions.
+- **The restore's staged copy is now CREATED inside its guarded block.**
+  `tempfile.mkstemp` and the descriptor close ran before the guard, so a
+  failure there escaped as a raw traceback and could leave a
+  `.restore-stage-*` file behind unreported — the same leak class this PR
+  closed for the private working copy. The creation is now inside the
+  guard, and the guard's cleanup skips the staged file when it was never
+  created.
+- **`purge --scrub-backups` no longer writes THROUGH an alias in the
+  backup tree.** The scrub rewrites each snapshot IN PLACE (the purge
+  transaction and the VACUUM), so a symlink (or a Windows reparse point)
+  standing in for a snapshot -- or a hard link to a file outside the tree
+  -- had the delete and the rewrite land on a file the operator never
+  nominated, OUTSIDE the sanctioned backup tree, while the scrub still
+  reported "no residue". The scrub now REFUSES an aliased snapshot
+  before it opens it, names the alias and its target, and the purge exits
+  6 -- its own "backup scrub failed" channel -- because the flag's
+  contract is completeness: an unscrubbed snapshot is never reported as
+  clean. The refusal is per snapshot, so a legitimate snapshot beside the
+  alias is still scrubbed. (swarm review F-016)
+- **An interrupted first open is now restartable, a lost search table is
+  rebuilt with every old row re-indexed, and 32 concurrent writers are no
+  longer refused with a restore-blaming message** (issue #506). The v3 and
+  v4 migration blocks guard each `ALTER TABLE` with the `table_info` probe
+  (the v6-v12 idiom), so a first open killed inside either block resumes on
+  the next open instead of dying on `duplicate column name`. The search-table
+  DDL moved to module constants and `init_db` now runs a restart-safe
+  recovery whenever `memory_fts` or any of its four shadow tables is missing
+  (whatever the row count): drop the remnants, create the table and its
+  triggers, run the FTS5 `rebuild`, all in ONE transaction with the mutation
+  generation bumped — a kill rolls it back and the next open redoes it.
+  `doctor` gains an `fts-index` check (graded `warn`, the derived-data
+  convention) that reports missing index rows and names `rebuild-fts`, and
+  the `fts` lane reports `degraded`/`fts-index-missing-rows`. The maintenance
+  probe returns immediately when no maintenance lock file exists (the old
+  probe acquired the exclusive lock, so concurrent writers serialized on it
+  and the slower ones timed out being blamed on a restore that was not
+  running), and a writer whose lease cannot be taken gets one clean
+  `[zmem]` line and exit 2 instead of a traceback.
+- **`restore --force` now rolls back automatically when it fails after
+  replacing the live store: the store is re-installed from the pre-restore
+  backup, which holds the store exactly as SQLite read it (including
+  committed `-wal` writes). The destination is no longer opened before the
+  swap. Sidecars are set aside instead of deleted, and their bytes, together
+  with the main file, are kept in `<backup dir>/restore-forensic-<stamp>/`.**
+  Note: if a stale `-wal` was beside the store, its rows are in that
+  rollback just as any open would have shown them; the forensic directory
+  holds the checkpoint-only file. (issue #504) The incoming snapshot is
+  staged on a private copy and PROVEN before the swap: integrity, identity,
+  migration to the running schema, and a semantic required-shape proof
+  against a fresh store built by the same code (objects including
+  `sqlite_autoindex_*`; every table compared element by element with
+  SQLite's ASCII-only identifier semantics and column keys cross-checked
+  against `PRAGMA table_xinfo`; the search table's declaration and the
+  search triggers exactly; extra indexes and triggers refused at or below
+  the supported stamp; the search index proven complete and usable —
+  rowid sets, a tokenizer-fed lexical probe, and a rolled-back round trip
+  through the triggers — with damaged derived index data healed by one
+  rebuild and wrong definitions refused). Any error after the swap rolls
+  back per the destination's prior state (non-empty: the safety copy is
+  re-installed and re-verified; missing: the destination is absent again;
+  empty: 0 bytes again); a rollback that itself fails prints the
+  manual-recovery lines and never the words `rolled back`.
+- **Consolidation and `update` no longer write from reads taken before
+  their write lock** (issue #507). The consolidation cluster transaction
+  opens with `BEGIN IMMEDIATE`, the keeper and every admitted neighbour are
+  re-read under the lock with a compare-and-set over every decision field
+  (namespace, content, tags, type, confidence, signal, taint, source_ref,
+  embedding, embedding_model, ingestion_ts — recall telemetry exempt), the
+  tombstone is conditional on the row still being live, and a cluster that
+  absorbed nothing rolls back with no `consolidated_at` stamp. `update`
+  derives every inherited value, guard, capture-policy decision and derived
+  field ONCE, from the row read under the write lock, after the existing
+  drift refusals have compared that row with the pre-lock snapshot.
+- **The store-recovery paths are now atomic where they were not.** The
+  search-index surgery recreates the whole search table in ONE transaction:
+  a failure or a kill between the DDL and the rebuild now rolls the
+  recreate back and the next open heals the store — instead of leaving
+  every search object present with an EMPTY index that the recovery gate
+  (which only rebuilds a MISSING object) would never repair, so the rows
+  stayed unsearchable until a manual `rebuild-fts`. A consolidation run
+  that loses the write lock at its first write now rolls its transaction
+  back before it returns, so the next caller does not trip over an open
+  transaction. Every restore-path line that echoes snapshot- or store-derived
+  text is escaped — the ONE exception is the manual-recovery line, which is
+  a copy-paste command and therefore keeps the path byte-exact (and
+  shell-quoted) — so a crafted snapshot cannot inject terminal control
+  bytes into the operator's terminal. The restore's working directory (a
+  byte copy of the live store) is now owner-only hardened like the forensic
+  directory beside it, on a best-effort basis: a filesystem that cannot
+  harden must not break the restore, so the hardening call is made and a
+  failure to harden does not abort it.
 - **Store opens skip content-normalization scans on clean stores.** Existing
   stores repair stale values in bounded batches across opens. The doctor
   report shows catch-up progress, and store-open timings are written to
@@ -17,7 +114,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   budget, and restore waits for active store opens before replacing the
   database. Update older plugin copies that share the same store to remove
   their per-open scans. ([#546](https://github.com/zaxbysauce/zmem/issues/546))
-
 - **Pre-tool recall no longer injects unrelated lessons before plain
   read-only commands.** The pre-tool query was the raw command text, so
   `ls`, `cat`, `sed -n '1,40p'`, path fragments and heredoc bodies matched
@@ -40,6 +136,53 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   path only; the fleet broker and the OpenCode bridge do not pass the tool
   input and are unchanged. Noise from `git status`, `grep`/`rg` and inline
   scripts is deliberately not filtered.
+
+- **The restore now reports a working copy that survived its cleanup.**
+  The private safety copy the restore makes of the live store holds
+  PLAINTEXT store and WAL bytes, and its removal is best-effort — so on a
+  locked file (the common Windows case) the directory used to survive
+  with nobody told. A directory nobody is told about is a directory
+  nobody removes. The restore now checks the removal's outcome and, when
+  the directory survived, records it DURABLY — a `RESTORE-LEFTOVER.txt`
+  marker inside the surviving directory, beside the bytes it holds — and
+  reports its exact location and what it holds, at the moment the restore
+  happens, not only if a later `purge --scrub-backups` happens to run.
+  Neither the record nor the warning can fail silently: a restore that
+  cannot report a surviving plaintext copy does not report success. The
+  record and the warning cover each other -- only if BOTH fail does the
+  survivor become unknowable, and then the restore fails rather than
+  reporting success -- and the staged copy (which holds the snapshot) is
+  cleaned up even when the report raises.
+
+- **The restore's required-shape proof now parses a table definition
+  the way SQLite parses it.** Before the staged copy of a snapshot may
+  replace the destination, the proof compares that snapshot's schema
+  against a freshly built store, token for token. Its tokenizer
+  normalized every numeric literal through `float`, so a column's
+  `DEFAULT 0` (an INTEGER) and `DEFAULT 0.0` (a REAL) compared EQUAL --
+  SQLite stores them as different values -- and two integers one unit
+  apart (`9007199254740992` and `9007199254740993`) collided as well. It
+  also ended a backtick-quoted identifier at the first backtick, while
+  SQLite reads a doubled backtick as an escaped one, so `` `a``b` `` is
+  the ONE identifier `a`b`. A snapshot whose required column's default
+  differed in kind, or by one unit, could therefore pass the proof and
+  replace the destination with a store of the wrong shape. The tokenizer
+  now keeps SQLite's own kind (INTEGER or REAL) with an EXACT value --
+  the proof still normalizes numbers BY VALUE, so `007` and `7` compare
+  equal, as before -- and reads a doubled-backtick identifier as the one
+  identifier SQLite sees. (issue #542 AC6)
+
+- **The release gate now refuses a CHANGELOG that carries an unresolved
+  merge marker** (PR #541). A merge whose conflict is resolved by
+  RECONSTRUCTION can leave the conflict MARKERS in the file beside the
+  reconstructed content, and the CHANGELOG ships to users. This PR's own
+  merge of `origin/main` reconstructed the union of both sides' notes
+  correctly and still left the three marker lines in place; nothing else
+  in the gate could see them, because the heading contract reads only
+  release headings and the drift gate asks only whether the section
+  carries content. The gate now reports the line number and the marker
+  and fails, in both the default release path and the per-PR
+  unreleased-drift path, and the shipped CHANGELOG is marker-free.
 
 - **Prompt-assertion partition: sentence-scoped negation, multi-focus orthogonal drop, moment allow-list, rescue count after admission** (issue #530).
   The partition now splits a stored row into sentences before applying

@@ -87,6 +87,19 @@ _LEXICAL_STOPWORDS = {
 
 
 
+# Issue #507: every row field the selection, the similarity, the admission,
+# the contested classification or the keeper ranking reads. A neighbour or
+# the keeper changed on one of these after selection -> the stale decision is
+# REFUSED, not re-decided. Exempt on purpose (recall telemetry only; they
+# change on every recall and would starve consolidation on a live store):
+# retrieval_count, surfaced_count, last_retrieved, last_surfaced.
+_DECISION_FIELDS = (
+    "namespace", "content", "tags", "type", "confidence", "signal",
+    "taint", "source_ref", "embedding", "embedding_model", "ingestion_ts",
+)
+_DECISION_FIELDS_SQL = ", ".join(_DECISION_FIELDS)
+
+
 def _lexical_tokens(text: str | None) -> set[str]:
     """Tokenize text into a lowercase word set for Jaccard-overlap clustering.
     Drops short tokens and common stopwords so similarity reflects content
@@ -499,10 +512,19 @@ def _absorb_into_keeper(
     # filter) still sees this row as dead at every T >= the tombstone (issue
     # #59, 4.4 as-of soundness).
     tomb_at = tx_now
-    conn.execute(
-        "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? WHERE id=?",
+    # Issue #507: the tombstone is CONDITIONAL on the row still being live —
+    # a rowcount other than 1 means a concurrent writer tombstoned or
+    # deleted it inside our transaction window, which rolls the whole
+    # cluster back (the caller's except path).
+    _cur = conn.execute(
+        "UPDATE memory SET superseded_at=?, valid_until=?, supersede_reason=? "
+        "WHERE id=? AND superseded_at IS NULL",
         (tomb_at, tomb_at, f"consolidated into {keeper_id}", absorbed["id"]),
     )
+    if _cur.rowcount != 1:
+        raise RuntimeError(
+            f"neighbour {absorbed['id']} was not live at tombstone time "
+            f"(rowcount={_cur.rowcount}); the cluster rolls back")
     try:
         conn.execute("DELETE FROM memory_vec WHERE memory_id=?", (absorbed["id"],))
     except sqlite3.OperationalError:
@@ -628,9 +650,22 @@ def _gather_neighbors(
                 continue
             sim = 1.0 - r["distance"]
             if sim >= effective_threshold:
+                # F-001 (swarm-pr-review CS-001): carry EVERY decision field
+                # this row has (the #507 run-start and per-neighbour CAS
+                # compare only fields present in the gathered row). The old
+                # narrow projection omitted namespace, source_ref, embedding,
+                # embedding_model and ingestion_ts — they existed only as
+                # WHERE predicates — so a concurrent namespace rekey
+                # committing between this gather and the refresh passed both
+                # CAS layers and tombstoned a live row into a keeper of the
+                # OLD namespace (violating #507 AC1 on the default
+                # embeddings path). The refresh projection (_refresh_live_row)
+                # is the reference; gather the same columns here.
                 row = conn.execute(
-                    "SELECT id, confidence, signal, tags, type, rowid, retrieval_count, "
-                    "surfaced_count, content, taint "
+                    "SELECT id, namespace, content, tags, type, rowid, "
+                    "confidence, signal, retrieval_count, surfaced_count, "
+                    "embedding, embedding_model, ingestion_ts, taint, "
+                    "source_ref "
                     "FROM memory "
                     "WHERE id=? AND superseded_at IS NULL AND namespace=? "
                     # PR1 (knowledge companion): pointer rows are never
@@ -1176,20 +1211,51 @@ def consolidate(
     # Write the consolidation timestamp BEFORE the clustering loop, so a killed
     # run still creates backpressure on the next session. Count is start-of-run
     # (pre-clustering) live count.
+    # F-003 companion (swarm-pr-review B1): this run-start write is the FIRST
+    # write under contention — guard it the same way as the cluster loop so a
+    # busy store produces a ruled skip line, never a raw OperationalError
+    # traceback out of consolidate().
     if not dry_run:
-        ts = now_iso()
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation', ?)",
-            (ts,),
-        )
-        live_count_now = conn.execute(
-            "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
-        ).fetchone()[0]
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation_count', ?)",
-            (str(live_count_now),),
-        )
-        conn.commit()
+        try:
+            ts = now_iso()
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation', ?)",
+                (ts,),
+            )
+            live_count_now = conn.execute(
+                "SELECT count(*) FROM memory WHERE superseded_at IS NULL"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('last_consolidation_count', ?)",
+                (str(live_count_now),),
+            )
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # F-003 (swarm-pr-review round 2): roll the implicit transaction
+            # back before returning. pysqlite's deferred BEGIN succeeds
+            # WITHOUT taking a lock and SQLite does NOT end the transaction
+            # on SQLITE_BUSY, so the connection can come back from this
+            # handler still inside a transaction -- and the next caller
+            # (organize.py reuses this connection) would then fail with
+            # 'cannot start a transaction within a transaction'. The guard
+            # mirrors the cluster-loop handler below.
+            if conn.in_transaction:
+                try:
+                    conn.rollback()
+                except sqlite3.Error as rb_exc:
+                    # F-003 (swarm-pr-review round 2, Stage-B review): a
+                    # rollback that itself fails must be REPORTED, not
+                    # swallowed -- the operator is told the connection may
+                    # still hold an open transaction.
+                    print(f"[zmem] consolidate: run-start rollback failed "
+                          f"({type(rb_exc).__name__}: {rb_exc}); the connection "
+                          f"may still hold an open transaction",
+                          file=sys.stderr)
+            print(f"[zmem] consolidate: run-start write failed "
+                  f"({type(exc).__name__}: {exc}); skipped, will retry next run",
+                  file=sys.stderr)
+            report["skipped_by_contention"] = True
+            return report
 
     # Load live memories. In embedding mode, only rows with an embedding are
     # candidates (vec0 KNN needs a query vector); in lexical fallback mode every
@@ -1336,11 +1402,36 @@ def consolidate(
         fresh_seed = _refresh_live_row(conn, seed["id"])
         if fresh_seed is None:
             continue  # the seed itself was absorbed by an earlier cluster
+        # Issue #507: the run's SELECTION happened at the working-set query
+        # above. A seed that changed on a decision field since then makes
+        # every decision this run made about it stale — skip the cluster and
+        # let the NEXT run re-cluster it from fresh state (the stale decision
+        # is refused, not re-decided). This also covers the row-changed-
+        # during-another-cluster's-admission case: the working set still
+        # holds the pre-change row, so the drift is visible here.
+        if any(fresh_seed[f] != seed[f] for f in _DECISION_FIELDS):
+            print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] "
+                  f"skipped (row changed on a decision field since this run's "
+                  f"selection; the next run re-clusters it)", file=sys.stderr)
+            continue
         seed = fresh_seed
         refreshed = []
         for nb, sim in neighbors:
             fresh = _refresh_live_row(conn, nb["id"])
             if fresh is not None:
+                # Same stale-decision rule for neighbours, against the
+                # working-set row this run selected them from. Both gather
+                # paths now project the full decision-field set (F-001 fixed
+                # the vec0 KNN's narrow projection), so every decision field
+                # is compared; the projection-filter remains only as a
+                # defensive shape for any future gather path.
+                _nb_fields = tuple(f for f in _DECISION_FIELDS if f in nb.keys())
+                if any(fresh[f] != nb[f] for f in _nb_fields):
+                    print(f"[zmem] consolidate: neighbour [{nb['id'][:8]}] "
+                          f"changed on a decision field since this run's "
+                          f"selection; absorb refused, row left as it is",
+                          file=sys.stderr)
+                    continue
                 refreshed.append((fresh, sim))
         neighbors = refreshed
         if not neighbors:
@@ -1558,15 +1649,62 @@ def consolidate(
                 })
             continue
 
-        # Atomic commit per cluster.
+        # Atomic commit per cluster. Issue #507: BEGIN IMMEDIATE — the
+        # write lock is taken BEFORE any in-transaction re-read, so the
+        # compare-and-set below compares against rows no concurrent writer
+        # can change between the read and the write.
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             keeper_grew = False
             cluster_absorbed = 0
             # v15 (#173 PR-review F30): ONE clock for the whole cluster
             # transaction — every absorb tombstone/merge and the
             # consolidated_at stamp below share it (contract line 137/AC7).
             cluster_now = now_iso()
+
+            # Issue #507: re-read the KEEPER under the lock with a liveness
+            # predicate and a decision-field CAS. Dead: the whole cluster is
+            # skipped (every absorb was decided against the old keeper).
+            # Alive but changed on a decision field: same — the stale
+            # decision must be refused, not re-decided.
+            _locked_keeper = _refresh_live_row(conn, seed["id"])
+            if _locked_keeper is None:
+                conn.execute("ROLLBACK")
+                print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] "
+                      f"skipped (keeper invalidated after selection)", file=sys.stderr)
+                if contested_override:
+                    report["contested_clusters"].append({
+                        "keeper": seed["id"],
+                        "namespace": seed["namespace"],
+                        "merged": False,
+                        "members": [
+                            {"id": mid, "polarity": "neg" if pol else "pos",
+                             "content_preview": (mcontent or "")[:60]}
+                            for mid, mcontent, pol in member_pols
+                        ],
+                    })
+                    contested_ids.update(mid for mid, _, _ in member_pols)
+                continue
+            if any(_locked_keeper[f] != seed[f] for f in _DECISION_FIELDS):
+                conn.execute("ROLLBACK")
+                print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] "
+                      f"skipped (keeper changed after selection; the stale "
+                      f"decision is refused)", file=sys.stderr)
+                if contested_override:
+                    report["contested_clusters"].append({
+                        "keeper": seed["id"],
+                        "namespace": seed["namespace"],
+                        "merged": False,
+                        "members": [
+                            {"id": mid, "polarity": "neg" if pol else "pos",
+                             "content_preview": (mcontent or "")[:60]}
+                            for mid, mcontent, pol in member_pols
+                        ],
+                    })
+                    contested_ids.update(mid for mid, _, _ in member_pols)
+                continue
+            seed = _locked_keeper
+
             for nb_row, nb_sim in admitted:
                 # Issue #376 defense-in-depth: revalidate this absorb against
                 # the keeper's CURRENT tags/type (grown by the absorbs above).
@@ -1585,6 +1723,24 @@ def consolidate(
                     continue
                 # Preserve absorbed content + record provenance + merge metadata
                 # + supersede (issue #19). consolidate-ONLY helper.
+                # Issue #507: re-read each admitted NEIGHBOUR under the lock.
+                # Dead: its tombstone stays, not counted as merged. Alive but
+                # changed on a decision field: ONLY this absorb is refused;
+                # the cluster's other neighbours are still absorbed as
+                # decided. The bookkeeping counts what was absorbed, never
+                # what was admitted.
+                _locked_nb = _refresh_live_row(conn, nb_row["id"])
+                if _locked_nb is None:
+                    print(f"[zmem] consolidate: neighbour [{nb_row['id'][:8]}] "
+                          f"invalidated after selection; its tombstone stands, "
+                          f"absorb skipped", file=sys.stderr)
+                    continue
+                if any(_locked_nb[f] != nb_row[f] for f in _DECISION_FIELDS):
+                    print(f"[zmem] consolidate: neighbour [{nb_row['id'][:8]}] "
+                          f"changed after selection; absorb refused, row left "
+                          f"as it is", file=sys.stderr)
+                    continue
+                nb_row = _locked_nb
                 decision = _absorb_into_keeper(conn, seed, nb_row, now=cluster_now)
                 # Issue #62, 7.4 (c76 no-op-absorb blast radius): only a keeper
                 # whose content actually GREW this run is a valid compression
@@ -1595,6 +1751,28 @@ def consolidate(
                 keeper_grew = keeper_grew or decision["will_append"]
                 absorbed.add(nb_row["id"])
                 cluster_absorbed += 1
+            # Issue #507: zero rows absorbed -> ROLLBACK: no consolidated_at,
+            # no merge or restatement message, report["merged"] unchanged (a
+            # cluster that refused every absorb is not a merge).
+            if cluster_absorbed == 0:
+                conn.execute("ROLLBACK")
+                print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] "
+                      f"skipped (no neighbour survived revalidation; nothing "
+                      f"merged)", file=sys.stderr)
+                if contested_override:
+                    report["contested_clusters"].append({
+                        "keeper": seed["id"],
+                        "namespace": seed["namespace"],
+                        "merged": False,
+                        "members": [
+                            {"id": mid, "polarity": "neg" if pol else "pos",
+                             "content_preview": (mcontent or "")[:60]}
+                            for mid, mcontent, pol in member_pols
+                        ],
+                    })
+                    contested_ids.update(mid for mid, _, _ in member_pols)
+                continue
+
             # Mark the keeper as consolidated.
             conn.execute(
                 "UPDATE memory SET consolidated_at=? WHERE id=?",
@@ -1654,7 +1832,15 @@ def consolidate(
             # swallowed-exception catch is pre-existing, but the new multi-write
             # _absorb_into_keeper enlarges what this transaction must succeed at
             # (implementation-review finding #3).
-            conn.execute("ROLLBACK")
+            # F-003 (swarm-pr-review RP-001): when the failure IS the BEGIN
+            # IMMEDIATE itself (write-lock contention past busy_timeout), no
+            # transaction is open and a bare ROLLBACK would raise "cannot
+            # rollback - no transaction is active" OUT of this handler,
+            # killing the whole run with an unhandled traceback. Guard with
+            # conn.in_transaction (the write.py idiom) so the ruled retry
+            # line below is what the operator sees.
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             print(f"[zmem] consolidate: cluster around [{seed['id'][:8]}] failed "
                   f"({type(exc).__name__}: {exc}); rolled back, will retry next run",
                   file=sys.stderr)

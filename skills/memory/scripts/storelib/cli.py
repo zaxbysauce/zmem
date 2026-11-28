@@ -6682,7 +6682,10 @@ def main():
                 _prepare_store(conn)
     except (RuntimeError, sqlite3.Error, OSError, ValueError) as e:
         close_open_connection()
-        print(f"[zmem] {e}", file=sys.stderr)
+        # F-019 (swarm-pr-review round 2): the early lease/open failure
+        # names the COMMAND that failed, so the operator knows what to
+        # re-run; it is one line and exit 2, never a traceback.
+        print(f"[zmem] {args.cmd}: {e}", file=sys.stderr)
         sys.exit(2)
     except BaseException:
         close_open_connection()

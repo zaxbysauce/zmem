@@ -954,6 +954,79 @@ def _integrity_check_readonly(path: Path) -> str:
     finally:
         handle.close()
 
+def _report_surviving_work_dir(work_dir: Path | None) -> bool:
+    """Report a work directory that survived its cleanup.
+
+    The restore's private working copy holds PLAINTEXT store and WAL
+    bytes. Its removal is best-effort (`ignore_errors=True`), so a
+    locked file can leave it behind -- and a directory nobody is told
+    about is a directory nobody removes.
+
+    The survivor is recorded DURABLY FIRST (a marker file inside the
+    surviving directory, next to the bytes it holds) and only then
+    printed. Neither step swallows an exception: if the record cannot
+    be written, or the warning cannot be printed, the failure
+    PROPAGATES -- a restore that cannot report a surviving plaintext
+    copy must not report success.
+
+    Returns True when the directory survived.
+    """
+    if work_dir is None:
+        return False
+    indeterminate = False
+    try:
+        survived = work_dir.is_dir()
+    except OSError:
+        # The CHECK failed. That is not proof of removal: the directory may
+        # still hold plaintext store bytes, so it is INDETERMINATE and is
+        # reported as such (the closeout reviewer's finding).
+        survived = True
+        indeterminate = True
+    if not survived:
+        return False
+    record = work_dir / "RESTORE-LEFTOVER.txt"
+    # The two mechanisms cover each other: the durable record is the
+    # fallback for the warning, and the warning is the fallback for the
+    # record. Only if BOTH fail is the survivor genuinely unknowable --
+    # and that must not pass silently.
+    record_error = None
+    try:
+        record.write_text(
+            ("The restore\'s private working copy could not be checked and "
+             "MAY have SURVIVED its cleanup.\n"
+             "This directory may hold PLAINTEXT store and WAL bytes.\n"
+             "Remove it by hand once you have read what you need from it.\n"
+             if indeterminate else
+             "The restore\'s private working copy SURVIVED its cleanup.\n"
+             "This directory holds PLAINTEXT store and WAL bytes.\n"
+             "Remove it by hand once you have read what you need from it.\n"),
+            encoding="utf-8")
+    except Exception as exc:
+        record_error = exc
+    warning_error = None
+    try:
+        if indeterminate:
+            _what = ("could not be checked and MAY have survived its cleanup; "
+                     "it may hold plaintext store and WAL bytes; remove it "
+                     "by hand")
+        else:
+            _what = ("SURVIVED its cleanup and still holds plaintext store "
+                     "and WAL bytes; remove it by hand")
+        print(f"[zmem] restore: WARNING - the private working copy "
+              f"{_esc(work_dir)} {_what} "
+              f"(the record is in {_esc(record)})",
+              file=sys.stderr)
+    except Exception as exc:
+        warning_error = exc
+    if record_error is not None and warning_error is not None:
+        raise RuntimeError(
+            "a private working copy (%s) survived its cleanup and NEITHER "
+            "the durable record nor the warning could be written; the "
+            "copy holds plaintext store and WAL bytes and must be removed "
+            "by hand" % work_dir) from record_error
+    return True
+
+
 def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
     """Restore the store from a snapshot, under the maintenance locks.
 
@@ -981,17 +1054,63 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
     still live, it refuses and leaves the destination untouched.
     """
     dest = STORE_PATH
+    # Issue #504 step 1 (supplement Item D): both stamp reads go through the
+    # sidecar-free reader — the bare mode=ro open CREATES a 0-byte -wal and a
+    # 32 KB -shm on a perfectly quiesced store, so every ordinary restore
+    # would find "sidecars present" and make a forensic directory for files
+    # it created itself. RuntimeError (non-integer stamp, _schema_compat)
+    # still refuses with exit 2, exactly as before.
+    from storelib.readonly import open_readonly as _ro_open, ReadOnlyStoreError as _ROErr
+
+    def _stamp_sidecar_free(path: Path):
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                return None
+            h = _ro_open(path)
+            try:
+                row = h.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+            finally:
+                h.close()
+            if not row:
+                return None
+            try:
+                return int(row[0])
+            except (TypeError, ValueError):
+                # Fail closed exactly like _read_schema_version: a
+                # non-integer stamp refuses with the same RuntimeError (exit 2).
+                raise RuntimeError(
+                    f"zmem: store {_esc(path)} has a non-integer "
+                    f"schema_version {_esc(repr(row[0]))}; refusing to modify it")
+        except (FileNotFoundError, _ROErr, sqlite3.Error, OSError):
+            return None
+
     try:
-        _read_schema_version(dest)
-        _read_schema_version(Path(from_path).expanduser())
+        v = _stamp_sidecar_free(dest)
+        if v is None and dest.exists() and dest.stat().st_size > 0:
+            _read_schema_version(dest)   # fail-closed on unreadable-but-present
+        v2 = _stamp_sidecar_free(Path(from_path).expanduser())
+        if v2 is None:
+            _read_schema_version(Path(from_path).expanduser())
+        # The stamp-policy half of the old preflight (issue #504 step 1):
+        # _read_schema_version also ran _schema_compat on every readable
+        # stamp — the newer-destination refusal (exit 2, destination
+        # untouched) lives there. The sidecar-free read must run the SAME
+        # gate on the stamps it read.
+        from storelib.schema import _schema_compat as _compat
+        if v is not None:
+            _compat(v, dest)
+        if v2 is not None:
+            _compat(v2, Path(from_path).expanduser())
     except RuntimeError as e:
-        print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+        print(f"[zmem] restore FAILED: {_esc(e)}", file=sys.stderr)
         return 2
     if _host is not None:
         try:
             _host.assert_local_fs(dest.parent)
         except ValueError as e:
-            print(f"[zmem] restore FAILED: {e}", file=sys.stderr)
+            print(f"[zmem] restore FAILED: {_esc(e)}", file=sys.stderr)
             return 1
 
     m_token = _acquire_maintenance_lock_with_liveness()
@@ -1045,210 +1164,1093 @@ def _restore_has_active_writers() -> bool:
     print("[zmem] restore REFUSED: a normal writer is currently active - "
           "destination untouched; re-run when it finishes", file=sys.stderr)
     for lease in live_writers[:5]:
-        print(f"[zmem]   active writer lease: {lease.name}", file=sys.stderr)
+        # F-002: the lease name is a FILENAME from the writer's lease
+        # directory, so it is externally observable -- and Windows forbids
+        # control characters in a file name, but this code also runs on
+        # POSIX, where it does not.
+        print(f"[zmem]   active writer lease: {_esc(lease.name)}",
+              file=sys.stderr)
     return True
 
-def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
-    """The restore body. Called only by cmd_restore(), which holds the `backup`
-    and `consolidate` locks for the whole of it. Returns a process exit code.
+# ---------------------------------------------------------------------------
+# Issue #504 step 3(e): the semantic REQUIRED SHAPE proof (inserted from
+# the trace's repro/shape-helpers-impl.py; see the plan for the rulings
+# behind every rule below).
+# ---------------------------------------------------------------------------
+# ASCII-only, per SQLite's tokenizer. Any character not matched here and not
+# inside a string literal / quoted identifier / comment REFUSES.
+_SHAPE_TOKEN = re.compile(
+    r"[ \t\n\f\r]+"
+    r"|--[^\n]*|/\*.*?\*/"
+    r"|'(?:[^']|'')*'"
+    r"|\"(?:[^\"]|\"\")*\""
+    r"|\[[^\]]*\]"
+    r"|`(?:[^`]|``)*`"   # a doubled backtick is an ESCAPED backtick,
+    #                        so the identifier ends at the backtick that
+    #                        is NOT doubled -- SQLite's own rule
+    r"|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|\.[0-9]+"
+    r"|[A-Za-z_][A-Za-z0-9_$]*"
+    r"|\|\||->>|<<|>>|<=|>=|==|!=|<>|[(),.;+\-*/%<>=~&|:\[\]]",
+    re.S,
+)
 
-    Deliberately NOT routed through main()'s connect()/init_db()/migrate()
-    path (see main()'s dispatch, which branches on `restore` before those
-    calls, exactly as `failures` does): on Windows an open sqlite3 connection
-    holds a file handle on the destination, and overwriting a file another
-    connection in this same process has open is precisely the thing to avoid.
-    Every connection this function opens is closed before the next step.
+_FTS_TRIGGERS = ("memory_ai", "memory_ad", "memory_au")
 
-    Order is load-bearing: verify the snapshot -> take the pre-restore safety
-    copy of the CURRENT store (which must still have its `-wal` frames intact,
-    so this happens BEFORE any sidecar removal) -> clear stale sidecars ->
-    copy -> checkpoint + re-verify.
+
+def _esc(text: str) -> str:
+    """F-007 (swarm-pr-review MU-001): escape snapshot-derived text before
+    it reaches the operator's terminal. Restore refusal lines echo
+    attacker-controlled sqlite_master identifiers and SQLite error text; a
+    crafted snapshot name carrying OSC 0/OSC 52 (clipboard-write) or CSI
+    sequences must not execute in the ruled output. When any
+    non-printable character is present the whole text is rendered in its
+    escaped form (\\x1b visible); clean text passes through unchanged so
+    ordinary names stay greppable.
     """
+    text = str(text)
+    if all(ch.isprintable() for ch in text):
+        return text
+    return text.encode("unicode_escape").decode("ascii")
+
+
+def _ascii_lower(text: str) -> str:
+    """SQLite's identifier case folding: ASCII A-Z only.
+
+    Python's str.lower()/casefold() map the Kelvin sign (U+212A) and other
+    non-ASCII capitals to ASCII look-alikes; SQLite's identifier folding
+    does not, so `"Kind"` (Kelvin) is a DIFFERENT identifier than `kind`
+    (the round-5 Kelvin CHECK impostor relied on exactly this confusion).
+    """
+    return "".join(
+        chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
+
+
+class ShapeError(Exception):
+    """The staged copy's shape is not what the running client needs."""
+
+
+def _shape_tokens(sql):
+    """SQL token stream with SQLite's ASCII-only semantics, fail-closed.
+
+    Comments and whitespace are dropped; bare words fold case with SQLite's
+    ASCII-only rule (_ascii_lower, NOT str.lower()/casefold(): Python equates
+    the Kelvin sign K with k, SQLite does not); quoted identifiers fold the
+    same way after unquoting (a DOUBLED backtick is an escaped backtick, so
+    `` `a``b` `` is the ONE identifier `a`b`); numbers keep SQLite's own
+    kind -- INTEGER or REAL -- and their EXACT value; any character the
+    scanner does not consume raises ShapeError (an unconsumed non-ASCII byte
+    is an identifier character to SQLite and must not slip through as
+    nothing).
+    """
+    out, i = [], 0
+    while i < len(sql):
+        m = _SHAPE_TOKEN.match(sql, i)
+        if not m:
+            raise ShapeError(
+                "unconsumed %r at %d (SQLite treats non-ASCII characters as "
+                "identifier characters; the definition is not what it looks "
+                "like)" % (sql[i], i))
+        i = m.end()
+        text = m.group()
+        if text[0] in " \t\n\f\r" or text.startswith("--") or text.startswith("/*"):
+            continue
+        if text[0] == "'":
+            out.append(("s", text))
+        elif text[0] in "\"[`":
+            inner = text[1:-1].replace(text[0] * 2, text[0])
+            out.append(("w", _ascii_lower(inner)))
+        elif text[0].isdigit() or text[0] == ".":
+            # SQLite's own rule: a numeric literal with a point or an
+            # exponent is a REAL, otherwise it is an INTEGER, and the two
+            # kinds are DIFFERENT values to SQLite (`DEFAULT 0` stores
+            # integer 0, `DEFAULT 0.0` stores real 0.0) -- so the kind is
+            # part of the shape. The INTEGER value is EXACT: a float
+            # would make 9007199254740992 and 9007199254740993 the same
+            # number (they differ by one ULP), and the proof would then
+            # accept a store whose required default is a different value.
+            # The proof's tolerance is kept: numbers normalize BY VALUE,
+            # so `007` and `7` still compare equal.
+            if "." in text or "e" in text or "E" in text:
+                try:
+                    out.append(("n", "r:%r" % float(text)))
+                except ValueError:
+                    out.append(("n", text))
+            else:
+                value = int(text)
+                if -(2 ** 63) <= value < 2 ** 63:
+                    out.append(("n", "i:%d" % value))
+                else:
+                    # SQLite's own rule: an integer literal that does NOT
+                    # fit in its signed 64-bit range is stored as a REAL,
+                    # so tagging it an integer would make the shape proof
+                    # compare a REAL against an integer token and refuse
+                    # a legitimate store.
+                    out.append(("n", "r:%r" % float(text)))
+        elif text[0].isalpha() or text[0] == "_":
+            out.append(("w", _ascii_lower(text)))
+        else:
+            out.append(("o", text))
+    return out
+
+
+def _shape_split_elements(tokens):
+    """Split a CREATE TABLE token stream at top-level commas.
+
+    Returns (column_elements, constraint_elements, options). The head (the
+    CREATE TABLE name part) and anything after the closing paren (the
+    WITHOUT ROWID / STRICT options) are handled here.
+    """
+    depth = 0
+    opened = False
+    parts, current = [], []
+    tail = []
+    in_tail = False
+    for tok in tokens:
+        if in_tail:
+            tail.append(tok)
+            continue
+        if tok == ("o", "(") and not opened:
+            opened, depth = True, 1
+            continue
+        if not opened:
+            continue  # the head (CREATE TABLE name)
+        if tok == ("o", "("):
+            depth += 1
+        elif tok == ("o", ")"):
+            depth -= 1
+            if depth == 0:
+                parts.append(current)
+                current = []
+                in_tail = True
+                continue
+        elif tok == ("o", ",") and depth == 1:
+            parts.append(current)
+            current = []
+            continue
+        current.append(tok)
+    columns, constraints = [], []
+    for part in parts:
+        if not part:
+            continue
+        head = part[0][1] if part[0][0] == "w" else ""
+        if head in ("constraint", "primary", "unique", "check", "foreign"):
+            constraints.append(tuple(part))
+        else:
+            columns.append(tuple(part))
+    return columns, constraints, tuple(tail)
+
+
+def _vtab_decl(sql):
+    return re.sub(r"float\[\d+\]", "float[dim]",
+                  re.sub(r"\s+", " ", sql or "").strip().lower())
+
+
+def _sqlite_column_names(staged, table):
+    """SQLite's own column-name list for `table` in the staged copy.
+
+    A single-quoted column KEY ('signal' TEXT) resolves to the identifier
+    signal — SQLite's semantics, not the scanner's (round 5 Important).
+    """
+    conn = sqlite3.connect(str(staged))
+    try:
+        return {row[1] for row in conn.execute(
+            'PRAGMA table_xinfo("%s")' % table.replace('"', '""'))}
+    finally:
+        conn.close()
+
+
+def _probe_word_for(content, tokenize):
+    """The first eligible search term of `content`, via SQLite's tokenizer.
+
+    A private :memory: fts5 table t (same tokenize argument as the fresh
+    memory_fts declaration) holds ONLY this row's content (the table is
+    DELETED first — an accumulating vocabulary can return an earlier row's
+    term, round 4 Critical 1); the first term of 4+ characters by offset,
+    read through fts5vocab, is the probe word. None when no term qualifies.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize=%s)" % tokenize)
+        conn.execute("CREATE VIRTUAL TABLE v USING fts5vocab(t, 'instance')")
+        conn.execute("DELETE FROM t")
+        conn.execute("INSERT INTO t(x) VALUES (?)", (content,))
+        row = conn.execute(
+            "SELECT term FROM v WHERE length(term) >= 4 ORDER BY offset LIMIT 1"
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def prove_required_shape(staged, fresh):
+    """The step 3(e) proof. Raises ShapeError with the precise reason.
+
+    `fresh` is a store built by the same code in a temporary directory; the
+    staged copy is compared with it object by object. A wrong definition
+    refuses; a damaged search index is healed by ONE rebuild and re-proven.
+    Returns {"rebuilt_index": bool, "probe_words": [...]}.
+    """
+    from schema_meta import SUPPORTED_SCHEMA_VERSION
+    from storelib import schema as _schema
+
+    def describe(path):
+        conn = sqlite3.connect(str(path))
+        try:
+            try:
+                _schema._load_vec(conn)
+            except Exception:
+                pass
+            objs, virtual, tables = {}, set(), {}
+            for typ, name, sql in conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master"):
+                objs[(typ, name)] = sql or ""
+                if typ == "table":
+                    if (sql or "").strip().lower().startswith("create virtual table"):
+                        virtual.add(name)
+                    else:
+                        tables[name] = sql or ""
+            stamp_row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            stamp = 0
+            if stamp_row:
+                try:
+                    stamp = int(stamp_row[0])
+                except (TypeError, ValueError):
+                    stamp = 0
+            rowids = [r[0] for r in conn.execute(
+                "SELECT rowid FROM memory ORDER BY rowid")]
+            docs = {r[0] for r in conn.execute("SELECT id FROM memory_fts_docsize")}
+        finally:
+            conn.close()
+        fts_decl = objs.get(("table", "memory_fts"), "")
+        m = re.search(r"tokenize='([^']+)'", fts_decl)
+        tokenize = m.group(1) if m else "unicode61"
+        return dict(objs=objs, virtual=virtual, tables=tables, stamp=stamp,
+                    rowids=rowids, docs=docs, tokenize=tokenize)
+
+    s, f = describe(staged), describe(fresh)
+    why = []
+
+    # 1. every fresh object exists by (type, name), autoindexes included.
+    for key in sorted(f["objs"]):
+        if key not in s["objs"]:
+            if key[1].startswith("sqlite_autoindex_"):
+                why.append("missing %s %s (the table's PRIMARY KEY or UNIQUE "
+                           "constraint is gone)" % key)
+            else:
+                why.append("missing %s %s" % key)
+
+    newer = s["stamp"] > SUPPORTED_SCHEMA_VERSION
+
+    # 2. every ordinary table element by element.
+    for table in sorted(f["tables"]):
+        if table not in s["tables"]:
+            why.append("table %s is missing" % table)
+            continue
+        try:
+            f_cols, f_cons, f_opts = _shape_split_elements(
+                _shape_tokens(f["tables"][table]))
+            s_cols, s_cons, s_opts = _shape_split_elements(
+                _shape_tokens(s["tables"][table]))
+        except ShapeError as exc:
+            why.append("table %s: %s" % (table, exc))
+            continue
+        f_by_name = {}
+        for elem in f_cols:
+            if not elem or elem[0][0] != "w":
+                why.append("table %s: unrecognizable column element" % table)
+                continue
+            f_by_name[elem[0][1]] = elem
+        # The table_xinfo cross-check: column KEYS are never trusted to the
+        # token stream alone (an ASCII tokenizer cannot see tainté / ſignal).
+        s_xinfo = _sqlite_column_names(staged, table)
+        s_by_name = {}
+        for elem in s_cols:
+            if not elem:
+                continue
+            key = elem[0][1] if elem[0][0] == "w" else None
+            if key is None and elem[0][0] == "s":
+                # single-quoted column KEY: SQLite resolves it to the
+                # identifier; find the xinfo name it belongs to.
+                inner = elem[0][1][1:-1].replace("''", "'")
+                key = inner if inner in s_xinfo else elem[0][1]
+            if key is None:
+                why.append("table %s: unrecognizable column element" % table)
+                continue
+            s_by_name[key] = elem
+        for name in sorted(f_by_name):
+            if name not in s_xinfo:
+                why.append("table %s: required column %s is missing "
+                           "(table_xinfo)" % (table, name))
+                continue
+            if not newer and name in s_by_name:
+                # Compare with the column KEY canonicalized to its name, so
+                # an equivalent spelling (a single-quoted key, which SQLite
+                # resolves to the identifier) is not a difference — while
+                # the REST of the element (type, NOT NULL, DEFAULT, ...)
+                # must match token for token.
+                s_elem = (("w", name),) + tuple(s_by_name[name][1:])
+                f_elem = (("w", name),) + tuple(f_by_name[name][1:])
+                if s_elem != f_elem:
+                    why.append("table %s: column %s is defined differently" % (table, name))
+        if not newer:
+            for name in sorted(s_xinfo):
+                if name not in f_by_name:
+                    why.append("table %s: extra column %s (stamp %d is at or "
+                               "below SUPPORTED)" % (table, name, s["stamp"]))
+            if sorted(f_cons) != sorted(s_cons):
+                why.append("table %s: the table constraints differ" % table)
+            if f_opts != s_opts:
+                why.append("table %s: the table options differ" % table)
+
+    # 3. the two virtual tables by declaration (dimension free).
+    fresh_vec = ("table", "memory_vec") in f["objs"]
+    staged_vec = ("table", "memory_vec") in s["objs"]
+    if fresh_vec and staged_vec:
+        if _vtab_decl(s["objs"][("table", "memory_vec")]) != _vtab_decl(
+                f["objs"][("table", "memory_vec")]):
+            why.append("virtual table memory_vec: declaration differs")
+    # memory_vec is compared only when the FRESH store has it (a client
+    # without sqlite-vec must not refuse every normal backup).
+    if ("table", "memory_fts") not in s["objs"]:
+        why.append("virtual table memory_fts is missing")
+    elif _vtab_decl(s["objs"][("table", "memory_fts")]) != _vtab_decl(
+            f["objs"][("table", "memory_fts")]):
+        why.append("virtual table memory_fts: declaration differs")
+
+    # 4. indexes and triggers token-equal; the three search triggers always.
+    for key in sorted(f["objs"]):
+        if key[0] not in ("index", "trigger") or key not in s["objs"]:
+            continue
+        if newer and key[1] not in _FTS_TRIGGERS:
+            continue
+        try:
+            if _shape_tokens(f["objs"][key]) != _shape_tokens(s["objs"][key]):
+                why.append("%s %s: the SQL differs" % key)
+        except ShapeError as exc:
+            why.append("%s %s: %s" % (key[0], key[1], exc))
+
+    # 5. extra indexes/triggers refuse at or below SUPPORTED.
+    if not newer:
+        for key in sorted(s["objs"]):
+            if key[0] in ("index", "trigger") and key not in f["objs"]:
+                if key[1].startswith("sqlite_autoindex_"):
+                    continue  # extra autoindex: a stronger table definition
+                why.append("extra %s %s (stamp %d is at or below SUPPORTED)"
+                           % (key[0], key[1], s["stamp"]))
+
+    if why:
+        raise ShapeError("; ".join(why[:6]) + ("; ..." if len(why) > 6 else ""))
+
+    # 6. the search index: heal derived data, prove it complete and usable.
+    rebuilt = False
+    probe_words = []
+    equal = s["docs"] == set(s["rowids"])
+    if equal:
+        conn = sqlite3.connect(str(staged))
+        try:
+            sample = (s["rowids"] if len(s["rowids"]) <= 256
+                      else s["rowids"][:128] + s["rowids"][-128:])
+            stale = False
+            for rowid in sample:
+                row = conn.execute(
+                    "SELECT content FROM memory WHERE rowid=?", (rowid,)).fetchone()
+                word = _probe_word_for(row[0] if row else "", s["tokenize"])
+                if not word:
+                    continue
+                probe_words.append(word)
+                hits = {r[0] for r in conn.execute(
+                    "SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?",
+                    ('"%s"' % word.replace('"', '""'),))}
+                if rowid not in hits:
+                    stale = True
+                    break
+        finally:
+            conn.close()
+        equal = not stale
+    if not equal:
+        conn = sqlite3.connect(str(staged))
+        try:
+            conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+            conn.commit()
+        finally:
+            conn.close()
+        rebuilt = True
+        conn = sqlite3.connect(str(staged))
+        try:
+            docs2 = {r[0] for r in conn.execute("SELECT id FROM memory_fts_docsize")}
+        finally:
+            conn.close()
+        if docs2 != set(s["rowids"]):
+            raise ShapeError("search index incomplete after rebuild "
+                             "(%d memory rowids, %d indexed)" % (
+                                 len(s["rowids"]), len(docs2)))
+    # The rolled-back round trip through the triggers.
+    conn = sqlite3.connect(str(staged))
+    conn.isolation_level = None
+    try:
+        token = "rtprobe" + uuid.uuid4().hex[:10]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "INSERT INTO memory (id, namespace, type, content, ingestion_ts) "
+                "VALUES (?, 'project:shape-probe', 'fact', ?, "
+                "'2026-11-25T00:00:00Z')", (token, "roundtrip " + token))
+            rowid = cur.lastrowid
+            found = {r[0] for r in conn.execute(
+                "SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?",
+                ('"%s"' % token,))}
+            if found != {rowid}:
+                raise ShapeError(
+                    "an inserted row is not indexed by the search triggers "
+                    "(found %r, expected %r)" % (sorted(found), [rowid]))
+            conn.execute("DELETE FROM memory WHERE id=?", (token,))
+            again = conn.execute(
+                "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH ?",
+                ('"%s"' % token,)).fetchone()[0]
+            if again:
+                raise ShapeError("a deleted row left %d index entries" % again)
+        finally:
+            conn.rollback()
+    except sqlite3.Error as exc:
+        raise ShapeError("round trip through the triggers failed: %s" % exc)
+    finally:
+        conn.close()
+    return {"rebuilt_index": rebuilt, "probe_words": probe_words[:5]}
+
+
+
+
+def _finish_failed_restore(*, dest, dest_exists, dest_nonempty,
+                           prerestore_path, stash_dir, forensic_dir,
+                           sidecars) -> int:
+    """Issue #504 step 9: roll back a restore that failed AFTER the swap.
+
+    Runs for ANY error after the swap (an exception in the success path, a
+    non-ok integrity result, or an exception raised by the swap call itself
+    once the staged file is gone — the replacement happened). The stashed
+    sidecars are never put back beside the re-installed file; the safety copy
+    is never consumed. Returns the process exit code (1).
+    """
+    if prerestore_path is not None:
+        try:
+            for p in sidecars:
+                if p.exists():
+                    p.unlink()
+            # F-017/F-020 (swarm-pr-review MS-001/MA-003): stage the rollback
+            # copy at a mkstemp name (never the predictable
+            # .restore-rollback- name a local actor could pre-plant), unlink
+            # it on any failure, and harden the re-installed store BEFORE
+            # the verification that may raise (a rollback whose verification
+            # fails must not leave the live store at umask-default mode).
+            fd_rb, rb_str = tempfile.mkstemp(
+                prefix=dest.name + ".restore-rollback-",
+                dir=str(dest.parent))
+            os.close(fd_rb)
+            stage_back = Path(rb_str)
+            try:
+                shutil.copyfile(prerestore_path, stage_back)
+                os.replace(stage_back, dest)
+            except BaseException:
+                if stage_back.exists():
+                    stage_back.unlink()
+                raise
+            if _host is not None:
+                try:
+                    _host.set_owner_only_perms(dest)
+                except OSError:
+                    pass  # hardening is best-effort on the rollback path
+            conn = sqlite3.connect(str(dest))
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                rb_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            finally:
+                conn.close()
+            if rb_integrity != "ok":
+                raise RuntimeError(
+                    f"re-installed pre-restore backup failed integrity_check: "
+                    f"{rb_integrity}")
+            print(f"[zmem] restore: rolled back: live store re-installed from the "
+                  f"pre-restore backup {_esc(prerestore_path)}", file=sys.stderr)
+        except Exception as rb:
+            print(f"[zmem] restore FAILED: automatic rollback also failed "
+                  f"({_esc(rb)}); the live store is NOT trustworthy",
+                  file=sys.stderr)
+            # F-002 (swarm-pr-review round 2, Stage-B review round 3):
+            # this line is a COPY-PASTE COMMAND, so the path must stay
+            # byte-exact -- escaping it here would print a path that does
+            # not exist and make the recovery command unusable. The path is
+            # shell-quoted, so it cannot inject a shell command either; and
+            # it is zmem's OWN backup file inside the operator's own backup
+            # directory, not an attacker-supplied snapshot value (every
+            # snapshot-derived string on this path IS escaped).
+            print(f"[zmem] restore: roll back by hand with "
+                  f"{command_prefix()} restore --from "
+                  f"{shlex.quote(str(prerestore_path))} --force",
+                  file=sys.stderr)
+            if forensic_dir is not None:
+                print(f"[zmem] restore: the files that were at the destination "
+                      f"before the restore are kept byte-for-byte in "
+                      f"{_esc(forensic_dir)}; do not copy them back beside the store "
+                      f"(inspect them only from a copy outside the store "
+                      f"directory)", file=sys.stderr)
+            return 1
+    else:
+        try:
+            # Missing or empty destination before the restore: the rollback
+            # target is that state. The INSTALLED file (and any sidecars the
+            # failed install created) go, whatever dest_exists was.
+            if dest.exists():
+                dest.unlink()
+            for p in sidecars:
+                if p.exists():
+                    p.unlink()
+            if dest_exists and not dest_nonempty:
+                dest.touch()
+                # F-005 (round-1 review comment): the re-created EMPTY
+                # destination is a file this restore writes, so it is
+                # hardened like every other one (best-effort: a filesystem
+                # that cannot harden must not break the rollback).
+                if _host is not None:
+                    try:
+                        _host.set_owner_only_perms(dest)
+                    except Exception:
+                        pass
+            # The rolled-back target state is destination-SPECIFIC: a
+            # destination that was missing must be missing again; one that
+            # was an empty file must exist and be 0 bytes again (the touch
+            # above recreated it). Checking bare existence would condemn
+            # every correctly-rolled-back empty destination (4.5 round-2
+            # finding F1: the ruled success line never printed).
+            for p in sidecars:
+                if p.exists():
+                    raise RuntimeError(f"{p.name} survived the rollback")
+            if dest.exists() != (dest_exists and not dest_nonempty):
+                raise RuntimeError(f"{dest.name} survived the rollback")
+            if dest.exists() and dest.stat().st_size != 0:
+                raise RuntimeError(f"{dest.name} is not empty again")
+            print("[zmem] restore: rolled back: destination was "
+                  "missing/empty before the restore and is again", file=sys.stderr)
+        except Exception as rb:
+            print(f"[zmem] restore FAILED: automatic rollback also failed "
+                  f"({_esc(rb)}); the live store is NOT trustworthy",
+                  file=sys.stderr)
+            if not dest_exists:
+                print(f"[zmem] restore: roll back by hand: delete {_esc(dest)} and any "
+                      f"{_esc(dest)}-wal, {_esc(dest)}-shm, {_esc(dest)}-journal beside it "
+                      f"(the destination store did not exist before the restore)",
+                      file=sys.stderr)
+            else:
+                print(f"[zmem] restore: roll back by hand: delete any {_esc(dest)}-wal, "
+                      f"{_esc(dest)}-shm, {_esc(dest)}-journal beside it, then replace "
+                      f"{_esc(dest)} with an empty 0-byte file (the destination store "
+                      f"was an empty file before the restore)", file=sys.stderr)
+            if forensic_dir is not None:
+                print(f"[zmem] restore: the files that were at the destination "
+                      f"before the restore are kept byte-for-byte in "
+                      f"{_esc(forensic_dir)}; do not copy them back beside the store "
+                      f"(inspect them only from a copy outside the store "
+                      f"directory)", file=sys.stderr)
+            return 1
+    # Remove the stash (ruling step 6: "Remove the stash"). The stashed
+    # sidecars are never put back beside the re-installed file — their bytes
+    # are in the forensic directory. A removal failure is reported, not
+    # silent: the restore still failed safely, so the exit code stays 1.
+    if stash_dir is not None and stash_dir.is_dir():
+        shutil.rmtree(stash_dir, ignore_errors=True)
+        if stash_dir.is_dir():
+            for leftover in sorted(p.name for p in stash_dir.iterdir()):
+                print(f"[zmem] restore: {_esc(leftover)} is set aside at "
+                      f"{_esc(stash_dir)}", file=sys.stderr)
+    return 1
+
+
+def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None = None) -> int:
+    """The restore body under the ruled order (issue #504, ASK-1 policy B).
+
+    Steps (the plan's `### #504`):
+      1. verify the snapshot (unchanged);
+      2. stage and prove the replacement on a PRIVATE copy — integrity,
+         identity, migrate via schema.connect_path, the REQUIRED SHAPE
+         proof; any failure refuses with the destination untouched;
+      3. rotate the incarnation on the staged copy;
+      4. forensic copy of the destination's file set (whenever any sidecar
+         is present);
+      5. safety copy from a PRIVATE working copy (only when the destination
+         is non-empty);
+      6. set sidecars aside by rename (reverse-order put-back on failure,
+         continuing past a failed put-back);
+      7. swap;
+      8. the success path (today's sequence: WAL, checkpoint, integrity,
+         row counts; owner permissions; the migration connection; the stash
+         removed);
+      9. ANY error after the swap rolls back (per destination state);
+     10. the ruled operator output.
+
+    Restore never refuses because of a sidecar, and the destination is never
+    opened through SQLite in place before the swap.
+    """
+    from storelib.generation import rotate_incarnation_on_staging
+    from storelib import schema as _schema
+    from schema_meta import SCHEMA_VERSION_KEY, SUPPORTED_SCHEMA_VERSION
+    from storelib.readonly import open_readonly, ReadOnlyStoreError
+
     snap = Path(from_path).expanduser()
     dest = STORE_PATH
 
     if not snap.is_file():
-        print(f"[zmem] restore FAILED: snapshot not found: {snap}", file=sys.stderr)
+        print(f"[zmem] restore FAILED: snapshot not found: {_esc(snap)}",
+              file=sys.stderr)
         return 1
 
     # --- 1. Verify the snapshot BEFORE touching the destination at all. ---
     try:
         snap_integrity = _integrity_check_readonly(snap)
     except Exception as e:
-        print(f"[zmem] restore FAILED: cannot read snapshot {snap} read-only: {e}",
+        print(f"[zmem] restore FAILED: cannot read snapshot {_esc(snap)} "
+              f"read-only: {_esc(e)}",
               file=sys.stderr)
         print("[zmem] restore: (a snapshot with a hot -wal sidecar must be "
               "checkpointed before it can be restored)", file=sys.stderr)
         return 1
     if snap_integrity != "ok":
-        print(f"[zmem] restore FAILED: snapshot integrity_check={snap_integrity} "
+        print(f"[zmem] restore FAILED: snapshot integrity_check={_esc(snap_integrity)} "
               f"- destination untouched", file=sys.stderr)
         return 1
-    print(f"[zmem] restore: source snapshot {snap}")
-    print(f"[zmem] restore: snapshot integrity_check={snap_integrity}")
+    print(f"[zmem] restore: source snapshot {_esc(snap)}")
+    print(f"[zmem] restore: snapshot integrity_check={_esc(snap_integrity)}")
 
     dest_exists = dest.exists()
+    dest_nonempty = dest_exists and dest.stat().st_size > 0
     if dest_exists and not force:
-        print(f"[zmem] restore FAILED: destination store already exists: {dest}\n"
+        print(f"[zmem] restore FAILED: destination store already exists: "
+              f"{_esc(dest)}\n"
               f"       pass --force to overwrite it (a pre-restore backup of the "
               f"current store is taken automatically).", file=sys.stderr)
         return 1
 
-    # --- 2. Pre-restore safety copy of the CURRENT store, before any sidecar
-    # removal so its WAL frames are still part of the online-backup snapshot. ---
-    prerestore_path = None
-    if dest_exists and dest.stat().st_size > 0:
+    # --- 2. Stage and PROVE the replacement (destination untouched). ---
+    sidecars = [Path(str(dest) + sfx) for sfx in SIDECAR_SUFFIXES]
+    present = [p for p in sidecars if p.exists()]
+    stash_dir: Path | None = None
+    staged: Path | None = None
+    forensic_dir: Path | None = None
+    prerestore_path: Path | None = None
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # F-004 (round-1 review comment) + the closeout reviewer's round 24:
+        # the staged copy is CREATED inside the guarded block as well as
+        # copied there, so an OSError in the creation (an unwritable
+        # directory, a failed descriptor close) takes the same controlled
+        # path as a failed validation -- a ruled message and the staged
+        # file removed -- instead of escaping as a raw traceback and
+        # leaving a .restore-stage-* file behind UNREPORTED.
+        fd_stage, stage_str = tempfile.mkstemp(
+            prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
+        staged = Path(stage_str)
+        # a FAILED close is a real failure: it takes the same controlled
+        # path as every other failure in this block (the guard's cleanup
+        # removes the staged file and the ruled message is printed). A
+        # close that failed means the descriptor was already closed, so
+        # the file CAN be removed.
+        os.close(fd_stage)
+        shutil.copy2(snap, staged)
+        # A hand-supplied snapshot may carry its own sidecars: recover them on
+        # the STAGED copy, never beside the live file.
+        for sfx in ("-wal", "-shm", "-journal"):
+            src_sib = Path(str(snap) + sfx)
+            if src_sib.exists():
+                shutil.copy2(src_sib, Path(str(staged) + sfx))
+                print(f"[zmem] restore: recovered snapshot {_esc(src_sib.name)} "
+                      f"onto the staged copy")
+        conn = sqlite3.connect(str(staged))
         try:
-            backup_dir = _ensure_backup_dir(out_dir)
-            # Prefix is outside SNAPSHOT_GLOB on purpose — automatic rotation
-            # must never prune the copy this restore's rollback depends on.
+            staged_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            conn.close()
+        if staged_integrity != "ok":
+            raise RuntimeError(f"integrity_check={staged_integrity}")
+        # identity: tables memory and meta; the 14 v1 columns; a positive stamp.
+        conn = sqlite3.connect(str(staged))
+        try:
+            names = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "memory" not in names or "meta" not in names:
+                raise RuntimeError("not a zmem store (no memory/meta tables)")
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(memory)")}
+            v1 = ("id", "namespace", "type", "content", "tags", "source_ref",
+                  "source_hash", "confidence", "signal", "valid_from",
+                  "superseded_at", "ingestion_ts", "retrieval_count",
+                  "last_retrieved")
+            missing = [c for c in v1 if c not in cols]
+            if missing:
+                raise RuntimeError(
+                    "memory lacks the v1 columns: %s" % ", ".join(missing))
+            stamp_row = conn.execute(
+                "SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)).fetchone()
+            if not stamp_row:
+                raise RuntimeError("no schema_version row")
+            staged_stamp_before = int(stamp_row[0])
+            if staged_stamp_before <= 0:
+                raise RuntimeError(f"schema_version={staged_stamp_before}")
+        finally:
+            conn.close()
+        # bring the staged copy to the running schema, then prove its shape
+        mconn = _schema.connect_path(staged)
+        try:
+            _schema.init_db(mconn)
+            _schema.migrate(mconn)
+            staged_stamp = mconn.execute(
+                "SELECT value FROM meta WHERE key=?", (SCHEMA_VERSION_KEY,)).fetchone()
+            staged_stamp = int(staged_stamp[0]) if staged_stamp else 0
+            staged_counts = _row_counts(mconn)
+        finally:
+            mconn.close()
+        fresh_dir = tempfile.mkdtemp(prefix="zmem-restore-fresh-")
+        fresh_path = Path(fresh_dir) / "fresh.sqlite"
+        try:
+            fconn = _schema.connect_path(fresh_path)
+            try:
+                _schema.init_db(fconn)
+                _schema.migrate(fconn)
+            finally:
+                fconn.close()
+            shape_info = prove_required_shape(staged, fresh_path)
+        finally:
+            shutil.rmtree(fresh_dir, ignore_errors=True)
+        for sfx in SIDECAR_SUFFIXES:
+            p = Path(str(staged) + sfx)
+            if p.exists():
+                p.unlink()
+    except Exception as e:
+        # the staged file may never have been CREATED (the creation is
+        # inside this guard now), so the cleanup skips it then
+        survivors = []
+        if staged is not None:
+            for p in ([staged]
+                      + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+                if p.exists():
+                    survivors.append(p)
+        # R1-F-004: the removal itself can fail (an AV lock, a Windows
+        # file lock), and the staged copy holds PLAINTEXT store bytes --
+        # a survivor must be REPORTED, never silently left behind (the
+        # same discipline the private working copy gets).
+        for p in survivors:
+            print(f"[zmem] restore FAILED: the staged copy {_esc(str(p))} "
+                  "SURVIVED its cleanup and still holds plaintext store "
+                  "bytes - remove it by hand", file=sys.stderr)
+        print(f"[zmem] restore FAILED: the staged copy could not be validated "
+              f"({_esc(e)}) - destination untouched", file=sys.stderr)
+        return 1
+
+    # --- 3+4. Rotate the incarnation on the staged copy and take the
+    # forensic copy — guarded like every neighbouring step (F-004,
+    # swarm-pr-review RP-003/CS-002/MA-004): a failure here (an unusable
+    # --out-dir/ZMEM_BACKUP_DIR, an unwritable backup tree, an AV-locked
+    # forensic target, an OSError from the rotation) must print a ruled
+    # ABORTED line, clean the staged copy, and leave the destination
+    # untouched — never a raw traceback with a leaked full-store stage.
+    # The backup dir is only needed when there is something to preserve
+    # (sidecars to set aside, or a non-empty destination to back up), so a
+    # first-time disaster-recovery restore into an empty location must not
+    # fail on an unusable ZMEM_BACKUP_DIR at all (the round-2 critic's
+    # second regression). ---
+    try:
+        rotate_incarnation_on_staging(staged)
+        backup_dir = (
+            _ensure_backup_dir(out_dir) if (present or dest_nonempty) else None)
+        if present:
+            forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}"
+            n = 1
+            while forensic_dir.exists():
+                forensic_dir = backup_dir / f"restore-forensic-{_snapshot_stamp()}-{n}"
+                n += 1
+            forensic_dir.mkdir(parents=True)
+            if _host is not None:
+                # F-005 (round-1 review comment): harden the forensic dir
+                # BEFORE the pre-restore copies land in it -- those bytes
+                # must never exist with default permissions.
+                _host.set_owner_only_perms(forensic_dir)
+            for p in [dest] + present:
+                if p.exists():
+                    shutil.copy2(p, forensic_dir / p.name)
+    except Exception as e:
+        print(f"[zmem] restore ABORTED: preparation failed ({_esc(e)}) — "
+              f"destination untouched", file=sys.stderr)
+        survivors = []
+        for p in ([staged]
+                  + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+            if p.exists():
+                survivors.append(p)
+        # the staged copy holds PLAINTEXT store bytes: a survivor must be
+        # REPORTED, never silently left behind
+        for p in survivors:
+            print(f"[zmem] restore FAILED: the staged copy "
+                  f"{_esc(str(p))} SURVIVED its cleanup and still "
+                  "holds plaintext store bytes - remove it by hand",
+                  file=sys.stderr)
+        return 1
+
+    # --- 5. Safety copy from a PRIVATE working copy (non-empty destination). ---
+    if dest_nonempty:
+        work_dir = None
+        try:
+            work_dir = backup_dir / f"restore-work-{_snapshot_stamp()}"
+            n = 1
+            while work_dir.exists():
+                work_dir = backup_dir / f"restore-work-{_snapshot_stamp()}-{n}"
+                n += 1
+            work_dir.mkdir(parents=True)
+            # F-005 (swarm-pr-review round 2): the forensic dir is
+            # owner-only hardened; the work dir holds a byte copy of the
+            # LIVE store, so it must be too -- otherwise the guarantee
+            # depends on how backup_dir happened to be created (a
+            # pre-existing, operator-supplied --out-dir is not hardened
+            # by _ensure_backup_dir). Best-effort: a filesystem that
+            # cannot harden must not break the restore, and the safety
+            # copy itself is the priority.
+            if _host is not None:
+                try:
+                    _host.set_owner_only_perms(work_dir)
+                except Exception:
+                    pass
+            working_main = work_dir / dest.name
+            shutil.copyfile(dest, working_main)
+            for sfx in ("-wal", "-journal"):     # never -shm
+                src = Path(str(dest) + sfx)
+                if src.exists():
+                    shutil.copyfile(src, Path(str(working_main) + sfx))
             pre_dest = _new_snapshot_path(backup_dir, PRERESTORE_PREFIX)
-            pre_info = create_snapshot(dest, pre_dest)
-            prerestore_path = pre_info["path"]
-            print(f"[zmem] restore: pre-restore backup {prerestore_path} "
-                  f"(integrity_check={pre_info['integrity_check']}, "
+            pre_info = create_snapshot(working_main, pre_dest)
+            prerestore_path = Path(pre_info["path"])
+            shutil.rmtree(work_dir, ignore_errors=True)
+            _report_surviving_work_dir(work_dir)
+            print(f"[zmem] restore: pre-restore backup {_esc(prerestore_path)} "
+                  f"(integrity_check={_esc(pre_info['integrity_check'])}, "
                   f"total={pre_info['snapshot_total']} live={pre_info['snapshot_live']})")
         except Exception as e:
-            print(f"[zmem] restore ABORTED: pre-restore backup of the current store "
-                  f"failed ({e}) — refusing to overwrite the only copy of it.",
-                  file=sys.stderr)
+            print(f"[zmem] restore ABORTED: the pre-restore backup of the "
+                  f"current store, or the report of a surviving working copy, "
+                  f"failed ({_esc(e)}) — refusing to overwrite the only copy "
+                  f"of it.", file=sys.stderr)
+            # F-004/MA-001: the private working copy must not survive a
+            # failed safety copy (it holds plaintext store + WAL bytes).
+            # The staged copy holds the snapshot -- plaintext store bytes --
+            # so its cleanup runs even when the survivor report raises. The
+            # report's failure still propagates: it is never converted into
+            # a success.
+            try:
+                if work_dir is not None:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    _report_surviving_work_dir(work_dir)
+            finally:
+                survivors = []
+                for p in ([staged]
+                          + [Path(str(staged) + sfx)
+                             for sfx in SIDECAR_SUFFIXES]):
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except OSError:
+                        pass
+                    if p.exists():
+                        survivors.append(p)
+                # the staged copy holds PLAINTEXT store bytes: a survivor
+                # must be REPORTED, never silently left behind
+                for p in survivors:
+                    print(f"[zmem] restore FAILED: the staged copy "
+                          f"{_esc(str(p))} SURVIVED its cleanup and still "
+                          "holds plaintext store bytes - remove it by hand",
+                          file=sys.stderr)
             return 1
     elif dest_exists:
         print("[zmem] restore: pre-restore backup skipped - destination store is "
-              "an empty file (nothing to preserve)")
+              "an empty file (no store content needed preserving; any sidecar "
+              "bytes were kept in the forensic copy)")
     else:
         print("[zmem] restore: pre-restore backup skipped - destination store "
               "does not exist yet")
 
-    # --- 3. Clear stale sidecars, then copy. Old `-wal` frames (and any hot
-    # `-journal`) belong to the PREVIOUS store; leaving them next to a restored
-    # main file would let SQLite replay them onto it. ---
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in SIDECAR_SUFFIXES:
-        sib = Path(str(dest) + suffix)
-        try:
-            if sib.exists():
-                sib.unlink()
-                print(f"[zmem] restore: removed stale {sib.name}")
-        except OSError as e:
-            print(f"[zmem] restore FAILED: could not remove stale {sib.name}: {e}",
+    # --- 6. Set the sidecars aside by rename; reverse-order put-back on any
+    # failure before the swap, continuing past a failed put-back. ---
+    moved: list[Path] = []
+    putback_failed = False
+    try:
+        if present:
+            stash_dir = dest.parent / f"{dest.name}.restore-stash-{uuid.uuid4().hex[:8]}"
+            stash_dir.mkdir()
+            for p in present:
+                p.rename(stash_dir / p.name)
+                moved.append(p)
+                print(f"[zmem] restore: removed stale {_esc(p.name)} from beside the store "
+                      f"(set aside; byte copy kept in {_esc(forensic_dir)})")
+
+        # --- 7. Swap. ---
+        os.replace(staged, dest)
+        staged = None
+    except Exception as e:
+        # The plan's step 8: a raising swap is treated as DONE when the
+        # staged file is gone (the replacement happened and the failure is a
+        # post-swap one -> the rollback of step 9 handles it); when the
+        # staged file never moved it is a pre-swap failure (put back, refuse).
+        swap_done = staged is None or not staged.exists()
+        cause = str(e) or type(e).__name__
+        if swap_done:
+            # Fall through to the step-9 rollback machinery via the same
+            # path the success-path failures take.
+            print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
+            staged = None
+            return _finish_failed_restore(
+                dest=dest, dest_exists=dest_exists, dest_nonempty=dest_nonempty,
+                prerestore_path=prerestore_path, stash_dir=stash_dir,
+                forensic_dir=forensic_dir, sidecars=sidecars)
+        # the staged copy is never left on a failure path -- and if the
+        # removal ITSELF fails, the survivor is REPORTED (it holds the
+        # snapshot, i.e. plaintext store bytes), like on every other
+        # failure path
+        survivors = []
+        for p in ([staged]
+                  + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+            if p.exists():
+                survivors.append(p)
+        for p in survivors:
+            print(f"[zmem] restore FAILED: the staged copy "
+                  f"{_esc(str(p))} SURVIVED its cleanup and still "
+                  "holds plaintext store bytes - remove it by hand",
                   file=sys.stderr)
-            # Sidecar removal is partial at this point, so the destination may
-            # already be inconsistent — the user needs the rollback path, same
-            # as every other post-pre-restore-backup failure branch below.
-            if prerestore_path:
-                print(f"[zmem] restore: roll back with "
-                      f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
+        if moved:
+            for p in reversed(moved):
+                try:
+                    (stash_dir / p.name).rename(p)
+                except OSError:
+                    putback_failed = True
+        if putback_failed:
+            leftovers = sorted(p.name for p in stash_dir.iterdir()) if stash_dir and stash_dir.is_dir() else []
+            print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
+            for name in leftovers:
+                print(f"[zmem] restore: {_esc(name)} is set aside at "
+                      f"{_esc(stash_dir)}", file=sys.stderr)
+            if forensic_dir is not None:
+                print(f"[zmem] restore: byte copies of the files from before the restore "
+                      f"are kept in {_esc(forensic_dir)}", file=sys.stderr)
+            # F-007: the ordering is deliberately fail-closed -- the
+            # pre-restore backup is NOT re-installed automatically -- so
+            # the operator must be told how to re-install it BY HAND.
+            # The path is a copy-paste command and stays byte-exact, as
+            # in the automatic-rollback failure branch above.
+            if prerestore_path is not None:
+                print(f"[zmem] restore: roll back by hand with "
+                      f"{command_prefix()} restore --from "
+                      f"{shlex.quote(str(prerestore_path))} --force",
+                      file=sys.stderr)
             return 1
-
-    try:
-        # Issue #474 (R2-1): stage the snapshot, rotate the store INCARNATION
-        # on the staged copy, then atomically install it. The destination
-        # never exists on disk carrying the snapshot's stale incarnation, so
-        # reuse identities cached against the previous store incarnation can
-        # never alias the restored store; a crash before the install leaves
-        # the old destination (and its cached identities) intact.
-        fd_stage, stage_str = tempfile.mkstemp(
-            prefix=dest.name + ".restore-stage-", dir=str(dest.parent))
-        os.close(fd_stage)
-        staged_restore = Path(stage_str)
-        shutil.copy2(snap, staged_restore)
-        from storelib.generation import rotate_incarnation_on_staging
-        rotate_incarnation_on_staging(staged_restore)
-        os.replace(staged_restore, dest)
-        # A hand-supplied snapshot may carry its own sidecars; ours never do.
-        for suffix in ("-wal", "-shm"):
-            src_sib = Path(str(snap) + suffix)
-            if src_sib.exists():
-                shutil.copy2(src_sib, Path(str(dest) + suffix))
-                print(f"[zmem] restore: copied snapshot {src_sib.name}")
-    except OSError as e:
-        print(f"[zmem] restore FAILED: copy failed: {e}", file=sys.stderr)
-        # The copy may have been partial, so the destination store is not
-        # trustworthy — point at the safety copy taken in step 2.
-        if prerestore_path:
-            print(f"[zmem] restore: roll back with "
-                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
+        print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
+        if stash_dir is not None and stash_dir.is_dir() and not any(stash_dir.iterdir()):
+            stash_dir.rmdir()
         return 1
 
-    # --- 4. Post-copy verification on the restored destination. ---
+    # --- 8. The success path (today's sequence, unchanged in statements). ---
     try:
-        conn = sqlite3.connect(str(dest))
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            post_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-            total, live = _row_counts(conn)
-        finally:
-            conn.close()
-    except Exception as e:
-        print(f"[zmem] restore FAILED: restored store could not be verified: {e}",
-              file=sys.stderr)
-        if prerestore_path:
-            print(f"[zmem] restore: roll back with "
-                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
-        return 1
-
-    if _host is not None:
-        _host.set_owner_only_perms(dest)
-
-    # Final-critic finding 3: refuse a failed post-copy integrity check
-    # BEFORE any migration work — never write migrations into a file
-    # already known to be bad, and keep the real cause (the integrity
-    # verdict) ahead of any migrate failure text.
-    if post_integrity != "ok":
-        print(f"[zmem] restore: destination {dest}")
-        print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
-        print(f"[zmem] restore FAILED: post-restore integrity_check={post_integrity}",
-              file=sys.stderr)
-        if prerestore_path:
-            print(f"[zmem] restore: roll back with "
-                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
-        return 1
-
-    # --- 5. Reach the current client's migrated shape (issue #493 AC1).
-    # The deliberate Windows file-handle bypass above means the restore
-    # path never runs main()'s connect()/init_db()/migrate(); without this
-    # step a snapshot whose schema predates the current client leaves the
-    # destination at the OLD shape until some LATER open migrates it. Every
-    # prior connection is closed, so this fresh open cannot hold a handle
-    # against the overwrite. The full production open sequence runs
-    # (init_db THEN migrate — init_db owns baseline indexes migrate never
-    # creates); _prepare_store is NOT used because cmd_restore already
-    # holds the schema/maintenance locks for this whole body. A snapshot
-    # NEWER than this client never reaches here (the pre-copy schema
-    # preflight refused it above with the destination untouched).
-    # Review-finding 1: this MUST be the LAST database action on the
-    # destination — the version is read INSIDE the migration connection
-    # and that read-write close checkpoints the WAL, so no read-only
-    # follow-up probe can leave orphan -wal/-shm sidecars at a freshly
-    # restored store (the stale-sidecar contracts in tests/test_backup.py
-    # pin exactly that). ---
-    try:
-        from storelib import schema as _schema
-        from schema_meta import SCHEMA_VERSION_KEY
-        mconn = _schema.connect()
+            conn = sqlite3.connect(str(dest))
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                post_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                total, live = _row_counts(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            raise RuntimeError(f"restored store could not be verified: {e}")
+        if staged_counts is not None and (total, live) != staged_counts:
+            raise RuntimeError(
+                f"restored row counts differ from the validated copy "
+                f"(installed total={total} live={live}; validated "
+                f"total={staged_counts[0]} live={staged_counts[1]})")
+        if _host is not None:
+            try:
+                _host.set_owner_only_perms(dest)
+            except Exception as e:
+                raise RuntimeError(
+                    f"could not set owner-only permissions on {dest}: {e}")
+        if post_integrity != "ok":
+            print(f"[zmem] restore: destination {_esc(dest)}")
+            print(f"[zmem] restore: post-restore integrity_check={_esc(post_integrity)}")
+            raise RuntimeError(f"post-restore integrity_check={post_integrity}")
         try:
-            _schema.init_db(mconn)
-            _schema.migrate(mconn)
-            migrated_ver = mconn.execute(
-                "SELECT value FROM meta WHERE key=?",
-                (SCHEMA_VERSION_KEY,)).fetchone()
-            migrated_ver = migrated_ver[0] if migrated_ver else "?"
-            _schema._commit(mconn)
-        finally:
-            mconn.close()
+            mconn = _schema.connect()
+            try:
+                _schema.init_db(mconn)
+                _schema.migrate(mconn)
+                migrated_ver = mconn.execute(
+                    "SELECT value FROM meta WHERE key=?",
+                    (SCHEMA_VERSION_KEY,)).fetchone()
+                migrated_ver = migrated_ver[0] if migrated_ver else "?"
+                _schema._commit(mconn)
+            finally:
+                mconn.close()
+        except Exception as e:
+            raise RuntimeError(f"post-restore open/migrate failed: {e}")
     except Exception as e:
-        print(f"[zmem] restore FAILED: post-restore open/migrate failed: {e}",
-              file=sys.stderr)
-        if prerestore_path:
-            print(f"[zmem] restore: roll back with "
-                  f"{command_prefix()} restore --from {shlex.quote(str(prerestore_path))} --force", file=sys.stderr)
-        return 1
+        # --- 9. ANY error after the swap rolls back. ---
+        print(f"[zmem] restore FAILED: {_esc(e)}", file=sys.stderr)
+        return _finish_failed_restore(
+            dest=dest, dest_exists=dest_exists, dest_nonempty=dest_nonempty,
+            prerestore_path=prerestore_path, stash_dir=stash_dir,
+            forensic_dir=forensic_dir, sidecars=sidecars)
 
-    print(f"[zmem] restore: destination {dest}")
-    print(f"[zmem] restore: post-restore integrity_check={post_integrity}")
+    # --- 10. Success output. ---
+    if stash_dir is not None and stash_dir.is_dir():
+        # Ruling step 8: "the stash removed" — on SUCCESS the stashed
+        # sidecars' bytes are already preserved in the forensic directory,
+        # so the whole stash tree goes (a bare rmdir would never fire: the
+        # moved files are still inside it). A removal failure is reported.
+        shutil.rmtree(stash_dir, ignore_errors=True)
+        if stash_dir.is_dir():
+            for leftover in sorted(p.name for p in stash_dir.iterdir()):
+                print(f"[zmem] restore: {_esc(leftover)} is set aside at "
+                      f"{_esc(stash_dir)}", file=sys.stderr)
+    print(f"[zmem] restore: destination {_esc(dest)}")
+    print(f"[zmem] restore: post-restore integrity_check={_esc(post_integrity)}")
     print(f"[zmem] restore: restored rows total={total} live={live}")
-    print(f"[zmem] restore: migrated shape schema_version={migrated_ver}")
+    print(f"[zmem] restore: migrated shape schema_version={_esc(migrated_ver)}")
+    if prerestore_path is not None:
+        if forensic_dir is not None:
+            print(f"[zmem] restore: sidecars and main file kept byte-for-byte in "
+                  f"{_esc(forensic_dir)}; the pre-restore backup "
+                  f"{_esc(prerestore_path)} is the store as SQLite read it, "
+                  f"including committed -wal frames")
+    else:
+        if forensic_dir is not None:
+            if dest_exists:
+                print(f"[zmem] restore: the files that were at the destination before "
+                      f"the restore are kept byte-for-byte in {_esc(forensic_dir)}; no "
+                      f"pre-restore backup exists because the destination store was "
+                      f"an empty file")
+            else:
+                print(f"[zmem] restore: the files that were at the destination before "
+                      f"the restore are kept byte-for-byte in {_esc(forensic_dir)}; no "
+                      f"pre-restore backup exists because the destination store did "
+                      f"not exist")
+    if shape_info.get("rebuilt_index"):
+        print("[zmem] restore: the staged copy's search index was rebuilt before "
+              "installing (its derived data was stale)")
     print("[zmem] restore: OK")
     return 0
