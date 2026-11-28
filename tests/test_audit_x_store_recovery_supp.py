@@ -1108,6 +1108,49 @@ class RestoreFaultMatrixTest(_InProcessRestoreBase):
         self._no_leftovers()
 
 
+class SwapSharingViolationTest(_InProcessRestoreBase):
+    """F-006: a failed replacement must take the pre-swap failure path.
+
+    The swap infers its success from the staged file's disappearance.
+    That inference is only safe if a FAILED `os.replace` leaves the
+    staged file in place -- which is what this leg CAPTURES rather than
+    assumes: on Windows an open handle carries no FILE_SHARE_DELETE, so
+    replacing an open destination fails with a sharing violation.
+    """
+
+    def test_a_locked_destination_takes_the_pre_swap_failure_path(self):
+        self._add("swap sharing victim")
+        snap = self._snapshot(self.dir, self.store)
+        before = self._live_rows()
+        self.assertTrue(before, "the destination has no rows to protect")
+
+        # hold the destination open: os.replace over it fails on Windows
+        held = open(str(self.store), "rb")
+        self.addCleanup(held.close)
+        try:
+            result = self._run(snap)
+        finally:
+            held.close()
+
+        self.assertNotEqual(result["rc"], 0,
+                            "a restore whose replacement failed reported "
+                            "success: %r" % (result,))
+        self.assertTrue(
+            result["raised"] is not None or "restore FAILED" in result["err"],
+            "the failed replacement was not reported as a failure: %r"
+            % (result,))
+        after = self._live_rows()
+        self.assertEqual(
+            after, before,
+            "the destination was replaced even though the replacement "
+            "failed: before %r, after %r" % (sorted(before), sorted(after)))
+        staged = [p.name for p in self.dir.iterdir()
+                  if ".restore-stage-" in p.name]
+        self.assertEqual(staged, [],
+                         "the staged copy survived the failed swap: %r"
+                         % (staged,))
+
+
 class StashRemovalTest(_InProcessRestoreBase):
     """A stash that cannot be removed on the SUCCESS path is reported, and
     the restore still succeeds (plan: 'the fault matrix beyond the frozen
