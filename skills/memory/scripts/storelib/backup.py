@@ -1911,6 +1911,7 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
     except Exception as e:
         # the staged file may never have been CREATED (the creation is
         # inside this guard now), so the cleanup skips it then
+        survivors = []
         if staged is not None:
             for p in ([staged]
                       + [Path(str(staged) + sfx) for sfx in SIDECAR_SUFFIXES]):
@@ -1919,6 +1920,16 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
                         p.unlink()
                 except OSError:
                     pass
+                if p.exists():
+                    survivors.append(p)
+        # R1-F-004: the removal itself can fail (an AV lock, a Windows
+        # file lock), and the staged copy holds PLAINTEXT store bytes --
+        # a survivor must be REPORTED, never silently left behind (the
+        # same discipline the private working copy gets).
+        for p in survivors:
+            print(f"[zmem] restore FAILED: the staged copy {_esc(str(p))} "
+                  "SURVIVED its cleanup and still holds plaintext store "
+                  "bytes - remove it by hand", file=sys.stderr)
         print(f"[zmem] restore FAILED: the staged copy could not be validated "
               f"({_esc(e)}) - destination untouched", file=sys.stderr)
         return 1

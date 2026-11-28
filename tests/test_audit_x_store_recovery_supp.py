@@ -337,6 +337,13 @@ class ImpostorMemoryTest(SuppBase):
                 "CREATE TABLE memory (id TEXT PRIMARY KEY, content TEXT); "
                 "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); "
                 "INSERT INTO meta VALUES ('schema_version', '19')")
+            # TG-3(b) (the closeout reviewer's round 32): a fixture whose
+            # tables hold NO rows makes the stored-row comparison VACUOUS,
+            # so representative rows are seeded in BOTH tables.
+            conn.execute("INSERT INTO memory (id, content) VALUES (?, ?)",
+                         ("impostor-row", "impostor content"))
+            conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)",
+                         ("other_key", "other value"))
             conn.commit()
             # TG-3(b) (the closeout reviewer's round 25): comparing only
             # the table names and the memory table's column names cannot
@@ -346,7 +353,8 @@ class ImpostorMemoryTest(SuppBase):
                 "SELECT type, name, tbl_name, sql FROM sqlite_master "
                 "ORDER BY type, name"))
             cols_before = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
-            rows_before = list(conn.execute("SELECT * FROM memory"))
+            rows_before = (list(conn.execute("SELECT * FROM memory")),
+                           list(conn.execute("SELECT * FROM meta")))
         finally:
             conn.close()
         import storelib.schema as schema_mod
@@ -357,7 +365,8 @@ class ImpostorMemoryTest(SuppBase):
                 "SELECT type, name, tbl_name, sql FROM sqlite_master "
                 "ORDER BY type, name"))
             cols_after = [r[1] for r in conn.execute("PRAGMA table_info(memory)")]
-            rows_after = list(conn.execute("SELECT * FROM memory"))
+            rows_after = (list(conn.execute("SELECT * FROM memory")),
+                          list(conn.execute("SELECT * FROM meta")))
         finally:
             conn.close()
         self.assertEqual(after, before,

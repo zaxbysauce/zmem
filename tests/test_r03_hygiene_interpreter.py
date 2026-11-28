@@ -154,6 +154,22 @@ def _is_operator_instruction(text: str) -> bool:
         match.group("exec"))
 
 
+_CMD_OCCURRENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:restore|backup|doctor|reindex|reembed|import-store"
+    r"|export|list|recall|consolidate)\s+--[a-z]")
+
+
+def _command_occurrences(text: str) -> int:
+    """How many commands the literal renders.
+
+    TG-2 (the closeout reviewer): a literal can carry TWO commands -- the
+    first one is rendered through `command_prefix()`, the second one is
+    not, and an operator who copies it runs a bare command. So a literal
+    that is itself an instruction must carry exactly ONE command.
+    """
+    return len(_CMD_OCCURRENCE_RE.findall(text))
+
+
 def _unprefixed_hint_literals(tree):
     """The operator command literals in `tree` that are NOT rendered
     through `command_prefix()`.
@@ -174,10 +190,16 @@ def _unprefixed_hint_literals(tree):
             if not _is_operator_instruction(part.value):
                 continue
             prev = values[idx - 1] if idx > 0 else None
-            if not (isinstance(prev, ast.FormattedValue)
-                    and isinstance(prev.value, ast.Call)
-                    and isinstance(prev.value.func, ast.Name)
-                    and prev.value.func.id == "command_prefix"):
+            prefixed = (isinstance(prev, ast.FormattedValue)
+                        and isinstance(prev.value, ast.Call)
+                        and isinstance(prev.value.func, ast.Name)
+                        and prev.value.func.id == "command_prefix")
+            if not prefixed:
+                bad.append(part.value)
+                continue
+            # a literal that renders TWO commands gives the second one the
+            # first one's prefix -- so it is a bare hint too
+            if _command_occurrences(part.value) > 1:
                 bad.append(part.value)
     return bad
 
@@ -210,6 +232,13 @@ class OperatorHintDetectorTest(unittest.TestCase):
         bad = _unprefixed_hint_literals(tree)
         self.assertEqual(len(bad), 1, bad)
         self.assertIn("doctor --json", bad[0])
+        # and the same shape with BOTH commands in ONE literal
+        tree2 = ast.parse(
+            'hint = f"{command_prefix()} restore --from store.sqlite '
+            'doctor --json"\n')
+        bad2 = _unprefixed_hint_literals(tree2)
+        self.assertEqual(len(bad2), 1, bad2)
+        self.assertIn("doctor --json", bad2[0])
 
     def test_leaves_prose_alone(self):
         prose = ('note = "For diagnostics, see doctor --json in the manual"\n'
