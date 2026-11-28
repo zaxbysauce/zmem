@@ -1343,11 +1343,13 @@ def repair_from_evidence(
 
         from schema_meta import normalize_content  # the store's own normalizer
         from storelib.generation import bump_mutation_generation
+        from storelib.schema import _clear_content_norm_dirty
         now = _revision_now()
         conn.execute(
             "UPDATE memory SET content=?, content_norm=?, embedding=NULL, "
             "embedding_model=NULL, embedded_at=NULL WHERE id=?",
             (new_content, normalize_content(new_content), memory_id))
+        _clear_content_norm_dirty(conn, memory_id)
         _clear_vec_row(conn, memory_id)
         bump_mutation_generation(conn)
         # Accumulating provenance record (one row can need several

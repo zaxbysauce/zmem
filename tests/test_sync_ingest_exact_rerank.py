@@ -972,6 +972,11 @@ class DirectIngestRowSeamTest(unittest.TestCase):
         sync_mod = self._fresh_sync(tmp)
         conn = sqlite3.connect(store)
         conn.row_factory = sqlite3.Row
+        # Model a genuinely pre-v8 memory table: current clients add
+        # content_norm change-tracking triggers, which SQLite will not allow
+        # us to drop the referenced column beneath.
+        for trigger in ("memory_cnorm_ai", "memory_cnorm_au", "memory_cnorm_ad"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
         conn.execute("DROP INDEX IF EXISTS idx_memory_content_norm")
         conn.execute("ALTER TABLE memory DROP COLUMN content_norm")
         conn.commit()

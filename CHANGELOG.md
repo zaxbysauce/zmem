@@ -8,7 +8,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ## [Unreleased]
 
 ### Fixed
-
 - **The repair lane's row-scoped exemptions are no longer dropped by
   the authoritative capture-policy evaluation.** `update_memory` evaluates
   the capture policy twice — a PRE-LOCK warning pass and the AUTHORITATIVE
@@ -107,6 +106,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   directory beside it, on a best-effort basis: a filesystem that cannot
   harden must not break the restore, so the hardening call is made and a
   failure to harden does not abort it.
+- **Store opens skip content-normalization scans on clean stores.** Existing
+  stores repair stale values in bounded batches across opens. The doctor
+  report shows catch-up progress, and store-open timings are written to
+  `ops/store-open.jsonl`. Schema-lock waiters reclaim locks from dead owners
+  during the same wait, pre-tool recall keeps lock waits within its hook
+  budget, and restore waits for active store opens before replacing the
+  database. Update older plugin copies that share the same store to remove
+  their per-open scans. ([#546](https://github.com/zaxbysauce/zmem/issues/546))
 - **Pre-tool recall no longer injects unrelated lessons before plain
   read-only commands.** The pre-tool query was the raw command text, so
   `ls`, `cat`, `sed -n '1,40p'`, path fragments and heredoc bodies matched

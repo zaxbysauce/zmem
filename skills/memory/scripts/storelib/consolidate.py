@@ -21,7 +21,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.entity import relink_memory
-from storelib.schema import _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
+from storelib.schema import _clear_content_norm_dirty, _commit, _embeddings, _env_float, _normalize_content, now_iso, worse_taint
 from storelib.sync import INGEST_MAX_CONTENT_CHARS
 from storelib.write import _clear_expiry, _merge_on_dedup, supersede_memory
 from storelib import generation as _store_generation
@@ -461,6 +461,7 @@ def _absorb_into_keeper(
         new_content = keeper_content + separator + absorbed_content
         conn.execute("UPDATE memory SET content=?, content_norm=? WHERE id=?",
                      (new_content, _normalize_content(new_content), keeper_id))
+        _clear_content_norm_dirty(conn, keeper_id)
         _store_generation.bump_mutation_generation(conn)  # issue #474 census
 
     # Record provenance: append the absorbed id to merged_from (comma-joined,

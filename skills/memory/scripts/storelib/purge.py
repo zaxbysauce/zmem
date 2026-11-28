@@ -49,11 +49,13 @@ from storelib.schema import (
     SCHEMA_LOCK_STALE_SECONDS,
     SCHEMA_LOCK_WAIT_SECONDS,
     _acquire_maintenance_lock_with_liveness,
+    _clear_content_norm_dirty,
     _cleanup_stale_writer_leases,
     _normalize_content,
     _load_vec,
     _release_named_lock,
     _strict_acquire_lock,
+    _wait_for_open_connections,
     now_iso,
 )
 from storelib.backup import (
@@ -486,6 +488,7 @@ def _apply_purge_transaction(conn: sqlite3.Connection,
                 "WHERE id=?",
                 (new_content, _normalize_content(new_content), new_merged,
                  kid))
+            _clear_content_norm_dirty(conn, kid)
             relink_memory(conn, kid)
 
         # Belief heads: rebuild survivors, delete the sourceless.
@@ -1182,7 +1185,7 @@ def _verify_ledgers_clean(data_dir: Path, needles: list[str]) -> dict[str, int]:
 # Backup snapshot scrub
 # --------------------------------------------------------------------------
 
-def _alias_target(path: Path) -> tuple[str, str] | None:
+def _alias_target(path: Path, root: Path | None = None) -> tuple[str, str] | None:
     """The kind and the description of an ALIAS, or None for an ordinary
     file.
 
@@ -1202,7 +1205,18 @@ def _alias_target(path: Path) -> tuple[str, str] | None:
         target_real = os.path.realpath(str(path))
     except OSError:
         return None
-    expected = os.path.join(parent_real, os.path.basename(str(path)))
+    # The root (the backup directory the scrub is pointed at) is the
+    # boundary: the snapshot must resolve to a file DIRECTLY inside the
+    # resolved root. The PARENT-relative comparison alone would let a
+    # snapshot reached through a symlinked sub-directory slip past it.
+    if root is not None:
+        try:
+            root_real = os.path.realpath(str(root))
+        except OSError:
+            return None
+        expected = os.path.join(root_real, os.path.basename(str(path)))
+    else:
+        expected = os.path.join(parent_real, os.path.basename(str(path)))
     if os.path.normcase(target_real) != os.path.normcase(expected):
         return ("a symlink or a reparse point",
                 "it resolves to %s" % target_real)
@@ -1217,7 +1231,8 @@ def _alias_target(path: Path) -> tuple[str, str] | None:
 
 
 def _scrub_snapshot(path: Path, chain: list[str],
-                    needles: list[str]) -> dict[str, str]:
+                    needles: list[str],
+                    root: Path | None = None) -> dict[str, str]:
     """Apply the SAME remediation inside one snapshot file, in place.
 
     Old-schema snapshots skip tables they do not have. The scrub never
@@ -1232,7 +1247,7 @@ def _scrub_snapshot(path: Path, chain: list[str],
     # connection: the flag's contract is completeness ("no residue"), so
     # an unscrubbed snapshot must not be reported as clean. The caller
     # turns the refusal into the flag's own "backup scrub failed" exit.
-    alias = _alias_target(path)
+    alias = _alias_target(path, root)
     if alias is not None:
         kind, detail = alias
         return {"snapshot": path.name, "status": "refused",
@@ -1300,14 +1315,25 @@ def _scrub_snapshot(path: Path, chain: list[str],
 # CLI entry
 # --------------------------------------------------------------------------
 
+def _purge_has_active_writers() -> bool:
+    live = _cleanup_stale_writer_leases()
+    if not live:
+        return False
+    print("[zmem] purge REFUSED: a normal writer is currently "
+          "active; re-run when it finishes", file=sys.stderr)
+    for lease in live[:5]:
+        print("[zmem]   active writer lease: %s" % lease.name, file=sys.stderr)
+    return True
+
+
 def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
               out_dir: str | None = None, as_json: bool = False) -> int:
     """`store.py purge --id <id> [...] [--scrub-backups --out-dir DIR]`.
 
     Exit ladder: 0 clean; 2 bad usage (incl. an invalid
     ZMEM_TEST_LEDGER_FAMILIES token); 3 unknown id; 4 maintenance, schema,
-    backup, consolidate, or live-writer refusal; 5 residue detected OR the
-    delivery-state skew refusal (an ops file family this client cannot
+    backup, consolidate, live-connection, or live-writer refusal;
+    5 residue detected OR the delivery-state skew refusal (an ops file family this client cannot
     scrub — in that case NOTHING was deleted, the store was not even
     opened, and no purged_id rows exist); 6 compaction/scrub failure."""
     from storelib import schema as schema_mod
@@ -1332,10 +1358,9 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 print("[zmem] purge REFUSED: %s" % e, file=sys.stderr)
                 return 4
 
-    # Full cmd_restore ladder (backup.py:647-701): maintenance -> schema ->
-    # backup -> consolidate -> live-writer refusal. Maintenance gates writers
-    # at their START only, so the lock + lease + backup/consolidate locks are
-    # what makes the byte-verify window exclusive.
+    # Like restore, hold maintenance while draining admitted connections
+    # before taking schema. A connection already admitted can still need
+    # schema and can register its writer lease while maintenance is held.
     m_token = _acquire_maintenance_lock_with_liveness()
     if m_token is None:
         print("[zmem] purge REFUSED: another maintenance operation "
@@ -1344,6 +1369,12 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
         return 4
     s_token = b_token = c_token = None
     try:
+        if _purge_has_active_writers():
+            return 4
+        if not _wait_for_open_connections():
+            print("[zmem] purge REFUSED: a store connection is active - "
+                  "store untouched; re-run when it finishes", file=sys.stderr)
+            return 4
         # Issue #357: a dead schema-lock holder is broken instead of
         # blocking purge for the stale window; a live holder keeps the
         # identical bounded wait and refusal below.
@@ -1364,13 +1395,7 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
             print("[zmem] purge REFUSED: a consolidation is currently "
                   "running - re-run when it finishes", file=sys.stderr)
             return 4
-        live = _cleanup_stale_writer_leases()
-        if live:
-            print("[zmem] purge REFUSED: a normal writer is currently "
-                  "active; re-run when it finishes", file=sys.stderr)
-            for lease in live[:5]:
-                print("[zmem]   active writer lease: %s" % lease.name,
-                      file=sys.stderr)
+        if _purge_has_active_writers():
             return 4
 
         # Issue #322 AC2: fail closed BEFORE any store access when the
@@ -1548,7 +1573,8 @@ def cmd_purge(*, ids: list[str], scrub_backups: bool = False,
                 for snap in sorted(list(bdir.glob("store-*.sqlite"))
                                    + list(bdir.glob("prerestore-*.sqlite"))):
                     snapshots.append(
-                        _scrub_snapshot(snap, snapshot_targets, needles))
+                        _scrub_snapshot(snap, snapshot_targets, needles,
+                                        root=bdir))
             except (sqlite3.Error, OSError, RuntimeError) as e:
                 print("[zmem] purge FAILED: backup scrub failed (%s)"
                       % e, file=sys.stderr)

@@ -21,7 +21,7 @@ import glob
 from datetime import datetime, timezone
 from pathlib import Path
 from storelib.opcmds import command_prefix
-from storelib.schema import _acquire_schema_lock_with_liveness, MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _acquire_maintenance_lock_with_liveness, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, now_iso
+from storelib.schema import _acquire_schema_lock_with_liveness, MAINTENANCE_LOCK_STALE_SECONDS, SCHEMA_LOCK_POLL_SECONDS, SCHEMA_LOCK_STALE_SECONDS, SCHEMA_LOCK_WAIT_SECONDS, STORE_PATH, _acquire_maintenance_lock_with_liveness, _cleanup_stale_writer_leases, _commit, _env_float, _host, _parse_iso_to_epoch, _read_schema_version, _release_named_lock, _strict_acquire_lock, _wait_for_open_connections, now_iso
 
 SNAPSHOT_PREFIX = "store-"
 
@@ -1103,56 +1103,58 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
               "running - destination untouched; re-run when it finishes",
               file=sys.stderr)
         return 2
-    # Issue #357: dead schema-lock holders are broken; live holders keep
-    # the identical bounded wait and refusal below.
-    s_token = _acquire_schema_lock_with_liveness(
-        wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
-        poll_seconds=SCHEMA_LOCK_POLL_SECONDS,
-    )
-    if s_token is None:
-        _release_named_lock("maintenance", m_token)
-        print("[zmem] restore REFUSED: store initialization or migration is "
-              "currently running - destination untouched; re-run when it finishes",
-              file=sys.stderr)
-        return 2
-
-    # Fixed acquisition order (backup, then consolidate); nothing else in this
-    # file takes both, so no deadlock is possible, and a half-acquired pair is
-    # always released before returning.
-    b_token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
-    if b_token is None:
-        _release_named_lock("schema", s_token)
-        _release_named_lock("maintenance", m_token)
-        print("[zmem] restore REFUSED: a backup is currently running - "
-              "destination untouched; re-run when it finishes", file=sys.stderr)
-        return 2
-    c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
-    if c_token is None:
-        _release_lock("backup", b_token)
-        _release_named_lock("schema", s_token)
-        _release_named_lock("maintenance", m_token)
-        print("[zmem] restore REFUSED: a consolidation is currently running - "
-              "destination untouched; re-run when it finishes", file=sys.stderr)
-        return 2
-    try:
-        live_writers = _cleanup_stale_writer_leases()
-        if live_writers:
-            print("[zmem] restore REFUSED: a normal writer is currently active - "
+    with contextlib.ExitStack() as locks:
+        locks.callback(_release_named_lock, "maintenance", m_token)
+        # Admitted CLI openers may still need schema to finish. Drain
+        # their connection leases before taking schema.
+        if _restore_has_active_writers():
+            return 2
+        if not _wait_for_open_connections():
+            print("[zmem] restore REFUSED: a store connection is active - "
                   "destination untouched; re-run when it finishes", file=sys.stderr)
-            for lease in live_writers[:5]:
-                # F-002: the lease name is a FILENAME from the writer's
-                # lease directory, so it is externally observable -- and
-                # Windows forbids control characters in a file name, but
-                # this code also runs on POSIX, where it does not.
-                print(f"[zmem]   active writer lease: {_esc(lease.name)}",
-                      file=sys.stderr)
+            return 2
+        s_token = _acquire_schema_lock_with_liveness(
+            wait_seconds=SCHEMA_LOCK_WAIT_SECONDS,
+            poll_seconds=SCHEMA_LOCK_POLL_SECONDS,
+        )
+        if s_token is None:
+            print("[zmem] restore REFUSED: store initialization or migration is "
+                  "currently running - destination untouched; re-run when it finishes",
+                  file=sys.stderr)
+            return 2
+        locks.callback(_release_named_lock, "schema", s_token)
+
+        b_token = _acquire_lock("backup", BACKUP_LOCK_STALE_SECONDS)
+        if b_token is None:
+            print("[zmem] restore REFUSED: a backup is currently running - "
+                  "destination untouched; re-run when it finishes", file=sys.stderr)
+            return 2
+        locks.callback(_release_lock, "backup", b_token)
+        c_token = _acquire_lock("consolidate", CONSOLIDATE_LOCK_STALE_SECONDS)
+        if c_token is None:
+            print("[zmem] restore REFUSED: a consolidation is currently running - "
+                  "destination untouched; re-run when it finishes", file=sys.stderr)
+            return 2
+        locks.callback(_release_lock, "consolidate", c_token)
+        if _restore_has_active_writers():
             return 2
         return _restore_locked(from_path=from_path, force=force, out_dir=out_dir)
-    finally:
-        _release_lock("consolidate", c_token)
-        _release_lock("backup", b_token)
-        _release_named_lock("schema", s_token)
-        _release_named_lock("maintenance", m_token)
+
+
+def _restore_has_active_writers() -> bool:
+    live_writers = _cleanup_stale_writer_leases()
+    if not live_writers:
+        return False
+    print("[zmem] restore REFUSED: a normal writer is currently active - "
+          "destination untouched; re-run when it finishes", file=sys.stderr)
+    for lease in live_writers[:5]:
+        # F-002: the lease name is a FILENAME from the writer's lease
+        # directory, so it is externally observable -- and Windows forbids
+        # control characters in a file name, but this code also runs on
+        # POSIX, where it does not.
+        print(f"[zmem]   active writer lease: {_esc(lease.name)}",
+              file=sys.stderr)
+    return True
 
 # ---------------------------------------------------------------------------
 # Issue #504 step 3(e): the semantic REQUIRED SHAPE proof (inserted from

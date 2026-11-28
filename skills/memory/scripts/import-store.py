@@ -107,7 +107,7 @@ except ImportError:
     _host = None
 
 from storelib.entity import relink_memory  # noqa: E402
-from storelib.schema import _load_vec, _normalize_content, init_db, migrate  # noqa: E402
+from storelib.schema import _clear_content_norm_dirty, _load_vec, _normalize_content, init_db, migrate  # noqa: E402
 from storelib.purge import _ID_SIDE_TABLES, _head_surviving_source  # noqa: E402
 from storelib.sync import (  # noqa: E402
     _INGEST_ID_RE,
@@ -446,6 +446,8 @@ def _sanitize_staged_store(staged: sqlite3.Connection,
                 staged.execute(
                     "UPDATE memory SET content_norm=? WHERE id=?",
                     (_expected_norm, mid))
+        if "content_norm" in cols:
+            _clear_content_norm_dirty(staged, mid)
         counters["added"] += 1
 
     # Issue #353 completeness (PR-review round): the closed id set covers
