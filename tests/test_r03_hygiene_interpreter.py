@@ -139,8 +139,6 @@ def _is_operator_instruction(text: str) -> bool:
     option that selects the source.") -- is NOT an instruction.
     """
     stripped = text.strip()
-    if len(stripped) > 120:
-        return False
     if re.search(r"[.!?]\s*$", stripped):
         return False
     match = _CMD_RE.match(text)
@@ -150,8 +148,16 @@ def _is_operator_instruction(text: str) -> bool:
     # is EXECUTABLE on its own: "zmem restore", "python .../store.py
     # restore" and "C:/x/store.py restore" are all pasteable, flagless or
     # not. Every executable form the pattern accepts counts.
-    return bool(re.search(r"\s--[a-z]", stripped)) or bool(
-        match.group("exec"))
+    #
+    # TG-2 (the closeout reviewer's round 37): the length rule must not
+    # HIDE an instruction. A literal that starts with a command AND
+    # carries its flag is copyable at any length, so it is an
+    # instruction; the length rule now applies only to the flagless
+    # executable form, where a long paragraph that merely starts with a
+    # command word is prose.
+    if re.search(r"\s--[a-z]", stripped):
+        return True
+    return len(stripped) <= 120 and bool(match.group("exec"))
 
 
 _CMD_OCCURRENCE_RE = re.compile(
@@ -212,6 +218,18 @@ class OperatorHintDetectorTest(unittest.TestCase):
 
     def test_flags_a_bare_operator_instruction(self):
         tree = ast.parse('hint = "doctor --json --rebuild-fts"\n')
+        _fstrings, bare = _operator_hints(tree)
+        self.assertEqual(len(bare), 1, bare)
+
+    def test_flags_a_long_bare_command_hint(self):
+        # TG-2 (the closeout reviewer's round 37): the length rule must
+        # not hide an instruction -- a long literal that starts with a
+        # command and carries its flag is still copyable.
+        long_hint = ("restore --from /tmp/some/quite/long/path/store.sqlite "
+                     + "and the rest of the sentence that makes it long "
+                     "and therefore long enough to have been excluded")
+        self.assertGreater(len(long_hint), 120, long_hint)
+        tree = ast.parse('hint = %r\n' % long_hint)
         _fstrings, bare = _operator_hints(tree)
         self.assertEqual(len(bare), 1, bare)
 
