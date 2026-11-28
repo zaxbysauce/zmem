@@ -1127,9 +1127,28 @@ class SwapSharingViolationTest(_InProcessRestoreBase):
         # hold the destination open: os.replace over it fails on Windows
         held = open(str(self.store), "rb")
         self.addCleanup(held.close)
+
+        # watch the REPLACEMENT itself: when it fails, record the error
+        # AND the state of the staged copy at that moment -- the swap's
+        # success inference depends on exactly that
+        import os as _os
+        import storelib.backup as _bm
+        real_replace = _os.replace
+        seen = {}
+
+        def watched_replace(src_path, dst_path, **kwargs):
+            try:
+                return real_replace(src_path, dst_path, **kwargs)
+            except OSError as exc:
+                seen["error"] = repr(exc)
+                seen["staged_exists"] = _os.path.exists(str(src_path))
+                raise
+
+        unpatch = self._patch_attr(_bm.os, "replace", watched_replace)
         try:
             result = self._run(snap)
         finally:
+            unpatch()
             held.close()
 
         self.assertNotEqual(result["rc"], 0,
@@ -1139,6 +1158,18 @@ class SwapSharingViolationTest(_InProcessRestoreBase):
             result["raised"] is not None or "restore FAILED" in result["err"],
             "the failed replacement was not reported as a failure: %r"
             % (result,))
+        # the capture must have watched the REPLACEMENT fail, with a
+        # sharing violation, and the staged copy must have been present
+        # at that moment -- that is what the swap's inference rests on
+        self.assertIn("error", seen,
+                      "the replacement was never observed failing: %r" % (result,))
+        self.assertRegex(seen["error"], r"(?i)(permission|sharing)",
+                         "the replacement did not fail with a sharing "
+                         "violation: %s" % seen["error"])
+        self.assertTrue(seen.get("staged_exists"),
+                        "the staged copy did NOT exist at the moment the "
+                        "replacement failed, so the swap's success "
+                        "inference is not established: %r" % (seen,))
         after = self._live_rows()
         self.assertEqual(
             after, before,

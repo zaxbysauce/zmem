@@ -1140,7 +1140,12 @@ def cmd_restore(*, from_path: str, force: bool = False, out_dir: str | None = No
             print("[zmem] restore REFUSED: a normal writer is currently active - "
                   "destination untouched; re-run when it finishes", file=sys.stderr)
             for lease in live_writers[:5]:
-                print(f"[zmem]   active writer lease: {lease.name}", file=sys.stderr)
+                # F-002: the lease name is a FILENAME from the writer's
+                # lease directory, so it is externally observable -- and
+                # Windows forbids control characters in a file name, but
+                # this code also runs on POSIX, where it does not.
+                print(f"[zmem]   active writer lease: {_esc(lease.name)}",
+                      file=sys.stderr)
             return 2
         return _restore_locked(from_path=from_path, force=force, out_dir=out_dir)
     finally:
@@ -2062,6 +2067,16 @@ def _restore_locked(*, from_path: str, force: bool = False, out_dir: str | None 
             if forensic_dir is not None:
                 print(f"[zmem] restore: byte copies of the files from before the restore "
                       f"are kept in {_esc(forensic_dir)}", file=sys.stderr)
+            # F-007: the ordering is deliberately fail-closed -- the
+            # pre-restore backup is NOT re-installed automatically -- so
+            # the operator must be told how to re-install it BY HAND.
+            # The path is a copy-paste command and stays byte-exact, as
+            # in the automatic-rollback failure branch above.
+            if prerestore_path is not None:
+                print(f"[zmem] restore: roll back by hand with "
+                      f"{command_prefix()} restore --from "
+                      f"{shlex.quote(str(prerestore_path))} --force",
+                      file=sys.stderr)
             return 1
         print(f"[zmem] restore FAILED: {_esc(cause)}", file=sys.stderr)
         if stash_dir is not None and stash_dir.is_dir() and not any(stash_dir.iterdir()):
